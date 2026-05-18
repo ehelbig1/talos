@@ -1,0 +1,29 @@
+[package]
+name = "talos-api-keys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bcrypt = "0.18"
+chrono.workspace = true
+hex = "0.4"
+rand = { version = "0.8", default-features = true, features = ["std"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+subtle = "2.4"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-auth-types = { path = "../talos-auth-types" }
+talos-config = { path = "../talos-config" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+{{- if and .Values.controller.enabled .Values.controller.podDisruptionBudget.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "talos.componentName" (list . "controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "controller") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "controller") | nindent 6 }}
+{{- end }}

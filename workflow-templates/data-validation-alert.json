@@ -1,0 +1,58 @@
+{
+  "name": "Data Fetch → Validation → Slack Alert",
+  "description": "Polls a data source, validates key numeric metrics against thresholds, and alerts via Slack when values are out of range.",
+  "category": "Monitoring",
+  "tags": ["data", "validation", "slack", "alerting", "scheduled"],
+  "nodes": [
+    {
+      "label": "Fetch Metrics",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.example.com/metrics"
+      }
+    },
+    {
+      "label": "Validate Thresholds",
+      "module_name": "Data Validator",
+      "config": {
+        "FIELD": "error_rate",
+        "MAX_VALUE": 0.05
+      }
+    },
+    {
+      "label": "Alert Team",
+      "module_name": "Slack Message",
+      "config": {
+        "CHANNEL": "#ops-alerts",
+        "TEXT": "Validation failed: error_rate exceeded threshold"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Fetch Metrics", "to": "Validate Thresholds" },
+    { "from": "Validate Thresholds", "to": "Alert Team" }
+  ],
+  "suggested_schedule": "*/15 * * * *",
+  "required_secrets": [
+    { "key_path": "slack/bot_token", "description": "Slack bot token with chat:write scope" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Alert Team",
+      "current_module": "Slack Message",
+      "replacements": [
+        {
+          "module_name": "Gmail",
+          "catalog_name": "send-gmail",
+          "config_delta": "Replace CHANNEL+TEXT with TO (on-call distribution list), SUBJECT (e.g. 'Threshold Breach Alert'), BODY. Required secret: google/gmail_oauth_token instead of slack/bot_token."
+        },
+        {
+          "module_name": "Message Publisher",
+          "catalog_name": "message-publisher",
+          "config_delta": "Replace CHANNEL+BOT_TOKEN with TOPIC (e.g. 'alerts.validation'). Downstream consumers (PagerDuty bridge, dashboards) subscribe to the NATS subject. No alert secret needed in the module."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,775 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    # Digest-pinned for supply-chain integrity — `:pg16` tag kept for
+    # human readability; the digest is what actually gets pulled. Update
+    # both when bumping: `docker buildx imagetools inspect pgvector/pgvector:pg16`
+    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    container_name: talos-postgres
+    environment:
+      POSTGRES_USER: talos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
+      POSTGRES_DB: talos
+    # DEVELOPMENT: Port exposed for migrations and local debugging
+    # PRODUCTION: Remove this port mapping - services should use internal Docker network
+    ports:
+      - "127.0.0.1:5433:5432"  # Use alternate host port to avoid conflicts
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - talos-network
+
+  # Redis Cache
+  redis:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 64M
+          cpus: '0.1'
+    image: redis:7-alpine@sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6
+    container_name: talos-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env}
+    ports:
+      # DEVELOPMENT: Port exposed for debugging
+      # PRODUCTION: Remove this port mapping
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # NATS Message Queue
+  nats:
+    image: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
+    container_name: talos-nats
+    # SECURITY: Require username/password authentication on all connections.
+    environment:
+      - NATS_USER=${NATS_USER:?NATS_USER required in .env}
+      - NATS_PASSWORD=${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+    command: >
+      sh -c "echo 'max_payload: 8388608' > /nats.conf && exec nats-server --jetstream --store_dir=/data -m 8222 --user \"$$NATS_USER\" --pass \"$$NATS_PASSWORD\" -c /nats.conf"
+    ports:
+      # DEVELOPMENT: Port exposed for debugging
+      # PRODUCTION: Remove this port mapping
+      - "127.0.0.1:4222:4222"  # Client connections
+      - "127.0.0.1:8222:8222"  # HTTP monitoring
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Compilation sandbox image — builds talos-builder:latest for TALOS_COMPILATION_CONTAINER=true.
+  # Only started when explicitly requested: `docker compose --profile builder up builder`
+  # or via `make builder-image`. Not included in default `docker compose up`.
+  builder:
+    profiles: ["builder"]
+    build:
+      context: .
+      dockerfile: Dockerfile.builder
+    image: talos-builder:latest
+    container_name: talos-builder
+    entrypoint: ["echo", "Builder image ready"]
+    restart: "no"
+
+  # One-shot migration service: runs sqlx migrate run before the controller starts.
+  # Uses the same image as the controller so no extra tooling is needed.
+  # The controller depends on this completing successfully so it never starts
+  # against an empty or partially-migrated schema.
+  migrate:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+      additional_contexts:
+        workflow_engine: ../talos-workflow-engine
+      args:
+        DATABASE_URL: ${DATABASE_URL}
+    container_name: talos-migrate
+    command: ["/usr/local/cargo/bin/sqlx", "migrate", "run", "--source", "/app/migrations"]
+    environment:
+      DATABASE_URL: postgres://talos:${POSTGRES_PASSWORD}@postgres:5432/talos
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - talos-network
+    restart: "no"
+
+  # HashiCorp Vault — KEK backend for envelope encryption.
+  # Dev profile: server mode with file storage so transit keys survive
+  # container restarts. `-dev` mode cannot persist transit keys (uses
+  # inmem storage regardless of mounted volumes) — see docker/vault/
+  # README for the rationale. Unseal key + root token are generated on
+  # first boot by vault-init and written to /vault/file/bootstrap.json
+  # inside the persistent volume.
+  #
+  # Production deployments MUST replace this with a real Vault cluster:
+  #   - Multiple replicas, raft storage or external backend
+  #   - Unseal keys held by distinct operators (Shamir 5/3 or KMS seal)
+  #   - Non-root token issued via a transit-only policy
+  #   - TLS termination
+  vault:
+    image: hashicorp/vault:1.18@sha256:750bb37c1638fa194ab37053a81618c61bb0491ddec6fccac87c07a8e6cd8166
+    container_name: talos-vault
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_ADDR: http://0.0.0.0:8200
+    ports:
+      - "127.0.0.1:8200:8200"
+    volumes:
+      # File storage for transit keys. Survives restarts.
+      - vault_data:/vault/file
+      # Vault server config (file storage backend, disable_mlock, etc.).
+      - ./docker/vault/vault.hcl:/vault/config/vault.hcl:ro
+    networks:
+      - talos-network
+    healthcheck:
+      # `vault status` exits 0 only when initialized + unsealed.
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+    command: ["vault", "server", "-config=/vault/config/vault.hcl"]
+
+  # One-shot init: initializes + unseals Vault on first boot, unseals on
+  # subsequent boots, then enables transit + creates the kek key.
+  # Idempotent — safe to re-run. The bootstrap file holds the single
+  # unseal key + root token; in production these would live in distinct
+  # operator-held safes, not on the Vault data volume.
+  vault-init:
+    image: hashicorp/vault:1.18@sha256:750bb37c1638fa194ab37053a81618c61bb0491ddec6fccac87c07a8e6cd8166
+    container_name: talos-vault-init
+    depends_on:
+      vault:
+        # Vault starts sealed on fresh storage, so its own healthcheck
+        # won't pass until vault-init unseals it. Wait for the container
+        # to exist instead, and let the init script poll for readiness.
+        condition: service_started
+    environment:
+      VAULT_ADDR: http://vault:8200
+    volumes:
+      - vault_data:/vault/file
+    networks:
+      - talos-network
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        BOOTSTRAP=/vault/file/bootstrap.json
+
+        # Wait for Vault's HTTP API to be up (it listens even while sealed).
+        for i in $$(seq 1 30); do
+          if vault status >/dev/null 2>&1 || [ $$? -eq 2 ]; then
+            break
+          fi
+          echo "vault-init: waiting for vault to listen ($$i/30)..."
+          sleep 2
+        done
+
+        INITIALIZED=$$(vault status -format=json 2>&1 | grep -o '"initialized":[[:space:]]*true' || true)
+        if [ -z "$$INITIALIZED" ]; then
+          echo "vault-init: initializing fresh Vault storage"
+          vault operator init -key-shares=1 -key-threshold=1 -format=json > "$$BOOTSTRAP"
+          chmod 600 "$$BOOTSTRAP"
+        else
+          echo "vault-init: existing Vault storage detected"
+          if [ ! -f "$$BOOTSTRAP" ]; then
+            echo "vault-init: ERROR — Vault is initialized but $$BOOTSTRAP is missing."
+            echo "vault-init: cannot unseal. Either restore the bootstrap file or"
+            echo "vault-init: wipe the vault_data volume (docker volume rm talos_vault_data)."
+            exit 1
+          fi
+        fi
+
+        # Extract first unseal key: flip into the unseal_keys_b64 array,
+        # grab the first quoted string, stop at the closing `]`. Robust to
+        # json formatting (pretty-printed vs compact) without needing jq.
+        UNSEAL_KEY=$$(awk '/"unseal_keys_b64"/{f=1;next} /\]/{f=0} f' "$$BOOTSTRAP" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        ROOT_TOKEN=$$(sed -n 's/.*"root_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$$BOOTSTRAP" | head -1)
+
+        if [ -z "$$UNSEAL_KEY" ] || [ -z "$$ROOT_TOKEN" ]; then
+          echo "vault-init: ERROR — could not parse unseal key or root token from $$BOOTSTRAP"
+          exit 1
+        fi
+
+        SEALED=$$(vault status -format=json 2>&1 | grep -o '"sealed":[[:space:]]*true' || true)
+        if [ -n "$$SEALED" ]; then
+          echo "vault-init: unsealing"
+          vault operator unseal "$$UNSEAL_KEY" >/dev/null
+        fi
+
+        export VAULT_TOKEN="$$ROOT_TOKEN"
+
+        # Enable the transit engine (no-op if already enabled).
+        vault secrets enable -path=transit transit 2>/dev/null || true
+        # Create the named KEK key (no-op if it already exists).
+        vault write -f transit/keys/talos-kek 2>/dev/null || true
+        # Confirm the key is reachable.
+        vault read transit/keys/talos-kek
+
+        # Create a stable-id child token so downstream services can use a
+        # predictable VAULT_TOKEN=dev-root across restarts. -force revokes
+        # any stale token with the same id before recreating. No-TTL +
+        # orphan so it doesn't expire or chain back to the root session.
+        vault token revoke dev-root 2>/dev/null || true
+        # Periodic orphan token: auto-renews every 768h, never expires as
+        # long as it's being used. Safe choice for a dev-only credential.
+        vault token create -id=dev-root -orphan -policy=root -period=768h -display-name=dev-root >/dev/null
+        echo "vault-init: dev-root token ready"
+
+  # Controller Service (GraphQL API)
+  controller:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+      additional_contexts:
+        workflow_engine: ../talos-workflow-engine
+      args:
+        DATABASE_URL: ${DATABASE_URL}
+        # Build-time git state — captured by build.rs and surfaced in
+        # session_start.server_version so operators can grep `git log`
+        # for the deployed commit. Defaults to "unknown" when the
+        # variable is unset (e.g. building from a tarball).
+        GIT_SHA_OVERRIDE: ${GIT_SHA_OVERRIDE:-unknown}
+        GIT_DIRTY_OVERRIDE: ${GIT_DIRTY_OVERRIDE:-false}
+    container_name: talos-controller
+    environment:
+      DATABASE_URL: postgres://talos:${POSTGRES_PASSWORD}@postgres:5432/talos
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      NATS_URL: nats://nats:4222
+      NATS_USER: ${NATS_USER:?NATS_USER required in .env}
+      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+      # talos-workflow-engine-nats defaults its subject prefix to `workflow`
+      # (so the crate is reusable outside Talos). Within this stack we
+      # override to `talos` so engine dispatches land on the `talos.*`
+      # subjects the worker subscribes to. Without this the controller
+      # publishes to workflow.pipeline.jobs, workers listen on
+      # talos.pipeline.jobs, and every dispatch fails with "no responders".
+      WORKFLOW_NATS_PREFIX: talos
+      RUST_LOG: info,controller=debug,audit_ledger=info
+      TALOS_REGISTRY_URL: http://registry:5000
+      BASE_URL: ${BASE_URL:-http://localhost:8000}
+      ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY:-}
+      # Gate for admin-only operator endpoints (gcal watch create/stop-all,
+      # etc). MUST remain unset in production. Set to "1" only when
+      # actively using docs/gcal-live-test.md or equivalent ops tooling.
+      ENABLE_ADMIN_OPS: ${ENABLE_ADMIN_OPS:-}
+      # MinIO / S3 configuration for audit ledger
+      AWS_ENDPOINT_URL: http://minio:9000
+      MINIO_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_CONTROLLER_USER:?MINIO_CONTROLLER_USER required in .env}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_CONTROLLER_PASSWORD:?MINIO_CONTROLLER_PASSWORD required in .env}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      MINIO_BUCKET: audit-logs
+      TALOS_MASTER_KEY: ${TALOS_MASTER_KEY:?TALOS_MASTER_KEY required in .env}
+      # KEK provider selection: `env` (default) loads TALOS_MASTER_KEY for
+      # local AES-256-GCM. `vault` calls Vault transit; legacy env stays
+      # wired for Phase-4 read-fallback + dual-write rollback safety.
+      KEK_PROVIDER: ${KEK_PROVIDER:-env}
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
+      VAULT_TOKEN: ${VAULT_TOKEN:-dev-root}
+      VAULT_TRANSIT_KEY_NAME: ${VAULT_TRANSIT_KEY_NAME:-talos-kek}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required in .env}
+      # HMAC key shared between controller and worker for signing NATS job requests.
+      # Generate with: openssl rand -hex 32
+      WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env}
+      # Audit event signing key — provides tamper-evident audit trail.
+      # Generate with: openssl rand -hex 32
+      TALOS_AUDIT_SIGNING_KEY: ${TALOS_AUDIT_SIGNING_KEY:-}
+      # MCP auth rate limiting (requests per minute per IP)
+      MCP_AUTH_RATE_LIMIT: ${MCP_AUTH_RATE_LIMIT:-60}
+      BCRYPT_COST: "12"
+      # CORS Configuration
+      ALLOWED_ORIGIN: "http://localhost:3002"
+      FRONTEND_URL: "http://localhost:3002"
+      # Rate limiting (requests per minute)
+      API_RATE_LIMIT: ${API_RATE_LIMIT:-1000}        # GraphQL API (default 1000 for development)
+      WEBHOOK_RATE_LIMIT: ${WEBHOOK_RATE_LIMIT:-500}     # Webhooks (default 500 for development)
+      GLOBAL_RATE_LIMIT: ${GLOBAL_RATE_LIMIT:-10000}    # Global total (default 10000 for development)
+      TRUSTED_IPS: ${TRUSTED_IPS:-127.0.0.1,::1}  # Whitelist IPs (bypass rate limits, defaults to localhost)
+      # Security headers
+      ALLOW_DEV_UNSAFE_CSRF_BYPASS: "false"
+      # ENABLE_HSTS: "true"          # Enable HSTS (only with HTTPS)
+      # Anthropic API Key
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Embeddings — Ollama (OpenAI-compatible API, local, no API key required).
+      # Override EMBEDDING_API_URL / EMBEDDING_API_KEY to switch providers (Azure, OpenAI, Jina…).
+      EMBEDDING_API_URL: "http://ollama:11434/v1/embeddings"
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-768}
+      # Ollama (Tier 1 — local LLM inference)
+      OLLAMA_URL: "http://ollama:11434"
+      # Neo4j (Knowledge Graph)
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-talos_graph_2026}
+      # OAuth - Google
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/auth/oauth/google/callback}
+      # OAuth - Okta
+      OKTA_DOMAIN: ${OKTA_DOMAIN:-}
+      OKTA_CLIENT_ID: ${OKTA_CLIENT_ID:-}
+      OKTA_CLIENT_SECRET: ${OKTA_CLIENT_SECRET:-}
+      OKTA_REDIRECT_URI: ${OKTA_REDIRECT_URI:-http://localhost:8000/auth/oauth/okta/callback}
+      # OAuth - Snyk
+      SNYK_CLIENT_ID: ${SNYK_CLIENT_ID:-}
+      SNYK_CLIENT_SECRET: ${SNYK_CLIENT_SECRET:-}
+      SNYK_REDIRECT_URI: ${SNYK_REDIRECT_URI:-http://localhost:8000/auth/oauth/snyk/callback}
+      # Gmail OAuth Configuration (can reuse Google Calendar's OAuth app — just add Gmail scopes)
+      GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-${GOOGLE_CLIENT_ID:-}}
+      # Gmail push-notification configuration. Optional; when unset,
+      # the push service is disabled and users.watch calls are not
+      # available. See docs/gmail-push-setup.md for the operator runbook.
+      GMAIL_PUBSUB_TOPIC: ${GMAIL_PUBSUB_TOPIC:-}
+      GMAIL_PUBSUB_AUDIENCE: ${GMAIL_PUBSUB_AUDIENCE:-}
+      GMAIL_PUBSUB_SERVICE_ACCOUNT: ${GMAIL_PUBSUB_SERVICE_ACCOUNT:-gmail-api-push@system.gserviceaccount.com}
+      GMAIL_DEFAULT_LABEL_IDS: ${GMAIL_DEFAULT_LABEL_IDS:-INBOX}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-${GOOGLE_CLIENT_SECRET:-}}
+      GMAIL_REDIRECT_URI: ${GMAIL_REDIRECT_URI:-http://localhost:8000/api/gmail/callback}
+      # Slack OAuth Configuration
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+      SLACK_REDIRECT_URI: ${SLACK_REDIRECT_URI:-http://localhost:8000/api/slack/callback}
+      # Atlassian (Jira) OAuth Configuration
+      ATLASSIAN_CLIENT_ID: ${ATLASSIAN_CLIENT_ID:-}
+      ATLASSIAN_CLIENT_SECRET: ${ATLASSIAN_CLIENT_SECRET:-}
+      ATLASSIAN_REDIRECT_URI: ${ATLASSIAN_REDIRECT_URI:-http://localhost:8000/api/atlassian/callback}
+      # The controller embeds its own WasmRuntime (used by run_sandbox / compile_custom_sandbox).
+      # Disable pooling here too — same reason as the worker service above.
+      TALOS_DISABLE_POOLING: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist cargo registry + build artifacts so runtime compilations
+      # (compile_custom_sandbox_template) survive container restarts.
+      #
+      # IMPORTANT: This path must match CARGO_HOME set in controller/Dockerfile.
+      # With CARGO_HOME=/tmp/cargo-cache the registry lives at
+      # /tmp/cargo-cache/registry/ — mounting at /usr/local/cargo/registry
+      # (the default path in rust:1.90 before the override) was invisible to
+      # cargo and caused full crate re-downloads on every container restart.
+      - cargo_cache:/tmp/cargo-cache
+      - cargo_target:/tmp/cargo-target
+      - compilation_cache:/tmp/talos_compilation_cache
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+      nats:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      # Vault becomes a hard dependency only when KEK_PROVIDER=vault, but
+      # listing it unconditionally is harmless: in dev compose Vault always
+      # comes up. Production deployments use a real (external) Vault and
+      # remove this stanza.
+      vault-init:
+        condition: service_completed_successfully
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Worker Service (WASM Runtime)
+  worker:
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+      replicas: ${WORKER_REPLICAS:-2}
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+      additional_contexts:
+        workflow_engine: ../talos-workflow-engine
+    environment:
+      NATS_URL: nats://nats:4222
+      NATS_USER: ${NATS_USER:?NATS_USER required in .env}
+      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+      # Worker caches compiled WASM bytes in Redis so sub-workflow invocations
+      # and loop re-dispatches don't re-fetch from the controller each time.
+      # Without this, the second iteration of any loop node fails with
+      # "failed to fetch wasm module from redis (not found or redis
+      # unavailable)" because the controller dispatcher emits a `redis:` URI
+      # that the worker can only resolve against an actual Redis client.
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      RUST_LOG: info,worker=debug
+      WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env}
+      # Disable the pooling allocator to avoid large PROT_NONE mmap slab failures
+      # under Docker Desktop's VM memory overcommit limits.  The on-demand allocator
+      # is correct in all environments; remove or set to "false" to re-enable pooling
+      # once the host environment is confirmed to support large PROT_NONE reservations.
+      TALOS_DISABLE_POOLING: "true"
+
+      # DATABASE_URL and EMBEDDING_* intentionally unset on the worker.
+      # Every data-access surface now routes through the controller
+      # via signed NATS-RPC:
+      #   - agent-memory   (get/set/delete/list_keys/search/store)
+      #   - graph-memory   (graph_search)
+      #   - database       (execute_query)
+      #   - state          (durable write-through, fire-and-forget)
+      # Sandbox escapes can't exfiltrate rows or mint cross-tenant
+      # queries because the worker has no Postgres credentials.
+
+      METRICS_AUTH_TOKENS: ${METRICS_AUTH_TOKENS:-dev-token}
+      # HMAC key shared between controller and worker for signing NATS job requests.
+      # Generate with: openssl rand -hex 32
+      #
+      # MinIO / S3 for audit ledger
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_WORKER_USER:?MINIO_WORKER_USER required in .env}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_WORKER_PASSWORD:?MINIO_WORKER_PASSWORD required in .env}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      MINIO_BUCKET: audit-logs
+      # Ollama (Tier 1 — local LLM inference from WASM modules)
+      OLLAMA_URL: "http://ollama:11434"
+      # Operator opt-in: allow modules to reach hostnames that resolve to
+      # private (RFC1918 / loopback / link-local) IPs, when those hostnames
+      # are explicitly named in the module's `allowed_hosts` (NOT via "*").
+      # Required for the worker to call sibling services on the host like
+      # nova at host.docker.internal:3030. IP literals to private ranges
+      # remain blocked unconditionally; wildcard allowlists keep full SSRF
+      # protection. Default off — leave unset (or set to "false") on
+      # multi-tenant deployments where module authors are not trusted.
+      WORKER_ALLOW_PRIVATE_HOST_TARGETS: ${WORKER_ALLOW_PRIVATE_HOST_TARGETS:-false}
+    depends_on:
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # =======================================================================
+  # Object Storage (MinIO — S3-compatible)
+  # ========================================================================
+
+  minio:
+    # `:latest` tag kept for human context; actual pull is pinned by digest.
+    # `latest` is a moving target, hence the explicit digest pin below.
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    container_name: talos-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER required in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD required in .env}
+    ports:
+      - "127.0.0.1:9000:9000"  # S3 API
+      - "127.0.0.1:9001:9001"  # Web Console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # One-shot init container: creates the audit-logs bucket and a write-only user.
+  minio-init:
+    image: minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    container_name: talos-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER required in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD required in .env}
+      MINIO_CONTROLLER_USER: ${MINIO_CONTROLLER_USER:?MINIO_CONTROLLER_USER required in .env}
+      MINIO_CONTROLLER_PASSWORD: ${MINIO_CONTROLLER_PASSWORD:?MINIO_CONTROLLER_PASSWORD required in .env}
+      MINIO_WORKER_USER: ${MINIO_WORKER_USER:?MINIO_WORKER_USER required in .env}
+      MINIO_WORKER_PASSWORD: ${MINIO_WORKER_PASSWORD:?MINIO_WORKER_PASSWORD required in .env}
+    networks:
+      - talos-network
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Waiting for MinIO to be ready...';
+        sleep 5;
+
+        # Configure mc client
+        /usr/bin/mc alias set myminio http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\" || exit 1;
+
+        # Create audit-logs bucket (no anonymous access policy — least-privilege
+        # controller user below is the only principal that may write to it)
+        /usr/bin/mc mb myminio/audit-logs --ignore-existing || true;
+
+        # Create write-only policy for controller
+        echo '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\"],\"Resource\":[\"arn:aws:s3:::audit-logs/*\"]}]}' > /tmp/audit-policy.json
+
+        # Apply the policy and user
+        /usr/bin/mc admin policy create myminio audit_write_only /tmp/audit-policy.json || true;
+        /usr/bin/mc admin user add myminio $$MINIO_CONTROLLER_USER $$MINIO_CONTROLLER_PASSWORD || true;
+        /usr/bin/mc admin policy attach myminio audit_write_only --user $$MINIO_CONTROLLER_USER || true;
+
+        echo \"MinIO bucket 'audit-logs' and least-privilege controller user ready\";
+        exit 0
+      "
+    restart: "no"
+
+  # ========================================================================
+  # Observability Stack
+  # ========================================================================
+
+  # Prometheus - Metrics Collection
+  prometheus:
+    image: prom/prometheus:v2.48.0@sha256:b440bc0e8aa5bab44a782952c09516b6a50f9d7b2325c1ffafac7bc833298e2e
+    container_name: talos-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Jaeger - Distributed Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.50@sha256:d589499a01e1e2f9d302db8e210af09688076fd8a93278fa024824a755c1a0f1
+    container_name: talos-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"  # Jaeger UI
+      - "127.0.0.1:4317:4317"    # OTLP gRPC
+      - "127.0.0.1:4318:4318"    # OTLP HTTP
+      - "127.0.0.1:14250:14250"  # Jaeger gRPC
+      - "127.0.0.1:14268:14268"  # Jaeger HTTP
+      - "127.0.0.1:9411:9411"    # Zipkin compatible
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Grafana - Visualization & Dashboards
+  grafana:
+    image: grafana/grafana:10.2.2@sha256:e3e9c2b5776fe3657f4954dfa91579224f98a0316f51d431989b15425e95530f
+    container_name: talos-grafana
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD required in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "127.0.0.1:3001:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - jaeger
+      - postgres
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Frontend Service (React/Vite dev server with hot-reload)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: talos-frontend
+    environment:
+      # Tells the Vite server-side proxy where to forward /graphql, /api, /ws.
+      # Must use the Docker service name — "localhost" inside the container
+      # resolves to the frontend container itself, not the controller.
+      API_PROXY_TARGET: http://controller:8000
+    ports:
+      - "3002:3000"
+    volumes:
+      # Mount host source so Vite HMR picks up file changes without rebuilding
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      # Keep node_modules from the image (not from host) for correct native binaries
+      - /app/node_modules
+    depends_on:
+      - controller
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # Local OCI Registry
+  # ========================================================================
+  registry:
+    image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+    container_name: talos-registry
+    ports:
+      - "127.0.0.1:5001:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      # For local development we'll use a basic HTTP registry without TLS
+      # In production, this would be an enterprise registry (GHCR/GAR)
+    volumes:
+      - registry_data:/var/lib/registry
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # Embeddings (Ollama — local, GPU-accelerated if NVIDIA runtime available)
+  # ========================================================================
+
+  # Ollama serves local models via an OpenAI-compatible REST API.
+  # The controller points EMBEDDING_API_URL at this service so no external
+  # ── Neo4j (Knowledge Graph for Graph RAG) ──────────────────────────────
+  # Stores entity-relationship triples extracted from actor memory writes.
+  # Used by the hybrid retrieval system to traverse connections between
+  # entities (people, tickets, projects, emails) that vector similarity
+  # alone can't capture.
+  neo4j:
+    image: neo4j:5.26-community@sha256:b357872da95a164c5243ca8d9060601130717ff43cee3c829402fab46209a412
+    container_name: talos-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD required in .env}
+      NEO4J_PLUGINS: '["apoc"]'
+      # SECURITY: Restrict APOC to the specific procedures used by graph_rag.rs.
+      # apoc.path.subgraphAll is used for multi-hop entity traversal.
+      NEO4J_dbms_security_procedures_unrestricted: apoc.path.*
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+    volumes:
+      - neo4j_data:/data
+    ports:
+      # DEVELOPMENT: Ports exposed for debugging graph structure
+      # PRODUCTION: Remove these port mappings — services use internal Docker network
+      - "127.0.0.1:7474:7474"   # Browser UI
+      - "127.0.0.1:7687:7687"   # Bolt protocol
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # API key is required for semantic search.
+  # NOTE: No ports are exposed to the host to avoid conflicts with host Ollama.
+  # This service is only accessible internally to other Docker services.
+  ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    container_name: talos-ollama
+    # Port 11434 is NOT exposed to the host to prevent conflicts with host Ollama.
+    # The controller accesses this service via http://ollama:11434 within the Docker network.
+    volumes:
+      - ollama_data:/root/.ollama
+    # Uncomment the deploy section to enable GPU pass-through (requires nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      # `ollama list` connects to the running server — exits non-zero if not ready.
+      # Longer start_period covers slow macOS VM / first-run model cache init.
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+
+volumes:
+  postgres_data:
+    driver: local
+  neo4j_data:
+    driver: local
+  redis_data:
+    driver: local
+  nats_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  minio-data:
+    driver: local
+  vault_data:
+    driver: local
+  registry_data:
+    driver: local
+  cargo_cache:
+    driver: local
+  cargo_target:
+    driver: local
+  compilation_cache:
+    driver: local
+  ollama_data:
+    driver: local
+
+networks:
+  talos-network:
+    driver: bridge

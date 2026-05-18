@@ -1,0 +1,37 @@
+[package]
+name = "talos-replay-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Talos crates — repositories
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-module-repository = { path = "../talos-module-repository" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+
+# Talos crates — services
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-registry = { path = "../talos-registry" }
+talos-capability-world = { path = "../talos-capability-world" }
+
+# Replay diff kernel + workflow engine + worker runtime — the kernel
+# this service exposes is "execute one WASM job + diff result", which
+# is exactly the surface the existing handlers had inline.
+talos-replay-diff = { path = "../talos-replay-diff" }
+talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+worker = { path = "../worker" }
+
+[lints]
+workspace = true

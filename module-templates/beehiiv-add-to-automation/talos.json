@@ -1,0 +1,59 @@
+{
+  "name": "beehiiv-add-to-automation",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: Add to Automation",
+  "description": "Enroll a subscriber into a Beehiiv automation journey. Use for upsell sequences, premium onboarding, win-back campaigns, and referral reward flows. The automation must have an active 'Add by API' trigger.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID", "AUTOMATION_ID"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key')."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxx...'). Supports {{key}} template interpolation."
+      },
+      "AUTOMATION_ID": {
+        "type": "string",
+        "description": "Beehiiv automation ID (e.g. 'auto_xxx...'). The automation must have an 'Add by API' trigger active. Use beehiiv-list-automations to discover IDs. Supports {{key}} template interpolation."
+      },
+      "SUBSCRIPTION_ID": {
+        "type": "string",
+        "description": "Subscription ID to enroll (e.g. 'sub_xxx...'). Provide either this or EMAIL — not both. Use '{{subscription_id}}' to pull from an upstream beehiiv-get-subscriber node. Supports {{key}} template interpolation."
+      },
+      "EMAIL": {
+        "type": "string",
+        "description": "Email address to enroll. Provide either this or SUBSCRIPTION_ID — not both. Supports {{key}} template interpolation (e.g. '{{email}}')."
+      },
+      "DOUBLE_OPT_OVERRIDE": {
+        "type": "string",
+        "enum": ["on", "off", "not_set"],
+        "default": "not_set",
+        "description": "Override the publication's double opt-in setting for this enrollment. 'off' activates immediately — use for subscribers already confirmed."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create an automation with 'Add by API' trigger",
+      "detail": "In your Beehiiv dashboard, go to Automations > New Automation. Add a trigger of type 'Add by API'. Configure the email sequence (upsell pitch, premium onboarding, win-back, etc.). Activate the automation."
+    },
+    {
+      "step": 2,
+      "title": "Find the automation ID",
+      "detail": "Use a beehiiv-list-automations node or call GET https://api.beehiiv.com/v2/publications/{pubId}/automations with your API key. Copy the 'id' field (auto_xxx...) for the automation you want."
+    },
+    {
+      "step": 3,
+      "title": "Chain with beehiiv-get-subscriber",
+      "detail": "A common pattern: [trigger] → [beehiiv-get-subscriber] → [condition: subscription_tier == 'free'] → [beehiiv-add-to-automation: upsell sequence]. Use '{{subscription_id}}' as SUBSCRIPTION_ID to pass the upstream subscriber's ID."
+    }
+  ]
+}

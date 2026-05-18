@@ -1,0 +1,65 @@
+{
+  "name": "Gmail Inbox → AI Analysis → Slack Digest",
+  "description": "Receives Gmail push notifications via webhook, uses an LLM to classify and summarize the email, then posts the digest to a Slack channel.",
+  "category": "Communication",
+  "tags": ["gmail", "llm", "slack", "email", "ai", "webhook"],
+  "nodes": [
+    {
+      "label": "Receive Gmail Event",
+      "module_name": "Gmail Webhook",
+      "config": {
+        "WATCH_LABELS": ["INBOX", "UNREAD"]
+      }
+    },
+    {
+      "label": "Summarize Email",
+      "module_name": "LLM Inference",
+      "config": {
+        "MODEL": "claude-sonnet-4-6",
+        "SYSTEM_PROMPT": "You are an email assistant. Summarize the email in 1-2 sentences, classify it as action-required or informational, and extract any deadlines mentioned.",
+        "MAX_TOKENS": 256
+      }
+    },
+    {
+      "label": "Post to Slack",
+      "module_name": "Slack Message",
+      "config": {
+        "CHANNEL": "#email-digest"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Receive Gmail Event", "to": "Summarize Email" },
+    { "from": "Summarize Email", "to": "Post to Slack" }
+  ],
+  "suggested_schedule": null,
+  "required_secrets": [
+    { "key_path": "google/gmail_oauth_token", "description": "Gmail OAuth2 refresh token with gmail.readonly scope" },
+    { "key_path": "llm/api_key", "description": "LLM provider API key" },
+    { "key_path": "slack/bot_token", "description": "Slack bot token with chat:write scope" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Receive Gmail Event",
+      "current_module": "Gmail Webhook",
+      "replacements": [
+        {
+          "module_name": "Slack Webhook Listener",
+          "catalog_name": "slack-webhook-listener",
+          "config_delta": "Replace OAUTH_TOKEN_SECRET+WATCH_LABELS with SIGNING_SECRET_PATH+EVENT_TYPES (e.g. ['app_mention']). Required secret: slack/signing_secret instead of google/gmail_oauth_token. Use to trigger AI analysis on Slack messages or mentions."
+        }
+      ]
+    },
+    {
+      "node_label": "Post to Slack",
+      "current_module": "Slack Message",
+      "replacements": [
+        {
+          "module_name": "Gmail",
+          "catalog_name": "send-gmail",
+          "config_delta": "Replace CHANNEL with TO (extracted from original sender), SUBJECT (e.g. 'Re: ' + original subject), BODY. google/gmail_oauth_token already required; slack/bot_token no longer needed. Use to reply-by-email instead of posting to Slack."
+        }
+      ]
+    }
+  ]
+}

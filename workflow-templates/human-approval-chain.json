@@ -1,0 +1,52 @@
+{
+  "name": "Request → Human Approval → Email Notification",
+  "description": "Fetches a request payload, pauses for human review and approval, then sends an email confirming the decision.",
+  "category": "Governance",
+  "tags": ["approval", "human-in-the-loop", "email", "governance"],
+  "nodes": [
+    {
+      "label": "Receive Request",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.example.com/pending-requests"
+      }
+    },
+    {
+      "label": "Await Approval",
+      "module_name": "Human Approval Gate",
+      "config": {
+        "REASON": "Please review the request before proceeding"
+      }
+    },
+    {
+      "label": "Send Confirmation",
+      "module_name": "Gmail",
+      "config": {
+        "SUBJECT": "Request Approved",
+        "BODY": "Your request has been reviewed and approved."
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Receive Request", "to": "Await Approval" },
+    { "from": "Await Approval", "to": "Send Confirmation" }
+  ],
+  "suggested_schedule": null,
+  "required_secrets": [
+    { "key_path": "google/gmail_oauth_token", "description": "Gmail OAuth2 refresh token with gmail.send scope" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Send Confirmation",
+      "current_module": "Gmail",
+      "replacements": [
+        {
+          "module_name": "Slack Message",
+          "catalog_name": "send-slack-message",
+          "config_delta": "Replace TO+SUBJECT+BODY with CHANNEL (e.g. '#approvals'). Required secret: slack/bot_token instead of google/gmail_oauth_token. Good when approvers and requesters are primarily in Slack."
+        }
+      ]
+    }
+  ]
+}

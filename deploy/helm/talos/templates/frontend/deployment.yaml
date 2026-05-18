@@ -1,0 +1,120 @@
+{{- if .Values.frontend.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "talos.componentName" (list . "frontend") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "frontend") | nindent 4 }}
+spec:
+  replicas: {{ .Values.frontend.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "frontend") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "frontend") | nindent 8 }}
+      annotations:
+        # Roll the frontend pod whenever its nginx ConfigMap changes.
+        # Without this, `helm upgrade` only diffs Deployment specs — a
+        # ConfigMap-only edit (e.g. adding a new `location /xxx` proxy
+        # block) silently leaves the running pod on the previous config
+        # until someone remembers `kubectl rollout restart`. We hit that
+        # twice in 2026-04 (`/auth/csrf`, `/mcp`) before adding this.
+        checksum/config: {{ include (print $.Template.BasePath "/frontend/configmap.yaml") . | sha256sum }}
+        {{- with .Values.frontend.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: frontend
+          image: {{ include "talos.image" .Values.frontend.image }}
+          imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.frontend.service.port }}
+              protocol: TCP
+          # MCP-901 (2026-05-14): API_PROXY_TARGET env var removed. It
+          # was set on the pod but never consumed inside the production
+          # container — that env var is read by `vite.config.ts`
+          # (Vite dev server proxy target) only. Production runs nginx
+          # against the ConfigMap-mounted default.conf (see volumeMount
+          # below), whose `proxy_pass` URLs are computed at chart-render
+          # time from `talos.componentName "controller"`. The env var
+          # was a misleading dead-knob — operators overriding it via
+          # `--set frontend.extraEnv` would see no effect on routing.
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.frontend.resources | nindent 12 }}
+          volumeMounts:
+            # nginx in the frontend image writes its pid and temp files to
+            # /var/cache/nginx and /var/run — mount emptyDirs so
+            # readOnlyRootFilesystem can stay true.
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+            - name: tmp
+              mountPath: /tmp
+            # Override the image-baked nginx config (which proxies to
+            # `controller`, the docker-compose service name) with the
+            # chart-rendered one that targets the K8s Service DNS name.
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+      volumes:
+        - name: nginx-cache
+          emptyDir:
+            sizeLimit: "128Mi"
+        - name: nginx-run
+          emptyDir:
+            sizeLimit: "16Mi"
+        - name: tmp
+          emptyDir:
+            sizeLimit: "64Mi"
+        - name: nginx-config
+          configMap:
+            name: {{ include "talos.componentName" (list . "frontend-nginx") }}
+            items:
+              - key: default.conf
+                path: default.conf
+      {{- with .Values.frontend.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.frontend.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.frontend.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.frontend.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,41 @@
+[env]
+# Use the checked-in .sqlx query cache so `cargo check/build/test` never
+# needs a live database connection.  Remove this line (or set to "false") only
+# when you are adding new sqlx queries and need `cargo sqlx prepare` to
+# regenerate the cache against a running database.
+SQLX_OFFLINE = "true"
+
+[profile.dev]
+# macOS: skip the dsymutil debug-info bundling pass on every incremental build.
+# This is the single biggest speedup for local `cargo build`/`cargo check` on Apple Silicon.
+# Other dev-profile fields live in Cargo.toml so they apply on every host.
+split-debuginfo = "unpacked"
+
+# ─── Linker (Linux only) ────────────────────────────────────────────────────
+#
+# `mold` is the fastest linker available on Linux today — 5-10× faster than
+# GNU ld at the final link step, which dominates incremental rebuild time on
+# a workspace this size (100+ crates).
+#
+# On macOS we deliberately don't override the linker: Apple's system ld
+# (modernised in macOS 14) is already faster than lld for Mach-O, and adding
+# a linker swap risks subtle codesigning / dyld differences.
+#
+# In the Docker build, `controller/Dockerfile` and `worker/Dockerfile`
+# already install mold and set `RUSTFLAGS=-C link-arg=-fuse-ld=mold` at the
+# env level. Cargo's env RUSTFLAGS takes priority over `[target.*].rustflags`
+# in this file, so the Docker config keeps working unchanged — these entries
+# only kick in when you run cargo on a Linux host *outside* Docker.
+#
+# Hard requirement: if mold isn't installed, cargo will surface the linker
+# error directly. To install:
+#   * Debian/Ubuntu: `sudo apt-get install mold`
+#   * Fedora/RHEL:   `sudo dnf install mold`
+#   * Arch:          `sudo pacman -S mold`
+#   * Source:        https://github.com/rui314/mold
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

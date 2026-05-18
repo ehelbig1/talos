@@ -1,0 +1,182 @@
+{{- if .Values.frontend.enabled -}}
+# Chart-rendered nginx config for the frontend pod. The frontend image
+# bakes in nginx.conf with `proxy_pass http://controller:8000` (the
+# docker-compose service name); in Kubernetes the controller Service is
+# named via talos.componentName so the upstream resolves to a different
+# DNS name. Mount this ConfigMap over /etc/nginx/conf.d/default.conf in
+# the deployment to override the image default for K8s deploys.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "talos.componentName" (list . "frontend-nginx") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "frontend") | nindent 4 }}
+data:
+  default.conf: |
+    server {
+        listen {{ .Values.frontend.service.port }};
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        # Security headers
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        # CSP allows Google Fonts (style-src + font-src) because index.html
+        # links to fonts.googleapis.com / fonts.gstatic.com. If you self-host
+        # the fonts later, tighten these back to 'self'.
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; object-src 'none'; frame-ancestors 'none';" always;
+        # HSTS unconditional — browsers ignore over HTTP per RFC 6797 §8.1.
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+        gzip on;
+        gzip_vary on;
+        gzip_min_length 1024;
+        gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
+
+        # Proxy GraphQL HTTP + REST + WebSocket subscriptions to the controller.
+        # /graphql handles POST queries and GETs (CSRF cookie seed via /health
+        # was the proper fix; legacy bundles may still GET /graphql).
+        location /graphql {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /ws — GraphQL subscriptions over WebSocket. Apollo / graphql-ws
+        # client opens wss://<host>/ws on login. Without this route nginx
+        # 404s the upgrade and the client retries forever.
+        #
+        # Origin pass-through is REQUIRED — controller's ws_auth middleware
+        # rejects connections with missing Origin in production with
+        # "WebSocket connection rejected: missing Origin header". The browser
+        # sends Origin on every WS handshake, but nginx does not forward
+        # request headers it doesn't recognize without an explicit
+        # proxy_set_header. Long timeouts let subscriptions stay open
+        # across idle periods.
+        location /ws {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header Origin $http_origin;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 3600;
+            proxy_send_timeout 3600;
+        }
+
+        # /api/* — REST endpoints (OAuth callbacks, webhooks, etc.) routed
+        # to the controller alongside GraphQL. Same handling as /graphql.
+        location /api/ {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /auth/oauth/* — OAuth flow callback URIs configured in the
+        # controller (Google, Okta, Snyk redirect_uri values).
+        location /auth/ {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /webhooks/* — inbound webhook handler (controller route
+        # `/webhooks/{id}`). External services (GitHub, Stripe, custom
+        # signers) POST here. HMAC verification + replay-cache live in
+        # the controller, not here. Same long-lived/streaming flags as
+        # /graphql in case a sender ships a large body.
+        location /webhooks/ {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /mcp — Model Context Protocol endpoint on the controller. Used
+        # by remote MCP clients (Claude Code, Claude Desktop, etc.) to
+        # invoke the controller's tool surface. Bearer-token auth is
+        # enforced inside the controller, not here. Without this route
+        # nginx serves the SPA shell on GET /mcp and 405 on POST /mcp,
+        # so the MCP client gets HTML/405 instead of a JSON-RPC reply
+        # and reports "Failed to reconnect to talos".
+        location /mcp {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            # MCP uses streamable-HTTP / SSE; allow long-lived responses.
+            proxy_buffering off;
+            proxy_read_timeout 3600;
+            proxy_send_timeout 3600;
+        }
+
+        # /health — controller health probe. Also the path the frontend
+        # GETs to seed its CSRF cookie (see graphqlClient.seedCsrfCookie).
+        location /health {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Stop browser favicon probes from filling logs with 404s.
+        # Replace with a real /favicon.ico in frontend/public/ when designed.
+        # no-controller-route: served directly by nginx, no controller proxy.
+        location = /favicon.ico {
+            access_log off;
+            log_not_found off;
+            return 204;
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+
+            # MCP-798 (2026-05-14): repeat the server-block security
+            # headers. Per nginx docs, `add_header` directives are
+            # inherited from the parent level ONLY when no `add_header`
+            # exists at the current level. The Cache-Control directive
+            # above disables inheritance, so the server-block
+            # X-Content-Type-Options / Referrer-Policy / CSP / HSTS
+            # would otherwise be DROPPED on every JS/CSS/image/font
+            # response. Missing nosniff on .js is the highest-impact
+            # gap — without it a misconfigured Content-Type would let
+            # the browser MIME-sniff a static asset and execute it as
+            # a different type (the classic XSS-via-mime-confusion).
+            # CSP/HSTS missing on assets is minor (CSP applies to the
+            # HTML response that loads them; HSTS is host-scoped after
+            # first set), but inclusion is uniform with the parent
+            # server block and harmless.
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; object-src 'none'; frame-ancestors 'none';" always;
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        }
+    }
+{{- end }}

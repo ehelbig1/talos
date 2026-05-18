@@ -1,0 +1,102 @@
+{{- if .Values.minio.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "talos.componentName" (list . "minio") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "minio") | nindent 4 }}
+spec:
+  serviceName: {{ include "talos.componentName" (list . "minio") }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "minio") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "minio") | nindent 8 }}
+    spec:
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: minio
+          image: {{ include "talos.image" .Values.minio.image }}
+          imagePullPolicy: {{ .Values.minio.image.pullPolicy }}
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          args:
+            - "server"
+            - "/data"
+            - "--console-address"
+            - ":{{ .Values.minio.service.consolePort }}"
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_ROOT_PASSWORD
+          ports:
+            - name: api
+              containerPort: {{ .Values.minio.service.apiPort }}
+            - name: console
+              containerPort: {{ .Values.minio.service.consolePort }}
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.minio.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- if not .Values.minio.persistence.enabled }}
+      # MCP-806 (2026-05-14): emptyDir fallback when persistence is
+      # disabled. Pre-fix the StatefulSet volumeMount at /data
+      # referenced a `data` volume only declared inside the
+      # `volumeClaimTemplates` block (also gated by persistence.enabled),
+      # so `--set minio.persistence.enabled=false` rendered cleanly but
+      # stuck the minio pod in ContainerCreating with "volume not found".
+      #
+      # WARNING — ephemeral semantics: emptyDir lives for the pod's
+      # lifetime only. MinIO stores audit-log archives (long-term
+      # retention beyond NATS) and any object-storage uploads in this
+      # volume; every pod restart wipes them. Audit history loss is a
+      # compliance concern; use ONLY for dev/test / CI scenarios.
+      # Production must use `persistence.enabled: true` with a durable
+      # storageClass.
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: "1Gi"
+      {{- end }}
+  {{- if .Values.minio.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "talos.componentLabels" (list . "minio") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.minio.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.minio.persistence.size }}
+  {{- end }}
+{{- end }}

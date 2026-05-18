@@ -1,0 +1,24 @@
+{{- if .Values.nats.enabled -}}
+# Headless Service for StatefulSet peer DNS (nats-0.nats-headless...).
+# Cluster routes in nats.conf reference pods via this DNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "talos.componentName" (list . "nats-headless") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "nats") | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: client
+      port: {{ .Values.nats.service.clientPort }}
+    - name: cluster
+      port: {{ .Values.nats.service.clusterPort }}
+    - name: monitor
+      port: {{ .Values.nats.service.monitorPort }}
+  selector:
+    {{- include "talos.componentSelectorLabels" (list . "nats") | nindent 4 }}
+{{- end }}

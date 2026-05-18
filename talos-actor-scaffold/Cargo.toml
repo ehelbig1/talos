@@ -1,0 +1,27 @@
+[package]
+name = "talos-actor-scaffold"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-actor-types = { path = "../talos-actor-types" }
+talos-capability-world = { path = "../talos-capability-world" }
+talos-memory = { path = "../talos-memory" }
+talos-module-repository = { path = "../talos-module-repository" }
+# MCP-1030: bounded_preview for caller-supplied reflection in error messages.
+talos-text-util = { path = "../talos-text-util" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

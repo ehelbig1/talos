@@ -1,0 +1,32 @@
+{
+  "name": "http-retry",
+  "version": "v1.0.0",
+  "display_name": "HTTP Request with Retry",
+  "description": "Make outbound HTTP requests with configurable retry and exponential backoff. Retries on transient errors (429, 5xx) up to MAX_RETRIES times.",
+  "category": "Network",
+  "capability_world": "http-node",
+  "allowed_hosts": ["*"],
+  "requires_secrets": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["URL"],
+    "properties": {
+      "URL": { "type": "string", "description": "Target URL" },
+      "METHOD": {
+        "type": "string",
+        "default": "GET",
+        "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+        "description": "HTTP method"
+      },
+      "BODY": { "type": "string", "description": "Request body (JSON string)" },
+      "TIMEOUT_MS": { "type": "number", "default": 10000, "description": "Per-attempt timeout in milliseconds" },
+      "MAX_RETRIES": { "type": "number", "default": 3, "description": "Maximum retry attempts after initial failure" },
+      "BACKOFF_MS": { "type": "number", "default": 1000, "description": "Initial backoff delay in milliseconds (doubles each retry)" },
+      "RETRY_ON_STATUS": {
+        "type": "string",
+        "default": "429,500,502,503,504",
+        "description": "Comma-separated HTTP status codes that trigger a retry"
+      }
+    }
+  }
+}

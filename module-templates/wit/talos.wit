@@ -1,0 +1,1664 @@
+package talos:core;
+
+// ============================================================================
+// HTTP Interface - Make HTTP requests to external APIs
+// ============================================================================
+interface http {
+    enum method {
+        get,
+        post,
+        put,
+        delete,
+        patch,
+    }
+
+    record request {
+        method: method,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+        timeout-ms: option<u32>,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    enum error {
+        invalidurl,
+        timeout,
+        networkerror,
+        forbiddenhost,
+    }
+
+    fetch: func(req: request) -> result<response, error>;
+
+    /// Dispatch multiple HTTP requests concurrently.
+    ///
+    /// All requests in the list are sent simultaneously on the host side
+    /// (subject to the same per-host allowlist, SSRF, and rate-limit checks
+    /// applied for individual `fetch` calls). The returned list preserves
+    /// the input order — `responses[i]` corresponds to `requests[i]`.
+    ///
+    /// Use this instead of a loop over `fetch` when fetching a batch of
+    /// independent URLs (e.g. 15 Hacker News story details). A 15-request
+    /// batch typically completes in the time of the single slowest request
+    /// rather than the sum of all request latencies.
+    fetch-all: func(reqs: list<request>) -> list<result<response, error>>;
+
+    /// Tier 1 — Make an HTTP request with a secret injected as `Authorization: Bearer {value}`.
+    ///
+    /// `slot` is a handle returned by `secrets::get-secret`. The host resolves
+    /// the slot to its plaintext value and injects it as the Authorization header.
+    /// The secret value NEVER enters guest memory.
+    ///
+    /// All standard `fetch` security checks apply (host allowlist, SSRF protection,
+    /// method allowlist, rate limiting). Use for OAuth bearer tokens, OpenAI API keys,
+    /// and any API that uses `Authorization: Bearer` authentication.
+    fetch-with-bearer: func(slot: u64, req: request) -> result<response, error>;
+
+    /// Tier 1 — Make an HTTP request with a secret injected as a named header.
+    ///
+    /// `slot` is a handle returned by `secrets::get-secret`. The host resolves
+    /// the slot to its plaintext value and injects it as `header-name: {value}`.
+    /// The secret value NEVER enters guest memory.
+    ///
+    /// All standard `fetch` security checks apply. Use for API-key schemes that
+    /// do not use Bearer auth, e.g. `x-api-key` (Anthropic), `x-goog-api-key` (Gemini).
+    fetch-with-header: func(slot: u64, header-name: string, req: request) -> result<response, error>;
+}
+
+// ============================================================================
+// Logging Interface - Structured logging for debugging and monitoring
+// ============================================================================
+interface logging {
+    enum level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+    log: func(lvl: level, msg: string);
+
+    /// Emit a structured JSON log event.
+    ///
+    /// `json` must be a valid JSON object string (e.g. `{"action":"retry","attempt":2}`).
+    /// The host validates the JSON, applies DLP redaction to all string leaves, and stores
+    /// the event as a structured log entry alongside the module's execution log.
+    ///
+    /// If `json` is not a valid JSON object the call is recorded as a plain string log
+    /// at the given level with a parse-error annotation, so no log event is silently lost.
+    log-json: func(lvl: level, json: string);
+}
+
+// ============================================================================
+// Secrets Interface - Secure access to encrypted secrets (three-tier model)
+//
+// Tier 1 — secret bytes never enter guest memory:
+//   Use hmac-sign, http::fetch-with-bearer, http::fetch-with-header
+// Tier 2 — explicit, audited plaintext crossing the WASM boundary:
+//   Use expose-secret(handle, reason) — logged, rate-limited, marks trace
+// Tier 3 — config injection via vault:// in HTTP headers (unchanged)
+// ============================================================================
+interface secrets {
+    enum error {
+        notfound,
+        unauthorized,
+        expired,
+        decryptionfailed,
+        /// Returned by expose-secret when the per-execution rate limit (10 calls) is exceeded.
+        ratelimited,
+    }
+
+    /// Resolve a vault path to an opaque slot handle (u64).
+    ///
+    /// The returned handle is valid for the lifetime of this execution.
+    /// It identifies a secret materialized on the host side; the plaintext
+    /// value is NEVER returned to guest memory by this call.
+    ///
+    /// SLOT LIFECYCLE:
+    ///   - Created: when this function returns (one slot per call, even for the same path).
+    ///   - TTL: 300 seconds from creation. Using a slot older than 300 s returns an error
+    ///     (rotation boundary — prevents stale keys after emergency rotation).
+    ///   - Scope: per-node execution. Each node in a workflow runs in its own WASM instance
+    ///     with a fresh context; slot handles from one node cannot be used in another.
+    ///   - Released: automatically at execution end, or explicitly via release-slot.
+    ///
+    /// Errors:
+    ///   - unauthorized: path not in this module's allowed_secrets grant. Fix: reinstall
+    ///     the module with the path added to allowed_secrets.
+    ///   - notfound: path does not exist in the vault for this user.
+    ///
+    /// Use the handle with:
+    ///   - hmac-sign          (Tier 1 — sign payload, no key in guest)
+    ///   - http::fetch-with-bearer / http::fetch-with-header  (Tier 1)
+    ///   - expose-secret      (Tier 2 — explicit, audited plaintext access)
+    get-secret: func(key-path: string) -> result<u64, error>;
+
+    /// Release a slot, zeroing its host-side memory immediately.
+    ///
+    /// Optional — all slots are automatically released when the execution ends.
+    /// Call this when you want to minimize the window during which a decrypted
+    /// value lives in host RAM (principle of least privilege for key material).
+    release-slot: func(handle: u64) -> result<_, error>;
+
+    /// Tier 1 — HMAC-SHA256-sign `data` using the key held in the slot.
+    ///
+    /// The secret key bytes never cross the WASM boundary; only the 32-byte
+    /// HMAC output is returned. Use for webhook signature verification,
+    /// request signing, and any HMAC-based auth scheme.
+    hmac-sign: func(handle: u64, data: list<u8>) -> result<list<u8>, error>;
+
+    /// Tier 2 — EXPLICIT AUDITED PLAINTEXT EXPOSURE.
+    ///
+    /// Returns the raw plaintext value of the secret identified by `handle`.
+    /// Every call is:
+    ///   - Logged at WARN level with `reason` and execution context.
+    ///   - Rate-limited: at most 10 calls per execution (returns ratelimited after).
+    ///   - Recorded in the execution trace (marks execution as containing Tier-2 exposure).
+    ///
+    /// Use ONLY when no Tier-1 operation satisfies your use case.
+    /// Prefer hmac-sign, fetch-with-bearer, or fetch-with-header — they are
+    /// structurally safer because the secret never reaches guest memory.
+    expose-secret: func(handle: u64, reason: string) -> result<string, error>;
+
+    /// Resolve a config field value that may be a `vault://path` reference or a bare vault path.
+    ///
+    /// If `config-value` starts with `vault://`, the prefix is stripped and the remainder
+    /// is treated as the vault path. If it is a bare string (no prefix), it is treated as
+    /// a vault path directly. In both cases the same allowlist enforcement and provider
+    /// resolution as `get-secret` applies.
+    ///
+    /// Returns an opaque Tier-1 slot handle — plaintext never reaches guest memory.
+    /// Use `hmac-sign`, `fetch-with-bearer`, or `fetch-with-header` with the returned handle.
+    resolve-config-vault: func(config-value: string) -> result<u64, error>;
+}
+
+// ============================================================================
+// State Interface - Persistent key-value storage for workflow state
+// ============================================================================
+interface state {
+    enum error {
+        notfound,
+        invalidkey,
+        storagefailed,
+    }
+
+    get: func(key: string) -> result<string, error>;
+    set: func(key: string, value: string) -> result<_, error>;
+    delete: func(key: string) -> result<_, error>;
+    exists: func(key: string) -> bool;
+    list-keys: func() -> list<string>;
+}
+
+// ============================================================================
+// Database Interface - Execute SQL queries against PostgreSQL
+// ============================================================================
+interface database {
+    enum error {
+        connectionfailed,
+        queryerror,
+        unauthorized,
+        invalidquery,
+    }
+
+    record query-result {
+        rows: string,
+        rows-affected: u64,
+    }
+
+    execute-query: func(sql: string, params: list<string>) -> result<query-result, error>;
+
+    /// Returns a human-readable description of the last error that occurred.
+    /// Call this immediately after execute-query returns an error to get details.
+    get-last-error: func() -> string;
+}
+
+// ============================================================================
+// Email Interface - Send emails via SMTP or email service
+// ============================================================================
+interface email {
+    enum error {
+        invalidaddress,
+        sendfailed,
+        unauthorized,
+    }
+
+    record attachment {
+        filename: string,
+        content-type: string,
+        data: list<u8>,
+    }
+
+    record message {
+        to: list<string>,
+        cc: option<list<string>>,
+        bcc: option<list<string>>,
+        subject: string,
+        body: string,
+        html: option<string>,
+        attachments: option<list<attachment>>,
+    }
+
+    send: func(msg: message) -> result<_, error>;
+}
+
+// ============================================================================
+// Webhook Interface - POST data to webhooks with retry logic
+// ============================================================================
+interface webhook {
+    enum error {
+        invalidurl,
+        sendfailed,
+        timeout,
+    }
+
+    record webhook-request {
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: string,
+        max-retries: option<u32>,
+        retry-delay-ms: option<u32>,
+    }
+
+    record webhook-response {
+        status: u16,
+        body: string,
+        retries: u32,
+    }
+
+    send: func(req: webhook-request) -> result<webhook-response, error>;
+}
+
+// ============================================================================
+// JSON Interface - JSON parsing and manipulation utilities
+// ============================================================================
+interface json {
+    enum error {
+        parseerror,
+        invalidpath,
+        typeerror,
+    }
+
+    parse: func(json-str: string) -> result<_, error>;
+    query: func(json-str: string, path: string) -> result<string, error>;
+    merge: func(json1: string, json2: string) -> result<string, error>;
+    prettify: func(json-str: string) -> result<string, error>;
+    minify: func(json-str: string) -> result<string, error>;
+}
+
+// ============================================================================
+// DateTime Interface - Date and time manipulation utilities
+// ============================================================================
+interface datetime {
+    enum error {
+        parseerror,
+        invalidformat,
+    }
+
+    now-unix: func() -> u64;
+    now-iso: func() -> string;
+    parse: func(date-str: string, format: option<string>) -> result<u64, error>;
+    format: func(timestamp: u64, format: string) -> result<string, error>;
+    add-seconds: func(timestamp: u64, seconds: s64) -> u64;
+    diff-seconds: func(timestamp1: u64, timestamp2: u64) -> s64;
+}
+
+// ============================================================================
+// Crypto Interface - Cryptographic operations (hashing, encoding, etc.)
+// ============================================================================
+interface crypto {
+    enum error {
+        invalidinput,
+        operationfailed,
+    }
+
+    enum hash-algorithm {
+        sha256,
+        sha512,
+        md5,
+    }
+
+    enum encoding {
+        hex,
+        base64,
+        base64url,
+    }
+
+    hash: func(algorithm: hash-algorithm, data: list<u8>) -> list<u8>;
+    hmac: func(algorithm: hash-algorithm, key: list<u8>, data: list<u8>) -> list<u8>;
+    encode: func(encoding: encoding, data: list<u8>) -> string;
+    decode: func(encoding: encoding, data: string) -> result<list<u8>, error>;
+    random-bytes: func(length: u32) -> list<u8>;
+    uuid: func() -> string;
+}
+
+// ============================================================================
+// Environment Interface - Access workflow and module configuration
+// ============================================================================
+interface env {
+    get-var: func(key: string) -> option<string>;
+    /// Returns all environment variables as a JSON object: `{"KEY": "value", ...}`.
+    /// Parse the result with `json::query` or your preferred JSON library.
+    get-all-vars: func() -> string;
+    get-workflow-id: func() -> string;
+    get-execution-id: func() -> string;
+    get-module-id: func() -> string;
+}
+
+// ============================================================================
+// File I/O Interface - Read and write files (with security controls)
+// ============================================================================
+interface files {
+    enum error {
+        notfound,
+        permissiondenied,
+        invalidpath,
+        ioerror,
+    }
+
+    record file-metadata {
+        size: u64,
+        modified-unix: u64,
+        is-directory: bool,
+    }
+
+    read: func(path: string) -> result<list<u8>, error>;
+    write: func(path: string, contents: list<u8>) -> result<_, error>;
+    exists: func(path: string) -> bool;
+    metadata: func(path: string) -> result<file-metadata, error>;
+    list-dir: func(path: string) -> result<list<string>, error>;
+    delete: func(path: string) -> result<_, error>;
+}
+
+// ============================================================================
+// Template Interface - Jinja2/Handlebars template rendering
+// ============================================================================
+interface templates {
+    enum error {
+        parseerror,
+        rendererror,
+        variablenotfound,
+    }
+
+    enum syntax {
+        jinja2,
+        handlebars,
+    }
+
+    render: func(template: string, variables: string, syntax: syntax) -> result<string, error>;
+    render-file: func(path: string, variables: string, syntax: syntax) -> result<string, error>;
+}
+
+// ============================================================================
+// Data Transform Interface - CSV and XML parsing/generation
+// ============================================================================
+interface data-transform {
+    enum error {
+        parseerror,
+        invalidformat,
+        ioerror,
+    }
+
+    record csv-options {
+        delimiter: option<string>,
+        has-headers: bool,
+        skip-rows: option<u32>,
+    }
+
+    csv-to-json: func(csv: string, options: option<csv-options>) -> result<string, error>;
+    json-to-csv: func(json: string, options: option<csv-options>) -> result<string, error>;
+    xml-to-json: func(xml: string) -> result<string, error>;
+    json-to-xml: func(json: string, root-element: string) -> result<string, error>;
+}
+
+// ============================================================================
+// Cache Interface - Distributed caching with Redis
+// ============================================================================
+interface cache {
+    enum error {
+        connectionfailed,
+        notfound,
+        operationfailed,
+    }
+
+    get: func(key: string) -> result<string, error>;
+    set: func(key: string, value: string, ttl: option<u32>) -> result<_, error>;
+    delete: func(key: string) -> result<_, error>;
+    exists: func(key: string) -> bool;
+    increment: func(key: string, amount: s64) -> result<s64, error>;
+    decrement: func(key: string, amount: s64) -> result<s64, error>;
+    mget: func(keys: list<string>) -> result<list<option<string>>, error>;
+    mset: func(pairs: list<tuple<string, string>>) -> result<_, error>;
+    expire: func(key: string, ttl: u32) -> result<_, error>;
+}
+
+// ============================================================================
+// Messaging Interface - Publish/Subscribe to message queues
+// ============================================================================
+interface messaging {
+    enum error {
+        connectionfailed,
+        publishfailed,
+        subscribefailed,
+        invalidtopic,
+    }
+
+    record message {
+        topic: string,
+        payload: list<u8>,
+        headers: option<list<tuple<string, string>>>,
+    }
+
+    publish: func(topic: string, payload: list<u8>) -> result<_, error>;
+    publish-with-headers: func(msg: message) -> result<_, error>;
+    request: func(topic: string, payload: list<u8>, timeout-ms: u32) -> result<list<u8>, error>;
+}
+
+// ============================================================================
+// GraphQL Interface - Execute GraphQL queries and mutations
+// ============================================================================
+interface graphql {
+    enum error {
+        networkerror,
+        parseerror,
+        queryerror,
+        invalidvariables,
+    }
+
+    record request {
+        url: string,
+        query: string,
+        variables: option<string>,
+        headers: option<list<tuple<string, string>>>,
+        timeout-ms: option<u32>,
+    }
+
+    record response {
+        data: option<string>,
+        errors: option<list<string>>,
+    }
+
+    execute: func(req: request) -> result<response, error>;
+    execute-with-retry: func(req: request, max-retries: u32) -> result<response, error>;
+}
+
+// ============================================================================
+// Governance Interface - Wait for human approval
+// ============================================================================
+interface governance {
+    request-approval: func(reason: string) -> bool;
+}
+
+// ============================================================================
+// WORLD DEFINITIONS
+//
+// Talos uses twelve tiered capability worlds organised in a partial order.
+// A node is compiled against exactly ONE world, which defines its security
+// boundary at the binary level: the runtime linker only exposes host functions
+// that belong to that world, providing defence-in-depth on top of the
+// upload-time capability check.
+//
+// World hierarchy (least → most privileged):
+//
+//   minimal-node         (pure computation — no I/O)
+//       └─ http-node         (HTTP, GraphQL, Webhooks, etc.)
+//           ├─ llm-node          (http + LLM APIs, no vault)
+//           └─ network-node      (http + raw TCP/UDP sockets)
+//                   ├─ secrets-node      (network + secrets + LLM)
+//                   ├─ filesystem-node   (network + files)
+//                   ├─ messaging-node    (network + NATS)
+//                   ├─ cache-node        (network + Redis)
+//                   ├─ governance-node   (network + human approvals)
+//                   ├─ database-node     (secrets + database + agent-memory)
+//                   └─ agent-node        (secrets + memory + governance + orchestration)
+//                           └─ automation-node  (full platform — all interfaces)
+//
+// Sub-worlds (secrets, filesystem, messaging, cache, governance) are
+// INCOMPARABLE with each other — e.g. secrets-node ≮ filesystem-node.
+//
+// Choose the LEAST privileged world that satisfies your module's needs.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Tier 1: Minimal — Pure computation, no I/O.
+//
+// Use for: data transformation, validation, formatting, pure logic.
+// Cannot make network calls, access secrets, write files, or use Redis.
+// Safest option; maximum isolation.
+// ----------------------------------------------------------------------------
+world minimal-node {
+    // Utility interfaces: pure computation, no external side-effects
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 2: HTTP — Can make outbound HTTP calls and maintain state.
+//
+// Use for: API integrations, webhooks, stateful workflows, GraphQL clients.
+// Cannot use raw TCP/UDP sockets, access secrets, write files, or use Redis/NATS directly.
+// The Talos HTTP host strictly enforces the allowed_hosts domain whitelist.
+// ----------------------------------------------------------------------------
+world http-node {
+    // All minimal interfaces
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+
+    // HTTP and state interfaces
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 2b: LLM — HTTP + native LLM bindings (llm::complete, llm-tools, llm-streaming).
+//
+// Use for: modules that call language models via host bindings instead of raw HTTP.
+// Advantages over secrets-node: no vault access required, key management is handled
+// entirely by the host (key never crosses the WASM boundary), available to all actors.
+// When you need vault:// secret resolution in addition, use secrets-node instead.
+//
+// Security: LLM calls consume quota from the actor's resource-quotas budget.
+//           The provider and model are constrained by the host's ANTHROPIC_API_KEY /
+//           OPENAI_API_KEY env vars — keys are never exposed to guest code.
+// ----------------------------------------------------------------------------
+world llm-node {
+    // All minimal interfaces
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+
+    // HTTP and state interfaces
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    // Adds: native LLM bindings (no vault access — keys managed by host)
+    import llm;
+    import llm-tools;
+    import llm-streaming;
+    import context-window;
+    import resource-quotas;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3: Network — Raw TCP/UDP sockets via WASI (not additional WIT imports).
+//
+// Use for: Native Rust drivers (PostgreSQL, Redis, AMQP) that require raw sockets.
+// The distinction from http-node is enforced at runtime: the worker grants
+// `inherit_network()` (wasi:sockets) only for network-node and above — not via
+// extra WIT interfaces. The WIT imports are identical to http-node.
+// Security Warning: Bypasses the allowed_hosts domain whitelist (operates at IP level).
+// ----------------------------------------------------------------------------
+world network-node {
+    // All minimal interfaces
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+
+    // Network and state interfaces
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ============================================================================
+// LLM Interface - Call large language model APIs (Anthropic, OpenAI, Gemini, Ollama)
+// ============================================================================
+interface llm {
+    enum provider {
+        anthropic,
+        openai,
+        gemini,
+        /// Local Ollama instance — no API key required, data stays on-prem.
+        /// Tier 1: use for quick, frequent, simple, or sensitive inference.
+        ollama,
+    }
+
+    enum role {
+        system,
+        user,
+        assistant,
+    }
+
+    record message {
+        role: role,
+        content: string,
+    }
+
+    record completion-request {
+        provider: option<provider>,
+        model: option<string>,
+        messages: list<message>,
+        max-tokens: option<u32>,
+        temperature: option<f32>,
+        system-prompt: option<string>,
+    }
+
+    record token-usage {
+        input-tokens: u32,
+        output-tokens: u32,
+    }
+
+    record completion-response {
+        text: string,
+        model: string,
+        usage: option<token-usage>,
+        stop-reason: option<string>,
+    }
+
+    /// Errors returned by the native llm::complete interface.
+    /// Variants carrying a string include an actionable message for debugging.
+    variant error {
+        /// API key env var not found in the worker. The string names the missing variable.
+        not-configured(string),
+        /// Provider returned HTTP 429.
+        rate-limited,
+        /// Request could not be serialized or is malformed. The string describes the issue.
+        invalid-request(string),
+        /// Provider returned a non-2xx error. The string contains the HTTP status + body excerpt.
+        api-error(string),
+        /// Network call timed out.
+        timeout,
+        /// Execution budget exhausted (cancellation signal received).
+        budget-exhausted,
+    }
+
+    complete: func(req: completion-request) -> result<completion-response, error>;
+}
+
+// ============================================================================
+// LLM Tool Use Interface - Function calling / structured output for agents
+// ============================================================================
+interface llm-tools {
+    /// JSON Schema definition for a tool parameter.
+    record tool-definition {
+        /// Unique tool name (e.g. "search_database", "send_email").
+        name: string,
+        /// Human-readable description shown to the model.
+        description: string,
+        /// JSON Schema string describing the tool's input parameters.
+        input-schema: string,
+    }
+
+    /// A tool call requested by the model.
+    record tool-call {
+        /// The tool name the model wants to invoke.
+        tool-name: string,
+        /// A unique ID for this tool call (for pairing with results).
+        call-id: string,
+        /// JSON string of the tool's input arguments.
+        arguments: string,
+    }
+
+    /// Result of executing a tool, sent back to the model.
+    record tool-result {
+        /// Must match the call-id from the tool-call.
+        call-id: string,
+        /// JSON string of the tool's output.
+        output: string,
+        /// Whether the tool execution succeeded.
+        is-error: bool,
+    }
+
+    /// Image content for multimodal messages.
+    record image-content {
+        /// Base64-encoded image data.
+        data: string,
+        /// MIME type (e.g. "image/png", "image/jpeg").
+        media-type: string,
+    }
+
+    /// Role enum (mirrors llm.role for self-contained typing).
+    enum role {
+        system,
+        user,
+        assistant,
+        tool,
+    }
+
+    /// Provider enum (mirrors llm.provider for self-contained typing).
+    enum provider {
+        anthropic,
+        openai,
+        gemini,
+        ollama,
+    }
+
+    /// Token usage statistics.
+    record token-usage {
+        input-tokens: u32,
+        output-tokens: u32,
+    }
+
+    /// A content block that can be text or a tool interaction.
+    variant content-block {
+        text(string),
+        tool-use(tool-call),
+        tool-result(tool-result),
+        /// Base64-encoded image data with MIME type (e.g. "image/png").
+        image(image-content),
+    }
+
+    /// A message with rich content blocks (text, tool calls, images).
+    record rich-message {
+        role: role,
+        content: list<content-block>,
+    }
+
+    /// Request with tool definitions and structured output support.
+    record tool-completion-request {
+        provider: option<provider>,
+        model: option<string>,
+        messages: list<rich-message>,
+        tools: list<tool-definition>,
+        max-tokens: option<u32>,
+        temperature: option<f32>,
+        system-prompt: option<string>,
+        /// If set, forces the model to call this specific tool.
+        force-tool: option<string>,
+        /// JSON Schema for structured output validation.
+        response-schema: option<string>,
+    }
+
+    /// Response that may contain tool calls requiring execution.
+    record tool-completion-response {
+        /// Content blocks in the response (text and/or tool calls).
+        content: list<content-block>,
+        model: string,
+        usage: option<token-usage>,
+        stop-reason: option<string>,
+    }
+
+    /// Errors returned by llm-tools::complete-with-tools.
+    variant error {
+        not-configured(string),
+        rate-limited,
+        invalid-request(string),
+        api-error(string),
+        timeout,
+        budget-exhausted,
+        /// Tool schema JSON was invalid. The string describes the problem.
+        invalid-tool-schema(string),
+    }
+
+    /// Complete with tool use support. The caller is responsible for executing
+    /// tool calls and sending results back in subsequent messages.
+    complete-with-tools: func(req: tool-completion-request) -> result<tool-completion-response, error>;
+}
+
+// ============================================================================
+// LLM Streaming Interface - Incremental token delivery
+// ============================================================================
+interface llm-streaming {
+    /// A single chunk from a streaming completion.
+    variant stream-event {
+        /// Partial text content.
+        text-delta(string),
+        /// A complete tool call identified by name, call-id, and JSON arguments.
+        tool-call(stream-tool-call),
+        /// Token usage stats (delivered at end of stream).
+        usage(stream-usage),
+        /// Stream has ended. Contains the stop reason.
+        done(string),
+        /// An error occurred mid-stream.
+        error(string),
+    }
+
+    /// Tool call within a stream event (self-contained, no cross-interface ref).
+    record stream-tool-call {
+        tool-name: string,
+        call-id: string,
+        arguments: string,
+    }
+
+    /// Token usage within a stream event.
+    record stream-usage {
+        input-tokens: u32,
+        output-tokens: u32,
+    }
+
+    /// Streaming completion request.
+    ///
+    /// Uses JSON strings for complex nested types to avoid cross-interface
+    /// type references (a WIT limitation).
+    record stream-request {
+        /// Provider name: "anthropic", "openai", "gemini", "ollama".
+        provider: option<string>,
+        model: option<string>,
+        /// JSON-encoded array of messages matching the llm-tools `rich-message` schema:
+        /// ```json
+        /// [
+        ///   {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        ///   {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]}
+        /// ]
+        /// ```
+        /// Each content block is one of: text, tool-use, tool-result, or image.
+        messages-json: string,
+        max-tokens: option<u32>,
+        temperature: option<f32>,
+        system-prompt: option<string>,
+    }
+
+    /// Streaming completion request with tool definitions.
+    record stream-tool-request {
+        provider: option<string>,
+        model: option<string>,
+        /// JSON-encoded array of rich messages (same schema as stream-request.messages-json).
+        messages-json: string,
+        /// JSON-encoded array of tool definitions:
+        /// ```json
+        /// [
+        ///   {"name": "get_weather", "description": "...", "input_schema": {"type": "object", ...}}
+        /// ]
+        /// ```
+        tools-json: string,
+        max-tokens: option<u32>,
+        temperature: option<f32>,
+        system-prompt: option<string>,
+    }
+
+    /// Errors returned by llm-streaming start-stream / start-tool-stream.
+    variant error {
+        not-configured(string),
+        rate-limited,
+        invalid-request(string),
+        api-error(string),
+        timeout,
+        budget-exhausted,
+    }
+
+    /// Start a streaming completion. Returns a stream ID.
+    /// Use `next-event` to poll for events until a `done` event is received.
+    start-stream: func(req: stream-request) -> result<string, error>;
+
+    /// Start a streaming completion with tool definitions.
+    start-tool-stream: func(req: stream-tool-request) -> result<string, error>;
+
+    /// Blocks until the next event is available from the stream.
+    /// Returns `none` when the stream is finished (sender closed).
+    /// Mid-stream errors are delivered as `stream-event::error(string)`.
+    next-event: func(stream-id: string) -> option<stream-event>;
+
+    /// Cancel an in-progress stream and release resources.
+    cancel-stream: func(stream-id: string);
+}
+
+// ============================================================================
+// Context Window Interface - Token estimation and context management
+// ============================================================================
+interface context-window {
+    /// Model context window information.
+    record context-info {
+        /// Maximum context window size in tokens.
+        max-tokens: u32,
+        /// Estimated tokens already used by the current conversation.
+        used-tokens: u32,
+        /// Tokens remaining before hitting the limit.
+        available-tokens: u32,
+    }
+
+    /// Estimate the number of tokens in a string.
+    estimate-tokens: func(text: string, model: option<string>) -> u32;
+
+    /// Get context window info for the configured model.
+    get-context-info: func(model: option<string>) -> context-info;
+}
+
+// ============================================================================
+// Resource Quotas Interface - Budget and usage tracking
+// ============================================================================
+interface resource-quotas {
+    /// Current usage for a resource metric.
+    record usage-info {
+        /// Resource name (e.g. "llm_tokens", "http_calls", "db_queries").
+        metric: string,
+        /// Current usage in the billing period.
+        used: u64,
+        /// Maximum allowed (0 = unlimited).
+        limit: u64,
+        /// Remaining budget.
+        remaining: u64,
+    }
+
+    enum error {
+        quota-exceeded,
+        metric-not-found,
+        not-configured,
+    }
+
+    /// Check remaining budget for a resource metric.
+    check-quota: func(metric: string) -> result<usage-info, error>;
+
+    /// Record usage of a resource metric. Returns updated info.
+    /// Fails with quota-exceeded if the usage would exceed the limit.
+    record-usage: func(metric: string, amount: u64) -> result<usage-info, error>;
+
+    /// List all tracked resource metrics and their current usage.
+    list-quotas: func() -> list<usage-info>;
+}
+
+// ============================================================================
+// Embedding Interface - Standalone vector embedding generation
+//
+// Generate embedding vectors from text without storing them (unlike
+// agent-memory::store-with-embedding which persists automatically).
+// Uses the host-managed LLM API key — no secret crosses the WASM boundary.
+// ============================================================================
+interface embedding {
+    variant error {
+        not-configured(string),
+        rate-limited,
+        invalid-request(string),
+        api-error(string),
+        budget-exhausted,
+    }
+
+    /// Generate a vector embedding from text.
+    /// Default model: text-embedding-3-small (OpenAI).
+    generate: func(text: string, model: option<string>) -> result<list<f32>, error>;
+}
+
+// ============================================================================
+// Events Interface - Structured domain event emission
+//
+// Emit typed events during execution for downstream consumers. Events are
+// published to NATS and stored as queryable execution events (not log lines).
+// Available from http-node tier upward.
+// ============================================================================
+interface events {
+    enum error {
+        invalid-event-type,
+        payload-too-large,
+        rate-limited,
+    }
+
+    /// Emit a domain event. event-type must be alphanumeric/dots/hyphens/underscores.
+    emit: func(event-type: string, payload: string) -> result<_, error>;
+
+    /// Emit with optional metadata (JSON string for filtering/routing).
+    emit-with-metadata: func(event-type: string, payload: string, metadata: option<string>) -> result<_, error>;
+}
+
+// ============================================================================
+// HTTP Stream Interface - Server-Sent Events (SSE) consumption
+//
+// Connect to an SSE endpoint and consume events incrementally.
+// Subject to the same SSRF protections and host allowlist as http::fetch.
+// Maximum 5 concurrent SSE connections per execution.
+// ============================================================================
+interface http-stream {
+    /// A single SSE event.
+    record sse-event {
+        /// Event type (from the `event:` field). None if not specified.
+        event-type: option<string>,
+        /// Event data (from the `data:` field(s), joined by newlines).
+        data: string,
+        /// Event ID (from the `id:` field). None if not specified.
+        id: option<string>,
+    }
+
+    enum error {
+        invalid-url,
+        forbidden-host,
+        connection-failed,
+        rate-limited,
+    }
+
+    /// Connect to an SSE endpoint. Returns a stream ID for polling.
+    connect: func(url: string, headers: list<tuple<string, string>>) -> result<string, error>;
+
+    /// Block until the next SSE event. Returns none when the stream ends.
+    next-event: func(stream-id: string) -> option<sse-event>;
+
+    /// Close an SSE connection and release resources.
+    close: func(stream-id: string);
+}
+
+// ============================================================================
+// Agent Memory Interface - Persistent key-value + vector similarity search
+// ============================================================================
+interface agent-memory {
+    /// Store a key-value pair in the agent's persistent memory.
+    /// Memory persists across executions within the same workflow.
+    record memory-entry {
+        key: string,
+        value: string,
+        /// Optional metadata as JSON for filtering during search.
+        metadata: option<string>,
+    }
+
+    /// Result from a similarity search.
+    record search-result {
+        key: string,
+        value: string,
+        /// Cosine similarity score (0.0 to 1.0).
+        score: f32,
+        metadata: option<string>,
+    }
+
+    enum error {
+        not-available,
+        key-not-found,
+        storage-full,
+        invalid-input,
+    }
+
+    /// Store a value in persistent memory.
+    set: func(key: string, value: string) -> result<_, error>;
+
+    /// Retrieve a value by key.
+    get: func(key: string) -> result<string, error>;
+
+    /// Delete a key from memory.
+    delete: func(key: string) -> result<_, error>;
+
+    /// List all keys matching an optional prefix.
+    list-keys: func(prefix: option<string>) -> result<list<string>, error>;
+
+    /// Store a value with an embedding vector for similarity search.
+    /// The embedding is generated automatically from the value text.
+    store-with-embedding: func(entry: memory-entry) -> result<_, error>;
+
+    /// Search memory by semantic similarity to a query string.
+    /// Returns the top `limit` results ordered by similarity score.
+    search: func(query: string, limit: u32) -> result<list<search-result>, error>;
+
+    /// Options for filtered semantic search.
+    ///
+    /// `exclude-kinds` excludes results whose `metadata.kind` field matches
+    /// any entry in the list. Use this to keep synthesize→persist→recall
+    /// chains honest: a workflow that writes `metadata.kind = "meeting_prep"`
+    /// for its briefs can exclude `["meeting_prep"]` on subsequent runs so
+    /// the LLM doesn't hallucinate off its own prior output (self-reference
+    /// feedback loop).
+    ///
+    /// Convention: writers that persist synthetic output SHOULD stamp
+    /// `metadata.kind` with a stable label (e.g. "meeting_prep", "recall",
+    /// "daily_brief"). Source-of-truth entries (user captures, ingested
+    /// data) typically omit `kind` or use `kind = "source"`.
+    ///
+    /// An empty `exclude-kinds` is equivalent to the bare `search` function.
+    record search-options {
+        /// Top-N results to return (1..=50 enforced by the host).
+        limit: u32,
+        /// List of `metadata.kind` values to exclude from results.
+        exclude-kinds: list<string>,
+    }
+
+    /// Search memory by semantic similarity with filter options.
+    ///
+    /// Prefer over `search` when the caller writes synthetic results back
+    /// to memory under `store-with-embedding` — without the exclusion,
+    /// those outputs re-surface on subsequent semantic queries and the
+    /// LLM starts citing its own prior hallucinations.
+    search-filtered: func(
+        query: string,
+        opts: search-options,
+    ) -> result<list<search-result>, error>;
+}
+
+// ============================================================================
+// Integration State Interface - Per-integration scoped persistent state
+//
+// Lets integration modules (gcal, gmail, jira, ...) persist their own
+// scoped state without adding per-integration tables to the core schema.
+// Rows are scoped by (integration_name, user_id, key) and hold an opaque
+// JSON value. Four indexed slots (str_1, str_2, ts_1_ms, int_1) let
+// integrations pick what to index at write time.
+//
+// SECURITY: integration_name comes from the module's compiled-in
+// metadata at the worker — guest code does NOT supply it. A module
+// without an integration_name (the vast majority) gets `unauthorized`
+// from every call.
+//
+// Backed by NATS-RPC to the controller. Workers without NATS get
+// error::not-available.
+// ============================================================================
+interface integration-state {
+    /// A stored entry. Same shape on read and write.
+    record stored-entry {
+        /// Logical key within (integration, user). Up to 256 bytes.
+        key: string,
+        /// JSON-encoded value. Up to 64 KiB.
+        value: string,
+        /// Optional TTL in seconds. None on writes = no expiry.
+        /// On reads = remaining lifetime in seconds (0 if expired,
+        /// though expired rows are filtered out).
+        ttl-seconds: option<u64>,
+        /// Generic indexed slots. Each integration documents in its
+        /// codebase which slot maps to which logical field. Empty
+        /// slots are not indexed and cost nothing. Named -one/-two
+        /// because WIT identifier segments cannot start with a digit
+        /// (rules out idx-str-1). Internally stored in the
+        /// `idx_str_1` / `idx_str_2` / `idx_ts_1_ms` / `idx_int_1`
+        /// columns on the controller side — the worker maps between
+        /// the two naming schemes.
+        idx-str-one: option<string>,
+        idx-str-two: option<string>,
+        idx-ts-one-ms: option<s64>,
+        idx-int-one: option<s64>,
+    }
+
+    /// Filter for `list`. Every field is optional; AND-combined.
+    record list-filter {
+        /// Match keys with this prefix. LIKE metacharacters in the
+        /// prefix are escaped server-side.
+        key-prefix: option<string>,
+        idx-str-one-eq: option<string>,
+        idx-str-two-eq: option<string>,
+        /// Inclusive lower bound on idx-ts-one-ms.
+        idx-ts-one-gte-ms: option<s64>,
+        /// Exclusive upper bound on idx-ts-one-ms.
+        idx-ts-one-lt-ms: option<s64>,
+        idx-int-one-eq: option<s64>,
+        /// Max rows. Clamped server-side to 500.
+        limit: u32,
+    }
+
+    enum error {
+        not-available,
+        not-found,
+        invalid-input,
+        /// Module is not an integration (no integration_name in
+        /// compiled metadata) — the host fn refused before any DB
+        /// round-trip.
+        unauthorized,
+        /// 10k-row cap per (integration, user) reached.
+        storage-full,
+        timeout,
+    }
+
+    /// Insert or update a row at this key. value MUST be valid JSON;
+    /// the host parses it server-side to catch malformed input early.
+    set: func(entry: stored-entry) -> result<_, error>;
+
+    /// Fetch the row at this key; not-found if absent or expired.
+    get: func(key: string) -> result<stored-entry, error>;
+
+    /// Remove the row at this key. Idempotent — succeeds even if
+    /// the key was already absent.
+    delete: func(key: string) -> result<_, error>;
+
+    /// List matching rows ordered by updated_at DESC. limit is the
+    /// max number returned (server cap: 500). Function is named
+    /// `list-entries` (not `list`) because `list` is a WIT keyword.
+    list-entries: func(filter: list-filter) -> result<list<stored-entry>, error>;
+}
+
+// ============================================================================
+// Graph Memory Interface - Knowledge-graph RAG queries
+//
+// Read-side companion to agent-memory. The host (controller) runs
+// entity extraction automatically on every actor-memory write, then
+// stores entities + relationships in Neo4j. This interface exposes
+// a traversal query so sandboxes can ask "what entities relate to X?"
+// and follow relationships N hops deep.
+//
+// graph-search delegates to the controller via NATS-RPC (the Neo4j
+// driver lives controller-side). It is therefore only usable from
+// workers that share the platform NATS bus — run_sandbox and
+// standalone worker harnesses that don't register with NATS will
+// receive error::not-available.
+// ============================================================================
+interface graph-memory {
+    /// A single entity returned by graph-search — either the seed
+    /// entity (distance 0) or one reached by traversing relationships
+    /// up to max-depth hops from the seed.
+    record graph-hit {
+        /// Entity type label (e.g. "Person", "Ticket", "Project").
+        entity-type: string,
+        /// Primary label / name used to match the input query.
+        label: string,
+        /// Graph hops from the seed entity (0 for seeds themselves).
+        distance: u32,
+        /// JSON-encoded property map. Callers decode with serde_json.
+        properties: string,
+    }
+
+    /// Traversal result: a set of related entities ordered by
+    /// distance from the seed entities, plus a JSON blob summarising
+    /// the edges between them.
+    record graph-context {
+        /// Total entity count across all distances.
+        entity-count: u32,
+        /// Entity hits sorted by (distance asc, label asc).
+        entities: list<graph-hit>,
+        /// JSON-encoded adjacency data — `{"edges": [{"src": "...",
+        /// "dst": "...", "type": "..."}, ...]}`. Opaque to the WIT
+        /// binding; decode on the guest side.
+        relationships: string,
+    }
+
+    enum error {
+        /// Host is running without a graph-service backend (no Neo4j
+        /// configured, or the controller-side NATS subscriber isn't
+        /// registered). Guests should fall back to agent-memory::search.
+        not-available,
+        /// Malformed query, empty string, or limits out of range.
+        invalid-input,
+        /// Controller RPC did not reply within the timeout budget.
+        timeout,
+        /// Controller replied with an internal error — surfaced here
+        /// so guests can distinguish recoverable (timeout) from
+        /// unrecoverable failures.
+        internal,
+    }
+
+    /// Search the knowledge graph for entities related to `query`,
+    /// starting from whichever seed entities match the query literal
+    /// and traversing up to `max-depth` hops. Ordered by distance,
+    /// capped at `limit` total entities (hard cap 200 on the host).
+    graph-search: func(
+        query: string,
+        max-depth: u32,
+        limit: u32,
+    ) -> result<graph-context, error>;
+}
+
+// ============================================================================
+// Agent Orchestration Interface - Multi-agent coordination
+// ============================================================================
+interface agent-orchestration {
+    /// Message passed between agents.
+    record agent-message {
+        /// Target agent/workflow identifier.
+        target: string,
+        /// Message payload (JSON).
+        payload: string,
+        /// Optional correlation ID for request-reply patterns.
+        correlation-id: option<string>,
+    }
+
+    /// Response from an agent invocation.
+    record agent-response {
+        /// The responding agent's identifier.
+        source: string,
+        /// Response payload (JSON).
+        payload: string,
+        /// Whether the agent completed successfully.
+        success: bool,
+        /// Correlation ID matching the request.
+        correlation-id: option<string>,
+    }
+
+    enum error {
+        agent-not-found,
+        timeout,
+        permission-denied,
+        invocation-failed,
+    }
+
+    /// Invoke another agent/workflow and wait for its response.
+    /// Timeout in milliseconds (max 120000).
+    invoke: func(msg: agent-message, timeout-ms: u32) -> result<agent-response, error>;
+
+    /// Send a fire-and-forget message to another agent/workflow.
+    send: func(msg: agent-message) -> result<_, error>;
+
+    /// List available agents/workflows that can be invoked.
+    list-agents: func() -> result<list<string>, error>;
+
+    /// Injects a new node into the current execution's remaining path.
+    /// The node will be executed immediately after the current node finishes.
+    inject-runtime-node: func(module-id: string, config: string) -> result<string, error>;
+
+    /// Redirects the execution flow to a specific existing node in the graph.
+    reroute-to-node: func(node-id: string) -> result<_, error>;
+}
+
+// ============================================================================
+// Object Storage Interface - S3-compatible storage operations
+// ============================================================================
+interface object-storage {
+    record put-request {
+        bucket: string,
+        key: string,
+        body: list<u8>,
+        content-type: option<string>,
+    }
+
+    record get-response {
+        body: list<u8>,
+        content-type: option<string>,
+        size: u64,
+    }
+
+    record list-entry {
+        key: string,
+        size: u64,
+        last-modified: option<string>,
+    }
+
+    enum error {
+        not-configured,
+        not-found,
+        access-denied,
+        bucket-not-found,
+        operation-failed,
+    }
+
+    /// Upload an object to storage.
+    put: func(req: put-request) -> result<_, error>;
+
+    /// Download an object from storage.
+    get: func(bucket: string, key: string) -> result<get-response, error>;
+
+    /// Delete an object from storage.
+    delete: func(bucket: string, key: string) -> result<_, error>;
+
+    /// List objects in a bucket with an optional prefix.
+    list-objects: func(bucket: string, prefix: option<string>, max-keys: option<u32>) -> result<list<list-entry>, error>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3a: Secrets — Network + read-only access to the secrets vault.
+//
+// Use for: LLM API calls, OAuth token usage, any module that reads a
+//          secret at runtime without needing direct database or file access.
+// ----------------------------------------------------------------------------
+world secrets-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    // Adds: secrets vault + LLM API access (with tool use, streaming, context)
+    import secrets;
+    import llm;
+    import llm-tools;
+    import llm-streaming;
+    import context-window;
+    import resource-quotas;
+    import embedding;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3b: Filesystem — Network + sandboxed file I/O.
+//
+// Use for: file format conversion (CSV→JSON, XML→JSON), document processing,
+//          any module that reads or writes files in the execution sandbox.
+// ----------------------------------------------------------------------------
+world filesystem-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    // Adds: sandboxed file system
+    import files;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3c: Messaging — Network + NATS pub/sub.
+//
+// Use for: event fan-out, notification pipelines, any module that publishes
+//          or requests messages on a NATS subject.
+// ----------------------------------------------------------------------------
+world messaging-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    // Adds: NATS messaging
+    import messaging;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3d: Cache — Network + Redis distributed cache.
+//
+// Use for: memoisation, rate-count storage, any module that reads/writes
+//          from the shared Redis cache.
+// ----------------------------------------------------------------------------
+world cache-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    // Adds: Redis cache
+    import cache;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3e: Governance — Network + human-in-the-loop approvals.
+// ----------------------------------------------------------------------------
+world governance-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    // Adds: governance approvals
+    import governance;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 4: Database — Network + secrets + direct PostgreSQL access.
+//
+// Use for: data pipeline nodes that must query or write the database,
+//          reporting modules, and any node that needs both credentials and SQL.
+// Secrets access is bundled because database connections always need auth.
+// ----------------------------------------------------------------------------
+world database-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    // Adds: secrets vault + LLM (with tool use, streaming, context) + database + agent memory
+    import secrets;
+    import llm;
+    import llm-tools;
+    import llm-streaming;
+    import context-window;
+    import resource-quotas;
+    import embedding;
+    import database;
+    import agent-memory;
+    import graph-memory;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 4b: Agent — Secrets + LLM + agent memory + governance + orchestration.
+//
+// The preferred world for autonomous agent modules. Provides LLM access,
+// persistent key-value + vector memory, human-in-the-loop approval gates,
+// and multi-agent orchestration — without granting direct database,
+// filesystem, cache, messaging, or object storage access.
+//
+// Incomparable with database-node: Agent has governance + orchestration but
+// no raw SQL; database-node has raw SQL but no governance or orchestration.
+// Both are subsets of automation-node.
+// ----------------------------------------------------------------------------
+world agent-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    import secrets;
+    import llm;
+    import llm-tools;
+    import llm-streaming;
+    import context-window;
+    import resource-quotas;
+    import embedding;
+
+    import agent-memory;
+    import graph-memory;
+    import integration-state;
+    import governance;
+    import agent-orchestration;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 5: Trusted (automation-node) — Full platform capabilities.
+//
+// Use ONLY when no narrower world satisfies your module's needs.
+// Grants simultaneous access to secrets, files, Redis, NATS, and the
+// database — a very large blast radius for a compromised module.
+// Requires explicit review before deployment.
+// ----------------------------------------------------------------------------
+world automation-node {
+    // All network interfaces
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+    import events;
+    import http-stream;
+
+    // All trusted-only interfaces
+    import secrets;
+    import llm;
+    import llm-tools;
+    import llm-streaming;
+    import context-window;
+    import resource-quotas;
+    import embedding;
+    import files;
+    import cache;
+    import messaging;
+    import database;
+    import governance;
+    import agent-memory;
+    import graph-memory;
+    import integration-state;
+    import agent-orchestration;
+    import object-storage;
+
+    export run: func(input: string) -> result<string, string>;
+}

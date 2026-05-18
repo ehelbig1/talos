@@ -1,0 +1,32 @@
+[package]
+name = "github-analyzer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wit-bindgen = "0.26.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+talos_sdk_macros = { path = "../../talos_sdk_macros" }
+
+# Our external crates to demonstrate the power of Wasm
+
+[lib]
+crate-type = ["cdylib"]
+path = "template.rs"
+
+[package.metadata.component]
+package = "talos:github-analyzer"
+
+[package.metadata.component.target]
+path = "../wit/talos.wit"
+world = "automation-node"
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = true
+codegen-units = 1
+strip = false
+
+[workspace]

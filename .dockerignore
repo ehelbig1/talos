@@ -1,0 +1,84 @@
+# Rust
+# Use **/target (not target/) so nested build artifacts are excluded too —
+# e.g. module-templates/*/target/ from local WASM builds can be 3 GB+.
+# Without this, those trees enter the build context and trigger an OOM/ENOSPC
+# failure when `chown -R /app` traverses them in Docker Desktop's VM.
+**/target
+**/*.rs.bk
+*.pdb
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment — broad on purpose. Both Dockerfiles do `COPY . .` and
+# nothing under controller/ or worker/ build-time references .env files,
+# so blocking everything that matches .env* is safe and prevents a
+# .env.production (or similar) from accidentally landing in an image
+# layer where `docker history` would expose it.
+.env*
+
+# Private keys, certificates, credential blobs. Defense-in-depth — these
+# should never be in the source tree, but if one slips in we don't want
+# it baked into a published image layer.
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials*.json
+*credentials.json
+
+# Release artifacts that are produced by `make release` itself. Including
+# the previous run's digests in the next build context is harmless but
+# pointless and busts the COPY layer cache on every release.
+release-digests.txt
+
+# Agent worktrees (claude-code, codex). These contain duplicate copies of
+# the workspace from in-progress agent runs — bloats build context, busts
+# COPY layer cache, and ships nested `.git` dirs into intermediate stages.
+.claude/
+.codex/
+
+# Documentation, observability dashboards, and dev-only scripts —
+# nothing the controller or worker binaries need at runtime.
+docs/
+observability/
+add_scopes.py
+update_protocol.py
+
+# Lint configs consumed by CI / dev only.
+audit.toml
+deny.toml
+
+# Helm chart / k3s deploy assets — not part of the controller/worker
+# build context. Helm renders against the chart from the operator's
+# checkout, not from the published image.
+deploy/
+
+# CHANGELOG, AGENTS.md, CLAUDE.md — docs, not runtime.
+CHANGELOG.md
+AGENTS.md
+CLAUDE.md

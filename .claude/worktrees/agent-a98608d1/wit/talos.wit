@@ -1,0 +1,658 @@
+package talos:core;
+
+// ============================================================================
+// HTTP Interface - Make HTTP requests to external APIs
+// ============================================================================
+interface http {
+    enum method {
+        get,
+        post,
+        put,
+        delete,
+        patch,
+    }
+
+    record request {
+        method: method,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+        timeout-ms: option<u32>,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    enum error {
+        invalidurl,
+        timeout,
+        networkerror,
+        forbiddenhost,
+    }
+
+    fetch: func(req: request) -> result<response, error>;
+}
+
+// ============================================================================
+// Logging Interface - Structured logging for debugging and monitoring
+// ============================================================================
+interface logging {
+    enum level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+    log: func(lvl: level, msg: string);
+}
+
+// ============================================================================
+// Secrets Interface - Secure access to encrypted secrets
+// ============================================================================
+interface secrets {
+    enum error {
+        notfound,
+        unauthorized,
+        expired,
+        decryptionfailed,
+    }
+
+    get-secret: func(key-path: string) -> result<string, error>;
+}
+
+// ============================================================================
+// State Interface - Persistent key-value storage for workflow state
+// ============================================================================
+interface state {
+    enum error {
+        notfound,
+        invalidkey,
+        storagefailed,
+    }
+
+    get: func(key: string) -> result<string, error>;
+    set: func(key: string, value: string) -> result<_, error>;
+    delete: func(key: string) -> result<_, error>;
+    exists: func(key: string) -> bool;
+    list-keys: func() -> list<string>;
+}
+
+// ============================================================================
+// Database Interface - Execute SQL queries against PostgreSQL
+// ============================================================================
+interface database {
+    enum error {
+        connectionfailed,
+        queryerror,
+        unauthorized,
+        invalidquery,
+    }
+
+    record query-result {
+        rows: string,
+        rows-affected: u64,
+    }
+
+    execute-query: func(sql: string, params: list<string>) -> result<query-result, error>;
+}
+
+// ============================================================================
+// Email Interface - Send emails via SMTP or email service
+// ============================================================================
+interface email {
+    enum error {
+        invalidaddress,
+        sendfailed,
+        unauthorized,
+    }
+
+    record attachment {
+        filename: string,
+        content-type: string,
+        data: list<u8>,
+    }
+
+    record message {
+        to: list<string>,
+        cc: option<list<string>>,
+        bcc: option<list<string>>,
+        subject: string,
+        body: string,
+        html: option<string>,
+        attachments: option<list<attachment>>,
+    }
+
+    send: func(msg: message) -> result<_, error>;
+}
+
+// ============================================================================
+// Webhook Interface - POST data to webhooks with retry logic
+// ============================================================================
+interface webhook {
+    enum error {
+        invalidurl,
+        sendfailed,
+        timeout,
+    }
+
+    record webhook-request {
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: string,
+        max-retries: option<u32>,
+        retry-delay-ms: option<u32>,
+    }
+
+    record webhook-response {
+        status: u16,
+        body: string,
+        retries: u32,
+    }
+
+    send: func(req: webhook-request) -> result<webhook-response, error>;
+}
+
+// ============================================================================
+// JSON Interface - JSON parsing and manipulation utilities
+// ============================================================================
+interface json {
+    enum error {
+        parseerror,
+        invalidpath,
+        typeerror,
+    }
+
+    parse: func(json-str: string) -> result<_, error>;
+    query: func(json-str: string, path: string) -> result<string, error>;
+    merge: func(json1: string, json2: string) -> result<string, error>;
+    prettify: func(json-str: string) -> result<string, error>;
+    minify: func(json-str: string) -> result<string, error>;
+}
+
+// ============================================================================
+// DateTime Interface - Date and time manipulation utilities
+// ============================================================================
+interface datetime {
+    enum error {
+        parseerror,
+        invalidformat,
+    }
+
+    now-unix: func() -> u64;
+    now-iso: func() -> string;
+    parse: func(date-str: string, format: option<string>) -> result<u64, error>;
+    format: func(timestamp: u64, format: string) -> result<string, error>;
+    add-seconds: func(timestamp: u64, seconds: s64) -> u64;
+    diff-seconds: func(timestamp1: u64, timestamp2: u64) -> s64;
+}
+
+// ============================================================================
+// Crypto Interface - Cryptographic operations (hashing, encoding, etc.)
+// ============================================================================
+interface crypto {
+    enum error {
+        invalidinput,
+        operationfailed,
+    }
+
+    enum hash-algorithm {
+        sha256,
+        sha512,
+        md5,
+    }
+
+    enum encoding {
+        hex,
+        base64,
+        base64url,
+    }
+
+    hash: func(algorithm: hash-algorithm, data: list<u8>) -> list<u8>;
+    hmac: func(algorithm: hash-algorithm, key: list<u8>, data: list<u8>) -> list<u8>;
+    encode: func(encoding: encoding, data: list<u8>) -> string;
+    decode: func(encoding: encoding, data: string) -> result<list<u8>, error>;
+    random-bytes: func(length: u32) -> list<u8>;
+    uuid: func() -> string;
+}
+
+// ============================================================================
+// Environment Interface - Access workflow and module configuration
+// ============================================================================
+interface env {
+    get-var: func(key: string) -> option<string>;
+    get-all-vars: func() -> string;
+    get-workflow-id: func() -> string;
+    get-execution-id: func() -> string;
+    get-module-id: func() -> string;
+}
+
+// ============================================================================
+// File I/O Interface - Read and write files (with security controls)
+// ============================================================================
+interface files {
+    enum error {
+        notfound,
+        permissiondenied,
+        invalidpath,
+        ioerror,
+    }
+
+    record file-metadata {
+        size: u64,
+        modified-unix: u64,
+        is-directory: bool,
+    }
+
+    read: func(path: string) -> result<list<u8>, error>;
+    write: func(path: string, contents: list<u8>) -> result<_, error>;
+    exists: func(path: string) -> bool;
+    metadata: func(path: string) -> result<file-metadata, error>;
+    list-dir: func(path: string) -> result<list<string>, error>;
+    delete: func(path: string) -> result<_, error>;
+}
+
+// ============================================================================
+// Template Interface - Jinja2/Handlebars template rendering
+// ============================================================================
+interface templates {
+    enum error {
+        parseerror,
+        rendererror,
+        variablenotfound,
+    }
+
+    enum syntax {
+        jinja2,
+        handlebars,
+    }
+
+    render: func(template: string, variables: string, syntax: syntax) -> result<string, error>;
+    render-file: func(path: string, variables: string, syntax: syntax) -> result<string, error>;
+}
+
+// ============================================================================
+// Data Transform Interface - CSV and XML parsing/generation
+// ============================================================================
+interface data-transform {
+    enum error {
+        parseerror,
+        invalidformat,
+        ioerror,
+    }
+
+    record csv-options {
+        delimiter: option<string>,
+        has-headers: bool,
+        skip-rows: option<u32>,
+    }
+
+    csv-to-json: func(csv: string, options: option<csv-options>) -> result<string, error>;
+    json-to-csv: func(json: string, options: option<csv-options>) -> result<string, error>;
+    xml-to-json: func(xml: string) -> result<string, error>;
+    json-to-xml: func(json: string, root-element: string) -> result<string, error>;
+}
+
+// ============================================================================
+// Cache Interface - Distributed caching with Redis
+// ============================================================================
+interface cache {
+    enum error {
+        connectionfailed,
+        notfound,
+        operationfailed,
+    }
+
+    get: func(key: string) -> result<string, error>;
+    set: func(key: string, value: string, ttl: option<u32>) -> result<_, error>;
+    delete: func(key: string) -> result<_, error>;
+    exists: func(key: string) -> bool;
+    increment: func(key: string, amount: s64) -> result<s64, error>;
+    decrement: func(key: string, amount: s64) -> result<s64, error>;
+    mget: func(keys: list<string>) -> result<list<option<string>>, error>;
+    mset: func(pairs: list<tuple<string, string>>) -> result<_, error>;
+    expire: func(key: string, ttl: u32) -> result<_, error>;
+}
+
+// ============================================================================
+// Messaging Interface - Publish/Subscribe to message queues
+// ============================================================================
+interface messaging {
+    enum error {
+        connectionfailed,
+        publishfailed,
+        subscribefailed,
+        invalidtopic,
+    }
+
+    record message {
+        topic: string,
+        payload: list<u8>,
+        headers: option<list<tuple<string, string>>>,
+    }
+
+    publish: func(topic: string, payload: list<u8>) -> result<_, error>;
+    publish-with-headers: func(msg: message) -> result<_, error>;
+    request: func(topic: string, payload: list<u8>, timeout-ms: u32) -> result<list<u8>, error>;
+}
+
+// ============================================================================
+// GraphQL Interface - Execute GraphQL queries and mutations
+// ============================================================================
+interface graphql {
+    enum error {
+        networkerror,
+        parseerror,
+        queryerror,
+        invalidvariables,
+    }
+
+    record request {
+        url: string,
+        query: string,
+        variables: option<string>,
+        headers: option<list<tuple<string, string>>>,
+        timeout-ms: option<u32>,
+    }
+
+    record response {
+        data: option<string>,
+        errors: option<list<string>>,
+    }
+
+    execute: func(req: request) -> result<response, error>;
+    execute-with-retry: func(req: request, max-retries: u32) -> result<response, error>;
+}
+
+// ============================================================================
+// Governance Interface - Wait for human approval
+// ============================================================================
+interface governance {
+    request-approval: func(reason: string) -> bool;
+}
+
+// ============================================================================
+// WORLD DEFINITIONS
+//
+// Talos uses eight tiered capability worlds organised in a partial order.
+// A node is compiled against exactly ONE world, which defines its security
+// boundary at the binary level: the runtime linker only exposes host functions
+// that belong to that world, providing defence-in-depth on top of the
+// upload-time capability check.
+//
+// World hierarchy (least → most privileged):
+//
+//   minimal-node
+//       └─ http-node       (HTTP, GraphQL, Webhooks, etc)
+//               └─ network-node (adds raw TCP/UDP sockets)
+//                       ├─ secrets-node    (network + secrets)
+//                       ├─ filesystem-node (network + files)
+//                       ├─ messaging-node  (network + messaging)
+//                       ├─ cache-node      (network + Redis cache)
+//                       └─ database-node   (network + secrets + database)
+//                               └─ automation-node  (full platform — all interfaces)
+//
+// Choose the LEAST privileged world that satisfies your module's needs.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Tier 1: Minimal — Pure computation, no I/O.
+//
+// Use for: data transformation, validation, formatting, pure logic.
+// Cannot make network calls, access secrets, write files, or use Redis.
+// Safest option; maximum isolation.
+// ----------------------------------------------------------------------------
+world minimal-node {
+    // Utility interfaces: pure computation, no external side-effects
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 2: HTTP — Can make outbound HTTP calls and maintain state.
+//
+// Use for: API integrations, webhooks, stateful workflows, GraphQL clients.
+// Cannot use raw TCP/UDP sockets, access secrets, write files, or use Redis/NATS directly.
+// The Talos HTTP host strictly enforces the allowed_hosts domain whitelist.
+// ----------------------------------------------------------------------------
+world http-node {
+    // All minimal interfaces
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+
+    // HTTP and state interfaces
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3: Network — Adds raw TCP/UDP socket capabilities (wasi:sockets).
+//
+// Use for: Native Rust drivers (PostgreSQL, Redis, AMQP) that require raw sockets.
+// Security Warning: Bypasses the allowed_hosts domain whitelist (operates at IP level).
+// ----------------------------------------------------------------------------
+world network-node {
+    // All minimal interfaces
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+
+    // Network and state interfaces
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3a: Secrets — Network + read-only access to the secrets vault.
+//
+// Use for: LLM API calls, OAuth token usage, any module that reads a
+//          secret at runtime without needing direct database or file access.
+// ----------------------------------------------------------------------------
+world secrets-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    // Adds: secrets vault
+    import secrets;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3b: Filesystem — Network + sandboxed file I/O.
+//
+// Use for: file format conversion (CSV→JSON, XML→JSON), document processing,
+//          any module that reads or writes files in the execution sandbox.
+// ----------------------------------------------------------------------------
+world filesystem-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    // Adds: sandboxed file system
+    import files;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3c: Messaging — Network + NATS pub/sub.
+//
+// Use for: event fan-out, notification pipelines, any module that publishes
+//          or requests messages on a NATS subject.
+// ----------------------------------------------------------------------------
+world messaging-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    // Adds: NATS messaging
+    import messaging;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3d: Cache — Network + Redis distributed cache.
+//
+// Use for: memoisation, rate-count storage, any module that reads/writes
+//          from the shared Redis cache.
+// ----------------------------------------------------------------------------
+world cache-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    // Adds: Redis cache
+    import cache;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 3e: Governance — Network + human-in-the-loop approvals.
+// ----------------------------------------------------------------------------
+world governance-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    // Adds: governance approvals
+    import governance;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 4: Database — Network + secrets + direct PostgreSQL access.
+//
+// Use for: data pipeline nodes that must query or write the database,
+//          reporting modules, and any node that needs both credentials and SQL.
+// Secrets access is bundled because database connections always need auth.
+// ----------------------------------------------------------------------------
+world database-node {
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    // Adds: secrets vault + direct database access
+    import secrets;
+    import database;
+
+    export run: func(input: string) -> result<string, string>;
+}
+
+// ----------------------------------------------------------------------------
+// Tier 5: Trusted (automation-node) — Full platform capabilities.
+//
+// Use ONLY when no narrower world satisfies your module's needs.
+// Grants simultaneous access to secrets, files, Redis, NATS, and the
+// database — a very large blast radius for a compromised module.
+// Requires explicit review before deployment.
+// ----------------------------------------------------------------------------
+world automation-node {
+    // All network interfaces
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+    import http;
+    import webhook;
+    import graphql;
+    import email;
+    import state;
+    import data-transform;
+    import templates;
+
+    // All trusted-only interfaces
+    import secrets;
+    import files;
+    import cache;
+    import messaging;
+    import database;
+    import governance;
+
+    export run: func(input: string) -> result<string, string>;
+}

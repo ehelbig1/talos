@@ -1,0 +1,2 @@
+ALTER TABLE workflows ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_workflows_tags ON workflows USING GIN(tags);

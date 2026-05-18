@@ -1,0 +1,1186 @@
+use cap_std::fs::Dir;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use tempfile::TempDir;
+use wasmtime::component::ResourceTable;
+use wasmtime::ResourceLimiter;
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+/// The execution context for a single Wasm job.
+///
+/// Holds WASI state, resource limits, pre-fetched secrets, workflow metadata,
+/// and optional handles to Redis / NATS / sandboxed file-system.
+pub struct TalosContext {
+    /// WASI state (file descriptors, env vars, etc.)
+    wasi: WasiCtx,
+    /// Resource table needed for the component model.
+    table: ResourceTable,
+    http_ctx: wasmtime_wasi_http::WasiHttpCtx,
+
+    /// Allowed outbound hosts for the `http::fetch` host function.
+    /// An empty list means "deny all" (safe default; use `["*"]` to allow any host).
+    pub allowed_hosts: Vec<String>,
+
+    /// Allowed HTTP methods for outbound requests (`http::fetch` and `graphql::execute`).
+    /// Empty = allow all methods. Non-empty = only those methods permitted.
+    /// Checked after the host allowlist so both restrictions must pass.
+    pub allowed_methods: Vec<String>,
+
+    /// Allowed SQL statement types for the `database::execute_query` host function.
+    /// Empty = allow all statements (backwards-compatible). Non-empty = only those
+    /// statement types permitted (e.g., `["SELECT", "INSERT"]`).
+    /// `SELECT` is always allowed regardless. DDL statements (CREATE, DROP, ALTER,
+    /// TRUNCATE) are always blocked regardless.
+    pub allowed_sql_operations: Vec<String>,
+
+    /// Per-module secret allowlist.  When non-empty, only secrets whose key
+    /// matches an entry in this list (or the wildcard `"*"`) are served by
+    /// `secrets::get-secret`.  An empty list means the module has no secret
+    /// allowlist configured and ALL available secrets are accessible
+    /// (backwards-compatible default).
+    pub allowed_secrets: Vec<String>,
+
+    /// Workflow-scoped environment variables surfaced via the `env` interface.
+    pub env_vars: HashMap<String, String>,
+    pub capability_world: crate::wit_inspector::CapabilityWorld,
+
+    /// Integration this module belongs to, if any. `None` means the module
+    /// is not an integration and `integration-state::*` host functions
+    /// return `unauthorized`. The worker NEVER reads this value from
+    /// guest args — it comes from the JobRequest populated by the engine
+    /// from `wasm_modules.integration_name`, which is set at compile
+    /// time via `compile_custom_sandbox(integration_name: "...")`.
+    /// Scopes every integration_state RPC the module makes.
+    pub integration_name: Option<String>,
+
+    /// Pluggable secret provider — the single source of truth for all secret resolution.
+    ///
+    /// Backs three-tier secret access:
+    ///   Tier 1: host-side ops (fetch-with-bearer, fetch-with-header, hmac-sign) — no plaintext to guest
+    ///   Tier 2: expose-secret(handle, reason) — explicit, audited, rate-limited plaintext crossing
+    ///   Tier 3: vault:// config injection in HTTP headers — unchanged
+    ///
+    /// SlotHandle values are host-internal (u64) — the WASM guest holds only the integer.
+    pub provider: std::sync::Arc<dyn talos_secrets::SecretProvider>,
+
+    /// Rate-limit counter for Tier-2 `expose-secret` calls.
+    /// Capped at MAX_EXPOSE_CALLS (10) per execution.
+    pub expose_call_count: std::sync::atomic::AtomicU64,
+
+    /// Set to true when any Tier-2 `expose-secret` call succeeds.
+    /// The execution trace is marked to indicate explicit secret exposure occurred.
+    pub secret_tier2_exposed: std::sync::atomic::AtomicBool,
+
+    /// When false, `expose_secret` returns Unauthorized before any plaintext
+    /// crosses the WASM boundary. Default: false (Tier-1-only). Modules must
+    /// opt in via `allow_tier2_exposure: true` in their metadata to receive
+    /// raw secret values.
+    pub allow_tier2_exposure: bool,
+
+    /// In-memory fallback counter for global Tier-2 expose-secret rate limiting.
+    /// Used when Redis is unavailable to avoid failing open on the daily per-user limit.
+    /// Shared across all executions in this worker process via Arc<AtomicU64>.
+    pub global_expose_fallback_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
+    /// Workflow ID for tracing / logging.
+    pub workflow_id: Option<String>,
+    /// Execution ID for tracing / logging (also used as NATS log topic suffix).
+    pub execution_id: Option<String>,
+    /// Module ID for permissions and logging.
+    pub module_id: Option<String>,
+    /// User ID for global rate limiting and audit logging.
+    pub user_id: Option<uuid::Uuid>,
+    /// Optional request identifier that ties together controller, worker and logs.
+    pub request_id: Option<String>,
+
+    /// Cancellation token for cooperative cancellation.  When set, host functions
+    /// check this token periodically and abort if revoked.
+    pub cancellation_token: Option<String>,
+
+    /// Whether this execution has been cancelled.  Set to true when the
+    /// cancellation token is detected as revoked.  Checked by host functions.
+    pub cancelled: std::sync::atomic::AtomicBool,
+
+    /// In-memory key-value store scoped to this workflow execution.
+    pub state_store: Arc<std::sync::Mutex<HashMap<String, String>>>,
+
+    /// Optional Redis client for the `cache` interface.
+    pub redis_client: Option<Arc<redis::Client>>,
+    /// Optional NATS client for the `messaging` and `logging` interfaces.
+    pub nats_client: Option<Arc<async_nats::Client>>,
+
+    /// The WORM cryptographic ledger for verifiable audit trails.
+    pub audit_ledger: Option<Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>>,
+
+    /// Ephemeral sandbox directory for the `files` interface.
+    ///
+    /// Every execution gets a fresh, empty temporary directory that is:
+    ///   - Mounted at `/` in the WASI preopened-dirs table so WASM nodes can use
+    ///     standard Rust file I/O (`std::fs`, `std::io`) transparently.
+    ///   - Exposed here as a `cap_std::fs::Dir` for the `talos:core/files` host
+    ///     functions, which enforce additional path‑sanitisation.
+    ///   - Automatically shredded when this `TalosContext` is dropped (panic,
+    ///     timeout, or normal completion), providing strong isolation between jobs.
+    pub fs_dir: Dir,
+
+    // `db_pool` removed Phase 2.10 — the worker has been credential-
+    // free since the database WIT was routed through NATS-RPC
+    // (Phase 2.3). The field was always None at runtime; deleting
+    // it makes "no Postgres credentials in this binary" structural.
+    /// Stores the human-readable detail of the last database error.
+    /// Populated by execute_query (now via NATS-RPC reply), read by get_last_error.
+    pub last_db_error: String,
+
+    /// Human-readable OOM error message set when memory growth is denied.
+    /// Checked after `call_run` failures to provide a clear diagnostic instead
+    /// of a generic trap message.
+    pub oom_error_message: Option<String>,
+
+    /// Actor ID for persistent memory + state operations. All
+    /// durable data flows through NATS-RPC to the controller; the
+    /// worker no longer holds a DB pool directly. Anonymous
+    /// executions (run_sandbox / test harness) leave this as `None`
+    /// and every write-through path short-circuits to a no-op.
+    pub actor_id: Option<uuid::Uuid>,
+
+    /// LLM data-egress tier ceiling. `Tier1` refuses resolution of
+    /// Anthropic / OpenAI / Gemini vault keys and fails closed with
+    /// a clear error. Default `Tier2` for jobs without actor context
+    /// or from pre-tier workers.
+    pub max_llm_tier: talos_workflow_job_protocol::LlmTier,
+
+    /// Keeps the ephemeral `TempDir` alive until this context is dropped.
+    /// Dropping `_ephemeral_dir` removes the directory from the file system.
+    _ephemeral_dir: TempDir,
+
+    /// Maximum memory allowed for this execution (bytes).
+    pub max_memory_bytes: usize,
+
+    /// Remaining crypto compute budget in microseconds.
+    /// Shared across all `hash()` and `hmac()` calls in this execution.
+    /// Default: 5 seconds (5_000_000 us). When exhausted, crypto calls return empty.
+    pub crypto_budget_us: AtomicU64,
+
+    /// In-memory quota tracking for this execution.
+    /// Each entry maps a metric name to (used, limit).
+    pub quota_usage: std::sync::Mutex<HashMap<String, (u64, u64)>>,
+
+    /// Per-execution call counters for rate-limited host functions.
+    /// Each counter tracks calls within the current execution.
+    pub http_call_count: AtomicU64,
+    pub db_query_count: AtomicU64,
+    pub messaging_publish_count: AtomicU64,
+    /// MCP-523: per-execution email-send count. Pre-fix `wit_email::send`
+    /// had no rate limit — see `MAX_EMAIL_SENDS_PER_EXECUTION` in
+    /// `host_impl.rs`.
+    pub email_send_count: AtomicU64,
+    /// MCP-537: per-execution webhook-send count. Pre-fix `wit_webhook::send`
+    /// had no rate limit — a WASM module could fire arbitrarily many
+    /// outbound POSTs (each up to 1 + max_retries actual requests).
+    /// See `MAX_WEBHOOK_SENDS_PER_EXECUTION` in `host_impl.rs`.
+    pub webhook_send_count: AtomicU64,
+    /// MCP-537: per-execution GraphQL-query count. Same gap as
+    /// `wit_webhook::send` — `wit_graphql::execute` and
+    /// `execute_with_retry` had no per-execution cap.
+    pub graphql_query_count: AtomicU64,
+    /// MCP-588: per-execution `wit_secrets::get_secret` count. Pre-fix
+    /// guest-initiated secret access had no rate limit — a module could
+    /// loop `get_secret` thousands of times within its fuel budget,
+    /// each call appending to the local audit ledger AND publishing to
+    /// `talos.audit.ledger` over NATS. The audit-pipeline DoS is the
+    /// concern (one execution flooding many MB of audit traffic), not
+    /// the secret values themselves (host-side allowlist is intact).
+    /// Host-initiated resolutions (`resolve_vault_header` from http /
+    /// graphql / webhook headers) are bounded by their parent surface's
+    /// per-execution cap, but the direct `get_secret` path was the
+    /// straggler.
+    pub secret_access_count: AtomicU64,
+
+    /// Cumulative bytes written to the sandbox filesystem in this execution.
+    pub fs_bytes_written: AtomicU64,
+
+    /// Number of log messages emitted in this execution.
+    pub log_message_count: AtomicU64,
+
+    /// Active LLM streams indexed by stream ID.
+    /// Each stream holds a receiver channel for SSE events stored as JSON values.
+    pub llm_streams:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<serde_json::Value>>>,
+
+    /// Per-execution event emission counter for the events interface.
+    pub event_emit_count: AtomicU64,
+
+    /// Active SSE streams indexed by stream ID.
+    /// Each stream holds a receiver for parsed SSE events (None = stream ended).
+    pub sse_streams:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<SseEventInternal>>>,
+
+    /// Shared HTTP client for all outbound requests in this execution.
+    ///
+    /// Built once per execution with security defaults (no redirects, user-agent).
+    /// Reused across `fetch`, `fetch_all`, `graphql`, `webhook`, `email`, `llm`,
+    /// and `object_storage` calls to enable TCP/TLS connection reuse via the
+    /// internal connection pool. Per-call timeouts are set on the request builder,
+    /// not the client.
+    pub http_client: reqwest::Client,
+
+    /// S3-compatible endpoint URL (e.g., "http://minio:9000" or "https://s3.amazonaws.com").
+    /// Configured via S3_ENDPOINT env var or secrets.
+    pub s3_endpoint: Option<String>,
+    /// S3 access key ID.
+    pub s3_access_key: Option<String>,
+    /// S3 secret access key.
+    pub s3_secret_key: Option<String>,
+    /// S3 region (default: "us-east-1").
+    pub s3_region: Option<String>,
+
+    /// Optional OpenTelemetry runtime metrics handle.
+    /// Set from the runtime after construction so host functions can record
+    /// rate-limit, approval, LLM, cancellation, and quota metrics.
+    pub metrics: Option<Arc<crate::metrics::RuntimeMetrics>>,
+
+    /// Captures bytes written to WASI stderr during execution (panic messages, etc.).
+    /// Shared with the WasiCtx via a clone; readable from outside the Store after execution.
+    pub stderr_capture: Arc<std::sync::Mutex<Vec<u8>>>,
+
+    /// When true, non-GET HTTP requests, webhook sends, and messaging publishes
+    /// are mocked with success responses instead of executing real network calls.
+    /// GET requests still execute normally for data fetching.
+    pub dry_run: bool,
+}
+
+impl WasiView for TalosContext {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
+
+struct MpscWriter {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl AsyncWrite for MpscWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let _ = self.sender.try_send(buf.to_vec());
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Clone)]
+struct ChannelStdout {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl IsTerminal for ChannelStdout {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for ChannelStdout {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(MpscWriter {
+            sender: self.sender.clone(),
+        })
+    }
+}
+
+/// Captures WASI stderr writes (e.g. panic messages) into an in-process buffer.
+/// The Arc<Mutex<Vec<u8>>> is shared between the WasiCtx and the outer runtime
+/// so that panic text can be read after the Store is consumed.
+struct BufferWriter {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+/// MCP-593: per-execution cap on WASI stderr capture. Pre-fix the
+/// BufferWriter's `extend_from_slice` was unbounded — a malicious or
+/// buggy WASM module writing multi-GB to stderr (WASI stderr flows
+/// to the host buffer, NOT the WASM-bounded heap) would OOM the
+/// worker. The only legitimate consumer of this buffer is
+/// `extract_panic_message_from_stderr` (runtime.rs:163), which
+/// reads the first ~hundred bytes of a Rust panic header. 64 KiB
+/// is generous (covers verbose panics with backtraces) and bounds
+/// the host-side allocation cost per execution.
+const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+
+impl AsyncWrite for BufferWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Ok(mut guard) = self.buffer.lock() {
+            // MCP-593: cap host-side allocation. Returning `buf.len()`
+            // even when we silently drop the tail keeps the WASM guest
+            // believing the write succeeded (so it doesn't get stuck
+            // looping retries on a "short write" — that would just
+            // burn fuel without making progress); the panic-extraction
+            // path only needs the first few hundred bytes anyway.
+            let remaining = MAX_STDERR_CAPTURE_BYTES.saturating_sub(guard.len());
+            if remaining > 0 {
+                let take = buf.len().min(remaining);
+                guard.extend_from_slice(&buf[..take]);
+            }
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Clone)]
+struct BufferCapture {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl IsTerminal for BufferCapture {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for BufferCapture {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(BufferWriter {
+            buffer: self.buffer.clone(),
+        })
+    }
+}
+
+/// Parsed SSE event for the http-stream interface.
+pub struct SseEventInternal {
+    pub event_type: Option<String>,
+    pub data: String,
+    pub id: Option<String>,
+}
+
+impl TalosContext {
+    /// Create a new execution context with an ephemeral file-system sandbox.
+    ///
+    /// A fresh temporary directory is created for each call and mounted at `/`
+    /// in the WASI preopened-dirs table.  The directory is removed from disk
+    /// when the returned `TalosContext` is dropped.
+    ///
+    /// * `allowed_hosts` – hostname allowlist for outbound HTTP (empty = deny all; use `["*"]` to allow any host).
+    /// * `allowed_methods` – HTTP method allowlist (empty = allow all; `["GET"]` = read-only).
+    /// * `max_memory_mb` – memory cap in megabytes.
+    /// * `secrets` – pre-fetched, decrypted secret values consumed by the `TalosVaultProvider`.
+    ///   After construction the map is owned by the provider; no plaintext copy remains in the context.
+    /// * `redis_client` – optional Redis connection.
+    /// * `nats_client` – optional NATS connection.
+    /// * `allow_wasi_network` – if `true`, grant `wasi:sockets` access so the
+    ///   component can use `std::net::TcpStream` (WASIP2).
+    ///   Only set this for `network-node` or `automation-node`
+    ///   components; `minimal-node` components never need it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        capability_world: crate::wit_inspector::CapabilityWorld,
+        allowed_hosts: Vec<String>,
+        allowed_methods: Vec<String>,
+        max_memory_mb: usize,
+        secrets: HashMap<String, String>,
+        redis_client: Option<Arc<redis::Client>>,
+        nats_client: Option<Arc<async_nats::Client>>,
+        allow_wasi_network: bool,
+        token_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+        global_expose_fallback_count: Arc<std::sync::atomic::AtomicU64>,
+    ) -> anyhow::Result<Self> {
+        // ── Ephemeral sandbox ────────────────────────────────────────────────
+        // Create the per-execution temporary directory.  It is automatically
+        // removed from disk (including all contents) when `_ephemeral_dir` is
+        // dropped — which happens as soon as the Store is deallocated after
+        // execution, timeout, or panic.
+        let ephemeral_dir = tempfile::tempdir()?;
+
+        // Open a cap_std::fs::Dir handle for the `talos:core/files` host functions.
+        // These host functions enforce additional path sanitisation on top of
+        // the capability-based boundary already provided by cap-std.
+        let fs_dir =
+            cap_std::fs::Dir::open_ambient_dir(ephemeral_dir.path(), cap_std::ambient_authority())?;
+
+        // ── WASI context ─────────────────────────────────────────────────────
+        // Mount the sandbox at `/` using its host path.  WasiCtxBuilder opens
+        // the directory internally and registers it as a WASI preopened dir so
+        // that WASM nodes can use standard Rust file I/O (std::fs, std::io)
+        // transparently.  The DirPerms / FilePerms restrict what the WASM guest
+        // can do within the sandbox.
+        // Ensure a sensible memory limit is supplied (must be > 0).
+        if max_memory_mb == 0 {
+            anyhow::bail!("max_memory_mb must be > 0");
+        }
+        let mut builder = WasiCtxBuilder::new();
+
+        if let Some(tx) = token_sender {
+            builder.stdout(ChannelStdout { sender: tx });
+        } else {
+            builder.inherit_stdout();
+        }
+
+        // Capture WASI stderr into an in-process buffer instead of inheriting the
+        // worker's process stderr.  Panic messages (written to WASI stderr by the
+        // wasm32-wasip2 runtime) are preserved here and surfaced in trap errors.
+        let stderr_capture = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        builder.stderr(BufferCapture {
+            buffer: stderr_capture.clone(),
+        });
+
+        builder.preopened_dir(ephemeral_dir.path(), "/", DirPerms::all(), FilePerms::all())?;
+
+        // Network access for wasi:sockets (WASIP2) — only granted when the
+        // component's capability world includes outbound network I/O.
+        // `inherit_network()` lets the guest use std::net::TcpStream et al.
+        // The Talos `allowed_hosts` list still governs the HTTP host function;
+        // raw TCP is gated here at the WasiCtx level.
+        if allow_wasi_network {
+            builder.inherit_network();
+            builder.allow_ip_name_lookup(true);
+
+            // SECURITY: Disable raw UDP sockets.  Talos HTTP is TCP-only;
+            // UDP would allow DNS exfiltration and QUIC bypass of HTTP controls.
+            builder.allow_udp(false);
+
+            // SECURITY: Prevent Server-Side Request Forgery (SSRF)
+            // Even though `talos:core/http::fetch` respects the `allowed_hosts` list,
+            // raw WASI sockets bypass it entirely because they resolve directly to IPs.
+            // To ensure the WASM sandbox cannot be used to scan internal network infrastructure,
+            // we actively block connections to private, loopback, and link-local IP addresses.
+            builder.socket_addr_check(|addr, _use| {
+                Box::pin(async move {
+                    let ip = addr.ip();
+
+                    // SECURITY: Canonicalize IPv4-mapped IPv6 addresses (::ffff:A.B.C.D)
+                    // before checking. Without this, an attacker can bypass IPv4 private
+                    // range checks by using the mapped form (e.g., ::ffff:127.0.0.1).
+                    let ip = match ip {
+                        std::net::IpAddr::V6(v6) => {
+                            let segs = v6.segments();
+                            // IPv4-mapped: ::ffff:A.B.C.D → segments [0,0,0,0,0,0xffff,hi,lo]
+                            if segs[0] == 0 && segs[1] == 0 && segs[2] == 0
+                                && segs[3] == 0 && segs[4] == 0 && segs[5] == 0xffff
+                            {
+                                let mapped = std::net::Ipv4Addr::new(
+                                    (segs[6] >> 8) as u8,
+                                    segs[6] as u8,
+                                    (segs[7] >> 8) as u8,
+                                    segs[7] as u8,
+                                );
+                                tracing::debug!("Canonicalized IPv4-mapped IPv6 {} → {}", v6, mapped);
+                                std::net::IpAddr::V4(mapped)
+                            } else {
+                                std::net::IpAddr::V6(v6)
+                            }
+                        }
+                        other => other,
+                    };
+
+                    // Block loopback (127.0.0.0/8), unspecified (0.0.0.0), and multicast
+                    //
+                    // MCP-1070 (2026-05-15): widen `is_unspecified()` to the
+                    // full 0.0.0.0/8 RFC-1122 "this network" range. Pre-fix
+                    // `is_unspecified()` matched only the exact `0.0.0.0`
+                    // address, leaving `0.x.y.z` (kernel-substituted to
+                    // loopback on some Linux versions per the
+                    // `talos_http_utils::ssrf` comment) reachable from WASI
+                    // sockets. Sibling of MCP-1067/1068 (ssrf.rs guard) and
+                    // MCP-1069 (worker WIT-http classifier). Bringing the
+                    // THREE SSRF classifier surfaces (controller pre-validation,
+                    // worker WIT-http, worker WASI sockets) into byte-for-byte
+                    // agreement on the /8 deny.
+                    let v4_in_unspecified_subnet = match ip {
+                        std::net::IpAddr::V4(v4) => v4.octets()[0] == 0,
+                        std::net::IpAddr::V6(_) => false,
+                    };
+                    if ip.is_loopback()
+                        || ip.is_unspecified()
+                        || v4_in_unspecified_subnet
+                        || ip.is_multicast()
+                    {
+                        tracing::warn!("SECURITY: Blocked WASI socket connection to loopback/multicast/unspecified IP: {}", ip);
+                        return false;
+                    }
+
+                    match ip {
+                        std::net::IpAddr::V4(ipv4) => {
+                            // Block RFC 1918 private networks (10.x, 172.16.x, 192.168.x)
+                            // and RFC 3927 link-local networks (169.254.x.x - AWS Metadata)
+                            if ipv4.is_private() || ipv4.is_link_local() || ipv4.is_broadcast() || ipv4.is_documentation() {
+                                tracing::warn!("SECURITY: Blocked WASI socket connection to private/internal IP: {}", ipv4);
+                                return false;
+                            }
+                            // Block RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
+                            // Commonly used in cloud provider internal ranges (AWS 100.64/10)
+                            let addr_u32 = u32::from(ipv4);
+                            if (addr_u32 >> 22) == (0x64400000u32 >> 22) {
+                                tracing::warn!("SECURITY: Blocked WASI socket connection to CGN range (100.64/10): {}", ipv4);
+                                return false;
+                            }
+                        }
+                        std::net::IpAddr::V6(ipv6) => {
+                            // Block Unique Local Addresses (fc00::/7) — IPv6 RFC 1918 equivalent
+                            if (ipv6.segments()[0] & 0xfe00) == 0xfc00 {
+                                tracing::warn!("SECURITY: Blocked WASI socket connection to private IPv6: {}", ipv6);
+                                return false;
+                            }
+                            // Block IPv6 link-local (fe80::/10) — already caught by is_loopback
+                            // but check explicitly for clarity
+                            if (ipv6.segments()[0] & 0xffc0) == 0xfe80 {
+                                tracing::warn!("SECURITY: Blocked WASI socket connection to IPv6 link-local: {}", ipv6);
+                                return false;
+                            }
+                            // Block IPv6 site-local (fec0::/10) — deprecated but still used
+                            if (ipv6.segments()[0] & 0xffc0) == 0xfec0 {
+                                tracing::warn!("SECURITY: Blocked WASI socket connection to IPv6 site-local (fec0::/10): {}", ipv6);
+                                return false;
+                            }
+                        }
+                    }
+
+                    // Allow public external internet connections
+                    true
+                })
+            });
+        }
+
+        let wasi = builder.build();
+
+        let table = ResourceTable::new();
+        let max_memory_bytes = max_memory_mb * 1024 * 1024;
+        let http_ctx = wasmtime_wasi_http::WasiHttpCtx::new();
+
+        // Consume the pre-fetched secrets map into the SecretProvider.
+        // No plaintext copy of the map is retained in TalosContext — all secret
+        // access goes through the provider, which adds slot-based tracking and
+        // audit logging via AuditingProvider.
+        let provider: std::sync::Arc<dyn talos_secrets::SecretProvider> = {
+            let p = talos_secrets::config::build_provider(
+                &talos_secrets::config::ProviderConfig::TalosVault,
+                secrets, // consumed — no clone
+                true,    // enable AuditingProvider wrapper
+            );
+            std::sync::Arc::from(p)
+        };
+
+        Ok(Self {
+            wasi,
+            table,
+            http_ctx,
+            allowed_hosts,
+            allowed_methods,
+            allowed_sql_operations: vec![],
+            allowed_secrets: vec![],
+            env_vars: HashMap::new(),
+            capability_world,
+            // Populated downstream from the JobRequest; construct-time
+            // default is None so non-integration modules fall through to
+            // the `unauthorized` path in integration_state host fns.
+            integration_name: None,
+            provider,
+            expose_call_count: std::sync::atomic::AtomicU64::new(0),
+            secret_tier2_exposed: std::sync::atomic::AtomicBool::new(false),
+            allow_tier2_exposure: false,
+            global_expose_fallback_count,
+            workflow_id: None,
+            execution_id: None,
+            module_id: None,
+            user_id: None,
+            state_store: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            redis_client,
+            nats_client,
+            audit_ledger: None,
+            last_db_error: String::new(),
+            oom_error_message: None,
+            fs_dir,
+            _ephemeral_dir: ephemeral_dir,
+            max_memory_bytes,
+            crypto_budget_us: AtomicU64::new(5_000_000), // 5 seconds default
+            request_id: None,
+            cancellation_token: None,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            quota_usage: std::sync::Mutex::new(HashMap::new()),
+            http_call_count: AtomicU64::new(0),
+            db_query_count: AtomicU64::new(0),
+            messaging_publish_count: AtomicU64::new(0),
+            email_send_count: AtomicU64::new(0),
+            webhook_send_count: AtomicU64::new(0),
+            graphql_query_count: AtomicU64::new(0),
+            secret_access_count: AtomicU64::new(0),
+            fs_bytes_written: AtomicU64::new(0),
+            log_message_count: AtomicU64::new(0),
+            llm_streams: std::sync::Mutex::new(HashMap::new()),
+            event_emit_count: AtomicU64::new(0),
+            sse_streams: std::sync::Mutex::new(HashMap::new()),
+            // MCP-471: tighten the SSRF-redirect fallback. The
+            // `redirect(Policy::none())` above closes the redirect-
+            // pivot bypass for the worker's outbound HTTP / webhook /
+            // GraphQL / http-stream surfaces. The previous fallback
+            // `Client::new()` (no `.redirect()`) would silently
+            // re-enable the default `Policy::limited(10)` redirect
+            // following — exactly the gap we're trying to prevent.
+            // `.build()` rarely fails (TLS init only); `Client::new()`
+            // would panic on the same condition anyway, so the
+            // fallback was effectively dead AND would have reopened
+            // the SSRF gap if reached. `.expect()` surfaces a
+            // deployment failure loudly at worker context creation
+            // instead of silently degrading security posture.
+            // MCP-1058 (2026-05-15): defense-in-depth `.connect_timeout()`
+            // on the WIT host HTTP client. Per-call `wit_http::fetch` /
+            // `wit_http::fetch_all` / `wit_webhook::send` set the
+            // request-level `.timeout()` per invocation, but no
+            // client-level cap on TCP+TLS handshake. A WASM module
+            // calling out to a remote that accepts TCP but stalls TLS
+            // (e.g. SSRF target hardened against TLS probes, or a
+            // black-holed host) would otherwise consume the full
+            // per-call timeout on the handshake alone. 5s matches the
+            // workspace-canonical handshake budget.
+            http_client: reqwest::Client::builder()
+                .user_agent("Talos-Worker/1.0")
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(10)
+                .build()
+                .expect("worker: failed to build hardened reqwest client with no-redirect policy"),
+            // MCP-937 (2026-05-15): filter empty-string env values so a
+            // Helm-placeholder `S3_ENDPOINT=""` (or any of the three S3
+            // creds) doesn't propagate `Some("")` into the
+            // wit_object_storage host functions. Downstream consumers
+            // use `.as_ref().ok_or(NotConfigured)` which succeeds on
+            // `Some(&"")`, then `format!("{}/{}/{}", "", bucket, key)`
+            // produces a relative URL → parse fails → operator sees a
+            // confusing "Invalid S3 URL" log instead of the clean
+            // "NotConfigured" surface the absent-config case was
+            // designed to produce.
+            //
+            // s3_region also needs the filter — its `.or_else(|| Some(
+            // "us-east-1"))` fallback was shadowed by `Some("")` (the
+            // same chain class as MCP-934). With the filter, empty
+            // S3_REGION falls through to the us-east-1 default.
+            //
+            // Same empty-env-var-bypass class as MCP-590..631 /
+            // MCP-934 / MCP-935 / MCP-936.
+            s3_endpoint: std::env::var("S3_ENDPOINT")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            s3_access_key: std::env::var("S3_ACCESS_KEY_ID")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            s3_secret_key: std::env::var("S3_SECRET_ACCESS_KEY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            s3_region: std::env::var("S3_REGION")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or_else(|| Some("us-east-1".to_string())),
+            metrics: None,
+            stderr_capture,
+            dry_run: false,
+            actor_id: None,
+            max_llm_tier: talos_workflow_job_protocol::LlmTier::default(),
+        })
+    }
+
+    /// Read the bytes written to WASI stderr during this execution.
+    /// Returns an empty string if nothing was captured (normal case).
+    /// Non-UTF8 bytes are replaced with the Unicode replacement character.
+    pub fn take_stderr_output(&self) -> String {
+        let guard = self
+            .stderr_capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&guard).into_owned()
+    }
+
+    /// Set workflow context metadata for tracing and automatic logging.
+    pub fn set_workflow_context(
+        &mut self,
+        workflow_id: String,
+        execution_id: String,
+        module_id: String,
+    ) {
+        self.workflow_id = Some(workflow_id);
+        self.execution_id = Some(execution_id);
+        self.module_id = Some(module_id);
+    }
+
+    /// Set an optional request identifier for end‑to‑end correlation.
+    pub fn set_request_id(&mut self, request_id: String) {
+        self.request_id = Some(request_id);
+    }
+
+    /// Set the user ID for global rate limiting and audit logging.
+    pub fn set_user_id(&mut self, user_id: uuid::Uuid) {
+        self.user_id = Some(user_id);
+    }
+
+    /// Override environment variables (from workflow / module configuration).
+    pub fn set_env_vars(&mut self, vars: HashMap<String, String>) {
+        self.env_vars = vars;
+    }
+
+    /// Build the module-scoped prefix for agent memory keys.
+    /// Format: `mem:{module_id}:` — distinct from state keys (`{module_id}:`).
+    pub fn memory_key_prefix(&self) -> String {
+        match &self.module_id {
+            Some(mid) => format!("mem:{}:", mid),
+            None => "mem:_:".to_string(),
+        }
+    }
+
+    /// Build a module-scoped agent memory key.
+    pub fn scoped_memory_key(&self, key: &str) -> String {
+        format!("{}{}", self.memory_key_prefix(), key)
+    }
+
+    /// Set per-module secret allowlist.  When non-empty, only secrets whose
+    /// key matches an entry (or `"*"`) are served by `secrets::get-secret`.
+    pub fn set_allowed_secrets(&mut self, allowed: Vec<String>) {
+        self.allowed_secrets = allowed;
+    }
+
+    /// Allow or deny Tier-2 secret exposure for this module.
+    pub fn set_allow_tier2_exposure(&mut self, allow: bool) {
+        self.allow_tier2_exposure = allow;
+    }
+
+    /// Set per-module SQL operation allowlist.
+    pub fn set_allowed_sql_operations(&mut self, allowed: Vec<String>) {
+        self.allowed_sql_operations = allowed;
+    }
+
+    /// Enable dry-run mode: non-GET HTTP requests, webhook sends, and messaging
+    /// publishes are mocked. GET requests still execute normally for data fetching.
+    pub fn set_dry_run(&mut self, dry_run: bool) {
+        self.dry_run = dry_run;
+    }
+
+    /// Attach OpenTelemetry runtime metrics so host functions can record
+    /// rate-limit, approval, LLM, cancellation, and quota events.
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::RuntimeMetrics>) {
+        self.metrics = Some(metrics);
+    }
+}
+
+// ============================================================================
+// SAFETY NOTE
+// ============================================================================
+// `WasiCtx` and `ResourceTable` contain interior-mutability structures that
+// are not `Sync`.  Talos guarantees each `TalosContext` is only ever accessed
+// from a single thread at any point in time (one store per job execution).
+// This impl must be revisited if concurrent access is ever introduced.
+// unsafe impl Sync for TalosContext {}
+
+// ============================================================================
+// Resource limiter – enforced by Wasmtime to prevent exhaustion attacks
+// ============================================================================
+impl ResourceLimiter for TalosContext {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> std::result::Result<bool, wasmtime::Error> {
+        tracing::debug!(
+            current_kb = current / 1024,
+            desired_kb = desired / 1024,
+            limit_mb = self.max_memory_bytes / 1024 / 1024,
+            "WASM memory growth requested"
+        );
+        if desired > self.max_memory_bytes {
+            tracing::warn!(
+                current_mb = current / 1024 / 1024,
+                desired_mb = desired / 1024 / 1024,
+                limit_mb = self.max_memory_bytes / 1024 / 1024,
+                "WASM memory limit exceeded — denying allocation"
+            );
+            self.oom_error_message = Some(format!(
+                "WASM module exceeded its {}MB memory limit (tried to allocate {}MB). Reduce result size or use pagination.",
+                self.max_memory_bytes / 1024 / 1024,
+                desired / 1024 / 1024
+            ));
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> std::result::Result<bool, wasmtime::Error> {
+        const MAX_TABLE_SIZE: usize = 10_000;
+        if desired > MAX_TABLE_SIZE {
+            tracing::warn!(
+                current,
+                desired,
+                MAX_TABLE_SIZE,
+                "WASM table limit exceeded — denying allocation"
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+// Allow the context to be used as wasmtime component store data.
+impl wasmtime::component::HasData for TalosContext {
+    type Data<'a> = TalosContext;
+}
+
+impl wasmtime_wasi_http::p2::WasiHttpView for TalosContext {
+    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::p2::WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.table,
+            // SECURITY: Use default_hooks() which delegates HTTP to the built-in
+            // send_request implementation.  Talos WASM nodes should use
+            // talos:core/http for controlled HTTP (host allowlist, rate limits,
+            // SSRF protection).  The WIT world definitions only include
+            // wasi:http/types for type compatibility — outgoing-handler is
+            // intentionally not wired into any world except trusted/automation.
+            hooks: wasmtime_wasi_http::p2::default_hooks(),
+        }
+    }
+}
+
+impl TalosContext {
+    pub fn set_audit_ledger(
+        &mut self,
+        ledger: std::sync::Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>,
+    ) {
+        self.audit_ledger = Some(ledger);
+    }
+
+    /// Records a capability denial to the cryptographic audit ledger and
+    /// publishes it to the WORM stream (`talos.audit.ledger`).
+    ///
+    /// Every policy-driven refusal in the worker — HTTP host allowlist,
+    /// HTTP method allowlist, Tier-1 LLM egress, secret allowlist,
+    /// private-IP SSRF guard — calls this BEFORE returning the deny error
+    /// to the guest. The append is hash-chained (SHA-256 over the previous
+    /// row's hash plus length-prefixed fields) and HMAC-signed if
+    /// `TALOS_AUDIT_SIGNING_KEY` is configured. The downstream subscriber
+    /// in the controller persists the row to Postgres (append-only via
+    /// `prevent_audit_modification` trigger) and to S3 / MinIO (optionally
+    /// Object-Lock-Compliance gated by `TALOS_AUDIT_S3_OBJECT_LOCK`).
+    ///
+    /// Best-effort: a NATS publish failure does NOT change the deny
+    /// outcome and the security event remains visible via tracing and the
+    /// in-memory ledger row. The deny path itself is unconditional.
+    ///
+    /// SECURITY: never pass plaintext secret values, full vault paths, or
+    /// URLs containing tokens through `target`. Hash secret-derived values
+    /// first and pass only the host / path / hash.
+    ///
+    /// * `capability` — kebab-case kind: `http-fetch`, `http-method`,
+    ///   `tier1-llm-egress`, `secret-access`, `vault-header`, `graphql`,
+    ///   `webhook`, etc. Stable across releases — operator dashboards key
+    ///   on this.
+    /// * `policy` — which named policy fired: `allowed-hosts`,
+    ///   `external-llm-hosts`, `private-ip`, `method-allowlist`,
+    ///   `secret-allowlist`, etc. Pairs with `capability` to make the
+    ///   reason machine-grep'able.
+    /// * `target` — the attempted target as a non-secret string (host,
+    ///   key-path SHA-256, sanitized URL).
+    ///
+    /// Takes `&mut self` (not `&self`) so the future is `Send` without
+    /// requiring `TalosContext: Sync` — `WasiCtx` contains
+    /// `dyn RngCore + Send` which is not `Sync`. Matches the existing
+    /// inline-audit pattern at `host_impl.rs::secrets::get_secret`.
+    pub async fn record_capability_denied(&mut self, capability: &str, policy: &str, target: &str) {
+        let Some(ledger_mutex) = &self.audit_ledger else {
+            return;
+        };
+
+        let payload = serde_json::json!({
+            "capability": capability,
+            "policy": policy,
+            "target": target,
+            "actor_id": self.actor_id.map(|u| u.to_string()),
+            "module_id": self.module_id.as_deref(),
+        })
+        .to_string();
+
+        let event = {
+            let mut ledger = ledger_mutex.lock().await;
+            ledger.append("worker", "wasi:capability_denied", &payload)
+        };
+
+        if let Some(n) = &self.nats_client {
+            let nats = n.clone();
+            // MCP-735 (2026-05-13): log NATS publish failures on the
+            // audit-ledger replication path. Local `ledger.append`
+            // above is the WORM source-of-truth (file-level
+            // append-only), so a publish failure doesn't lose the
+            // event — but SIEM/dashboard consumers watching the NATS
+            // stream would silently see zero capability-deny events
+            // during a NATS outage and conclude (incorrectly) that no
+            // probes are happening. Same operational-visibility class
+            // as MCP-733 (state-write SQL) and MCP-734 (state-write-
+            // through publish) — fire-and-forget for the guest, but
+            // operators need WARN-level visibility on systemic
+            // failures.
+            let capability_label = capability.to_string();
+            tokio::spawn(async move {
+                let hash = event.calculate_hash();
+                let msg = serde_json::json!({
+                    "event": event,
+                    "hash": hash,
+                });
+                match serde_json::to_vec(&msg) {
+                    Ok(bytes) => {
+                        if let Err(e) = nats
+                            .publish("talos.audit.ledger".to_string(), bytes.into())
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "talos_rpc",
+                                capability = %capability_label,
+                                error = %e,
+                                "audit-ledger NATS replication failed (capability_denied) — local ledger unaffected, SIEM stream will miss this event"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "Failed to serialize capability_denied audit event"
+                    ),
+                }
+            });
+        }
+    }
+
+    /// Build a module-scoped state key to isolate per-module state within a
+    /// shared pipeline execution.  Format: `{module_id}:{key}`.
+    pub fn scoped_state_key(&self, key: &str) -> String {
+        match &self.module_id {
+            Some(mid) => format!("{}:{}", mid, key),
+            None => key.to_string(), // fallback for tests/unknown
+        }
+    }
+
+    /// Check if this execution has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // ========================================================================
+    // UNIFIED RESOURCE VALIDATION HELPERS
+    // ========================================================================
+
+    /// Validates that a JSON payload does not exceed the configured size limit.
+    ///
+    /// This is a unified helper used by all JSON-handling host functions to ensure
+    /// consistent enforcement of payload size limits and prevent OOM attacks.
+    ///
+    /// # Arguments
+    /// * `payload` - The JSON string to validate
+    /// * `operation` - Name of the operation for logging (e.g., "json::parse")
+    ///
+    /// # Returns
+    /// * `Ok(())` if the payload is within limits
+    /// * `Err(limit)` where limit is the max size if exceeded
+    pub fn validate_json_size(&self, payload: &str, operation: &str) -> Result<(), usize> {
+        const DEFAULT_MAX_JSON: usize = 1024 * 1024; // 1 MiB default
+        // MCP-495: cache the env-driven cap on first use. Every JSON
+        // parse/serialize ran `std::env::var("WASM_MAX_JSON_SIZE")` —
+        // a Mutex<HashMap> lookup inside libstd — and re-parsed the
+        // string on every call. WASM_MAX_JSON_SIZE is set at process
+        // start and doesn't change at runtime; OnceLock locks it in.
+        //
+        // MCP-772 (2026-05-13): route through `nonzero_env_or_default`
+        // (sibling to MCP-639 which fixed the WASM_MAX_OUTPUT_BYTES /
+        // WASM_MAX_INPUT_BYTES variants). `WASM_MAX_JSON_SIZE=0`
+        // previously parsed as a valid value and produced
+        // `payload.len() > 0 → true` for any non-empty JSON, rejecting
+        // every parse/serialize at the boundary. Helper substitutes
+        // the default + emits a structured WARN at first use.
+        use std::sync::OnceLock;
+        static MAX_JSON: OnceLock<usize> = OnceLock::new();
+        let max_json = *MAX_JSON.get_or_init(|| {
+            crate::runtime::nonzero_env_or_default("WASM_MAX_JSON_SIZE", DEFAULT_MAX_JSON)
+        });
+
+        if payload.len() > max_json {
+            tracing::warn!(
+                operation = operation,
+                size = payload.len(),
+                limit = max_json,
+                "JSON payload exceeds size limit"
+            );
+            return Err(max_json);
+        }
+        Ok(())
+    }
+
+    /// Consumes fuel to account for async host function execution time.
+    ///
+    /// This provides "async-aware" fuel consumption. While WASM fuel counts
+    /// instructions executed inside the guest, async host functions (like HTTP
+    /// requests) can run for a long time without executing guest instructions.
+    ///
+    /// This method converts elapsed wall time into an approximate fuel cost
+    /// based on the assumption that ~1ms of wall time ≈ 10,000 instructions
+    /// on a typical host. This prevents modules from making indefinite async
+    /// calls to bypass fuel limits.
+    ///
+    /// # Arguments
+    /// * `elapsed` - The elapsed wall time
+    /// * `operation` - Name of the operation for logging
+    ///
+    /// # Returns
+    /// The fuel cost computed from `elapsed`. Currently always succeeds —
+    /// fuel-budget enforcement happens in the per-host-fn caller, this
+    /// helper just standardizes the wall-time → fuel conversion.
+    pub fn consume_async_fuel(&mut self, elapsed: std::time::Duration, operation: &str) -> u64 {
+        // Approximate conversion: 1ms wall time ≈ 10,000 WASM instructions
+        // This is a conservative estimate that prevents abuse while allowing
+        // legitimate async operations.
+        const FUEL_PER_MS: u64 = 10_000;
+        let fuel_cost = (elapsed.as_millis() as u64).saturating_mul(FUEL_PER_MS);
+
+        // Return the cost so the caller can account for it
+        tracing::debug!(
+            operation = operation,
+            elapsed_ms = elapsed.as_millis(),
+            fuel_cost = fuel_cost,
+            "Consumed async fuel"
+        );
+
+        fuel_cost
+    }
+
+    /// Atomically check and consume crypto budget.
+    ///
+    /// This is an optimized variant of `deduct_crypto_budget` that checks if
+    /// sufficient budget exists before deducting, preventing overdraft.
+    ///
+    /// # Arguments
+    /// * `microseconds` - The amount of budget to consume
+    ///
+    /// # Returns
+    /// * `true` if the budget was successfully deducted
+    /// * `false` if insufficient budget exists
+    pub fn try_deduct_crypto_budget(&self, microseconds: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = self.crypto_budget_us.load(Ordering::Relaxed);
+            if current < microseconds {
+                return false;
+            }
+            let new_val = current - microseconds;
+            match self.crypto_budget_us.compare_exchange(
+                current,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue, // CAS failed, retry
+            }
+        }
+    }
+
+    /// Mark this execution as cancelled.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check if a rate limit has been exceeded. Returns true if OK, false if exceeded.
+    /// `limit` of 0 means unlimited.
+    ///
+    /// MCP-495: previously `fetch_add(1)` unconditionally — even when
+    /// the call was already over-budget. A module hammering an
+    /// exhausted limit pushed the counter arbitrarily high; consumers
+    /// reading the counter for metrics / reporting saw inflated
+    /// "attempts" instead of the actual call count. The CAS pattern
+    /// here matches `try_deduct_crypto_budget` / `deduct_crypto_budget`
+    /// in this same file: load → check → CAS-increment, retry on
+    /// contention. The counter only advances when the call IS
+    /// admitted, so its value is a faithful "calls allowed" tally.
+    /// The batch-HTTP path at `host_impl.rs::fetch_all` had to roll
+    /// back manually for the same reason — this helper now does
+    /// the right thing inline.
+    pub fn check_rate_limit(&self, counter: &AtomicU64, limit: u64) -> bool {
+        if limit == 0 {
+            return true;
+        }
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = counter.load(Ordering::Relaxed);
+            if current >= limit {
+                return false;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Atomically deduct `microseconds` from the crypto time budget.
+    /// Returns `true` if budget remains, `false` if exhausted.
+    pub fn deduct_crypto_budget(&self, microseconds: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = self.crypto_budget_us.load(Ordering::Relaxed);
+            if current == 0 {
+                return false;
+            }
+            let new_val = current.saturating_sub(microseconds);
+            match self.crypto_budget_us.compare_exchange(
+                current,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return new_val > 0,
+                Err(_) => continue, // CAS failed, retry
+            }
+        }
+    }
+
+    // Bulk state flush / load were part of the pre-Phase-2.3 durable-
+    // state design (used `state_db_pool` directly from the worker).
+    // With state writes now brokered through NATS via
+    // `spawn_state_write_through`, there is no in-process DB pool on
+    // the worker to flush to. Removed 2026-04-14.
+}
+
+// `flush_state_impl` and `load_state_impl` lived here pre-Phase-2.3
+// to push state into `execution_state` from the worker directly.
+// That path no longer exists — writes go through NATS-RPC
+// (`spawn_state_write_through`) and reads are in-memory only during
+// an execution. Deleted 2026-04-14.

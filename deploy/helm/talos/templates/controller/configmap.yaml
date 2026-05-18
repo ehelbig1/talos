@@ -1,0 +1,23 @@
+{{- if .Values.controller.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "talos.componentName" (list . "controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "controller") | nindent 4 }}
+data:
+  # Non-sensitive configuration snapshot. The Deployment renders env from
+  # values.yaml inline — this ConfigMap is kept for rolling-restart
+  # checksums and for operators to grep `kubectl get cm` to see what
+  # static config the controller was launched with.
+  CHART_VERSION: {{ .Chart.Version | quote }}
+  APP_VERSION: {{ .Chart.AppVersion | quote }}
+  NATS_URL: {{ include "talos.natsUrl" . | quote }}
+  NEO4J_URI: {{ include "talos.neo4jUri" . | quote }}
+  VAULT_ADDR: {{ include "talos.vaultAddr" . | quote }}
+  MINIO_ENDPOINT: {{ include "talos.minioEndpoint" . | quote }}
+  WORKFLOW_NATS_PREFIX: "talos"
+  KEK_PROVIDER: {{ .Values.controller.env.KEK_PROVIDER | default "vault" | quote }}
+  VAULT_TRANSIT_KEY_NAME: {{ .Values.controller.env.VAULT_TRANSIT_KEY_NAME | default "talos-kek" | quote }}
+{{- end }}

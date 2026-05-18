@@ -1,0 +1,42 @@
+{
+  "name": "human-approval",
+  "version": "v1.0.0",
+  "display_name": "Human Approval Gate",
+  "description": "Pause workflow execution and require manual human approval before proceeding. Emits an approval request event that must be acknowledged via the API.",
+  "category": "Governance",
+  "capability_world": "governance-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "REASON": {
+        "type": "string",
+        "default": "Manual review required",
+        "description": "Human-readable explanation for why approval is required"
+      },
+      "APPROVERS": {
+        "type": "string",
+        "description": "Optional comma-separated list of approver identifiers (email addresses or usernames)"
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Actor capability ceiling — required before adding this node",
+      "detail": "The workflow owning actor MUST have max_capability_world: \"governance-node\". If you see a capability ceiling violation at trigger time, run: grant_capability_ceiling(actor_id: \"<actor_id>\", world: \"governance-node\"). Without this, the workflow will fail at execution time with a capability ceiling error even if it builds successfully. Check the actor's current ceiling with get_actor_details."
+    },
+    {
+      "step": 2,
+      "title": "Configure approval reason",
+      "detail": "Set REASON to a clear explanation of what the approver is authorizing. This text will be shown in the approval request. You may use {{field_name}} to interpolate upstream output values — e.g. REASON: \"Review payment of {{amount}} to {{vendor}}\"."
+    },
+    {
+      "step": 3,
+      "title": "Approve or reject via MCP tool",
+      "detail": "When execution pauses at this node, call list_pending_approvals to see waiting approvals, then submit_workflow_approval(execution_id: \"<id>\", approved: true|false, reason: \"...\") to unblock the execution. Approved workflows continue from the next node; rejected workflows fail with an 'approval denied' error message."
+    }
+  ]
+}

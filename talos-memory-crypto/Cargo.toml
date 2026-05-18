@@ -1,0 +1,17 @@
+[package]
+name = "talos-memory-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+talos-memory = { path = "../talos-memory" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+uuid.workspace = true
+zeroize = "1.8"
+
+[lints]
+workspace = true

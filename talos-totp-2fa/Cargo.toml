@@ -1,0 +1,31 @@
+[package]
+name = "talos-totp-2fa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+bcrypt = "0.18"
+chrono.workspace = true
+dashmap = "6.1"
+hex = "0.4"
+image = "0.25"
+qrcode = "0.14"
+rand = { version = "0.8", default-features = true, features = ["std"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-config = { path = "../talos-config" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+subtle = "2.4"
+totp-rs = "5.7"
+tracing.workspace = true
+urlencoding = "2.1"
+uuid.workspace = true
+zeroize = "1.8"
+
+[lints]
+workspace = true

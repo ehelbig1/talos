@@ -1,0 +1,65 @@
+{
+  "name": "multi-agent-router",
+  "version": "v1.0.0",
+  "display_name": "Multi-Agent Router",
+  "description": "Capability-based task router: reads an input task description, scores it against a configured routing table of {capability: workflow_id} pairs using keyword matching, and triggers the best-matching sub-workflow. Falls back to a default workflow when no capability matches.",
+  "category": "Orchestration",
+  "capability_world": "automation-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["ROUTING_TABLE"],
+    "properties": {
+      "ROUTING_TABLE": {
+        "type": "string",
+        "description": "JSON object mapping capability names to workflow IDs. Each key is a capability name (used for keyword matching against the task) and each value is the workflow_id UUID to dispatch to. Example: '{\"data-analysis\": \"uuid-1\", \"email-drafting\": \"uuid-2\", \"code-review\": \"uuid-3\"}'"
+      },
+      "DEFAULT_WORKFLOW_ID": {
+        "type": "string",
+        "description": "Workflow ID to dispatch to when no capability matches. If not set and no match is found, the node returns an error."
+      },
+      "MATCH_THRESHOLD": {
+        "type": "number",
+        "default": 1,
+        "description": "Minimum number of keyword tokens from the capability name that must appear in the task description for a match (default: 1). Increase for stricter matching."
+      },
+      "PASS_THROUGH_INPUT": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true, the original task input is forwarded as the sub-workflow's input. When false, only the routing metadata is sent."
+      }
+    }
+  },
+  "output_shape": {
+    "routed": "true if a sub-workflow was selected, false if no match and no default",
+    "matched_capability": "The capability name that matched (null if using default)",
+    "match_score": "Number of keyword tokens matched",
+    "workflow_id": "The workflow_id that was selected for dispatch",
+    "task_summary": "First 200 characters of the input task for traceability",
+    "all_scores": "Object mapping each capability to its match score for debugging"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Actor capability ceiling",
+      "detail": "The workflow owning actor MUST have max_capability_world: 'automation-node'. Run: grant_capability_ceiling(actor_id: '<actor_id>', world: 'automation-node')."
+    },
+    {
+      "step": 2,
+      "title": "Create sub-workflows first",
+      "detail": "Create and publish all sub-workflows that the router will dispatch to. Note the workflow_id UUID of each one."
+    },
+    {
+      "step": 3,
+      "title": "Configure the routing table",
+      "detail": "Set ROUTING_TABLE to a JSON object. Keys should be descriptive, hyphen-separated capability names (these are tokenized for matching). Values are the workflow_id UUIDs. Example: '{\"sentiment-analysis\": \"abc-123\", \"text-summarization\": \"def-456\"}'."
+    },
+    {
+      "step": 4,
+      "title": "Input format",
+      "detail": "Send input as {\"task\": \"description of what needs to be done\"}. The router tokenizes the task and matches tokens against capability name tokens. The best match (highest token overlap) wins."
+    }
+  ]
+}

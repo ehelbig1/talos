@@ -1,0 +1,46 @@
+{
+  "name": "anthropic-claude",
+  "version": "v1.0.0",
+  "display_name": "Anthropic Claude",
+  "description": "Call the Anthropic Claude API with native tool_use for guaranteed structured output. Requires OUTPUT_SCHEMA (JSON Schema object) to define the output shape. Set API_KEY_SECRET config key to the vault path where your Anthropic API key is stored (canonical path: 'anthropic/api_key').",
+  "category": "AI",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.anthropic.com"],
+  "requires_secrets": ["anthropic/api_key"],
+  "setup_instructions": [
+    "1. Store your Anthropic API key: create_secret {name: 'anthropic/api_key', value: 'sk-ant-...', namespace: 'ai'}",
+    "2. Install this module with the vault path: install_module_from_catalog {name: 'anthropic-claude', allowed_secrets: ['anthropic/api_key']}",
+    "3. In node config, set API_KEY_SECRET = 'anthropic/api_key' (must match the vault path exactly)",
+    "4. Set OUTPUT_SCHEMA to a JSON Schema object string defining the required output shape",
+    "Note: If your key is stored at a different vault path, pass that path in the allowed_secrets array at install time and use the same path in API_KEY_SECRET config."
+  ],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "OUTPUT_SCHEMA"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path for the Anthropic API key. Canonical path: 'anthropic/api_key'. Must exactly match the path used when the secret was stored and when the module was installed with allowed_secrets."
+      },
+      "MODEL": {
+        "type": "string",
+        "default": "claude-sonnet-4-6",
+        "description": "Claude model identifier (e.g. claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001)"
+      },
+      "SYSTEM_PROMPT": {
+        "type": "string",
+        "default": "You are a helpful assistant.",
+        "description": "System prompt sent to Claude"
+      },
+      "MAX_TOKENS": {
+        "type": "number",
+        "default": 1024,
+        "description": "Maximum tokens in the response"
+      },
+      "OUTPUT_SCHEMA": {
+        "type": "string",
+        "description": "JSON Schema object (as a JSON string) defining the structured output shape. Required — tool_use is always enabled for this template."
+      }
+    }
+  }
+}

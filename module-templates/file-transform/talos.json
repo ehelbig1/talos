@@ -1,0 +1,39 @@
+{
+  "name": "file-transform",
+  "version": "v1.0.0",
+  "display_name": "File Transform",
+  "description": "Read, transform, and write data files within a sandboxed execution environment (supports CSV, XML, JSON).",
+  "category": "Data",
+  "capability_world": "filesystem-node",
+  "config_schema": {
+    "type": "object",
+    "required": ["input_file", "output_file"],
+    "properties": {
+      "input_file": {
+        "type": "string",
+        "description": "Path to the input file"
+      },
+      "output_file": {
+        "type": "string",
+        "description": "Path to the output file"
+      },
+      "input_format": {
+        "type": "string",
+        "enum": ["csv", "xml", "json"],
+        "default": "csv",
+        "description": "Format of the input file"
+      },
+      "output_format": {
+        "type": "string",
+        "enum": ["csv", "xml", "json"],
+        "default": "json",
+        "description": "Format of the output file"
+      },
+      "csv_has_headers": {
+        "type": "boolean",
+        "default": true,
+        "description": "Whether the CSV file has a header row"
+      }
+    }
+  }
+}

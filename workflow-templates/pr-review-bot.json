@@ -1,0 +1,44 @@
+{
+  "name": "GitHub PR Auto-Review → Slack Notification",
+  "description": "Automatically reviews new GitHub pull requests using an LLM and posts the review summary to Slack for team visibility.",
+  "category": "Development",
+  "tags": ["github", "pull-requests", "code-review", "slack", "ai"],
+  "nodes": [
+    {
+      "label": "Review PR",
+      "module_name": "GitHub PR Reviewer",
+      "config": {
+        "REPOSITORY": "owner/repo"
+      }
+    },
+    {
+      "label": "Notify Team",
+      "module_name": "Slack Message",
+      "config": {
+        "CHANNEL": "#code-reviews"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Review PR", "to": "Notify Team" }
+  ],
+  "suggested_schedule": null,
+  "required_secrets": [
+    { "key_path": "github/token", "description": "GitHub PAT with repo and pull_requests:write scopes" },
+    { "key_path": "llm/api_key", "description": "LLM provider API key for review generation" },
+    { "key_path": "slack/bot_token", "description": "Slack bot token with chat:write scope" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Notify Team",
+      "current_module": "Slack Message",
+      "replacements": [
+        {
+          "module_name": "Gmail",
+          "catalog_name": "send-gmail",
+          "config_delta": "Replace CHANNEL with TO (reviewer distribution list), SUBJECT (e.g. 'PR Review Ready'), BODY. Required secret: google/gmail_oauth_token instead of slack/bot_token. Use when reviewers prefer asynchronous email over Slack pings."
+        }
+      ]
+    }
+  ]
+}

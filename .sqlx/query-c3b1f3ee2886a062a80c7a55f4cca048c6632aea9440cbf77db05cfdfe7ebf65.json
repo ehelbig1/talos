@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT d.id FROM dead_letter_queue d JOIN workflows w ON w.id = d.workflow_id WHERE d.id = $1 AND w.user_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c3b1f3ee2886a062a80c7a55f4cca048c6632aea9440cbf77db05cfdfe7ebf65"
+}

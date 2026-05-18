@@ -1,0 +1,42 @@
+{
+  "name": "data-validator",
+  "version": "v1.0.0",
+  "display_name": "Data Validator",
+  "description": "Validate numeric fields in the input data against min/max bounds. Fails the node if validation does not pass, allowing conditional error edges to handle invalid data.",
+  "category": "Data",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["FIELD"],
+    "properties": {
+      "FIELD": {
+        "type": "string",
+        "description": "Field name in the input data to validate (e.g. 'score', 'count', 'price')"
+      },
+      "MIN_VALUE": {
+        "type": "number",
+        "description": "Minimum allowed value (inclusive). No minimum check if omitted."
+      },
+      "MAX_VALUE": {
+        "type": "number",
+        "description": "Maximum allowed value (inclusive). No maximum check if omitted."
+      }
+    }
+  },
+  "output_shape": {
+    "field": "The name of the validated field (mirrors the FIELD config value)",
+    "success": "true if the value passed validation, false if it failed bounds checks",
+    "value": "The numeric value that was validated (as a JSON number)",
+    "error": "Present only on failure — human-readable description of the bounds violation"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Data flow warning — output replaces upstream input",
+      "detail": "Data_Validator outputs {\"field\", \"success\", \"value\"} — NOT the full upstream payload. Nodes wired after the validator cannot access the original trigger fields (e.g. order_id, country, items_count) via data[\"input\"]. Use data[\"__trigger_input__\"][\"field_name\"] to recover original trigger fields in downstream nodes."
+    }
+  ]
+}

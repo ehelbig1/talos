@@ -1,0 +1,14 @@
+{
+    "name": "echo-debug",
+    "display_name": "Echo/Debug",
+    "version": "v1.0.0",
+    "category": "Development",
+    "description": "Prints incoming data to logs for debugging.",
+    "capability_world": "minimal-node",
+    "allowed_hosts": [],
+    "requires_secrets": [],
+    "config_schema": {
+        "type": "object",
+        "properties": {}
+    }
+}

@@ -1,0 +1,37 @@
+[package]
+name = "talos-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-nats = "0.47"
+chrono.workspace = true
+chrono-tz = "0.10"
+croner = "2.0"
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-config = { path = "../talos-config" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-engine = { path = "../talos-engine" }
+talos-memory = { path = "../talos-memory" }
+talos-execution-repository = { path = "../talos-execution-repository" }
+talos-module-executions = { path = "../talos-module-executions" }
+talos-registry = { path = "../talos-registry" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-worker-fleet = { path = "../talos-worker-fleet" }
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

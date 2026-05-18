@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO resource_quotas (org_id, metric, max_limit) VALUES ($1, $2, $3) ON CONFLICT (org_id, metric) DO UPDATE SET max_limit = EXCLUDED.max_limit",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "362231d438ed5a1f5ec0da334ad3e37c698b25889f2cebdae91b0f5bad474a19"
+}

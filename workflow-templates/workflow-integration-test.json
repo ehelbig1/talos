@@ -1,0 +1,42 @@
+{
+  "name": "Workflow Integration Test",
+  "description": "Test a workflow against mocked dependencies with contract assertions. Uses Mock Responder to simulate external services and Workflow Assert to validate outputs — no real API calls required.",
+  "category": "Development",
+  "tags": ["testing", "integration", "mock", "assertions", "ci", "quality"],
+  "required_secrets": [],
+  "suggested_schedule": null,
+  "nodes": [
+    {
+      "label": "Mock Upstream API",
+      "module_name": "Mock Responder",
+      "config": {
+        "RESPONSE": "{\"status\": \"ok\", \"data\": {\"id\": 1, \"name\": \"test-record\"}, \"meta\": {\"total\": 1}}",
+        "ECHO_INPUT": "false"
+      }
+    },
+    {
+      "label": "Assert Response Contract",
+      "module_name": "Workflow Assert",
+      "config": {
+        "ASSERTIONS": "[{\"path\": \"status\", \"op\": \"eq\", \"value\": \"ok\"}, {\"path\": \"data.id\", \"op\": \"exists\"}, {\"path\": \"data.name\", \"op\": \"ne\", \"value\": \"\"}, {\"path\": \"meta.total\", \"op\": \"gt\", \"value\": 0}]",
+        "FAIL_FAST": "true"
+      }
+    }
+  ],
+  "edges": [
+    {"from": "Mock Upstream API", "to": "Assert Response Contract"}
+  ],
+  "alternatives": [
+    {
+      "current_module": "Mock Responder",
+      "node_label": "Mock Upstream API",
+      "replacements": [
+        {
+          "catalog_name": "http-retry",
+          "module_name": "HTTP Request with Retry",
+          "config_delta": "Replace RESPONSE+ECHO_INPUT with URL (e.g. 'https://staging.example.com/api/endpoint'), METHOD ('GET'), and optional MAX_RETRIES / BACKOFF_MS. Use to swap the mock for real HTTP calls against a staging environment without touching the assertion node."
+        }
+      ]
+    }
+  ]
+}

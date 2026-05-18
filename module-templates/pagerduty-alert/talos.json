@@ -1,0 +1,64 @@
+{
+  "display_name": "PagerDuty Alert",
+  "category": "Operations",
+  "capability_world": "network-node",
+  "description": "Trigger, acknowledge, or resolve a PagerDuty incident via the Events API v2.",
+  "allowed_hosts": ["events.pagerduty.com"],
+  "requires_secrets": ["pagerduty/integration_key"],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "INTEGRATION_KEY_SECRET": {
+        "type": "string",
+        "description": "Secret key_path storing the PagerDuty Events API v2 integration key (e.g. pagerduty/integration_key)"
+      },
+      "SUMMARY": {
+        "type": "string",
+        "description": "Short human-readable summary of the alert (shown as the incident title in PagerDuty)"
+      },
+      "ACTION": {
+        "type": "string",
+        "description": "Event action to send to PagerDuty",
+        "enum": ["trigger", "acknowledge", "resolve"],
+        "default": "trigger"
+      },
+      "SEVERITY": {
+        "type": "string",
+        "description": "Severity level for the alert",
+        "enum": ["critical", "error", "warning", "info"],
+        "default": "error"
+      },
+      "SOURCE": {
+        "type": "string",
+        "description": "Optional: machine-readable name of the component that caused the alert (e.g. 'api-server', 'db-primary')"
+      },
+      "DEDUP_KEY": {
+        "type": "string",
+        "description": "Optional deduplication key. Subsequent events with the same key update the existing incident instead of creating a new one."
+      }
+    },
+    "required": ["INTEGRATION_KEY_SECRET", "SUMMARY"]
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a PagerDuty integration",
+      "detail": "In PagerDuty, navigate to Services → select or create a service → Integrations → Add Integration → Events API v2."
+    },
+    {
+      "step": 2,
+      "title": "Copy the integration key",
+      "detail": "Copy the Integration Key shown on the integration detail page."
+    },
+    {
+      "step": 3,
+      "title": "Store the key as a secret",
+      "detail": "Use set_secret with key_path='pagerduty/integration_key' and the copied key as the value."
+    },
+    {
+      "step": 4,
+      "title": "Configure this node",
+      "detail": "Set INTEGRATION_KEY_SECRET='pagerduty/integration_key' and SUMMARY to a descriptive alert message. Optionally set ACTION, SEVERITY, SOURCE, and DEDUP_KEY."
+    }
+  ]
+}

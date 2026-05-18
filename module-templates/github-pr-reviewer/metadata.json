@@ -1,0 +1,8 @@
+{
+    "id": "github-pr-reviewer",
+    "name": "GitHub PR Auto-Reviewer",
+    "description": "Webhook-driven AI code review using OpenAI to comment directly on GitHub PRs.",
+    "category": "Development",
+    "version": "1.0.0",
+    "author": "Talos"
+}

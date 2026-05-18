@@ -1,0 +1,60 @@
+{
+  "name": "Weekly GitHub Report → AI Summary → Email",
+  "description": "Every Monday morning, analyzes a GitHub repository's recent activity, generates an executive summary using an LLM, and sends it via Gmail.",
+  "category": "Reporting",
+  "tags": ["github", "llm", "email", "scheduled", "weekly-report"],
+  "nodes": [
+    {
+      "label": "Fetch Repo Activity",
+      "module_name": "GitHub Repo Analyzer",
+      "config": {
+        "repository": "owner/repo"
+      }
+    },
+    {
+      "label": "Generate Summary",
+      "module_name": "LLM Inference",
+      "config": {
+        "MODEL": "claude-sonnet-4-6",
+        "SYSTEM_PROMPT": "You are a technical writer. Summarize the repository activity for a non-technical audience in 3-5 bullet points.",
+        "MAX_TOKENS": 512
+      }
+    },
+    {
+      "label": "Email Report",
+      "module_name": "Gmail",
+      "config": {
+        "TO": "team@example.com",
+        "SUBJECT": "Weekly Engineering Report"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Fetch Repo Activity", "to": "Generate Summary" },
+    { "from": "Generate Summary", "to": "Email Report" }
+  ],
+  "suggested_schedule": "0 8 * * 1",
+  "required_secrets": [
+    { "key_path": "github/token", "description": "GitHub PAT with repo:read scope" },
+    { "key_path": "llm/api_key", "description": "LLM provider API key" },
+    { "key_path": "google/gmail_oauth_token", "description": "Gmail OAuth2 refresh token" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Email Report",
+      "current_module": "Gmail",
+      "replacements": [
+        {
+          "module_name": "Slack Message",
+          "catalog_name": "send-slack-message",
+          "config_delta": "Replace TO+SUBJECT+BODY with CHANNEL (e.g. '#weekly-reports'). Required secret: slack/bot_token instead of google/gmail_oauth_token. Better for team-wide visibility where the report is discussed inline."
+        },
+        {
+          "module_name": "Microsoft Teams Message",
+          "catalog_name": "send-teams-message",
+          "config_delta": "Replace TO+SUBJECT+BODY with WEBHOOK_URL_SECRET='teams/webhook_url'. Set TITLE='Weekly Engineering Report'. Required secret: teams/webhook_url instead of google/gmail_oauth_token."
+        }
+      ]
+    }
+  ]
+}

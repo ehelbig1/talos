@@ -1,0 +1,9 @@
+{
+  "name": "Network Scanner",
+  "description": "Probe TCP host:port targets to check reachability. Uses WASI Preview 2 native sockets (std::net::TcpStream) — requires wasm32-wasip2 compilation target. Supports service banner grabbing.",
+  "category": "network",
+  "capability_world": "network-node",
+  "tags": ["network", "security", "tcp", "port-scan", "wasip2"],
+  "author": "Talos",
+  "version": "1.0.0"
+}

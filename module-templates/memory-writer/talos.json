@@ -1,0 +1,29 @@
+{
+  "name": "memory-writer",
+  "version": "v1.0.0",
+  "display_name": "Actor Memory Writer",
+  "description": "Passes upstream output through and injects a __memory_write__ key so the engine auto-persists it to actor memory. Configure MEMORY_KEY (default: 'work_context') and MEMORY_TYPE (default: 'semantic'). Use as the last node in a pipeline to persist summarized data.",
+  "category": "Orchestration",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "dependencies": {
+    "chrono": "0.4"
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "MEMORY_KEY": {
+        "type": "string",
+        "default": "work_context",
+        "description": "Key under which the data is stored in actor memory"
+      },
+      "MEMORY_TYPE": {
+        "type": "string",
+        "enum": ["semantic", "episodic", "working", "scratchpad"],
+        "default": "semantic",
+        "description": "Memory type: semantic (permanent), episodic (7d), working (1h), scratchpad (24h)"
+      }
+    }
+  }
+}

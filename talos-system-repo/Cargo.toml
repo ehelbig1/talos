@@ -1,0 +1,18 @@
+[package]
+name = "talos-system-repo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bcrypt = "0.18"
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+{
+  "name": "Google Calendar Webhook",
+  "category": "calendar",
+  "description": "Receive real-time notifications when Google Calendar events are created, updated, or deleted",
+  "icon": "📅",
+  "version": "1.0.0",
+  "author": "Talos",
+  "tags": ["google", "calendar", "webhook", "events", "notifications"],
+  "documentation": "https://developers.google.com/calendar/api/guides/push",
+  "requirements": [
+    "Google account connected via OAuth",
+    "Calendar selection (configured via UI)"
+  ],
+  "capabilities": {
+    "realtime": true,
+    "filtering": true,
+    "enrichment": true,
+    "oauth": "google"
+  }
+}

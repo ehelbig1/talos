@@ -1,0 +1,29 @@
+[package]
+name = "talos-rpc-subscribers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-nats = "0.47"
+futures = "0.3"
+serde_json.workspace = true
+# M-7: AST-based SQL validation re-applied at the controller boundary
+# as defense-in-depth against worker↔Postgres parser-divergence. Same
+# version as the worker uses so both sides agree on what's a single
+# statement.
+sqlparser = "0.53"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-actor-memory-service = { path = "../talos-actor-memory-service" }
+talos-graph-rag = { path = "../talos-graph-rag" }
+talos-integration-state = { path = "../talos-integration-state" }
+talos-memory = { path = "../talos-memory" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

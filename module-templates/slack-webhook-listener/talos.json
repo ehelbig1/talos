@@ -1,0 +1,58 @@
+{
+  "name": "slack-webhook-listener",
+  "version": "v1.0.0",
+  "display_name": "Slack Webhook Listener",
+  "description": "Receive and verify Slack event webhook payloads. Validates the Slack signing secret, filters by channel and event type, and outputs structured event data.",
+  "category": "Communication",
+  "capability_world": "network-node",
+  "allowed_hosts": ["slack.com", "api.slack.com"],
+  "requires_secrets": ["slack/signing_secret"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["SIGNING_SECRET_PATH"],
+    "properties": {
+      "SIGNING_SECRET_PATH": {
+        "type": "string",
+        "description": "Secret path for the Slack app signing secret (e.g. 'slack/signing_secret')"
+      },
+      "CHANNEL_FILTER": {
+        "type": "string",
+        "description": "Optional channel ID to filter events. Only events from this channel will be processed."
+      },
+      "EVENT_TYPES": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional list of Slack event types to process (e.g. ['message', 'app_mention']). All events processed if omitted."
+      },
+      "OUTPUT_FORMAT": {
+        "type": "string",
+        "enum": ["raw", "simplified", "enriched"],
+        "default": "simplified",
+        "description": "Output format: 'raw' returns full Slack payload, 'simplified' returns key fields, 'enriched' adds metadata."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable Event Subscriptions in your Slack app",
+      "detail": "In your Slack app settings, go to 'Event Subscriptions' and toggle it on. Set the Request URL to your Talos webhook endpoint."
+    },
+    {
+      "step": 2,
+      "title": "Subscribe to bot events",
+      "detail": "Under 'Subscribe to bot events', add the event types you want to receive (e.g. 'message.channels', 'app_mention')."
+    },
+    {
+      "step": 3,
+      "title": "Copy the signing secret",
+      "detail": "In 'Basic Information', find 'App Credentials' and copy the 'Signing Secret'."
+    },
+    {
+      "step": 4,
+      "title": "Store signing secret",
+      "detail": "Use set_secret: key_path='slack/signing_secret', value='your-signing-secret'."
+    }
+  ]
+}

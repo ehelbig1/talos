@@ -1,0 +1,46 @@
+{
+  "name": "data-pipeline-etl",
+  "version": "v1.0.0",
+  "display_name": "Data Pipeline ETL",
+  "description": "Extract data from a source URL (JSON array), transform it, and load it into a database table. Optionally injects a Bearer token from a stored secret for authenticated endpoints.",
+  "category": "Data",
+  "capability_world": "database-node",
+  "allowed_hosts": ["*"],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["SOURCE_URL", "TARGET_TABLE"],
+    "properties": {
+      "SOURCE_URL": {
+        "type": "string",
+        "description": "URL to fetch source data from. Must return a JSON array of objects."
+      },
+      "TARGET_TABLE": {
+        "type": "string",
+        "description": "Target database table name (alphanumeric + underscores only). The table must already exist with columns: remote_id, name, email, company."
+      },
+      "API_TOKEN_SECRET": {
+        "type": "string",
+        "description": "Optional: key_path of a secret containing the Bearer token for authenticated source endpoints (e.g. 'api/source-token'). Leave empty for public URLs."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Prepare your database table",
+      "detail": "Create the target table before running. Example: CREATE TABLE etl_records (id SERIAL PRIMARY KEY, remote_id VARCHAR(255), name VARCHAR(255), email VARCHAR(255), company VARCHAR(255));"
+    },
+    {
+      "step": 2,
+      "title": "Store API token (if needed)",
+      "detail": "If SOURCE_URL requires authentication, store the token with set_secret and reference its key_path in API_TOKEN_SECRET. Example: key_path='api/source-token'."
+    },
+    {
+      "step": 3,
+      "title": "Verify source URL",
+      "detail": "The SOURCE_URL must return a JSON array of objects with fields: id, name, email, company (nested). Test with curl before deploying."
+    }
+  ]
+}

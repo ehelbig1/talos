@@ -1,0 +1,28 @@
+FROM ollama/ollama:0.5.1@sha256:722ce8caba5f8b8bd2ee654b2e29466415be3071a704e3f4db1702b83c885f76
+
+# Models baked into the image so they're available on first boot.
+#
+# - nomic-embed-text: 768-dim embeddings for semantic search (~274 MB).
+# - qwen2.5:32b (default): Tier-1 LLM for agents that must keep data on-host
+#   (sensitive actors: medical, financial, relationship content). Qwen 2.5 32B
+#   is best-in-class for agent tool-use + JSON-mode output at this size and
+#   fits in 32GB RAM with Q4_K_M quantization (~20 GB on disk).
+#
+# Larger hardware upgrade path: build with
+#   docker compose build --build-arg TIER1_MODEL=llama3.3:70b ollama
+# Needs ~64GB RAM; stronger on complex reasoning at ~3x slower token generation.
+# Both expose the same OpenAI-compatible API the controller already uses.
+ARG TIER1_MODEL=qwen2.5:32b
+ENV TIER1_MODEL=${TIER1_MODEL}
+
+RUN ollama serve & \
+    SERVER_PID=$! && \
+    sleep 5 && \
+    ollama pull nomic-embed-text && \
+    ollama pull "${TIER1_MODEL}" && \
+    # Keep `mistral` available too so existing workflows that hardcoded it
+    # continue to work during the default-model migration window.
+    # Remove from this image once all module configs have been flipped to
+    # the new default. Small enough (~4 GB) to keep around.
+    ollama pull mistral && \
+    kill $SERVER_PID 2>/dev/null || true

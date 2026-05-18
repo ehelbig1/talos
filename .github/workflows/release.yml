@@ -1,0 +1,290 @@
+name: Release
+
+# Triggers on any `v*` tag push — e.g. `git tag v1.2.3 && git push --tags`.
+# Produces signed Docker images + SBOMs + SLSA provenance for every tag.
+#
+# SLSA Level 2 contract (what a verifier can assert after this workflow runs):
+#   • Image was built by GitHub Actions on `ehelbig1/talos-v0` (hosted CI).
+#   • Source commit + tag + workflow invocation are baked into a signed
+#     in-toto provenance attestation verifiable via Sigstore.
+#   • Dependencies at build time are listed in a signed SBOM attestation.
+#   • All three artifacts (image, SBOM, provenance) are entered into the
+#     Rekor public transparency log — tamper-evident via offline queries.
+#
+# Verification (example):
+#   cosign verify \
+#     --certificate-identity-regexp "^https://github.com/ehelbig1/talos-v0/\\.github/workflows/release\\.yml@refs/tags/v.*" \
+#     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+#     ghcr.io/ehelbig1/talos-controller:1.2.3
+#
+# See `docs/security/operational-runbook.md` for the full verification
+# procedure + incident response on a revoked / leaked identity.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write        # create GitHub Release + upload assets
+  packages: write        # push to ghcr.io
+  id-token: write        # REQUIRED for Sigstore keyless signing — grants
+                          # the workflow an OIDC token that Fulcio uses to
+                          # issue short-lived certs bound to this repo +
+                          # workflow + ref. Without this, `cosign sign`
+                          # falls back to key-based signing and we'd need
+                          # to manage private keys manually.
+  attestations: write    # required by slsa-github-generator for the
+                          # GitHub-native attestation store (in addition
+                          # to Rekor).
+
+jobs:
+  # ── Gate on CI — never release a broken tagged commit ──────────────────
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # ── Build + push images; emit digests for downstream signing jobs ──────
+  release:
+    name: Build & Push
+    needs: [ci]
+    runs-on: ubuntu-latest
+    outputs:
+      # Each service's fully-qualified digest flows to the sign/attest
+      # jobs. Signing BY DIGEST (not by tag) is the whole security point:
+      # a later re-tag to a different image can't co-opt the signature.
+      controller-digest: ${{ steps.push.outputs.controller-digest }}
+      worker-digest: ${{ steps.push.outputs.worker-digest }}
+      frontend-digest: ${{ steps.push.outputs.frontend-digest }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      # All third-party actions in this workflow are pinned by full commit
+      # SHA. Release runs under an OIDC identity that mints Sigstore
+      # signatures + SLSA provenance in our name — a compromised upstream
+      # at a moving tag could co-opt those credentials. CI (.github/workflows/ci.yml)
+      # uses the same SHA pins; bump in lockstep.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      # Workspace path-deps require the sibling at a path one level
+      # above ${{ github.workspace }}. actions/checkout refuses
+      # out-of-workspace paths, so clone via plain git. Repo is public.
+      - name: Clone talos-workflow-engine sibling
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/aegix-dev/talos-workflow-engine.git \
+            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
+
+      - name: Derive version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
+        with:
+          toolchain: "1.95"
+
+      - name: Build release binaries
+        run: cargo build --release --locked --workspace
+
+      - name: Build Docker images
+        run: docker compose build controller worker frontend
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef  # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push immutable VERSION tags, capture digests
+        id: push
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          OWNER="${{ github.repository_owner }}"
+          # Push ONLY the version tag in this step. The mutable `:latest`
+          # tag is moved by the `promote-latest` job AFTER signing and
+          # SBOM attestation complete — without that ordering, a consumer
+          # pulling `:latest` between push and sign could land an
+          # unsigned artifact (small race window in CI, but real).
+          for svc in controller worker frontend; do
+            VER_TAG="ghcr.io/$OWNER/talos-$svc:$VERSION"
+            docker tag "talos-$svc" "$VER_TAG"
+            docker push "$VER_TAG"
+            # Resolve digest deterministically (the push output isn't
+            # machine-parseable across docker versions). `inspect` returns
+            # `ghcr.io/...:tag@sha256:...` from RepoDigests after push.
+            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$VER_TAG" \
+                     | awk -F@ '{print $2}')
+            echo "$svc digest: $DIGEST"
+            echo "${svc}-digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@01570a1f39cb168c169c802c3bceb9e93fb10974  # v2.1.0
+        with:
+          generate_release_notes: true
+
+  # ── Sign each image + attest SBOM (SLSA L2 artifact identity) ──────────
+  # Runs as a separate job so its OIDC token scope is narrowly "signing",
+  # not "build+push+sign". Limits blast radius if the signing step is ever
+  # compromised.
+  sign:
+    name: Sign + SBOM (${{ matrix.service }})
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      packages: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [controller, worker, frontend]
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef  # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pinned-by-SHA for both cosign + syft because these actions run
+      # with our OIDC token — a compromised upstream action would issue
+      # signatures in our name. `@v3` is a moving target; a full SHA is not.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a  # v3.8.1
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@df80a981bc6edbc4e220a492d3cbe9f5547a6e75  # v0.17.9
+
+      - name: Resolve digest for this service
+        id: digest
+        run: |
+          case "${{ matrix.service }}" in
+            controller) echo "digest=${{ needs.release.outputs.controller-digest }}" >> "$GITHUB_OUTPUT" ;;
+            worker)     echo "digest=${{ needs.release.outputs.worker-digest }}"     >> "$GITHUB_OUTPUT" ;;
+            frontend)   echo "digest=${{ needs.release.outputs.frontend-digest }}"   >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Sign image (keyless, Sigstore + Rekor)
+        env:
+          # Opt into keyless — no local key material, identity comes from
+          # the workflow's OIDC token. Fulcio issues a 10-minute cert
+          # bound to the workflow URI; Rekor records the signature.
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/talos-${{ matrix.service }}@${{ steps.digest.outputs.digest }}"
+          echo "Signing: $IMAGE"
+          # `--yes` skips the interactive confirm — non-interactive CI only.
+          cosign sign --yes "$IMAGE"
+
+      - name: Generate SBOM (SPDX-JSON)
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/talos-${{ matrix.service }}@${{ steps.digest.outputs.digest }}"
+          syft "$IMAGE" -o spdx-json > sbom-${{ matrix.service }}.spdx.json
+          # Size-sanity: empty SBOM means syft didn't actually scan anything.
+          test "$(wc -c < sbom-${{ matrix.service }}.spdx.json)" -gt 1024
+
+      - name: Attest SBOM to the image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/talos-${{ matrix.service }}@${{ steps.digest.outputs.digest }}"
+          # `attest` wraps the SBOM in an in-toto statement, signs via
+          # Sigstore, and uploads to the registry alongside the image.
+          # `verify-attestation` later downloads + verifies the chain.
+          cosign attest --yes \
+            --predicate sbom-${{ matrix.service }}.spdx.json \
+            --type spdxjson \
+            "$IMAGE"
+
+      - name: Upload SBOM to release assets
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: sbom-${{ matrix.service }}-${{ needs.release.outputs.version }}
+          path: sbom-${{ matrix.service }}.spdx.json
+          retention-days: 90
+
+  # ── SLSA provenance (the L2 badge requirement) ─────────────────────────
+  # `slsa-github-generator` is the official SLSA-framework-maintained
+  # reusable workflow. It emits a signed in-toto provenance statement
+  # that includes: builder identity, source repo + commit, workflow ref,
+  # entry point, build time, and all inputs. Verifiers use this to prove
+  # the artifact came from OUR CI and no other.
+  provenance:
+    needs: [release]
+    permissions:
+      id-token: write
+      packages: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: controller
+            digest: ${{ needs.release.outputs.controller-digest }}
+          - service: worker
+            digest: ${{ needs.release.outputs.worker-digest }}
+          - service: frontend
+            digest: ${{ needs.release.outputs.frontend-digest }}
+    # Reusable workflow pinned by SHA + tag comment. Reusable workflows are
+    # invoked via `uses:` at the top level of the job; SHA pinning works the
+    # same as actions and prevents a tag-move from injecting steps under
+    # our id-token.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563  # v2.0.0
+    with:
+      image: ghcr.io/${{ github.repository_owner }}/talos-${{ matrix.service }}
+      digest: ${{ matrix.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Promote `:latest` only AFTER signing + provenance complete ─────────
+  # The :VERSION tag was pushed in the `release` job and is the digest the
+  # sign + provenance jobs attest. Moving `:latest` here (post-sign) closes
+  # the small race window where a consumer pulling `:latest` between push
+  # and sign-job-complete would land an unsigned artifact. The retag is
+  # done server-side via `crane` to avoid re-pulling the image.
+  promote-latest:
+    name: Promote :latest to signed digest
+    needs: [release, sign, provenance]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: controller
+            digest: ${{ needs.release.outputs.controller-digest }}
+          - service: worker
+            digest: ${{ needs.release.outputs.worker-digest }}
+          - service: frontend
+            digest: ${{ needs.release.outputs.frontend-digest }}
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef  # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install crane
+        # `crane` retags by digest server-side without re-pulling the image
+        # bytes. Pinned by SHA same as every other action in this workflow.
+        uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e  # v0.4
+        with:
+          version: v0.20.2
+
+      - name: Tag :latest → @${{ matrix.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository_owner }}/talos-${{ matrix.service }}"
+          # `crane tag` resolves the source digest server-side, so the
+          # :latest tag points at the SAME bytes that sign + provenance
+          # already attested.
+          crane tag "${IMAGE}@${{ matrix.digest }}" latest
+          echo "Promoted ${IMAGE}:latest → ${{ matrix.digest }}"

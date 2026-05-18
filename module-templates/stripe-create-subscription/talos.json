@@ -1,0 +1,30 @@
+{
+  "name": "stripe-create-subscription",
+  "version": "v1.0.0",
+  "display_name": "Stripe: Create Subscription",
+  "description": "Create a recurring subscription for a Stripe customer against a price/plan. Supports trial periods, payment behavior control (for 3D Secure flows), and metadata. Use after stripe-create-customer to start a billing relationship. The returned subscription_id and client_secret (when payment_behavior=default_incomplete) can be passed to a frontend for payment confirmation.",
+  "category": "Payments",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.stripe.com"],
+  "requires_secrets": ["stripe/secret_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "CUSTOMER_ID", "PRICE_ID"],
+    "properties": {
+      "API_KEY_SECRET": { "type": "string", "description": "Vault path to the Stripe secret key." },
+      "CUSTOMER_ID": { "type": "string", "description": "Stripe customer ID (cus_xxx). Supports {{customer_id}} interpolation." },
+      "PRICE_ID": { "type": "string", "description": "Stripe price ID (price_xxx or plan_xxx). Supports {{price_id}} interpolation." },
+      "QUANTITY": { "type": "integer", "default": 1, "description": "Quantity of the price to subscribe to (default: 1)." },
+      "TRIAL_PERIOD_DAYS": { "type": "integer", "description": "Number of trial days before billing starts. Mutually exclusive with TRIAL_END." },
+      "TRIAL_END": { "type": "string", "description": "Unix timestamp (seconds) when trial ends. Overrides TRIAL_PERIOD_DAYS if both set. Supports {{trial_end}} interpolation." },
+      "PAYMENT_BEHAVIOR": { "type": "string", "default": "default_incomplete", "description": "Payment behavior: 'default_incomplete' (requires frontend confirmation, recommended for 3DS), 'error_if_incomplete' (fail fast), 'allow_incomplete' (create even if payment fails)." },
+      "CANCEL_AT_PERIOD_END": { "type": "boolean", "default": false, "description": "If true, subscription cancels at end of current billing period rather than immediately renewing." },
+      "METADATA": { "type": "string", "description": "JSON object of key-value metadata (e.g. '{\"plan_name\": \"pro\"}')." }
+    }
+  },
+  "setup_instructions": [
+    { "step": 1, "title": "Create a price in Stripe Dashboard", "detail": "Go to Products in your Stripe Dashboard, create a product and price (e.g. '$29/month'). Copy the price ID (price_xxx) into PRICE_ID." },
+    { "step": 2, "title": "Typical workflow pattern", "detail": "Chain: [stripe-create-customer] → [stripe-create-subscription: CUSTOMER_ID={{customer_id}}, PRICE_ID=price_xxx] → [condition: status == 'active' or status == 'incomplete'] → downstream actions." },
+    { "step": 3, "title": "3D Secure (3DS) flow", "detail": "Set PAYMENT_BEHAVIOR=default_incomplete. The subscription will be created with status='incomplete' and the output includes a client_secret. Pass this to your frontend's Stripe.js to confirm payment and complete 3DS authentication." }
+  ]
+}

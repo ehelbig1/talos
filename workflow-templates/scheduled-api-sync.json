@@ -1,0 +1,64 @@
+{
+  "name": "Scheduled API Sync → Database",
+  "description": "Fetches data from an external API on a schedule, normalizes the JSON structure, and syncs it into a target database table. Good for keeping local data up to date with third-party APIs.",
+  "category": "Data",
+  "tags": ["etl", "scheduled", "http", "json", "database", "sync"],
+  "nodes": [
+    {
+      "label": "Fetch API Data",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.example.com/data",
+        "TIMEOUT_MS": 10000
+      }
+    },
+    {
+      "label": "Normalize Fields",
+      "module_name": "JSON Transform",
+      "config": {
+        "SELECTOR": "data",
+        "TRANSFORM": "keys_to_lowercase"
+      }
+    },
+    {
+      "label": "Sync to Database",
+      "module_name": "Data Pipeline ETL",
+      "config": {
+        "TARGET_TABLE": "synced_records"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Fetch API Data", "to": "Normalize Fields" },
+    { "from": "Normalize Fields", "to": "Sync to Database" }
+  ],
+  "suggested_schedule": "0 */6 * * *",
+  "required_secrets": [
+    { "key_path": "database/connection_url", "description": "PostgreSQL connection URL for the target database" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Sync to Database",
+      "current_module": "Data Pipeline ETL",
+      "replacements": [
+        {
+          "module_name": "Database Query",
+          "catalog_name": "database-query",
+          "config_delta": "Replace SOURCE_URL+TARGET_TABLE with a custom QUERY string (e.g. INSERT INTO synced_records ... ON CONFLICT DO UPDATE). Use when you need upsert semantics, multi-step transactions, or custom conflict resolution beyond a bulk INSERT."
+        }
+      ]
+    },
+    {
+      "node_label": "Normalize Fields",
+      "current_module": "JSON Transform",
+      "replacements": [
+        {
+          "module_name": "LLM Inference",
+          "catalog_name": "llm-inference",
+          "config_delta": "Replace SELECTOR+TRANSFORM with MODEL + SYSTEM_PROMPT (e.g. 'Extract and normalize the following fields into a flat JSON object: ...'). Required secret: llm/api_key added. Useful when the API response schema varies by record or requires semantic interpretation."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "name": "http-request",
+  "version": "v1.0.0",
+  "display_name": "HTTP Request",
+  "description": "Make outbound HTTP requests to external APIs.",
+  "category": "Network",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "*"
+  ],
+  "requires_secrets": [],
+  "recommended_fuel": {
+    "expected_items": 1,
+    "bytes_per_item": 2000000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "METHOD": {
+        "type": "string",
+        "enum": [
+          "GET",
+          "POST",
+          "PUT",
+          "DELETE",
+          "PATCH"
+        ],
+        "default": "GET"
+      },
+      "URL": {
+        "type": "string"
+      },
+      "HEADERS": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BODY": {
+        "type": "string"
+      },
+      "TIMEOUT_MS": {
+        "type": "number",
+        "default": 5000
+      },
+      "SANITIZE_FOR_LLM": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, sanitizes the HTTP response for safe LLM consumption: strips HTML tags, enforces MAX_CONTENT_LENGTH, and wraps the result in [EXTERNAL_CONTENT_BEGIN]...[EXTERNAL_CONTENT_END] delimiters so the LLM can distinguish external content from instructions."
+      },
+      "MAX_CONTENT_LENGTH": {
+        "type": "number",
+        "default": 8192,
+        "description": "Maximum byte length of the response body when SANITIZE_FOR_LLM is true. Content beyond this limit is truncated with a [TRUNCATED] marker before being passed to downstream nodes. Default: 8192 bytes."
+      }
+    },
+    "required": [
+      "URL"
+    ]
+  }
+}

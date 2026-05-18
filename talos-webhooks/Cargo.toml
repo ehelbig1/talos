@@ -1,0 +1,56 @@
+[package]
+name = "talos-webhooks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-nats = "0.47"
+axum = { version = "0.8", features = ["json"] }
+chrono.workspace = true
+dashmap = "6.1"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+ipnetwork = "0.21"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+subtle = "2.4"
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-config = { path = "../talos-config" }
+talos-continuation-trigger = { path = "../talos-continuation-trigger" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-engine = { path = "../talos-engine" }
+talos-idempotency = { path = "../talos-idempotency" }
+# MCP-1144: canonical encrypted_secrets composition (module-declared
+# secrets + host-reserved LLM provider keys). Replaces ~50 lines of
+# duplicated inline logic across the live webhook dispatch (line ~1133)
+# and the DLQ replay dispatch (line ~2427).
+talos-integration-helpers = { path = "../talos-integration-helpers" }
+talos-metrics = { path = "../talos-metrics" }
+talos-module-executions = { path = "../talos-module-executions" }
+talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
+talos-rate-limit = { path = "../talos-rate-limit" }
+talos-registry = { path = "../talos-registry" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+# MCP-1050: canonical truncate_at_char_boundary for webhook UA truncation.
+talos-text-util = { path = "../talos-text-util" }
+talos-worker-fleet = { path = "../talos-worker-fleet" }
+talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+zeroize = "1.8"
+uuid.workspace = true
+
+[lints]
+workspace = true

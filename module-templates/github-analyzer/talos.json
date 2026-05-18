@@ -1,0 +1,38 @@
+{
+  "name": "github-analyzer",
+  "display_name": "GitHub Repo Analyzer (Private)",
+  "version": "v1.0.0",
+  "category": "Development Tools",
+  "capability_world": "secrets-node",
+  "description": "Analyzes private and public GitHub repositories using a Personal Access Token. Requires a GitHub PAT stored in the vault (canonical path: 'github/pat'). For public-only repos without secrets, use github-analyzer-public (http-node) instead.",
+  "allowed_hosts": ["api.github.com"],
+  "requires_secrets": ["github/pat"],
+  "setup_instructions": [
+    "1. Create a GitHub Personal Access Token (PAT) at https://github.com/settings/tokens with repo scope",
+    "2. Store it at the canonical vault path: create_secret {name: 'github/pat', value: 'ghp_...', namespace: 'integrations'}",
+    "3. Install with the vault path: install_module_from_catalog {name: 'github-analyzer', allowed_secrets: ['github/pat']}",
+    "4. In node config, set secret_name = 'github/pat' and repository = 'owner/repo'",
+    "Note: The legacy canonical path 'github_token' is also supported — use whichever path you stored the secret under, and pass the same path in both allowed_secrets and secret_name config."
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "repository": {
+        "type": "string",
+        "title": "Repository",
+        "description": "The GitHub repo to analyze (e.g., 'anthropics/claude-code')"
+      },
+      "search_pattern": {
+        "type": "string",
+        "title": "Search Regex",
+        "description": "Optional regular expression to search for in commit messages (e.g., '(?i)(fix|bug|issue)')"
+      },
+      "secret_name": {
+        "type": "string",
+        "title": "Secret Name",
+        "description": "Vault path for the GitHub PAT. Canonical path: 'github/pat'. Must match the path used when the secret was stored and when the module was installed with allowed_secrets."
+      }
+    },
+    "required": ["repository"]
+  }
+}

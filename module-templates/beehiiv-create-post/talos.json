@@ -1,0 +1,84 @@
+{
+  "name": "beehiiv-create-post",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: Create Post",
+  "description": "Create a newsletter post on Beehiiv. Supports draft and confirmed (send immediately) statuses, scheduling, content tags, and LLM-generated content via template interpolation.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID", "TITLE"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key')."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxx...'). Supports {{key}} template interpolation."
+      },
+      "TITLE": {
+        "type": "string",
+        "description": "Post title (shown in email subject and web). Supports {{key}} template interpolation (e.g. '{{title}}' to pull from an upstream LLM node)."
+      },
+      "SUBTITLE": {
+        "type": "string",
+        "description": "Post subtitle/preview text. Supports {{key}} template interpolation."
+      },
+      "BODY_CONTENT": {
+        "type": "string",
+        "description": "HTML content of the post body. Supports {{key}} template interpolation (e.g. '{{content}}' to pipe LLM-generated HTML content directly into the post). Mutually exclusive with BLOCKS — if both are set, BODY_CONTENT takes precedence."
+      },
+      "STATUS": {
+        "type": "string",
+        "enum": ["draft", "confirmed"],
+        "default": "draft",
+        "description": "'draft' (default): saves the post without sending or scheduling. 'confirmed': sends or schedules the post. Use 'draft' for AI-generated content that needs human review before sending."
+      },
+      "SCHEDULED_AT": {
+        "type": "string",
+        "description": "ISO 8601 datetime for scheduled delivery (e.g. '2026-06-01T09:00:00Z'). Only used when STATUS is 'confirmed'. If omitted with STATUS='confirmed', the post sends immediately. Supports {{key}} template interpolation."
+      },
+      "CONTENT_TAGS": {
+        "type": "string",
+        "description": "Comma-separated content tags for the post (e.g. 'product-update,release-notes'). Used for filtering in the Beehiiv dashboard and analytics."
+      },
+      "THUMBNAIL_IMAGE_URL": {
+        "type": "string",
+        "description": "URL for the post's thumbnail image shown in email and web previews. Must be publicly accessible. Supports {{key}} template interpolation."
+      },
+      "EMAIL_SUBJECT": {
+        "type": "string",
+        "description": "Custom email subject line override. If omitted, Beehiiv uses the post title. Supports {{key}} template interpolation."
+      },
+      "EMAIL_PREVIEW_TEXT": {
+        "type": "string",
+        "description": "Preview text shown in email clients below the subject line. Supports {{key}} template interpolation."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a Beehiiv API key",
+      "detail": "Log in to https://app.beehiiv.com, navigate to Settings > Integrations > API, and create a new API key."
+    },
+    {
+      "step": 2,
+      "title": "Store the API key as a Talos secret",
+      "detail": "Use set_secret with key_path='beehiiv/api_key' and value='<your-api-key>'."
+    },
+    {
+      "step": 3,
+      "title": "Find your Publication ID",
+      "detail": "Call GET https://api.beehiiv.com/v2/publications with your API key. Copy the 'id' field (pub_xxx...) for your publication."
+    },
+    {
+      "step": 4,
+      "title": "Recommended: Start with STATUS=draft",
+      "detail": "When using LLM-generated content, set STATUS to 'draft' so the post appears in your Beehiiv dashboard for review before sending. Change to 'confirmed' only for fully automated pipelines you trust."
+    }
+  ]
+}

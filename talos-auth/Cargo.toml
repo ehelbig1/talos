@@ -1,0 +1,33 @@
+[package]
+name = "talos-auth"
+description = "Authentication service for Talos: signup, login, JWT issue/verify, refresh-token rotation, lockout, sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+talos-auth-types = { path = "../talos-auth-types" }
+talos-config = { path = "../talos-config" }
+# MCP-1012: DLP-redact user_agent before persisting to auth_audit_log,
+# matching the sibling parity with oauth_audit_log + admin_event_log.
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+bcrypt = "0.18"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+regex = "1.12"
+sha2 = "0.10"
+hex = "0.4"
+rand = { version = "0.8", default-features = true, features = ["std"] }
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+async-trait = "0.1"
+
+[lints]
+workspace = true

@@ -1,0 +1,99 @@
+# Phase 1 overrides — single-node k3s.
+# Layer on top of values.yaml:
+#   helm install talos ./deploy/helm/talos -f deploy/helm/talos/values-phase1.yaml
+#
+# Assumes:
+#   - External Postgres (Neon serverless).
+#   - External Redis (Upstash).
+#   - Self-hosted Neo4j, NATS, Vault, MinIO (single replica each).
+#   - Ollama is optional; enable if this node has a reasonable CPU/RAM budget.
+#   - Sigstore ENFORCES signatures (k3s ships the policy-controller via
+#     the chart README install steps).
+
+global:
+  domain: "talos.local"
+
+controller:
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 1
+  podDisruptionBudget:
+    enabled: false
+  affinity: {}
+  topologySpreadConstraints: []
+  resources:
+    requests:
+      cpu: 250m
+      memory: 384Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+worker:
+  replicaCount: 1
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 75
+  podDisruptionBudget:
+    enabled: false
+  affinity: {}
+  topologySpreadConstraints: []
+  resources:
+    requests:
+      cpu: 250m
+      memory: 384Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+frontend:
+  replicaCount: 1
+  podDisruptionBudget:
+    enabled: false
+
+nats:
+  replicaCount: 1
+  persistence:
+    size: "5Gi"
+  jetstream:
+    # See values.yaml for why this is bare bytes (NATS parser quirks).
+    maxFileStore: 3221225472   # 3 GiB
+
+neo4j:
+  enabled: true
+  persistence:
+    size: "10Gi"
+  heap:
+    initial: "256m"
+    max: "512m"
+
+vault:
+  enabled: true
+  persistence:
+    size: "2Gi"
+
+minio:
+  enabled: true
+  persistence:
+    size: "20Gi"
+
+ollama:
+  enabled: true
+  persistence:
+    size: "20Gi"
+
+security:
+  sigstore:
+    enabled: true
+
+# k3s uses Traefik in the kube-system namespace, not ingress-nginx.
+# Without this override, the chart's NetworkPolicies block traffic from
+# Traefik → frontend/controller → 502s on every ingress request.
+networkPolicy:
+  ingressNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: kube-system

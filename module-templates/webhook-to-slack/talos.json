@@ -1,0 +1,77 @@
+{
+  "name": "webhook-to-slack",
+  "version": "v1.0.0",
+  "display_name": "Webhook to Slack",
+  "description": "Receives structured input, formats it into a Slack Block Kit message using a configurable template, and POSTs to a Slack Incoming Webhook URL. No bot token required -- uses Slack's webhook integration for simple one-way notifications.",
+  "category": "Communication",
+  "capability_world": "http-node",
+  "allowed_hosts": ["hooks.slack.com"],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["SLACK_WEBHOOK_URL"],
+    "properties": {
+      "SLACK_WEBHOOK_URL": {
+        "type": "string",
+        "description": "Slack Incoming Webhook URL (starts with https://hooks.slack.com/services/...). Obtain from Slack App settings > Incoming Webhooks."
+      },
+      "CHANNEL": {
+        "type": "string",
+        "description": "Override the default channel for this webhook (e.g. '#alerts', '#deploys'). Leave empty to use the webhook's default channel."
+      },
+      "TEMPLATE": {
+        "type": "string",
+        "default": "{{title}}\n{{message}}",
+        "description": "Message format template using {{field}} placeholders that are replaced with values from the input JSON. Supports dot notation: {{event.type}}, {{user.name}}. If the resolved template is empty, falls back to a JSON dump of the input."
+      },
+      "EMOJI": {
+        "type": "string",
+        "default": ":robot_face:",
+        "description": "Emoji icon for the bot avatar (e.g. ':warning:', ':white_check_mark:', ':fire:'). Uses Slack emoji syntax."
+      },
+      "USERNAME": {
+        "type": "string",
+        "default": "Talos",
+        "description": "Display name for the bot posting the message."
+      },
+      "USE_BLOCKS": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true, formats the message as Slack Block Kit (section + context blocks with markdown). When false, sends plain text only."
+      },
+      "COLOR": {
+        "type": "string",
+        "description": "Hex color for the attachment sidebar (e.g. '#36a64f' for green, '#ff0000' for red). Only used when USE_BLOCKS is false (attachments mode)."
+      }
+    }
+  },
+  "output_shape": {
+    "success": "Boolean: true if Slack accepted the webhook POST (HTTP 200)",
+    "status_code": "HTTP status code returned by Slack",
+    "channel": "The channel the message was posted to (if overridden)",
+    "message_preview": "First 100 characters of the formatted message for traceability"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a Slack Incoming Webhook",
+      "detail": "Go to https://api.slack.com/apps > your app > Incoming Webhooks > Add New Webhook to Workspace. Select the target channel. Copy the webhook URL (starts with https://hooks.slack.com/services/...)."
+    },
+    {
+      "step": 2,
+      "title": "Install the module",
+      "detail": "install_module_from_catalog {name: 'webhook-to-slack'}. No secrets required -- the webhook URL is set as node config (Slack webhook URLs are not considered secrets as they are scoped to a single channel)."
+    },
+    {
+      "step": 3,
+      "title": "Configure the message template",
+      "detail": "Set TEMPLATE to a format string using {{field}} placeholders matching your input JSON keys. Example: 'Alert: {{alert_name}}\\nSeverity: {{severity}}\\nDetails: {{details}}'. Dot notation works for nested fields."
+    },
+    {
+      "step": 4,
+      "title": "Wire into your workflow",
+      "detail": "Place this node at the end of a workflow or on an error edge to send notifications. Input should be a JSON object whose fields match the TEMPLATE placeholders."
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{{- if .Values.security.sigstore.enabled -}}
+# -----------------------------------------------------------------------------
+# Sigstore ClusterImagePolicy — enforces signed images for Talos releases.
+#
+# Requires the policy-controller admission webhook (sigstore.dev) to be
+# installed in the cluster. See chart README → "Sigstore" for install.
+#
+# When `security.sigstore.enabled: false`, this resource is not rendered
+# and signature verification is skipped.
+# -----------------------------------------------------------------------------
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: {{ include "talos.fullname" . }}-signed-images
+  labels:
+    {{- include "talos.labels" . | nindent 4 }}
+spec:
+  images:
+    {{- range .Values.security.sigstore.imageGlobs }}
+    - glob: {{ . | quote }}
+    {{- end }}
+  authorities:
+    - name: github-actions-oidc
+      keyless:
+        url: {{ .Values.security.sigstore.oidcIssuer | quote }}
+        identities:
+          - issuer: {{ .Values.security.sigstore.oidcIssuer | quote }}
+            subjectRegExp: {{ .Values.security.sigstore.certIdentityRegex | quote }}
+      ctlog:
+        url: https://rekor.sigstore.dev
+{{- end }}

@@ -1,0 +1,345 @@
+/* Tailwind v4 — single import triggers theme + utilities */
+@import "tailwindcss";
+/* Load tailwind.config.js for v3-compat theme extensions (custom colors, darkMode, etc.) */
+@config "../tailwind.config.js";
+
+/* Custom utility fallbacks for Tailwind classes that reference CSS variables */
+.bg-muted {
+  background-color: hsl(var(--muted));
+}
+.bg-muted-foreground {
+  color: hsl(var(--muted-foreground));
+}
+.bg-border {
+  background-color: hsl(var(--border));
+}
+.bg-primary {
+  background-color: hsl(var(--primary));
+}
+.bg-secondary {
+  background-color: hsl(var(--secondary));
+}
+.bg-destructive {
+  background-color: hsl(var(--destructive));
+}
+.bg-accent {
+  background-color: hsl(var(--accent));
+}
+.bg-card {
+  background-color: hsl(var(--card));
+}
+.bg-muted\/50 {
+  background-color: hsl(var(--muted) / 0.5);
+}
+
+@layer base {
+  :root {
+    /* Tiered Dark Palette — Surface-based elevation */
+    --background: 232 14% 6%; /* #0B0C10 - Slightly deeper */
+    --foreground: 210 40% 98%;
+    
+    /* Level 1: Sidebar, Nav */
+    --surface-1: 232 14% 10%; /* #14161F */
+    /* Level 2: Main Content Area */
+    --surface-2: 232 14% 8%; /* #0F1117 */
+    /* Level 3: Cards, Panels */
+    --surface-3: 232 14% 12%; /* #1A1D27 */
+    /* Level 4: Modals, Popovers */
+    --surface-4: 232 14% 16%; /* #242835 */
+
+    --card: var(--surface-3);
+    --card-foreground: 210 40% 98%;
+    --popover: var(--surface-4);
+    --popover-foreground: 210 40% 98%;
+    
+    /* Vibrant Accents — Desaturated for Dark Mode */
+    --primary: 250 89% 70%; /* #818CF8 - Modern Indigo/Violet */
+    --primary-foreground: 210 40% 98%;
+    --secondary: 232 14% 14%;
+    --secondary-foreground: 210 40% 98%;
+    
+    --muted: 232 14% 12%;
+    --muted-foreground: 215 20% 65%;
+    
+    --accent: 250 89% 70%;
+    --accent-foreground: 210 40% 98%;
+    
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    
+    --warning: 45 93% 47%;
+    --warning-foreground: 45 93% 5%;
+    
+    --success: 160 84% 39%;
+    --success-foreground: 160 84% 98%;
+    
+    --info: 199 89% 48%;
+    --info-foreground: 210 40% 98%;
+    
+    --border: 232 14% 18%;
+    --input: 232 14% 12%;
+    --ring: 250 89% 70%;
+    --radius: 0.75rem; /* Slightly softer corners for premium feel */
+  }
+
+  @theme {
+    --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-heading: "Outfit", var(--font-sans);
+  }
+
+  * {
+    border-color: hsl(var(--border) / 0.5);
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    letter-spacing: -0.02em;
+  }
+}
+
+/* Performance Optimizations */
+@utility gpu {
+  transform: translate3d(0,0,0);
+  backface-visibility: hidden;
+  perspective: 1000px;
+  will-change: transform, opacity;
+}
+
+@utility optimize-blur {
+  contain: paint;
+}
+
+@utility transition-premium {
+  transition-property: all;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 300ms;
+}
+
+@utility glass {
+  backdrop-filter: blur(64px);
+  border-color: hsla(0, 0%, 100%, 0.05);
+  background-color: hsla(0, 0%, 100%, 0.02);
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+}
+
+@utility surface-elevation {
+  box-shadow: 0 0 0 1px hsla(var(--foreground), 0.05),
+              0 4px 6px -1px rgba(0, 0, 0, 0.1),
+              0 2px 4px -1px rgba(0, 0, 0, 0.06);
+}
+
+@utility hover-elevation {
+  &:hover {
+    transition-property: all;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+    transition-duration: 300ms;
+    transform: translateY(-4px);
+    box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.3),
+                0 0 20px -5px hsla(var(--primary), 0.2);
+    border-color: hsla(var(--primary), 0.3);
+  }
+}
+
+@utility custom-scrollbar {
+  &::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  &::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border-radius: 9999px;
+  }
+  &::-webkit-scrollbar-thumb:hover {
+    background-color: hsla(var(--primary), 0.5);
+  }
+}
+
+/* React Flow dark overrides */
+.react-flow__background {
+  background: hsl(var(--background)) !important;
+}
+.react-flow__background-pattern {
+  stroke: hsla(var(--foreground), 0.04) !important;
+}
+.react-flow__edge-path {
+  stroke: hsla(var(--primary), 0.6);
+  stroke-width: 2;
+}
+.react-flow__edge-path:hover {
+  stroke: hsl(var(--primary));
+  stroke-width: 3;
+}
+.react-flow__handle {
+  background: hsl(var(--primary)) !important;
+  border: 2px solid hsl(var(--background)) !important;
+  width: 8px !important;
+  height: 8px !important;
+}
+.react-flow__controls {
+  background: hsla(var(--surface-3), 0.8);
+  backdrop-filter: blur(8px);
+  border: 1px solid hsla(var(--foreground), 0.08);
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+.react-flow__controls button {
+  background: transparent;
+  border-bottom: 1px solid hsla(var(--foreground), 0.04);
+  color: hsl(var(--muted-foreground));
+  transition: all 0.2s ease;
+}
+.react-flow__controls button:hover {
+  background: hsla(var(--primary), 0.1);
+  color: hsl(var(--primary));
+}
+
+/* Status pulse animation */
+@keyframes status-pulse {
+  0% { box-shadow: 0 0 0 0 hsla(var(--primary), 0.4); }
+  70% { box-shadow: 0 0 0 8px hsla(var(--primary), 0); }
+  100% { box-shadow: 0 0 0 0 hsla(var(--primary), 0); }
+}
+@utility animate-status-pulse {
+  animation: status-pulse 2s infinite;
+}
+
+/* Shimmer utility */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@utility animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    hsla(var(--foreground), 0.03) 25%,
+    hsla(var(--foreground), 0.08) 50%,
+    hsla(var(--foreground), 0.03) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite linear;
+}
+
+/* Glassmorphism primitives */
+@utility glass-card {
+  background: hsla(var(--surface-3), 0.6);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid hsla(var(--foreground), 0.08);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
+}
+
+@utility glass-nav {
+  background: hsla(var(--surface-1), 0.8);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid hsla(var(--foreground), 0.05);
+}
+
+@utility glass-dark {
+  background: hsla(var(--surface-4), 0.85);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid hsla(var(--foreground), 0.1);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+}
+
+@utility glass-light {
+  background: hsla(var(--white), 0.03);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid hsla(var(--white), 0.05);
+}
+
+/* ─── Accessibility: Reduced Motion ─────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .animate-pulse,
+  .animate-spin,
+  .animate-shimmer,
+  .animate-status-pulse {
+    animation: none !important;
+  }
+}
+
+/* ─── Accessibility: Focus Utilities ────────────────────────────── */
+@utility focus-ring {
+  @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 focus-visible:ring-offset-0;
+}
+
+@utility skip-to-content {
+  @apply sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-[100];
+  @apply focus:px-4 focus:py-2 focus:rounded-xl focus:bg-primary focus:text-primary-foreground;
+  @apply focus:text-sm focus:font-bold focus:shadow-xl;
+}
+
+/* ─── Premium UI Extensions ───────────────────────────────────────── */
+@utility premium-gradient {
+  background: linear-gradient(135deg, 
+    hsla(var(--primary), 0.15) 0%, 
+    hsla(var(--primary), 0.05) 25%, 
+    transparent 50%, 
+    hsla(var(--primary), 0.05) 75%, 
+    hsla(var(--primary), 0.15) 100%
+  );
+  background-size: 200% 200%;
+  animation: shimmer 10s infinite linear;
+}
+
+@utility icon-glow {
+  filter: drop-shadow(0 0 8px hsla(var(--primary), 0.4));
+}
+
+@utility glass-panel {
+  background: hsla(var(--surface-3), 0.4);
+  backdrop-filter: blur(32px);
+  border: 1px solid hsla(var(--foreground), 0.05);
+  box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.4);
+}
+
+@utility animate-float {
+  animation: float 6s ease-in-out infinite;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+@utility animate-progress-bar {
+  background-size: 200% 100%;
+  background-image: linear-gradient(
+    90deg,
+    transparent 25%,
+    hsla(var(--primary), 0.4) 50%,
+    transparent 75%
+  );
+  animation: shimmer 1.5s infinite linear;
+}
+
+/* Performance: GPU-optimized glassmorphism */
+.glass-card,
+.glass-nav,
+.glass,
+.glass-panel {
+  contain: paint;
+  will-change: backdrop-filter;
+  transform: translateZ(0); /* Force GPU layer */
+}

@@ -1,0 +1,149 @@
+{{- if .Values.neo4j.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "talos.componentName" (list . "neo4j") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "neo4j") | nindent 4 }}
+spec:
+  serviceName: {{ include "talos.componentName" (list . "neo4j") }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "neo4j") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "neo4j") | nindent 8 }}
+    spec:
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: neo4j
+          image: {{ include "talos.image" .Values.neo4j.image }}
+          imagePullPolicy: {{ .Values.neo4j.image.pullPolicy }}
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          env:
+            - name: NEO4J_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.componentName" (list . "neo4j") }}
+                  key: NEO4J_AUTH
+            - name: NEO4J_PLUGINS
+              value: '["apoc"]'
+            # Security: Restrict APOC to the procedures used by graph_rag.
+            - name: NEO4J_dbms_security_procedures_unrestricted
+              value: "apoc.path.*"
+            - name: NEO4J_server_memory_heap_initial__size
+              value: {{ .Values.neo4j.heap.initial | quote }}
+            - name: NEO4J_server_memory_heap_max__size
+              value: {{ .Values.neo4j.heap.max | quote }}
+          ports:
+            - name: bolt
+              containerPort: 7687
+            - name: http
+              containerPort: 7474
+          # MCP-895 (2026-05-14): startupProbe gives cold-boot a generous
+          # 5-minute budget (periodSeconds 10 × failureThreshold 30) before
+          # kubelet falls through to the liveness check. Neo4j on a real
+          # persistent volume can take 60+ seconds to open the Bolt port
+          # (load store files, replay WAL, start APOC plugin) — the prior
+          # livenessProbe budget of 60s initial + 5×20s = 160s could
+          # restart the pod mid-recovery on slow PVs or after node
+          # migration with cold disk cache, looping the StatefulSet
+          # indefinitely. With the startup gate, liveness only fires
+          # once Bolt is confirmed open at least once.
+          startupProbe:
+            tcpSocket:
+              port: bolt
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: bolt
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            tcpSocket:
+              port: bolt
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.neo4j.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: logs
+              mountPath: /logs
+            # readOnlyRootFilesystem=true blocks writes to / — Neo4j's
+            # entrypoint needs three writable paths during boot:
+            #   /tmp                          (mktemp during init)
+            #   /var/lib/neo4j/plugins        (APOC jar copy from /labs)
+            #   /var/lib/neo4j/conf           (APOC writes neo4j.conf
+            #                                  defaults via "Applying
+            #                                  default values for plugin
+            #                                  apoc to neo4j.conf")
+            # All three emptyDir; cheap to repopulate per pod start.
+            - name: tmp
+              mountPath: /tmp
+            - name: plugins
+              mountPath: /var/lib/neo4j/plugins
+            - name: conf
+              mountPath: /var/lib/neo4j/conf
+      volumes:
+        - name: logs
+          emptyDir:
+            sizeLimit: "1Gi"
+        - name: tmp
+          emptyDir:
+            sizeLimit: "256Mi"
+        - name: plugins
+          emptyDir:
+            sizeLimit: "256Mi"
+        - name: conf
+          emptyDir:
+            sizeLimit: "16Mi"
+        {{- if not .Values.neo4j.persistence.enabled }}
+        # MCP-806 (2026-05-14): emptyDir fallback when persistence is
+        # disabled. Pre-fix the StatefulSet volumeMount at /data
+        # referenced a `data` volume only declared inside the
+        # `volumeClaimTemplates` block (also gated by
+        # persistence.enabled), so `--set neo4j.persistence.enabled=
+        # false` rendered cleanly but stuck the neo4j pod in
+        # ContainerCreating with "volume not found".
+        #
+        # WARNING — ephemeral semantics: emptyDir lives for the pod's
+        # lifetime only. neo4j's graph database is in this volume —
+        # every pod restart wipes graph-RAG memory (entity nodes +
+        # relationships extracted from actor memories). Recoverable
+        # via re-backfill on next memory write, but the historical
+        # graph is gone. Use ONLY for dev/test / CI scenarios where
+        # the entire database starts fresh. Production must use
+        # `persistence.enabled: true`.
+        - name: data
+          emptyDir:
+            sizeLimit: "1Gi"
+        {{- end }}
+  {{- if .Values.neo4j.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "talos.componentLabels" (list . "neo4j") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.neo4j.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.neo4j.persistence.size }}
+  {{- end }}
+{{- end }}

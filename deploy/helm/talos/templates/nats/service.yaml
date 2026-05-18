@@ -1,0 +1,22 @@
+{{- if .Values.nats.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "talos.componentName" (list . "nats") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "nats") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: client
+      port: {{ .Values.nats.service.clientPort }}
+      targetPort: client
+      protocol: TCP
+    - name: monitor
+      port: {{ .Values.nats.service.monitorPort }}
+      targetPort: monitor
+      protocol: TCP
+  selector:
+    {{- include "talos.componentSelectorLabels" (list . "nats") | nindent 4 }}
+{{- end }}

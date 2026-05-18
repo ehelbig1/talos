@@ -1,0 +1,1 @@
+ALTER TABLE workflows ADD COLUMN IF NOT EXISTS description TEXT;

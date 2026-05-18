@@ -1,0 +1,28 @@
+[package]
+name = "talos-workflow-repository"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+chrono.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-engine-events = { path = "../talos-engine-events" }
+talos-graph-rag = { path = "../talos-graph-rag" }
+talos-memory = { path = "../talos-memory" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-text-util = { path = "../talos-text-util" }
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

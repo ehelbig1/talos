@@ -1,0 +1,24 @@
+{
+    "name": "github-analyzer-public",
+    "display_name": "GitHub Repo Analyzer (Public)",
+    "version": "v1.0.0",
+    "category": "Development Tools",
+    "capability_world": "http-node",
+    "description": "Analyzes public GitHub repositories without authentication. Suitable for agents with an http-node or lower capability ceiling. For private repos use github-analyzer (secrets-node).",
+    "allowed_hosts": ["api.github.com"],
+    "requires_secrets": [],
+    "config_schema": {
+        "type": "object",
+        "properties": {
+            "repository": {
+                "type": "string",
+                "description": "GitHub repo to analyze (e.g., 'owner/repo')"
+            },
+            "search_pattern": {
+                "type": "string",
+                "description": "Optional substring patterns to match in commit messages (pipe-separated, e.g. 'fix|bug|feat'). Defaults to '(?i)(fix|bug|issue|feat)'."
+            }
+        },
+        "required": ["repository"]
+    }
+}

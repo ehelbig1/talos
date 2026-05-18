@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "*" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_USER: talos
+          POSTGRES_PASSWORD: talos
+          POSTGRES_DB: talos
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U talos -d talos"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          components: rustfmt, clippy
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: Set up database
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          psql -h localhost -U talos -d talos -c "SELECT 1;"
+        env:
+          PGPASSWORD: talos
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Security audit (check for known vulnerabilities)
+        run: cargo audit
+
+      - name: Lint Rust code
+        run: make lint
+
+      - name: Run tests with coverage
+        run: make coverage
+
+      - name: Build Docker images
+        run: make build

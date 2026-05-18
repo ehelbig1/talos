@@ -1,0 +1,22 @@
+{{- if .Values.worker.enabled -}}
+# Headless Service — the worker is a NATS subscriber, not a client-facing
+# server, but exposing /metrics on a stable DNS label keeps Prometheus
+# ServiceMonitor config identical to any other service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "talos.componentName" (list . "worker") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "worker") | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: metrics
+      port: {{ .Values.worker.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "talos.componentSelectorLabels" (list . "worker") | nindent 4 }}
+{{- end }}

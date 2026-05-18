@@ -1,0 +1,31 @@
+{
+    "name": "html-to-text",
+    "display_name": "HTML to Text",
+    "version": "v1.0.0",
+    "category": "Transformation",
+    "description": "Strip HTML tags + script/style/comment blocks, returning visible text. Built for the fetch → extract → LLM pattern (competitive watch, content monitoring) where raw HTML is too noisy and too fuel-expensive for the LLM to process directly. Caps input at MAX_INPUT_BYTES (default 60_000) and output at MAX_VISIBLE_CHARS (default 8_000) so a 1MB marketing page still fits in a sane fuel budget. Reads upstream `body` from either the http-request module's accumulated output or a passed-in `body` field.",
+    "capability_world": "minimal-node",
+    "allowed_hosts": [],
+    "requires_secrets": [],
+    "config_schema": {
+        "type": "object",
+        "properties": {
+            "MAX_INPUT_BYTES": {
+                "type": "integer",
+                "minimum": 1024,
+                "maximum": 5000000,
+                "description": "Hard cap on bytes scanned from the upstream HTML body. Default 60000. Most pricing/positioning content is in the first ~50KB of well-built marketing pages; capping below the full page size is the single biggest WASM-fuel lever."
+            },
+            "MAX_VISIBLE_CHARS": {
+                "type": "integer",
+                "minimum": 256,
+                "maximum": 100000,
+                "description": "Cap on output visible characters after tag stripping. Default 8000 (~2000 LLM tokens). The scanner stops walking input once this cap is reached."
+            },
+            "INPUT_FIELD": {
+                "type": "string",
+                "description": "Override the upstream field path to read HTML from. Default tries (in order): __accumulated__.<source-node-id>, __accumulated__.fetch, body, input.body. Use when your upstream node uses a non-standard field name."
+            }
+        }
+    }
+}

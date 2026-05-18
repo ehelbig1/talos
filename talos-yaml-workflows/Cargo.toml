@@ -1,0 +1,16 @@
+[package]
+name = "talos-yaml-workflows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9"
+talos-workflow-types = { path = "../talos-workflow-types" }
+
+[lints]
+workspace = true

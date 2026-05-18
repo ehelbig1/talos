@@ -1,0 +1,40 @@
+{
+  "name": "hmac-signer",
+  "version": "v1.0.0",
+  "display_name": "HMAC Signer",
+  "description": "Produce an HMAC-SHA256 signature of input data using a secret key from the vault. Useful for webhook signature verification or request signing. Set SECRET_NAME config key to the vault path where your HMAC signing key is stored (canonical paths: 'webhooks/signing_secret' for generic webhooks, 'github/webhook_secret' for GitHub, 'stripe/webhook_secret' for Stripe).",
+  "category": "Security",
+  "capability_world": "secrets-node",
+  "allowed_hosts": [],
+  "requires_secrets": ["webhooks/signing_secret"],
+  "setup_instructions": [
+    "1. Store your HMAC signing key at a canonical vault path:",
+    "   - Generic webhook: create_secret {name: 'webhooks/signing_secret', value: 'your-secret'}",
+    "   - GitHub webhook:  create_secret {name: 'github/webhook_secret', value: 'your-secret'}",
+    "   - Stripe webhook:  create_secret {name: 'stripe/webhook_secret', value: 'your-secret'}",
+    "2. Install with the specific path you used: install_module_from_catalog {name: 'hmac-signer', allowed_secrets: ['webhooks/signing_secret']}",
+    "3. In node config, set SECRET_NAME to the same vault path, and DATA_FIELD to the input field to sign",
+    "4. For GitHub-style signatures, set INCLUDE_PREFIX = 'sha256='",
+    "Note: Specify the exact vault path you used in both allowed_secrets and SECRET_NAME — they must match."
+  ],
+  "config_schema": {
+    "type": "object",
+    "required": ["SECRET_NAME"],
+    "properties": {
+      "SECRET_NAME": {
+        "type": "string",
+        "description": "Vault path for the HMAC signing key. Canonical paths: 'webhooks/signing_secret' (generic), 'github/webhook_secret' (GitHub), 'stripe/webhook_secret' (Stripe). Must exactly match the path used when the secret was stored and when the module was installed with allowed_secrets."
+      },
+      "DATA_FIELD": {
+        "type": "string",
+        "default": "data",
+        "description": "Field in the input JSON containing the string to sign"
+      },
+      "INCLUDE_PREFIX": {
+        "type": "string",
+        "default": "",
+        "description": "Optional prefix prepended to the signature (e.g., 'sha256=' for GitHub webhook style)"
+      }
+    }
+  }
+}

@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+# Talos k3s Phase 1 installer.
+#
+# Bootstraps a single-node k3s cluster with cert-manager, Sigstore
+# policy-controller (optional), Traefik ingress (k3s default), and the Talos
+# Helm chart. Idempotent — safe to re-run.
+#
+# Prerequisites on the target VM (Ubuntu 22.04/24.04):
+#   - Public IPv4 address with DNS A records for $TALOS_FRONTEND_HOST and
+#     $TALOS_API_HOST (defaults: $TALOS_HOST and api.$TALOS_HOST).
+#   - Firewall open on 80/tcp, 443/tcp, 6443/tcp (k3s API — restrict later).
+#   - >= 4 vCPU, 8 GB RAM, 80 GB disk.
+#   - Public Postgres (Neon, RDS) with pgvector extension.
+#   - Public Redis with TLS (Upstash, ElastiCache).
+#
+# Required env vars (set in /etc/talos/install.env or export before run):
+#   TALOS_HOST                 e.g. talos.example.com
+#   TALOS_ACME_EMAIL           email for Let's Encrypt registration
+#   TALOS_POSTGRES_URL         postgres://user:pass@host/db?sslmode=require
+#   TALOS_REDIS_URL            rediss://default:pass@host:6379
+#   TALOS_GHCR_OWNER           GitHub owner (lowercase) for ghcr.io/<owner>/talos-*
+#   TALOS_CONTROLLER_DIGEST    sha256:<64 hex> — controller image digest
+#   TALOS_WORKER_DIGEST        sha256:<64 hex> — worker image digest
+#   TALOS_FRONTEND_DIGEST      sha256:<64 hex> — frontend image digest
+#
+# Optional:
+#   TALOS_API_HOST             default: api.$TALOS_HOST    (controller ingress)
+#   TALOS_FRONTEND_HOST        default: $TALOS_HOST        (frontend ingress)
+#   TALOS_NAMESPACE            default: talos
+#   TALOS_RELEASE              default: talos
+#   TALOS_DISABLE_SIGSTORE     "yes" → admit unsigned images (dev / first-deploy)
+#   TALOS_GHCR_REPO            github repo name for sigstore identity (default: talos)
+#   TALOS_IMAGE_PULL_SECRET    name of pre-created docker-registry secret if ghcr is private
+#   TALOS_REGISTRY_URL         OCI registry serving module templates (e.g. https://ghcr.io).
+#                              Empty → controller seeds from disk (default for fresh deploys).
+#                              Set this AFTER you've run the template-publish.yml workflow at
+#                              least once, otherwise the Library / Catalog will be empty.
+#   TALOS_REGISTRY_NAMESPACE   Path prefix within the registry. Default: $TALOS_GHCR_OWNER/talos-tools
+#   TALOS_SIGSTORE_REQUIRED    Worker-side cosign verification of OCI templates.
+#                              "" or "false" → disabled (dev / first-deploy).
+#                              "audit"       → verify, log on failure, continue (migration).
+#                              "true"        → verify, refuse on failure (production).
+#   TALOS_SIGSTORE_IDENTITY_REGEXP  Required when TALOS_SIGSTORE_REQUIRED is set. Regex matched
+#                                   against the SAN URI of the Fulcio cert. For GitHub Actions
+#                                   keyless, pin to the workflow URL pattern. Example:
+#                                   ^https://github\\.com/${TALOS_GHCR_OWNER}/talos/\\.github/workflows/template-publish\\.yml@
+#   ANTHROPIC_API_KEY / OPENAI_API_KEY
+#   EMBEDDING_API_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL / EMBEDDING_DIMENSIONS / EMBEDDING_MAX_RPM
+#       Pick a provider (in order of recommendation):
+#         OpenAI:  EMBEDDING_API_URL=https://api.openai.com/v1/embeddings
+#                  EMBEDDING_API_KEY=sk-...  EMBEDDING_MODEL=text-embedding-3-small  EMBEDDING_DIMENSIONS=1536
+#         Voyage:  EMBEDDING_API_URL=https://api.voyageai.com/v1/embeddings
+#                  EMBEDDING_API_KEY=...     EMBEDDING_MODEL=voyage-3                EMBEDDING_DIMENSIONS=1024
+#                  Free tier is 3 RPM — set EMBEDDING_MAX_RPM=3 to avoid 429 storms.
+#         Cohere:  EMBEDDING_API_URL=https://api.cohere.com/v2/embed
+#                  EMBEDDING_API_KEY=...     EMBEDDING_MODEL=embed-v4.0              EMBEDDING_DIMENSIONS=1024
+#       The DB column dimension MUST match — see migrations/*_resize_embedding*.sql
+#       for the schema and write a follow-up migration if you switch families.
+#   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / ... (any OAuth provider you use)
+#
+# IMPORTANT: This script is "create-once" for the bootstrap secret. If you've
+# already deployed and want to add or rotate a key (e.g. flipping from OpenAI
+# to Voyage), use scripts/patch-bootstrap-secret.sh — re-running install.sh
+# does NOT update the secret (re-creating it would rotate TALOS_MASTER_KEY
+# and orphan every encrypted DEK).
+#
+# Run as root (or via sudo): ./install.sh
+
+set -euo pipefail
+
+# ── Config ────────────────────────────────────────────────────────
+TALOS_NAMESPACE="${TALOS_NAMESPACE:-talos}"
+TALOS_RELEASE="${TALOS_RELEASE:-talos}"
+K3S_VERSION="${K3S_VERSION:-v1.31.4+k3s1}"
+CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
+SIGSTORE_VERSION="${SIGSTORE_VERSION:-0.12.0}"
+HELM_VERSION="${HELM_VERSION:-v3.16.3}"
+ENV_FILE="${ENV_FILE:-/etc/talos/install.env}"
+
+log()  { printf '\033[1;34m▶ %s\033[0m\n'   "$*"; }
+ok()   { printf '\033[1;32m✓ %s\033[0m\n'   "$*"; }
+warn() { printf '\033[1;33m⚠ %s\033[0m\n'   "$*"; }
+die()  { printf '\033[1;31m✗ %s\033[0m\n'   "$*" >&2; exit 1; }
+
+# ── 0. Load env + validate ───────────────────────────────────────
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    set -a; source "$ENV_FILE"; set +a
+fi
+
+REQUIRED=(
+    TALOS_HOST TALOS_ACME_EMAIL
+    TALOS_POSTGRES_URL TALOS_REDIS_URL
+    TALOS_GHCR_OWNER
+    TALOS_CONTROLLER_DIGEST TALOS_WORKER_DIGEST TALOS_FRONTEND_DIGEST
+)
+for var in "${REQUIRED[@]}"; do
+    if [[ -z "${!var:-}" ]]; then
+        die "$var is required — set it in $ENV_FILE or export it before running."
+    fi
+done
+
+# Validate digest format up-front to avoid a 5-minute helm rollout failure.
+for d in TALOS_CONTROLLER_DIGEST TALOS_WORKER_DIGEST TALOS_FRONTEND_DIGEST; do
+    if ! [[ "${!d}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+        die "$d must look like sha256:<64 hex chars>, got: ${!d}"
+    fi
+done
+
+# Hostnames default off TALOS_HOST.
+TALOS_API_HOST="${TALOS_API_HOST:-api.$TALOS_HOST}"
+TALOS_FRONTEND_HOST="${TALOS_FRONTEND_HOST:-$TALOS_HOST}"
+TALOS_GHCR_REPO="${TALOS_GHCR_REPO:-talos}"
+
+[[ $EUID -eq 0 ]] || die "run as root (or via sudo)."
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHART_DIR="$(cd "$SCRIPT_DIR/../helm/talos" && pwd)"
+[[ -f "$CHART_DIR/Chart.yaml" ]] || die "chart not found at $CHART_DIR — run from a full talos checkout."
+
+# ── 1. Install k3s ───────────────────────────────────────────────
+if command -v k3s >/dev/null 2>&1; then
+    ok "k3s already installed ($(k3s --version | head -1))"
+else
+    log "Installing k3s $K3S_VERSION"
+    # --disable servicelb: we use Traefik bundled with k3s.
+    # --write-kubeconfig-mode 600: kubeconfig contains cluster-admin
+    #   credentials. World-readable (644) lets any unprivileged user on
+    #   the host (including a compromised non-root service) escape to
+    #   cluster-admin via kubectl. install.sh runs as root (line 115);
+    #   operators wanting non-root post-install access should
+    #   `sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config && sudo chown $USER ~/.kube/config`.
+    # --secrets-encryption: encrypt Secrets at rest in etcd.
+    curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="$K3S_VERSION" \
+        INSTALL_K3S_EXEC="--write-kubeconfig-mode 600 --secrets-encryption" \
+        sh -
+    ok "k3s installed"
+fi
+
+export KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+
+log "Waiting for k3s API"
+for _ in $(seq 1 60); do
+    if k3s kubectl get nodes >/dev/null 2>&1; then ok "k3s API ready"; break; fi
+    sleep 2
+done
+
+# ── 2. Install Helm ──────────────────────────────────────────────
+if command -v helm >/dev/null 2>&1; then
+    ok "helm already installed ($(helm version --short))"
+else
+    log "Installing helm $HELM_VERSION"
+    curl -sfL "https://get.helm.sh/helm-$HELM_VERSION-linux-amd64.tar.gz" \
+        | tar -xz -C /tmp
+    install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+    rm -rf /tmp/linux-amd64
+    ok "helm installed"
+fi
+
+# ── 3. cert-manager (TLS via Let's Encrypt) ──────────────────────
+log "Installing cert-manager $CERT_MANAGER_VERSION"
+helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null
+helm repo update >/dev/null
+helm upgrade --install cert-manager jetstack/cert-manager \
+    --namespace cert-manager --create-namespace \
+    --version "$CERT_MANAGER_VERSION" \
+    --set crds.enabled=true \
+    --wait --timeout 5m
+ok "cert-manager ready"
+
+cat <<EOF | k3s kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ${TALOS_ACME_EMAIL}
+    privateKeySecretRef: {name: letsencrypt-prod-account-key}
+    solvers:
+    - http01:
+        ingress: {class: traefik}
+EOF
+
+# ── 4. Sigstore policy-controller (optional) ─────────────────────
+if [[ "${TALOS_DISABLE_SIGSTORE:-no}" != "yes" ]]; then
+    log "Installing Sigstore policy-controller $SIGSTORE_VERSION"
+    helm repo add sigstore https://sigstore.github.io/helm-charts --force-update >/dev/null
+    helm repo update >/dev/null
+    helm upgrade --install policy-controller sigstore/policy-controller \
+        --namespace cosign-system --create-namespace \
+        --version "$SIGSTORE_VERSION" \
+        --wait --timeout 5m
+    ok "policy-controller ready"
+else
+    warn "Sigstore enforcement disabled — unsigned images will be admitted."
+fi
+
+# ── 5. Talos namespace + admission labels ────────────────────────
+log "Creating namespace $TALOS_NAMESPACE"
+k3s kubectl create namespace "$TALOS_NAMESPACE" --dry-run=client -o yaml \
+    | k3s kubectl apply -f -
+
+# PodSecurityAdmission: enforce 'restricted' profile for the talos namespace.
+k3s kubectl label namespace "$TALOS_NAMESPACE" \
+    pod-security.kubernetes.io/enforce=restricted \
+    pod-security.kubernetes.io/audit=restricted \
+    pod-security.kubernetes.io/warn=restricted \
+    --overwrite
+
+if [[ "${TALOS_DISABLE_SIGSTORE:-no}" != "yes" ]]; then
+    k3s kubectl label namespace "$TALOS_NAMESPACE" \
+        policy.sigstore.dev/include=true --overwrite
+fi
+
+# ── 6. Bootstrap secret + Neo4j auth secret ──────────────────────
+# The chart consumes a Secret named via `bootstrapSecret.secretName`. We
+# create it out-of-band (with bootstrapSecret.enabled=false in the overlay)
+# so plaintext values never round-trip through `helm get values`.
+#
+# Neo4j needs NEO4J_AUTH ("user/pass") in a separate Secret because the
+# upstream image only accepts a combined env var. We keep both Secrets in
+# lockstep — generate together, fail loud if they drift.
+# Mirror the chart's `talos.fullname` helper: when the release name already
+# contains the chart name ("talos"), fullname is just the release name;
+# otherwise it's "<release>-talos". componentName is then "<fullname>-<comp>".
+if [[ "$TALOS_RELEASE" == *talos* ]]; then
+    TALOS_FULLNAME="$TALOS_RELEASE"
+else
+    TALOS_FULLNAME="${TALOS_RELEASE}-talos"
+fi
+
+SECRET_NAME="${TALOS_RELEASE}-bootstrap"
+NEO4J_SECRET_NAME="${TALOS_FULLNAME}-neo4j"
+HAS_BOOTSTRAP=0; HAS_NEO4J=0
+k3s kubectl -n "$TALOS_NAMESPACE" get secret "$SECRET_NAME"        >/dev/null 2>&1 && HAS_BOOTSTRAP=1
+k3s kubectl -n "$TALOS_NAMESPACE" get secret "$NEO4J_SECRET_NAME"  >/dev/null 2>&1 && HAS_NEO4J=1
+
+if [[ $HAS_BOOTSTRAP -eq 1 && $HAS_NEO4J -eq 1 ]]; then
+    ok "bootstrap + neo4j secrets already exist — reusing"
+    warn "  to rotate: kubectl -n $TALOS_NAMESPACE delete secret $SECRET_NAME $NEO4J_SECRET_NAME && rerun this script."
+elif [[ $HAS_BOOTSTRAP -ne $HAS_NEO4J ]]; then
+    die "secret state is inconsistent — exactly one of $SECRET_NAME / $NEO4J_SECRET_NAME exists. Delete both and rerun."
+else
+    log "Generating cryptographic keys + service credentials"
+
+    rand_hex32()  { openssl rand -hex 32; }
+    rand_b64_pw() { openssl rand -base64 32 | tr -d '+=/' | head -c 32; }
+
+    TALOS_MASTER_KEY=$(rand_hex32)
+    JWT_SECRET=$(rand_hex32)
+    WORKER_SHARED_KEY=$(rand_hex32)
+    AUDIT_SIGNING_KEY=$(rand_hex32)
+
+    NATS_USER="talos"
+    NATS_PASSWORD=$(rand_b64_pw)
+
+    NEO4J_PASSWORD=$(rand_b64_pw)
+
+    MINIO_ROOT_USER="minioroot"
+    MINIO_ROOT_PASSWORD=$(rand_b64_pw)
+    MINIO_CONTROLLER_USER="controller"
+    MINIO_CONTROLLER_PASSWORD=$(rand_b64_pw)
+    MINIO_WORKER_USER="worker"
+    MINIO_WORKER_PASSWORD=$(rand_b64_pw)
+
+    # Worker /metrics endpoint requires a bearer token; comma-separated to
+    # allow rotation. One token is enough for first deploy — operators can
+    # add more (e.g. for separate Prometheus and Grafana scrapers) by
+    # rotating the secret in place.
+    METRICS_AUTH_TOKENS=$(rand_hex32)
+
+    # Build the kubectl create-secret args. Optional/empty values are
+    # included as empty strings so the chart's `optional: true` secretKeyRef
+    # resolves cleanly (vs missing keys, which print warnings on every pod start).
+    args=(
+        --from-literal=DATABASE_URL="$TALOS_POSTGRES_URL"
+        --from-literal=REDIS_URL="$TALOS_REDIS_URL"
+        --from-literal=NATS_USER="$NATS_USER"
+        --from-literal=NATS_PASSWORD="$NATS_PASSWORD"
+        --from-literal=NEO4J_USER="neo4j"
+        --from-literal=NEO4J_PASSWORD="$NEO4J_PASSWORD"
+        --from-literal=TALOS_MASTER_KEY="$TALOS_MASTER_KEY"
+        # Pre-init placeholder. The vault-init Job replaces this with a
+        # least-privilege `talos-controller` token (transit/encrypt + decrypt
+        # against the talos-kek key, nothing else) once Vault is unsealed.
+        # The controller refuses to start while this placeholder is set —
+        # vault-init triggers a rollout after the swap so the controller
+        # picks up the real token automatically. See vault/init-job.yaml.
+        --from-literal=VAULT_TOKEN="__pending_vault_init__"
+        --from-literal=JWT_SECRET="$JWT_SECRET"
+        --from-literal=WORKER_SHARED_KEY="$WORKER_SHARED_KEY"
+        --from-literal=TALOS_AUDIT_SIGNING_KEY="$AUDIT_SIGNING_KEY"
+        --from-literal=MINIO_ROOT_USER="$MINIO_ROOT_USER"
+        --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD"
+        --from-literal=MINIO_CONTROLLER_USER="$MINIO_CONTROLLER_USER"
+        --from-literal=MINIO_CONTROLLER_PASSWORD="$MINIO_CONTROLLER_PASSWORD"
+        --from-literal=MINIO_WORKER_USER="$MINIO_WORKER_USER"
+        --from-literal=MINIO_WORKER_PASSWORD="$MINIO_WORKER_PASSWORD"
+        --from-literal=METRICS_AUTH_TOKENS="$METRICS_AUTH_TOKENS"
+        --from-literal=ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+        --from-literal=OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+        --from-literal=EMBEDDING_API_URL="${EMBEDDING_API_URL:-}"
+        --from-literal=EMBEDDING_API_KEY="${EMBEDDING_API_KEY:-}"
+        --from-literal=EMBEDDING_MODEL="${EMBEDDING_MODEL:-}"
+        --from-literal=EMBEDDING_DIMENSIONS="${EMBEDDING_DIMENSIONS:-}"
+        --from-literal=EMBEDDING_MAX_RPM="${EMBEDDING_MAX_RPM:-}"
+        --from-literal=GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-}"
+        --from-literal=GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET:-}"
+        --from-literal=GMAIL_CLIENT_ID="${GMAIL_CLIENT_ID:-}"
+        --from-literal=GMAIL_CLIENT_SECRET="${GMAIL_CLIENT_SECRET:-}"
+        --from-literal=SLACK_CLIENT_ID="${SLACK_CLIENT_ID:-}"
+        --from-literal=SLACK_CLIENT_SECRET="${SLACK_CLIENT_SECRET:-}"
+        --from-literal=ATLASSIAN_CLIENT_ID="${ATLASSIAN_CLIENT_ID:-}"
+        --from-literal=ATLASSIAN_CLIENT_SECRET="${ATLASSIAN_CLIENT_SECRET:-}"
+        --from-literal=OKTA_DOMAIN="${OKTA_DOMAIN:-}"
+        --from-literal=OKTA_CLIENT_ID="${OKTA_CLIENT_ID:-}"
+        --from-literal=OKTA_CLIENT_SECRET="${OKTA_CLIENT_SECRET:-}"
+        --from-literal=SNYK_CLIENT_ID="${SNYK_CLIENT_ID:-}"
+        --from-literal=SNYK_CLIENT_SECRET="${SNYK_CLIENT_SECRET:-}"
+        --from-literal=ADMIN_SECRET_KEY="${ADMIN_SECRET_KEY:-}"
+        --from-literal=TOTP_ISSUER="${TOTP_ISSUER:-Talos}"
+    )
+
+    k3s kubectl -n "$TALOS_NAMESPACE" create secret generic "$SECRET_NAME" "${args[@]}"
+    ok "bootstrap secret created (${#args[@]} keys)"
+
+    # Neo4j auth Secret — combined "user/password" form, separate from bootstrap.
+    k3s kubectl -n "$TALOS_NAMESPACE" create secret generic "$NEO4J_SECRET_NAME" \
+        --from-literal=NEO4J_AUTH="neo4j/$NEO4J_PASSWORD"
+    ok "neo4j auth secret created"
+
+    warn "Back BOTH secrets up NOW — losing TALOS_MASTER_KEY orphans every DEK."
+    warn "  k3s kubectl -n $TALOS_NAMESPACE get secret $SECRET_NAME       -o yaml > /root/${SECRET_NAME}.backup.yaml"
+    warn "  k3s kubectl -n $TALOS_NAMESPACE get secret $NEO4J_SECRET_NAME -o yaml > /root/${NEO4J_SECRET_NAME}.backup.yaml"
+fi
+
+# ── 7. Render values overlay ─────────────────────────────────────
+# Drives image digests, ingress hosts, TLS, sigstore identity, and tells
+# the chart "do not create the bootstrap Secret — use the one we just made".
+OVERLAY=/etc/talos/values-deploy.yaml
+mkdir -p /etc/talos
+log "Writing $OVERLAY"
+
+if [[ "${TALOS_DISABLE_SIGSTORE:-no}" == "yes" ]]; then
+    SIGSTORE_BLOCK=$(cat <<EOF
+security:
+  sigstore:
+    enabled: false
+EOF
+)
+else
+    SIGSTORE_BLOCK=$(cat <<EOF
+security:
+  sigstore:
+    enabled: true
+    imageGlobs:
+      - "ghcr.io/${TALOS_GHCR_OWNER}/talos-*"
+    githubOrg: "${TALOS_GHCR_OWNER}"
+    githubRepo: "${TALOS_GHCR_REPO}"
+    certIdentityRegex: "^https://github\\\\.com/${TALOS_GHCR_OWNER}/${TALOS_GHCR_REPO}/\\\\.github/workflows/.+@refs/(heads/main|tags/v.+)\$"
+    oidcIssuer: "https://token.actions.githubusercontent.com"
+EOF
+)
+fi
+
+if [[ -n "${TALOS_IMAGE_PULL_SECRET:-}" ]]; then
+    PULL_SECRETS_BLOCK=$(cat <<EOF
+global:
+  imagePullSecrets:
+    - name: ${TALOS_IMAGE_PULL_SECRET}
+EOF
+)
+else
+    PULL_SECRETS_BLOCK="global: {}"
+fi
+
+cat > "$OVERLAY" <<EOF
+# Generated by deploy/k3s/install.sh — do not edit by hand.
+# Re-run install.sh to regenerate.
+${PULL_SECRETS_BLOCK}
+
+bootstrapSecret:
+  enabled: false
+  secretName: "${SECRET_NAME}"
+
+controller:
+  image:
+    repository: "ghcr.io/${TALOS_GHCR_OWNER}/talos-controller"
+    digest: "${TALOS_CONTROLLER_DIGEST}"
+  # OCI template registry. When TALOS_REGISTRY_URL is set in install.env, the
+  # controller skips disk template seeding and pulls catalog metadata from the
+  # configured registry. See .github/workflows/template-publish.yml — that
+  # workflow must have run at least once to populate the registry before
+  # operators flip this on, otherwise the Library / Catalog will appear empty.
+  ociRegistry:
+    url: "${TALOS_REGISTRY_URL:-}"
+    namespace: "${TALOS_REGISTRY_NAMESPACE:-${TALOS_GHCR_OWNER}/talos-tools}"
+  ingress:
+    enabled: true
+    className: "traefik"
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+      traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
+    hosts:
+      - host: "${TALOS_API_HOST}"
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: controller-tls
+        hosts:
+          - "${TALOS_API_HOST}"
+
+worker:
+  image:
+    repository: "ghcr.io/${TALOS_GHCR_OWNER}/talos-worker"
+    digest: "${TALOS_WORKER_DIGEST}"
+  # Sigstore enforcement for OCI template signatures. See worker/src/main.rs
+  # for the runtime check + worker.sigstore in values.yaml for the chart key.
+  # Defaults to disabled — operators flip on after running the publish
+  # workflow at least once and confirming the identity regexp matches.
+  sigstore:
+    required: "${TALOS_SIGSTORE_REQUIRED:-}"
+    identityRegexp: "${TALOS_SIGSTORE_IDENTITY_REGEXP:-}"
+    oidcIssuer: "https://token.actions.githubusercontent.com"
+
+frontend:
+  image:
+    repository: "ghcr.io/${TALOS_GHCR_OWNER}/talos-frontend"
+    digest: "${TALOS_FRONTEND_DIGEST}"
+  ingress:
+    enabled: true
+    className: "traefik"
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+      traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
+    hosts:
+      - host: "${TALOS_FRONTEND_HOST}"
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: frontend-tls
+        hosts:
+          - "${TALOS_FRONTEND_HOST}"
+
+${SIGSTORE_BLOCK}
+EOF
+chmod 0600 "$OVERLAY"
+ok "overlay written"
+
+# ── 8. Deploy Talos chart ────────────────────────────────────────
+log "Installing Talos chart from $CHART_DIR"
+helm upgrade --install "$TALOS_RELEASE" "$CHART_DIR" \
+    --namespace "$TALOS_NAMESPACE" \
+    --values "$CHART_DIR/values-phase1.yaml" \
+    --values "$OVERLAY" \
+    --wait --timeout 10m
+
+ok "Talos installed"
+
+# ── 8.5 Preserve client source IP through Traefik ────────────────
+# The k3s-bundled Traefik Service ships with externalTrafficPolicy=Cluster,
+# which lets kube-proxy SNAT every external request to a node-internal IP
+# *before* Traefik sees the connection. Result: per-IP rate limiting
+# collapses every real client into one bucket (the SNAT IP), even with
+# the controller's RFC 7239 X-Forwarded-For walker enabled — the chain
+# terminates at the SNAT IP because that's all Traefik ever received.
+#
+# Switching to externalTrafficPolicy=Local makes kube-proxy preserve the
+# original source IP. Safe on single-node k3s (Traefik runs on the only
+# node). On a future multi-node cluster, deploy Traefik as a DaemonSet or
+# enable proxy-protocol on the upstream load balancer instead.
+#
+# Idempotent: kubectl patch --type=merge is a no-op if the field is
+# already Local. Tolerate Traefik not being installed (someone could
+# disable it later) by trapping the error.
+if k3s kubectl -n kube-system get svc traefik >/dev/null 2>&1; then
+    log "Patching Traefik service for source-IP preservation"
+    k3s kubectl -n kube-system patch svc traefik \
+        --type=merge -p '{"spec":{"externalTrafficPolicy":"Local"}}' >/dev/null
+    ok "Traefik externalTrafficPolicy=Local (per-IP rate limiting now buckets on real client IP)"
+else
+    warn "Traefik service not found in kube-system — skipping source-IP patch"
+fi
+
+# ── 9. Smoke test ────────────────────────────────────────────────
+CONTROLLER_DEPLOY="${TALOS_FULLNAME}-controller"
+log "Waiting for controller health endpoint"
+for _ in $(seq 1 30); do
+    if k3s kubectl -n "$TALOS_NAMESPACE" exec "deploy/${CONTROLLER_DEPLOY}" -- \
+            curl -sf http://localhost:8000/health >/dev/null 2>&1; then
+        ok "controller healthy"
+        break
+    fi
+    sleep 5
+done
+
+# ── 9.1 End-to-end public-path smoke test ────────────────────────
+# Probes every nginx-fronted endpoint to catch the regression class
+# that survives a clean helm upgrade but breaks at request time:
+# missing nginx route, dropped controller endpoint, broken handler.
+# Auth-required probes (full MCP + memory round-trip) are skipped
+# unless SMOKE_AGENT_TOKEN + SMOKE_ACTOR_ID are exported.
+SMOKE_SCRIPT="$SCRIPT_DIR/../../scripts/smoke.sh"
+if [[ -x "$SMOKE_SCRIPT" ]]; then
+    log "Running end-to-end smoke test against https://$TALOS_FRONTEND_HOST"
+    if BASE_URL="https://$TALOS_FRONTEND_HOST" "$SMOKE_SCRIPT"; then
+        ok "smoke test passed"
+    else
+        warn "smoke test failed — install completed but at least one public path is broken."
+        warn "  → review the smoke output above; common causes:"
+        warn "    - missing nginx location for a new controller route (see scripts/lint-structural.sh)"
+        warn "    - frontend pod still on old ConfigMap (kubectl rollout restart deploy/${TALOS_FULLNAME}-frontend)"
+        warn "    - DNS / LE cert not yet propagated"
+    fi
+else
+    warn "smoke script not found at $SMOKE_SCRIPT — skipping end-to-end probe."
+fi
+
+printf '\n\033[1;32m╔═══════════════════════════════════════════════════════════╗\033[0m\n'
+printf '\033[1;32m║ Talos is up. Next steps:                                  ║\033[0m\n'
+printf '\033[1;32m╚═══════════════════════════════════════════════════════════╝\033[0m\n'
+printf '  1. Visit  https://%s/  once DNS + LE cert propagates (~2 min).\n' "$TALOS_FRONTEND_HOST"
+printf '  2. API    https://%s/health\n' "$TALOS_API_HOST"
+printf '  3. Pods   kubectl -n %s get pods\n' "$TALOS_NAMESPACE"
+printf '  4. Logs   kubectl -n %s logs -f deploy/%s\n' "$TALOS_NAMESPACE" "$CONTROLLER_DEPLOY"
+printf '  5. Backup kubectl -n %s get secret %s -o yaml > /root/%s.backup.yaml\n' \
+    "$TALOS_NAMESPACE" "$SECRET_NAME" "$SECRET_NAME"
+printf '\n'

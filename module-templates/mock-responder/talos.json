@@ -1,0 +1,30 @@
+{
+  "name": "mock-responder",
+  "version": "v1.0.0",
+  "display_name": "Mock Responder",
+  "description": "Returns a configured static JSON response. Use in workflow tests to simulate downstream services without making real API calls.",
+  "category": "Development",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["RESPONSE"],
+    "properties": {
+      "RESPONSE": {
+        "type": "string",
+        "description": "JSON string to return as the node output. Must be valid JSON."
+      },
+      "ECHO_INPUT": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, also include the input payload in the response under the '__input__' key."
+      },
+      "FAIL_WITH": {
+        "type": "string",
+        "default": "",
+        "description": "When non-empty, always fail the node with this error message (useful for testing error paths)."
+      }
+    }
+  }
+}

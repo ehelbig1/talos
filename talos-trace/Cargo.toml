@@ -1,0 +1,18 @@
+[package]
+name = "talos-trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "reqwest-client", "http-proto"] }
+tracing.workspace = true
+tracing-opentelemetry = "0.28"
+tracing-subscriber = "0.3"
+
+[lints]
+workspace = true

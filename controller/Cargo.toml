@@ -1,0 +1,229 @@
+[package]
+name = "controller"
+version = "1.0.0-r306"
+edition = "2021"
+# Internal workspace crate — not published to crates.io. License set so
+# cargo-deny's unlicensed-crate check passes; no third-party distribution.
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lru = "0.16.3"
+# HTML sanitisation for user-facing rendered output (briefing endpoint).
+ammonia = "4"
+# Atomic hot-swap for the Pub/Sub JWK cache (gmail::pubsub_jwt).
+# Readers never see a half-built map; refresh writes a new Arc.
+arc-swap = "1.7"
+# Use Axum 0.8 (required by async-graphql‑axum 7.x)
+axum = { version = "0.8", features = ["json", "ws"] }
+async-graphql = { version = "7.2", features = ["uuid", "chrono", "dataloader"] }
+async-graphql-axum = "7.2"
+tokio = { version = "1.49", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-stream = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+uuid = { version = "1.20", features = ["serde", "v4", "v5"] }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-dlp = { path = "../talos-dlp" }
+talos-secrets = { path = "../talos-secrets" }
+talos-memory = { path = "../talos-memory" }
+talos-mcp = { path = "../talos-mcp" }
+talos-auth-types = { path = "../talos-auth-types" }
+talos-actor-types = { path = "../talos-actor-types" }
+talos-workflow-types = { path = "../talos-workflow-types" }
+talos-auth = { path = "../talos-auth" }
+talos-rate-limit = { path = "../talos-rate-limit" }
+talos-csrf = { path = "../talos-csrf" }
+talos-circuit-breaker = { path = "../talos-circuit-breaker" }
+talos-feature-flags = { path = "../talos-feature-flags" }
+talos-idempotency = { path = "../talos-idempotency" }
+talos-cost-attribution = { path = "../talos-cost-attribution" }
+talos-errors = { path = "../talos-errors" }
+talos-metrics = { path = "../talos-metrics" }
+talos-http-utils = { path = "../talos-http-utils" }
+talos-shutdown = { path = "../talos-shutdown" }
+talos-tenancy = { path = "../talos-tenancy" }
+talos-secrets-rotation = { path = "../talos-secrets-rotation" }
+talos-node-cache = { path = "../talos-node-cache" }
+talos-db-monitor = { path = "../talos-db-monitor" }
+talos-worker-fleet = { path = "../talos-worker-fleet" }
+talos-schedule-repo = { path = "../talos-schedule-repo" }
+talos-config = { path = "../talos-config" }
+talos-config-validator = { path = "../talos-config-validator" }
+talos-integration-state = { path = "../talos-integration-state" }
+talos-system-repo = { path = "../talos-system-repo" }
+talos-api-keys = { path = "../talos-api-keys" }
+talos-graph-rag = { path = "../talos-graph-rag" }
+talos-security-headers = { path = "../talos-security-headers" }
+talos-retry-intelligence = { path = "../talos-retry-intelligence" }
+talos-capability-world = { path = "../talos-capability-world" }
+talos-jobs = { path = "../talos-jobs" }
+talos-replay-diff = { path = "../talos-replay-diff" }
+talos-replay-service = { path = "../talos-replay-service" }
+talos-inline-compile-service = { path = "../talos-inline-compile-service" }
+talos-search-service = { path = "../talos-search-service" }
+talos-trace = { path = "../talos-trace" }
+talos-mcp-tool-schema = { path = "../talos-mcp-tool-schema" }
+talos-organizations = { path = "../talos-organizations" }
+talos-yaml-workflows = { path = "../talos-yaml-workflows" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-audit-ledger = { path = "../talos-audit-ledger" }
+talos-db = { path = "../talos-db" }
+talos-text-util = { path = "../talos-text-util" }
+talos-trace-nats = { path = "../talos-trace-nats" }
+talos-workflow-signing = { path = "../talos-workflow-signing" }
+talos-capability-downgrade = { path = "../talos-capability-downgrade" }
+talos-workflow-creation = { path = "../talos-workflow-creation" }
+talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
+talos-hot-update-service = { path = "../talos-hot-update-service" }
+talos-execution-orchestration = { path = "../talos-execution-orchestration" }
+talos-workflow-manifest = { path = "../talos-workflow-manifest" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
+talos-webhook-repository = { path = "../talos-webhook-repository" }
+talos-totp-2fa = { path = "../talos-totp-2fa" }
+talos-oauth = { path = "../talos-oauth" }
+talos-integrations = { path = "../talos-integrations" }
+talos-module-executions = { path = "../talos-module-executions" }
+talos-memory-crypto = { path = "../talos-memory-crypto" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-actor-memory-service = { path = "../talos-actor-memory-service" }
+talos-advanced-repository = { path = "../talos-advanced-repository" }
+talos-analytics-repository = { path = "../talos-analytics-repository" }
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-engine-events = { path = "../talos-engine-events" }
+talos-execution-repository = { path = "../talos-execution-repository" }
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+talos-workflow-validation = { path = "../talos-workflow-validation" }
+talos-actor-policy-hook = { path = "../talos-actor-policy-hook" }
+talos-workflow-versions = { path = "../talos-workflow-versions" }
+talos-module-repository = { path = "../talos-module-repository" }
+talos-registry = { path = "../talos-registry" }
+talos-module-templates = { path = "../talos-module-templates" }
+talos-rpc-subscribers = { path = "../talos-rpc-subscribers" }
+talos-actor-scaffold = { path = "../talos-actor-scaffold" }
+talos-engine = { path = "../talos-engine" }
+talos-subworkflow-contract = { path = "../talos-subworkflow-contract" }
+talos-scheduler = { path = "../talos-scheduler" }
+talos-actor-policies = { path = "../talos-actor-policies" }
+talos-templates = { path = "../talos-templates" }
+talos-llm = { path = "../talos-llm" }
+talos-atlassian = { path = "../talos-atlassian" }
+talos-slack = { path = "../talos-slack" }
+talos-compilation = { path = "../talos-compilation" }
+talos-integration-helpers = { path = "../talos-integration-helpers" }
+talos-google-calendar = { path = "../talos-google-calendar" }
+talos-gmail = { path = "../talos-gmail" }
+talos-continuation-trigger = { path = "../talos-continuation-trigger" }
+talos-webhooks = { path = "../talos-webhooks" }
+talos-api = { path = "../talos-api" }
+talos-mcp-handlers = { path = "../talos-mcp-handlers" }
+talos-api-docs = { path = "../talos-api-docs" }
+talos-ws-auth = { path = "../talos-ws-auth" }
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
+talos-workflow-engine-nats = { path = "../../talos-workflow-engine/talos-workflow-engine-nats" }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono", "migrate"] } # `migrate` enables sqlx::migrate! macro for auto-applying migrations at controller startup. RUSTSEC-2024-0363 fix already in 0.8.
+pgvector = { version = "0.4", features = ["sqlx"] }
+neo4rs = "0.8"
+dotenvy = "0.15"
+petgraph = "0.6"
+futures = "0.3"
+async-trait = "0.1"  # Only needed for dyn-compatible async traits (JobHandler)
+worker = { path = "../worker" }
+rand = { version = "0.8", default-features = true, features = ["std"] }
+anyhow = "1.0"
+# Logging dependencies
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Node creation dependencies
+handlebars = "6.4"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Secrets management and webhook security
+aes-gcm = "0.10"
+hex = "0.4"
+hmac = "0.12"
+base64 = "0.22"
+constant_time_eq = "0.3"  # Constant-time comparison for cryptographic tokens
+subtle = "2.4"  # Constant‑time equality (used for HMAC verification)
+
+# Authentication
+bcrypt = "0.18"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+regex = "1.12"
+
+# Cookie handling
+tower-cookies = "0.11"
+
+# Rate limiting
+governor = "0.6"
+tower = { version = "0.5", features = ["util"] }
+ipnetwork = "0.21"
+dashmap = "6.1.0"  # Lock-free concurrent HashMap
+
+# External services for WASM capabilities
+# Updated to match worker versions for type compatibility
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+# rustls is pulled in transitively by redis/sqlx/reqwest. We add it as a
+# direct dep so main.rs can call rustls::crypto::ring::default_provider()
+# .install_default() at startup — required since rustls 0.23 stopped
+# auto-selecting a CryptoProvider when more than one is in the dep graph.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+async-nats = "0.47"
+cap-std = "3.4"  # Capability-based file system for WASM sandboxing
+
+# 2FA/TOTP
+totp-rs = "5.7"
+qrcode = "0.14"
+image = "0.25"
+
+# OAuth/OIDC – implemented with `oauth2` crate only (no `openidconnect`).
+oauth2 = { version = "4.4.2", default-features = false, features = ["reqwest"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+# OCI registry client — used by registry::sync to pull template manifests from
+# GHCR / docker registry / harbor / etc. Same crate the worker uses for WASM
+# pulls; pinning the same major version keeps semantics aligned across the
+# two services. Auth flow (anonymous + Bearer challenge) is handled by the
+# crate, so the controller doesn't have to implement OAuth bearer-token
+# negotiation by hand.
+oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+urlencoding = "2.1"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "reqwest-client", "http-proto"] }
+tracing-opentelemetry = "0.28"
+tower_governor = "0.8.0"
+
+# S3 client for immutable audit ledger storage (MinIO)
+aws-config = "1.5"
+aws-sdk-s3 = "1.30"
+tonic = "0.12.3"
+rhai = { version = "1.19", features = ["serde"] }
+zeroize = "1.8"
+dirs-next = "2.0"  # Locate CARGO_HOME for container registry cache mounts
+thiserror = "2.0"
+croner = "2.0"
+chrono-tz = "0.10"
+prometheus = "0.13" # Blocked at 0.13: opentelemetry-prometheus 0.27 requires prometheus 0.13.x.
+                    # RUSTSEC-2024-0437 (protobuf recursion crash) unfixable until opentelemetry-prometheus
+                    # releases a 0.28+ that supports prometheus 0.14. Track: open-telemetry/opentelemetry-rust.
+
+[dev-dependencies]
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
+# Used by gmail::pubsub_jwt tests to mint RSA keypairs that back
+# locally-signed test JWTs. Production verifier fetches JWKs from
+# Google and never calls rsa::* directly.
+rsa = { version = "0.9", features = ["pem"] }
+
+[features]
+default = []
+
+[lints]
+workspace = true

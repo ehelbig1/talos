@@ -1,0 +1,114 @@
+{{- if and .Values.worker.enabled .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "talos.componentName" (list . "worker") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "worker") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "worker") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # MCP-896 (2026-05-14): Prometheus scrape only — workers are not
+    # reachable otherwise. Pre-fix this used `podSelector: {}` (any
+    # pod in namespace); scoped to a monitoring-namespace selector
+    # for lateral-movement defense even though the port is metrics-
+    # only (less blast radius than the controller case, same fix
+    # for consistency).
+    {{- if .Values.networkPolicy.monitoringIngress.enabled }}
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.monitoringIngress.namespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.worker.service.metricsPort }}
+    {{- end }}
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # NATS
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.nats.service.clientPort }}
+    # MinIO (audit logs)
+    {{- if .Values.minio.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: minio
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.minio.service.apiPort }}
+    {{- end }}
+    # Ollama (tier-1 LLM)
+    {{- if .Values.ollama.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ollama
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 11434
+    {{- end }}
+    # External HTTP/HTTPS — required for module HTTP calls. The host deny
+    # list (job_protocol::EXTERNAL_LLM_HOSTS + per-actor tier gate) is
+    # enforced in the worker itself; NetworkPolicy is the coarse outer
+    # boundary.
+    - to:
+        {{- range .Values.networkPolicy.externalEgressCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+            except:
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+    # Redis (worker caches WASM bytes) — REDIS_URL points to external host.
+    # MCP-796 (2026-05-14): full RFC-1918 deny-list parity with the
+    # port-443/80 egress above and with the controller's NetworkPolicy.
+    # Pre-fix this except-block only listed 169.254.0.0/16 (cloud
+    # metadata) — missing 10/8, 172.16/12, 192.168/16 — so the worker
+    # was permitted to reach private-network Redis instances on port
+    # 6379 even though every other external-egress rule in the chart
+    # rejected them. Operator-configured REDIS_URL is currently the
+    # only path to this socket; this fix is defense-in-depth against a
+    # future caller-driven Redis URL configuration that would
+    # otherwise inherit a wider blast radius than the HTTPS path.
+    - to:
+        {{- range .Values.networkPolicy.externalEgressCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+            except:
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 6379
+{{- end }}

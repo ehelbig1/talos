@@ -1,0 +1,31 @@
+[package]
+name = "talos-slack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = { version = "0.8", features = ["json"] }
+chrono.workspace = true
+oauth2 = { version = "4.4.2", default-features = false, features = ["reqwest"] }
+regex = "1.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-config = { path = "../talos-config" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-oauth = { path = "../talos-oauth" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+# MCP-1028: truncate-then-redact discipline on audit log error_message.
+talos-text-util = { path = "../talos-text-util" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+urlencoding = "2.1"
+uuid.workspace = true
+
+[lints]
+workspace = true

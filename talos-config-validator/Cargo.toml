@@ -1,0 +1,18 @@
+[package]
+name = "talos-config-validator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hex = "0.4"
+talos-config = { path = "../talos-config" }
+# MCP-1050: canonical truncate_at_char_boundary for DATABASE_URL preview.
+talos-text-util = { path = "../talos-text-util" }
+tracing.workspace = true
+
+[lints]
+workspace = true

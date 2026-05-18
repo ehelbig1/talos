@@ -1,0 +1,22 @@
+{
+  "name": "stripe-get-customer",
+  "version": "v1.0.0",
+  "display_name": "Stripe: Get Customer",
+  "description": "Retrieve a Stripe customer by ID, including their subscription status and billing details. Use after stripe-create-customer or from a Stripe webhook to check subscription tier, livemode, and balance. Set EXPAND_SUBSCRIPTIONS=true to include active subscription details for condition branching.",
+  "category": "Payments",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.stripe.com"],
+  "requires_secrets": ["stripe/secret_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "CUSTOMER_ID"],
+    "properties": {
+      "API_KEY_SECRET": { "type": "string", "description": "Vault path to the Stripe secret key (e.g. 'stripe/secret_key')." },
+      "CUSTOMER_ID": { "type": "string", "description": "Stripe customer ID (e.g. 'cus_xxx'). Supports {{customer_id}} template interpolation." },
+      "EXPAND_SUBSCRIPTIONS": { "type": "boolean", "default": false, "description": "When true, expands the subscriptions list inline. Adds subscription status, current_period_end, and plan details to the output." }
+    }
+  },
+  "setup_instructions": [
+    { "step": 1, "title": "Typical workflow pattern", "detail": "Chain: [Stripe webhook: customer.subscription.updated] → [stripe-get-customer: CUSTOMER_ID={{customer_id}}, EXPAND_SUBSCRIPTIONS=true] → [condition: subscription_status == 'active'] → downstream actions." }
+  ]
+}

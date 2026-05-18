@@ -1,0 +1,114 @@
+{{- if .Values.nats.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "talos.componentName" (list . "nats") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "nats") | nindent 4 }}
+spec:
+  serviceName: {{ include "talos.componentName" (list . "nats-headless") }}
+  replicas: {{ .Values.nats.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "nats") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "nats") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/nats/configmap.yaml") . | sha256sum }}
+    spec:
+      terminationGracePeriodSeconds: 60
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: nats
+          image: {{ include "talos.image" .Values.nats.image }}
+          imagePullPolicy: {{ .Values.nats.image.pullPolicy }}
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          args:
+            # The jetstream block in nats.conf already pins store_dir to
+            # /data/jetstream — passing --store_dir on the CLI in addition
+            # produces "Duplicate 'store_dir' configuration" at startup.
+            - "nats-server"
+            - "-c"
+            - "/etc/nats/nats.conf"
+          env:
+            - name: NATS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: NATS_USER
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: NATS_PASSWORD
+          ports:
+            - name: client
+              containerPort: {{ .Values.nats.service.clientPort }}
+            - name: cluster
+              containerPort: {{ .Values.nats.service.clusterPort }}
+            - name: monitor
+              containerPort: {{ .Values.nats.service.monitorPort }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.nats.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "talos.componentName" (list . "nats") }}
+        {{- if not .Values.nats.persistence.enabled }}
+        # MCP-806 (2026-05-14): emptyDir fallback when persistence is
+        # disabled. Pre-fix the StatefulSet volumeMount at /data
+        # referenced a `data` volume only declared inside the
+        # `volumeClaimTemplates` block (also gated by
+        # persistence.enabled), so `--set nats.persistence.enabled=
+        # false` rendered cleanly but stuck the nats pod in
+        # ContainerCreating with "volume not found".
+        #
+        # WARNING — ephemeral semantics: emptyDir lives for the pod's
+        # lifetime only. NATS JetStream message queue + RPC reply state
+        # are wiped on every pod restart; in-flight job dispatches
+        # vanish (recoverable via re-enqueue but no per-message audit).
+        # Use ONLY for dev/test / CI; production must use
+        # `persistence.enabled: true`.
+        - name: data
+          emptyDir:
+            sizeLimit: "1Gi"
+        {{- end }}
+  {{- if .Values.nats.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "talos.componentLabels" (list . "nats") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.nats.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.nats.persistence.size }}
+  {{- end }}
+{{- end }}

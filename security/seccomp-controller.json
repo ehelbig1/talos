@@ -1,0 +1,287 @@
+{
+  "_comment": "Seccomp profile for the Talos controller container (Rust/Axum API server). Deny-by-default with an allowlist. The controller needs broader filesystem and exec permissions than the worker because it compiles WASM modules (cargo, wizer) and manages connections to PostgreSQL, Redis, NATS, and MinIO.",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "_comment": "File descriptor I/O",
+      "names": [
+        "read",
+        "write",
+        "readv",
+        "writev",
+        "pread64",
+        "pwrite64",
+        "lseek",
+        "close",
+        "dup",
+        "dup2",
+        "dup3",
+        "pipe",
+        "pipe2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "File open / stat / metadata",
+      "names": [
+        "open",
+        "openat",
+        "stat",
+        "fstat",
+        "lstat",
+        "newfstatat",
+        "statx",
+        "access",
+        "faccessat",
+        "faccessat2",
+        "readlink",
+        "readlinkat",
+        "getcwd",
+        "getdents",
+        "getdents64"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Memory management",
+      "names": [
+        "mmap",
+        "mprotect",
+        "munmap",
+        "mremap",
+        "brk",
+        "madvise",
+        "membarrier"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Signal handling",
+      "names": [
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "rt_sigreturn",
+        "sigaltstack",
+        "restart_syscall"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Process / thread management (includes execve for compilation subprocesses)",
+      "names": [
+        "clone",
+        "clone3",
+        "execve",
+        "execveat",
+        "exit",
+        "exit_group",
+        "wait4",
+        "waitid",
+        "set_robust_list",
+        "get_robust_list",
+        "prctl",
+        "arch_prctl",
+        "set_tid_address",
+        "getpid",
+        "gettid",
+        "getppid",
+        "getuid",
+        "geteuid",
+        "getgid",
+        "getegid",
+        "getgroups",
+        "sched_yield",
+        "sched_getaffinity",
+        "sched_setaffinity",
+        "rseq",
+        "vfork"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Synchronization primitives",
+      "names": [
+        "futex",
+        "futex_waitv"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Networking (PostgreSQL, Redis, NATS, MinIO, HTTP API)",
+      "names": [
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "accept4",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "shutdown",
+        "getsockname",
+        "getpeername",
+        "setsockopt",
+        "getsockopt",
+        "socketpair"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Event polling (tokio/epoll)",
+      "names": [
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_wait",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "poll",
+        "ppoll",
+        "select",
+        "pselect6",
+        "eventfd",
+        "eventfd2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "File descriptor control",
+      "names": [
+        "fcntl",
+        "flock",
+        "ioctl"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Time / clocks",
+      "names": [
+        "clock_gettime",
+        "clock_getres",
+        "clock_nanosleep",
+        "nanosleep",
+        "gettimeofday"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Randomness (TLS, JWT signing, CSRF tokens)",
+      "names": [
+        "getrandom"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Filesystem operations (compilation workspace, tmpfs, template files)",
+      "names": [
+        "unlink",
+        "unlinkat",
+        "rename",
+        "renameat",
+        "renameat2",
+        "mkdir",
+        "mkdirat",
+        "rmdir",
+        "ftruncate",
+        "fallocate",
+        "fsync",
+        "fdatasync",
+        "fchmod",
+        "fchmodat",
+        "fchown",
+        "fchownat",
+        "utimensat",
+        "statfs",
+        "fstatfs",
+        "symlink",
+        "symlinkat",
+        "link",
+        "linkat",
+        "chmod",
+        "chown",
+        "lchown",
+        "chdir",
+        "fchdir"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Name resolution and system info",
+      "names": [
+        "uname",
+        "sysinfo",
+        "getrlimit",
+        "prlimit64",
+        "setrlimit"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Thread-local storage",
+      "names": [
+        "set_thread_area",
+        "get_thread_area"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Timerfd (tokio runtime)",
+      "names": [
+        "timerfd_create",
+        "timerfd_settime",
+        "timerfd_gettime"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Signalfd (async signal handling)",
+      "names": [
+        "signalfd",
+        "signalfd4"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Process execution support (needed for compilation subprocesses: cargo, wizer, wasm-tools)",
+      "names": [
+        "getresuid",
+        "getresgid",
+        "setpgid",
+        "getpgid",
+        "getpgrp",
+        "setsid",
+        "getsid",
+        "tgkill",
+        "kill",
+        "rt_sigtimedwait",
+        "rt_sigsuspend"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Inotify (file watching for config/compilation)",
+      "names": [
+        "inotify_init",
+        "inotify_init1",
+        "inotify_add_watch",
+        "inotify_rm_watch"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "sendfile (efficient file transfer for HTTP responses)",
+      "names": [
+        "sendfile"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "briefing-html-generator",
+  "version": "v1.0.0",
+  "display_name": "Briefing HTML Dashboard",
+  "description": "Generates an interactive HTML dashboard from structured briefing data (top_priority, todays_focus, incoming, quick_wins, day_summary). Includes action buttons that trigger Jira issue transitions via the Talos MCP API. Configure BASE_URL and ACTION_WORKFLOW_ID.",
+  "category": "Reporting",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "dependencies": {
+    "chrono": "0.4"
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "BASE_URL": {
+        "type": "string",
+        "default": "http://localhost:8000",
+        "description": "Talos controller base URL for action button API calls"
+      },
+      "ACTION_WORKFLOW_ID": {
+        "type": "string",
+        "description": "UUID of the jira-action workflow to trigger when buttons are clicked"
+      }
+    },
+    "required": ["ACTION_WORKFLOW_ID"]
+  }
+}

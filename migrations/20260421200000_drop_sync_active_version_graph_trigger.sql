@@ -1,0 +1,30 @@
+-- Drop the `trg_sync_workflow_version_graph` trigger.
+--
+-- The trigger (20260413000001) propagated workflows.graph_json changes
+-- to the currently-active row in workflow_versions on every UPDATE. In
+-- practice this silently mutated "published" versions every time the
+-- draft was edited — so `list_versions` + `diff_versions` + rollback
+-- all became meaningless (all versions ended up holding the same
+-- content — whatever was most recently written to the draft).
+--
+-- Demonstrated concretely during manual testing (2026-04-21):
+--   create_workflow({nodes:[n1]})
+--   publish_version -> v1
+--   add_node_to_workflow(n2)   -- draft now has {n1, n2}
+--                              -- trigger rewrites v1 to {n1, n2}
+--   publish_version -> v2      -- snapshots draft (also {n1, n2})
+--   diff_versions(1, 2)        -- empty (identical graph_json)
+--   rollback_workflow(1)       -- new v3 carries v1's graph (= {n1, n2})
+--
+-- The correct contract:
+--   - workflows.graph_json is the mutable DRAFT
+--   - workflow_versions rows are immutable SNAPSHOTS
+--   - `trigger_workflow` reads from the active snapshot (workflow_versions)
+--   - draft edits take effect only after publish_version
+--
+-- Dropping the trigger restores that contract. The function itself is
+-- kept (no CASCADE) so if the platform ever wants a read-model variant
+-- (e.g. a materialized "current" view that explicitly mirrors the draft),
+-- the implementation is available without relying on git history.
+
+DROP TRIGGER IF EXISTS trg_sync_workflow_version_graph ON workflows;

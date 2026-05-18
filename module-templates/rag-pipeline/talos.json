@@ -1,0 +1,101 @@
+{
+  "name": "rag-pipeline",
+  "version": "v1.0.0",
+  "display_name": "RAG Pipeline",
+  "description": "Retrieval-Augmented Generation pipeline: embeds a query via an embedding API, searches a vector store for relevant documents, and synthesizes an answer using an LLM. Requires API keys for the embedding service and the LLM provider stored in the secrets vault.",
+  "category": "AI",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["*"],
+  "requires_secrets": ["rag/embedding_api_key", "rag/llm_api_key"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["EMBEDDING_API_URL", "VECTOR_DB_URL", "EMBEDDING_API_KEY_SECRET", "LLM_API_KEY_SECRET"],
+    "properties": {
+      "EMBEDDING_API_URL": {
+        "type": "string",
+        "description": "Full URL for the embedding API endpoint (e.g. 'https://api.openai.com/v1/embeddings'). The request POSTs JSON with {\"model\": EMBEDDING_MODEL, \"input\": query}."
+      },
+      "EMBEDDING_MODEL": {
+        "type": "string",
+        "default": "text-embedding-3-small",
+        "description": "Model identifier sent to the embedding API (e.g. 'text-embedding-3-small', 'text-embedding-ada-002')."
+      },
+      "EMBEDDING_API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path for the embedding API key (e.g. 'rag/embedding_api_key'). Must match the path used in create_secret and install_module_from_catalog allowed_secrets."
+      },
+      "VECTOR_DB_URL": {
+        "type": "string",
+        "description": "Full URL for the vector store search endpoint (e.g. 'https://my-index.pinecone.io/query'). The request POSTs JSON with {\"vector\": [...], \"topK\": TOP_K, \"includeMetadata\": true}."
+      },
+      "VECTOR_DB_API_KEY_SECRET": {
+        "type": "string",
+        "description": "Optional vault path for the vector DB API key. When set, the key is injected as an 'Api-Key' header. Omit if the vector DB uses no authentication."
+      },
+      "TOP_K": {
+        "type": "number",
+        "default": 5,
+        "description": "Number of nearest-neighbor results to retrieve from the vector store (1-50)."
+      },
+      "LLM_API_URL": {
+        "type": "string",
+        "default": "https://api.openai.com/v1/chat/completions",
+        "description": "Full URL for the LLM chat completions endpoint."
+      },
+      "LLM_MODEL": {
+        "type": "string",
+        "default": "gpt-4o",
+        "description": "LLM model identifier for answer synthesis (e.g. 'gpt-4o', 'gpt-4o-mini')."
+      },
+      "LLM_API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path for the LLM API key (e.g. 'rag/llm_api_key')."
+      },
+      "SYSTEM_PROMPT": {
+        "type": "string",
+        "default": "You are a helpful assistant. Answer the user's question using ONLY the provided context documents. If the context does not contain enough information, say so explicitly. Do not make up information.",
+        "description": "System prompt for the LLM synthesis step. The retrieved documents are appended as context automatically."
+      },
+      "MAX_TOKENS": {
+        "type": "number",
+        "default": 1024,
+        "description": "Maximum tokens for the LLM response."
+      },
+      "SCORE_THRESHOLD": {
+        "type": "number",
+        "default": 0.0,
+        "description": "Minimum similarity score to include a document in the context (0.0-1.0). Documents below this threshold are filtered out."
+      }
+    }
+  },
+  "output_shape": {
+    "answer": "The LLM-synthesized answer based on retrieved context",
+    "query": "The original query that was embedded and searched",
+    "sources": "Array of retrieved documents with text, score, and metadata",
+    "source_count": "Number of documents that passed the score threshold",
+    "model": "The LLM model used for synthesis"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Store embedding API key",
+      "detail": "create_secret {name: 'rag/embedding_api_key', value: 'sk-...', namespace: 'ai'}. If using OpenAI embeddings, this is your OpenAI API key."
+    },
+    {
+      "step": 2,
+      "title": "Store LLM API key",
+      "detail": "create_secret {name: 'rag/llm_api_key', value: 'sk-...', namespace: 'ai'}. Can be the same key as the embedding key if both use the same provider."
+    },
+    {
+      "step": 3,
+      "title": "Install the module with secret access",
+      "detail": "install_module_from_catalog {name: 'rag-pipeline', allowed_secrets: ['rag/embedding_api_key', 'rag/llm_api_key']}. Add 'rag/vector_db_api_key' if your vector DB requires authentication."
+    },
+    {
+      "step": 4,
+      "title": "Configure node with your endpoints",
+      "detail": "Set EMBEDDING_API_URL to your embedding endpoint, VECTOR_DB_URL to your vector store query endpoint, and both _API_KEY_SECRET configs to the matching vault paths. Input to this node should be a JSON object with a 'query' field containing the user's question."
+    }
+  ]
+}

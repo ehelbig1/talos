@@ -1,0 +1,176 @@
+name: Publish Templates
+
+# Publishes the bundled module-templates/ to the OCI registry as
+# `ghcr.io/{owner}/talos-tools/{name}:{version}`, plus a discovery index at
+# `ghcr.io/{owner}/talos-tools/_index:latest`. The controller's
+# `registry::sync` reads the index on startup to populate the catalog.
+#
+# Triggers:
+#   - push to main when anything under module-templates/ changes
+#   - manual workflow_dispatch (for re-publishing without code changes)
+#
+# Compilation re-uses the controller binary's `publish-templates`
+# subcommand. CI never re-implements the cargo-component scaffold —
+# whatever's in the controller image is what gets shipped, no drift.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "module-templates/**"
+      - ".github/workflows/template-publish.yml"
+  workflow_dispatch:
+    inputs:
+      controller_image:
+        description: "Controller image to use as the template builder (default: ghcr.io/{owner}/talos-controller:latest)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write   # ghcr.io push
+  id-token: write   # reserved for future Sigstore keyless signing
+
+env:
+  REGISTRY: ghcr.io
+  NAMESPACE: ${{ github.repository_owner }}/talos-tools
+  # Concurrency group keyed by branch — back-to-back commits cancel any
+  # in-flight run so we don't race on registry pushes.
+  ORAS_VERSION: "1.2.0"
+
+concurrency:
+  group: template-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install ORAS
+        run: |
+          set -euxo pipefail
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin oras
+          oras version
+
+      - name: Install Cosign
+        # Keyless signing via the workflow's own GitHub OIDC token. No keys
+        # to manage — the certificate identity (the workflow URL) is what
+        # the worker verifies against. See § "Cosign verify" in worker/.
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.1"
+
+      - name: Resolve controller builder image
+        id: builder
+        run: |
+          set -euxo pipefail
+          IMAGE="${{ inputs.controller_image }}"
+          if [ -z "$IMAGE" ]; then
+            IMAGE="${REGISTRY}/${{ github.repository_owner }}/talos-controller:latest"
+          fi
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Using builder image: $IMAGE"
+
+      - name: Compile templates via controller binary
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/templates-out"
+          # Run the controller binary as a one-shot CLI. The binary's
+          # `publish-templates` subcommand reuses the same CompilationService
+          # the running server uses, so what CI builds == what production runs.
+          docker pull "${{ steps.builder.outputs.image }}"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/module-templates:/app/module-templates:ro" \
+            -v "$GITHUB_WORKSPACE/templates-out:/out" \
+            -e TALOS_WIT_PATH=/app/wit/talos.wit \
+            "${{ steps.builder.outputs.image }}" \
+            publish-templates \
+            --templates-dir /app/module-templates \
+            --output /out
+          echo "Compiled templates:"
+          ls -la "$GITHUB_WORKSPACE/templates-out"
+
+      - name: Push individual template artifacts
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/templates-out"
+          # Iterate every template directory and oras-push as
+          # {name}:{version} where {version} comes from talos.json.
+          # Each push is followed by a keyless cosign sign — the worker's
+          # `verify_oci_signature` check (when TALOS_SIGSTORE_REQUIRED=true)
+          # will reject any unsigned artifact at pull time.
+          for dir in */; do
+            name="${dir%/}"
+            tag="$(jq -r '.version // "latest"' "$dir/talos.json")"
+            ref="${REGISTRY}/${NAMESPACE}/${name}:${tag}"
+            echo "Pushing $ref"
+            # --config: talos.json is the OCI config blob (sync.rs reads
+            # this to populate node_templates metadata).
+            # The .wasm layer carries the wasm media type the worker pulls
+            # against (worker/src/main.rs accepted_media_types).
+            oras push "$ref" \
+              --config "$dir/talos.json:application/vnd.talos.template.config.v1+json" \
+              "$dir/module.wasm:application/vnd.wasm.content.layer.v1+wasm" \
+              --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+              --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+              --annotation "talos.template.name=$name" \
+              --annotation "talos.template.version=$tag"
+            cosign sign --yes "$ref"
+            # Also push :latest so unpinned consumers get rolling updates.
+            # Pinned consumers (anything that sets `tag` in _index.json
+            # explicitly) are unaffected. Sign that ref independently — the
+            # cert identity is the same workflow URL.
+            if [ "$tag" != "latest" ]; then
+              latest_ref="${REGISTRY}/${NAMESPACE}/${name}:latest"
+              oras push "$latest_ref" \
+                --config "$dir/talos.json:application/vnd.talos.template.config.v1+json" \
+                "$dir/module.wasm:application/vnd.wasm.content.layer.v1+wasm" \
+                --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+                --annotation "org.opencontainers.image.revision=${{ github.sha }}"
+              cosign sign --yes "$latest_ref"
+            fi
+          done
+
+      - name: Push discovery index
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/templates-out"
+          # The index artifact's CONFIG BLOB is the JSON that sync.rs
+          # parses as IndexConfig. The empty layer satisfies oras's
+          # "must have at least one layer" requirement on some registries.
+          : > _empty
+          ref="${REGISTRY}/${NAMESPACE}/_index:latest"
+          echo "Pushing $ref"
+          oras push "$ref" \
+            --config "_index.json:application/vnd.talos.template.index.v1+json" \
+            "_empty:application/vnd.talos.template.index.empty.v1" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+            --annotation "talos.index.template_count=$(jq '.templates | length' _index.json)"
+          # Sign the index with the same identity as individual templates.
+          # Controller's sync (when configured) verifies the index
+          # signature before trusting the listed entries.
+          cosign sign --yes "$ref"
+
+      - name: Mark templates package public (best-effort)
+        # Public packages don't need auth on pull, which avoids the Bearer
+        # token complexity in the controller. This is best-effort — it
+        # requires `admin:packages` scope on the token, which GITHUB_TOKEN
+        # does NOT have, so it'll silently fail. Operators set visibility
+        # manually in the GHCR UI on first publish.
+        run: |
+          echo "Set the talos-tools/* packages to PUBLIC in https://github.com/${{ github.repository_owner }}?tab=packages"
+          echo "(GITHUB_TOKEN doesn't have admin:packages — skip if already public)"

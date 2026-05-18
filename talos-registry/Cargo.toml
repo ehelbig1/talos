@@ -1,0 +1,31 @@
+[package]
+name = "talos-registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = { version = "0.8", features = ["json"] }
+chrono.workspace = true
+oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+async-trait = "0.1"
+subtle = "2.6"
+talos-capability-world = { path = "../talos-capability-world" }
+talos-config = { path = "../talos-config" }
+# MCP-1036: bounded_preview for caller-supplied reflection in error messages.
+talos-text-util = { path = "../talos-text-util" }
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

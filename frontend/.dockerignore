@@ -1,0 +1,23 @@
+# Frontend-specific ignore — the root .dockerignore already covers
+# node_modules and target, but `docker compose build frontend` uses
+# frontend/ as its context and a local .dockerignore takes precedence
+# when the Dockerfile lives next to it.
+
+node_modules/
+node_modules/.vite/
+node_modules/.cache/
+.vite/
+dist/
+.turbo/
+.next/
+
+# Env files never belong in images.
+.env
+.env.local
+.env.*.local
+
+# Build artifacts + IDE noise.
+*.log
+.DS_Store
+.vscode/
+.idea/

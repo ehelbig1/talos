@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO webhook_request_log (\n                trigger_id, method, headers, body, source_ip, user_agent,\n                status_code, response_body, response_time_ms, wasm_execution_ms,\n                success, error_message\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Text",
+        "Int4",
+        "Int4",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "83c2d97017dd39d54b86e2294a8f4fdd38cbcb71bf11dbbcfd761b60d6c6b829"
+}

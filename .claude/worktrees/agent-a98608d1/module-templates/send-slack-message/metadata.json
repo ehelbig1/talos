@@ -1,0 +1,20 @@
+{
+  "name": "Send Slack Message",
+  "category": "messaging",
+  "description": "Send a message to a Slack channel using the Slack Web API chat.postMessage endpoint",
+  "icon": "💬",
+  "version": "1.0.0",
+  "author": "Talos",
+  "tags": ["slack", "messaging", "notification", "chat", "outbound"],
+  "documentation": "https://api.slack.com/methods/chat.postMessage",
+  "requirements": [
+    "Slack Bot OAuth token with chat:write scope",
+    "Channel ID or name"
+  ],
+  "capabilities": {
+    "realtime": false,
+    "filtering": false,
+    "enrichment": false,
+    "oauth": "slack"
+  }
+}

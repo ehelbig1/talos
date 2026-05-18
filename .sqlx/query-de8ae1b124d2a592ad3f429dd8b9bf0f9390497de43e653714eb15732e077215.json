@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                logs.id, logs.execution_id,\n                logs.level as \"level: LogLevel\",\n                logs.message, logs.metadata, logs.created_at\n            FROM module_execution_logs logs\n            JOIN module_executions execs ON logs.execution_id = execs.id\n            WHERE logs.execution_id = $1 AND execs.user_id = $2\n            ORDER BY logs.created_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "execution_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "level: LogLevel",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "de8ae1b124d2a592ad3f429dd8b9bf0f9390497de43e653714eb15732e077215"
+}

@@ -1,0 +1,46 @@
+{
+  "name": "beehiiv-get-referral-program",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: Get Referral Program",
+  "description": "Retrieve the referral program milestones and reward definitions for a Beehiiv publication. Use to build referral reward automation workflows: check a subscriber's referral count, compare against milestone thresholds, and trigger reward fulfillment.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key')."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxx...'). Supports {{key}} template interpolation."
+      },
+      "REFERRAL_COUNT": {
+        "type": "number",
+        "default": 0,
+        "description": "When set to a subscriber's current referral count (e.g. '{{referral_count}}' from an upstream beehiiv-get-subscriber node), the output includes 'next_milestone' (the next uncrossed milestone) and 'crossed_milestones' (all milestones the subscriber has reached). Use in condition nodes to trigger reward fulfillment."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable the referral program",
+      "detail": "In your Beehiiv dashboard, go to Grow > Referral Program and enable it. Configure milestones and rewards (physical items, promo codes, digital downloads, or premium access)."
+    },
+    {
+      "step": 2,
+      "title": "Automated reward fulfillment pattern",
+      "detail": "Chain: [beehiiv webhook: subscription.created with referral_code] → [beehiiv-get-subscriber: expand=stats,referrals] → [beehiiv-get-referral-program: REFERRAL_COUNT={{stats.referrals_count}}] → [condition: crossed_milestones is not empty] → [send reward via email or external system]."
+    },
+    {
+      "step": 3,
+      "title": "Note on reward fulfillment",
+      "detail": "Beehiiv supports auto_fulfill for some reward types. This node surfaces the milestone/reward definitions; actual fulfillment of non-auto rewards (physical goods, promo codes) should be handled by downstream nodes (e.g. send-gmail, http-request to your fulfillment system)."
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "name": "send-slack-message",
+  "version": "v1.0.0",
+  "display_name": "Slack Message",
+  "description": "Send messages to Slack channels using the Slack Web API. Supports plain text and Block Kit JSON payloads.",
+  "category": "Communication",
+  "capability_world": "network-node",
+  "allowed_hosts": ["slack.com", "api.slack.com"],
+  "requires_secrets": ["slack/bot_token"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["BOT_TOKEN", "CHANNEL"],
+    "properties": {
+      "BOT_TOKEN": {
+        "type": "string",
+        "description": "Secret path for the Slack bot OAuth token (e.g. 'slack/bot_token')"
+      },
+      "CHANNEL": {
+        "type": "string",
+        "description": "Slack channel ID or name to send the message to (e.g. '#general' or 'C01234ABCDE')"
+      },
+      "TEXT": {
+        "type": "string",
+        "description": "Plain text message to send"
+      },
+      "BLOCKS": {
+        "type": "string",
+        "description": "JSON string of Slack Block Kit blocks for rich formatting (overrides TEXT when set)"
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a Slack App",
+      "detail": "Go to https://api.slack.com/apps and click 'Create New App'. Choose 'From scratch', give it a name, and select your workspace."
+    },
+    {
+      "step": 2,
+      "title": "Enable chat:write permission",
+      "detail": "In your app settings, navigate to 'OAuth & Permissions'. Under 'Bot Token Scopes', add the 'chat:write' scope."
+    },
+    {
+      "step": 3,
+      "title": "Install app to workspace",
+      "detail": "Still in 'OAuth & Permissions', click 'Install to Workspace'. Authorize the app. Copy the 'Bot User OAuth Token' (starts with xoxb-)."
+    },
+    {
+      "step": 4,
+      "title": "Store token as secret",
+      "detail": "Use set_secret to store the Bot User OAuth Token: key_path='slack/bot_token', value='xoxb-your-token-here'."
+    },
+    {
+      "step": 5,
+      "title": "Invite bot to channel",
+      "detail": "In Slack, type /invite @YourAppName in the target channel to allow the bot to post there."
+    }
+  ]
+}

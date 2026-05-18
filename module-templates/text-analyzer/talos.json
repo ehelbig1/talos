@@ -1,0 +1,20 @@
+{
+    "name": "text-analyzer",
+    "display_name": "Text Analyzer",
+    "version": "v1.0.0",
+    "category": "Data Processing",
+    "description": "Analyzes text and returns character, word, and line counts.",
+    "capability_world": "minimal-node",
+    "allowed_hosts": [],
+    "requires_secrets": [],
+    "config_schema": {
+        "type": "object",
+        "properties": {
+            "DEFAULT_TEXT": { 
+                "type": "string", 
+                "title": "Default Text", 
+                "description": "Text to analyze if none is provided in the input payload" 
+            }
+        }
+    }
+}

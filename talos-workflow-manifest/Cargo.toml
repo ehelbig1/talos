@@ -1,0 +1,27 @@
+[package]
+name = "talos-workflow-manifest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Talos crates — repositories
+talos-module-repository = { path = "../talos-module-repository" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+
+# Talos crates — services
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+
+[lints]
+workspace = true

@@ -1,0 +1,72 @@
+[package]
+name = "talos-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-graphql = { version = "7.2", features = ["uuid", "chrono", "dataloader"] }
+async-graphql-axum = "7.2"
+async-nats = "0.47"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["json", "ws"] }
+bcrypt = "0.18"
+chrono.workspace = true
+futures = "0.3"
+hex = "0.4"
+rand = { version = "0.8", default-features = true, features = ["std"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+regex = "1.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rhai = { version = "1.19", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-actor-memory-service = { path = "../talos-actor-memory-service" }
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-api-keys = { path = "../talos-api-keys" }
+talos-auth = { path = "../talos-auth" }
+talos-auth-types = { path = "../talos-auth-types" }
+talos-capability-world = { path = "../talos-capability-world" }
+talos-compilation = { path = "../talos-compilation" }
+talos-config = { path = "../talos-config" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-engine = { path = "../talos-engine" }
+talos-execution-orchestration = { path = "../talos-execution-orchestration" }
+talos-http-utils = { path = "../talos-http-utils" }
+talos-memory = { path = "../talos-memory" }
+talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+tower-cookies = "0.11"
+worker = { path = "../worker" }
+talos-google-calendar = { path = "../talos-google-calendar" }
+talos-integrations = { path = "../talos-integrations" }
+talos-llm = { path = "../talos-llm" }
+talos-mcp-tool-schema = { path = "../talos-mcp-tool-schema" }
+talos-module-executions = { path = "../talos-module-executions" }
+talos-oauth = { path = "../talos-oauth" }
+talos-organizations = { path = "../talos-organizations" }
+talos-rate-limit = { path = "../talos-rate-limit" }
+talos-registry = { path = "../talos-registry" }
+talos-scheduler = { path = "../talos-scheduler" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+# MCP-1036: bounded_preview for caller-supplied reflection in validate_uuid error.
+talos-text-util = { path = "../talos-text-util" }
+talos-totp-2fa = { path = "../talos-totp-2fa" }
+talos-webhooks = { path = "../talos-webhooks" }
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+talos-workflow-creation = { path = "../talos-workflow-creation" }
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-types = { path = "../talos-workflow-types" }
+talos-workflow-versions = { path = "../talos-workflow-versions" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

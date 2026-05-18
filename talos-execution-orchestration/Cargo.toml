@@ -1,0 +1,48 @@
+[package]
+name = "talos-execution-orchestration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-nats = "0.47"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Talos crates — utility
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-http-utils = { path = "../talos-http-utils" }
+talos-text-util = { path = "../talos-text-util" }
+
+# Talos crates — repositories
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-execution-repository = { path = "../talos-execution-repository" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+
+# Talos crates — services
+talos-actor-memory-service = { path = "../talos-actor-memory-service" }
+talos-config = { path = "../talos-config" }
+talos-engine = { path = "../talos-engine" }
+talos-execution-result-collector = { path = "../talos-execution-result-collector" }
+talos-registry = { path = "../talos-registry" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-validation = { path = "../talos-workflow-validation" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

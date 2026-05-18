@@ -1,0 +1,20 @@
+[package]
+name = "talos-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json.workspace = true
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+tokio = { version = "1", features = ["time"] }
+tracing.workspace = true
+zeroize = "1.8"
+
+[lints]
+workspace = true

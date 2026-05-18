@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id,\n                       encrypted_value,\n                       encryption_key_id,\n                       allowed_modules,\n                       expires_at,\n                       owner_user_id\n                FROM secrets\n                WHERE key_path = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "encrypted_value",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "encryption_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "allowed_modules",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "owner_user_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "96881aea33d55342981f07c07e07f1dad0b18d8fae7f4f08efe46b2ef31d7386"
+}

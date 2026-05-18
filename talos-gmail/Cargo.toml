@@ -1,0 +1,54 @@
+[package]
+name = "talos-gmail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arc-swap = "1.7"
+async-nats = "0.47"
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+chrono.workspace = true
+dashmap = "6.1"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+oauth2 = { version = "4.4.2", default-features = false, features = ["reqwest"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+subtle = "2.4"
+# MCP-1021: canonical FRONTEND_URL validation (rejects ? and # in addition
+# to /; the inline validator we removed only checked /).
+talos-config = { path = "../talos-config" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-integration-helpers = { path = "../talos-integration-helpers" }
+talos-integration-state = { path = "../talos-integration-state" }
+talos-memory = { path = "../talos-memory" }
+talos-module-executions = { path = "../talos-module-executions" }
+talos-oauth = { path = "../talos-oauth" }
+talos-registry = { path = "../talos-registry" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-text-util = { path = "../talos-text-util" }
+talos-trace-nats = { path = "../talos-trace-nats" }
+thiserror = "2.0"
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+urlencoding = "2.1"
+uuid.workspace = true
+
+[dev-dependencies]
+# Used by pubsub_jwt::tests to mint RSA keypairs that back locally-signed
+# test JWTs. Production verifier fetches JWKs from Google and never calls
+# rsa::* directly.
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
+
+[lints]
+workspace = true

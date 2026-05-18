@@ -1,0 +1,20 @@
+[package]
+name = "talos-workflow-signing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+# MCP-1060: route TALOS_WORKFLOW_SIGNING_STRICT bool parse through the
+# canonical `bool_env_or_default` helper rather than an inline copy.
+talos-config = { path = "../talos-config" }
+tracing.workspace = true
+zeroize = "1.8"
+
+[lints]
+workspace = true

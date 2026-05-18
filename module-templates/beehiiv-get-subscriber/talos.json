@@ -1,0 +1,55 @@
+{
+  "name": "beehiiv-get-subscriber",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: Get Subscriber",
+  "description": "Look up a Beehiiv subscriber by email address. Returns subscription status, tier, custom fields, tags, and engagement stats. Use to branch on subscriber state before taking further actions.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID", "EMAIL"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key')."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'). Supports {{key}} template interpolation."
+      },
+      "EMAIL": {
+        "type": "string",
+        "description": "Email address to look up. Supports {{key}} template interpolation (e.g. '{{email}}' to pull from upstream node output)."
+      },
+      "EXPAND": {
+        "type": "string",
+        "description": "Comma-separated list of fields to expand in the response. Options: 'stats' (open_rate, click_through_rate), 'custom_fields', 'tags'. Example: 'stats,custom_fields,tags'. Leave empty for the core subscription object only."
+      },
+      "NOT_FOUND_BEHAVIOR": {
+        "type": "string",
+        "enum": ["error", "return_null"],
+        "default": "return_null",
+        "description": "'return_null' (default): returns {found: false} when the subscriber doesn't exist, allowing downstream condition nodes to branch. 'error': fails the node when subscriber is not found."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a Beehiiv API key",
+      "detail": "Log in to https://app.beehiiv.com, navigate to Settings > Integrations > API, and create a new API key."
+    },
+    {
+      "step": 2,
+      "title": "Store the API key as a Talos secret",
+      "detail": "Use set_secret with key_path='beehiiv/api_key' and value='<your-api-key>'."
+    },
+    {
+      "step": 3,
+      "title": "Find your Publication ID",
+      "detail": "Call GET https://api.beehiiv.com/v2/publications with your API key. Copy the 'id' field (pub_xxx...) for your publication."
+    }
+  ]
+}

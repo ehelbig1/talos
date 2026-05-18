@@ -1,0 +1,28 @@
+[package]
+name = "talos-compilation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dirs-next = "2.0"
+handlebars = "6.4"
+hex = "0.4"
+regex = "1.12"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+talos-capability-world = { path = "../talos-capability-world" }
+talos-config = { path = "../talos-config" }
+talos-engine-events = { path = "../talos-engine-events" }
+talos-text-util = { path = "../talos-text-util" }
+talos-wit-inspector = { path = "../talos-wit-inspector" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "process", "time", "io-util", "fs"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

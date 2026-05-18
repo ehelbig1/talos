@@ -1,0 +1,79 @@
+{
+  "name": "llm-inference",
+  "version": "v2.0.0",
+  "display_name": "LLM Inference",
+  "description": "Generate AI text completions via the host's managed LLM client. The provider's API key is fetched and held by the controller — never enters guest WASM memory. Supports Anthropic, OpenAI, Gemini, and local Ollama.",
+  "category": "AI",
+  "capability_world": "llm-node",
+  "allowed_hosts": [],
+  "allowed_secrets": [],
+  "recommended_fuel": {
+    "expected_items": 50,
+    "bytes_per_item": 2000,
+    "llm_output_bytes": 24000,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "PROVIDER": {
+        "type": "string",
+        "enum": ["anthropic", "openai", "gemini", "ollama"],
+        "default": "anthropic",
+        "description": "LLM provider. 'anthropic' (default, Tier 2) → api.anthropic.com; 'openai' (Tier 2) → api.openai.com; 'gemini' (Tier 2) → generativelanguage.googleapis.com; 'ollama' (Tier 1, local) → host's configured Ollama instance, no API key needed, data stays on-prem. The host resolves the provider's vault key automatically — there is no API_KEY_SECRET config in this module."
+      },
+      "MODEL": {
+        "type": "string",
+        "description": "Model identifier. Defaults: 'claude-sonnet-4-6' (anthropic), 'gpt-4o' (openai), 'gemini-2.5-flash' (gemini), 'mistral' (ollama). Override for specific models — must be a valid identifier the selected provider recognises."
+      },
+      "SYSTEM_PROMPT": {
+        "type": "string",
+        "default": "You are a helpful assistant.",
+        "description": "System prompt sent before the user message. Supports {{key}} and {{key.subkey}} template interpolation — placeholders are replaced with values from upstream node output at runtime. Strings are inlined; objects/arrays are JSON-serialized. Interpolated values are wrapped in <untrusted_data> tags so the spotlighting directive treats them as data, not instructions. Unresolved placeholders are left as-is so misconfiguration surfaces visibly. Appended with actor context when INJECT_CONTEXT is true."
+      },
+      "MAX_TOKENS": {
+        "type": "number",
+        "default": 1024,
+        "description": "Maximum number of tokens the model may generate in the response. Capped at u32::MAX."
+      },
+      "TEMPERATURE": {
+        "type": "number",
+        "description": "Sampling temperature (0.0 = deterministic, higher = more creative). Provider-specific range — typically 0.0 to 1.0 or 0.0 to 2.0. Omit to use the provider's default."
+      },
+      "OUTPUT_SCHEMA": {
+        "type": ["string", "array"],
+        "description": "Required top-level JSON keys in the LLM output (e.g. 'action,target,confidence' or [\"action\",\"target\"]). When set, the output is parsed as JSON and each listed key must be present — failure raises an error. Also appends a soft instruction to the SYSTEM_PROMPT requesting raw JSON. For natively-enforced structured output (Anthropic tool_use), use the `llm-tools::complete-with-tools` host interface directly via a custom sandbox — out of scope here."
+      },
+      "BLOCKED_PATTERNS": {
+        "type": ["string", "array"],
+        "description": "Substrings that must NOT appear in the LLM output (comma-separated string or JSON array). Any match causes the node to fail with a descriptive error. Use to prevent prompt-injection payloads or sensitive markers from reaching downstream nodes."
+      },
+      "BLOCKED_PATTERNS_INPUT": {
+        "type": ["string", "array"],
+        "description": "Substrings that must NOT appear in the input passed to the LLM. Same format as BLOCKED_PATTERNS. Pre-call guard — saves a round-trip when adversarial content is detected in retrieved data or upstream output."
+      },
+      "MAX_OUTPUT_CHARS_ENFORCED": {
+        "type": "number",
+        "description": "Hard character ceiling on the LLM response. If exceeded, the response is truncated on a UTF-8 char boundary and a '[TRUNCATED]' marker is appended before validation and downstream processing. Prevents runaway responses from flooding downstream nodes."
+      },
+      "MAX_OUTPUT_TOKENS_ENFORCED": {
+        "type": "number",
+        "description": "Deprecated alias for MAX_OUTPUT_CHARS_ENFORCED (the limit is character-based, not token-based). Use MAX_OUTPUT_CHARS_ENFORCED instead."
+      },
+      "INJECT_CONTEXT": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, appends the __actor_context__ payload from the workflow input to the system prompt under <agent_memory> tags. Set this to true for actor-bound workflows that should see the actor's seeded semantic memories. The injection key is __actor_context__ (canonical post-r215). Use `preview_actor_context` MCP tool to inspect what will be injected before running."
+      },
+      "MEMORY_WRITE_KEY": {
+        "type": "string",
+        "description": "When set to a non-empty string, wraps the LLM output in the __memory_write__ protocol so the actor runtime stores it under this key in episodic memory (168h TTL). Leave empty (default) for normal passthrough output."
+      },
+      "SPOTLIGHTING": {
+        "type": "boolean",
+        "default": true,
+        "description": "Anti-prompt-injection wrapping. When true (default), wraps user input in <untrusted_data> tags, injected memory in <agent_memory> tags, and appends a SECURITY DIRECTIVE to the system prompt instructing the model to treat all tagged content as data, never instructions. Set false ONLY when you trust the input source completely (e.g. an internal pipeline)."
+      }
+    }
+  }
+}

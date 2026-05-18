@@ -1,0 +1,48 @@
+{{- if and .Values.vault.enabled .Values.vault.init.enabled -}}
+{{- $bootstrapSecret := include "talos.bootstrapSecretName" . -}}
+{{- $controllerDeploy := include "talos.componentName" (list . "controller") -}}
+# Scoped Role for the vault-init Job's secret-patcher container.
+#
+# Two operations on two named resources only:
+#   - get + patch on the bootstrap Secret (to replace the VAULT_TOKEN
+#     placeholder with the freshly-minted talos-controller token).
+#   - patch on the controller Deployment (to trigger a rollout so the
+#     new VAULT_TOKEN takes effect; envFromSecret reads at pod start).
+#
+# resourceNames pinning means a compromise of this SA token cannot read
+# any other Secret or modify any other Deployment in the namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "talos.componentName" (list . "vault-init") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "vault") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ $bootstrapSecret | quote }}
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames:
+      - {{ $controllerDeploy | quote }}
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "talos.componentName" (list . "vault-init") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "vault") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos.componentName" (list . "vault-init") }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "talos.componentName" (list . "vault-init") }}
+{{- end }}

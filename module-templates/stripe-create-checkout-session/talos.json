@@ -1,0 +1,30 @@
+{
+  "name": "stripe-create-checkout-session",
+  "version": "v1.0.0",
+  "display_name": "Stripe: Create Checkout Session",
+  "description": "Generate a hosted Stripe Checkout payment URL for one-time payments, subscriptions, or payment method setup. The returned checkout_url can be sent to the customer via email or webhook for self-service payment. Sessions expire after 24 hours. Supports payment, subscription, and setup modes.",
+  "category": "Payments",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.stripe.com"],
+  "requires_secrets": ["stripe/secret_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "SUCCESS_URL", "CANCEL_URL"],
+    "properties": {
+      "API_KEY_SECRET": { "type": "string", "description": "Vault path to the Stripe secret key." },
+      "SUCCESS_URL": { "type": "string", "description": "URL to redirect to after successful payment (must start with https://). Supports {{key}} interpolation. Can include {CHECKOUT_SESSION_ID} for Stripe to replace with the session ID." },
+      "CANCEL_URL": { "type": "string", "description": "URL to redirect to when the customer cancels (must start with https://). Supports {{key}} interpolation." },
+      "MODE": { "type": "string", "default": "payment", "description": "Checkout mode: 'payment' (one-time), 'subscription' (recurring), or 'setup' (save payment method without charging)." },
+      "PRICE_ID": { "type": "string", "description": "Stripe price ID (price_xxx) for the line item. Required for payment and subscription modes. Supports {{price_id}} interpolation." },
+      "QUANTITY": { "type": "integer", "default": 1, "description": "Quantity for the line item (default: 1)." },
+      "CUSTOMER_ID": { "type": "string", "description": "Existing Stripe customer ID (cus_xxx) to associate with the session. Supports {{customer_id}} interpolation." },
+      "CUSTOMER_EMAIL": { "type": "string", "description": "Pre-fill the customer's email in the checkout form. Cannot be used if CUSTOMER_ID is set. Supports {{email}} interpolation." },
+      "METADATA": { "type": "string", "description": "JSON object of key-value metadata to attach to the session (e.g. '{\"order_id\": \"ord_123\"}')." }
+    }
+  },
+  "setup_instructions": [
+    { "step": 1, "title": "Checkout modes", "detail": "Use MODE=payment for one-time charges with PRICE_ID. Use MODE=subscription to start a recurring billing relationship. Use MODE=setup to save a payment method for later use without charging." },
+    { "step": 2, "title": "Typical payment link workflow", "detail": "Chain: [customer sign-up webhook] → [stripe-create-customer] → [stripe-create-checkout-session: MODE=subscription, PRICE_ID=price_xxx, CUSTOMER_ID={{customer_id}}] → [send-gmail: body includes checkout_url]." },
+    { "step": 3, "title": "SUCCESS_URL with session ID", "detail": "Set SUCCESS_URL to 'https://yourapp.com/success?session={CHECKOUT_SESSION_ID}' — Stripe replaces {CHECKOUT_SESSION_ID} with the actual session ID on redirect, so you can verify payment server-side." }
+  ]
+}

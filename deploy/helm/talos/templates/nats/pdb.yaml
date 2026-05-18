@@ -1,0 +1,23 @@
+{{- if and .Values.nats.enabled .Values.nats.podDisruptionBudget.enabled -}}
+# MCP-894 (2026-05-14): protect the NATS cluster from voluntary
+# eviction during node drains / upgrades. The cluster runs 3 replicas
+# (per values.yaml `nats.replicaCount: 3`) and JetStream stream replicas
+# default to 1 — so without a PDB, a `kubectl drain` could evict 2 of 3
+# NATS pods simultaneously, taking the cluster below the quorum it
+# needs to serve worker↔controller signed-RPC traffic. Default
+# `minAvailable: 2` keeps the cluster at majority during voluntary
+# disruptions; operators can still scale down or terminate via
+# explicit replica-count changes.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "talos.componentName" (list . "nats") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "nats") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.nats.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "nats") | nindent 6 }}
+{{- end }}

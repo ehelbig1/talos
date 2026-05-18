@@ -1,0 +1,144 @@
+{{- if .Values.vault.enabled -}}
+{{- /* MCP-805 (2026-05-14): persistence is a hard requirement, not an
+       operator toggle, when vault.enabled is true. The vault-init Job
+       writes bootstrap.json (unseal keys + root token) and the
+       talos-controller token to /vault/file via a persistentVolumeClaim
+       that's shared with the Vault StatefulSet pod (see
+       templates/vault/init-job.yaml line ~263 `claimName: data-...-0`).
+       Without that shared PVC, emptyDir per-pod isolation prevents
+       vault-init from handing bootstrap state to Vault — Vault stays
+       uninitialized / sealed forever and the install never completes.
+       Worse, transit-engine KEK material is also pinned to that PVC; an
+       emptyDir-backed Vault would wipe the KEK on every pod restart,
+       making every Postgres-stored envelope-encrypted secret unreadable.
+       Pre-fix, setting `vault.persistence.enabled: false` rendered a
+       manifest that helm-installed cleanly but stuck the Vault pod in
+       ContainerCreating with "volume not found" — the operator-facing
+       failure was a vague kubectl-describe message that didn't surface
+       the architectural reason. Fail-fast here with the operator-grade
+       explanation; HCP Vault is the documented escape hatch (set
+       `vault.enabled: false` and point `controller.env.VAULT_ADDR` at
+       an external Vault). */ -}}
+{{- if not .Values.vault.persistence.enabled -}}
+{{- fail "vault.persistence.enabled MUST be true when vault.enabled is true — the vault-init Job shares its PVC with the Vault pod to hand off bootstrap.json + transit KEK material. Disabling persistence renders an unbootable Vault. For ephemeral / external setups, set vault.enabled=false and point controller.env.VAULT_ADDR at HCP Vault or another externally-managed Vault address." -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "talos.componentName" (list . "vault") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "vault") | nindent 4 }}
+spec:
+  serviceName: {{ include "talos.componentName" (list . "vault") }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "vault") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "vault") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/vault/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: vault
+          image: {{ include "talos.image" .Values.vault.image }}
+          imagePullPolicy: {{ .Values.vault.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+              {{- if .Values.vault.allowMemoryLocking }}
+              # IPC_LOCK lets Vault mlock() memory to prevent secret material
+              # being paged to swap. Only effective if the host has swap
+              # enabled AND the Vault HCL flips `disable_mlock = false`.
+              # Adding any capability is forbidden by PodSecurityAdmission
+              # `restricted` — flipping this on requires running this
+              # namespace at `baseline` (or moving Vault into a dedicated
+              # namespace with relaxed PSA). Default off so Phase 1 / k3s
+              # restricted-PSA installs succeed; Vault stays safe because
+              # the HCL pins `disable_mlock = true` and k3s nodes ship
+              # without swap.
+              add: ["IPC_LOCK"]
+              {{- end }}
+          env:
+            - name: VAULT_ADDR
+              value: "http://0.0.0.0:8200"
+            - name: SKIP_CHOWN
+              value: "true"
+            - name: SKIP_SETCAP
+              value: "true"
+          args:
+            # Just "server". The hashicorp/vault image's entrypoint already
+            # appends `-config=/vault/config`, which scans the directory and
+            # picks up vault.hcl. Passing `-config=/vault/config/vault.hcl`
+            # in addition would load the same file twice, producing two
+            # listener stanzas and "bind: address already in use" on 8200.
+            - "server"
+          ports:
+            - name: http
+              containerPort: 8200
+          readinessProbe:
+            # Accept sealed (503) and uninitialized (501) as Ready by
+            # remapping them to 204 — otherwise the Service has no
+            # endpoints during first boot, the vault-init Job can't
+            # reach the API to unseal it, and Vault stays sealed
+            # forever (chicken-and-egg). The controller does its own
+            # Vault transit health check at startup and will
+            # CrashLoopBackOff while Vault is sealed; once vault-init
+            # completes, the next restart succeeds.
+            httpGet:
+              path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            # Liveness probe accepts sealed state (501/503) — otherwise
+            # Kubernetes kills the pod before vault-init can unseal it.
+            httpGet:
+              path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.vault.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /vault/config
+            - name: data
+              mountPath: /vault/file
+            - name: logs
+              mountPath: /vault/logs
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "talos.componentName" (list . "vault") }}
+        - name: logs
+          emptyDir:
+            sizeLimit: "256Mi"
+  {{- if .Values.vault.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "talos.componentLabels" (list . "vault") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.vault.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.vault.persistence.size }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,64 @@
+{
+  "name": "send-gmail",
+  "version": "v1.0.0",
+  "display_name": "Gmail",
+  "description": "Send emails via Gmail using OAuth2. Supports HTML and plain text email bodies.",
+  "category": "Communication",
+  "capability_world": "network-node",
+  "allowed_hosts": ["gmail.googleapis.com", "www.googleapis.com", "oauth2.googleapis.com"],
+  "requires_secrets": ["google/gmail_oauth_token"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["OAUTH_TOKEN", "TO", "SUBJECT"],
+    "properties": {
+      "OAUTH_TOKEN": {
+        "type": "string",
+        "description": "Secret path for the Gmail OAuth2 token (e.g. 'google/gmail_oauth_token')"
+      },
+      "TO": {
+        "type": "string",
+        "description": "Recipient email address"
+      },
+      "SUBJECT": {
+        "type": "string",
+        "description": "Email subject line"
+      },
+      "BODY": {
+        "type": "string",
+        "description": "Email body content (plain text or HTML)"
+      },
+      "FROM": {
+        "type": "string",
+        "description": "Sender email address (must match the authenticated Gmail account)"
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a Google Cloud project",
+      "detail": "Go to https://console.cloud.google.com, create a new project, and enable the Gmail API under 'APIs & Services > Library'."
+    },
+    {
+      "step": 2,
+      "title": "Configure OAuth consent screen",
+      "detail": "In 'APIs & Services > OAuth consent screen', configure the app (External or Internal). Add the 'https://www.googleapis.com/auth/gmail.send' scope."
+    },
+    {
+      "step": 3,
+      "title": "Create OAuth credentials",
+      "detail": "In 'APIs & Services > Credentials', create an OAuth 2.0 Client ID. Choose 'Web application'. Add your redirect URI."
+    },
+    {
+      "step": 4,
+      "title": "Obtain refresh token",
+      "detail": "Use the OAuth flow to authorize your Gmail account. Store the resulting refresh token (long-lived) rather than the short-lived access token."
+    },
+    {
+      "step": 5,
+      "title": "Store token as secret",
+      "detail": "Use set_secret to store the refresh token: key_path='google/gmail_oauth_token', value='your-refresh-token'."
+    }
+  ]
+}

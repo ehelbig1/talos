@@ -1,0 +1,107 @@
+{
+  "name": "beehiiv-subscribe",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: Subscribe",
+  "description": "Subscribe or reactivate an email address on a Beehiiv publication. Supports UTM attribution, custom fields, tier assignment, and automation enrollment.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID", "EMAIL"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key'). Create API keys at https://app.beehiiv.com/settings/integrations."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'). Supports {{key}} template interpolation from upstream node output."
+      },
+      "EMAIL": {
+        "type": "string",
+        "description": "Email address to subscribe. Supports {{key}} template interpolation (e.g. '{{email}}' to pull from upstream node output)."
+      },
+      "REACTIVATE_EXISTING": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, resubscribes a previously unsubscribed email. When false (default), returns the existing subscription without modification."
+      },
+      "SEND_WELCOME_EMAIL": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, sends the publication's configured welcome email to the new subscriber."
+      },
+      "DOUBLE_OPT_OVERRIDE": {
+        "type": "string",
+        "enum": ["on", "off", "not_set"],
+        "default": "not_set",
+        "description": "'on' requires the subscriber to confirm via email before activating. 'off' activates immediately regardless of publication settings. 'not_set' uses the publication's default double opt-in setting."
+      },
+      "TIER": {
+        "type": "string",
+        "enum": ["free", "premium"],
+        "description": "Subscription tier to assign. Leave unset to use the publication default (free)."
+      },
+      "UTM_SOURCE": {
+        "type": "string",
+        "description": "Acquisition source for analytics (e.g. 'talos-workflow'). Supports {{key}} template interpolation."
+      },
+      "UTM_MEDIUM": {
+        "type": "string",
+        "description": "Acquisition medium for analytics (e.g. 'automation'). Supports {{key}} template interpolation."
+      },
+      "UTM_CAMPAIGN": {
+        "type": "string",
+        "description": "Acquisition campaign name. Supports {{key}} template interpolation."
+      },
+      "UTM_TERM": {
+        "type": "string",
+        "description": "Acquisition search term. Supports {{key}} template interpolation."
+      },
+      "UTM_CONTENT": {
+        "type": "string",
+        "description": "Acquisition content variant (for A/B testing). Supports {{key}} template interpolation."
+      },
+      "REFERRING_SITE": {
+        "type": "string",
+        "description": "Website URL the subscriber was referred from. Supports {{key}} template interpolation."
+      },
+      "REFERRAL_CODE": {
+        "type": "string",
+        "description": "Referral code of the referring subscriber. Grants referral credit to the referrer."
+      },
+      "CUSTOM_FIELDS": {
+        "type": ["string", "array"],
+        "description": "Custom fields to set on this subscription. Provide as a JSON array of {name, value} objects (e.g. '[{\"name\":\"first_name\",\"value\":\"Alice\"}]') or a JSON array value. Custom fields must already exist in the publication."
+      },
+      "AUTOMATION_IDS": {
+        "type": "string",
+        "description": "Comma-separated list of automation IDs to enroll the subscriber in. Each automation must have an active 'Add by API' trigger."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a Beehiiv API key",
+      "detail": "Log in to https://app.beehiiv.com, navigate to Settings > Integrations > API, and create a new API key. Copy the key — it is only shown once."
+    },
+    {
+      "step": 2,
+      "title": "Store the API key as a Talos secret",
+      "detail": "Use set_secret with key_path='beehiiv/api_key' and value='<your-api-key>'."
+    },
+    {
+      "step": 3,
+      "title": "Find your Publication ID",
+      "detail": "Call the Beehiiv API: GET https://api.beehiiv.com/v2/publications (with Authorization: Bearer <key>). Copy the 'id' field (format: pub_xxx...) from the publication you want to use."
+    },
+    {
+      "step": 4,
+      "title": "Configure the node",
+      "detail": "Set API_KEY_SECRET to 'beehiiv/api_key', PUBLICATION_ID to your pub_xxx... ID, and EMAIL to the subscriber's email address (or a {{template}} reference to an upstream node's output)."
+    }
+  ]
+}

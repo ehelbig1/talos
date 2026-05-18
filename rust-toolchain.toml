@@ -1,0 +1,14 @@
+[toolchain]
+# Pin the Rust version so local dev, CI, and Docker builds all see the
+# same set of clippy lints and rustfmt rules. Without this, GitHub's
+# `dtolnay/rust-toolchain@stable` floats with whatever upstream stable
+# releases (every 6 weeks) and drift causes CI-only failures the
+# moment a new lint lands.
+#
+# Bump strategy: when a new stable shipa nd we want to pick up
+# language features / lint improvements, run `rustup install <new>`
+# locally, run `cargo clippy --workspace -- -D warnings`, fix anything
+# that breaks, then bump this pin in the same PR. Always pin to a
+# specific minor version; never use `stable`.
+channel = "1.95"
+components = ["rustfmt", "clippy"]

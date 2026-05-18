@@ -1,0 +1,52 @@
+Talos chart installed.
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+Version:   {{ .Chart.Version }} (appVersion {{ .Chart.AppVersion }})
+
+NEXT STEPS
+==========
+
+1. Verify the migrations Job completed successfully:
+
+     kubectl -n {{ .Release.Namespace }} logs job/{{ include "talos.componentName" (list . "migrations") }}
+
+2. If Vault is in-cluster, confirm the init Job unsealed Vault and minted
+   the least-privilege talos-controller token (logs from BOTH containers):
+
+     kubectl -n {{ .Release.Namespace }} logs job/{{ include "talos.componentName" (list . "vault-init") }} -c vault-bootstrap
+     kubectl -n {{ .Release.Namespace }} logs job/{{ include "talos.componentName" (list . "vault-init") }} -c secret-patcher
+     kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "talos.componentName" (list . "controller") }} -- \
+       sh -c 'curl -sS -H "X-Vault-Token: $VAULT_TOKEN" $VAULT_ADDR/v1/transit/keys/talos-kek | head -c 200'
+
+3. Wait for controller pods to be Ready:
+
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "talos.componentName" (list . "controller") }}
+
+4. Access the API:
+
+{{- if .Values.controller.ingress.enabled }}
+{{- range .Values.controller.ingress.hosts }}
+     https://{{ .host }}
+{{- end }}
+{{- else }}
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "talos.componentName" (list . "controller") }} 8000:{{ .Values.controller.service.port }}
+{{- end }}
+
+5. Access the Frontend:
+
+{{- if .Values.frontend.ingress.enabled }}
+{{- range .Values.frontend.ingress.hosts }}
+     https://{{ .host }}
+{{- end }}
+{{- else }}
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "talos.componentName" (list . "frontend") }} 3000:{{ .Values.frontend.service.port }}
+{{- end }}
+
+SECURITY REMINDERS
+==================
+
+- Rotate WORKER_SHARED_KEY and TALOS_AUDIT_SIGNING_KEY at least annually.
+- If {{ if .Values.security.sigstore.enabled }}sigstore enforcement is ON{{ else }}sigstore enforcement is DISABLED{{ end }}, all images under
+  {{- range .Values.security.sigstore.imageGlobs }} {{ . }} {{- end }} {{ if .Values.security.sigstore.enabled }}must be signed{{ else }}are NOT verified — enable before production{{ end }}.
+- Review the chart README for the full secret-rotation and Phase 1 → 2 migration runbook.

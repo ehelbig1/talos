@@ -1,0 +1,69 @@
+{
+  "name": "API Health Check → Alert on Failure",
+  "description": "Polls an API endpoint every 5 minutes, validates the response, and sends a Slack alert if the response is outside acceptable bounds.",
+  "category": "Monitoring",
+  "tags": ["http", "monitoring", "slack", "scheduled", "health-check"],
+  "nodes": [
+    {
+      "label": "Poll API",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.example.com/health",
+        "TIMEOUT_MS": 5000
+      }
+    },
+    {
+      "label": "Validate Response",
+      "module_name": "Data Validator",
+      "config": {
+        "FIELD": "status_code",
+        "MIN_VALUE": 200,
+        "MAX_VALUE": 299
+      }
+    },
+    {
+      "label": "Send Alert",
+      "module_name": "Slack Message",
+      "config": {
+        "CHANNEL": "#alerts"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Poll API", "to": "Validate Response" },
+    { "from": "Validate Response", "to": "Send Alert" }
+  ],
+  "suggested_schedule": "*/5 * * * *",
+  "required_secrets": [
+    { "key_path": "slack/bot_token", "description": "Slack bot token with chat:write scope" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Send Alert",
+      "current_module": "Slack Message",
+      "replacements": [
+        {
+          "module_name": "Gmail",
+          "catalog_name": "send-gmail",
+          "config_delta": "Replace CHANNEL with TO (on-call address), SUBJECT (e.g. 'API Health Alert'), and BODY. Required secret: google/gmail_oauth_token instead of slack/bot_token."
+        },
+        {
+          "module_name": "Message Publisher",
+          "catalog_name": "message-publisher",
+          "config_delta": "Replace CHANNEL+BOT_TOKEN with TOPIC (e.g. 'alerts.health'). Downstream systems (PagerDuty bridge, alertmanager) subscribe to the NATS topic."
+        },
+        {
+          "module_name": "Microsoft Teams Message",
+          "catalog_name": "send-teams-message",
+          "config_delta": "Replace CHANNEL+BOT_TOKEN with WEBHOOK_URL_SECRET='teams/webhook_url'. Set TITLE='API Health Alert' and COLOR='#D13438' for red urgent alerts. Required secret: teams/webhook_url instead of slack/bot_token."
+        },
+        {
+          "module_name": "PagerDuty Alert",
+          "catalog_name": "pagerduty-alert",
+          "config_delta": "Replace Slack config with INTEGRATION_KEY_SECRET='pagerduty/integration_key', SUMMARY='API health check failed', SEVERITY='critical'. Set DEDUP_KEY to the monitored URL to deduplicate repeat alerts. Required secret: pagerduty/integration_key instead of slack/bot_token."
+        }
+      ]
+    }
+  ]
+}

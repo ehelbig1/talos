@@ -1,0 +1,46 @@
+{{- if and .Values.worker.enabled .Values.monitoring.serviceMonitor.enabled -}}
+# MCP-904 (2026-05-14): tells Prometheus Operator to scrape /metrics
+# on the worker's dedicated metrics port. Requires the
+# `monitoring.coreos.com/v1` CRDs already installed in the cluster.
+#
+# The worker exposes /metrics on a separate Service port (not the
+# NATS subscriber path — workers are otherwise unreachable from
+# outside the cluster). Bearer-token auth via METRICS_AUTH_TOKENS
+# is REQUIRED — per MCP-902 the worker panics at startup if the
+# env is unset/empty, and `/metrics` returns 401 to unauthenticated
+# requests at runtime.
+#
+# METRICS_AUTH_TOKENS is a comma-separated list of acceptable
+# tokens. Prometheus sends one Bearer token per scrape; any token
+# in the list authenticates. To rotate, set the Secret to
+# `old-token,new-token`, roll Prometheus to pick up `new-token`,
+# then drop `old-token` from the Secret.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "talos.componentName" (list . "worker") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "worker") | nindent 4 }}
+    {{- with .Values.monitoring.serviceMonitor.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "worker") | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval | quote }}
+      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout | quote }}
+      scheme: http
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ include "talos.bootstrapSecretName" . }}
+          key: {{ .Values.monitoring.serviceMonitor.workerTokenSecretKey | quote }}
+{{- end }}

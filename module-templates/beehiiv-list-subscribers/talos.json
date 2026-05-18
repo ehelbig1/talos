@@ -1,0 +1,82 @@
+{
+  "name": "beehiiv-list-subscribers",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: List Subscribers",
+  "description": "Fetch a paginated, filtered list of subscribers from a Beehiiv publication. Filter by tier (free/premium), status, and premium tier IDs. Use for churn analysis, cohort targeting, and revenue reporting. Outputs a cursor for pagination loops.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key')."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxx...'). Supports {{key}} template interpolation."
+      },
+      "STATUS": {
+        "type": "string",
+        "enum": ["all", "validating", "invalid", "pending", "active", "inactive"],
+        "default": "all",
+        "description": "Filter subscribers by subscription status. 'active' returns confirmed subscribers; 'inactive' returns churned/unsubscribed."
+      },
+      "TIER": {
+        "type": "string",
+        "enum": ["all", "free", "premium"],
+        "default": "all",
+        "description": "Filter by subscription tier. Use 'premium' to list only paying subscribers."
+      },
+      "PREMIUM_TIER_IDS": {
+        "type": "string",
+        "description": "Comma-separated premium tier IDs to filter by specific paid tiers (e.g. 'tier_aaa,tier_bbb'). Use beehiiv-list-premium-tiers to discover IDs."
+      },
+      "LIMIT": {
+        "type": "number",
+        "default": 25,
+        "description": "Number of subscribers to return per page (1–100). Higher values reduce API calls for large lists."
+      },
+      "CURSOR": {
+        "type": "string",
+        "description": "Pagination cursor from a previous call's 'next_cursor' output. Supports {{key}} template interpolation to chain paginated loops: '{{next_cursor}}'."
+      },
+      "DIRECTION": {
+        "type": "string",
+        "enum": ["asc", "desc"],
+        "default": "desc",
+        "description": "Sort direction. 'desc' returns newest subscribers first."
+      },
+      "EXPAND_STATS": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, includes per-subscriber engagement stats (open_rate, click_through_rate). Increases response size and latency."
+      },
+      "EXPAND_CUSTOM_FIELDS": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, includes custom field values for each subscriber."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Common pattern — list premium subscribers",
+      "detail": "Set TIER to 'premium' and STATUS to 'active' to get all paying subscribers. Use with EXPAND_STATS=true to include engagement metrics for churn risk analysis."
+    },
+    {
+      "step": 2,
+      "title": "Pagination in loops",
+      "detail": "When has_more is true in the output, the next_cursor field contains a token for the next page. Pass it to a subsequent node using CURSOR='{{next_cursor}}' to iterate through all results."
+    },
+    {
+      "step": 3,
+      "title": "Revenue reporting pattern",
+      "detail": "Chain: [schedule trigger] → [beehiiv-list-subscribers: TIER=premium, STATUS=active] → [LLM node: summarize count and tier breakdown] → [notification]."
+    }
+  ]
+}

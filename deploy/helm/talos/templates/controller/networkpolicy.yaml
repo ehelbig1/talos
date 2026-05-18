@@ -1,0 +1,130 @@
+{{- if and .Values.controller.enabled .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "talos.componentName" (list . "controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "controller") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "controller") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Ingress controller → controller:8000
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingressNamespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.controller.service.port }}
+    # Frontend → controller (same namespace)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: frontend
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.controller.service.port }}
+    # MCP-896 (2026-05-14): Prometheus scrape from a scoped monitoring
+    # namespace. Pre-fix this rule was `from: [podSelector: {}]` which
+    # means "any pod in this namespace" — and the controller serves
+    # /graphql, /mcp, /auth/* on the SAME port as /metrics, so the
+    # old rule silently let any in-namespace pod hit the full API
+    # surface (the auth layer is still in front, but the
+    # NetworkPolicy layer was useless for lateral-movement defense).
+    {{- if .Values.networkPolicy.monitoringIngress.enabled }}
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.monitoringIngress.namespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.controller.service.port }}
+    {{- end }}
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # NATS
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.nats.service.clientPort }}
+    # Neo4j (if in-cluster)
+    {{- if .Values.neo4j.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: neo4j
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 7687
+    {{- end }}
+    # Vault (if in-cluster)
+    {{- if .Values.vault.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: vault
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 8200
+    {{- end }}
+    # MinIO
+    {{- if .Values.minio.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: minio
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.minio.service.apiPort }}
+    {{- end }}
+    # Ollama (if in-cluster)
+    {{- if .Values.ollama.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ollama
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 11434
+    {{- end }}
+    # External egress (Postgres, Redis, OAuth providers, LLM providers)
+    - to:
+        {{- range .Values.networkPolicy.externalEgressCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+            except:
+              - 169.254.0.0/16   # link-local / cloud metadata
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 5432   # Postgres
+        - protocol: TCP
+          port: 6379   # Redis
+        - protocol: TCP
+          port: 7687   # Neo4j AuraDB
+{{- end }}

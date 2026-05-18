@@ -1,0 +1,49 @@
+{
+  "name": "gmail-list-messages",
+  "version": "v1.0.0",
+  "display_name": "Gmail: List Messages",
+  "description": "List messages from the authenticated Gmail account. Filter by Gmail search query (e.g. 'is:unread newer_than:24h'), cap results, and receive structured metadata (id, subject, from, date, snippet). Canonical building block for morning-brief / inbox-triage / follow-up-detector workflows.\n\nRequires a vault:// reference to an Atlassian-style Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time — you only need to pass the vault path.",
+  "category": "Communication",
+  "capability_world": "http-node",
+  "allowed_hosts": ["gmail.googleapis.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": ["vault://oauth/gmail/*/access_token"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/gmail/{user_id}/{email}/access_token'). The controller resolves the vault reference and refreshes the token if expired."
+      },
+      "QUERY": {
+        "type": "string",
+        "default": "is:unread newer_than:24h",
+        "description": "Gmail search query — same syntax as the web UI. Common: 'is:unread newer_than:24h' (morning brief), 'label:important newer_than:1d', 'from:boss@company.com'. Empty → all mail."
+      },
+      "MAX_RESULTS": {
+        "type": "integer",
+        "default": 10,
+        "description": "Maximum messages to fetch metadata for (1–25). Each message requires one extra HTTP call for headers — keep tight to stay within fuel budget."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable the Gmail API",
+      "detail": "In https://console.cloud.google.com, enable the Gmail API and configure OAuth consent with the 'https://www.googleapis.com/auth/gmail.readonly' scope (or 'gmail.metadata' if you only need headers)."
+    },
+    {
+      "step": 2,
+      "title": "Authorize the integration",
+      "detail": "Complete the OAuth flow via your Talos integration UI or CLI. The controller stores the access_token + refresh_token at 'oauth/gmail/{user_id}/{email}/access_token' and 'oauth/gmail/{user_id}/{email}/refresh_token' respectively, and tracks expiry in integration_credentials."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/gmail/{your_user_id}/{your_email}/access_token'. The controller resolves the vault path + refreshes the token if needed before dispatching. If you hit 401s, call refresh_oauth_token(vault_path) to force-refresh and read the outcome."
+    }
+  ]
+}

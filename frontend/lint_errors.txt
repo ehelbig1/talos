@@ -1,0 +1,244 @@
+
+> talos-frontend@0.1.0 lint:eslint
+> eslint src/**/*.ts src/**/*.tsx
+
+
+/Users/evanhelbig/projects/talos/frontend/src/components/AddExistingNodeDialog.tsx
+   2:10  warning  'formatSize' is defined but never used. Allowed unused vars must match /^_/u      @typescript-eslint/no-unused-vars
+   2:22  warning  'formatDate' is defined but never used. Allowed unused vars must match /^_/u      @typescript-eslint/no-unused-vars
+  10:10  warning  'DarkSurfaceDiv' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+  13:15  warning  'WasmModule' is defined but never used. Allowed unused vars must match /^_/u      @typescript-eslint/no-unused-vars
+  19:28  warning  Unexpected any. Specify a different type                                          @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/ConditionEdge.tsx
+  2:1  warning  Imports "EdgeProps" are only used as type                             @typescript-eslint/consistent-type-imports
+  7:3  warning  'id' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+
+/Users/evanhelbig/projects/talos/frontend/src/components/CreateModuleDialog.tsx
+    3:1   warning  Imports "NodeTemplate" are only used as type                                     @typescript-eslint/consistent-type-imports
+    7:18  warning  'Section' is defined but never used. Allowed unused vars must match /^_/u        @typescript-eslint/no-unused-vars
+    8:10  warning  'SectionHeader' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+    9:10  warning  'FlexContainer' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+   11:10  warning  'Input' is defined but never used. Allowed unused vars must match /^_/u          @typescript-eslint/no-unused-vars
+   18:3   warning  'Shield' is defined but never used. Allowed unused vars must match /^_/u         @typescript-eslint/no-unused-vars
+   19:3   warning  'Bot' is defined but never used. Allowed unused vars must match /^_/u            @typescript-eslint/no-unused-vars
+   30:82  warning  Unexpected any. Specify a different type                                         @typescript-eslint/no-explicit-any
+   45:55  warning  Unexpected any. Specify a different type                                         @typescript-eslint/no-explicit-any
+   46:52  warning  Unexpected any. Specify a different type                                         @typescript-eslint/no-explicit-any
+   68:45  warning  Unexpected any. Specify a different type                                         @typescript-eslint/no-explicit-any
+   73:36  warning  Unexpected any. Specify a different type                                         @typescript-eslint/no-explicit-any
+   83:16  warning  'e' is defined but never used                                                    @typescript-eslint/no-unused-vars
+  148:17  warning  Unexpected any. Specify a different type                                         @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/ErrorBoundary.tsx
+   2:1   warning  Imports "ReactNode" are only used as type  @typescript-eslint/consistent-type-imports
+   8:22  warning  Unexpected any. Specify a different type   @typescript-eslint/no-explicit-any
+  17:46  warning  Unexpected any. Specify a different type   @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/ExecutionHistory.test.tsx
+  29:46  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/ExecutionHistory.tsx
+   18:45  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   40:9   warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   43:9   warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  123:42  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  126:36  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/ExecutionPanel.tsx
+    4:10  warning  'CopyField' is defined but never used. Allowed unused vars must match /^_/u                  @typescript-eslint/no-unused-vars
+    5:1   warning  Imports "ExecutionUpdate" are only used as type                                              @typescript-eslint/consistent-type-imports
+   27:3   warning  'CheckCircle2' is defined but never used. Allowed unused vars must match /^_/u               @typescript-eslint/no-unused-vars
+   28:3   warning  'Clock' is defined but never used. Allowed unused vars must match /^_/u                      @typescript-eslint/no-unused-vars
+   31:3   warning  'ChevronDown' is defined but never used. Allowed unused vars must match /^_/u                @typescript-eslint/no-unused-vars
+   32:3   warning  'ChevronRight' is defined but never used. Allowed unused vars must match /^_/u               @typescript-eslint/no-unused-vars
+   44:11  warning  'TimedEvent' is defined but never used. Allowed unused vars must match /^_/u                 @typescript-eslint/no-unused-vars
+   77:10  warning  'setErrorExpanded' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+   98:19  warning  Unexpected any. Specify a different type                                                     @typescript-eslint/no-explicit-any
+  218:21  warning  Unexpected any. Specify a different type                                                     @typescript-eslint/no-explicit-any
+  282:17  warning  Unexpected any. Specify a different type                                                     @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/Inspector.test.tsx
+  108:11  warning  'edge' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/Users/evanhelbig/projects/talos/frontend/src/components/Inspector.tsx
+    2:1   warning  Imports "WorkflowState" are only used as type                                       @typescript-eslint/consistent-type-imports
+    2:43  warning  'WorkflowNodeData' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+    3:1   warning  Imports "UIState" are only used as type                                             @typescript-eslint/consistent-type-imports
+    4:1   warning  Imports "EphemeralSlice" and "NodeStatusType" are only used as type                 @typescript-eslint/consistent-type-imports
+   60:45  warning  Unexpected any. Specify a different type                                            @typescript-eslint/no-explicit-any
+   81:75  warning  Unexpected any. Specify a different type                                            @typescript-eslint/no-explicit-any
+   90:66  warning  Unexpected any. Specify a different type                                            @typescript-eslint/no-explicit-any
+  515:42  warning  Unexpected any. Specify a different type                                            @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/KeyboardShortcutsHelp.tsx
+  3:10  warning  'cn' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/Users/evanhelbig/projects/talos/frontend/src/components/NodeConfigForm.tsx
+   5:10  warning  'Badge' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+  21:26  warning  Unexpected any. Specify a different type                                 @typescript-eslint/no-explicit-any
+  22:40  warning  Unexpected any. Specify a different type                                 @typescript-eslint/no-explicit-any
+  55:16  warning  'e' is defined but never used                                            @typescript-eslint/no-unused-vars
+  78:17  warning  Unexpected any. Specify a different type                                 @typescript-eslint/no-explicit-any
+  84:61  warning  Unexpected any. Specify a different type                                 @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/TalosNode.tsx
+  3:1  warning  Imports "NodeProps" are only used as type       @typescript-eslint/consistent-type-imports
+  4:1  warning  Imports "NodeStatusType" are only used as type  @typescript-eslint/consistent-type-imports
+
+/Users/evanhelbig/projects/talos/frontend/src/components/Terminal.tsx
+  56:28  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/TestRhaiModal.tsx
+  44:17  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/Toolbox.tsx
+  6:10  warning  'cn' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+
+/Users/evanhelbig/projects/talos/frontend/src/components/WorkflowExecutionHistory.tsx
+  2:1  warning  Imports "WorkflowExecution" are only used as type  @typescript-eslint/consistent-type-imports
+
+/Users/evanhelbig/projects/talos/frontend/src/components/WorkflowToolbar.test.tsx
+  38:26  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/WorkflowToolbar.tsx
+    1:17  warning  'Plus' is defined but never used. Allowed unused vars must match /^_/u                @typescript-eslint/no-unused-vars
+    1:29  warning  'Play' is defined but never used. Allowed unused vars must match /^_/u                @typescript-eslint/no-unused-vars
+    1:35  warning  'Trash2' is defined but never used. Allowed unused vars must match /^_/u              @typescript-eslint/no-unused-vars
+    1:83  warning  'Info' is defined but never used. Allowed unused vars must match /^_/u                @typescript-eslint/no-unused-vars
+   16:10  warning  'getFixSuggestion' is defined but never used. Allowed unused vars must match /^_/u    @typescript-eslint/no-unused-vars
+   56:9   warning  'isRunning' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+  198:94  warning  Unexpected any. Specify a different type                                              @typescript-eslint/no-explicit-any
+  207:28  warning  Unexpected any. Specify a different type                                              @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/components/Workspace.tsx
+   4:1   warning  Imports "Connection", "Node", "Edge", "OnNodesChange" and "OnEdgesChange" are only used as type  @typescript-eslint/consistent-type-imports
+   6:3   warning  'BackgroundVariant' is defined but never used. Allowed unused vars must match /^_/u              @typescript-eslint/no-unused-vars
+  56:38  warning  Unexpected any. Specify a different type                                                         @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/contexts/AuthContext.tsx
+   1:1   warning  Imports "ReactNode" are only used as type                                        @typescript-eslint/consistent-type-imports
+   8:1   warning  Imports "User" are only used as type                                             @typescript-eslint/consistent-type-imports
+   8:16  warning  'getStoredUser' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+  32:16  warning  'err' is defined but never used                                                  @typescript-eslint/no-unused-vars
+
+/Users/evanhelbig/projects/talos/frontend/src/hooks/useAddExistingNode.ts
+  35:17  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  54:60  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/hooks/useTokenRefresh.ts
+  24:16  warning  'error' is defined but never used  @typescript-eslint/no-unused-vars
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/auth.ts
+  139:12  warning  'error' is defined but never used  @typescript-eslint/no-unused-vars
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/capabilityBadge.tsx
+  164:46  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/categoryIcons.ts
+  2:1  warning  All imports in the declaration are only used as types. Use `import type`  @typescript-eslint/consistent-type-imports
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/graphqlClient.ts
+  109:30  warning  Unexpected any. Specify a different type                        @typescript-eslint/no-explicit-any
+  137:70  error    Irregular whitespace not allowed                                no-irregular-whitespace
+  157:7   error    There is no `cause` attached to the symptom error being thrown  preserve-caught-error
+  159:5   error    There is no `cause` attached to the symptom error being thrown  preserve-caught-error
+  300:53  warning  Unexpected any. Specify a different type                        @typescript-eslint/no-explicit-any
+  312:16  warning  'e' is defined but never used                                   @typescript-eslint/no-unused-vars
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/layout.ts
+  3:1  warning  All imports in the declaration are only used as types. Use `import type`  @typescript-eslint/consistent-type-imports
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/openapi.ts
+   10:16  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   11:17  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   12:15  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   13:14  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   25:26  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   26:16  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   87:16  warning  'error' is defined but never used         @typescript-eslint/no-unused-vars
+   94:12  warning  'error' is defined but never used         @typescript-eslint/no-unused-vars
+  148:19  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  149:32  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  184:62  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  203:37  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  219:50  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  239:44  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  239:50  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  245:16  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  247:52  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/smartConfig.test.ts
+   80:67  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   87:49  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   97:10  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  112:10  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/smartConfig.ts
+    8:10  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+  155:12  warning  'error' is defined but never used                                      @typescript-eslint/no-unused-vars
+  168:10  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+  169:11  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+  264:33  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+  266:19  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+  284:15  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+  303:19  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+  304:34  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+  342:39  warning  'url' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+  342:69  warning  Unexpected any. Specify a different type                               @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/useTemplates.test.ts
+   3:32  warning  'vi' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+  53:46  warning  Unexpected any. Specify a different type                              @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/useTemplates.ts
+  51:17  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/lib/workflowLoader.ts
+   54:25  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   54:39  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   67:11  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   82:62  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+   85:71  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  105:42  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  108:18  warning  'e' is defined but never used             @typescript-eslint/no-unused-vars
+  122:47  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  146:47  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/mocks/handlers.ts
+  1:30  warning  'graphql' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars
+  6:42  warning  Unexpected any. Specify a different type                                   @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/pages/Dashboard.test.tsx
+    1:37  warning  'waitFor' is defined but never used. Allowed unused vars must match /^_/u   @typescript-eslint/no-unused-vars
+   25:38  warning  'selector' is defined but never used. Allowed unused args must match /^_/u  @typescript-eslint/no-unused-vars
+  116:89  warning  Unexpected any. Specify a different type                                    @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/pages/Dashboard.tsx
+   10:1   warning  All imports in the declaration are only used as types. Use `import type`  @typescript-eslint/consistent-type-imports
+  238:17  warning  Unexpected any. Specify a different type                                  @typescript-eslint/no-explicit-any
+  334:40  warning  Unexpected any. Specify a different type                                  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/store/executionStore.test.ts
+  30:78  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  74:80  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/store/executionStore.ts
+   4:1   warning  All imports in the declaration are only used as types. Use `import type`  @typescript-eslint/consistent-type-imports
+  78:31  warning  Unexpected any. Specify a different type                                  @typescript-eslint/no-explicit-any
+  85:41  warning  Unexpected any. Specify a different type                                  @typescript-eslint/no-explicit-any
+
+/Users/evanhelbig/projects/talos/frontend/src/store/workflowStore.test.ts
+  3:1  warning  All imports in the declaration are only used as types. Use `import type`  @typescript-eslint/consistent-type-imports
+
+/Users/evanhelbig/projects/talos/frontend/src/store/workflowStore.ts
+    2:1   warning  Imports "RFNode", "RFEdge", "OnNodesChange", "OnEdgesChange" and "Connection" are only used as type  @typescript-eslint/consistent-type-imports
+    8:3   warning  'addEdge' is defined but never used. Allowed unused vars must match /^_/u                            @typescript-eslint/no-unused-vars
+   24:27  warning  Unexpected any. Specify a different type                                                             @typescript-eslint/no-explicit-any
+   48:31  warning  Unexpected any. Specify a different type                                                             @typescript-eslint/no-explicit-any
+   75:29  warning  Unexpected any. Specify a different type                                                             @typescript-eslint/no-explicit-any
+  109:46  warning  Unexpected any. Specify a different type                                                             @typescript-eslint/no-explicit-any
+
+✖ 156 problems (3 errors, 153 warnings)
+  0 errors and 19 warnings potentially fixable with the `--fix` option.
+

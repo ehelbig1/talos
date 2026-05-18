@@ -1,0 +1,53 @@
+{
+  "display_name": "Microsoft Teams Message",
+  "category": "Communication",
+  "capability_world": "network-node",
+  "description": "Send a message card to a Microsoft Teams channel via an Incoming Webhook URL.",
+  "allowed_hosts": ["outlook.office.com", "outlook.office365.com"],
+  "requires_secrets": ["teams/webhook_url"],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "WEBHOOK_URL_SECRET": {
+        "type": "string",
+        "description": "Secret key_path storing the Teams Incoming Webhook URL (e.g. teams/webhook_url)"
+      },
+      "TITLE": {
+        "type": "string",
+        "description": "Optional card title displayed at the top of the Teams message"
+      },
+      "TEXT": {
+        "type": "string",
+        "description": "Message body text. Markdown is supported."
+      },
+      "COLOR": {
+        "type": "string",
+        "description": "Hex accent color for the message card",
+        "default": "#0078D4"
+      }
+    },
+    "required": ["WEBHOOK_URL_SECRET"]
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Add an Incoming Webhook connector",
+      "detail": "In your Microsoft Teams channel, click the '...' menu → Connectors → Incoming Webhook → Configure."
+    },
+    {
+      "step": 2,
+      "title": "Create and copy the webhook URL",
+      "detail": "Give the webhook a name, optionally upload an icon, then click 'Create'. Copy the generated webhook URL."
+    },
+    {
+      "step": 3,
+      "title": "Store the URL as a secret",
+      "detail": "Use set_secret with key_path='teams/webhook_url' and the copied URL as the value."
+    },
+    {
+      "step": 4,
+      "title": "Configure this node",
+      "detail": "Set WEBHOOK_URL_SECRET='teams/webhook_url' on this node, then optionally set TITLE, TEXT, and COLOR."
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "name": "jira-search-issues",
+  "version": "v1.0.0",
+  "display_name": "Jira Issue Search",
+  "description": "Search Jira Cloud issues using JQL. Requires a vault:// reference to an Atlassian OAuth access token in the AUTH_HEADER config key. Returns structured issue data (key, summary, status, assignee, priority, type, updated).",
+  "category": "Integration",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "api.atlassian.com"
+  ],
+  "requires_secrets": [
+    "vault://oauth/atlassian/*/access_token"
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "JQL": {
+        "type": "string",
+        "description": "Jira Query Language expression (e.g. 'project = SECP ORDER BY updated DESC')"
+      },
+      "CLOUD_ID": {
+        "type": "string",
+        "description": "Atlassian Cloud instance ID (UUID from accessible-resources)"
+      },
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token (e.g. vault://oauth/atlassian/{user_id}/{cloud_id}/access_token). The host resolves this and prepends 'Bearer ' automatically."
+      },
+      "MAX_RESULTS": {
+        "type": "string",
+        "default": "25",
+        "description": "Maximum number of issues to return (1-100)"
+      },
+      "FIELDS": {
+        "type": "string",
+        "default": "summary,status,assignee,priority,updated,issuetype",
+        "description": "Comma-separated Jira fields to include"
+      }
+    },
+    "required": ["JQL", "CLOUD_ID", "AUTH_HEADER"]
+  }
+}

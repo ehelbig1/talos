@@ -1,0 +1,22 @@
+apiVersion: v2
+name: talos
+description: |
+  Talos workflow automation platform — Rust/Axum controller (GraphQL + REST + MCP),
+  WASM worker runtime (wasmtime), React/TypeScript frontend, plus in-cluster
+  NATS, Neo4j, HashiCorp Vault and MinIO. Postgres and Redis are expected to
+  be external (Neon/Upstash in Phase 1, RDS/ElastiCache in Phase 2).
+type: application
+# Bump appVersion when promoting a new controller/worker image.
+# chart version follows the chart itself, not the platform.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/talos/talos
+maintainers:
+  - name: Talos Platform Team
+keywords:
+  - workflow
+  - automation
+  - wasm
+  - graphql
+  - mcp

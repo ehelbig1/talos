@@ -1,0 +1,8 @@
+{
+    "id": "data-pipeline-etl",
+    "name": "Data Pipeline ETL",
+    "description": "High-performance Wasm ETL node to fetch, sanitize, and insert external JSON data into Postgres.",
+    "category": "Data Engineering",
+    "version": "1.0.0",
+    "author": "Talos"
+}

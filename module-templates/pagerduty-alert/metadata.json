@@ -1,0 +1,19 @@
+{
+  "name": "PagerDuty Alert",
+  "category": "operations",
+  "description": "Trigger, acknowledge, or resolve a PagerDuty incident via the Events API v2",
+  "icon": "🚨",
+  "version": "1.0.0",
+  "author": "Talos",
+  "tags": ["pagerduty", "alerting", "incident", "on-call", "operations", "monitoring"],
+  "documentation": "https://developer.pagerduty.com/docs/send-an-event",
+  "requirements": [
+    "PagerDuty Events API v2 integration key stored as a secret"
+  ],
+  "capabilities": {
+    "realtime": false,
+    "filtering": false,
+    "enrichment": false,
+    "oauth": null
+  }
+}

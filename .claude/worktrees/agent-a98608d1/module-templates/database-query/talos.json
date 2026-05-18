@@ -1,0 +1,22 @@
+{
+  "name": "database-query",
+  "version": "v1.0.0",
+  "display_name": "Database Query",
+  "description": "Execute parameterized SQL queries securely against authorized datastores.",
+  "category": "Data",
+  "config_schema": {
+    "type": "object",
+    "required": ["QUERY"],
+    "properties": {
+      "QUERY": {
+        "type": "string",
+        "description": "The SQL query to execute (use $1, $2, etc. for parameters)"
+      },
+      "PARAMS": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Array of parameters to bind to the query"
+      }
+    }
+  }
+}

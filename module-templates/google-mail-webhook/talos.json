@@ -1,0 +1,53 @@
+{
+  "name": "google-mail-webhook",
+  "version": "v1.0.0",
+  "display_name": "Gmail Webhook",
+  "description": "Receive Gmail push notifications via Google Pub/Sub and process incoming email events. Filters by label and event type.",
+  "category": "Communication",
+  "capability_world": "network-node",
+  "allowed_hosts": ["gmail.googleapis.com", "www.googleapis.com"],
+  "requires_secrets": ["google/gmail_oauth_token"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["OAUTH_TOKEN_SECRET"],
+    "properties": {
+      "OAUTH_TOKEN_SECRET": {
+        "type": "string",
+        "description": "Secret path for the Gmail OAuth2 token with gmail.readonly scope (e.g. 'google/gmail_oauth_token')"
+      },
+      "WATCH_LABELS": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Gmail label IDs to watch for new messages (e.g. ['INBOX', 'UNREAD']). Watches all mail if omitted."
+      },
+      "EVENT_TYPES": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Gmail notification event types to process (e.g. ['messageAdded', 'labelAdded'])"
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable Gmail API and Pub/Sub API",
+      "detail": "In Google Cloud Console, enable both the 'Gmail API' and 'Cloud Pub/Sub API' under 'APIs & Services > Library'."
+    },
+    {
+      "step": 2,
+      "title": "Create OAuth credentials with gmail.readonly scope",
+      "detail": "Create OAuth 2.0 credentials and authorize with the 'https://www.googleapis.com/auth/gmail.readonly' scope."
+    },
+    {
+      "step": 3,
+      "title": "Store OAuth token as secret",
+      "detail": "Use set_secret: key_path='google/gmail_oauth_token', value='your-refresh-token'."
+    },
+    {
+      "step": 4,
+      "title": "Configure Gmail push notifications",
+      "detail": "Call the Gmail API's users.watch endpoint to start receiving push notifications to your Pub/Sub topic, then route those notifications to your Talos webhook endpoint."
+    }
+  ]
+}

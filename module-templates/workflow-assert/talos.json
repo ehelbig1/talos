@@ -1,0 +1,25 @@
+{
+  "name": "workflow-assert",
+  "version": "v1.0.0",
+  "display_name": "Workflow Assert",
+  "description": "Assert conditions on the input payload. Fails the node (and the execution) if any assertion is violated. Useful for integration testing and contract validation.",
+  "category": "Development",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["ASSERTIONS"],
+    "properties": {
+      "ASSERTIONS": {
+        "type": "string",
+        "description": "JSON array of assertion objects. Each object must have: path (dot-notation field path), op (eq|ne|gt|lt|contains|exists|not_exists), and optionally value. Example: [{\"path\":\"status\",\"op\":\"eq\",\"value\":\"ok\"},{\"path\":\"count\",\"op\":\"gt\",\"value\":0}]"
+      },
+      "FAIL_FAST": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true, stop on first failed assertion. When false, collect all failures."
+      }
+    }
+  }
+}

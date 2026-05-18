@@ -1,0 +1,23 @@
+{
+  "name": "stripe-cancel-subscription",
+  "version": "v1.0.0",
+  "display_name": "Stripe: Cancel Subscription",
+  "description": "Cancel a Stripe subscription immediately or at the end of the current billing period. Immediate cancellation stops billing right away; at-period-end lets the customer use their remaining paid time before cancellation takes effect. Use in churn workflows triggered by user requests or payment failures.",
+  "category": "Payments",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.stripe.com"],
+  "requires_secrets": ["stripe/secret_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "SUBSCRIPTION_ID"],
+    "properties": {
+      "API_KEY_SECRET": { "type": "string", "description": "Vault path to the Stripe secret key." },
+      "SUBSCRIPTION_ID": { "type": "string", "description": "Stripe subscription ID (sub_xxx). Supports {{subscription_id}} template interpolation." },
+      "CANCEL_AT_PERIOD_END": { "type": "boolean", "default": false, "description": "If false (default): cancel immediately via DELETE. If true: schedule cancellation at end of billing period — customer keeps access until then." }
+    }
+  },
+  "setup_instructions": [
+    { "step": 1, "title": "Immediate vs scheduled cancellation", "detail": "CANCEL_AT_PERIOD_END=false (default): subscription is canceled immediately, customer loses access now. CANCEL_AT_PERIOD_END=true: subscription is marked to cancel at period end, status becomes 'active' with cancel_at_period_end=true — customer keeps access until current_period_end." },
+    { "step": 2, "title": "Typical churn workflow", "detail": "Chain: [customer requests cancellation] → [stripe-cancel-subscription: SUBSCRIPTION_ID={{subscription_id}}, CANCEL_AT_PERIOD_END=true] → [send farewell email] → [log churn event]." }
+  ]
+}

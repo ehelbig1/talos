@@ -1,0 +1,48 @@
+{
+  "name": "HTTP Trigger → JSON Transform → Message Publisher",
+  "description": "Receives an HTTP payload, transforms it to a normalized format, and publishes the result to a NATS message queue for downstream consumers.",
+  "category": "Integration",
+  "tags": ["http", "json", "nats", "messaging", "event-driven"],
+  "nodes": [
+    {
+      "label": "Receive Payload",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "POST",
+        "URL": "https://api.example.com/events"
+      }
+    },
+    {
+      "label": "Normalize Data",
+      "module_name": "JSON Transform",
+      "config": {
+        "SELECTOR": "data",
+        "TRANSFORM": "keys_to_lowercase"
+      }
+    },
+    {
+      "label": "Publish Event",
+      "module_name": "Message Publisher",
+      "config": {}
+    }
+  ],
+  "edges": [
+    { "from": "Receive Payload", "to": "Normalize Data" },
+    { "from": "Normalize Data", "to": "Publish Event" }
+  ],
+  "suggested_schedule": null,
+  "required_secrets": [],
+  "alternatives": [
+    {
+      "node_label": "Normalize Data",
+      "current_module": "JSON Transform",
+      "replacements": [
+        {
+          "module_name": "LLM Inference",
+          "catalog_name": "llm-inference",
+          "config_delta": "Replace SELECTOR+TRANSFORM with MODEL + SYSTEM_PROMPT describing the normalization in natural language (e.g. 'Extract the event type, timestamp, and user_id from this payload and return JSON'). Required secret: llm/api_key added. Use when source schema is variable or requires semantic understanding."
+        }
+      ]
+    }
+  ]
+}

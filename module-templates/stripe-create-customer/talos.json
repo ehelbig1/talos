@@ -1,0 +1,26 @@
+{
+  "name": "stripe-create-customer",
+  "version": "v1.0.0",
+  "display_name": "Stripe: Create Customer",
+  "description": "Create a new customer record in Stripe. Use as the first node in payment automation workflows before creating subscriptions or checkout sessions. Supports {{key}} template interpolation so upstream node output (e.g. email from a sign-up webhook) can be passed directly.",
+  "category": "Payments",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.stripe.com"],
+  "requires_secrets": ["stripe/secret_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "EMAIL"],
+    "properties": {
+      "API_KEY_SECRET": { "type": "string", "description": "Vault path to the Stripe secret key (e.g. 'stripe/secret_key')." },
+      "EMAIL": { "type": "string", "description": "Customer email address. Supports {{key}} template interpolation." },
+      "NAME": { "type": "string", "description": "Customer full name. Supports {{key}} template interpolation." },
+      "PHONE": { "type": "string", "description": "Customer phone number in E.164 format (e.g. '+15555555555')." },
+      "DESCRIPTION": { "type": "string", "description": "Internal description for this customer. Not visible to the customer." },
+      "METADATA": { "type": "string", "description": "JSON object of key-value metadata to attach (e.g. '{\"user_id\": \"usr_123\"}')." }
+    }
+  },
+  "setup_instructions": [
+    { "step": 1, "title": "Store your Stripe secret key", "detail": "In Talos Secrets, store your Stripe secret key (sk_live_... or sk_test_...) at the path in API_KEY_SECRET (e.g. 'stripe/secret_key')." },
+    { "step": 2, "title": "Typical workflow pattern", "detail": "Chain: [webhook or trigger] → [stripe-create-customer: EMAIL={{email}}] → [stripe-create-subscription: CUSTOMER_ID={{customer_id}}]. Store the returned customer_id for subsequent Stripe operations." }
+  ]
+}

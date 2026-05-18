@@ -1,0 +1,66 @@
+{
+  "name": "beehiiv-update-subscriber",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: Update Subscriber",
+  "description": "Update an existing Beehiiv subscriber's tier, custom fields, tags, or subscription status. Chain after beehiiv-get-subscriber to use the subscription_id from upstream output.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID", "SUBSCRIPTION_ID"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key')."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxx...'). Supports {{key}} template interpolation."
+      },
+      "SUBSCRIPTION_ID": {
+        "type": "string",
+        "description": "The subscription ID to update (e.g. 'sub_xxx...'). Use '{{subscription_id}}' to pull from a preceding beehiiv-get-subscriber node. Supports {{key}} template interpolation."
+      },
+      "UNSUBSCRIBE": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, marks the subscription as unsubscribed. This cannot be undone via the API — resubscription requires a new subscription with reactivate_existing=true."
+      },
+      "TIER": {
+        "type": "string",
+        "enum": ["free", "premium"],
+        "description": "New subscription tier. Leave unset to keep the current tier."
+      },
+      "CUSTOM_FIELDS": {
+        "type": ["string", "array"],
+        "description": "Custom fields to update. Provide as a JSON array of {name, value} objects (e.g. '[{\"name\":\"first_name\",\"value\":\"Bob\"}]'). Only listed fields are updated; others are unchanged. Fields must already exist in the publication."
+      },
+      "ADD_TAGS": {
+        "type": "string",
+        "description": "Comma-separated list of tag strings to add to the subscriber (e.g. 'vip,early-adopter'). Max 100 tags per publication. Tags are created automatically if they don't exist."
+      },
+      "REMOVE_TAGS": {
+        "type": "string",
+        "description": "Comma-separated list of tag strings to remove from the subscriber (e.g. 'trial'). Non-existent tags are silently ignored."
+      },
+      "AUTOMATION_IDS": {
+        "type": "string",
+        "description": "Comma-separated automation IDs to enroll the subscriber in. Each must have an active 'Add by API' trigger."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Get the subscription ID",
+      "detail": "Chain a beehiiv-get-subscriber node before this node. Map its output 'subscription_id' field to this node's SUBSCRIPTION_ID config using the template syntax '{{subscription_id}}'."
+    },
+    {
+      "step": 2,
+      "title": "Configure the update",
+      "detail": "Set one or more of TIER, CUSTOM_FIELDS, ADD_TAGS, REMOVE_TAGS, or UNSUBSCRIBE. At least one update field must be specified — a no-op call will still succeed but returns the unchanged subscription."
+    }
+  ]
+}

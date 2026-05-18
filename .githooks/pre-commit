@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -e
+
+echo "Running pre-commit checks..."
+
+# 1. Prevent committing .env files with real secrets
+if git diff --cached --name-only | grep -q '\.env$'; then
+    echo "ERROR: Attempting to commit .env file. Use .env.example instead."
+    exit 1
+fi
+
+# 2. Check for credential logging patterns in staged Rust files
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -v '_test\|tests/')
+if [ -n "$STAGED_RS" ]; then
+    # Check for raw token/cookie logging
+    if echo "$STAGED_RS" | xargs grep -ln 'tracing::debug!.*Cookie.*{:' 2>/dev/null | grep -v 'is_some\|is_none'; then
+        echo "WARNING: Potential credential logging detected in staged files."
+        echo "Log presence (is_some/is_none), not values."
+    fi
+
+    # Check for raw error returns to API clients
+    if echo "$STAGED_RS" | xargs grep -ln 'error.*Some(e\.to_string())' 2>/dev/null; then
+        echo "WARNING: Raw error strings returned to API clients in staged files."
+        echo "Use generic error messages for client responses."
+    fi
+fi
+
+# 3. Check for modified migration files that were already applied
+STAGED_MIGRATIONS=$(git diff --cached --name-only --diff-filter=M -- 'migrations/*.sql')
+if [ -n "$STAGED_MIGRATIONS" ]; then
+    echo "ERROR: Modifying existing migration files breaks sqlx checksums."
+    echo "Create a new migration file instead."
+    echo "Modified: $STAGED_MIGRATIONS"
+    exit 1
+fi
+
+# 4. Verify Rust compiles (quick check)
+if [ -n "$STAGED_RS" ]; then
+    echo "Checking Rust compilation..."
+    cargo check --workspace 2>/dev/null || {
+        echo "ERROR: Rust compilation failed."
+        exit 1
+    }
+fi
+
+echo "Pre-commit checks passed."

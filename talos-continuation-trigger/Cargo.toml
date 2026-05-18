@@ -1,0 +1,29 @@
+[package]
+name = "talos-continuation-trigger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-nats = "0.47"
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid"] }
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-advanced-repository = { path = "../talos-advanced-repository" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-engine = { path = "../talos-engine" }
+talos-execution-result-collector = { path = "../talos-execution-result-collector" }
+talos-registry = { path = "../talos-registry" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+tokio = { version = "1", features = ["rt", "macros"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

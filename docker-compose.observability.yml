@@ -1,0 +1,131 @@
+# Talos Observability Stack
+# Includes: Prometheus, Grafana, Jaeger for full observability
+#
+# Usage:
+#   docker-compose -f docker-compose.observability.yml up -d
+#
+# Access:
+#   - Prometheus: http://localhost:9090
+#   - Grafana: http://localhost:3001 (admin/admin) - Port 3001 to avoid conflict with talos-frontend
+#   - Jaeger UI: http://localhost:16686
+#   - Talos Metrics: http://localhost:9091/metrics
+
+services:
+  # ========================================================================
+  # PROMETHEUS - Metrics Collection
+  # ========================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: talos-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      # The correct Prometheus config resides in ./observability/prometheus/prometheus.yml
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - observability
+
+  # ========================================================================
+  # GRAFANA - Metrics Visualization
+  # ========================================================================
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: talos-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"  # Changed to 3001 to avoid conflict with talos-frontend
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      # SECURITY: Use :? to fail if password is not set — never allow the 'admin' default.
+      # Set GRAFANA_ADMIN_PASSWORD in your environment before starting this stack.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      # SECURITY: Anonymous access disabled — all dashboards require login.
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SERVER_ROOT_URL=http://localhost:3001
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - observability
+
+  # ========================================================================
+  # JAEGER - Distributed Tracing
+  # ========================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    container_name: talos-jaeger
+    restart: unless-stopped
+    ports:
+      # Jaeger UI
+      - "16686:16686"
+      # OTLP gRPC receiver
+      - "4317:4317"
+      # OTLP HTTP receiver
+      - "4318:4318"
+      # Jaeger collector HTTP
+      - "14268:14268"
+      # Jaeger collector gRPC
+      - "14250:14250"
+      # Zipkin compatible endpoint
+      - "9411:9411"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+      - SPAN_STORAGE_TYPE=memory
+      - MEMORY_MAX_TRACES=10000
+    networks:
+      - observability
+
+  # ========================================================================
+  # TALOS WORKER (Example - for testing)
+  # ========================================================================
+  # Uncomment to run Talos worker with observability enabled
+  #
+  # talos-worker:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: talos-worker
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:8080"  # Main application
+  #     - "9091:9090"  # Metrics endpoint
+  #   environment:
+  #     - RUST_LOG=info
+  #     - OTEL_METRICS_ENABLED=true
+  #     - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+  #     - OTEL_SERVICE_NAME=talos-worker
+  #     - PROMETHEUS_PORT=9090
+  #   depends_on:
+  #     - prometheus
+  #     - jaeger
+  #   networks:
+  #     - observability
+
+networks:
+  observability:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  jaeger-data:
+    driver: local

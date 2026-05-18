@@ -1,0 +1,65 @@
+{
+  "name": "webhook-fanout",
+  "version": "v1.0.0",
+  "display_name": "Webhook Fanout",
+  "description": "Iterate an upstream array and POST each item to a target URL with a vault-resolved bearer-style auth header. Designed for the common Talos\u2192external-app integration pattern (e.g. pa-followup-tracker dispatching tasks into a sister app). Continues on per-item failures by default; surfaces an error sample so transient issues don't silently drop items.",
+  "category": "Network",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "*"
+  ],
+  "requires_secrets": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "URL": {
+        "type": "string",
+        "description": "Target URL. Each item is POSTed here. For worker\u2192host-bridge use 'http://host.docker.internal:<port>/...' on Mac/Win Docker (requires WORKER_ALLOW_PRIVATE_HOST_TARGETS=true on the worker)."
+      },
+      "INPUT_FIELD": {
+        "type": "string",
+        "default": "items",
+        "description": "Top-level field on the upstream output to read the array from. e.g. if upstream emits {\"stale\": [...]} use 'stale'. If the field is absent OR the upstream payload itself is an array, the upstream is treated as the array directly."
+      },
+      "AUTH_HEADER_NAME": {
+        "type": "string",
+        "default": "x-auth-token",
+        "description": "Outbound header name carrying the auth token. Use 'authorization' if your target expects RFC 7235 Bearer."
+      },
+      "AUTH_HEADER_VALUE": {
+        "type": "string",
+        "description": "Token value. Set to 'vault://path/to/secret' so the worker resolves it server-side at fetch time \u2014 the plaintext NEVER enters guest WASM memory. Module's allowed_secrets MUST include the path."
+      },
+      "EXTRA_HEADERS": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "key": {"type": "string"},
+            "value": {"type": "string"}
+          }
+        },
+        "description": "Optional additional headers. content-type defaults to application/json and is overridable here."
+      },
+      "TIMEOUT_MS": {
+        "type": "number",
+        "default": 5000,
+        "description": "Per-request timeout. Total wall time for the node is bounded by node timeout_secs."
+      },
+      "STOP_ON_ERROR": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, abort the fan-out on the first per-item failure (returns the partial-dispatch summary as an Err). Default false: log + count errors and keep going so transient downstream issues don't drop the entire batch."
+      },
+      "MAX_ITEMS": {
+        "type": "number",
+        "default": 100,
+        "description": "Hard cap on items dispatched per execution. Protects against runaway loops if upstream emits an unexpected shape."
+      }
+    },
+    "required": [
+      "URL",
+      "AUTH_HEADER_VALUE"
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "talos-actor-types"
+description = "Pure-data types for Talos actors: LLM tier ceiling, approval-policy enums"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# MCP-1031: bounded_preview for caller-supplied reflection in error messages.
+talos-text-util = { path = "../talos-text-util" }
+uuid.workspace = true
+
+[lints]
+workspace = true

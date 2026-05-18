@@ -1,0 +1,32 @@
+schema: "http://127.0.0.1:8000/graphql"
+documents: "src/**/*.{ts,tsx,graphql}"
+hooks:
+  afterOneFileWrite:
+    - prettier --write
+config:
+  pluckConfig:
+    modules:
+      - name: "@/lib/graphqlClient"
+        identifier: graphqlFetcher
+      - name: "@/lib/graphqlClient"
+        identifier: graphqlRequest
+    magicComments:
+      - "graphql"
+generates:
+  src/generated/graphql.ts:
+    plugins:
+      - "typescript"
+      - "typescript-operations"
+      - "typescript-react-query"
+    config:
+      fetcher:
+        func: "@/lib/graphqlClient#graphqlFetcher"
+      reactQueryVersion: 5
+      scalars:
+        UUID:
+          input: string
+          output: string
+        JSON:
+          input: unknown
+          output: unknown
+

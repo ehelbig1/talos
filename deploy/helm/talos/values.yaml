@@ -1,0 +1,937 @@
+# Default values for Talos (Phase 2 production shape).
+# -----------------------------------------------------
+# Phase 2 assumptions:
+#   - Postgres is EXTERNAL (e.g. RDS with pgvector enabled).
+#   - Redis is EXTERNAL (e.g. ElastiCache).
+#   - Neo4j may be external (AuraDB) or in-cluster — default in-cluster.
+#   - NATS, Vault, MinIO are self-hosted in-cluster.
+#   - Sigstore signature enforcement is ON by default.
+#
+# For a single-node k3s (Phase 1) deployment, layer
+#   values-phase1.yaml on top of this file.
+# For explicit multi-AZ production, layer values-phase2.yaml.
+
+global:
+  # Kubernetes image pull secret name(s). Reference pre-created secrets
+  # that hold GHCR / ECR credentials.
+  imagePullSecrets: []
+  # - name: ghcr-pull
+
+  # Name of the domain Talos is served under. Used in ingress hosts and in
+  # BASE_URL / FRONTEND_URL env vars.
+  domain: "talos.example.com"
+
+  # The Kubernetes namespace the chart expects. We do not create the
+  # namespace from the chart (so the operator can set PodSecurityAdmission
+  # labels on it beforehand). Reference only.
+  namespace: "talos"
+
+# ----------------------------------------------------------------------------
+# Controller — Rust/Axum GraphQL + REST + MCP API server.
+# Owns Postgres + Neo4j + Vault credentials.
+# ----------------------------------------------------------------------------
+controller:
+  enabled: true
+  replicaCount: 2
+
+  # MCP-1209: deployment topology hints security_audit JWT grading.
+  # Talos default = single_pod: only the controller signs/validates JWTs;
+  # workers authenticate to controller via HMAC-NATS-RPC, never JWT.
+  # In single_pod mode HS256 is graded "pass" (10 pts). Operators who
+  # extend Talos with additional JWT-validating services should set this
+  # to "microservices", which downgrades HS256 to "warn" (5 pts) to
+  # encourage RS256/ES256 (asymmetric, no shared symmetric secret).
+  deploymentTopology: "single_pod"
+
+  image:
+    repository: ghcr.io/OWNER/talos-controller
+    # REPLACE with your published image digest.
+    # Format: @sha256:<64 hex chars>. Digest pin is mandatory in production
+    # (tag-only pulls are rejected by the sigstore ClusterImagePolicy below).
+    digest: "sha256:PLACEHOLDER_CONTROLLER_DIGEST_REPLACE_ME"
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 8000
+    # Controller exposes /metrics on the same port.
+    metricsPath: /metrics
+
+  ingress:
+    enabled: true
+    className: "nginx"
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+      nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+      # GraphQL subscriptions use WebSockets.
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    hosts:
+      - host: api.talos.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: controller-tls
+        hosts:
+          - api.talos.example.com
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  # Anti-affinity + spread across zones by default (Phase 2).
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: controller
+            topologyKey: kubernetes.io/hostname
+
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: controller
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+
+  # Non-sensitive env. Sensitive values live in controller.secrets (below)
+  # and are mounted via secretKeyRef. Names must match what the Rust code
+  # reads via std::env::var (see controller/src/).
+  env:
+    RUST_LOG: "info,controller=debug,audit_ledger=info"
+    RUST_ENV: "production"
+    # Trust X-Forwarded-For headers from cluster-internal proxies (Traefik
+    # in kube-system, nginx in the frontend pod). Without this, the
+    # controller rate-limits by Traefik's pod IP — every client looks
+    # identical and the API_RATE_LIMIT is shared across the whole cluster,
+    # producing 429s on every refocus refetch storm. Default k3s pod CIDR
+    # is 10.42.0.0/16 and Service CIDR is 10.43.0.0/16 — covers both
+    # ingress controller pods AND the frontend's nginx.
+    # Override per-cluster if your CNI uses different CIDRs (Calico,
+    # Cilium, GKE, EKS).
+    TRUSTED_PROXY_CIDRS: "10.42.0.0/16,10.43.0.0/16"
+    # Upstream subject prefix for the workflow engine; Talos controller and
+    # worker both use `talos.*` (see docker-compose.yml comment).
+    WORKFLOW_NATS_PREFIX: "talos"
+    AWS_DEFAULT_REGION: "us-east-1"
+    AWS_S3_FORCE_PATH_STYLE: "true"
+    MINIO_BUCKET: "audit-logs"
+    BCRYPT_COST: "12"
+    MCP_AUTH_RATE_LIMIT: "60"
+    API_RATE_LIMIT: "1000"
+    WEBHOOK_RATE_LIMIT: "500"
+    GLOBAL_RATE_LIMIT: "10000"
+    ALLOW_DEV_UNSAFE_CSRF_BYPASS: "false"
+    ENABLE_HSTS: "true"
+    KEK_PROVIDER: "vault"
+    VAULT_TRANSIT_KEY_NAME: "talos-kek"
+    TALOS_DISABLE_POOLING: "true"
+    # JWT audience-claim enforcement (MCP-857). Once every live token
+    # in your cluster carries `aud=talos`, set this to "true" to fail
+    # closed on tokens missing the claim (defense vs. cross-audience
+    # JWT replay — see talos-auth/src/lib.rs ~line 1239). During the
+    # back-compat retirement window, leave commented/unset and the
+    # verifier accepts aud-less tokens. Flip to "true" only after
+    # confirming no aud-less tokens remain (e.g. all sessions refreshed
+    # past the JWT TTL since the issuer started stamping `aud`).
+    # JWT_REQUIRE_AUD: "true"
+    # Bootstrap-time first-admin pin (MCP-859). STRONGLY RECOMMENDED
+    # for any deployment exposed to the public internet BEFORE the
+    # operator's own signup completes. When set, ONLY a user
+    # registering with this email can claim the automation-node
+    # ceiling bootstrap promotion — closes the "attacker registers
+    # first" race (talos-auth/src/bootstrap.rs::pinned_email). Leave
+    # unset for private/compose-only deploys where no one can beat
+    # the operator to /auth/register. Trim + lowercase happens
+    # automatically; empty string is treated as unset.
+    # BOOTSTRAP_FIRST_USER_EMAIL: "admin@example.com"
+    # All EMBEDDING_* config (URL/KEY/MODEL/DIMENSIONS/MAX_RPM) lives in the
+    # bootstrap secret as of r241 so operators can rotate providers without
+    # editing the chart. The controller's `EmbeddingConfig::from_env`
+    # supplies sensible defaults when keys are unset (or empty-string).
+    # See deploy/helm/talos/templates/controller/deployment.yaml for the
+    # secretKeyRef wiring.
+
+  # OCI registry source for module templates. When set, the controller skips
+  # the disk-bundled template seeding (`module-templates/` baked into the
+  # image) and pulls catalog metadata from the registry instead. The worker
+  # pulls the actual WASM bytes at execution time via the same URL prefix.
+  #
+  # Default (empty) → disk seeding only. Set to a registry URL to switch to
+  # the OCI source-of-truth model (recommended for production multi-instance
+  # deploys).
+  #
+  #   ociRegistry:
+  #     url: "https://ghcr.io"
+  #     namespace: "OWNER/talos-tools"   # path prefix under the registry
+  #
+  # Templates are then pulled from `{url}/v2/{namespace}/_index/manifests/latest`
+  # for discovery. See .github/workflows/template-publish.yml for the
+  # publish flow.
+  #
+  # PRIVATE PACKAGES: set bootstrapSecret.data.OCI_REGISTRY_USERNAME +
+  # OCI_REGISTRY_PASSWORD (MCP-860). Both controller and worker mount
+  # these via secretKeyRef; empty falls back to Anonymous auth.
+  ociRegistry:
+    url: ""
+    namespace: ""
+
+  # ------------------------------------------------------------------
+  # WORM audit-ledger persistence to S3 / MinIO with Object Lock.
+  # ------------------------------------------------------------------
+  # The controller batches every cryptographic-ledger event from the
+  # WASM workers (`talos.audit.ledger` NATS subject — secret access,
+  # capability denials, etc.) and uploads to MinIO / S3 every 5s or
+  # every 100 events.
+  #
+  # When `s3ObjectLock.enabled: true` the upload sets Object Lock in
+  # `Compliance` mode with the configured retention. The bucket MUST
+  # have Object Lock enabled at creation time (it CANNOT be turned on
+  # for an existing bucket — AWS / MinIO restriction). Compliance mode
+  # means even an account root user cannot remove the object until the
+  # retention date — the right default for tamper-evident audit.
+  #
+  # Leave `enabled: false` if your bucket lacks Object Lock support;
+  # the cryptographic hash chain on each event still provides local
+  # tamper evidence even without WORM at the storage tier.
+  audit:
+    s3ObjectLock:
+      enabled: false
+      retentionDays: 2555     # 7 years; clamped to [1, 36500] at runtime
+
+  # Extra arbitrary env vars rendered as name/value pairs into the Deployment.
+  # Use this for non-sensitive per-deploy overrides.
+  extraEnv: []
+  # - name: ENABLE_EDGE_ROUTING
+  #   value: "true"
+
+  # Volume config — the controller writes runtime compilation artifacts.
+  # We mount an emptyDir (in-memory by default) so readOnlyRootFilesystem
+  # remains enabled.
+  compilationCache:
+    # Use `emptyDir` for ephemeral scratch; set to "persistent" with a PVC
+    # if you want cached compiler output across restarts.
+    type: emptyDir
+    sizeLimit: "2Gi"
+
+  # Ports the container exposes (in addition to the service port).
+  ports: []
+
+  serviceAccount:
+    create: true
+    # If the install environment needs Workload Identity / IRSA for
+    # reaching an external VAULT_ADDR or S3 bucket, patch annotations here.
+    annotations: {}
+
+# ----------------------------------------------------------------------------
+# Worker — wasmtime-backed sandbox. Credential-free.
+# ----------------------------------------------------------------------------
+worker:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: ghcr.io/OWNER/talos-worker
+    digest: "sha256:PLACEHOLDER_WORKER_DIGEST_REPLACE_ME"
+    pullPolicy: IfNotPresent
+
+  service:
+    # Headless for potential NATS-based worker discovery; no traffic
+    # is routed here today (worker is a subscriber, not a server).
+    type: ClusterIP
+    clusterIP: None
+    # /metrics for Prometheus scrape.
+    metricsPort: 9090
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: worker
+            topologyKey: kubernetes.io/hostname
+
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: worker
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+
+  env:
+    RUST_LOG: "info,worker=debug"
+    RUST_ENV: "production"
+    # AWS_DEFAULT_REGION + AWS_S3_FORCE_PATH_STYLE are read transparently
+    # by the AWS SDK when modules use the object_storage WIT capability
+    # against the in-cluster MinIO. Both are SDK-implicit so there's no
+    # `std::env::var` call in worker code.
+    AWS_DEFAULT_REGION: "us-east-1"
+    AWS_S3_FORCE_PATH_STYLE: "true"
+    # MCP-856 (2026-05-14): `MINIO_BUCKET` removed from the worker env
+    # block. The worker has no audit-ledger dep (talos-audit-ledger is
+    # controller-only) and no Rust code reads `MINIO_BUCKET` from env.
+    # Bucket name on the worker's object_storage path comes from per-call
+    # args inside the WIT host functions, not env. The header comment on
+    # the worker deployment template mentioned "MinIO creds (signed
+    # audit-log writes)" but that's stale — the worker doesn't write
+    # audit logs to MinIO; the controller does (via talos-audit-ledger,
+    # which DOES read MINIO_BUCKET).
+    METRICS_PORT: "9090"
+    TALOS_DISABLE_POOLING: "true"
+    # WORKER_ALLOW_PRIVATE_HOST_TARGETS gates module HTTP calls to
+    # RFC1918 hostnames. Leave `false` on multi-tenant deployments.
+    WORKER_ALLOW_PRIVATE_HOST_TARGETS: "false"
+
+  # Sigstore enforcement for OCI template signatures. The publish workflow
+  # (.github/workflows/template-publish.yml) signs every artifact via
+  # cosign keyless using the workflow's GitHub OIDC token. The worker
+  # verifies signatures BEFORE pulling the WASM bytes — unsigned or
+  # tampered artifacts are rejected when `required: true`.
+  #
+  # Modes (TALOS_SIGSTORE_REQUIRED env value):
+  #   "" / "false"  → Disabled — don't verify (dev / first-deploy).
+  #   "audit"       → Verify, log on failure, continue. Migration window.
+  #   "true"        → Verify, refuse on failure. Production.
+  #
+  # `identityRegexp` MUST be set when not Disabled. It's matched against
+  # the SAN URI of the Fulcio cert; pin to the workflow URL pattern so
+  # only artifacts signed by THIS repo's publish workflow are accepted.
+  # Default `oidcIssuer` is the GitHub Actions OIDC endpoint.
+  sigstore:
+    required: ""              # "" | "audit" | "true"
+    identityRegexp: ""        # e.g. "^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@"
+    oidcIssuer: "https://token.actions.githubusercontent.com"
+
+  extraEnv: []
+
+  serviceAccount:
+    create: true
+    annotations: {}
+
+# ----------------------------------------------------------------------------
+# Frontend — React/TS SPA served by nginx.
+# ----------------------------------------------------------------------------
+frontend:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: ghcr.io/OWNER/talos-frontend
+    digest: "sha256:PLACEHOLDER_FRONTEND_DIGEST_REPLACE_ME"
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 3000
+
+  ingress:
+    enabled: true
+    className: "nginx"
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    hosts:
+      - host: talos.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: frontend-tls
+        hosts:
+          - talos.example.com
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+# ============================================================================
+# External services — Phase 2 default is "bring your own".
+# Fill in the URIs; the chart will render them into controller/worker Secrets.
+# ============================================================================
+
+postgres:
+  # In-cluster Postgres is NOT deployed by this chart. Use a managed
+  # Postgres with pgvector (Neon in Phase 1, RDS in Phase 2).
+  external:
+    # Full connection string including user, password, host, port, db.
+    # Example: postgres://talos:PASSWORD@db.example.com:5432/talos
+    # Leave empty to require it be injected via external-secrets.
+    url: ""
+
+redis:
+  external:
+    # Example: rediss://:PASSWORD@redis.example.com:6379 (TLS)
+    url: ""
+
+# ----------------------------------------------------------------------------
+# NATS — self-hosted in-cluster (both phases).
+# ----------------------------------------------------------------------------
+nats:
+  enabled: true
+  replicaCount: 3
+
+  image:
+    repository: nats
+    tag: "2.10-alpine"
+    digest: "sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
+    pullPolicy: IfNotPresent
+
+  # MCP-894 (2026-05-14): PDB enabled by default for the 3-replica
+  # NATS cluster. Without it, a `kubectl drain` (node upgrade,
+  # capacity rebalance) could evict 2 of 3 NATS pods at once, taking
+  # the cluster below quorum and breaking worker↔controller
+  # signed-RPC traffic for the duration of the eviction. Sibling to
+  # controller / worker / frontend PDBs which already ship.
+  # minAvailable: 2 keeps majority during voluntary disruption.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: "20Gi"
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  service:
+    clientPort: 4222
+    clusterPort: 6222
+    monitorPort: 8222
+
+  jetstream:
+    enabled: true
+    # max_memory_store / max_file_store accept bare bytes as int64. We pass
+    # integers (no unit suffix) so NATS' parser doesn't have to interpret
+    # any suffix at all — earlier "512Mi" / "512MB" attempts hit
+    # `strconv.ParseInt: parsing "512M": invalid syntax`. Values match the
+    # previous Mi/Gi caps in raw bytes.
+    maxMemoryStore: 536870912        # 512 MiB
+    maxFileStore: 10737418240        # 10 GiB
+
+# ----------------------------------------------------------------------------
+# Neo4j — in-cluster by default. In Phase 2, set `enabled: false` and
+# supply an AuraDB URI via `neo4j.external.uri`.
+# ----------------------------------------------------------------------------
+neo4j:
+  enabled: true
+
+  image:
+    repository: neo4j
+    tag: "5.26-community"
+    digest: "sha256:b357872da95a164c5243ca8d9060601130717ff43cee3c829402fab46209a412"
+    pullPolicy: IfNotPresent
+
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: "50Gi"
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  heap:
+    initial: "512m"
+    max: "1g"
+
+  external:
+    # When `neo4j.enabled` is false, this URI is used instead.
+    # Format: neo4j+s://dbid.databases.neo4j.io (AuraDB) or bolt://host:7687
+    uri: ""
+
+# ----------------------------------------------------------------------------
+# HashiCorp Vault — self-hosted in-cluster (Phase 1). In Phase 2 the
+# recommended path is HCP Vault; set `vault.enabled: false` and point
+# VAULT_ADDR via the controller secret.
+# ----------------------------------------------------------------------------
+vault:
+  enabled: true
+
+  # IPC_LOCK capability for mlock(). Default false because:
+  #   - Adding any capability is rejected by PodSecurityAdmission `restricted`,
+  #     which the install.sh labels the namespace with by default.
+  #   - The Vault HCL pins `disable_mlock = true`, so Vault won't actually call
+  #     mlock() even if granted the cap.
+  #   - k3s nodes ship without swap, so paging risk is moot.
+  # Flip true only when running this namespace at PSA `baseline` AND the host
+  # has swap enabled AND you've also flipped `disable_mlock = false` in the
+  # vault.hcl ConfigMap.
+  allowMemoryLocking: false
+
+  image:
+    repository: hashicorp/vault
+    tag: "1.18"
+    digest: "sha256:750bb37c1638fa194ab37053a81618c61bb0491ddec6fccac87c07a8e6cd8166"
+    pullPolicy: IfNotPresent
+
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: "10Gi"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Init job — two-phase bootstrap on each apply:
+  #   Phase 1 (vault image): initialize on first boot / unseal otherwise,
+  #     enable transit engine, create the KEK key, write the
+  #     `talos-controller` policy (transit/encrypt + decrypt + read against
+  #     the KEK key only — least privilege), mint an orphan periodic
+  #     `talos-controller` token under that policy.
+  #   Phase 2 (kubectl image): patch the bootstrap Secret's VAULT_TOKEN
+  #     with the new least-privilege token (only if it's a known
+  #     placeholder — `__pending_vault_init__`, `dev-root`, or empty),
+  #     then trigger a controller rollout so envFromSecret picks up the
+  #     new value at the next pod start.
+  init:
+    enabled: true
+    # kubectl image used by the secret-patcher container. Pin to the
+    # k3s minor version when possible. Override here, or leave for the
+    # template's default of bitnami/kubectl:1.31.
+    kubectlImage:
+      repository: bitnami/kubectl
+      tag: "1.31"
+      pullPolicy: IfNotPresent
+    # MCP-898 (2026-05-14): explicit resources for the init Job's two
+    # containers. Pre-fix neither carried `resources:`, putting the
+    # Pod in BestEffort QoS — first to be OOM-killed under any node
+    # memory pressure. The vault-bootstrap initContainer runs
+    # `vault operator init` / `unseal` / `secrets enable transit` /
+    # `policy write` / `token create` and writes the
+    # talos-controller token to /tmp; an OOM-kill between
+    # `vault operator init` succeeding and the unseal key being
+    # captured leaves Vault initialized but the key lost (the JSON
+    # output is parsed in shell, not persisted before parse) →
+    # cluster permanently broken, requires PVC restore from backup.
+    # Override sizing here if your cluster runs at high memory
+    # pressure and you've observed Burstable evictions too.
+    resources:
+      bootstrap:
+        requests:
+          cpu: 50m
+          memory: 96Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+      secretPatcher:
+        requests:
+          cpu: 25m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+    # bootstrap.json (unseal key + root token) lives on the Vault PVC
+    # under /vault/file/bootstrap.json. Do NOT copy it into a
+    # release-owned Kubernetes Secret — that would tie key material to
+    # release lifecycle.
+
+  # Address used by the controller. When vault.enabled=true, this resolves
+  # to the in-cluster Service DNS; otherwise set to your HCP Vault addr.
+  addrOverride: ""
+
+# ----------------------------------------------------------------------------
+# MinIO — self-hosted S3-compatible object storage (audit logs, artifacts).
+# ----------------------------------------------------------------------------
+minio:
+  enabled: true
+
+  image:
+    repository: minio/minio
+    tag: "latest"
+    digest: "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+    pullPolicy: IfNotPresent
+
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: "100Gi"
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+  service:
+    apiPort: 9000
+    consolePort: 9001
+
+  bucket: "audit-logs"
+
+# ----------------------------------------------------------------------------
+# Ollama — optional local LLM inference (tier-1 actor data-privacy gate).
+# Skip in Phase 2 unless GPU nodes are available.
+# TODO: GPU support is not wired up in this chart (no nvidia.com/gpu
+# resource request). Add when Phase 2 adds GPU nodes.
+# ----------------------------------------------------------------------------
+ollama:
+  enabled: false
+  image:
+    repository: ollama/ollama
+    tag: "latest"
+    digest: "sha256:PLACEHOLDER_OLLAMA_DIGEST_REPLACE_ME"
+  persistence:
+    enabled: true
+    size: "50Gi"
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+
+# ----------------------------------------------------------------------------
+# Migrations — one-shot sqlx migrate job, pre-install & pre-upgrade hook.
+# Uses the same image as the controller.
+# ----------------------------------------------------------------------------
+migrations:
+  enabled: true
+  # Override if you want to pin a separate image; defaults to the controller.
+  image:
+    repository: ""
+    digest: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  backoffLimit: 2
+  # Time after which Helm deletes the Job object after completion.
+  activeDeadlineSeconds: 900
+
+# ----------------------------------------------------------------------------
+# Security — sigstore image-signature enforcement.
+# ----------------------------------------------------------------------------
+security:
+  sigstore:
+    # Requires the `policy-controller` admission webhook (sigstore.dev)
+    # already installed in the cluster. See chart README for install
+    # instructions and how to disable this when publishing unsigned
+    # dev images.
+    enabled: true
+    # Only images in these globs must be signed. Wildcarded to allow
+    # private registry mirrors; tighten for your environment.
+    imageGlobs:
+      - "ghcr.io/OWNER/talos-*"
+    # GitHub Actions OIDC identity that signs the releases.
+    githubOrg: "OWNER"
+    githubRepo: "talos"
+    # The refs allowed to sign (releases + main).
+    certIdentityRegex: "^https://github\\.com/OWNER/talos/\\.github/workflows/.+@refs/(heads/main|tags/v.+)$"
+    oidcIssuer: "https://token.actions.githubusercontent.com"
+
+# ----------------------------------------------------------------------------
+# NetworkPolicies — enable default-deny + per-service allow rules.
+# ----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Namespace selector used when allowing ingress-controller traffic.
+  ingressNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: "ingress-nginx"
+  # MCP-896 (2026-05-14): scrape pods are restricted via this selector
+  # instead of the previous `podSelector: {}` "allow any pod in
+  # namespace" anti-pattern. The controller multiplexes /metrics,
+  # /metrics/prometheus, /graphql, /mcp, and /auth/* onto a single port
+  # (Service exposes only `http: 8000`), so the old rule silently
+  # granted every in-namespace pod access to the full API surface, not
+  # just the scrape endpoints. Same fix applied to worker + nats
+  # NetworkPolicies (those at least had separate metrics ports, but the
+  # principle is identical — lateral-movement blast radius).
+  #
+  # Default matches the kube-prometheus-stack convention of labeling
+  # the monitoring namespace `kubernetes.io/metadata.name: monitoring`.
+  # Override for in-namespace Prometheus deploys or non-standard
+  # labels. Setting `enabled: false` removes the scrape ingress rule
+  # entirely (Prometheus must run via a service-mesh sidecar or
+  # out-of-cluster pull in that case).
+  monitoringIngress:
+    enabled: true
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: "monitoring"
+  # CIDRs the controller is allowed to reach for outbound LLM / SaaS calls.
+  # Restrict in production to the exact hostnames' IP ranges if desired.
+  externalEgressCIDRs:
+    - "0.0.0.0/0"
+
+# ----------------------------------------------------------------------------
+# Monitoring — Prometheus Operator integration (MCP-904).
+# ----------------------------------------------------------------------------
+#
+# When enabled, the chart creates two ServiceMonitor CRDs (one for the
+# controller, one for the worker) so that a Prometheus Operator install
+# auto-discovers and scrapes Talos /metrics endpoints. REQUIRES the
+# `monitoring.coreos.com/v1` CRDs already installed in the cluster (via
+# kube-prometheus-stack or prometheus-operator) — without them, the
+# manifests are rejected by the API server and `helm install` fails.
+#
+# Bearer tokens are read from the same bootstrap Secret keys the
+# controller / worker consume:
+#   controller → PROMETHEUS_SCRAPE_TOKEN  (bootstrapSecret.data)
+#   worker     → METRICS_AUTH_TOKENS      (bootstrapSecret.data)
+# Both must be set to non-empty values OR the scrape endpoint returns
+# 403 (controller) / 401 (worker, post MCP-902).
+#
+# The NetworkPolicy `monitoringIngress` block (above) governs which
+# pods are allowed to REACH the scrape ports. The two settings must
+# agree: by default `monitoringIngress.namespaceSelector` matches
+# `kubernetes.io/metadata.name: monitoring`, which is the kube-
+# prometheus-stack convention. Operators running Prometheus in a
+# different namespace must update BOTH selectors.
+monitoring:
+  serviceMonitor:
+    enabled: false
+    # Scrape cadence; kube-prometheus-stack default is 30s.
+    interval: 30s
+    scrapeTimeout: 10s
+    # Override the bootstrap Secret keys if your External-Secrets
+    # operator stores them under different names.
+    controllerTokenSecretKey: PROMETHEUS_SCRAPE_TOKEN
+    workerTokenSecretKey: METRICS_AUTH_TOKENS
+    # Optional extra labels propagated onto the ServiceMonitor object —
+    # kube-prometheus-stack defaults to scraping ServiceMonitors with
+    # `release: <prometheus-release-name>`, so most operators need:
+    #   monitoring:
+    #     serviceMonitor:
+    #       extraLabels:
+    #         release: kube-prometheus-stack
+    extraLabels: {}
+
+# ----------------------------------------------------------------------------
+# Bootstrap Secret — seed values injected on first install.
+# For production, set `bootstrapSecret.enabled: false` and wire
+# External Secrets Operator to populate the Secret named by
+# `secretName` instead. The chart only *consumes* that Secret by name;
+# it does not force re-create it on upgrade when `enabled: false`.
+# ----------------------------------------------------------------------------
+bootstrapSecret:
+  enabled: true
+  secretName: "talos-controller-secrets"
+  # ALL keys below MUST be populated before `helm install`. Leaving a key
+  # empty renders an empty Secret field; the controller will crash on
+  # startup with a clear "X required" error (per docker-compose.yml).
+  data:
+    # Postgres + Redis URIs (full connection strings)
+    DATABASE_URL: ""
+    REDIS_URL: ""
+    # NATS basic auth
+    NATS_USER: ""
+    NATS_PASSWORD: ""
+    # Neo4j credentials
+    NEO4J_USER: "neo4j"
+    NEO4J_PASSWORD: ""
+    # Envelope encryption — AES-256-GCM master key; base64 of 32 bytes
+    # from `openssl rand -base64 32`. Only used when KEK_PROVIDER=env.
+    # Also stays wired as the legacy-read fallback when KEK_PROVIDER=vault.
+    TALOS_MASTER_KEY: ""
+    # Vault — in-cluster Vault: the chart's vault-init Job mints a
+    # least-privilege `talos-controller` token (transit/encrypt + decrypt
+    # against the KEK key only) and patches the bootstrap Secret with it
+    # on each apply. The placeholder `__pending_vault_init__` is what
+    # install.sh seeds; vault-init replaces it during install.
+    # HCP / external Vault: replace with an AppRole / identity-issued
+    # token; the chart's init logic refuses to patch operator-set values.
+    VAULT_TOKEN: "__pending_vault_init__"
+    # JWT signing (HS256 secret, or see JWT_PRIVATE_KEY/JWT_PUBLIC_KEY
+    # for RS256 — set JWT_ALGORITHM accordingly in controller.extraEnv).
+    JWT_SECRET: ""
+    # Worker ↔ controller NATS-RPC HMAC key
+    # Generate with: openssl rand -hex 32
+    WORKER_SHARED_KEY: ""
+    # Audit event signing (tamper-evident trail)
+    # Generate with: openssl rand -hex 32
+    TALOS_AUDIT_SIGNING_KEY: ""
+    # Worker /metrics + /health bearer-token auth (MCP-902). REQUIRED for
+    # worker startup — `metrics_server::start_metrics_server` panics
+    # via `.expect("Failed to start metrics server — ensure
+    # METRICS_AUTH_TOKENS is set")` when the env var is unset OR empty
+    # OR contains only whitespace. Pre-fix the chart wired the
+    # secretKeyRef on worker/deployment.yaml with optional:true but
+    # never defined the key in bootstrapSecret.data → `helm install`
+    # produced a CrashLoopBackOff worker out of the box. Comma-
+    # separated list; generate one with `openssl rand -hex 32`. The
+    # controller's equivalent is PROMETHEUS_SCRAPE_TOKEN (separate
+    # token, separate scrape config). For External Secrets operators
+    # with `bootstrapSecret.enabled: false`, this key MUST be
+    # populated in your own Secret named by `secretName`.
+    METRICS_AUTH_TOKENS: ""
+    # OCI registry auth for PRIVATE template packages (MCP-860). Read
+    # by BOTH the controller (talos-registry::sync::registry_auth_from_env
+    # for catalog discovery + manifest pulls) AND the worker (OCI WASM
+    # pulls at execution time). Anonymous when unset/empty — works for
+    # public packages where signing provides trust. For private GHCR
+    # packages, set username to the GitHub user and password to a PAT
+    # with `read:packages` scope. Empty values fall back to Anonymous
+    # (talos-registry/src/sync.rs line ~569: `if !user.is_empty() &&
+    # !pass.is_empty()`). Worker reqwest fallback path only supports
+    # Basic auth — bearer-token OAuth challenge flow is not implemented
+    # (per CLAUDE.md OCI auth model section).
+    OCI_REGISTRY_USERNAME: ""
+    OCI_REGISTRY_PASSWORD: ""
+    # Worker AOT cache HMAC (MCP-858). HMAC-SHA256 signature over every
+    # compiled-WASM blob the worker caches to disk — stops a tampered
+    # AOT artifact from being executed on the next pod restart. REQUIRED
+    # in production: when unset (or empty), the worker PANICS at startup
+    # with "CRITICAL: TALOS_AOT_HMAC_KEY must be set in production"
+    # (worker/src/runtime.rs::aot_key_ring). Must be ≥32 bytes — shorter
+    # keys also panic in production. Generate with: openssl rand -hex 32
+    # In dev (RUST_ENV != production) it falls back to an ephemeral
+    # random key per startup; AOT cache invalidates on every restart.
+    # MCP-1210: also wired into the controller deployment as a no-op
+    # pass-through so security_audit can attest the key is set + ≥32 bytes
+    # after hex decode. The controller does not USE the key — wiring it
+    # cross-pod gives operators one place to look and grades the audit.
+    TALOS_AOT_HMAC_KEY: ""
+    # MinIO credentials — least-privilege per-service users
+    MINIO_ROOT_USER: ""
+    MINIO_ROOT_PASSWORD: ""
+    MINIO_CONTROLLER_USER: ""
+    MINIO_CONTROLLER_PASSWORD: ""
+    MINIO_WORKER_USER: ""
+    MINIO_WORKER_PASSWORD: ""
+    # Optional — LLM provider keys. Controller-only; never shipped to worker.
+    ANTHROPIC_API_KEY: ""
+    OPENAI_API_KEY: ""
+    # Optional — embedding provider key (leave empty for local Ollama).
+    EMBEDDING_API_URL: ""
+    EMBEDDING_API_KEY: ""
+    # Optional — OAuth clients. Leave blank to disable the integration.
+    GOOGLE_CLIENT_ID: ""
+    GOOGLE_CLIENT_SECRET: ""
+    GMAIL_CLIENT_ID: ""
+    GMAIL_CLIENT_SECRET: ""
+    SLACK_CLIENT_ID: ""
+    SLACK_CLIENT_SECRET: ""
+    ATLASSIAN_CLIENT_ID: ""
+    ATLASSIAN_CLIENT_SECRET: ""
+    OKTA_DOMAIN: ""
+    OKTA_CLIENT_ID: ""
+    OKTA_CLIENT_SECRET: ""
+    SNYK_CLIENT_ID: ""
+    SNYK_CLIENT_SECRET: ""
+    # Optional — Admin-only operator endpoints gate. Leave "" in prod.
+    ADMIN_SECRET_KEY: ""
+    # TOTP config
+    TOTP_ISSUER: "Talos"
+    # --- Operator-only bearer tokens (MCP-857) ---
+    # Both gates fail closed in production when the env is unset or
+    # empty (see MCP-591 sweep); leaving these "" on a non-production
+    # cluster is fine and disables the corresponding endpoint instead.
+    #
+    # PROMETHEUS_SCRAPE_TOKEN — shared-secret bearer for GET /metrics.
+    # Production: REQUIRED. When unset/empty AND RUST_ENV=production,
+    # the handler returns 403 for every scrape (controller/main.rs
+    # ::prometheus_metrics_handler). Configure your ServiceMonitor /
+    # Prometheus client to add `Authorization: Bearer <token>`.
+    # Generate with: openssl rand -hex 32
+    PROMETHEUS_SCRAPE_TOKEN: ""
+    # REGISTRY_PUBLISH_TOKEN — shared-secret bearer for
+    # POST /api/registry/publish (operator-only OCI catalog publish).
+    # When unset/empty AND RUST_ENV=production, the endpoint returns
+    # 403 with "Catalog publish endpoint disabled — set
+    # REGISTRY_PUBLISH_TOKEN to enable" (talos-registry/src/api.rs).
+    # Generate with: openssl rand -hex 32 and pass via the publish
+    # workflow as `Authorization: Bearer <token>`.
+    REGISTRY_PUBLISH_TOKEN: ""
+
+# ----------------------------------------------------------------------------
+# Pod-level security context defaults.
+# ----------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
+  capabilities:
+    drop: ["ALL"]

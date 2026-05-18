@@ -1,0 +1,20 @@
+[package]
+name = "talos-errors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = { version = "0.8", features = ["json"] }
+bcrypt = "0.18"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+thiserror = "2.0"
+tracing.workspace = true
+
+[lints]
+workspace = true

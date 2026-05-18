@@ -1,0 +1,23 @@
+[package]
+name = "talos-workflow-versions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-actor-policy-hook = { path = "../talos-actor-policy-hook" }
+talos-actor-types = { path = "../talos-actor-types" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-validation = { path = "../talos-workflow-validation" }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

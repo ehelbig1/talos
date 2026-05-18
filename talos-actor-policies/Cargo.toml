@@ -1,0 +1,33 @@
+[package]
+name = "talos-actor-policies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+chrono.workspace = true
+dashmap = "6.1"
+hex = "0.4"
+rand = { version = "0.8", default-features = true, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rhai = { version = "1.19", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-actor-policy-hook = { path = "../talos-actor-policy-hook" }
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-actor-types = { path = "../talos-actor-types" }
+talos-advanced-repository = { path = "../talos-advanced-repository" }
+talos-config = { path = "../talos-config" }
+talos-engine = { path = "../talos-engine" }
+talos-http-utils = { path = "../talos-http-utils" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

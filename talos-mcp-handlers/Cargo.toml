@@ -1,0 +1,99 @@
+[package]
+name = "talos-mcp-handlers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arc-swap = "1.7"
+async-nats = "0.47"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+bcrypt = "0.18"
+chrono.workspace = true
+chrono-tz = "0.10"
+croner = "2.0"
+dashmap = "6.1"
+futures = "0.3"
+governor = "0.6"
+handlebars = "6.4"
+hex = "0.4"
+hmac = "0.12"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+neo4rs = "0.8"
+oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+petgraph = "0.6"
+rand = { version = "0.8", default-features = true, features = ["std"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+regex = "1.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rhai = { version = "1.19", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-actor-memory-service = { path = "../talos-actor-memory-service" }
+talos-actor-policies = { path = "../talos-actor-policies" }
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-actor-scaffold = { path = "../talos-actor-scaffold" }
+talos-advanced-repository = { path = "../talos-advanced-repository" }
+talos-analytics-repository = { path = "../talos-analytics-repository" }
+talos-capability-world = { path = "../talos-capability-world" }
+talos-compilation = { path = "../talos-compilation" }
+talos-config = { path = "../talos-config" }
+talos-continuation-trigger = { path = "../talos-continuation-trigger" }
+talos-dlp = { path = "../talos-dlp" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-engine = { path = "../talos-engine" }
+talos-execution-repository = { path = "../talos-execution-repository" }
+talos-graph-rag = { path = "../talos-graph-rag" }
+talos-http-utils = { path = "../talos-http-utils" }
+talos-llm = { path = "../talos-llm" }
+talos-mcp = { path = "../talos-mcp" }
+talos-memory = { path = "../talos-memory" }
+talos-module-repository = { path = "../talos-module-repository" }
+talos-oauth = { path = "../talos-oauth" }
+talos-registry = { path = "../talos-registry" }
+talos-rate-limit = { path = "../talos-rate-limit" }
+talos-replay-diff = { path = "../talos-replay-diff" }
+talos-replay-service = { path = "../talos-replay-service" }
+talos-inline-compile-service = { path = "../talos-inline-compile-service" }
+talos-search-service = { path = "../talos-search-service" }
+talos-schedule-repo = { path = "../talos-schedule-repo" }
+talos-scheduler = { path = "../talos-scheduler" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-subworkflow-contract = { path = "../talos-subworkflow-contract" }
+talos-system-repo = { path = "../talos-system-repo" }
+talos-text-util = { path = "../talos-text-util" }
+talos-webhook-repository = { path = "../talos-webhook-repository" }
+talos-webhooks = { path = "../talos-webhooks" }
+talos-execution-orchestration = { path = "../talos-execution-orchestration" }
+talos-workflow-manifest = { path = "../talos-workflow-manifest" }
+talos-execution-result-collector = { path = "../talos-execution-result-collector" }
+talos-hot-update-service = { path = "../talos-hot-update-service" }
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+talos-workflow-creation = { path = "../talos-workflow-creation" }
+talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
+talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
+talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-types = { path = "../talos-workflow-types" }
+talos-workflow-validation = { path = "../talos-workflow-validation" }
+talos-workflow-versions = { path = "../talos-workflow-versions" }
+talos-yaml-workflows = { path = "../talos-yaml-workflows" }
+thiserror = "2.0"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "process", "io-util", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing.workspace = true
+urlencoding = "2.1"
+uuid = { version = "1.20", features = ["serde", "v4", "v5"] }
+worker = { path = "../worker" }
+
+[lints]
+workspace = true

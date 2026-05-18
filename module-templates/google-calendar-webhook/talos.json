@@ -1,0 +1,55 @@
+{
+    "name": "google-calendar-webhook",
+    "display_name": "Google Calendar Webhook",
+    "version": "v1.0.0",
+    "category": "Integration",
+    "capability_world": "network-node",
+    "description": "Receive real-time push notifications from Google Calendar when events are created, updated, or deleted.",
+    "allowed_hosts": ["www.googleapis.com", "oauth2.googleapis.com"],
+    "requires_secrets": ["google/calendar_oauth_token"],
+    "config_schema": {
+        "type": "object",
+        "required": ["CALENDAR_ID", "OAUTH_TOKEN"],
+        "properties": {
+            "CALENDAR_ID": {
+                "type": "string",
+                "description": "Google Calendar ID to watch for changes (e.g. 'primary' or 'user@example.com')"
+            },
+            "OAUTH_TOKEN": {
+                "type": "string",
+                "description": "Secret key_path for a Google OAuth2 refresh token with calendar.readonly scope (e.g. 'google/calendar_oauth_token')"
+            },
+            "EVENT_TYPES": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["created", "updated", "deleted"]
+                },
+                "description": "Calendar change types to forward downstream. Omit to receive all types.",
+                "default": ["created", "updated", "deleted"]
+            }
+        }
+    },
+    "setup_instructions": [
+        {
+            "step": 1,
+            "title": "Enable the Google Calendar API",
+            "detail": "Go to https://console.cloud.google.com, create or select a project, and enable the Google Calendar API under 'APIs & Services > Library'."
+        },
+        {
+            "step": 2,
+            "title": "Create OAuth credentials",
+            "detail": "In 'APIs & Services > Credentials', create an OAuth 2.0 Client ID (Web application). Add your Talos redirect URI. Authorize with the 'https://www.googleapis.com/auth/calendar.readonly' scope."
+        },
+        {
+            "step": 3,
+            "title": "Store the refresh token as a secret",
+            "detail": "Use set_secret with key_path='google/calendar_oauth_token' and the resulting OAuth2 refresh token as the value."
+        },
+        {
+            "step": 4,
+            "title": "Configure this node",
+            "detail": "Set CALENDAR_ID to 'primary' or your specific calendar address, and OAUTH_TOKEN to 'google/calendar_oauth_token'. Optionally restrict EVENT_TYPES to only the change kinds you care about."
+        }
+    ]
+}

@@ -1,0 +1,241 @@
+{
+  "_comment": "Seccomp profile for the Talos worker container (Rust/wasmtime WASM runtime). Deny-by-default with an allowlist of syscalls needed for normal operation. The worker runs untrusted WASM code, so this profile is intentionally restrictive.",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "_comment": "File descriptor I/O",
+      "names": [
+        "read",
+        "write",
+        "readv",
+        "writev",
+        "pread64",
+        "pwrite64",
+        "lseek",
+        "close",
+        "dup",
+        "dup2",
+        "dup3",
+        "pipe",
+        "pipe2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "File open / stat / metadata",
+      "names": [
+        "open",
+        "openat",
+        "stat",
+        "fstat",
+        "lstat",
+        "newfstatat",
+        "statx",
+        "access",
+        "faccessat",
+        "faccessat2",
+        "readlink",
+        "readlinkat",
+        "getcwd",
+        "getdents",
+        "getdents64"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Memory management (critical for wasmtime JIT)",
+      "names": [
+        "mmap",
+        "mprotect",
+        "munmap",
+        "mremap",
+        "brk",
+        "madvise",
+        "membarrier"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Signal handling",
+      "names": [
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "rt_sigreturn",
+        "sigaltstack",
+        "restart_syscall"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Process / thread management",
+      "names": [
+        "clone",
+        "clone3",
+        "exit",
+        "exit_group",
+        "wait4",
+        "waitid",
+        "set_robust_list",
+        "get_robust_list",
+        "prctl",
+        "arch_prctl",
+        "set_tid_address",
+        "getpid",
+        "gettid",
+        "getppid",
+        "getuid",
+        "geteuid",
+        "getgid",
+        "getegid",
+        "getgroups",
+        "sched_yield",
+        "sched_getaffinity",
+        "sched_setaffinity",
+        "rseq"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Synchronization primitives (futex is essential for Rust std)",
+      "names": [
+        "futex",
+        "futex_waitv"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Networking (NATS, metrics server)",
+      "names": [
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "accept4",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "shutdown",
+        "getsockname",
+        "getpeername",
+        "setsockopt",
+        "getsockopt",
+        "socketpair"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Event polling (tokio/epoll)",
+      "names": [
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_wait",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "poll",
+        "ppoll",
+        "select",
+        "pselect6",
+        "eventfd",
+        "eventfd2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "File descriptor control",
+      "names": [
+        "fcntl",
+        "flock",
+        "ioctl"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Time / clocks",
+      "names": [
+        "clock_gettime",
+        "clock_getres",
+        "clock_nanosleep",
+        "nanosleep",
+        "gettimeofday"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Randomness (used by Rust stdlib, TLS, wasmtime)",
+      "names": [
+        "getrandom"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "File system operations (read-only container, but needed for tmpfs)",
+      "names": [
+        "unlink",
+        "unlinkat",
+        "rename",
+        "renameat",
+        "renameat2",
+        "mkdir",
+        "mkdirat",
+        "rmdir",
+        "ftruncate",
+        "fallocate",
+        "fsync",
+        "fdatasync",
+        "fchmod",
+        "fchmodat",
+        "fchown",
+        "fchownat",
+        "utimensat",
+        "statfs",
+        "fstatfs"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Name resolution and misc",
+      "names": [
+        "uname",
+        "sysinfo",
+        "getrlimit",
+        "prlimit64",
+        "setrlimit"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Thread-local storage",
+      "names": [
+        "set_thread_area",
+        "get_thread_area"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Timerfd (used by tokio runtime)",
+      "names": [
+        "timerfd_create",
+        "timerfd_settime",
+        "timerfd_gettime"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Signalfd (async signal handling)",
+      "names": [
+        "signalfd",
+        "signalfd4"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}

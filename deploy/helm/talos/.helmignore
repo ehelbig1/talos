@@ -1,0 +1,21 @@
+# Patterns to ignore when building Helm packages.
+.DS_Store
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+# CI / dev
+.github/
+.circleci/
+# Release artifacts
+*.tgz
+# Chart-local READMEs that shouldn't ship
+OWNERS
+OWNERS_ALIASES
+# Tests
+tests/

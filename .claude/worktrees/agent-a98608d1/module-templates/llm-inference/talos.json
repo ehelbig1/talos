@@ -1,0 +1,37 @@
+{
+  "name": "llm-inference",
+  "version": "v1.0.0",
+  "display_name": "LLM Inference",
+  "description": "Generate AI text completions securely using provider API keys injected from the secret vault.",
+  "category": "AI",
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "MODEL"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Reference to the API key secret path (e.g., talos/openai_key)"
+      },
+      "MODEL": {
+        "type": "string",
+        "default": "gpt-4",
+        "description": "The model identifier to use"
+      },
+      "API_URL": {
+        "type": "string",
+        "default": "https://api.openai.com/v1/chat/completions",
+        "description": "The API endpoint for the LLM provider"
+      },
+      "SYSTEM_PROMPT": {
+        "type": "string",
+        "default": "You are a helpful assistant.",
+        "description": "Optional system prompt instruction"
+      },
+      "MAX_TOKENS": {
+        "type": "number",
+        "default": 1024,
+        "description": "Maximum number of tokens to generate"
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{{- if .Values.controller.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "talos.componentName" (list . "controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "controller") | nindent 4 }}
+spec:
+  type: {{ .Values.controller.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.controller.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "talos.componentSelectorLabels" (list . "controller") | nindent 4 }}
+{{- end }}

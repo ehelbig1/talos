@@ -1,0 +1,284 @@
+{{- if .Values.controller.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "talos.componentName" (list . "controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "controller") | nindent 4 }}
+spec:
+  {{- if not .Values.controller.autoscaling.enabled }}
+  replicas: {{ .Values.controller.replicaCount }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "controller") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "controller") | nindent 8 }}
+      annotations:
+        # Roll pods when the configmap or secret changes.
+        checksum/config: {{ include (print $.Template.BasePath "/controller/configmap.yaml") . | sha256sum }}
+        {{- with .Values.controller.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "talos.componentName" (list . "controller") }}
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: controller
+          image: {{ include "talos.image" .Values.controller.image }}
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.controller.service.port }}
+              protocol: TCP
+          env:
+            # --- Static config from values.yaml ---
+            {{- include "talos.envFromMap" .Values.controller.env | nindent 12 }}
+            # --- OCI template registry (only emitted when configured) ---
+            # Setting TALOS_REGISTRY_URL switches the controller from disk-
+            # bundled template seeding to OCI catalog sync. See
+            # values.yaml § controller.ociRegistry for the operator-facing
+            # config and registry::sync.rs for the runtime path.
+            {{- with .Values.controller.ociRegistry.url }}
+            - name: TALOS_REGISTRY_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.controller.ociRegistry.namespace }}
+            - name: TALOS_REGISTRY_NAMESPACE
+              value: {{ . | quote }}
+            {{- end }}
+            # MCP-860: Optional OCI Basic-auth for private packages.
+            # `optional: true` keeps anonymous public-registry deploys
+            # working when the bootstrap secret omits these keys.
+            - name: OCI_REGISTRY_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: OCI_REGISTRY_USERNAME
+                  optional: true
+            - name: OCI_REGISTRY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: OCI_REGISTRY_PASSWORD
+                  optional: true
+            # --- In-cluster service addresses (derived) ---
+            - name: NATS_URL
+              value: {{ include "talos.natsUrl" . | quote }}
+            - name: NEO4J_URI
+              value: {{ include "talos.neo4jUri" . | quote }}
+            - name: VAULT_ADDR
+              value: {{ include "talos.vaultAddr" . | quote }}
+            - name: AWS_ENDPOINT_URL
+              value: {{ include "talos.minioEndpoint" . | quote }}
+            - name: MINIO_ENDPOINT
+              value: {{ include "talos.minioEndpoint" . | quote }}
+            - name: BASE_URL
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}"
+            - name: FRONTEND_URL
+              value: "https://{{ (index .Values.frontend.ingress.hosts 0).host }}"
+            - name: ALLOWED_ORIGIN
+              value: "https://{{ (index .Values.frontend.ingress.hosts 0).host }}"
+            # MCP-1209: deployment topology hints security_audit JWT grading.
+            # single_pod = JWT signed/validated only inside the controller
+            # process (Talos default — workers use HMAC-NATS-RPC, not JWT).
+            # microservices = JWT validated by ≥2 independent services;
+            # in that mode HS256 is a "warn" because the symmetric key
+            # must be distributed cross-service. RS256/ES256 always pass.
+            - name: TALOS_DEPLOYMENT_TOPOLOGY
+              value: {{ .Values.controller.deploymentTopology | default "single_pod" | quote }}
+            - name: OLLAMA_URL
+              {{- if .Values.ollama.enabled }}
+              value: "http://{{ include "talos.componentName" (list . "ollama") }}.{{ .Release.Namespace }}.svc.cluster.local:11434"
+              {{- else }}
+              value: ""
+              {{- end }}
+            # Embedding provider config — two independent sources, secret OR
+            # values.yaml controller.env. r241 dropped the `ollama.enabled=true`
+            # branch that hard-coded the in-cluster ollama service URL (the
+            # chart never shipped an ollama Deployment, so the branch only
+            # ever produced a phantom URL that silently failed). r242 adds
+            # `hasKey` guards so operator `controller.env` overrides win and
+            # the secretKeyRef block is skipped — without the guard, helm
+            # renders BOTH entries via `talos.envFromMap` AND the explicit
+            # block below, and the duplicate makes the secret entry win
+            # (because it appears later in the env array). When the secret
+            # key is missing AND the operator hasn't set it via controller.env,
+            # the controller's `EmbeddingConfig::from_env` supplies sensible
+            # defaults. Either source works; setting both means controller.env
+            # wins because we skip the secretKeyRef render entirely below.
+            {{- if not (hasKey .Values.controller.env "EMBEDDING_API_URL") }}
+            - name: EMBEDDING_API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: EMBEDDING_API_URL
+                  optional: true
+            {{- end }}
+            {{- if not (hasKey .Values.controller.env "EMBEDDING_MODEL") }}
+            - name: EMBEDDING_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: EMBEDDING_MODEL
+                  optional: true
+            {{- end }}
+            {{- if not (hasKey .Values.controller.env "EMBEDDING_DIMENSIONS") }}
+            - name: EMBEDDING_DIMENSIONS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: EMBEDDING_DIMENSIONS
+                  optional: true
+            {{- end }}
+            {{- if not (hasKey .Values.controller.env "EMBEDDING_MAX_RPM") }}
+            - name: EMBEDDING_MAX_RPM
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: EMBEDDING_MAX_RPM
+                  optional: true
+            {{- end }}
+            # --- Secrets ---
+            {{- $secretKeys := list
+                "DATABASE_URL"
+                "REDIS_URL"
+                "NATS_USER" "NATS_PASSWORD"
+                "NEO4J_USER" "NEO4J_PASSWORD"
+                "TALOS_MASTER_KEY"
+                "VAULT_TOKEN"
+                "JWT_SECRET"
+                "WORKER_SHARED_KEY"
+                "TALOS_AUDIT_SIGNING_KEY"
+                "ANTHROPIC_API_KEY" "OPENAI_API_KEY"
+                "EMBEDDING_API_KEY"
+                "GOOGLE_CLIENT_ID" "GOOGLE_CLIENT_SECRET"
+                "GMAIL_CLIENT_ID" "GMAIL_CLIENT_SECRET"
+                "SLACK_CLIENT_ID" "SLACK_CLIENT_SECRET"
+                "ATLASSIAN_CLIENT_ID" "ATLASSIAN_CLIENT_SECRET"
+                "OKTA_DOMAIN" "OKTA_CLIENT_ID" "OKTA_CLIENT_SECRET"
+                "SNYK_CLIENT_ID" "SNYK_CLIENT_SECRET"
+                "ADMIN_SECRET_KEY"
+                "TOTP_ISSUER"
+                "PROMETHEUS_SCRAPE_TOKEN"
+                "REGISTRY_PUBLISH_TOKEN"
+                "TALOS_AOT_HMAC_KEY"
+            -}}
+            # Controller MinIO creds map to the AWS_* env vars the controller reads.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_CONTROLLER_USER
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_CONTROLLER_PASSWORD
+            {{- include "talos.envFromSecret" (list (include "talos.bootstrapSecretName" .) $secretKeys) | nindent 12 }}
+            # OAuth redirect URIs (derived from base URL).
+            - name: GOOGLE_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/auth/oauth/google/callback"
+            - name: GMAIL_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/gmail/callback"
+            - name: SLACK_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/slack/callback"
+            - name: ATLASSIAN_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/atlassian/callback"
+            - name: OKTA_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/auth/oauth/okta/callback"
+            - name: SNYK_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/auth/oauth/snyk/callback"
+            {{- if .Values.controller.audit.s3ObjectLock.enabled }}
+            # WORM audit ledger Object Lock — Compliance mode, bucket
+            # must have Object Lock enabled at creation. See
+            # values.yaml controller.audit.s3ObjectLock for context.
+            - name: TALOS_AUDIT_S3_OBJECT_LOCK
+              value: "true"
+            - name: TALOS_AUDIT_S3_RETENTION_DAYS
+              value: {{ .Values.controller.audit.s3ObjectLock.retentionDays | quote }}
+            {{- end }}
+            {{- with .Values.controller.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # /live is a trivial process-alive check (no DB/Redis/NATS calls),
+          # so a Postgres or Redis hiccup can't trigger a pod restart.
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # /ready returns 503 only when Postgres is down (Redis/NATS report
+          # degraded but still 200), so the pod leaves the Service when it
+          # genuinely can't serve traffic but stays in rotation through
+          # transient downstream blips.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: compilation-cache
+              mountPath: /tmp/talos_compilation_cache
+            - name: cargo-cache
+              mountPath: /tmp/cargo-cache
+            - name: cargo-target
+              mountPath: /tmp/cargo-target
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: "512Mi"
+        - name: compilation-cache
+          emptyDir:
+            sizeLimit: {{ .Values.controller.compilationCache.sizeLimit | quote }}
+        - name: cargo-cache
+          emptyDir:
+            sizeLimit: "2Gi"
+        - name: cargo-target
+          emptyDir:
+            sizeLimit: "2Gi"
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

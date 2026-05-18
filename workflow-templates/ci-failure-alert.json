@@ -1,0 +1,70 @@
+{
+  "name": "GitHub CI Status → Slack Failure Alert",
+  "description": "Polls GitHub's commit status API for a repository, validates that the CI is passing, and alerts a Slack channel immediately when a failure is detected.",
+  "category": "Development",
+  "tags": ["github", "ci", "slack", "monitoring", "scheduled", "devops"],
+  "nodes": [
+    {
+      "label": "Fetch CI Status",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.github.com/repos/owner/repo/commits/HEAD/status",
+        "TIMEOUT_MS": 5000
+      }
+    },
+    {
+      "label": "Check Passing",
+      "module_name": "Data Validator",
+      "config": {
+        "FIELD": "state",
+        "MIN_VALUE": 0
+      }
+    },
+    {
+      "label": "Alert on Failure",
+      "module_name": "Slack Message",
+      "config": {
+        "CHANNEL": "#ci-alerts",
+        "TEXT": "CI failure detected on main branch"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Fetch CI Status", "to": "Check Passing" },
+    { "from": "Check Passing", "to": "Alert on Failure" }
+  ],
+  "suggested_schedule": "*/10 * * * *",
+  "required_secrets": [
+    { "key_path": "github/token", "description": "GitHub PAT with repo:read scope for private repositories" },
+    { "key_path": "slack/bot_token", "description": "Slack bot token with chat:write scope" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Alert on Failure",
+      "current_module": "Slack Message",
+      "replacements": [
+        {
+          "module_name": "Gmail",
+          "catalog_name": "send-gmail",
+          "config_delta": "Replace CHANNEL+TEXT with TO (on-call email), SUBJECT (e.g. 'CI Failure on main'), BODY. Required secret: google/gmail_oauth_token instead of slack/bot_token."
+        },
+        {
+          "module_name": "Message Publisher",
+          "catalog_name": "message-publisher",
+          "config_delta": "Replace CHANNEL+BOT_TOKEN with TOPIC (e.g. 'ci.failures'). Downstream systems (PagerDuty forwarder, ops dashboards) subscribe to the NATS subject. No notification credentials stored in this module."
+        },
+        {
+          "module_name": "Microsoft Teams Message",
+          "catalog_name": "send-teams-message",
+          "config_delta": "Replace CHANNEL+BOT_TOKEN with WEBHOOK_URL_SECRET='teams/webhook_url'. Set TITLE='CI Failure Detected' and COLOR='#D13438'. Required secret: teams/webhook_url instead of slack/bot_token."
+        },
+        {
+          "module_name": "PagerDuty Alert",
+          "catalog_name": "pagerduty-alert",
+          "config_delta": "Replace Slack config with INTEGRATION_KEY_SECRET='pagerduty/integration_key', SUMMARY='CI failure on main branch', SEVERITY='error', ACTION='trigger'. Set DEDUP_KEY='ci-main-failure' to prevent duplicate incidents. Required secret: pagerduty/integration_key instead of slack/bot_token."
+        }
+      ]
+    }
+  ]
+}

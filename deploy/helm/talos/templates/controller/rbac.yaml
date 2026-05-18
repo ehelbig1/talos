@@ -1,0 +1,17 @@
+{{- if and .Values.controller.enabled .Values.controller.serviceAccount.create -}}
+# The controller does not reach the Kubernetes API at runtime. No Role /
+# RoleBinding is provisioned — this file is kept as a seam for operators
+# who want to grant specific resource access (e.g. reading a ConfigMap
+# that carries an in-cluster TLS CA).
+#
+# Example (commented):
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: {{ include "talos.componentName" (list . "controller") }}
+#   namespace: {{ .Release.Namespace }}
+# rules:
+#   - apiGroups: [""]
+#     resources: ["configmaps"]
+#     verbs: ["get", "list"]
+{{- end }}

@@ -1,0 +1,51 @@
+{
+  "name": "beehiiv-list-premium-tiers",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: List Premium Tiers",
+  "description": "Retrieve all premium subscription tiers for a publication, including pricing details (amount, currency, billing interval) and subscriber counts. Use to discover tier IDs needed for subscriber upgrade workflows and to audit your monetization structure.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key')."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxx...'). Supports {{key}} template interpolation."
+      },
+      "INCLUDE_PRICES": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true (default), expands each tier to include pricing details: amount_cents, currency, billing interval, CTA text, and feature list."
+      },
+      "INCLUDE_STATS": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true (default), expands each tier to include subscriber count (active_subscriptions)."
+      },
+      "LIMIT": {
+        "type": "number",
+        "default": 100,
+        "description": "Maximum number of tiers to return (1–100). Most publications have fewer than 10 tiers."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Discover tier IDs for upgrade workflows",
+      "detail": "Run this node once to get tier IDs. Copy the 'id' field from the tier you want to use in beehiiv-update-subscriber (TIER / premium_tier_ids)."
+    },
+    {
+      "step": 2,
+      "title": "Revenue structure audit",
+      "detail": "Chain: [schedule trigger] → [beehiiv-list-premium-tiers] → [beehiiv-list-subscribers: TIER=premium] → compute revenue = sum(active_subscriptions × amount_cents per tier)."
+    }
+  ]
+}

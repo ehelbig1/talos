@@ -1,0 +1,82 @@
+# cargo-audit configuration — used by CI (`cargo audit` operates on
+# Cargo.lock alone, no `cargo metadata` resolution needed, so it works
+# even when the sibling `talos-workflow-engine` repo isn't checked out).
+#
+# `deny.toml` is the richer source of truth for local `make audit`
+# (advisories + licenses + bans + sources), but its `cargo metadata`
+# dependency means it can only run in environments that have the
+# sibling private repo on disk. Keep this list synced with the
+# `[advisories].ignore` block in deny.toml.
+#
+# CI loads this file by copying it to `~/.cargo/audit.toml` before
+# invoking `cargo audit`. See `.github/workflows/ci.yml`.
+#
+# Re-evaluate every entry on each dependency-update cycle.
+
+[advisories]
+ignore = [
+    # --- Vulnerabilities in unreachable transitive code paths ---
+
+    # protobuf 2.x uncontrolled-recursion crash. Pulled by prometheus 0.13.x
+    # via opentelemetry-prometheus. Our /metrics endpoint is internal-only;
+    # no attacker-controlled input reaches the protobuf decoder. Blocked
+    # on opentelemetry-prometheus releasing prometheus 0.14 support.
+    "RUSTSEC-2024-0437",
+
+    # rsa Marvin-attack timing sidechannel. Pulled by jsonwebtoken 10.x.
+    # Our JWT stack uses HS256 (HMAC) — RS256 RSA path not reachable. No
+    # upstream fix available. Re-evaluate if we ever switch to RS256.
+    "RUSTSEC-2023-0071",
+
+    # rustls-webpki 0.101.x — URI name-constraints accepted. Pulled by
+    # aws-smithy-http-client legacy-rustls. Our AWS SDK only talks to
+    # AWS STS (not attacker-controlled) and MinIO (we control the cert).
+    "RUSTSEC-2026-0098",
+
+    # rustls-webpki 0.101.x — wildcard name-constraint bypass. Same chain
+    # / same non-exploitability reasoning as RUSTSEC-2026-0098.
+    "RUSTSEC-2026-0099",
+
+    # rustls-webpki 0.101.x — panic on empty onlySomeReasons in CRL parsing.
+    # Reachable only when parsing CRLs; AWS SDK + Talos code never do.
+    "RUSTSEC-2026-0104",
+
+    # rustls-webpki 0.102.x — CRL not consulted due to faulty
+    # DistributionPoint matching. Default UnknownStatusPolicy::Deny makes
+    # this a fail-closed reject-unknown rather than unsafe-accept.
+    "RUSTSEC-2026-0049",
+
+    # tokio-tar — dev-only via testcontainers (controller dev-deps).
+    # Production binaries don't link tokio-tar. cargo-audit doesn't have
+    # cargo-deny's `exclude-dev` graph filter so we ignore explicitly.
+    "RUSTSEC-2025-0111",
+
+    # --- Unmaintained crates (supply-chain risk only, no live exploit) ---
+
+    # proc-macro-error unmaintained. Transitive via derive-heavy crates.
+    "RUSTSEC-2024-0370",
+
+    # derivative unmaintained. Transitive via derive macros.
+    "RUSTSEC-2024-0388",
+
+    # instant unmaintained. Transitive (Wasm-compatible Instant). web-time
+    # is the migration target; upstream adoption gradual.
+    "RUSTSEC-2024-0384",
+
+    # paste unmaintained but widely-used proc-macro for ident concat.
+    # No vuln, just maintenance flag. No clean replacement yet.
+    "RUSTSEC-2024-0436",
+
+    # backoff unmaintained. Transitive. Replacement target: backon /
+    # tokio-retry whenever retry code is next touched.
+    "RUSTSEC-2025-0012",
+
+    # rustls-pemfile unmaintained — functionality moved into
+    # rustls-pki-types 1.9+. Pulled by neo4rs (Bolt TLS) and
+    # rustls-native-certs. Drops automatically when consumers migrate.
+    "RUSTSEC-2025-0134",
+
+    # lru 0.12.x unmaintained transitive copy. Our direct lru = "0.16"
+    # already uses the maintained line. Drops when consumers migrate.
+    "RUSTSEC-2026-0002",
+]

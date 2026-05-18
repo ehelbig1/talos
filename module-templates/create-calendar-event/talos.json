@@ -1,0 +1,63 @@
+{
+  "name": "create-calendar-event",
+  "version": "v1.0.0",
+  "display_name": "Google Calendar Event",
+  "description": "Create events in Google Calendar using OAuth2. Supports setting title, time range, timezone, and calendar selection.",
+  "category": "Integration",
+  "capability_world": "network-node",
+  "allowed_hosts": ["www.googleapis.com", "calendar.googleapis.com"],
+  "requires_secrets": ["google/calendar_oauth_token"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["OAUTH_TOKEN_SECRET", "CALENDAR_ID", "TITLE", "START_TIME", "END_TIME"],
+    "properties": {
+      "OAUTH_TOKEN_SECRET": {
+        "type": "string",
+        "description": "Secret path for the Google Calendar OAuth2 token (e.g. 'google/calendar_oauth_token')"
+      },
+      "CALENDAR_ID": {
+        "type": "string",
+        "description": "Google Calendar ID to create the event in (use 'primary' for the main calendar)"
+      },
+      "TITLE": {
+        "type": "string",
+        "description": "Event title/summary"
+      },
+      "START_TIME": {
+        "type": "string",
+        "description": "Event start time in RFC3339 format (e.g. '2026-03-17T09:00:00-07:00')"
+      },
+      "END_TIME": {
+        "type": "string",
+        "description": "Event end time in RFC3339 format (e.g. '2026-03-17T10:00:00-07:00')"
+      },
+      "TIMEZONE": {
+        "type": "string",
+        "description": "IANA timezone name (e.g. 'America/New_York'). Defaults to UTC."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable Google Calendar API",
+      "detail": "In Google Cloud Console, go to 'APIs & Services > Library' and enable the 'Google Calendar API'."
+    },
+    {
+      "step": 2,
+      "title": "Create OAuth credentials",
+      "detail": "In 'APIs & Services > Credentials', create an OAuth 2.0 Client ID. Add the 'https://www.googleapis.com/auth/calendar.events' scope."
+    },
+    {
+      "step": 3,
+      "title": "Obtain OAuth tokens",
+      "detail": "Run the OAuth authorization flow to grant calendar access. Capture the refresh token from the response."
+    },
+    {
+      "step": 4,
+      "title": "Store refresh token as secret",
+      "detail": "Use set_secret: key_path='google/calendar_oauth_token', value='your-refresh-token'."
+    }
+  ]
+}

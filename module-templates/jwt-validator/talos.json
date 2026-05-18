@@ -1,0 +1,40 @@
+{
+  "name": "jwt-validator",
+  "version": "v1.0.0",
+  "display_name": "JWT Validator",
+  "description": "Validates a JSON Web Token (JWT) signature and required claims using a secret key fetched from the vault. Set SECRET_NAME config key to the vault path where your JWT signing key is stored (canonical path: 'auth/jwt_secret').",
+  "category": "Security",
+  "capability_world": "secrets-node",
+  "allowed_hosts": [],
+  "requires_secrets": ["auth/jwt_secret"],
+  "setup_instructions": [
+    "1. Store your JWT signing key: create_secret {name: 'auth/jwt_secret', value: 'your-hmac-key', namespace: 'auth'}",
+    "2. Install this module with the vault path: install_module_from_catalog {name: 'jwt-validator', allowed_secrets: ['auth/jwt_secret']}",
+    "3. In node config, set SECRET_NAME = 'auth/jwt_secret' (must match the vault path exactly)",
+    "Note: If your key is stored at a different vault path (e.g. 'api/signing_key'), pass that path in allowed_secrets at install time and use the same path in SECRET_NAME config."
+  ],
+  "config_schema": {
+    "type": "object",
+    "required": ["SECRET_NAME"],
+    "properties": {
+      "SECRET_NAME": {
+        "type": "string",
+        "description": "Vault path for the JWT HMAC signing key. Canonical path: 'auth/jwt_secret'. Must exactly match the path used when the secret was stored and when the module was installed with allowed_secrets."
+      },
+      "ALGORITHM": {
+        "type": "string",
+        "default": "HS256",
+        "description": "JWT signing algorithm (currently only HS256 supported)"
+      },
+      "REQUIRED_CLAIMS": {
+        "type": "string",
+        "description": "Comma-separated claim names that must be present (e.g., 'sub,exp,iat')"
+      },
+      "TOKEN_FIELD": {
+        "type": "string",
+        "default": "token",
+        "description": "Field in the input JSON that contains the JWT string"
+      }
+    }
+  }
+}

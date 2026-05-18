@@ -1,0 +1,26 @@
+{
+  "name": "@talos/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for building Talos WASM workflow modules",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": ["talos", "wasm", "workflow", "agent", "component-model"],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "typescript": "^5.6"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

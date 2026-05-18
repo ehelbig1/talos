@@ -1,0 +1,64 @@
+{
+  "name": "HTTP → JSON Transform → Database ETL",
+  "description": "Fetches data from an external API, transforms the JSON structure, and loads it into a database table.",
+  "category": "Data",
+  "tags": ["etl", "http", "json", "database", "data-pipeline"],
+  "nodes": [
+    {
+      "label": "Fetch Data",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.example.com/data"
+      }
+    },
+    {
+      "label": "Transform JSON",
+      "module_name": "JSON Transform",
+      "config": {
+        "SELECTOR": "data.items",
+        "TRANSFORM": "keys_to_lowercase"
+      }
+    },
+    {
+      "label": "Load to Database",
+      "module_name": "Data Pipeline ETL",
+      "config": {
+        "SOURCE_URL": "",
+        "TARGET_TABLE": "processed_data"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Fetch Data", "to": "Transform JSON" },
+    { "from": "Transform JSON", "to": "Load to Database" }
+  ],
+  "suggested_schedule": null,
+  "required_secrets": [
+    { "key_path": "database/connection_url", "description": "PostgreSQL connection URL for target database" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Load to Database",
+      "current_module": "Data Pipeline ETL",
+      "replacements": [
+        {
+          "module_name": "Database Query",
+          "catalog_name": "database-query",
+          "config_delta": "Replace SOURCE_URL+TARGET_TABLE with a custom QUERY (e.g. INSERT INTO ... VALUES (...)). Use when you need parameterized SQL, conflict handling (ON CONFLICT DO UPDATE), or multi-statement transactions."
+        }
+      ]
+    },
+    {
+      "node_label": "Transform JSON",
+      "current_module": "JSON Transform",
+      "replacements": [
+        {
+          "module_name": "LLM Inference",
+          "catalog_name": "llm-inference",
+          "config_delta": "Replace SELECTOR+TRANSFORM with SYSTEM_PROMPT describing the transformation in natural language. Useful for unstructured API responses where the schema varies or field extraction requires reasoning."
+        }
+      ]
+    }
+  ]
+}

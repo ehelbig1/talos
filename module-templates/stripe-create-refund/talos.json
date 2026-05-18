@@ -1,0 +1,27 @@
+{
+  "name": "stripe-create-refund",
+  "version": "v1.0.0",
+  "display_name": "Stripe: Create Refund",
+  "description": "Issue a full or partial refund for a Stripe charge or payment intent. Use in customer support workflows, fraud handling, or automated refund policies. Supports {{key}} template interpolation for CHARGE_ID and PAYMENT_INTENT_ID so IDs from webhook events can be passed directly.",
+  "category": "Payments",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.stripe.com"],
+  "requires_secrets": ["stripe/secret_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET"],
+    "properties": {
+      "API_KEY_SECRET": { "type": "string", "description": "Vault path to the Stripe secret key." },
+      "CHARGE_ID": { "type": "string", "description": "Stripe charge ID (ch_xxx) to refund. Provide either CHARGE_ID or PAYMENT_INTENT_ID, not both. Supports {{charge_id}} interpolation." },
+      "PAYMENT_INTENT_ID": { "type": "string", "description": "Stripe payment intent ID (pi_xxx) to refund. Provide either CHARGE_ID or PAYMENT_INTENT_ID, not both. Supports {{payment_intent_id}} interpolation." },
+      "AMOUNT": { "type": "integer", "description": "Amount to refund in the smallest currency unit (e.g. cents for USD). If omitted, issues a full refund." },
+      "REASON": { "type": "string", "description": "Refund reason: 'duplicate', 'fraudulent', or 'requested_by_customer'. Defaults to no reason if omitted." },
+      "METADATA": { "type": "string", "description": "JSON object of key-value metadata to attach to the refund (e.g. '{\"ticket_id\": \"cs_123\"}')." }
+    }
+  },
+  "setup_instructions": [
+    { "step": 1, "title": "Charge vs Payment Intent", "detail": "If your payment flow used PaymentIntents (recommended), use PAYMENT_INTENT_ID. If you used Charges directly, use CHARGE_ID. Only provide one." },
+    { "step": 2, "title": "Partial refund", "detail": "Set AMOUNT to refund only a portion (in cents). For example, AMOUNT=500 refunds $5.00 USD. Omit AMOUNT for a full refund." },
+    { "step": 3, "title": "Typical support workflow", "detail": "Chain: [support ticket webhook] → [stripe-create-refund: PAYMENT_INTENT_ID={{payment_intent_id}}, REASON=requested_by_customer] → [send refund confirmation email]." }
+  ]
+}

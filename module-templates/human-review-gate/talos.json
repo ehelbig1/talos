@@ -1,0 +1,79 @@
+{
+  "name": "human-review-gate",
+  "version": "v1.0.0",
+  "display_name": "Human Review Gate",
+  "description": "Pauses workflow execution for human approval. Sends a webhook notification with full execution context to a configured URL, then blocks until an approval or rejection signal is received via the platform API. Supports configurable timeout with optional auto-approve behavior.",
+  "category": "Governance",
+  "capability_world": "governance-node",
+  "allowed_hosts": ["*"],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["NOTIFICATION_WEBHOOK_URL"],
+    "properties": {
+      "NOTIFICATION_WEBHOOK_URL": {
+        "type": "string",
+        "description": "URL to POST a JSON notification when the gate is triggered. The payload includes execution_id, workflow context, reason, and a direct link for approval. Use this to notify Slack, PagerDuty, email, or a custom review dashboard."
+      },
+      "TIMEOUT_MINUTES": {
+        "type": "number",
+        "default": 60,
+        "description": "Maximum minutes to wait for human approval before timing out (1-1440). If AUTO_APPROVE_IF_TIMEOUT is true, the gate approves on timeout; otherwise it rejects."
+      },
+      "AUTO_APPROVE_IF_TIMEOUT": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, the gate auto-approves if the timeout expires without a human decision. When false (default), timeout causes rejection. WARNING: enabling this means unreviewed items proceed automatically."
+      },
+      "REASON": {
+        "type": "string",
+        "default": "Human review required before proceeding",
+        "description": "Human-readable explanation shown in the approval request and webhook notification. Supports {{field}} interpolation from upstream node output."
+      },
+      "APPROVERS": {
+        "type": "string",
+        "description": "Comma-separated list of approver emails or usernames. Included in the webhook notification payload for routing to the correct reviewer."
+      },
+      "INCLUDE_INPUT_IN_NOTIFICATION": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true, the full upstream input data is included in the webhook notification payload. Set to false for sensitive data that should not leave the platform."
+      },
+      "WEBHOOK_SECRET": {
+        "type": "string",
+        "description": "Optional HMAC-SHA256 signing secret for the webhook notification. When set, an X-Talos-Signature header is added to the webhook POST for payload verification."
+      }
+    }
+  },
+  "output_shape": {
+    "approved": "Boolean: true if approved, false if rejected or timed out without auto-approve",
+    "decision_source": "How the decision was made: 'human', 'timeout_auto_approve', or 'timeout_reject'",
+    "reason": "The approval reason from config",
+    "reviewer": "The identity of the reviewer who approved/rejected (null for timeout decisions)",
+    "wait_seconds": "How many seconds the gate waited before receiving a decision",
+    "notification_sent": "Boolean: whether the webhook notification was successfully delivered"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Actor capability ceiling -- required before adding this node",
+      "detail": "The workflow owning actor MUST have max_capability_world: 'governance-node'. Run: grant_capability_ceiling(actor_id: '<actor_id>', world: 'governance-node'). Without this, the workflow will fail at execution time with a capability ceiling error."
+    },
+    {
+      "step": 2,
+      "title": "Configure notification webhook",
+      "detail": "Set NOTIFICATION_WEBHOOK_URL to the endpoint that should receive approval requests. For Slack, use an Incoming Webhook URL. For custom dashboards, implement a POST handler that accepts JSON with {execution_id, reason, approvers, input_data, timestamp}."
+    },
+    {
+      "step": 3,
+      "title": "Set approval timeout behavior",
+      "detail": "Set TIMEOUT_MINUTES (default: 60) and AUTO_APPROVE_IF_TIMEOUT (default: false). For safety-critical workflows, keep auto-approve disabled so unreviewed items are rejected. For low-risk workflows, enable auto-approve to prevent indefinite blocking."
+    },
+    {
+      "step": 4,
+      "title": "Approve or reject via MCP tool",
+      "detail": "When execution pauses at this node, call list_pending_approvals to see waiting approvals, then submit_workflow_approval(execution_id: '<id>', approved: true|false, reason: '...') to unblock the execution."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "name": "Multi-Source Morning Digest → Email",
+  "description": "Every weekday morning, fetches data from a custom API and recent GitHub activity, uses an LLM to synthesize a unified digest, and sends it via email. Replaces manual status-checking across multiple sources.",
+  "category": "Reporting",
+  "tags": ["digest", "github", "llm", "email", "scheduled", "reporting", "morning-brief"],
+  "nodes": [
+    {
+      "label": "Fetch Custom Data",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.example.com/summary"
+      }
+    },
+    {
+      "label": "Fetch GitHub Activity",
+      "module_name": "GitHub Repo Analyzer",
+      "config": {
+        "repository": "owner/repo"
+      }
+    },
+    {
+      "label": "Synthesize Digest",
+      "module_name": "LLM Inference",
+      "config": {
+        "MODEL": "claude-sonnet-4-6",
+        "SYSTEM_PROMPT": "You are a technical briefing assistant. Synthesize the provided data into a concise morning digest with sections: Key Metrics, GitHub Activity, and Action Items.",
+        "MAX_TOKENS": 768
+      }
+    },
+    {
+      "label": "Send Morning Brief",
+      "module_name": "Gmail",
+      "config": {
+        "SUBJECT": "Morning Digest"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Fetch Custom Data", "to": "Synthesize Digest" },
+    { "from": "Fetch GitHub Activity", "to": "Synthesize Digest" },
+    { "from": "Synthesize Digest", "to": "Send Morning Brief" }
+  ],
+  "suggested_schedule": "0 7 * * 1-5",
+  "required_secrets": [
+    { "key_path": "github/token", "description": "GitHub PAT with repo:read scope" },
+    { "key_path": "llm/api_key", "description": "LLM provider API key" },
+    { "key_path": "google/gmail_oauth_token", "description": "Gmail OAuth2 refresh token" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Send Morning Brief",
+      "current_module": "Gmail",
+      "replacements": [
+        {
+          "module_name": "Slack Message",
+          "catalog_name": "send-slack-message",
+          "config_delta": "Replace TO+SUBJECT+BODY with CHANNEL (e.g. '#morning-digest'). Required secret: slack/bot_token added; google/gmail_oauth_token no longer needed. Better for teams that start their day in Slack."
+        }
+      ]
+    }
+  ]
+}

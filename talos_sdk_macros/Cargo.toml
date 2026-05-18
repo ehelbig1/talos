@@ -1,0 +1,24 @@
+[package]
+name = "talos_sdk_macros"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+# Intentionally NOT inheriting [lints] from workspace.
+# This crate is shipped to production as a standalone path-dep at
+# /app/talos_sdk_macros (see controller/Dockerfile, line 121). When the
+# lint scaffold's spawned Cargo workspace path-deps this crate, Cargo
+# walks up looking for a workspace root that defines [workspace.lints]
+# and finds none — failing every `lint_sandbox` call with
+# "failed to find a workspace root". Workspace clippy still applies to
+# this crate during regular `cargo clippy --workspace` runs; the
+# inherited block was redundant in that direction.

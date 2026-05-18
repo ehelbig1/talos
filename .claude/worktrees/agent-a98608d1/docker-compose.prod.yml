@@ -1,0 +1,221 @@
+# Production Docker Compose Configuration
+#
+# Security Features:
+# ✅ PostgreSQL port NOT exposed (internal network only)
+# ✅ RUST_ENV=production (enables strict CSP, HSTS, global rate limiter)
+# ✅ Production rate limits (60 API req/min, 30 webhook req/min)
+# ✅ HSTS enabled by default
+# ✅ Controller only accessible via reverse proxy
+#
+# Usage:
+#   docker-compose -f docker-compose.prod.yml up -d
+#
+# Prerequisites:
+#   - .env.production file with required secrets
+#   - SSL/TLS termination via reverse proxy (nginx, Caddy, Traefik, etc.)
+#   - Set FRONTEND_URL and BASE_URL environment variables
+
+services:
+  # ✅ SECURITY: NATS with mandatory authentication
+  nats:
+    image: nats:2.10-alpine
+    container_name: talos-nats-prod
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "-m"
+      - "8222"
+      - "--user"
+      - "${NATS_USER:?NATS_USER required in .env.production}"
+      - "--pass"
+      - "${NATS_PASSWORD:?NATS_PASSWORD required in .env.production}"
+    # ✅ SECURITY: NO port exposure — internal Docker network only
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - talos-network
+    restart: always
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: talos-redis-prod
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env.production}
+    # ✅ SECURITY: NO port exposure — internal Docker network only
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - talos-network
+    restart: always
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: talos-postgres-prod
+    environment:
+      POSTGRES_USER: talos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env.production}
+      POSTGRES_DB: talos
+    # ✅ SECURITY: NO port exposure - internal Docker network only
+    # Database accessed only via controller service at postgres:5432
+    # For emergency access: docker exec -it talos-postgres-prod psql -U talos
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - talos-network
+    restart: always
+    # Production resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # Controller Service (GraphQL API)
+  controller:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    container_name: talos-controller-prod
+    environment:
+      # Database connection (internal network)
+      DATABASE_URL: postgres://talos:${POSTGRES_PASSWORD}@postgres:5432/talos
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      NATS_URL: nats://nats:4222
+      NATS_USER: ${NATS_USER:?NATS_USER required}
+      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required}
+
+      # ✅ PRODUCTION MODE: Enables strict CSP, HSTS, global rate limiter, disables GraphiQL
+      RUST_ENV: production
+      RUST_LOG: info,controller=info
+
+      # Production domain
+      BASE_URL: ${BASE_URL:?BASE_URL required (e.g., https://api.talos.example.com)}
+
+      # ✅ SECRETS: Required in .env.production
+      TALOS_MASTER_KEY: ${TALOS_MASTER_KEY:?TALOS_MASTER_KEY required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required}
+      WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required}
+      BCRYPT_COST: "12"
+
+      # CORS Configuration
+      ALLOWED_ORIGIN: ${FRONTEND_URL:?FRONTEND_URL required (e.g., https://app.talos.example.com)}
+      FRONTEND_URL: ${FRONTEND_URL}
+
+      # ✅ PRODUCTION RATE LIMITS (stricter than development)
+      API_RATE_LIMIT: "60"          # GraphQL API: 60 req/min per IP (1/sec)
+      WEBHOOK_RATE_LIMIT: "30"      # Webhooks: 30 req/min per IP (0.5/sec)
+      GLOBAL_RATE_LIMIT: "5000"     # Global: 5000 req/min total
+      TRUSTED_IPS: ${TRUSTED_IPS:-} # Optional: Comma-separated whitelist IPs
+
+      # ✅ SECURITY: HSTS enabled (requires SSL/TLS termination by reverse proxy)
+      ENABLE_HSTS: "true"
+
+      # Anthropic API Key
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+      # OAuth - Google
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+
+      # OAuth - Okta
+      OKTA_DOMAIN: ${OKTA_DOMAIN:-}
+      OKTA_CLIENT_ID: ${OKTA_CLIENT_ID:-}
+      OKTA_CLIENT_SECRET: ${OKTA_CLIENT_SECRET:-}
+      OKTA_REDIRECT_URI: ${OKTA_REDIRECT_URI:-}
+
+      # OAuth - Snyk
+      SNYK_CLIENT_ID: ${SNYK_CLIENT_ID:-}
+      SNYK_CLIENT_SECRET: ${SNYK_CLIENT_SECRET:-}
+      SNYK_REDIRECT_URI: ${SNYK_REDIRECT_URI:-}
+
+      # Slack OAuth
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+      SLACK_REDIRECT_URI: ${SLACK_REDIRECT_URI:-}
+
+    # ✅ SECURITY: Controller only accessible via reverse proxy (nginx/Caddy)
+    # Uncomment for local reverse proxy access:
+    # ports:
+    #   - "127.0.0.1:8000:8000"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    networks:
+      - talos-network
+
+    restart: always
+
+    # Production resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+
+  # Worker Service (WASM Execution Engine)
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    # Remove container_name to allow scaling workers
+    # container_name: talos-worker-prod
+    environment:
+      NATS_URL: nats://nats:4222
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      NATS_USER: ${NATS_USER:?NATS_USER required in .env}
+      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+      WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env.production}
+      RUST_LOG: info,worker=info
+      # Metrics server configuration
+      METRICS_PORT: "9091"
+      METRICS_AUTH_TOKENS: ${METRICS_AUTH_TOKENS:?METRICS_AUTH_TOKENS required in .env.production}
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - talos-network
+    restart: always
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G

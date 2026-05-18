@@ -1,0 +1,35 @@
+{
+  "name": "redis-cache",
+  "version": "v1.0.0",
+  "display_name": "Redis Cache",
+  "description": "Store and retrieve arbitrary data across workflow runs using a Redis key-value store.",
+  "category": "Storage",
+  "config_schema": {
+    "type": "object",
+    "required": ["operation", "key"],
+    "properties": {
+      "operation": {
+        "type": "string",
+        "enum": ["get", "set", "delete", "increment"],
+        "default": "get",
+        "description": "The cache operation to perform"
+      },
+      "key": {
+        "type": "string",
+        "description": "The key to operate on"
+      },
+      "value": {
+        "type": "string",
+        "description": "The value to set (only required for set operation)"
+      },
+      "ttl": {
+        "type": "number",
+        "description": "Optional time-to-live in seconds (only used for set operation)"
+      },
+      "amount": {
+        "type": "number",
+        "description": "Amount to increment by (default 1, for increment operation)"
+      }
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "name": "AI Meeting Prep → Calendar Event → Email Agenda",
+  "description": "Fetches context for an upcoming meeting, generates an agenda using an LLM, creates a Google Calendar event, and emails the agenda to attendees.",
+  "category": "Productivity",
+  "tags": ["calendar", "llm", "email", "meetings", "productivity"],
+  "nodes": [
+    {
+      "label": "Fetch Meeting Context",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.example.com/meeting-context"
+      }
+    },
+    {
+      "label": "Generate Agenda",
+      "module_name": "LLM Inference",
+      "config": {
+        "MODEL": "claude-sonnet-4-6",
+        "SYSTEM_PROMPT": "You are a meeting facilitator. Generate a structured agenda with time allocations based on the provided context.",
+        "MAX_TOKENS": 512
+      }
+    },
+    {
+      "label": "Create Calendar Event",
+      "module_name": "Google Calendar Event",
+      "config": {
+        "CALENDAR_ID": "primary",
+        "TIMEZONE": "America/New_York"
+      }
+    },
+    {
+      "label": "Email Agenda",
+      "module_name": "Gmail",
+      "config": {
+        "SUBJECT": "Meeting Agenda"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Fetch Meeting Context", "to": "Generate Agenda" },
+    { "from": "Generate Agenda", "to": "Create Calendar Event" },
+    { "from": "Generate Agenda", "to": "Email Agenda" }
+  ],
+  "suggested_schedule": null,
+  "required_secrets": [
+    { "key_path": "llm/api_key", "description": "LLM provider API key" },
+    { "key_path": "google/calendar_oauth_token", "description": "Google Calendar OAuth2 refresh token" },
+    { "key_path": "google/gmail_oauth_token", "description": "Gmail OAuth2 refresh token" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Email Agenda",
+      "current_module": "Gmail",
+      "replacements": [
+        {
+          "module_name": "Slack Message",
+          "catalog_name": "send-slack-message",
+          "config_delta": "Replace TO+SUBJECT+BODY with CHANNEL (e.g. '#meetings'). Required secret: slack/bot_token added; google/gmail_oauth_token no longer needed. Good for distributed teams that coordinate in Slack."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <!-- CSP is enforced via nginx.conf response headers, which support all
+         directives including frame-ancestors.  A <meta> CSP tag is intentionally
+         absent: it cannot set frame-ancestors and is weaker than HTTP headers. -->
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Talos — Visual Workflow Automation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script type="module" src="/src/main.tsx"></script>
+  </head>
+  <body class="h-full bg-gray-50">
+    <div id="root" class="h-full"></div>
+  </body>
+</html>

@@ -1,0 +1,71 @@
+{
+  "name": "Request → Approval Gate → Audit Log → Email",
+  "description": "Receives a request, pauses for human approval, writes the decision to an audit database table, and sends an email notification. Useful for change management and compliance workflows.",
+  "category": "Governance",
+  "tags": ["approval", "audit", "email", "compliance", "governance", "human-in-the-loop"],
+  "nodes": [
+    {
+      "label": "Receive Request",
+      "module_name": "HTTP Request",
+      "config": {
+        "METHOD": "GET",
+        "URL": "https://api.example.com/pending"
+      }
+    },
+    {
+      "label": "Await Approval",
+      "module_name": "Human Approval Gate",
+      "config": {
+        "REASON": "Please review and approve this change request before it is applied"
+      }
+    },
+    {
+      "label": "Write Audit Log",
+      "module_name": "Data Pipeline ETL",
+      "config": {
+        "TARGET_TABLE": "change_audit_log"
+      }
+    },
+    {
+      "label": "Notify Requester",
+      "module_name": "Gmail",
+      "config": {
+        "SUBJECT": "Your request has been processed"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Receive Request", "to": "Await Approval" },
+    { "from": "Await Approval", "to": "Write Audit Log" },
+    { "from": "Write Audit Log", "to": "Notify Requester" }
+  ],
+  "suggested_schedule": null,
+  "required_secrets": [
+    { "key_path": "database/connection_url", "description": "PostgreSQL connection URL for the audit log database" },
+    { "key_path": "google/gmail_oauth_token", "description": "Gmail OAuth2 refresh token for sending notifications" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Notify Requester",
+      "current_module": "Gmail",
+      "replacements": [
+        {
+          "module_name": "Slack Message",
+          "catalog_name": "send-slack-message",
+          "config_delta": "Replace TO+SUBJECT+BODY with CHANNEL (e.g. '#approvals'). Required secret: slack/bot_token added; google/gmail_oauth_token no longer needed."
+        }
+      ]
+    },
+    {
+      "node_label": "Write Audit Log",
+      "current_module": "Data Pipeline ETL",
+      "replacements": [
+        {
+          "module_name": "Database Query",
+          "catalog_name": "database-query",
+          "config_delta": "Replace SOURCE_URL+TARGET_TABLE with a custom QUERY (e.g. INSERT INTO change_audit_log (request_id, decision, decided_at, actor) VALUES (...) ON CONFLICT DO NOTHING). Use for custom audit schema with specific column types or constraints."
+        }
+      ]
+    }
+  ]
+}

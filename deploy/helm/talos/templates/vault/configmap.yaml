@@ -1,0 +1,28 @@
+{{- if .Values.vault.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "talos.componentName" (list . "vault") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "vault") | nindent 4 }}
+data:
+  vault.hcl: |
+    # File storage — transit keys survive restarts. For HA production
+    # deployments replace with raft storage pointing at a PVC per replica
+    # (or switch to HCP Vault, which is the Phase 2 recommendation).
+    storage "file" {
+      path = "/vault/file"
+    }
+
+    listener "tcp" {
+      address     = "0.0.0.0:8200"
+      tls_disable = 1
+    }
+
+    # disable_mlock is safe in Kubernetes — no swap is configured on
+    # worker nodes, and IPC_LOCK is granted below as defense-in-depth.
+    disable_mlock = true
+    api_addr      = "http://{{ include "talos.componentName" (list . "vault") }}.{{ .Release.Namespace }}.svc.cluster.local:8200"
+    ui            = true
+{{- end }}

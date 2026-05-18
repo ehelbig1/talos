@@ -1,0 +1,20 @@
+{
+  "name": "Create Calendar Event",
+  "category": "calendar",
+  "description": "Create a new event on a Google Calendar using the Google Calendar API",
+  "icon": "📅",
+  "version": "1.0.0",
+  "author": "Talos",
+  "tags": ["google", "calendar", "event", "schedule", "outbound"],
+  "documentation": "https://developers.google.com/calendar/api/v3/reference/events/insert",
+  "requirements": [
+    "Google OAuth access token with calendar.events scope",
+    "Event summary, start time, and end time"
+  ],
+  "capabilities": {
+    "realtime": false,
+    "filtering": false,
+    "enrichment": false,
+    "oauth": "google"
+  }
+}

@@ -1,0 +1,126 @@
+# Alertmanager routing config stub for Talos crypto alerts.
+#
+# Drop this into your existing alertmanager.yaml under `route:` and
+# `receivers:`. The two critical routes — `category: data-loss` and
+# `category: crypto-broken` — bypass every grouping delay and page
+# immediately because they indicate encrypted-at-rest data is either
+# unreadable right now or will become unreadable on the next restart.
+#
+# PagerDuty routing key and Slack webhook are injected via env vars
+# at Helm install time or via External Secrets Operator — never
+# committed to git.
+
+route:
+  # Default routing — 5 minute grouping for normal noise.
+  receiver: talos-default
+  group_by: [alertname, category]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # ── Encrypted data is ALREADY unreadable. Page now, no grouping. ──
+    - receiver: talos-pagerduty-critical
+      matchers:
+        - category =~ "data-loss|crypto-broken"
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1h
+      continue: true  # also fan out to Slack for team visibility
+
+    - receiver: talos-slack-oncall
+      matchers:
+        - category =~ "data-loss|crypto-broken"
+      group_wait: 0s
+      group_interval: 5m
+      repeat_interval: 1h
+
+    # ── Degraded but survivable (legacy fallback carrying load, etc.) ──
+    - receiver: talos-slack-oncall
+      matchers:
+        - severity = warning
+        - category =~ "crypto-degraded|persistence-degraded"
+      group_wait: 2m
+      group_interval: 10m
+      repeat_interval: 12h
+
+    # ── Availability — page on extended controller downtime. ──
+    - receiver: talos-pagerduty-critical
+      matchers:
+        - category = availability
+      group_wait: 1m
+      repeat_interval: 15m
+
+    # ── Ops hygiene (drills, backups) — low-urgency ticket, never paging. ──
+    - receiver: talos-jira-ops-hygiene
+      matchers:
+        - category = ops-hygiene
+      group_wait: 10m
+      group_interval: 24h
+      repeat_interval: 168h  # weekly reminder until resolved
+
+receivers:
+  - name: talos-default
+    # Catch-all — slack channel, low urgency.
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/slack-webhook-default
+        channel: '#talos-alerts'
+        send_resolved: true
+        title: '{{ .GroupLabels.alertname }} ({{ .Status }})'
+        text: >-
+          {{ range .Alerts }}• *{{ .Labels.severity }}* — {{ .Annotations.summary }}
+          {{ if .Annotations.description }}
+            {{ .Annotations.description }}{{ end }}
+          {{ end }}
+
+  - name: talos-pagerduty-critical
+    pagerduty_configs:
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty-routing-key
+        severity: critical
+        send_resolved: true
+        description: '{{ template "pagerduty.default.description" . }}'
+        details:
+          category: '{{ .CommonLabels.category }}'
+          runbook: '{{ .CommonAnnotations.runbook }}'
+          summary: '{{ .CommonAnnotations.summary }}'
+          action: '{{ .CommonAnnotations.action }}'
+
+  - name: talos-slack-oncall
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/slack-webhook-oncall
+        channel: '#talos-oncall'
+        send_resolved: true
+        title: ':rotating_light: {{ .CommonLabels.alertname }} — {{ .CommonLabels.category }}'
+        text: >-
+          {{ range .Alerts }}
+          *{{ .Annotations.summary }}*
+
+          {{ .Annotations.description }}
+
+          {{ if .Annotations.action }}*Action:* {{ .Annotations.action }}{{ end }}
+          {{ if .Annotations.runbook }}*Runbook:* {{ .Annotations.runbook }}{{ end }}
+          {{ end }}
+
+  - name: talos-jira-ops-hygiene
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/jira-ops-hygiene-webhook
+        send_resolved: false
+        max_alerts: 1
+
+# Inhibit cascades — TalosKEKDecryptFailuresBoth implies every downstream
+# memory-write / module-payload alert. Don't fan out while the root cause
+# is active.
+inhibit_rules:
+  - source_matchers:
+      - alertname = TalosKEKDecryptFailuresBoth
+    target_matchers:
+      - category = crypto-broken
+      - alertname != TalosKEKDecryptFailuresBoth
+    equal: [category]
+
+  - source_matchers:
+      - alertname = VaultSealed
+    target_matchers:
+      - category =~ "crypto-broken|crypto-degraded"
+      - alertname != VaultSealed
+    equal: []

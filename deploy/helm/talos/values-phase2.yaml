@@ -1,0 +1,99 @@
+# Phase 2 overrides — managed Kubernetes (EKS/GKE/AKS), multi-AZ.
+# Layer on top of values.yaml:
+#   helm install talos ./deploy/helm/talos -f deploy/helm/talos/values-phase2.yaml
+#
+# Assumes:
+#   - External RDS Postgres with pgvector.
+#   - External ElastiCache Redis (or equivalent).
+#   - HCP Vault (enable = false) OR in-cluster Vault cluster.
+#   - AuraDB Neo4j (neo4j.enabled = false) OR self-hosted.
+#   - Cert-manager ClusterIssuer `letsencrypt-prod` installed.
+#   - Sigstore policy-controller installed in cluster.
+
+global:
+  domain: "talos.example.com"
+
+controller:
+  replicaCount: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: controller
+          topologyKey: kubernetes.io/hostname
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: controller
+
+worker:
+  replicaCount: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+          topologyKey: kubernetes.io/hostname
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: worker
+
+frontend:
+  replicaCount: 3
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+
+# In-cluster services — keep NATS and MinIO; disable Vault (HCP Vault) and
+# Neo4j (AuraDB) unless you are self-hosting.
+nats:
+  enabled: true
+  replicaCount: 3
+  persistence:
+    size: "100Gi"
+
+neo4j:
+  enabled: false
+  external:
+    uri: "neo4j+s://REPLACE_ME.databases.neo4j.io"
+
+vault:
+  enabled: false
+  addrOverride: "https://vault.hcp.example.com"
+
+minio:
+  enabled: true
+  persistence:
+    size: "500Gi"
+
+ollama:
+  enabled: false
+
+security:
+  sigstore:
+    enabled: true

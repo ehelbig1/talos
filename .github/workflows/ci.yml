@@ -1,0 +1,486 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "*"]
+  pull_request:
+    branches: [main]
+
+# Least-privilege default. Individual jobs can widen if they need to
+# write to the repo (no current job does — release.yml has its own
+# permissions block for ghcr / Sigstore).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Single source of truth — bumping the toolchain only here keeps every
+  # job in lockstep. rust-toolchain.toml has the same value; both must
+  # be bumped together.
+  RUST_TOOLCHAIN: "1.95"
+  # Path-deps in controller/Cargo.toml require this sibling. Public repo
+  # — `git clone` works with no auth. Drop these knobs once the engine
+  # publishes to crates.io and the path-dep becomes a versioned dep.
+  TWE_REPO: "https://github.com/aegix-dev/talos-workflow-engine.git"
+  TWE_REF: "main"
+
+# Cancel in-flight runs of the same workflow + ref when a new push lands.
+# Frees runner minutes on rapid-fire commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────
+# Third-party action pins.
+#
+# Every external action is pinned to a full commit SHA (with a comment
+# noting the human-readable tag it resolved to). Mutable tags can be
+# moved by the action owner — pinning to SHA prevents a compromised
+# upstream from injecting steps into our CI under our token.
+# Bump in lockstep with Dependabot updates.
+# ─────────────────────────────────────────────────────────────────────────
+
+jobs:
+  # ── Fast lints: rustfmt + structural checks (no Rust compile) ─────────────
+  # Sub-30-second job that fails fast on the cheap things — formatting
+  # drift and structural-rule violations don't need to wait for the
+  # workspace to compile. Expensive `cargo clippy --workspace` moved
+  # into the `test` job below, where the workspace is already being
+  # compiled — running both in parallel paid for one full compile twice.
+  lint:
+    name: Fast lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Clone talos-workflow-engine sibling
+        # `cargo fmt --all` calls `cargo metadata` to enumerate workspace
+        # members, which resolves the sibling path-dep in
+        # controller/Cargo.toml. Without the sibling on disk the metadata
+        # call fails before fmt even runs.
+        run: |
+          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
+            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
+
+      - name: Install rustfmt
+        # Toolchain pin matters because rustfmt rules differ between
+        # versions — pinning rust-toolchain.toml + this CI knob keeps
+        # local + CI in lockstep.
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master @ 2026-04-...
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+
+      - name: rustfmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Structural lints
+        run: bash scripts/lint-structural.sh
+
+      - name: WIT drift check
+        # Catches fork between `wit/talos.wit` and the embedded copy in
+        # `module-templates/wit/talos.wit` — same check as `make lint`.
+        run: |
+          diff -q wit/talos.wit module-templates/wit/talos.wit \
+            || { echo "::error::wit/talos.wit and module-templates/wit/talos.wit have drifted"; exit 1; }
+
+  # ── Clippy: workspace lint with -D warnings ───────────────────────────────
+  # Separate from `test` so the two can run in parallel. We tried merging
+  # clippy into the test job to reuse nextest's compile, but cargo can't
+  # share metadata across `--cfg test` and non-test invocations — clippy
+  # had to re-type-check every dependency, costing 10+ minutes on top of
+  # nextest. Two parallel jobs finish in less wall-clock than the merged
+  # serial path.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+
+      - name: Clone talos-workflow-engine sibling
+        run: |
+          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
+            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache Rust build artifacts
+        # Per-job shared-key — clippy and test each maintain their own
+        # cache slot. Co-occupying one slot would invalidate after every
+        # job since each writes back at end-of-run.
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2.7.5
+        with:
+          shared-key: clippy
+
+      - name: cargo clippy --workspace --no-deps
+        # Matches `make lint` scope (bin+lib only, not --all-targets).
+        # Tests and examples have a backlog of cosmetic lint drift; fixing
+        # that is tracked separately and would expand this to --all-targets.
+        run: cargo clippy --workspace --no-deps -- -D warnings
+
+  # ── Test: nextest with Postgres service for integration tests ─────────────
+  # cargo-nextest is 3-5x faster than `cargo test` (parallel scheduling,
+  # single test binary). Replaces tarpaulin in CI — coverage moved to
+  # local-only / weekly-cron concern.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    # 30 min: cold cache runs the full workspace compile (~12 min) + nextest
+    # (~3-4 min). Warm-cache reruns finish in ~6-8 min.
+    timeout-minutes: 30
+    services:
+      postgres:
+        # Migrations require three extensions: pgcrypto (bundled),
+        # pg_trgm (bundled), and `vector` (pgvector — third-party).
+        # Plain `postgres:16-alpine` lacks `vector`, so migrations
+        # would fail mid-stream on `CREATE EXTENSION vector`. Match
+        # production by using the pgvector/pgvector image with the
+        # same pinned digest as docker-compose.yml.
+        image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+        env:
+          POSTGRES_USER: talos
+          POSTGRES_PASSWORD: talos
+          POSTGRES_DB: talos
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U talos -d talos"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://talos:talos@localhost:5432/talos
+      # Tests that construct `SecretsManager` (most integration tests
+      # routed through `common::setup_test_context`) require a master
+      # key for envelope encryption. 64 hex chars = 32 bytes — matches
+      # what `openssl rand -hex 32` produces. Deterministic CI value;
+      # production keys live in Helm secrets and are never this string.
+      TALOS_MASTER_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      # JWT signing in AuthService::new requires this; tests pass a
+      # 32+ char secret directly but a few code paths still consult
+      # the env var at construction time.
+      JWT_SECRET: "ci-jwt-secret-32-bytes-of-padding-zzzzz"
+      # GitHub-hosted runners ship ~14 GB free disk. The workspace's
+      # debug build with default `debug = 2` produces ~25-30 GB of
+      # `.rlib` + split-debuginfo artifacts and exhausts the disk
+      # mid-link (manifests as `signal 7 [Bus error]` from rust-lld
+      # plus "No space left on device" right after).
+      # `line-tables-only` keeps file:line in panic backtraces — the
+      # only debuginfo a CI test failure actually needs — and cuts
+      # artifact size by ~60%.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        # Removes preinstalled Android SDK / .NET / Haskell / Boost /
+        # CodeQL toolcache (~25 GB) — none of which we use. Doing this
+        # inline rather than via a third-party action avoids one more
+        # SHA pin to maintain. Skip on dry-run / cache-warm jobs by
+        # making each removal best-effort (`|| true`).
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Clone talos-workflow-engine sibling
+        run: |
+          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
+            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2.7.5
+        with:
+          shared-key: test
+
+      - name: Install cargo-nextest
+        # Prebuilt binary — bypasses `cargo install`'s 5-8min compile.
+        uses: taiki-e/install-action@7769b73c2ec98c38dfcf2e18c83cfd4880c038c1  # v2.62.21
+        with:
+          tool: cargo-nextest
+
+      - name: Apply migrations to services postgres
+        # Tests using `common::setup_test_context` (init_pool path)
+        # connect via `DATABASE_URL` and expect the schema to be live.
+        # Apply migrations in alphabetical order — they're already
+        # idempotent (`IF NOT EXISTS` everywhere) and don't depend on
+        # sqlx's `_sqlx_migrations` tracking table for the test path.
+        # Tests using `test_helpers::get_test_db_pool` start their own
+        # testcontainer + run migrations themselves.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+          for f in migrations/*.sql; do
+            echo "▶ applying $(basename "$f")"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: Run tests
+        run: cargo nextest run --workspace --no-fail-fast
+
+      - name: Doctests
+        # nextest doesn't run doctests yet; separate step. Skip on
+        # chore/docs commits since they shouldn't change public APIs.
+        if: ${{ github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'chore') && !startsWith(github.event.head_commit.message, 'docs')) }}
+        run: cargo test --workspace --doc
+
+  # ── Catalog: WASM template compilation against current WIT ────────────────
+  catalog:
+    name: Catalog templates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Clone talos-workflow-engine sibling
+        run: |
+          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
+            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip2
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2.7.5
+        with:
+          shared-key: catalog
+
+      - name: Install cargo-component
+        uses: taiki-e/install-action@7769b73c2ec98c38dfcf2e18c83cfd4880c038c1  # v2.62.21
+        with:
+          tool: cargo-component@0.21.1
+
+      - name: make check-catalog
+        run: make check-catalog
+
+  # ── Audit: supply-chain + secret scan + migration sanity ──────────────────
+  # No Rust compile needed — pure file inspection + cargo-audit (Cargo.lock
+  # only). Fast (~1 min), runs in parallel with everything else.
+  audit:
+    name: Supply-chain & secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@7769b73c2ec98c38dfcf2e18c83cfd4880c038c1  # v2.62.21
+        with:
+          tool: cargo-audit
+
+      - name: RUSTSEC advisory scan
+        # cargo-audit operates on Cargo.lock alone (no `cargo metadata`
+        # resolution), so the sibling repo isn't required here.
+        # `audit.toml` ignores are kept synced with `deny.toml`'s
+        # `[advisories].ignore`.
+        run: |
+          mkdir -p ~/.cargo
+          cp audit.toml ~/.cargo/audit.toml
+          cargo audit
+
+      - name: Secret pattern scan
+        run: |
+          # `dlp.rs` is the regex-definition module that legitimately
+          # contains every pattern we redact — exclude it.
+          if grep -rn "AKIA\|sk-[a-zA-Z0-9]\{20,\}\|ghp_\|glpat-" \
+              --include="*.rs" --include="*.ts" --include="*.tsx" \
+              --exclude=dlp.rs \
+              controller/src worker/src frontend/src; then
+            echo "::error::Secrets detected in source code! See lines above."
+            exit 1
+          fi
+
+      - name: Validate migrations are idempotent
+        run: |
+          # Check all migrations use IF NOT EXISTS / IF EXISTS / DO $$
+          for f in migrations/*.sql; do
+            if grep -qE "^(CREATE TABLE|CREATE INDEX|ALTER TABLE)" "$f" \
+                && ! grep -q "IF NOT EXISTS\|IF EXISTS\|DO \$\$" "$f"; then
+              echo "WARNING: $f may not be idempotent (missing IF NOT EXISTS)"
+            fi
+          done
+
+      - name: Verify encryption columns in migrations
+        run: |
+          grep -q "output_data_enc" migrations/20260408170952_encrypt_execution_output.sql
+          grep -q "output_enc_key_id" migrations/20260408170952_encrypt_execution_output.sql
+
+      - name: Verify audit immutability triggers
+        run: grep -q "prevent_audit_modification" migrations/20260408000001_audit_log_immutability.sql
+
+      - name: Verify compilation container Dockerfile
+        run: |
+          test -f Dockerfile.builder
+          grep -q "network=none\|--network=none" controller/src/compilation/container.rs
+          grep -q "cap-drop=ALL\|cap_drop" controller/src/compilation/container.rs
+
+  # ── Docker build + smoke ─────────────────────────────────────────────────
+  # Two parallel jobs (controller + worker) on separate runners. Single
+  # runner can't build them concurrently — they share the cargo cache
+  # mount and deadlock on cargo's `.rustc_info.json.lock`. Sequential on
+  # one runner takes 50+ min and hits the timeout; two runners finish in
+  # ~25-30 min wall-clock. Skipped on chore/docs commits.
+  docker:
+    name: Docker controller + worker + smoke
+    runs-on: ubuntu-latest
+    # Combined: `docker compose build controller worker` builds in parallel
+    # sharing BuildKit cache mounts — splitting into two jobs (commit 6746727)
+    # cost the parallelism and TLE'd controller-only at both 35m and 50m.
+    # Combined historically finished under 50m.
+    timeout-minutes: 50
+    if: ${{ github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'chore') && !startsWith(github.event.head_commit.message, 'docs')) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Clone talos-workflow-engine sibling
+        run: |
+          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
+            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
+
+      - name: Seed CI .env
+        # Worker builder also reads .env at build time via `${VAR:?error}`
+        # interpolation in compose, so we need the same placeholder set.
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_PASSWORD=ci-postgres-pw-not-a-real-secret
+          JWT_SECRET=ci-jwt-secret-32-bytes-of-padding-zzzzz
+          NATS_USER=ci
+          NATS_PASSWORD=ci-nats-pw-not-a-real-secret
+          REDIS_PASSWORD=ci-redis-pw-not-a-real-secret
+          NEO4J_PASSWORD=ci-neo4j-pw-not-a-real-secret
+          TALOS_MASTER_KEY=ci-master-key-32-bytes-of-padding-zzzz
+          WORKER_SHARED_KEY=ci-worker-key-32-bytes-of-padding-zzz
+          GRAFANA_PASSWORD=ci-grafana-pw-not-a-real-secret
+          MINIO_ROOT_USER=ciroot
+          MINIO_ROOT_PASSWORD=ci-minio-root-pw-not-a-real-secret
+          MINIO_CONTROLLER_USER=cictrl
+          MINIO_CONTROLLER_PASSWORD=ci-minio-ctrl-pw-not-a-real-secret
+          MINIO_WORKER_USER=ciwrk
+          MINIO_WORKER_PASSWORD=ci-minio-wrk-pw-not-a-real-secret
+          EOF
+
+      - name: Build controller + worker images (parallel via compose)
+        # Compose builds services concurrently by default — both share the
+        # same BuildKit cache mounts, halving wall time vs sequential.
+        run: docker compose build controller worker
+
+      - name: Smoke test controller
+        run: |
+          docker compose up -d postgres redis nats
+          for i in $(seq 1 30); do
+            docker compose exec -T postgres pg_isready -U talos -d talos 2>/dev/null && break
+            sleep 1
+          done
+          docker compose up -d controller
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && break
+            sleep 1
+          done
+          curl -f http://localhost:8000/health
+          docker compose down
+
+  # ── Compilation sandbox image + Python SDK syntax check ──────────────────
+  # Independent of the Rust pipeline; runs in parallel.
+  sandbox-image:
+    name: Compilation sandbox image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'chore') && !startsWith(github.event.head_commit.message, 'docs')) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Build compilation sandbox image
+        run: docker build -f Dockerfile.builder -t talos-builder:latest .
+
+      - name: Python SDK lint
+        run: |
+          python3 -c "import ast; ast.parse(open('sdks/python/talos_sdk/module.py').read())"
+          python3 -c "import ast; ast.parse(open('sdks/python/talos_sdk/types.py').read())"
+
+  # ── Frontend ─────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - run: npx vitest run --reporter=verbose
+
+      - run: npx vite build

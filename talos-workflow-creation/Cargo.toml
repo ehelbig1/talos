@@ -1,0 +1,31 @@
+[package]
+name = "talos-workflow-creation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+regex = "1.12"
+serde.workspace = true
+serde_json.workspace = true
+talos-compilation = { path = "../talos-compilation" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-llm = { path = "../talos-llm" }
+talos-module-repository = { path = "../talos-module-repository" }
+# MCP-1050: canonical truncate_at_char_boundary for sanitized workflow name.
+talos-text-util = { path = "../talos-text-util" }
+talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+tracing.workspace = true
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

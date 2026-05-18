@@ -1,0 +1,201 @@
+[workspace]
+resolver = "2"
+members = [
+    "talos-dlp",
+    "talos-secrets",
+    "talos-memory",
+    "talos-mcp",
+    "talos-auth-types",
+    "talos-actor-types",
+    "talos-workflow-types",
+    "talos-auth",
+    "talos-rate-limit",
+    "talos-csrf",
+    "talos-circuit-breaker",
+    "talos-feature-flags",
+    "talos-idempotency",
+    "talos-cost-attribution",
+    "talos-errors",
+    "talos-metrics",
+    "talos-http-utils",
+    "talos-shutdown",
+    "talos-tenancy",
+    "talos-secrets-rotation",
+    "talos-node-cache",
+    "talos-db-monitor",
+    "talos-worker-fleet",
+    "talos-schedule-repo",
+    "talos-config",
+    "talos-integration-state",
+    "talos-system-repo",
+    "talos-api-keys",
+    "talos-graph-rag",
+    "talos-security-headers",
+    "talos-retry-intelligence",
+    "talos-capability-world",
+    "talos-jobs",
+    "talos-replay-diff",
+    "talos-trace",
+    "talos-mcp-tool-schema",
+    "talos-organizations",
+    "talos-yaml-workflows",
+    "talos-dlp-provider",
+    "talos-audit-ledger",
+    "talos-config-validator",
+    "talos-db",
+    "talos-text-util",
+    "talos-trace-nats",
+    "talos-workflow-signing",
+    "talos-capability-downgrade",
+    "talos-workflow-creation",
+    "talos-workflow-creation-helpers",
+    "talos-execution-result-collector",
+    "talos-execution-orchestration",
+    "talos-workflow-manifest",
+    "talos-replay-service",
+    "talos-inline-compile-service",
+    "talos-search-service",
+    "talos-hot-update-service",
+    "talos-secrets-manager",
+    "talos-module-payload-encryption",
+    "talos-webhook-repository",
+    "talos-totp-2fa",
+    "talos-oauth",
+    "talos-integrations",
+    "talos-module-executions",
+    "talos-memory-crypto",
+    "talos-workflow-repository",
+    "talos-actor-memory-service",
+    "talos-advanced-repository",
+    "talos-analytics-repository",
+    "talos-actor-repository",
+    "talos-engine-events",
+    "talos-execution-repository",
+    "talos-workflow-authorization",
+    "talos-workflow-validation",
+    "talos-actor-policy-hook",
+    "talos-workflow-versions",
+    "talos-module-repository",
+    "talos-registry",
+    "talos-module-templates",
+    "talos-rpc-subscribers",
+    "talos-actor-scaffold",
+    "talos-engine",
+    "talos-subworkflow-contract",
+    "talos-scheduler",
+    "talos-actor-policies",
+    "talos-templates",
+    "talos-llm",
+    "talos-atlassian",
+    "talos-slack",
+    "talos-compilation",
+    "talos-wit-inspector",
+    "talos-integration-helpers",
+    "talos-google-calendar",
+    "talos-gmail",
+    "talos-continuation-trigger",
+    "talos-webhooks",
+    "talos-api",
+    "talos-mcp-handlers",
+    "talos-api-docs",
+    "talos-ws-auth",
+    "controller",
+    "worker",
+    "talos_sdk_macros",
+]
+
+# Shared package metadata. Crates opt in via `version.workspace = true`
+# (etc.) in their `[package]` table. Keeping these centralised means a
+# version bump or license-string fix touches one file, not eight.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Shared third-party deps. Crates opt in via `serde.workspace = true`.
+# Versions pinned here are the source of truth — crate-level overrides
+# should be rare and require justification (e.g. a crate temporarily
+# pinned to an older minor for a downstream-compat reason). Existing
+# crates were not migrated to these wholesale during the spike that
+# introduced this section; they continue to specify their own versions
+# until touched. New crates should prefer `*.workspace = true`.
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Workspace-level clippy policy.
+#
+# Goal: keep `cargo clippy -- -D warnings` green so CI catches real
+# issues, while opting out of stylistic lints whose suggested rewrites
+# would either cost API stability (boxing every error type to satisfy
+# `result_large_err`) or readability (adding type aliases for inline
+# Pin<Box<dyn Future>> shapes that read fine in context). Each allow
+# is a deliberate, documented call — not "shut up, clippy".
+#
+# When adding a new allow, write a one-liner justification next to it.
+# When removing one, run `cargo clippy --workspace -- -D warnings` to
+# confirm no regressions.
+[workspace.lints.clippy]
+# API-shape lints — flagging an opinionated style of structuring code,
+# not a bug. We accept the natural shape and document at call-sites.
+too_many_arguments = "allow"   # functions with 8+ args; struct-of-args isn't always cleaner
+type_complexity = "allow"      # inline Pin<Box<dyn Future>> reads better than an alias
+result_large_err = "allow"     # boxing errors costs API ergonomics for marginal stack savings
+
+# Doc-comment formatting niggles. `cargo doc -D warnings` still catches
+# real broken-link issues; these are over-zealous on Markdown layout.
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+
+# `#[must_use]` attached to a function returning a `#[must_use]` type
+# (e.g. `Result`) is redundant but harmless — the type's marker is what
+# enforces the check. Removing the function-level attr is a pure
+# style change that conveys nothing.
+double_must_use = "allow"
+
+# `from_str(&str) -> Result<Self, _>` is ambiguous with `FromStr::from_str`.
+# We have a few inherent `from_str` constructors that intentionally don't
+# implement FromStr (e.g. arity differs, error type is project-specific).
+# Renaming would be a breaking API change for marginal benefit.
+should_implement_trait = "allow"
+
+# `match x { Some(s) if s == "literal" => ... }` is, per clippy, more
+# clearly written as `Some("literal")`. Both read fine; the pattern-guard
+# style is conventional in our MCP arg-matching code.
+redundant_guards = "allow"
+
+
+[profile.dev]
+# Cut debug info to line tables only. Full debug info (default) doubles
+# the .o write time for every incremental build and balloons target/ on
+# disk — for everyday development the only thing it gains is step-through
+# debugging, which we rarely use. Stack traces (panic/RUST_BACKTRACE/sentry)
+# still resolve to file:line because line tables are preserved.
+# Net: 10-20% faster `cargo build` / `cargo check` across the workspace.
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = 3
+debug = false
+codegen-units = 4
+
+[profile.docker]
+inherits = "release"
+opt-level = 1
+incremental = false
+# 256 codegen units = max parallel codegen. The previous value (4) was
+# inherited from `release` where high-CU counts hurt cross-CU inlining
+# under opt-level=3 — but this profile is opt-level=1, so the inlining
+# trade-off is negligible. Combined with mold (installed in
+# controller/Dockerfile and worker/Dockerfile), more CUs just mean more
+# parallel cores producing object files for mold to link.
+codegen-units = 256
+debug = false

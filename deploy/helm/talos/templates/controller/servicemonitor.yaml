@@ -1,0 +1,43 @@
+{{- if and .Values.controller.enabled .Values.monitoring.serviceMonitor.enabled -}}
+# MCP-904 (2026-05-14): tells Prometheus Operator to scrape
+# /metrics/prometheus on the controller's http port. Requires the
+# `monitoring.coreos.com/v1` CRDs already installed in the cluster
+# (kube-prometheus-stack / prometheus-operator) — without them this
+# manifest is rejected by the API server.
+#
+# The controller serves /metrics/prometheus on the SAME port as
+# /graphql + /mcp + /auth/* (single-port Service, see service.yaml).
+# Bearer-token auth via PROMETHEUS_SCRAPE_TOKEN is enforced by the
+# controller route handler; an unauthenticated scrape returns 403.
+# The bearer-token Secret + key is wired below — Prometheus loads the
+# token at scrape time. Token rotation needs only a Secret patch,
+# NOT a ServiceMonitor edit.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "talos.componentName" (list . "controller") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "controller") | nindent 4 }}
+    {{- with .Values.monitoring.serviceMonitor.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "controller") | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http
+      path: /metrics/prometheus
+      interval: {{ .Values.monitoring.serviceMonitor.interval | quote }}
+      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout | quote }}
+      scheme: http
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ include "talos.bootstrapSecretName" . }}
+          key: {{ .Values.monitoring.serviceMonitor.controllerTokenSecretKey | quote }}
+{{- end }}

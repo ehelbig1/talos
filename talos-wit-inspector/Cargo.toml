@@ -1,0 +1,18 @@
+[package]
+name = "talos-wit-inspector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+talos-capability-world = { path = "../talos-capability-world" }
+wasmparser = "0.224"
+
+[dev-dependencies]
+proptest = "1.5"
+
+[lints]
+workspace = true

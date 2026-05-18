@@ -1,0 +1,48 @@
+{
+  "name": "constitutional-refinement",
+  "version": "v1.0.0",
+  "display_name": "Constitutional Refinement",
+  "description": "Iteratively critiques and refines LLM output against a constitution of principles. Applies each principle as a critique pass and revises until all principles are satisfied or max rounds are reached.",
+  "category": "AI",
+  "capability_world": "llm-node",
+  "allowed_hosts": ["api.openai.com", "api.anthropic.com"],
+  "allowed_secrets": ["*"],
+  "config_schema": {
+    "type": "object",
+    "required": ["CONSTITUTION", "API_KEY_SECRET"],
+    "properties": {
+      "CONSTITUTION": {
+        "type": "string",
+        "description": "Newline-separated list of principles to apply during critique. Each non-empty line is treated as one principle. Example: 'Be factually accurate\\nAvoid harmful content\\nUse clear, concise language'. All principles are evaluated in each refinement round."
+      },
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the LLM provider API key (e.g. 'talos/openai_key' or 'talos/anthropic_key'). The key is injected by the host and never crosses into guest memory."
+      },
+      "PROVIDER": {
+        "type": "string",
+        "enum": ["openai", "anthropic"],
+        "default": "openai",
+        "description": "LLM provider to use for critique calls. 'openai' targets api.openai.com; 'anthropic' targets api.anthropic.com."
+      },
+      "MODEL": {
+        "type": "string",
+        "description": "Model identifier override. Defaults to 'gpt-4o-mini' for OpenAI and 'claude-sonnet-4-6' for Anthropic. Override to use a more capable model for higher-stakes refinement (e.g. 'gpt-4o', 'claude-opus-4-6')."
+      },
+      "MAX_ROUNDS": {
+        "type": "number",
+        "default": 3,
+        "description": "Maximum number of critique-and-revise rounds. Must be between 1 and 5. The loop stops early when the model reports revision_needed: false for all remaining principles. Lower values reduce LLM cost; higher values allow more thorough refinement."
+      },
+      "MAX_TOKENS": {
+        "type": "number",
+        "default": 1024,
+        "description": "Maximum tokens the LLM may generate per critique call. Each round consumes one call, so total token usage is up to MAX_ROUNDS × MAX_TOKENS."
+      },
+      "CRITIQUE_PROMPT": {
+        "type": "string",
+        "description": "Optional custom instruction appended to the critique system prompt. Use to add domain-specific guidance (e.g. 'Focus on regulatory compliance language' or 'The audience is a non-technical executive'). Defaults to a generic constitutional-AI critique instruction when not set."
+      }
+    }
+  }
+}

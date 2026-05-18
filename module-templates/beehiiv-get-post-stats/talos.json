@@ -1,0 +1,55 @@
+{
+  "name": "beehiiv-get-post-stats",
+  "version": "v1.0.0",
+  "display_name": "Beehiiv: Get Post Stats",
+  "description": "Fetch engagement metrics for a specific Beehiiv post: recipients, open rate, click rate, unsubscribes, and spam reports. Use for conversion attribution, A/B test analysis, and triggering follow-up automations based on post performance.",
+  "category": "Marketing",
+  "capability_world": "secrets-node",
+  "allowed_hosts": ["api.beehiiv.com"],
+  "requires_secrets": ["beehiiv/api_key"],
+  "config_schema": {
+    "type": "object",
+    "required": ["API_KEY_SECRET", "PUBLICATION_ID", "POST_ID"],
+    "properties": {
+      "API_KEY_SECRET": {
+        "type": "string",
+        "description": "Vault path to the Beehiiv API key (e.g. 'beehiiv/api_key')."
+      },
+      "PUBLICATION_ID": {
+        "type": "string",
+        "description": "Beehiiv publication ID (e.g. 'pub_xxx...'). Supports {{key}} template interpolation."
+      },
+      "POST_ID": {
+        "type": "string",
+        "description": "Post ID to retrieve stats for (e.g. 'post_xxx...'). Use '{{post_id}}' to pull from an upstream beehiiv-create-post node. Supports {{key}} template interpolation."
+      },
+      "LOW_OPEN_RATE_THRESHOLD": {
+        "type": "number",
+        "default": 0,
+        "description": "When set (e.g. 0.20 for 20%), the output includes a 'below_open_rate_threshold' boolean flag. Use downstream in condition nodes to trigger re-engagement automations when open rate is disappointing."
+      },
+      "LOW_CLICK_RATE_THRESHOLD": {
+        "type": "number",
+        "default": 0,
+        "description": "When set (e.g. 0.03 for 3%), the output includes a 'below_click_rate_threshold' boolean flag for condition branching."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Find your post ID",
+      "detail": "Post IDs are returned by beehiiv-create-post in the 'post_id' field. Alternatively, call GET https://api.beehiiv.com/v2/publications/{pubId}/posts to list all posts and find the ID."
+    },
+    {
+      "step": 2,
+      "title": "Automated performance alert pattern",
+      "detail": "Chain: [schedule trigger, 24h after post send] → [beehiiv-get-post-stats: LOW_OPEN_RATE_THRESHOLD=0.20] → [condition: below_open_rate_threshold == true] → [beehiiv-add-to-automation: re-send sequence] or [notification]."
+    },
+    {
+      "step": 3,
+      "title": "Post-send upsell pattern",
+      "detail": "Chain: [beehiiv-create-post] → [wait 48h] → [beehiiv-get-post-stats: LOW_CLICK_RATE_THRESHOLD=0.05] → [condition: below_click_rate_threshold == false (performing well)] → [beehiiv-add-to-automation: upsell sequence for engaged readers]."
+    }
+  ]
+}

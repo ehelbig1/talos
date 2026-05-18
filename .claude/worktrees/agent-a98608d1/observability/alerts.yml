@@ -1,0 +1,163 @@
+# Prometheus Alert Rules for Talos WASM Runtime
+# These alerts trigger when metrics exceed thresholds
+
+groups:
+  # ========================================================================
+  # WASM Runtime Performance Alerts
+  # ========================================================================
+  - name: wasm_performance
+    interval: 30s
+    rules:
+      # High error rate
+      - alert: HighWASMErrorRate
+        expr: rate(wasm_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          component: wasm-runtime
+        annotations:
+          summary: "High WASM execution error rate"
+          description: "WASM error rate is {{ $value | humanize }} errors/sec (threshold: 0.1/sec)"
+
+      # Critical error rate
+      - alert: CriticalWASMErrorRate
+        expr: rate(wasm_errors_total[5m]) > 1.0
+        for: 1m
+        labels:
+          severity: critical
+          component: wasm-runtime
+        annotations:
+          summary: "Critical WASM execution error rate"
+          description: "WASM error rate is {{ $value | humanize }} errors/sec (threshold: 1.0/sec)"
+
+      # Slow execution time (P95 > 500ms)
+      - alert: SlowWASMExecution
+        expr: histogram_quantile(0.95, rate(wasm_execution_duration_ms_bucket[5m])) > 500
+        for: 5m
+        labels:
+          severity: warning
+          component: wasm-runtime
+        annotations:
+          summary: "Slow WASM execution detected"
+          description: "P95 execution time is {{ $value | humanize }}ms (threshold: 500ms)"
+
+      # Very slow execution time (P95 > 2000ms)
+      - alert: VerySlowWASMExecution
+        expr: histogram_quantile(0.95, rate(wasm_execution_duration_ms_bucket[5m])) > 2000
+        for: 2m
+        labels:
+          severity: critical
+          component: wasm-runtime
+        annotations:
+          summary: "Very slow WASM execution detected"
+          description: "P95 execution time is {{ $value | humanize }}ms (threshold: 2000ms)"
+
+      # Low cache hit rate (< 70%)
+      - alert: LowCacheHitRate
+        expr: |
+          (
+            rate(wasm_cache_hits[5m]) /
+            (rate(wasm_cache_hits[5m]) + rate(wasm_cache_misses[5m]))
+          ) < 0.7
+        for: 10m
+        labels:
+          severity: warning
+          component: wasm-runtime
+        annotations:
+          summary: "Low WASM cache hit rate"
+          description: "Cache hit rate is {{ $value | humanizePercentage }} (threshold: 70%)"
+
+  # ========================================================================
+  # WASM Runtime Resource Alerts
+  # ========================================================================
+  - name: wasm_resources
+    interval: 30s
+    rules:
+      # High memory usage
+      - alert: HighWASMMemoryUsage
+        expr: wasm_memory_used_bytes > 1073741824  # 1GB
+        for: 5m
+        labels:
+          severity: warning
+          component: wasm-runtime
+        annotations:
+          summary: "High WASM memory usage"
+          description: "Memory usage is {{ $value | humanize1024 }}B (threshold: 1GB)"
+
+      # Too many active instances
+      - alert: TooManyActiveInstances
+        expr: wasm_instances_active > 500
+        for: 5m
+        labels:
+          severity: warning
+          component: wasm-runtime
+        annotations:
+          summary: "Too many active WASM instances"
+          description: "{{ $value }} active instances (threshold: 500)"
+
+      # High retry rate
+      - alert: HighRetryRate
+        expr: rate(wasm_retries_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: wasm-runtime
+        annotations:
+          summary: "High WASM retry rate"
+          description: "Retry rate is {{ $value | humanize }} retries/sec (threshold: 0.5/sec)"
+
+  # ========================================================================
+  # Service Health Alerts
+  # ========================================================================
+  - name: service_health
+    interval: 30s
+    rules:
+      # Worker down
+      - alert: TalosWorkerDown
+        expr: up{job="talos-worker"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: worker
+        annotations:
+          summary: "Talos worker is down"
+          description: "Worker instance {{ $labels.instance }} has been down for > 1 minute"
+
+      # Prometheus scrape failures
+      - alert: PrometheusScrapeFailure
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: monitoring
+        annotations:
+          summary: "Prometheus scrape failure"
+          description: "Failed to scrape {{ $labels.job }} for > 5 minutes"
+
+  # ========================================================================
+  # Throughput Alerts
+  # ========================================================================
+  - name: throughput
+    interval: 30s
+    rules:
+      # Low throughput (< 10 req/sec)
+      - alert: LowWASMThroughput
+        expr: rate(wasm_executions_total[5m]) < 10
+        for: 10m
+        labels:
+          severity: info
+          component: wasm-runtime
+        annotations:
+          summary: "Low WASM execution throughput"
+          description: "Throughput is {{ $value | humanize }} executions/sec (threshold: 10/sec)"
+
+      # No executions for 30 minutes
+      - alert: NoWASMExecutions
+        expr: rate(wasm_executions_total[30m]) == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: wasm-runtime
+        annotations:
+          summary: "No WASM executions detected"
+          description: "No executions in the last 30 minutes - worker may be idle or broken"

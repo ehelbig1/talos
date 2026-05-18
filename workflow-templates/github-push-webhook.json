@@ -1,0 +1,92 @@
+{
+  "name": "GitHub Push → CI Status → Slack Notification",
+  "description": "Receives GitHub push webhook events, validates the HMAC signature, extracts commit metadata, and posts a formatted notification to Slack. Shows how to wire an incoming webhook to a processing workflow.",
+  "category": "DevOps",
+  "tags": ["github", "webhook", "ci", "slack", "event-driven", "push"],
+  "nodes": [
+    {
+      "label": "Receive GitHub Push",
+      "module_name": "Slack Webhook Listener",
+      "config": {
+        "SIGNING_SECRET_PATH": "github/webhook_secret",
+        "EVENT_TYPES": ["push"],
+        "OUTPUT_FORMAT": "raw"
+      }
+    },
+    {
+      "label": "Extract Commit Info",
+      "module_name": "JSON Transform",
+      "config": {
+        "SELECTOR": "commits[0]",
+        "TRANSFORM": "identity"
+      }
+    },
+    {
+      "label": "Format Notification",
+      "module_name": "LLM Inference",
+      "config": {
+        "MODEL": "claude-haiku-4-5",
+        "SYSTEM_PROMPT": "You receive a GitHub commit object. Return a single concise Slack-formatted line: \"*[branch]* <commit message> by <author> (<short_sha>)\". No prose, no markdown fences.",
+        "MAX_TOKENS": 128
+      }
+    },
+    {
+      "label": "Post to Slack",
+      "module_name": "Slack Message",
+      "config": {
+        "CHANNEL": "#engineering"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "Receive GitHub Push", "to": "Extract Commit Info" },
+    { "from": "Extract Commit Info", "to": "Format Notification" },
+    { "from": "Format Notification", "to": "Post to Slack" }
+  ],
+  "suggested_schedule": null,
+  "webhook_trigger": {
+    "description": "This workflow is triggered by an incoming GitHub webhook — NOT by a cron schedule. After publishing, call create_webhook with workflow_id to get the inbound URL, then paste it into GitHub → Settings → Webhooks with Content-Type: application/json.",
+    "setup_steps": [
+      "publish_version the workflow",
+      "Call create_webhook with {workflow_id, secret_key_path: 'github/webhook_secret'} to get the inbound URL",
+      "In your GitHub repo: Settings → Webhooks → Add webhook",
+      "Set Payload URL to the inbound URL, Content type: application/json, Secret: the value at github/webhook_secret",
+      "Select 'Just the push event' (or your desired events)",
+      "Save — GitHub will immediately deliver a ping event to verify connectivity"
+    ]
+  },
+  "required_secrets": [
+    { "key_path": "github/webhook_secret", "description": "Random string used to sign GitHub webhook payloads (generate with: openssl rand -hex 20)" },
+    { "key_path": "slack/bot_token", "description": "Slack bot token with chat:write scope" },
+    { "key_path": "llm/api_key", "description": "Anthropic API key for commit message formatting" }
+  ],
+  "alternatives": [
+    {
+      "node_label": "Receive GitHub Push",
+      "current_module": "Slack Webhook Listener",
+      "replacements": [
+        {
+          "module_name": "Gmail Webhook",
+          "catalog_name": "google-mail-webhook",
+          "config_delta": "Use for Gmail-triggered workflows instead. For GitHub events, keep Slack Webhook Listener and configure SIGNING_SECRET_PATH to 'github/webhook_secret'."
+        }
+      ]
+    },
+    {
+      "node_label": "Post to Slack",
+      "current_module": "Slack Message",
+      "replacements": [
+        {
+          "module_name": "Microsoft Teams Message",
+          "catalog_name": "send-teams-message",
+          "config_delta": "Replace CHANNEL+BOT_TOKEN with WEBHOOK_URL_SECRET='teams/webhook_url'. Use when your engineering team uses Teams instead of Slack."
+        },
+        {
+          "module_name": "PagerDuty Alert",
+          "catalog_name": "pagerduty-alert",
+          "config_delta": "Replace Slack notification with a PagerDuty incident trigger. Set INTEGRATION_KEY_SECRET, SUMMARY (e.g. 'Push to main by {{author}}'), ACTION='trigger'. Use when push events should page on-call."
+        }
+      ]
+    }
+  ]
+}

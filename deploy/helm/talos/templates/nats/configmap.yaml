@@ -1,0 +1,47 @@
+{{- if .Values.nats.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "talos.componentName" (list . "nats") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "nats") | nindent 4 }}
+data:
+  nats.conf: |
+    # 8 MiB payload cap — matches the controller's RPC upper bound.
+    max_payload: 8388608
+
+    # Monitoring
+    http_port: {{ .Values.nats.service.monitorPort }}
+
+    # Auth — user/password enforced on every connection.
+    authorization {
+      user: $NATS_USER
+      password: $NATS_PASSWORD
+    }
+
+    {{- if .Values.nats.jetstream.enabled }}
+    jetstream {
+      store_dir: "/data/jetstream"
+      # Render as bare integers — values.yaml provides bare bytes (int64)
+      # because NATS' suffix parser rejected both Mi/Gi (Kubernetes
+      # notation) and MB/GB (Go bytefmt) in different ways. Use printf
+      # %d on int64 so YAML's float64 default representation
+      # ("5.36870912e+08") doesn't leak into the rendered HCL.
+      max_memory_store: {{ printf "%d" (.Values.nats.jetstream.maxMemoryStore | int64) }}
+      max_file_store:   {{ printf "%d" (.Values.nats.jetstream.maxFileStore | int64) }}
+    }
+    {{- end }}
+
+    {{- if gt (int .Values.nats.replicaCount) 1 }}
+    cluster {
+      name: "talos-nats"
+      listen: 0.0.0.0:{{ .Values.nats.service.clusterPort }}
+      routes = [
+        {{- range $i, $_ := until (int $.Values.nats.replicaCount) }}
+        "nats://{{ include "talos.componentName" (list $ "nats") }}-{{ $i }}.{{ include "talos.componentName" (list $ "nats-headless") }}.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.nats.service.clusterPort }}",
+        {{- end }}
+      ]
+    }
+    {{- end }}
+{{- end }}

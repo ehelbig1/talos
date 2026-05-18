@@ -1,0 +1,26 @@
+{
+  "name": "json-transform",
+  "version": "v1.0.0",
+  "display_name": "JSON Transform",
+  "description": "Extract and transform fields from JSON data using dot-path selectors and built-in transform operations like keys_to_lowercase, flatten, and filter.",
+  "category": "Data",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["SELECTOR", "TRANSFORM"],
+    "properties": {
+      "SELECTOR": {
+        "type": "string",
+        "description": "Dot-path selector to extract a field from the input (e.g. 'data.items' or 'response.results')"
+      },
+      "TRANSFORM": {
+        "type": "string",
+        "description": "Transform operation to apply: 'keys_to_lowercase', 'keys_to_uppercase', 'flatten', 'filter_nulls', 'identity'"
+      }
+    }
+  },
+  "setup_instructions": []
+}

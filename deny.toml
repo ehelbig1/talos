@@ -1,0 +1,248 @@
+# cargo-deny configuration — supply-chain policy gate for the Talos workspace.
+#
+# What this enforces:
+#   [advisories] — fail CI on any RUSTSEC advisory for a crate we actually
+#     use. This is the main security gate.
+#   [licenses]   — allow only OSI-approved permissive licenses. Copyleft
+#     (GPL/AGPL/LGPL/SSPL) is rejected; we don't want any crate pulling us
+#     into license obligations.
+#   [bans]       — deny specific crate versions / duplicates / unmaintained
+#     crates that carry elevated risk.
+#   [sources]    — only allow crates.io + our sibling workspace path.
+#     Blocks "someone published a poisoned fork to a custom registry"
+#     attacks.
+#
+# Run locally:
+#   cargo install cargo-deny --locked
+#   cargo deny check
+#
+# Run CI gate:
+#   cargo deny --all-features check advisories bans sources licenses
+#
+# See https://embarkstudios.github.io/cargo-deny/ for the schema.
+
+[graph]
+# Check every target — Talos ships for Linux x86_64 + aarch64 in Docker,
+# plus macOS for dev. Limiting to those targets cuts scan time in half
+# vs. the default "every target triple ever seen".
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+    # WASM targets — modules compile to wasm32-wasip1; any advisory on a
+    # crate that builds for WASM still matters for the WASM runtime.
+    { triple = "wasm32-wasip1" },
+    { triple = "wasm32-unknown-unknown" },
+]
+# Exclude dev-dependencies from the scan — a vuln in a test-only crate
+# (dev-dep) can't reach production. Build-deps (proc-macros, build.rs)
+# DO reach CI/build machines so we keep them in scope.
+exclude-dev = true
+
+# ============================================================================
+# Advisories — RUSTSEC vulnerability database gate.
+# ============================================================================
+[advisories]
+# Fail on any advisory unless explicitly ignored below.
+# `db-path` and `db-urls` left defaults (~/.cargo/advisory-dbs).
+version = 2
+yanked = "deny"
+ignore = [
+    # --- Transitive vulnerabilities in unused / unreachable code paths ---
+    #
+    # Each entry documents: (1) what pulls the bad crate, (2) why the vuln
+    # is not reachable in our deployment, and (3) what we're tracking
+    # upstream for a real fix. Re-review quarterly — silent suppressions
+    # are forbidden.
+
+    { id = "RUSTSEC-2024-0437", reason = """
+protobuf 2.x uncontrolled-recursion crash. Pulled by `prometheus` 0.13.x
+(and via `opentelemetry-prometheus`). Attack vector: crafted protobuf
+POSTed to a metrics endpoint. Our `/metrics` endpoint is bound to
+internal network only — not exposed to the internet or guest WASM
+code. Impact is DoS (crash), not code exec. Tracking: rust-prometheus
+hasn't migrated to protobuf 3.x; `prometheus-client` (official WG) is
+the long-term swap target. Upstream tracking issue:
+https://github.com/tikv/rust-prometheus/issues/494
+""" },
+
+    { id = "RUSTSEC-2023-0071", reason = """
+Marvin Attack timing sidechannel in `rsa` crate. Pulled by
+`jsonwebtoken` 10.x for RS256 signing support. Our JWT stack uses
+HS256 (symmetric HMAC) — configured via the `JWT_ALGORITHM` env var
+which defaults to HS256 and is not set to RS256 anywhere in our
+deployment. The vulnerable RSA signing code path is NOT reachable.
+If we ever switch to RS256, this exemption must be revisited — no
+upstream fix is available per the advisory text ("No safe upgrade").
+Mitigation: enforce HS256-only via a boot-time check before removing
+this exemption's scope assumption.
+""" },
+
+    { id = "RUSTSEC-2026-0098", reason = """
+rustls-webpki 0.101.x — URI name-constraints accepted. Pulled by
+aws-smithy-http-client's `legacy-rustls` feature (rustls 0.21.x).
+Our AWS SDK talks to: (a) AWS STS for auth, (b) MinIO (we control
+the cert). No attacker-controlled certificates in scope. The attack
+requires a misissued certificate — implausible against our endpoint
+set. Tracking: aws-sdk-rust issue for migration off legacy-rustls:
+https://github.com/awslabs/aws-sdk-rust/issues (search 'rustls 0.21').
+""" },
+
+    { id = "RUSTSEC-2026-0099", reason = """
+rustls-webpki 0.101.x — wildcard name-constraint bypass. Same
+aws-smithy-http-client legacy-rustls chain as RUSTSEC-2026-0098.
+Same non-exploitability reasoning (no attacker-controlled certs in
+AWS SDK scope).
+""" },
+
+    { id = "RUSTSEC-2026-0104", reason = """
+rustls-webpki 0.101.x — panic on empty onlySomeReasons in CRL
+parsing. Reachable only when parsing CRLs, which neither the AWS SDK
+nor any Talos code path does. Same legacy-rustls chain.
+""" },
+
+    { id = "RUSTSEC-2026-0049", reason = """
+rustls-webpki 0.102.x — CRL not consulted due to faulty
+DistributionPoint matching. Our cert-verification path uses the
+default `UnknownStatusPolicy::Deny`, which makes this a safe
+"reject unknown revocation" rather than unsafe accept. Advisory
+itself notes impact is "limited". Same legacy-rustls chain waiting
+on aws-sdk migration.
+""" },
+
+    # --- Unmaintained crates (supply-chain risk, no current exploit) ---
+
+    { id = "RUSTSEC-2024-0384", reason = """
+`instant` is unmaintained. Pulled transitively. Provides Wasm-compatible
+Instant; replacement `web-time` exists but upstream adoption is
+gradual. No security issue — maintenance flag. Re-review 2026-Q3.
+""" },
+
+    { id = "RUSTSEC-2024-0436", reason = """
+`paste` is unmaintained but still functional. Widely-used proc-macro
+for identifier concatenation; no known vuln. Maintenance flag only.
+Tracking: no single obvious replacement yet; many crates use it.
+""" },
+
+    { id = "RUSTSEC-2025-0012", reason = """
+`backoff` is unmaintained. Pulled transitively for exponential-backoff
+retries. No vulnerability — maintenance flag. Replacement target when
+retry code is next touched: `backon` or `tokio-retry`.
+""" },
+
+    { id = "RUSTSEC-2025-0134", reason = """
+`rustls-pemfile` is unmaintained — functionality has moved into
+`rustls-pki-types` 1.9+. Pulled by `neo4rs` (Bolt TLS) and
+`rustls-native-certs`. No vulnerability — maintenance flag. Will
+drop automatically when upstream consumers migrate to the new API.
+""" },
+
+]
+
+# ============================================================================
+# Licenses — only permissive OSI licenses allowed.
+# ============================================================================
+[licenses]
+version = 2
+# SPDX IDs ONLY. cargo-deny will fail if a crate has no license metadata
+# rather than silently skipping — intentional.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    # Unicode-3.0 supersedes Unicode-DFS-2016; unicode-ident 1.0.14+ uses
+    # the new SPDX ID. Kept only 3.0 to surface any crate still stamping
+    # the old license header.
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    # CDLA-Permissive-2.0: Mozilla's license for the root-CA data set in
+    # `webpki-roots`. It's a permissive data-sharing license (functionally
+    # equivalent to MIT for our purposes — no copyleft, no patent trap).
+    # See https://cdla.dev/permissive-2-0/.
+    "CDLA-Permissive-2.0",
+    # MPL-2.0 is a weak copyleft — file-level. Acceptable for us because
+    # we don't modify MPL-licensed source; distributing binaries that
+    # merely link to MPL code is fine. Document any MPL crate in the
+    # third-party notices file.
+    "MPL-2.0",
+]
+# Confidence threshold for license detection — bump to 0.93 so heuristic
+# matches are rare. Known crates (in-tree workspace members) always
+# match cleanly.
+confidence-threshold = 0.93
+exceptions = [
+    # Per-crate license exemptions go here with justification, e.g.:
+    # { allow = ["OpenSSL"], name = "ring", version = "*" },
+]
+
+# ============================================================================
+# Bans — specific crate bans, duplicate-version policy, unmaintained gate.
+# ============================================================================
+[bans]
+# `deny` fails the build. `warn` surfaces in output but doesn't block.
+multiple-versions = "warn"  # bump to "deny" once the transitive-dep tree is cleaner
+wildcards = "deny"          # any `crate = "*"` dep is a supply-chain footgun
+# Exempt `path = "../..."` deps from the wildcard ban — in-tree workspace
+# crates resolve via filesystem paths, not versions, and don't create
+# the "version drift" risk the wildcard ban is targeting.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# Explicit crate denials — crates we'll NEVER accept as direct or
+# transitive deps. Kept small and specific; every entry has a reason.
+deny = [
+    # `openssl-src` bundles a vendored OpenSSL — rustls is our TLS stack,
+    # pulling in openssl-src means someone in the dep tree is using
+    # native-tls at build time, which is a security regression.
+    { name = "openssl-src", reason = "prefer rustls — vendored OpenSSL expands attack surface" },
+]
+# NOTE on `native-tls`: the ideal policy is a hard deny (rustls is our
+# TLS standard for every direct call). In practice, `oci-distribution`
+# 0.11 and `opentelemetry-otlp` 0.27's `reqwest-client` feature pull
+# native-tls transitively through reqwest's defaults — neither crate
+# currently offers a `rustls-only` feature. Our controller + worker
+# EXPLICITLY disable reqwest default features + enable only rustls-tls
+# for our direct HTTP calls, so the native-tls code path is only hit
+# by OCI registry fetches (our internal registry — trust boundary) and
+# OTLP export (our OTLP collector — trust boundary). Both endpoints
+# are operator-controlled, not attacker-controlled.
+# Tracking upstream:
+#   - oci-distribution: https://github.com/oras-project/rust-oci-client/issues (rustls feature)
+#   - opentelemetry-rust: rustls support via default-features = false
+# Revisit the ban once either ships a rustls-only path.
+
+# Skip duplicate-version warnings for crates that are KNOWN to have
+# legitimate multi-version transitive roots (the Rust ecosystem's
+# long-tail of rand/syn/windows-sys migrations). Kept empty initially;
+# fill in after the first `cargo deny check bans` run.
+skip = []
+skip-tree = []
+
+# ============================================================================
+# Sources — only crates.io + the sibling talos-workflow-engine workspace.
+# ============================================================================
+[sources]
+# Unknown registries are blocked — a poisoned fork published to a custom
+# registry can't sneak in even if someone accidentally adds it.
+unknown-registry = "deny"
+# Local paths / git sources must be explicitly listed below.
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+# `path = "../talos-workflow-engine/..."` deps are in-tree sibling
+# workspace members; cargo-deny categorizes them as "unknown-git"
+# when they resolve via path. Allow them explicitly so we don't have
+# to blanket `unknown-git = "allow"`.
+[sources.allow-org]
+# No GitHub orgs whitelisted — if we ever need `git = "https://github.com/foo/bar"`
+# deps, add the org here and explain why.
+github = []
+gitlab = []
+bitbucket = []

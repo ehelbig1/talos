@@ -1,0 +1,376 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: talos-postgres
+    environment:
+      POSTGRES_USER: talos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
+      POSTGRES_DB: talos
+    # DEVELOPMENT: Port exposed for migrations and local debugging
+    # PRODUCTION: Remove this port mapping - services should use internal Docker network
+    ports:
+      - "5433:5432"  # Use alternate host port to avoid conflicts
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - talos-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: talos-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env}
+    ports:
+      # DEVELOPMENT: Port exposed for debugging
+      # PRODUCTION: Remove this port mapping
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # NATS Message Queue
+  nats:
+    image: nats:2.10-alpine
+    container_name: talos-nats
+    # SECURITY: Require username/password authentication on all connections.
+    environment:
+      - NATS_USER=${NATS_USER:?NATS_USER required in .env}
+      - NATS_PASSWORD=${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+    command: >
+      sh -c "echo 'max_payload: 8388608' > /nats.conf && exec nats-server --jetstream --store_dir=/data -m 8222 --user \"$$NATS_USER\" --pass \"$$NATS_PASSWORD\" -c /nats.conf"
+    ports:
+      # DEVELOPMENT: Port exposed for debugging
+      # PRODUCTION: Remove this port mapping
+      - "127.0.0.1:4222:4222"  # Client connections
+      - "127.0.0.1:8222:8222"  # HTTP monitoring
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Controller Service (GraphQL API)
+  controller:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+      args:
+        DATABASE_URL: ${DATABASE_URL}
+    container_name: talos-controller
+    environment:
+      DATABASE_URL: postgres://talos:${POSTGRES_PASSWORD}@postgres:5432/talos
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      NATS_URL: nats://nats:4222
+      NATS_USER: ${NATS_USER:?NATS_USER required in .env}
+      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+      RUST_LOG: trace,controller=trace,audit_ledger=info
+      TALOS_REGISTRY_URL: http://registry:5000
+      BASE_URL: ${BASE_URL:-http://localhost:8000}
+      # MinIO / S3 configuration for audit ledger
+      AWS_ENDPOINT_URL: http://minio:9000
+      MINIO_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_CONTROLLER_USER:-controller}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_CONTROLLER_PASSWORD:-controller_secret_123}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      MINIO_BUCKET: audit-logs
+      TALOS_MASTER_KEY: ${TALOS_MASTER_KEY:?TALOS_MASTER_KEY required in .env}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required in .env}
+      # HMAC key shared between controller and worker for signing NATS job requests.
+      # Generate with: openssl rand -hex 32
+      WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env}
+      BCRYPT_COST: "12"
+      # CORS Configuration
+      ALLOWED_ORIGIN: "http://localhost:3002"
+      FRONTEND_URL: "http://localhost:3002"
+      # Rate limiting (requests per minute)
+      API_RATE_LIMIT: ${API_RATE_LIMIT:-1000}        # GraphQL API (default 1000 for development)
+      WEBHOOK_RATE_LIMIT: ${WEBHOOK_RATE_LIMIT:-500}     # Webhooks (default 500 for development)
+      GLOBAL_RATE_LIMIT: ${GLOBAL_RATE_LIMIT:-10000}    # Global total (default 10000 for development)
+      TRUSTED_IPS: ${TRUSTED_IPS:-127.0.0.1,::1}  # Whitelist IPs (bypass rate limits, defaults to localhost)
+      # Security headers
+      # ENABLE_HSTS: "true"          # Enable HSTS (only with HTTPS)
+      # Anthropic API Key
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # OAuth - Google
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/auth/oauth/google/callback}
+      # OAuth - Okta
+      OKTA_DOMAIN: ${OKTA_DOMAIN:-}
+      OKTA_CLIENT_ID: ${OKTA_CLIENT_ID:-}
+      OKTA_CLIENT_SECRET: ${OKTA_CLIENT_SECRET:-}
+      OKTA_REDIRECT_URI: ${OKTA_REDIRECT_URI:-http://localhost:8000/auth/oauth/okta/callback}
+      # OAuth - Snyk
+      SNYK_CLIENT_ID: ${SNYK_CLIENT_ID:-}
+      SNYK_CLIENT_SECRET: ${SNYK_CLIENT_SECRET:-}
+      SNYK_REDIRECT_URI: ${SNYK_REDIRECT_URI:-http://localhost:8000/auth/oauth/snyk/callback}
+      # Slack OAuth Configuration
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+      SLACK_REDIRECT_URI: ${SLACK_REDIRECT_URI:-http://localhost:8000/api/slack/callback}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Run DB migrations before launching the controller binary
+    # Use explicit path to sqlx binary to avoid PATH issues for non‑root user.
+    # Run DB migrations using sqlx from the container's PATH
+    command: ["sh","-c","sqlx migrate run && exec /app/controller"]
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Worker Service (WASM Execution Engine)
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    # Remove explicit container_name so Docker Compose can spin up multiple replicas
+    # container_name: talos-worker
+    deploy:
+      replicas: 3
+    environment:
+      NATS_URL: nats://nats:4222
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      NATS_USER: ${NATS_USER:?NATS_USER required in .env}
+      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+      WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env}
+      RUST_LOG: info,worker=debug
+      JAEGER_ENDPOINT: http://jaeger:4317
+      METRICS_PORT: "9091"
+      # Required by the metrics server — generate with: openssl rand -hex 16
+      METRICS_AUTH_TOKENS: ${METRICS_AUTH_TOKENS:?METRICS_AUTH_TOKENS required in .env}
+      # WORM storage configuration for immutable audit logs
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_BUCKET: audit-logs
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Frontend Service (React + Vite)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: talos-frontend
+    environment:
+      # API_PROXY_TARGET: server-side only (no VITE_ prefix = NOT baked into the JS bundle).
+      # The Vite dev server forwards /graphql, /api, and /ws to this URL.
+      # The browser always uses relative paths and never sees this hostname.
+      API_PROXY_TARGET: "http://controller:8000"
+      # VITE_API_URL must stay empty so the browser uses relative URLs (/graphql)
+      # which go through the Vite proxy.  If set to an absolute URL here it would
+      # be baked into the JS bundle and the browser would fail with ERR_NAME_NOT_RESOLVED
+      # because controller:8000 is a Docker-internal hostname.
+      VITE_API_URL: ""
+    ports:
+      - "3002:3000"
+    volumes:
+      # Mount source code for hot-reload
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/vite.config.ts:/app/vite.config.ts
+      - ./frontend/tailwind.config.js:/app/tailwind.config.js
+      - ./frontend/tsconfig.json:/app/tsconfig.json
+      - ./frontend/postcss.config.js:/app/postcss.config.js
+    depends_on:
+      controller:
+        condition: service_healthy
+    networks:
+      - talos-network
+
+  # MinIO provides an S3‑compatible, write‑once, read‑many object store.
+  # It is used as the durable append‑only ledger for audit events.
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    networks:
+      - talos-network
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console UI
+    environment:
+      # Default credentials for local dev – can be overridden via .env
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  # One‑off init container that creates the audit bucket with Object‑Lock enabled.
+  # It uses the official `minio/mc` client to talk to the MinIO service.
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    networks:
+      - talos-network
+    entrypoint: >
+      /bin/sh -c "
+        # Wait for MinIO to be reachable
+        until /usr/bin/mc alias set myminio http://minio:9000 $${MINIO_ROOT_USER:-admin} $${MINIO_ROOT_PASSWORD:-admin123} >/dev/null 2>&1; do sleep 1; done;
+        
+        # Create the bucket with Object-Lock enabled (do not force remove existing!)
+        /usr/bin/mc mb --with-lock myminio/audit-logs || true;
+        
+        # Enable versioning required for Object-Lock compliance
+        /usr/bin/mc version enable myminio/audit-logs || true;
+        
+        # Set compliance retention (365 days as an example)
+        /usr/bin/mc retention set compliance 365d myminio/audit-logs --default || true;
+        
+        # Create a least-privilege policy for the controller
+        echo '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\"],\"Resource\":[\"arn:aws:s3:::audit-logs/*\"]}]}' > /tmp/audit-policy.json
+        
+        # Apply the policy and user
+        /usr/bin/mc admin policy create myminio audit_write_only /tmp/audit-policy.json || true;
+        /usr/bin/mc admin user add myminio $${MINIO_CONTROLLER_USER:-controller} $${MINIO_CONTROLLER_PASSWORD:-controller_secret_123} || true;
+        /usr/bin/mc admin policy attach myminio audit_write_only --user $${MINIO_CONTROLLER_USER:-controller} || true;
+        
+        echo \"MinIO bucket 'audit-logs' and least-privilege controller user ready\";
+        exit 0
+      "
+    restart: unless-stopped
+
+  # ========================================================================
+  # Observability Stack
+  # ========================================================================
+
+  # Prometheus - Metrics Collection
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: talos-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Jaeger - Distributed Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: talos-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+      - "14250:14250"  # Jaeger gRPC
+      - "14268:14268"  # Jaeger HTTP
+      - "9411:9411"    # Zipkin compatible
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # Grafana - Visualization & Dashboards
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: talos-grafana
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - jaeger
+      - postgres
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # Local OCI Registry
+  # ========================================================================
+  registry:
+    image: registry:2
+    container_name: talos-registry
+    ports:
+      - "5001:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      # For local development we'll use a basic HTTP registry without TLS
+      # In production, this would be an enterprise registry (GHCR/GAR)
+    volumes:
+      - registry_data:/var/lib/registry
+    networks:
+      - talos-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  nats_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  minio-data:
+    driver: local
+  registry_data:
+    driver: local
+
+networks:
+  talos-network:
+    driver: bridge

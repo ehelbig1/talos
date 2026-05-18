@@ -1,0 +1,35 @@
+{
+  "name": "csv-parser",
+  "version": "v1.0.0",
+  "display_name": "CSV Parser",
+  "description": "Parse a CSV string into an array of JSON objects. Supports custom delimiters and optional headers.",
+  "category": "Data",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "DELIMITER": {
+        "type": "string",
+        "default": ",",
+        "description": "Field separator character (default: comma)"
+      },
+      "HAS_HEADER": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true, treat the first row as column names"
+      },
+      "MAX_ROWS": {
+        "type": "number",
+        "default": 10000,
+        "description": "Maximum rows to parse (safety cap)"
+      },
+      "CSV_FIELD": {
+        "type": "string",
+        "default": "csv",
+        "description": "Field in the input JSON that contains the CSV string"
+      }
+    }
+  }
+}

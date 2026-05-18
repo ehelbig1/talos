@@ -1,0 +1,36 @@
+[package]
+name = "talos-audit-ledger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow.workspace = true
+lru = "0.16"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "reqwest-client", "http-proto"] }
+tonic = "0.12.3"
+async-nats = "0.47"
+aws-config = "1.5"
+aws-sdk-s3 = "1.30"
+chrono.workspace = true
+futures = "0.3"
+hex = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-config = { path = "../talos-config" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-http-utils = { path = "../talos-http-utils" }
+talos-text-util = { path = "../talos-text-util" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

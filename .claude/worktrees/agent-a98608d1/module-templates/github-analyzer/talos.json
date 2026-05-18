@@ -1,0 +1,29 @@
+{
+    "name": "github-analyzer",
+    "display_name": "GitHub Repo Analyzer",
+    "version": "v1.0.0",
+    "category": "Development Tools",
+    "description": "Analyzes a GitHub repository's recent commits, pulling data via HTTP and checking against regex patterns. Requires a 'github_token' secret.",
+    "allowed_hosts": ["api.github.com"],
+  "config_schema": {
+        "type": "object",
+        "properties": {
+            "repository": {
+                "type": "string",
+                "title": "Repository",
+                "description": "The GitHub repo to analyze (e.g., 'anthropics/claude-code')"
+            },
+            "search_pattern": {
+                "type": "string",
+                "title": "Search Regex",
+                "description": "Optional regular expression to search for in commit messages (e.g., '(?i)(fix|bug|issue)')"
+            },
+            "secret_name": {
+                "type": "string",
+                "title": "Secret Name",
+                "description": "Name of the secret containing the GitHub PAT (defaults to 'github_token')"
+            }
+        },
+        "required": ["repository"]
+    }
+}

@@ -1,0 +1,66 @@
+{{- if .Values.migrations.enabled -}}
+# -----------------------------------------------------------------------------
+# sqlx migrate — one-shot Job run on every install and upgrade.
+#
+# Runs as a Helm pre-install / pre-upgrade hook at weight 0 so it
+# completes before the controller Deployment rolls out against an
+# unmigrated schema. Uses the same image as the controller (which bundles
+# the sqlx CLI + the /app/migrations directory).
+# -----------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "talos.componentName" (list . "migrations") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "migrations") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: 1200
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "migrations") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{- if .Values.migrations.image.repository }}
+            {{ include "talos.image" .Values.migrations.image }}
+          {{- else }}
+            {{ include "talos.image" .Values.controller.image }}
+          {{- end }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          command:
+            - /usr/local/cargo/bin/sqlx
+          args:
+            - migrate
+            - run
+            - --source
+            - /app/migrations
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: DATABASE_URL
+          resources:
+            {{- toYaml .Values.migrations.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: "128Mi"
+{{- end }}

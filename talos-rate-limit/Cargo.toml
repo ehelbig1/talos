@@ -1,0 +1,22 @@
+[package]
+name = "talos-rate-limit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+axum = { version = "0.8", features = ["json"] }
+governor = "0.6"
+ipnetwork = "0.21"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+talos-config = { path = "../talos-config" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+
+[lints]
+workspace = true

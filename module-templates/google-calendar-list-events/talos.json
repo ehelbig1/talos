@@ -1,0 +1,57 @@
+{
+  "name": "google-calendar-list-events",
+  "version": "v1.0.0",
+  "display_name": "Google Calendar: List Events",
+  "description": "List upcoming events from a Google Calendar over a time window. Returns structured event data (summary, start, end, location, attendees, hangout_link). Canonical building block for morning-brief / meeting-prep / schedule-awareness workflows.\n\nRequires a vault:// reference to a Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
+  "category": "Integration",
+  "capability_world": "http-node",
+  "allowed_hosts": ["www.googleapis.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": ["vault://oauth/google_calendar/*/access_token"],
+  "requires_approval_for": [],
+  "dependencies": {
+    "chrono": "0.4"
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/google_calendar/{user_id}/{account_id}/access_token'). The controller resolves + refreshes the token if expired."
+      },
+      "CALENDAR_ID": {
+        "type": "string",
+        "default": "primary",
+        "description": "Calendar ID. 'primary' for the authenticated user's main calendar, or a specific calendar address / ID."
+      },
+      "HOURS_AHEAD": {
+        "type": "integer",
+        "default": 24,
+        "description": "Window size in hours (1–168, i.e. up to 7 days). Events starting between now and now+HOURS_AHEAD are returned."
+      },
+      "MAX_RESULTS": {
+        "type": "integer",
+        "default": 20,
+        "description": "Maximum events to return (1–50)."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable the Google Calendar API",
+      "detail": "In https://console.cloud.google.com, enable the Google Calendar API and configure OAuth consent with the 'https://www.googleapis.com/auth/calendar.readonly' scope."
+    },
+    {
+      "step": 2,
+      "title": "Authorize the integration",
+      "detail": "Complete the OAuth flow via your Talos integration UI or CLI. The controller stores tokens at 'oauth/google_calendar/{user_id}/{account_id}/{access|refresh}_token' and tracks expiry."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/google_calendar/{your_user_id}/{your_account_id}/access_token'. For 401s, use refresh_oauth_token(vault_path) to force a refresh and inspect the outcome."
+    }
+  ]
+}

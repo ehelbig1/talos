@@ -1,0 +1,63 @@
+{
+  "name": "pii-scrubber",
+  "version": "v1.0.0",
+  "display_name": "PII Scrubber",
+  "description": "Scans input text for PII patterns (emails, phone numbers, SSNs, credit card numbers, IP addresses) and replaces matches with configurable redaction tokens. Pure computation with no network access -- safe for sensitive data processing.",
+  "category": "Security",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "PATTERNS_TO_REDACT": {
+        "type": "string",
+        "default": "email,phone,ssn,credit_card,ip_address",
+        "description": "Comma-separated list of PII pattern names to scan for. Available patterns: email, phone, ssn, credit_card, ip_address. Use 'all' to enable every built-in pattern."
+      },
+      "REPLACEMENT_TOKEN": {
+        "type": "string",
+        "default": "[REDACTED]",
+        "description": "String to replace detected PII with. Use type-specific tokens by setting to 'typed', which produces [REDACTED_EMAIL], [REDACTED_PHONE], etc."
+      },
+      "INPUT_FIELD": {
+        "type": "string",
+        "description": "When set, only scrub this specific field from the input JSON object. When not set, scrubs all string values recursively."
+      },
+      "PRESERVE_FORMAT": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, preserves partial format hints (e.g. '***-**-1234' for SSN, '****-****-****-5678' for credit cards). When false, replaces entirely with the replacement token."
+      }
+    }
+  },
+  "output_shape": {
+    "scrubbed": "The input text/object with PII replaced by redaction tokens",
+    "detections": "Array of {pattern, count} objects summarizing what was found",
+    "total_redactions": "Total number of PII instances redacted",
+    "patterns_checked": "Array of pattern names that were scanned"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Install as a minimal-node module",
+      "detail": "install_module_from_catalog {name: 'pii-scrubber'}. No secrets or network access required -- this module runs as pure computation in the minimal-node sandbox."
+    },
+    {
+      "step": 2,
+      "title": "Choose patterns to redact",
+      "detail": "Set PATTERNS_TO_REDACT to a comma-separated list of pattern names: email, phone, ssn, credit_card, ip_address, or 'all'. Defaults to all five patterns."
+    },
+    {
+      "step": 3,
+      "title": "Configure redaction style",
+      "detail": "Set REPLACEMENT_TOKEN to '[REDACTED]' for uniform redaction, or 'typed' for pattern-specific tokens like [REDACTED_EMAIL]. Enable PRESERVE_FORMAT to keep partial format hints for downstream validation."
+    },
+    {
+      "step": 4,
+      "title": "Wire into your workflow",
+      "detail": "Place this node before any node that sends data externally (LLM calls, webhooks, logging). Input can be a JSON object (all string values are scrubbed recursively) or a plain string. Output preserves the input structure with PII replaced."
+    }
+  ]
+}

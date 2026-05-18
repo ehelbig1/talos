@@ -1,0 +1,209 @@
+{{- if .Values.worker.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "talos.componentName" (list . "worker") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "worker") | nindent 4 }}
+spec:
+  {{- if not .Values.worker.autoscaling.enabled }}
+  replicas: {{ .Values.worker.replicaCount }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "worker") | nindent 8 }}
+      {{- with .Values.worker.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "talos.componentName" (list . "worker") }}
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ include "talos.image" .Values.worker.image }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.worker.service.metricsPort }}
+              protocol: TCP
+          env:
+            # --- Static config ---
+            {{- include "talos.envFromMap" .Values.worker.env | nindent 12 }}
+            # --- Sigstore enforcement (only emitted when configured) ---
+            # See values.yaml § worker.sigstore for the operator-facing
+            # config and worker/src/main.rs::SigstorePolicy for runtime
+            # enforcement. Verification happens BEFORE OCI pull, so an
+            # unsigned/tampered artifact never enters the cache.
+            {{- with .Values.worker.sigstore.required }}
+            - name: TALOS_SIGSTORE_REQUIRED
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.worker.sigstore.identityRegexp }}
+            - name: TALOS_SIGSTORE_IDENTITY_REGEXP
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.worker.sigstore.oidcIssuer }}
+            - name: TALOS_SIGSTORE_OIDC_ISSUER
+              value: {{ . | quote }}
+            {{- end }}
+            # --- Derived in-cluster addresses ---
+            - name: NATS_URL
+              value: {{ include "talos.natsUrl" . | quote }}
+            - name: AWS_ENDPOINT_URL
+              value: {{ include "talos.minioEndpoint" . | quote }}
+            - name: OLLAMA_URL
+              {{- if .Values.ollama.enabled }}
+              value: "http://{{ include "talos.componentName" (list . "ollama") }}.{{ .Release.Namespace }}.svc.cluster.local:11434"
+              {{- else }}
+              value: ""
+              {{- end }}
+            # --- Secrets ---
+            # NOTE: The worker is credential-free for data-plane access.
+            # It only needs:
+            #   - NATS auth (to subscribe to job subjects),
+            #   - Redis URL (to resolve `redis:` wasm bytes URIs from the controller),
+            #   - MinIO creds (object_storage WIT capability for guest modules
+            #     — NOT audit-log writes; audit-ledger is controller-only.
+            #     MCP-856 (2026-05-14) corrected the stale claim here),
+            #   - WORKER_SHARED_KEY (HMAC on signed NATS-RPC requests),
+            #   - TALOS_AUDIT_SIGNING_KEY.
+            # No Postgres, no Neo4j, no LLM provider keys — those are
+            # reserved host-only paths and are denied even with `allowed_secrets: ["*"]`.
+            - name: NATS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: NATS_USER
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: NATS_PASSWORD
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: REDIS_URL
+            - name: WORKER_SHARED_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: WORKER_SHARED_KEY
+            - name: TALOS_AUDIT_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: TALOS_AUDIT_SIGNING_KEY
+            # MCP-858 (2026-05-14): AOT cache HMAC key. The worker
+            # panics on startup in production when this is unset. Set
+            # via bootstrapSecret.data.TALOS_AOT_HMAC_KEY (must be ≥32
+            # bytes). `optional: true` lets dev clusters w/o the key
+            # render fine (worker generates an ephemeral key per pod).
+            # Rotation: append previous keys to TALOS_AOT_HMAC_KEY_PREVIOUS
+            # via worker.extraEnv (comma-separated, verification-only).
+            - name: TALOS_AOT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: TALOS_AOT_HMAC_KEY
+                  optional: true
+            # MCP-860: Optional OCI Basic-auth for private template
+            # packages. Worker pulls WASM bytes at execution time via
+            # talos-registry; reqwest fallback path only supports Basic.
+            # `optional: true` keeps anonymous public-registry deploys
+            # working when these keys are absent from the bootstrap secret.
+            - name: OCI_REGISTRY_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: OCI_REGISTRY_USERNAME
+                  optional: true
+            - name: OCI_REGISTRY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: OCI_REGISTRY_PASSWORD
+                  optional: true
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_WORKER_USER
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_WORKER_PASSWORD
+            - name: METRICS_AUTH_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: METRICS_AUTH_TOKENS
+                  optional: true
+            {{- with .Values.worker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            # MCP-797 (2026-05-14): switched from `/` to `/healthz`.
+            # Pre-fix probes hit `/` (~400 bytes of static HTML that
+            # also disclosed METRICS_AUTH_TOKENS state to anyone
+            # who could reach the metrics port). `/healthz` is the
+            # canonical k8s unauthenticated liveness convention and
+            # matches the controller's `/live` shape — static "OK".
+            # /metrics and /health remain bearer-token-protected.
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: "1Gi"
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
