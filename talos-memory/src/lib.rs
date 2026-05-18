@@ -433,12 +433,20 @@ pub async fn persist_memory_with_metadata(
     memory_type: &str,
     ttl_hours: Option<f64>,
 ) -> Result<PersistOutcome> {
-    if key.is_empty() {
-        anyhow::bail!("Memory key cannot be empty");
-    }
-    if key.len() > 500 {
-        anyhow::bail!("Memory key must be ≤ 500 characters");
-    }
+    // MCP-1224 (2026-05-18): route through the canonical
+    // `validate_memory_key` helper at the persistence boundary so
+    // every writer — MCP handlers, GraphQL mutations, engine
+    // __memory_write__ hook, signed memory_rpc, talos-actor-scaffold's
+    // seed_memories loop — observes the same rule (trim +
+    // whitespace-only reject + ≤500-char cap + control-char/null-byte
+    // reject) regardless of whether the caller remembered to
+    // validate first. Pre-fix the inline `is_empty() || len() > 500`
+    // check missed whitespace-only keys and embedded control chars;
+    // a probe via scaffold_actor with `seed_memories: { "   ": ... }`
+    // persisted a row that readers (all trim post-MCP-834) couldn't
+    // recover. Same canonical-layer-defense shape as MCP-1218/1219
+    // promoting graph_json caps into the engine's canonical validator.
+    let key = validate_memory_key(key).map_err(|e| anyhow::anyhow!("{}", e))?;
     // Single JSON serialization, reused for size check + embedding text +
     // encryption. Prior code serialized the same value three times per
     // write (once for the size cap, once for embedding text input, once
@@ -569,12 +577,20 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     memory_type: &str,
     ttl_hours: Option<f64>,
 ) -> Result<PersistOutcome> {
-    if key.is_empty() {
-        anyhow::bail!("Memory key cannot be empty");
-    }
-    if key.len() > 500 {
-        anyhow::bail!("Memory key must be ≤ 500 characters");
-    }
+    // MCP-1224 (2026-05-18): route through the canonical
+    // `validate_memory_key` helper at the persistence boundary so
+    // every writer — MCP handlers, GraphQL mutations, engine
+    // __memory_write__ hook, signed memory_rpc, talos-actor-scaffold's
+    // seed_memories loop — observes the same rule (trim +
+    // whitespace-only reject + ≤500-char cap + control-char/null-byte
+    // reject) regardless of whether the caller remembered to
+    // validate first. Pre-fix the inline `is_empty() || len() > 500`
+    // check missed whitespace-only keys and embedded control chars;
+    // a probe via scaffold_actor with `seed_memories: { "   ": ... }`
+    // persisted a row that readers (all trim post-MCP-834) couldn't
+    // recover. Same canonical-layer-defense shape as MCP-1218/1219
+    // promoting graph_json caps into the engine's canonical validator.
+    let key = validate_memory_key(key).map_err(|e| anyhow::anyhow!("{}", e))?;
     // Single JSON serialization, reused for size check + embedding text +
     // encryption (mirrors the non-tx path).
     let serialized = serde_json::to_string(value).context("memory value JSON serialization")?;
@@ -1703,6 +1719,68 @@ mod tests {
         }
         assert!(validate_memory_type("bogus").is_err());
         assert!(validate_memory_type("").is_err());
+    }
+
+    // MCP-1224 (2026-05-18): the canonical `validate_memory_key` helper
+    // is now invoked at the persistence boundary inside
+    // `persist_memory_with_metadata` and `persist_memory_in_tx_with_metadata`
+    // (sibling-drift fix — `scaffold_actor.seed_memories` and any other
+    // caller of those write paths previously did only a shallow
+    // `key.is_empty()` check, allowing `"   "` whitespace-only keys
+    // through and persisting unreachable rows). These tests pin the
+    // canonical validator's accept/reject contract so a future
+    // refactor of `validate_memory_key` doesn't loosen the bound.
+    #[test]
+    fn validate_memory_key_accepts_canonical() {
+        assert_eq!(validate_memory_key("foo").unwrap(), "foo");
+        assert_eq!(validate_memory_key("daily_brief/2026-04-21").unwrap(), "daily_brief/2026-04-21");
+        // Trim semantics: surrounding whitespace stripped, inner
+        // whitespace preserved.
+        assert_eq!(validate_memory_key("  foo  ").unwrap(), "foo");
+        assert_eq!(validate_memory_key("a b\tc").unwrap(), "a b\tc");
+        // Exact-cap accepted (500 chars).
+        let at_cap = "a".repeat(MAX_MEMORY_KEY_CHARS);
+        assert_eq!(validate_memory_key(&at_cap).unwrap(), at_cap.as_str());
+    }
+
+    #[test]
+    fn validate_memory_key_rejects_whitespace_only() {
+        // The seed_memories bypass: scaffold_actor caller passed
+        // `"   "` and a shallow `is_empty()` check accepted it,
+        // persisting a row whose primary-key projection is empty
+        // and therefore unreachable from any subsequent recall.
+        assert!(validate_memory_key("   ").is_err());
+        assert!(validate_memory_key("\t\t").is_err());
+        assert!(validate_memory_key(" \t \t ").is_err());
+        assert!(validate_memory_key("").is_err());
+    }
+
+    #[test]
+    fn validate_memory_key_rejects_control_chars() {
+        // Tab is explicitly allowed (MCP-388 trim parity) — every
+        // other control char rejected.
+        assert!(validate_memory_key("foo\0bar").is_err());
+        assert!(validate_memory_key("foo\nbar").is_err());
+        assert!(validate_memory_key("foo\rbar").is_err());
+        assert!(validate_memory_key("foo\x07bar").is_err());
+        // Trailing control chars also rejected (validator inspects
+        // the original key, not just the trimmed view, so embedded
+        // \0 inside untrimmed padding still triggers).
+        assert!(validate_memory_key("  foo\0  ").is_err());
+        // Tab inside the key is fine.
+        assert!(validate_memory_key("foo\tbar").is_ok());
+    }
+
+    #[test]
+    fn validate_memory_key_rejects_oversize() {
+        // 501 chars rejected (cap is 500 chars, MAX_MEMORY_KEY_CHARS).
+        let oversize = "a".repeat(MAX_MEMORY_KEY_CHARS + 1);
+        assert!(validate_memory_key(&oversize).is_err());
+        // 10 000 chars rejected — the pre-MCP-834 GraphQL path used
+        // MAX_SHORT_STRING_LENGTH = 10 000, which is what made this
+        // drift hard to detect on the write surface before promotion.
+        let way_oversize = "a".repeat(10_000);
+        assert!(validate_memory_key(&way_oversize).is_err());
     }
 
     #[test]

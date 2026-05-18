@@ -1876,6 +1876,29 @@ async fn handle_scaffold_actor(
     {
         let mut out: Vec<SeedMemorySpec> = Vec::with_capacity(map.len());
         for (key, entry) in map {
+            // MCP-1224 (2026-05-18): canonical key validation at the
+            // boundary. Pre-fix `seed_memories: { "   ": ... }` was
+            // accepted, persisted via `persist_memory_with_metadata`'s
+            // shallow inline check, and produced a memory row readers
+            // (all trim post-MCP-834) couldn't recover. The MCP-834
+            // workspace-audit-complete claim missed this handler. The
+            // canonical layer now also rejects, but rejecting at the
+            // boundary gives a clearer error message naming the
+            // offending JSON key.
+            let key = match talos_memory::validate_memory_key(key) {
+                Ok(trimmed) => trimmed.to_string(),
+                Err(e) => {
+                    return mcp_error(
+                        req_id,
+                        -32602,
+                        &format!(
+                            "seed_memories['{}']: invalid memory key ({})",
+                            talos_text_util::bounded_preview(key, 64),
+                            e
+                        ),
+                    )
+                }
+            };
             let value = match entry.get("value") {
                 Some(v) => v.clone(),
                 None => continue, // legacy: silently skip entries without value
@@ -1902,7 +1925,7 @@ async fn handle_scaffold_actor(
                             -32602,
                             &format!(
                                 "seed_memories['{}'].memory_type must be one of {} — got '{}'",
-                                talos_text_util::bounded_preview(key, 64),
+                                talos_text_util::bounded_preview(&key, 64),
                                 talos_memory::memory_types_csv(),
                                 talos_text_util::bounded_preview(s, 64)
                             ),
