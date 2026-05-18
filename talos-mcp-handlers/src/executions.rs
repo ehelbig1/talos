@@ -5648,41 +5648,64 @@ async fn handle_analyze_execution_failure(
 
                 if patched {
                     let updated_json = graph.to_string();
-                    let db_result = state
-                        .execution_repo
-                        .update_workflow_graph(workflow_id, user_id, &updated_json)
-                        .await;
-                    // MCP-882 (2026-05-14): log the underlying error
-                    // before collapsing to the generic "Failed to save
-                    // patched graph" response. Pre-fix `db_result.is_ok()`
-                    // branched on bool without logging the sqlx error,
-                    // so an operator running diagnose_and_fix_node_failure
-                    // saw "fix_applied: false" with no signal whether
-                    // the failure was a permission issue, FK violation,
-                    // write timeout, or graph-JSON shape rejection.
-                    // Operator-facing message stays generic; server log
-                    // distinguishes the cause.
-                    match db_result {
-                        Ok(_) => {
-                            fix_result = Some(serde_json::json!({
-                                "fix_applied": true,
-                                "patched_node": patched_node_display,
-                                "patched_field": field_name,
-                                "retry_with_execution_id": exec_id.to_string(),
-                                "note": "Field initialized to empty string — call update_node_config to set the correct value, then retry."
-                            }));
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                workflow_id = %workflow_id,
-                                user_id = %user_id,
-                                error = %e,
-                                "handle_analyze_execution_failure: update_workflow_graph failed during auto-fix"
-                            );
-                            fix_result = Some(serde_json::json!({
-                                "fix_applied": false,
-                                "error": "Failed to save patched graph"
-                            }));
+                    // MCP-1227 (2026-05-18): mirror the MCP-1226 chokepoint
+                    // for this auto-fix write path. `analyze_execution_failure`
+                    // can only stamp a single field with `""` (no caller-
+                    // injected number that could violate caps), so the
+                    // only way validation fails is if the legacy graph
+                    // already has over-cap timeouts/retries. Surface that
+                    // as `fix_applied: false` with the validator's
+                    // pointer at the offending field — operator must
+                    // hand-edit the legacy values before the auto-fix
+                    // can land. Sibling defense-in-depth posture to
+                    // `rollback_workflow` (versions.rs).
+                    if let Err(cap_msg) =
+                        talos_workflow_types::validate_graph_timeouts(&updated_json)
+                    {
+                        fix_result = Some(serde_json::json!({
+                            "fix_applied": false,
+                            "error": format!(
+                                "Existing workflow graph violates per-node / per-loop / per-retry caps; auto-fix refused. Edit the offending node by hand. Detail: {}",
+                                cap_msg
+                            ),
+                        }));
+                    } else {
+                        let db_result = state
+                            .execution_repo
+                            .update_workflow_graph(workflow_id, user_id, &updated_json)
+                            .await;
+                        // MCP-882 (2026-05-14): log the underlying error
+                        // before collapsing to the generic "Failed to save
+                        // patched graph" response. Pre-fix `db_result.is_ok()`
+                        // branched on bool without logging the sqlx error,
+                        // so an operator running diagnose_and_fix_node_failure
+                        // saw "fix_applied: false" with no signal whether
+                        // the failure was a permission issue, FK violation,
+                        // write timeout, or graph-JSON shape rejection.
+                        // Operator-facing message stays generic; server log
+                        // distinguishes the cause.
+                        match db_result {
+                            Ok(_) => {
+                                fix_result = Some(serde_json::json!({
+                                    "fix_applied": true,
+                                    "patched_node": patched_node_display,
+                                    "patched_field": field_name,
+                                    "retry_with_execution_id": exec_id.to_string(),
+                                    "note": "Field initialized to empty string — call update_node_config to set the correct value, then retry."
+                                }));
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    workflow_id = %workflow_id,
+                                    user_id = %user_id,
+                                    error = %e,
+                                    "handle_analyze_execution_failure: update_workflow_graph failed during auto-fix"
+                                );
+                                fix_result = Some(serde_json::json!({
+                                    "fix_applied": false,
+                                    "error": "Failed to save patched graph"
+                                }));
+                            }
                         }
                     }
                 } else {
