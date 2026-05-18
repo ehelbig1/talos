@@ -62,6 +62,19 @@ fn inject_deprecation(resp: JsonRpcResponse, old_name: &str, new_name: &str) -> 
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
     let actor_worlds_enum: Vec<&str> = crate::capability_worlds::ACTOR_CEILING_WORLDS.to_vec();
+    // MCP-1225 (2026-05-18): render memory_type enums from the canonical
+    // `talos_memory::MEMORY_TYPES` list rather than hardcoding a literal.
+    // Pre-fix `seed_memories.memory_type` declared
+    // `["semantic", "episodic", "procedural", "scratchpad"]` — "procedural"
+    // is NOT a canonical type (runtime validator rejected it with
+    // "must be one of working, episodic, semantic, scratchpad") AND
+    // "working" was missing entirely. Operators following the published
+    // tool schema were either lied to ("procedural" looked legitimate
+    // until the call returned -32602) or denied a real option ("working"
+    // was undiscoverable via schema). Same drift-prevention shape as
+    // `memory_types_csv()` for error messages and `actor_worlds_enum`
+    // above for capability worlds.
+    let memory_types_enum: Vec<&str> = talos_memory::MEMORY_TYPES.to_vec();
     vec![
         // ── Phase 1.1: Actor identity ──────────────────────────────────────
         serde_json::json!({
@@ -150,7 +163,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             "type": "object",
                             "properties": {
                                 "value": {},
-                                "memory_type": { "type": "string", "enum": ["semantic", "episodic", "procedural", "scratchpad"] },
+                                "memory_type": { "type": "string", "enum": memory_types_enum.clone() },
                                 "metadata_kind": { "type": "string", "description": "Optional metadata.kind label so consumers can filter via search_filtered(exclude_kinds: [...])" },
                                 "ttl_hours": { "type": "number" }
                             },
