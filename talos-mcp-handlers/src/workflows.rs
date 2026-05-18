@@ -7085,13 +7085,34 @@ fn spawn_llm_auto_fill_task(
         }
 
         if changed {
-            let _ = repo_fill
-                .update_workflow_graph(workflow_id, user_id, &graph.to_string())
-                .await;
-            tracing::debug!(
-                "auto_fill_config: patched graph for workflow {}",
-                workflow_id
-            );
+            let updated_json = graph.to_string();
+            // MCP-1229 (2026-05-18): mirror the MCP-1226 chokepoint on
+            // this background auto-fill write. `auto_fill_config` patches
+            // missing config defaults on a fire-and-forget tokio::spawn;
+            // pre-fix it could round-trip a legacy graph_json that had
+            // over-cap timeouts/retries from before the caps were
+            // enforced. Cannot return an mcp_error here (no JSON-RPC
+            // handle in a background task), so log-and-skip the write
+            // instead — operator's next edit through any chokepointed
+            // surface will surface the cap violation properly.
+            if let Err(cap_msg) =
+                talos_workflow_types::validate_graph_timeouts(&updated_json)
+            {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    user_id = %user_id,
+                    detail = %cap_msg,
+                    "auto_fill_config: skipping write — existing graph_json violates caps"
+                );
+            } else {
+                let _ = repo_fill
+                    .update_workflow_graph(workflow_id, user_id, &updated_json)
+                    .await;
+                tracing::debug!(
+                    "auto_fill_config: patched graph for workflow {}",
+                    workflow_id
+                );
+            }
         }
     });
 }
@@ -8416,6 +8437,14 @@ async fn handle_add_edge_to_workflow(
 
     // Persist
     let updated_json = graph.to_string();
+    // MCP-1229 (2026-05-18): mirror the MCP-1226 chokepoint. `add_edge_to_workflow`
+    // doesn't add caps directly but rewrites the WHOLE graph_json, so a
+    // legacy graph with over-cap timeouts/retries would round-trip
+    // through this save. Defense-in-depth posture matches the
+    // rollback_workflow / set_workflow_priority pattern.
+    if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
+        return resp;
+    }
     if let Err(e) = state
         .workflow_repo
         .update_workflow_graph_unchecked(wf_id, &updated_json)
@@ -8680,6 +8709,14 @@ async fn handle_swap_node_module(
 
         // ── Persist ──────────────────────────────────────────────────────────
         let updated_json = graph.to_string();
+        // MCP-1229 (2026-05-18): mirror the MCP-1226 chokepoint. `swap_node_module`
+        // preserves config keys from the old node; if the old node had
+        // over-cap timeouts/retries, those would round-trip through this
+        // save unchecked. Defense-in-depth posture matches the
+        // rollback_workflow / set_workflow_priority pattern.
+        if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
+            return resp;
+        }
         if let Err(e) = state
             .workflow_repo
             .update_workflow_graph(wf_id, user_id, &updated_json)
@@ -9272,6 +9309,15 @@ async fn handle_set_workflow_execution_timeout(
     }
 
     let updated_json = graph.to_string();
+    // MCP-1229 (2026-05-18): mirror the MCP-1226 chokepoint. The handler
+    // input is already gated to 1-3600 (matches MAX_WORKFLOW_EXECUTION_
+    // TIMEOUT_SECS), but a legacy graph may have over-cap PER-NODE
+    // timeouts/retries that would round-trip through this save.
+    // Defense-in-depth posture matches the rollback_workflow /
+    // set_workflow_priority pattern.
+    if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
+        return resp;
+    }
     match state
         .workflow_repo
         .update_workflow_graph(wf_id, user_id, &updated_json)

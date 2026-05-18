@@ -1010,6 +1010,81 @@ else
 fi
 echo
 
+# ── 15. Graph_json write chokepoint (MCP-1226 / 1227 / 1228 / 1229) ───
+#
+# Every MCP handler that writes workflows.graph_json MUST route through
+# `crate::utils::ensure_graph_within_caps` (or the `save_graph_json` /
+# `save_graph_json_unchecked` helpers in graph.rs that wrap it) BEFORE
+# the repository UPDATE. The canonical
+# `talos_workflow_types::validate_graph_timeouts` caps from MCP-1216 /
+# MCP-1218 / MCP-1219 / MCP-1220 / MCP-1221 only run at create /
+# update / import time; any narrow-mutation handler that does
+# load-modify-save bypasses those caps unless the chokepoint is
+# invoked. MCP-1226 (`update_node_config(action: "update_config")`)
+# was the first live-verified bypass: caller stamped `timeout_secs:
+# 86400`, `retry_count: 9000`, `retry_backoff_ms: 99999999` and they
+# round-tripped through the DB. MCP-1227 (executions.rs
+# `analyze_execution_failure` auto-fix path) and MCP-1228
+# (`add_node_to_workflow`) were the sibling holes.
+#
+# The lint flags:
+#   * `.update_workflow_graph(`
+#   * `.update_workflow_graph_unchecked(`
+#   * `.update_workflow_graph_json(`
+# in `talos-mcp-handlers/` UNLESS the matched line is preceded within
+# 8 lines by either `ensure_graph_within_caps` (the canonical
+# chokepoint call) or `validate_graph_timeouts` (the underlying
+# canonical validator — same contract). The two declarations in
+# `graph.rs::save_graph_json` and `save_graph_json_unchecked` ARE
+# the chokepoint, so they self-opt-out via `ensure_graph_within_caps`
+# inside their own bodies.
+#
+# Opt-out marker: `// allow-direct-graph-write: <reason>` for any
+# documented exception (none today).
+bold "▶ check 15: graph_json writes via canonical chokepoint (MCP-1226/1227/1228/1229)"
+
+GRAPH_WRITE_VIOLATIONS=0
+while IFS= read -r line; do
+    file="$(echo "$line" | cut -d: -f1)"
+    lineno="$(echo "$line" | cut -d: -f2)"
+
+    # Look 20 lines back for chokepoint call or opt-out marker. The
+    # MCP-1227 executions.rs site needed >8 lines: the validator runs
+    # at the start of an if/else block, the persist call lives in the
+    # else branch, and the indentation pushes the persist line 12+
+    # rows below the validator. 20 lines is enough headroom for the
+    # widest pattern we use without being so generous it loses
+    # specificity.
+    start=$((lineno > 20 ? lineno - 20 : 1))
+    context="$(sed -n "${start},${lineno}p" "$file" 2>/dev/null)"
+
+    if echo "$context" | grep -q 'ensure_graph_within_caps\|validate_graph_timeouts\|allow-direct-graph-write'; then
+        continue
+    fi
+
+    printf '  %s\n' "$line"
+    GRAPH_WRITE_VIOLATIONS=$((GRAPH_WRITE_VIOLATIONS + 1))
+done < <(grep -rEna '\.update_workflow_graph(_unchecked|_json)?\(' \
+            --include='*.rs' \
+            talos-mcp-handlers/src 2>/dev/null \
+        | grep -v '_test\.\|/tests/' \
+        | grep -vE ':[[:space:]]*//' \
+        || true)
+
+if [ "$GRAPH_WRITE_VIOLATIONS" -gt 0 ]; then
+    red "✗ found $GRAPH_WRITE_VIOLATIONS direct graph_json write(s) bypassing canonical caps"
+    yellow "  → call crate::utils::ensure_graph_within_caps(&graph_json, &req_id)?"
+    yellow "    before the repository write, OR route through the"
+    yellow "    save_graph_json / save_graph_json_unchecked helpers"
+    yellow "    in graph.rs that already wrap it."
+    yellow "  → opt-out comment // allow-direct-graph-write: <reason>"
+    yellow "    within 8 lines above is for documented exceptions."
+    EXIT_CODE=1
+else
+    green "✓ talos-mcp-handlers graph_json writes all route through canonical caps"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
