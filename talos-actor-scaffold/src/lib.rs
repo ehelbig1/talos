@@ -592,6 +592,85 @@ fn validate_starter_workflow(sw: &StarterWorkflowSpec) -> Result<(), ScaffoldErr
             "starter_workflow.output_schema_keys: at most 32 keys".to_string(),
         ));
     }
+    // MCP-1223 (2026-05-18): three gaps in the pre-existing validator
+    // that let caller-controlled strings flow straight to DB:
+    //
+    //   1. `description` — binds to `workflows.description` at
+    //      `build_and_create_starter_workflow` (lib.rs:687). Pre-fix
+    //      a 10 MiB description would persist verbatim and amplify
+    //      dashboard rendering. Sibling to the canonical 5000-char
+    //      cap on the broader `create_actor.description` /
+    //      `create_workflow.description` validators (MCP-748/837).
+    //   2. `provider` — bound into the graph_json node's PROVIDER
+    //      field at lib.rs:648. Engine deserialises against the
+    //      LLM_PROVIDER enum at dispatch time (so unknown strings
+    //      fail at run, not at create) BUT the row persists with
+    //      the bad provider in graph_json — workflow looks valid
+    //      until first trigger surfaces the typo. Hard-cap the
+    //      length so a 1 MiB provider can't bloat graph_json
+    //      regardless. The known-good enum check stays at the
+    //      engine boundary; the boundary cap is defense-in-depth.
+    //   3. `model` — same as provider but for the MODEL field.
+    //      Real model names are 20-60 chars
+    //      ("claude-sonnet-4-6", "gpt-4o-mini-2024-07-18");
+    //      256-char cap is generous headroom.
+    if let Some(desc) = sw.description.as_deref() {
+        let trimmed = desc.trim();
+        if trimmed.is_empty() {
+            // Empty-after-trim → caller's intent is ambiguous between
+            // "left blank" and "typed whitespace". Match the canonical
+            // create_actor/create_workflow rule: empty Option is OK,
+            // whitespace-only string is not (operator typo class).
+            return Err(ScaffoldError::InvalidStarterWorkflow(
+                "starter_workflow.description must be non-empty and non-whitespace when provided; \
+                 omit the field entirely to leave it blank"
+                    .to_string(),
+            ));
+        }
+        if trimmed.chars().count() > 5000 {
+            return Err(ScaffoldError::InvalidStarterWorkflow(
+                "starter_workflow.description must be ≤ 5000 characters".to_string(),
+            ));
+        }
+        // Match the workspace canonical control-char rule (MCP-432
+        // family): allow \t \n \r but reject other ASCII control chars
+        // and embedded \0 — Postgres surfaces the latter as opaque
+        // "invalid byte sequence" otherwise.
+        if desc.contains('\0')
+            || desc
+                .chars()
+                .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
+        {
+            return Err(ScaffoldError::InvalidStarterWorkflow(
+                "starter_workflow.description cannot contain control characters or null bytes"
+                    .to_string(),
+            ));
+        }
+    }
+    if sw.provider.trim().is_empty() {
+        return Err(ScaffoldError::InvalidStarterWorkflow(
+            "starter_workflow.provider must be a non-empty, non-whitespace string".to_string(),
+        ));
+    }
+    if sw.provider.len() > 64 {
+        return Err(ScaffoldError::InvalidStarterWorkflow(
+            "starter_workflow.provider must be ≤ 64 characters".to_string(),
+        ));
+    }
+    if let Some(model) = sw.model.as_deref() {
+        if model.trim().is_empty() {
+            return Err(ScaffoldError::InvalidStarterWorkflow(
+                "starter_workflow.model must be non-empty and non-whitespace when provided; \
+                 omit the field entirely to use the provider default"
+                    .to_string(),
+            ));
+        }
+        if model.len() > 256 {
+            return Err(ScaffoldError::InvalidStarterWorkflow(
+                "starter_workflow.model must be ≤ 256 characters".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -968,5 +1047,161 @@ mod tests {
     #[test]
     fn llm_tier_from_arg_unknown() {
         assert!(LlmTier::from_arg("super").is_err());
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // MCP-1223: description / provider / model gaps
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mcp_1223_description_none_accepted() {
+        let mut sw = good_starter();
+        sw.description = None;
+        assert!(validate_starter_workflow(&sw).is_ok());
+    }
+
+    #[test]
+    fn mcp_1223_description_typical_accepted() {
+        let mut sw = good_starter();
+        sw.description = Some("Reviews engineering changes for shipability".to_string());
+        assert!(validate_starter_workflow(&sw).is_ok());
+    }
+
+    #[test]
+    fn mcp_1223_description_whitespace_only_rejected() {
+        let mut sw = good_starter();
+        sw.description = Some("   \t  ".to_string());
+        let err = validate_starter_workflow(&sw).unwrap_err();
+        match err {
+            ScaffoldError::InvalidStarterWorkflow(m) => {
+                assert!(m.contains("non-empty"));
+                assert!(m.contains("non-whitespace"));
+            }
+            _ => panic!("wrong error variant"),
+        }
+    }
+
+    #[test]
+    fn mcp_1223_description_over_5000_chars_rejected() {
+        let mut sw = good_starter();
+        sw.description = Some("x".repeat(5001));
+        let err = validate_starter_workflow(&sw).unwrap_err();
+        match err {
+            ScaffoldError::InvalidStarterWorkflow(m) => {
+                assert!(m.contains("5000"))
+            }
+            _ => panic!("wrong error variant"),
+        }
+    }
+
+    #[test]
+    fn mcp_1223_description_at_5000_chars_accepted() {
+        let mut sw = good_starter();
+        sw.description = Some("x".repeat(5000));
+        assert!(validate_starter_workflow(&sw).is_ok());
+    }
+
+    #[test]
+    fn mcp_1223_description_10mb_attack_rejected() {
+        let mut sw = good_starter();
+        sw.description = Some("A".repeat(10 * 1024 * 1024));
+        assert!(validate_starter_workflow(&sw).is_err());
+    }
+
+    #[test]
+    fn mcp_1223_description_null_byte_rejected() {
+        let mut sw = good_starter();
+        sw.description = Some("Hello\0World".to_string());
+        let err = validate_starter_workflow(&sw).unwrap_err();
+        match err {
+            ScaffoldError::InvalidStarterWorkflow(m) => {
+                assert!(m.contains("control characters"));
+            }
+            _ => panic!("wrong error variant"),
+        }
+    }
+
+    #[test]
+    fn mcp_1223_description_control_char_rejected() {
+        let mut sw = good_starter();
+        // ASCII BELL (0x07), not in the {tab, newline, CR} allowlist.
+        sw.description = Some("Hello\x07World".to_string());
+        assert!(validate_starter_workflow(&sw).is_err());
+    }
+
+    #[test]
+    fn mcp_1223_description_allows_newlines_and_tabs() {
+        let mut sw = good_starter();
+        sw.description = Some("Line one\nLine two\tindented\r\nCRLF works".to_string());
+        assert!(validate_starter_workflow(&sw).is_ok());
+    }
+
+    #[test]
+    fn mcp_1223_provider_empty_rejected() {
+        let mut sw = good_starter();
+        sw.provider = "".to_string();
+        assert!(validate_starter_workflow(&sw).is_err());
+    }
+
+    #[test]
+    fn mcp_1223_provider_whitespace_only_rejected() {
+        let mut sw = good_starter();
+        sw.provider = "   ".to_string();
+        assert!(validate_starter_workflow(&sw).is_err());
+    }
+
+    #[test]
+    fn mcp_1223_provider_over_64_chars_rejected() {
+        let mut sw = good_starter();
+        sw.provider = "p".repeat(65);
+        let err = validate_starter_workflow(&sw).unwrap_err();
+        match err {
+            ScaffoldError::InvalidStarterWorkflow(m) => assert!(m.contains("64")),
+            _ => panic!("wrong error variant"),
+        }
+    }
+
+    #[test]
+    fn mcp_1223_provider_canonical_names_accepted() {
+        for p in &["anthropic", "openai", "gemini", "ollama"] {
+            let mut sw = good_starter();
+            sw.provider = (*p).to_string();
+            assert!(
+                validate_starter_workflow(&sw).is_ok(),
+                "should accept {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_1223_model_none_accepted() {
+        let mut sw = good_starter();
+        sw.model = None;
+        assert!(validate_starter_workflow(&sw).is_ok());
+    }
+
+    #[test]
+    fn mcp_1223_model_typical_accepted() {
+        let mut sw = good_starter();
+        sw.model = Some("claude-sonnet-4-6".to_string());
+        assert!(validate_starter_workflow(&sw).is_ok());
+    }
+
+    #[test]
+    fn mcp_1223_model_whitespace_only_rejected() {
+        let mut sw = good_starter();
+        sw.model = Some("   ".to_string());
+        assert!(validate_starter_workflow(&sw).is_err());
+    }
+
+    #[test]
+    fn mcp_1223_model_over_256_chars_rejected() {
+        let mut sw = good_starter();
+        sw.model = Some("m".repeat(257));
+        let err = validate_starter_workflow(&sw).unwrap_err();
+        match err {
+            ScaffoldError::InvalidStarterWorkflow(m) => assert!(m.contains("256")),
+            _ => panic!("wrong error variant"),
+        }
     }
 }
