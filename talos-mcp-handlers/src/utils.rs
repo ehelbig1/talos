@@ -314,6 +314,27 @@ pub use talos_mcp::{mcp_error, mcp_text};
 /// historical messages that mention the MCP tool to call next ("Use
 /// resume_executions to re-enable.") so callers see byte-identical
 /// text to the pre-extraction inline handlers.
+/// MCP-1226 (2026-05-18): cross-handler chokepoint that validates
+/// graph_json against the canonical
+/// `talos_workflow_types::validate_graph_timeouts` caps before any
+/// MCP write path persists it. Originally lived in `graph.rs` as a
+/// private helper used by `save_graph_json` / `save_graph_json_unchecked`;
+/// promoted here so `set_workflow_priority` (configuration.rs) and
+/// `rollback_workflow` (versions.rs) can call it without depending on
+/// `graph.rs`. Those two paths write graph_json through
+/// `update_workflow_graph_json` instead of `save_graph_json` so they
+/// bypass the graph.rs chokepoint. The promotion keeps the canonical
+/// validator a single import-everywhere call, mirroring the `push
+/// validator into the canonical helper` pattern (MCP-1224 for
+/// memory_key, MCP-1225 for memory_type enum).
+pub fn ensure_graph_within_caps(
+    graph_json: &str,
+    req_id: &Option<serde_json::Value>,
+) -> Result<(), super::types::JsonRpcResponse> {
+    talos_workflow_types::validate_graph_timeouts(graph_json)
+        .map_err(|msg| super::mcp_error(req_id.clone(), -32602, &msg))
+}
+
 pub fn orchestration_error_to_response(
     err: talos_execution_orchestration::OrchestrationError,
     req_id: Option<serde_json::Value>,
@@ -2830,5 +2851,109 @@ mod multiline_description_tests {
     #[test]
     fn rejects_other_control_chars() {
         assert!(validate_multiline_description("X", Some("ab\u{0007}cd"), 5000, "", None).is_err());
+    }
+}
+
+// MCP-1226 (2026-05-18): pin the canonical-validator chokepoint at
+// the persistence boundary. Pre-fix `update_node_config` with action
+// `update_config` shipped caller-controlled `timeout_secs` / `retry_count`
+// / `retry_backoff_ms` straight through to graph_json (live-verified
+// 86400 / 9000 / 99999999). Validating at the helper closes that
+// bypass AND every future graph-mutation tool inherits the contract.
+#[cfg(test)]
+mod ensure_graph_within_caps_tests {
+    use super::ensure_graph_within_caps;
+
+    fn body_text(resp: &super::super::types::JsonRpcResponse) -> String {
+        serde_json::to_string(resp).unwrap_or_default()
+    }
+
+    #[test]
+    fn accepts_empty_graph() {
+        assert!(ensure_graph_within_caps("{}", &None).is_ok());
+        assert!(ensure_graph_within_caps(r#"{"nodes":[],"edges":[]}"#, &None).is_ok());
+    }
+
+    #[test]
+    fn accepts_within_cap_per_node() {
+        let g = r#"{
+            "nodes": [{
+                "id": "n1",
+                "data": {"timeout_secs": 600, "retry_count": 100, "retry_backoff_ms": 600000}
+            }],
+            "edges": []
+        }"#;
+        assert!(ensure_graph_within_caps(g, &None).is_ok());
+    }
+
+    #[test]
+    fn rejects_over_cap_timeout_secs() {
+        let g = r#"{
+            "nodes": [{"id": "n1", "data": {"timeout_secs": 86400}}],
+            "edges": []
+        }"#;
+        let err = ensure_graph_within_caps(g, &None).unwrap_err();
+        let text = body_text(&err);
+        assert!(text.contains("timeout_secs"), "msg: {text}");
+        // The cap is 600 (MAX_NODE_TIMEOUT_SECS); error message
+        // surfaces the actual offending value.
+        assert!(text.contains("86400"), "msg: {text}");
+    }
+
+    #[test]
+    fn rejects_over_cap_retry_count() {
+        let g = r#"{
+            "nodes": [{"id": "n1", "retry_count": 9000}],
+            "edges": []
+        }"#;
+        let err = ensure_graph_within_caps(g, &None).unwrap_err();
+        let text = body_text(&err);
+        assert!(text.contains("retry_count"), "msg: {text}");
+        assert!(text.contains("9000"), "msg: {text}");
+    }
+
+    #[test]
+    fn rejects_over_cap_retry_backoff_ms() {
+        let g = r#"{
+            "nodes": [{"id": "n1", "retry_backoff_ms": 99999999}],
+            "edges": []
+        }"#;
+        let err = ensure_graph_within_caps(g, &None).unwrap_err();
+        let text = body_text(&err);
+        assert!(text.contains("retry_backoff_ms"), "msg: {text}");
+    }
+
+    #[test]
+    fn rejects_data_shape_retry_fields() {
+        // Engine reads retry from EITHER top-level OR `data.retry_*`
+        // — validator must catch the bypass through either shape.
+        let g = r#"{
+            "nodes": [{"id": "n1", "data": {"retry_count": 9000}}],
+            "edges": []
+        }"#;
+        let err = ensure_graph_within_caps(g, &None).unwrap_err();
+        let text = body_text(&err);
+        assert!(text.contains("retry_count"), "msg: {text}");
+    }
+
+    #[test]
+    fn rejects_workflow_level_execution_timeout() {
+        let g = r#"{
+            "execution_timeout_secs": 86400,
+            "nodes": [],
+            "edges": []
+        }"#;
+        let err = ensure_graph_within_caps(g, &None).unwrap_err();
+        let text = body_text(&err);
+        assert!(text.contains("execution_timeout_secs"), "msg: {text}");
+    }
+
+    #[test]
+    fn malformed_json_passes_through() {
+        // Same surface as the underlying validator — invalid JSON
+        // isn't this helper's concern (the engine / parser will
+        // surface the parse error elsewhere). Validator returns Ok
+        // for unparseable input.
+        assert!(ensure_graph_within_caps("{not json", &None).is_ok());
     }
 }

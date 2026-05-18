@@ -540,6 +540,17 @@ async fn handle_set_workflow_priority(
         obj.insert("priority".to_string(), serde_json::json!(priority));
     }
     let updated = graph.to_string();
+    // MCP-1226 (2026-05-18): mirror the `save_graph_json` chokepoint
+    // for non-graph.rs write paths. `set_workflow_priority` loads
+    // the existing graph, stamps a top-level `priority` key, and
+    // writes the whole thing back via `update_workflow_graph_json`
+    // — bypassing the `save_graph_json` validator. If the workflow
+    // already has over-cap timeouts (e.g. from a legacy create
+    // before the caps were added) this surfaces them at the next
+    // priority edit instead of letting them linger.
+    if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated, &req_id) {
+        return resp;
+    }
     match state
         .workflow_repo
         .update_workflow_graph_json(wf_id, user_id, &updated)

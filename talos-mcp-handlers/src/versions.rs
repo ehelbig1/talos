@@ -428,6 +428,18 @@ async fn handle_rollback_workflow(
         }
     };
 
+    // MCP-1226 (2026-05-18): mirror the `save_graph_json` chokepoint
+    // for non-graph.rs write paths. A legacy version snapshot
+    // recorded before the per-node / per-loop / per-retry caps were
+    // enforced may still carry over-cap values; surface them at the
+    // rollback boundary so the operator notices and edits before
+    // pinning the legacy snapshot as the new active draft. Without
+    // this check `rollback_workflow` would happily restore an
+    // unbounded retry_count / timeout / loop count.
+    if let Err(resp) = crate::utils::ensure_graph_within_caps(&graph_json, &req_id) {
+        return resp;
+    }
+
     // Update the draft graph_json
     if let Err(e) = state
         .workflow_repo

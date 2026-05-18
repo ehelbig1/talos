@@ -153,6 +153,26 @@ fn canonicalise_rhai_in_graph_json(graph_json: &str) -> std::borrow::Cow<'_, str
 
 /// Save updated graph_json for a workflow via the repository, returning a
 /// standard MCP error response on failure.
+///
+/// MCP-1226 (2026-05-18): canonical-validator chokepoint for every
+/// in-Rust graph mutation. Pre-fix `update_node_config` with
+/// `action: "update_config", config: { timeout_secs: 86400,
+/// retry_count: 9000, retry_backoff_ms: 99999999 }` wrote those
+/// over-cap values straight through `save_graph_json` to the DB —
+/// `validate_graph_timeouts` was only invoked at `create_workflow` /
+/// `update_workflow` / `import_workflow` time, so any mutation tool
+/// that loads-modify-saves the graph (`update_node_config`,
+/// `add_node_to_workflow`, `add_edge_to_workflow`, `add_skip_condition`,
+/// the 20+ system-node add_* tools, etc.) bypassed the MCP-1218 /
+/// MCP-1219 / MCP-1220 / MCP-1221 caps entirely. Live-verified:
+/// timeout_secs: 86400 (max 600), retry_count: 9000 (max 100),
+/// retry_backoff_ms: 99999999 (max 600000) all persisted.
+///
+/// Routing the canonical validator through the persistence helper
+/// closes every current bypass path AND any future graph-mutation
+/// tool inherits the contract for free — same `push validator into
+/// the canonical helper` pattern as MCP-1224 (memory_key at
+/// `persist_memory_with_metadata`).
 async fn save_graph_json(
     state: &McpState,
     wf_id: Uuid,
@@ -161,6 +181,7 @@ async fn save_graph_json(
     req_id: &Option<serde_json::Value>,
 ) -> Result<(), JsonRpcResponse> {
     let canonical = canonicalise_rhai_in_graph_json(graph_json);
+    crate::utils::ensure_graph_within_caps(canonical.as_ref(), req_id)?;
     match state
         .workflow_repo
         .update_workflow_graph(wf_id, user_id, canonical.as_ref())
@@ -187,6 +208,7 @@ async fn save_graph_json_unchecked(
     req_id: &Option<serde_json::Value>,
 ) -> Result<(), JsonRpcResponse> {
     let canonical = canonicalise_rhai_in_graph_json(graph_json);
+    crate::utils::ensure_graph_within_caps(canonical.as_ref(), req_id)?;
     match state
         .workflow_repo
         .update_workflow_graph_unchecked(wf_id, canonical.as_ref())
