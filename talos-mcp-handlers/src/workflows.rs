@@ -2374,6 +2374,20 @@ async fn handle_add_node_to_workflow(
     }
 
     let updated_json = graph.to_string();
+    // MCP-1228 (2026-05-18): mirror the MCP-1226 chokepoint on this
+    // direct-repository write. `handle_add_node_to_workflow` calls
+    // `workflow_repo.update_workflow_graph_unchecked` rather than
+    // `save_graph_json_unchecked`, so the canonical
+    // `validate_graph_timeouts` cap check never fired on the
+    // top-level `timeout_secs` / `retry_count` / `retry_backoff_ms`
+    // fields that `build_add_node_payload` stamps onto the new
+    // node verbatim. Same bypass class as the `update_node_config`
+    // hole MCP-1226 closed, on a different handler — `add_node_to_
+    // workflow` was the sibling that build_add_node_payload's
+    // verbatim-stamp pattern exposed.
+    if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
+        return resp;
+    }
     let _ = state
         .workflow_repo
         .update_workflow_graph_unchecked(wf_id, &updated_json)
