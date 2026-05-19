@@ -428,18 +428,28 @@ postgres:
   enabled: false
 
   image:
-    # Official upstream Postgres image from Docker Hub. NOT bitnami —
-    # Bitnami changed their free-image policy in late 2025 and many
-    # of their public images now redirect to a paid registry. The
-    # official upstream image is community-maintained, free, and
-    # uses a postgres user at uid/gid 70 (which is why the
-    # StatefulSet uses its own securityContext block instead of
-    # inheriting the chart-wide 10001 default).
-    repository: postgres
-    tag: "17-alpine"
+    # The pgvector team's official image — Debian-based, derived
+    # from `postgres:17`, with the pgvector extension compiled in.
+    # Required because the Talos schema uses `vector(N)` columns
+    # (actor_memory.embedding, semantic_execution_cache, etc.) and
+    # the stock postgres image doesn't ship pgvector. The schema's
+    # `CREATE EXTENSION IF NOT EXISTS vector` is wrapped in
+    # `EXCEPTION WHEN OTHERS THEN` so it silently no-ops if the
+    # extension isn't available — then the next migration that
+    # uses `vector(1536)` fails with "type vector does not exist".
+    #
+    # NOT Bitnami — Bitnami changed their free-image policy in
+    # late 2025 and many public images now redirect to a paid
+    # registry. NOT pgvector/pgvector:pg17-alpine — no alpine
+    # variant is published by the pgvector team.
+    #
+    # Postgres user in this image is uid/gid 999 (Debian
+    # convention), NOT 70 (Alpine). The StatefulSet's
+    # securityContext is set accordingly.
+    repository: pgvector/pgvector
+    tag: "pg17"
     # Pin to a digest in production. Compose with `docker manifest
-    # inspect postgres:17-alpine | jq -r '.config.digest'` (or set
-    # TALOS_POSTGRES_IMAGE_DIGEST in install.sh).
+    # inspect pgvector/pgvector:pg17 | jq -r '.config.digest'`.
     digest: ""
     pullPolicy: IfNotPresent
 

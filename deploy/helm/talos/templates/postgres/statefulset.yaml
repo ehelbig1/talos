@@ -5,10 +5,13 @@
 # single-replica, no streaming replication, no PITR. Backup is via
 # daily pg_dump (see postgres/backup-cronjob.yaml).
 #
-# Image: official upstream `postgres:17-alpine` (Docker Hub). Postgres
-# runs as uid/gid 70 inside the container, which is why this pod has
+# Image: pgvector/pgvector:pg17 (the pgvector team's official image,
+# derived from Debian-based postgres:17). The Talos schema uses
+# vector(N) columns so the stock postgres image fails at migration
+# 20260406000001 with "type vector does not exist". Postgres user is
+# uid/gid 999 in this image (Debian convention) — the StatefulSet has
 # its own securityContext block instead of inheriting the chart's
-# default 10001. fsGroup: 70 makes the PVC owner match.
+# default 10001. fsGroup: 999 makes the PVC owner match.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -55,9 +58,9 @@ spec:
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:
         runAsNonRoot: true
-        runAsUser: 70
-        runAsGroup: 70
-        fsGroup: 70
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -71,7 +74,7 @@ spec:
             # container root FS itself is read-only.
             readOnlyRootFilesystem: true
             runAsNonRoot: true
-            runAsUser: 70
+            runAsUser: 999
             capabilities:
               drop: ["ALL"]
           env:

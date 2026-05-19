@@ -40,9 +40,9 @@ spec:
           {{- include "talos.imagePullSecrets" . | nindent 10 }}
           securityContext:
             runAsNonRoot: true
-            runAsUser: 70
-            runAsGroup: 70
-            fsGroup: 70
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
             seccompProfile:
               type: RuntimeDefault
           containers:
@@ -53,7 +53,7 @@ spec:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
                 runAsNonRoot: true
-                runAsUser: 70
+                runAsUser: 999
                 capabilities:
                   drop: ["ALL"]
               env:
