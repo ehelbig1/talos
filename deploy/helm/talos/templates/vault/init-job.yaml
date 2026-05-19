@@ -70,7 +70,11 @@ metadata:
     # will pick up the existing unseal key and just re-unseal.
 spec:
   backoffLimit: 3
-  ttlSecondsAfterFinished: 600
+  # Keep finished pods around for an hour so operators can inspect
+  # logs after a deploy. The Job itself is small (one-shot, no data
+  # produced) so the extra retention cost is negligible. Reduce to
+  # 600 (10 min) if you don't need this much triage window.
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels:
