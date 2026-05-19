@@ -55,6 +55,16 @@ kind: Pod
 metadata:
   name: ${POD}
   namespace: ${NS}
+  labels:
+    # Stamp the same component label the chart applies to its
+    # migrations Job pods so the NetworkPolicy on talos-postgres
+    # admits us. Without this, k3s's bundled kube-router REJECTs
+    # the connection (→ "Connection refused" from the postgres
+    # side, even though the pod is happily listening). Found while
+    # debugging the in-cluster Postgres rollout 2026-05-19.
+    app.kubernetes.io/name: talos
+    app.kubernetes.io/instance: talos
+    app.kubernetes.io/component: migrations
 spec:
   restartPolicy: Never
   securityContext:
