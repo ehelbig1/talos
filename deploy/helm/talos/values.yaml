@@ -681,11 +681,18 @@ vault:
   init:
     enabled: true
     # kubectl image used by the secret-patcher container. Pin to the
-    # k3s minor version when possible. Override here, or leave for the
-    # template's default of bitnami/kubectl:1.31.
+    # k3s minor version when possible. Default switched from
+    # `bitnami/kubectl:1.31` to `rancher/kubectl:v1.31.4` in May-2026:
+    # Bitnami changed their free-image policy in late 2025 and the
+    # public `bitnami/kubectl` tag now returns "manifest unknown" /
+    # ImagePullBackOff — leaving the vault-init Job stuck for 39+
+    # hours in production until we figured out it was the same
+    # Bitnami issue that motivated the Postgres image switch.
+    # rancher/kubectl is free, tracks k8s minor versions, and aligns
+    # with the k3s the chart targets.
     kubectlImage:
-      repository: bitnami/kubectl
-      tag: "1.31"
+      repository: rancher/kubectl
+      tag: "v1.31.4"
       pullPolicy: IfNotPresent
     # MCP-898 (2026-05-14): explicit resources for the init Job's two
     # containers. Pre-fix neither carried `resources:`, putting the

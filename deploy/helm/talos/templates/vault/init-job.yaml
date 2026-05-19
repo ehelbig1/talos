@@ -1,5 +1,18 @@
 {{- if and .Values.vault.enabled .Values.vault.init.enabled -}}
-{{- $kubectlImage := .Values.vault.init.kubectlImage | default (dict "repository" "bitnami/kubectl" "tag" "1.31" "pullPolicy" "IfNotPresent") -}}
+{{/*
+  kubectl image for the secret-patcher sidecar. Default switched from
+  `bitnami/kubectl:1.31` to `rancher/kubectl:v1.31.4` in May-2026:
+  Bitnami changed their free-image policy in late 2025 and the public
+  `bitnami/kubectl` tag now returns "manifest unknown" / image-pull
+  errors, leaving the vault-init Job stuck in ImagePullBackOff
+  indefinitely — which in turn blocks the controller from starting
+  (VAULT_TOKEN is never patched out of its `__pending_vault_init__`
+  placeholder). rancher/kubectl is free, mirrors k8s minor versions
+  in lockstep, and aligns with the k3s the chart targets. Operators
+  on a paid Bitnami subscription can override via
+  `vault.init.kubectlImage` in values.
+*/}}
+{{- $kubectlImage := .Values.vault.init.kubectlImage | default (dict "repository" "rancher/kubectl" "tag" "v1.31.4" "pullPolicy" "IfNotPresent") -}}
 {{- $bootstrapSecret := include "talos.bootstrapSecretName" . -}}
 {{- $controllerDeploy := include "talos.componentName" (list . "controller") -}}
 {{- $kekKeyName := .Values.controller.env.VAULT_TRANSIT_KEY_NAME | default "talos-kek" -}}
