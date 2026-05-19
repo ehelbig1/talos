@@ -22,7 +22,10 @@ DIGEST=""
 if [[ -n "${TALOS_CONTROLLER_DIGEST:-}" ]]; then
     DIGEST="$TALOS_CONTROLLER_DIGEST"
 elif [[ -f /etc/talos/install.env ]]; then
-    DIGEST="$(grep -E '^TALOS_CONTROLLER_DIGEST=' /etc/talos/install.env | head -1 | cut -d= -f2- | tr -d '"' || true)"
+    # The anchored `^TALOS_` pattern is intentionally loose on leading
+    # whitespace — install.env files in the wild get hand-edited and
+    # often end up indented. Strip leading whitespace before matching.
+    DIGEST="$(grep -E '^[[:space:]]*TALOS_CONTROLLER_DIGEST=' /etc/talos/install.env | head -1 | sed -E 's/^[[:space:]]*//' | cut -d= -f2- | tr -d '"' || true)"
 fi
 if [[ -z "$DIGEST" ]]; then
     # Last-ditch: parse the talos-migrations Job's container image.
