@@ -245,17 +245,30 @@ pub fn validate_graph_timeouts(graph_json: &str) -> Result<(), String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("<unknown>");
 
-            // 2a. Per-node timeout_secs (MCP-1218). Lives under `data`.
-            if let Some(data) = node.get("data") {
-                if let Some(secs) = data.get("timeout_secs").and_then(|v| v.as_u64()) {
-                    if secs > MAX_NODE_TIMEOUT_SECS {
-                        return Err(format!(
-                            "Invalid timeout_secs {} on node '{}' in graph_json: exceeds the {} second per-node cap. \
-                             Per-node timeouts are bounded to bound worker-slot occupancy when the workflow-level \
-                             execution_timeout_secs is set to 0 (disabled).",
-                            secs, node_id, MAX_NODE_TIMEOUT_SECS
-                        ));
-                    }
+            // 2a. Per-node timeout_secs (MCP-1218 / MCP-1230). Dual-shape:
+            //      top-level OR `data.timeout_secs`. The original MCP-1218
+            //      fix only checked `data.timeout_secs`, but
+            //      `add_node_to_workflow` writes `timeout_secs` at the
+            //      node's top level via `build_add_node_payload` (alongside
+            //      retry_count / retry_backoff_ms). Verified live on
+            //      2026-05-19: `add_node_to_workflow(timeout_secs: 86400)`
+            //      bypassed the validator and persisted because the
+            //      top-level shape was missed; same call with
+            //      `retry_count: 9000` was correctly rejected because
+            //      MCP-1219 was already dual-shape. This brings
+            //      timeout_secs into parity with retry_count.
+            let timeout_secs = node
+                .get("timeout_secs")
+                .or_else(|| node.get("data").and_then(|d| d.get("timeout_secs")))
+                .and_then(|v| v.as_u64());
+            if let Some(secs) = timeout_secs {
+                if secs > MAX_NODE_TIMEOUT_SECS {
+                    return Err(format!(
+                        "Invalid timeout_secs {} on node '{}' in graph_json: exceeds the {} second per-node cap. \
+                         Per-node timeouts are bounded to bound worker-slot occupancy when the workflow-level \
+                         execution_timeout_secs is set to 0 (disabled).",
+                        secs, node_id, MAX_NODE_TIMEOUT_SECS
+                    ));
                 }
             }
 
@@ -800,6 +813,47 @@ version: null
         let g = r#"{"nodes": [{"id": "sub", "data": {"timeout_secs": 86400}}]}"#;
         let err = validate_graph_timeouts(g).unwrap_err();
         assert!(err.contains("86400"));
+    }
+
+    // MCP-1230 (2026-05-19): per-node timeout_secs validator was data-
+    // shape-only; the MCP `add_node_to_workflow` tool's
+    // `build_add_node_payload` writes `timeout_secs` at the top level of
+    // the node (parallel to `id` and `type`), not under `data`. That
+    // top-level shape bypassed the validator until MCP-1230 brought it
+    // into dual-shape parity with retry_count/retry_backoff_ms. Live-
+    // verified on 2026-05-19 against the production cluster:
+    // `add_node_to_workflow(timeout_secs: 86400)` persisted unchecked
+    // before this fix.
+    #[test]
+    fn per_node_validator_rejects_top_level_shape_above_cap() {
+        // Shape produced by build_add_node_payload — `timeout_secs` at
+        // the node's top level, NOT under `data`.
+        let g = format!(
+            r#"{{"nodes": [{{"id": "n2", "timeout_secs": {}}}]}}"#,
+            MAX_NODE_TIMEOUT_SECS + 1
+        );
+        let err = validate_graph_timeouts(&g).unwrap_err();
+        assert!(err.contains("timeout_secs"));
+        assert!(err.contains("'n2'"));
+    }
+
+    #[test]
+    fn per_node_validator_rejects_top_level_24h() {
+        // Exact value caught live on 2026-05-19 bypassing the chokepoint.
+        let g = r#"{"nodes": [{"id": "n2", "timeout_secs": 86400}]}"#;
+        let err = validate_graph_timeouts(g).unwrap_err();
+        assert!(err.contains("86400"));
+    }
+
+    #[test]
+    fn per_node_validator_top_level_at_cap_accepted() {
+        // 600 is at the cap — should pass through cleanly. Sibling to
+        // per_node_validator_accepts_at_cap for the top-level shape.
+        let g = format!(
+            r#"{{"nodes": [{{"id": "n2", "timeout_secs": {}}}]}}"#,
+            MAX_NODE_TIMEOUT_SECS
+        );
+        assert!(validate_graph_timeouts(&g).is_ok());
     }
 
     #[test]
