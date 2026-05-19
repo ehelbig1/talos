@@ -69,11 +69,6 @@ jobs:
       # Workspace path-deps require the sibling at a path one level
       # above ${{ github.workspace }}. actions/checkout refuses
       # out-of-workspace paths, so clone via plain git. Repo is public.
-      - name: Clone talos-workflow-engine sibling
-        run: |
-          git clone --depth 1 --branch main \
-            https://github.com/aegix-dev/talos-workflow-engine.git \
-            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
 
       - name: Derive version from tag
         id: version

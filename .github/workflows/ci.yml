@@ -18,11 +18,6 @@ env:
   # job in lockstep. rust-toolchain.toml has the same value; both must
   # be bumped together.
   RUST_TOOLCHAIN: "1.95"
-  # Path-deps in controller/Cargo.toml require this sibling. Public repo
-  # — `git clone` works with no auth. Drop these knobs once the engine
-  # publishes to crates.io and the path-dep becomes a versioned dep.
-  TWE_REPO: "https://github.com/aegix-dev/talos-workflow-engine.git"
-  TWE_REF: "main"
 
 # Cancel in-flight runs of the same workflow + ref when a new push lands.
 # Frees runner minutes on rapid-fire commits.
@@ -57,14 +52,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Clone talos-workflow-engine sibling
-        # `cargo fmt --all` calls `cargo metadata` to enumerate workspace
-        # members, which resolves the sibling path-dep in
-        # controller/Cargo.toml. Without the sibling on disk the metadata
-        # call fails before fmt even runs.
-        run: |
-          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
-            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
 
       - name: Install rustfmt
         # Toolchain pin matters because rustfmt rules differ between
@@ -114,10 +101,6 @@ jobs:
           sudo rm -rf /usr/local/share/boost || true
           sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
 
-      - name: Clone talos-workflow-engine sibling
-        run: |
-          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
-            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
@@ -211,10 +194,6 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
           df -h /
 
-      - name: Clone talos-workflow-engine sibling
-        run: |
-          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
-            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
@@ -268,10 +247,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Clone talos-workflow-engine sibling
-        run: |
-          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
-            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
@@ -387,10 +362,6 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
           df -h /
 
-      - name: Clone talos-workflow-engine sibling
-        run: |
-          git clone --depth 1 --branch "$TWE_REF" "$TWE_REPO" \
-            "$(dirname "$GITHUB_WORKSPACE")/talos-workflow-engine"
 
       - name: Seed CI .env
         # Worker builder also reads .env at build time via `${VAR:?error}`

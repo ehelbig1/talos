@@ -1,0 +1,309 @@
+name: Main Publish
+
+# Builds + pushes signed `:main-<sha>` and `:main-latest` images on every
+# push to main. Operators tracking HEAD point their `TALOS_*_DIGEST` env
+# vars at the digests emitted in the job summary, OR use the `:main-latest`
+# tag for "always pull latest main" deployments.
+#
+# Relationship to release.yml:
+#   - release.yml fires on `v*` tags, emits SLSA-L2 attestations,
+#     publishes a GitHub Release, signs by digest. THE production path.
+#   - main-publish.yml (this file) fires on every push to main, signs by
+#     digest, emits digests in the job summary. Lighter — no GitHub
+#     Release, no SLSA provenance attestation. Tagged-release verification
+#     contract is unaffected.
+#
+# Verification (example):
+#   cosign verify \
+#     --certificate-identity-regexp "^https://github\\.com/ehelbig1/talos-v0/\\.github/workflows/main-publish\\.yml@refs/heads/main$" \
+#     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+#     ghcr.io/ehelbig1/talos-controller@sha256:<digest>
+#
+# Trigger filter intentionally narrow:
+#   - skips docs-only / workflow-config-only changes (no image impact)
+#   - runs on dispatch for force-rebuilds (image-pull issue, base-image bump)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "memory/**"
+      - ".gitignore"
+      - "LICENSE*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # ghcr.io push
+  id-token: write   # OIDC token for Sigstore keyless signing
+
+# Cancel in-flight runs of the same workflow + ref. Back-to-back commits
+# on main skip the older build instead of queueing.
+concurrency:
+  group: main-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/talos
+  # Short SHA used in `:main-<sha>` tag. Operators reference this tag
+  # when they want an immutable pin to a specific main commit.
+  SHORT_SHA: ${{ github.sha }}
+
+jobs:
+  # ── Build + push three service images in parallel ─────────────────────
+  build:
+    name: Build & Push (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    # 60 minutes — the cold cargo workspace build takes ~45 min on a
+    # 16-CPU runner; warm builds with BuildKit cache hit ~15 min.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [controller, worker, frontend]
+    # NOTE: this matrix uses artifact upload (not `outputs:`) to hand off
+    # digests to the downstream sign + summarise jobs. matrix-level
+    # `outputs:` is a foot-gun — each matrix entry overwrites the job's
+    # outputs block as a whole, so only the LAST entry's values survive
+    # for downstream `needs.build.outputs.X`. Artifact upload is the
+    # canonical pattern for fanning service-keyed values out of a matrix.
+    steps:
+      # All third-party actions pinned by full commit SHA. A moving tag
+      # (`@v3`) could be redirected by a compromised upstream and inject
+      # arbitrary steps under our OIDC token (which signs in our name).
+      # Pinned-by-SHA gives us an offline-verifiable commitment to the
+      # exact action source. Bump in lockstep with release.yml.
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.0
+        with:
+          persist-credentials: false
+
+      # BuildKit gives us per-layer parallelism + GHA cache backend
+      # (`type=gha,mode=max`), which dramatically reduces cold-build time
+      # for the Rust workspaces (controller + worker share most deps).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Compute image tags. The mutable `:main-latest` floats; the
+      # `:main-<sha>` is immutable and what operators should pin to in
+      # install.env for deterministic deploys. Both tags resolve to the
+      # SAME digest, so cosign signatures cover both.
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_PREFIX}-${{ matrix.service }}"
+          SHORT="${SHORT_SHA:0:12}"
+          # Order matters for `tags:` input below — Docker pushes them in
+          # listed order. Mutable tag last so a partial-push leaves the
+          # immutable tag as the canonical pointer.
+          echo "tags=${IMAGE}:main-${SHORT},${IMAGE}:main-latest" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+
+      # OCI labels for traceability — pulled from the image manifest by
+      # `docker inspect`, `cosign verify --output-file`, etc.
+      - name: Compute labels
+        id: labels
+        run: |
+          cat <<EOF >> "$GITHUB_OUTPUT"
+          labels<<LABELS_EOF
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          org.opencontainers.image.title=talos-${{ matrix.service }}
+          org.opencontainers.image.description=Talos ${{ matrix.service }} — main-branch build
+          org.opencontainers.image.licenses=MIT OR Apache-2.0
+          LABELS_EOF
+          EOF
+
+      # Build + push in one step. `provenance: true` attaches a SLSA
+      # provenance attestation to the image (lighter than the L2
+      # attestation release.yml emits via slsa-github-generator, but
+      # enough for SBOM + identity verification on main builds).
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6.18.0
+        with:
+          context: .
+          file: ${{ matrix.service }}/Dockerfile
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.labels.outputs.labels }}
+          # GHA cache backend — survives across runs on the same branch,
+          # keyed by Dockerfile path. `mode=max` caches every layer
+          # (default is min = only final layer). For Rust workspaces the
+          # cargo deps layer is by far the biggest; max is worth it.
+          cache-from: type=gha,scope=main-${{ matrix.service }}
+          cache-to: type=gha,scope=main-${{ matrix.service }},mode=max
+          push: true
+          provenance: true
+          # Build args expose the git SHA to the controller binary's
+          # build.rs so session_start.server_version reflects this commit.
+          # Mirrors release.yml's GIT_SHA_OVERRIDE pattern.
+          build-args: |
+            GIT_SHA_OVERRIDE=${{ github.sha }}
+            GIT_DIRTY_OVERRIDE=false
+
+      # Persist the digest as a tiny artifact so the sign + summarise
+      # jobs can read it back. One artifact per service; downstream jobs
+      # download all three with a single `pattern: digest-*` call.
+      - name: Write digest to file
+        id: collect-digest
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.build.outputs.digest }}"
+          if [[ -z "$DIGEST" ]]; then
+            echo "::error::digest empty — docker/build-push-action did not return one"
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          printf '%s' "$DIGEST" > "/tmp/digests/${{ matrix.service }}.txt"
+          echo "✓ ${{ matrix.service }} pushed: ${DIGEST}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: digest-${{ matrix.service }}
+          path: /tmp/digests/${{ matrix.service }}.txt
+          # Tiny payload (one sha256 line). 1-day retention is plenty —
+          # downstream jobs run within seconds and we don't keep these
+          # past the workflow run.
+          retention-days: 1
+          if-no-files-found: error
+
+      # Job-summary entry per service — visible in the workflow run UI,
+      # operators paste these directly into install.env. The full summary
+      # (all three services side-by-side) is assembled in the `summarise`
+      # job below.
+      - name: Append to job summary
+        run: |
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## ${{ matrix.service }}
+          \`\`\`
+          TALOS_$(echo "${{ matrix.service }}" | tr '[:lower:]' '[:upper:]')_DIGEST=${{ steps.build.outputs.digest }}
+          \`\`\`
+          Image: \`${{ steps.tags.outputs.image }}:main-${{ steps.tags.outputs.short }}\`
+          EOF
+
+  # ── Sign each image (keyless, Sigstore + Rekor) ─────────────────────────
+  # Separate job so its OIDC token scope is narrowly "signing", not
+  # "build+push+sign". Limits blast radius if signing is ever compromised.
+  # Mirrors the structure in release.yml.
+  sign:
+    name: Sign (${{ matrix.service }})
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      packages: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [controller, worker, frontend]
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a  # v3.8.1
+
+      - name: Download digest artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: digest-${{ matrix.service }}
+          path: /tmp/digests/
+
+      - name: Resolve digest
+        id: digest
+        run: |
+          set -euo pipefail
+          D="$(cat /tmp/digests/${{ matrix.service }}.txt)"
+          if [[ -z "$D" ]]; then
+            echo "::error::digest artifact empty for ${{ matrix.service }}"
+            exit 1
+          fi
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+
+      - name: Sign image (keyless, Sigstore + Rekor)
+        env:
+          # Opt into keyless — identity from the workflow's OIDC token.
+          # Fulcio issues a short-lived cert (~10 min) bound to this
+          # workflow URI + ref; Rekor records the signature publicly so a
+          # later cert revocation is detectable via transparency-log
+          # queries.
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_PREFIX}-${{ matrix.service }}@${{ steps.digest.outputs.digest }}"
+          echo "Signing: $IMAGE"
+          cosign sign --yes "$IMAGE"
+
+  # ── Final job summary table ───────────────────────────────────────────
+  # Single source of truth for "what just got pushed" — operators land
+  # here from the run URL, copy the three TALOS_*_DIGEST lines into their
+  # install.env, run install.sh.
+  summarise:
+    name: Publish summary
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: digest-*
+          path: /tmp/digests/
+          merge-multiple: true
+
+      - name: Emit final summary
+        run: |
+          set -euo pipefail
+          SHORT="${SHORT_SHA:0:12}"
+          # Each digest artifact was uploaded by the build matrix job as
+          # `digest-<service>` containing `<service>.txt` with the
+          # sha256:... line. `merge-multiple: true` flattens them into
+          # /tmp/digests/{controller,worker,frontend}.txt.
+          CONTROLLER_DIGEST="$(cat /tmp/digests/controller.txt)"
+          WORKER_DIGEST="$(cat /tmp/digests/worker.txt)"
+          FRONTEND_DIGEST="$(cat /tmp/digests/frontend.txt)"
+
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          # 🚀 Main publish complete — ${SHORT}
+
+          Copy into \`/etc/talos/install.env\` on your cluster host, then
+          re-run \`sudo /opt/talos/deploy/k3s/install.sh\`:
+
+          \`\`\`
+          TALOS_CONTROLLER_DIGEST=${CONTROLLER_DIGEST}
+          TALOS_WORKER_DIGEST=${WORKER_DIGEST}
+          TALOS_FRONTEND_DIGEST=${FRONTEND_DIGEST}
+          \`\`\`
+
+          Or pin to the mutable \`:main-latest\` tag (auto-tracks future
+          pushes — only use this on dev clusters; production should pin
+          to digests for reproducible deploys).
+
+          ## Verification
+          \`\`\`
+          cosign verify \\\\
+            --certificate-identity-regexp "^https://github\\\\.com/${{ github.repository }}/\\\\.github/workflows/main-publish\\\\.yml@refs/heads/main\$" \\\\
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\\\
+            ${REGISTRY}/${IMAGE_PREFIX}-controller@\${CONTROLLER_DIGEST}
+          \`\`\`
+          EOF
