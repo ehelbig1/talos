@@ -681,18 +681,25 @@ vault:
   init:
     enabled: true
     # kubectl image used by the secret-patcher container. Pin to the
-    # k3s minor version when possible. Default switched from
-    # `bitnami/kubectl:1.31` to `rancher/kubectl:v1.31.4` in May-2026:
-    # Bitnami changed their free-image policy in late 2025 and the
-    # public `bitnami/kubectl` tag now returns "manifest unknown" /
-    # ImagePullBackOff — leaving the vault-init Job stuck for 39+
-    # hours in production until we figured out it was the same
-    # Bitnami issue that motivated the Postgres image switch.
-    # rancher/kubectl is free, tracks k8s minor versions, and aligns
-    # with the k3s the chart targets.
+    # k3s minor version when possible.
+    #
+    # Image-choice history:
+    # 1. `bitnami/kubectl:1.31` — original. Stopped working in late
+    #    2025 when Bitnami moved public images to a paid registry.
+    # 2. `rancher/kubectl:v1.31.4` — failed at runc with "exec:
+    #    /bin/sh: no such file or directory". The image is a
+    #    scratch-style minimal layout with only the kubectl binary;
+    #    no shell at all. Doesn't work for our script-based
+    #    secret-patcher.
+    # 3. `alpine/k8s:1.31.4` — current default. Alpine-based,
+    #    community-maintained at github.com/alpine-docker/k8s,
+    #    bundles kubectl + helm + sh + bash + jq + awk + curl. Free.
+    #    Aligns with k3s minor version. This is the canonical "I
+    #    need kubectl in a CI/init Job" image in the k8s
+    #    ecosystem post-bitnami.
     kubectlImage:
-      repository: rancher/kubectl
-      tag: "v1.31.4"
+      repository: alpine/k8s
+      tag: "1.31.4"
       pullPolicy: IfNotPresent
     # MCP-898 (2026-05-14): explicit resources for the init Job's two
     # containers. Pre-fix neither carried `resources:`, putting the
