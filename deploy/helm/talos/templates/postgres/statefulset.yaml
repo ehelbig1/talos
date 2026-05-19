@@ -16,6 +16,25 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "talos.componentLabels" (list . "postgres") | nindent 4 }}
+  annotations:
+    # Run BEFORE the migrations Job (weight 0). The migration Job is a
+    # pre-install/pre-upgrade hook itself, so the Postgres resources
+    # have to be pre-install/pre-upgrade hooks with a *more negative*
+    # weight; otherwise on a fresh install the migration job tries to
+    # connect to a Postgres pod that doesn't exist yet. Helm waits for
+    # a StatefulSet hook's pods to be Ready (readyReplicas == replicas)
+    # before moving on, so by the time the migrations Job runs,
+    # pg_isready is green.
+    #
+    # Side effect: every `helm upgrade` recreates the StatefulSet
+    # (~30 s Postgres restart). PVCs from volumeClaimTemplates aren't
+    # touched by `helm uninstall` or by hook recreation, so the data
+    # survives the bounce. Acceptable for the single-node / homelab
+    # path; multi-node production should use an external managed
+    # Postgres (`postgres.enabled: false`) anyway.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-11"
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   serviceName: {{ include "talos.componentName" (list . "postgres") }}
   replicas: 1

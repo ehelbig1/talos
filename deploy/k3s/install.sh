@@ -444,8 +444,14 @@ else
 fi
 
 # Postgres mode — internal (chart-deployed) vs external (managed).
+#
+# Heredoc uses single-quoted 'EOF' to disable shell expansion: the
+# inline comment below contains backticks around "helm get values",
+# which unquoted EOF would execute as a command substitution. There
+# are no $-variables in this block that need expansion, so the
+# single-quoted form is strictly safer.
 if [[ "${TALOS_USE_INTERNAL_POSTGRES:-no}" == "yes" ]]; then
-    POSTGRES_BLOCK=$(cat <<EOF
+    POSTGRES_BLOCK=$(cat <<'EOF'
 postgres:
   enabled: true
   # passwordSecret.create=false: the chart consumes the credentials

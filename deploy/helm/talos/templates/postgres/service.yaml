@@ -6,6 +6,13 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "talos.componentLabels" (list . "postgres") | nindent 4 }}
+  annotations:
+    # Install before the StatefulSet so the StatefulSet pod has stable
+    # DNS via the headless service from the moment it's scheduled.
+    # Weight -13 < statefulset's -11 ensures order.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-13"
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   type: ClusterIP
   ports:
