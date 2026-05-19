@@ -74,6 +74,26 @@ spec:
         - protocol: TCP
           port: 7687
     {{- end }}
+    # Postgres (if in-cluster). When postgres.enabled=true, the
+    # postgres Service points at a pod in the cluster's pod
+    # network (10.42.0.0/16 on k3s by default). The
+    # externalEgressCIDRs block below explicitly `except`s the
+    # RFC1918 ranges including 10.0.0.0/8, so without this rule
+    # the controller's connection to the in-cluster Postgres
+    # gets dropped → sqlx pool hangs → "pool timed out while
+    # waiting for an open connection". Sibling rule to the
+    # Neo4j / Vault / MinIO blocks above. Worker doesn't talk
+    # to Postgres directly so it doesn't need an equivalent.
+    {{- if .Values.postgres.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- end }}
     # Vault (if in-cluster)
     {{- if .Values.vault.enabled }}
     - to:
