@@ -23,16 +23,20 @@ name: Main Publish
 #   - skips docs-only / workflow-config-only changes (no image impact)
 #   - runs on dispatch for force-rebuilds (image-pull issue, base-image bump)
 
+# Auto-trigger on push to main DISABLED in May-2026 — operator opted
+# out of paid GitHub Actions and publishes locally via
+# `scripts/publish-images.sh`. Workflow kept as reference for when GHA
+# is re-enabled. To restore the push trigger, uncomment the block below.
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "memory/**"
-      - ".gitignore"
-      - "LICENSE*"
   workflow_dispatch:
+  # push:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - "**.md"
+  #     - "docs/**"
+  #     - "memory/**"
+  #     - ".gitignore"
+  #     - "LICENSE*"
 
 permissions:
   contents: read

@@ -13,12 +13,13 @@ name: Publish Templates
 # subcommand. CI never re-implements the cargo-component scaffold —
 # whatever's in the controller image is what gets shipped, no drift.
 
+# Push-trigger DISABLED in May-2026 — operator opted out of paid GitHub
+# Actions. Module-template publishing is a rare operation; do it via
+# `gh workflow run template-publish.yml` after the operator's GHA spend
+# is approved, OR run the controller's `publish-templates` subcommand
+# locally with `gh release create` for the tag side. Workflow kept as
+# reference. To restore push-on-template-change, uncomment below.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "module-templates/**"
-      - ".github/workflows/template-publish.yml"
   workflow_dispatch:
     inputs:
       controller_image:

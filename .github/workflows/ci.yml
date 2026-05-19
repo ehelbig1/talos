@@ -1,10 +1,20 @@
 name: CI
 
+# Auto-triggers DISABLED in May-2026 — the operator opted out of paid
+# GitHub Actions and runs the workspace's lint + test suite locally via
+# `cargo check --workspace`, `cargo test --workspace`, and
+# `bash scripts/lint-structural.sh`. Image publish is handled by
+# `scripts/publish-images.sh` (local builds + cosign).
+#
+# This workflow is kept (not deleted) so it can be re-enabled by
+# restoring the `push` + `pull_request` triggers below if GHA spending
+# is later approved. The job logic itself is unchanged.
 on:
-  push:
-    branches: [main, "*"]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+  # push:
+  #   branches: [main, "*"]
+  # pull_request:
+  #   branches: [main]
 
 # Least-privilege default. Individual jobs can widen if they need to
 # write to the repo (no current job does — release.yml has its own

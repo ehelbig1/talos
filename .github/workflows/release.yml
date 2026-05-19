@@ -20,10 +20,16 @@ name: Release
 # See `docs/security/operational-runbook.md` for the full verification
 # procedure + incident response on a revoked / leaked identity.
 
+# Tag-trigger DISABLED in May-2026 — operator opted out of paid GitHub
+# Actions. Production tagged releases are produced locally via
+# `scripts/publish-images.sh`. Workflow kept as the canonical SLSA-L2
+# reference and for when GHA is re-enabled — to restore tag triggering,
+# uncomment the `push: tags:` block below.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+  # push:
+  #   tags:
+  #     - 'v*'
 
 permissions:
   contents: write        # create GitHub Release + upload assets
