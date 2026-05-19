@@ -65,6 +65,16 @@ release-digests.txt
 # Documentation, observability dashboards, and dev-only scripts —
 # nothing the controller or worker binaries need at runtime.
 docs/
+# Exception: the talos-workflow-engine crate's `SCHEMA_DOC` const
+# does `include_str!("../../docs/workflow-engine/graph-json-schema.md")`
+# at compile time. That file MUST be in the build context. ~8 small
+# markdown files (~60 KB total) — negligible context-size hit, but
+# without it `cargo build` fails with "couldn't read … No such file
+# or directory". Bug surfaced 2026-05-19 immediately after folding
+# the engine back into the workspace (commit 0f34bb3); the engine
+# previously lived outside the docker context entirely so the
+# include_str path resolved against the sibling repo.
+!docs/workflow-engine/
 observability/
 add_scopes.py
 update_protocol.py
