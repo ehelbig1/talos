@@ -231,7 +231,16 @@ spec:
           resources:
             {{- toYaml .Values.vault.init.resources.secretPatcher | nindent 12 }}
           command:
-            - /bin/bash
+            # /bin/sh, NOT /bin/bash — the rancher/kubectl image (and
+            # any minimal-busybox kubectl variant) doesn't ship bash;
+            # the bitnami image we used previously did, masking the
+            # bash-dependency. The script body below is POSIX-clean
+            # (set -eu, case, printf, no [[ ]] / arrays / parameter
+            # expansion-substitution), so /bin/sh works fine. Verified
+            # by event-log on the May-2026 rollout:
+            #   `failed to create shim task: ... exec: "/bin/bash":
+            #    stat /bin/bash: no such file or directory`.
+            - /bin/sh
             - -c
             - |
               set -eu
