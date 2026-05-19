@@ -545,6 +545,21 @@ chmod 0600 "$OVERLAY"
 ok "overlay written"
 
 # ── 8. Deploy Talos chart ────────────────────────────────────────
+# Pre-delete the vault-init Job if it exists. The chart's vault-init
+# is a regular Job (not a Helm hook — see comment in
+# templates/vault/init-job.yaml for why), so when its pod template
+# changes between releases (image bump, env-var rename, etc.), helm
+# upgrade fails with `Job.batch is invalid: spec.template ... field
+# is immutable`. The Job is idempotent — its initContainer detects
+# the existing bootstrap.json on the Vault PVC and just re-unseals —
+# so deleting and recreating each run is safe AND avoids the
+# manual-intervention workflow operators kept hitting on
+# image/spec changes (most recently May-2026 bitnami/kubectl →
+# rancher/kubectl switch).
+log "Pre-cleaning vault-init Job (immutable spec workaround)"
+k3s kubectl -n "$TALOS_NAMESPACE" delete job talos-vault-init \
+    --ignore-not-found --wait=true >/dev/null 2>&1 || true
+
 log "Installing Talos chart from $CHART_DIR"
 helm upgrade --install "$TALOS_RELEASE" "$CHART_DIR" \
     --namespace "$TALOS_NAMESPACE" \
