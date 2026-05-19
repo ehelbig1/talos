@@ -1,0 +1,52 @@
+{{- if and .Values.postgres.enabled .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "talos.componentName" (list . "postgres") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "postgres") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "talos.componentSelectorLabels" (list . "postgres") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Three legitimate clients:
+    #   1. controller    — runtime SQL queries (pool of ~20 connections)
+    #   2. migrations    — `sqlx migrate run` on every helm install/upgrade
+    #   3. postgres-backup — daily pg_dump CronJob
+    # The worker never reaches Postgres directly; it routes through
+    # signed NATS-RPC to the controller (same architectural rule as
+    # Neo4j). Adding worker here would weaken the data-plane
+    # isolation property.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: controller
+              app.kubernetes.io/instance: {{ .Release.Name }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: migrations
+              app.kubernetes.io/instance: {{ .Release.Name }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres-backup
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 5432
+  egress:
+    # DNS only. Postgres never reaches out — no replication, no FDW,
+    # no archive_command. If WAL archiving to S3 is ever turned on
+    # this list needs to grow; until then keep it tight.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}

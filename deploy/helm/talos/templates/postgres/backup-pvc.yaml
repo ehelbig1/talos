@@ -1,0 +1,22 @@
+{{- if and .Values.postgres.enabled .Values.postgres.backup.enabled .Values.postgres.backup.persistence.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "talos.componentName" (list . "postgres-backup") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "postgres-backup") | nindent 4 }}
+  annotations:
+    # Survive `helm uninstall` so daily dumps aren't lost if the
+    # chart is re-rolled. Same pattern as the postgres-credentials
+    # Secret.
+    helm.sh/resource-policy: "keep"
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.postgres.backup.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.postgres.backup.persistence.size | default "10Gi" }}
+{{- end }}

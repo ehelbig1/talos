@@ -411,12 +411,120 @@ frontend:
 # ============================================================================
 
 postgres:
-  # In-cluster Postgres is NOT deployed by this chart. Use a managed
-  # Postgres with pgvector (Neon in Phase 1, RDS in Phase 2).
+  # Two mutually-exclusive modes:
+  #
+  # 1. `enabled: false` (default, recommended for any multi-node /
+  #    managed deployment): operator wires DATABASE_URL in
+  #    bootstrapSecret pointing at a managed Postgres (Neon, RDS,
+  #    Cloud SQL, etc.).
+  #
+  # 2. `enabled: true` (single-node / homelab): chart deploys a
+  #    standalone Postgres StatefulSet on the same cluster, backed
+  #    by a local-path PVC. NOT replicated — single replica, no
+  #    PITR, daily pg_dump only. Suitable for personal / prototype
+  #    Talos installs where running an external managed Postgres
+  #    isn't desirable. install.sh exposes the `TALOS_USE_INTERNAL_
+  #    POSTGRES=yes` toggle to opt in.
+  enabled: false
+
+  image:
+    # Official upstream Postgres image from Docker Hub. NOT bitnami —
+    # Bitnami changed their free-image policy in late 2025 and many
+    # of their public images now redirect to a paid registry. The
+    # official upstream image is community-maintained, free, and
+    # uses a postgres user at uid/gid 70 (which is why the
+    # StatefulSet uses its own securityContext block instead of
+    # inheriting the chart-wide 10001 default).
+    repository: postgres
+    tag: "17-alpine"
+    # Pin to a digest in production. Compose with `docker manifest
+    # inspect postgres:17-alpine | jq -r '.config.digest'` (or set
+    # TALOS_POSTGRES_IMAGE_DIGEST in install.sh).
+    digest: ""
+    pullPolicy: IfNotPresent
+
+  auth:
+    # All three of these are consumed via secretKeyRef from a Secret
+    # named `<release>-talos-postgres-credentials`. install.sh
+    # generates the password at first install; subsequent installs
+    # reuse the existing Secret (`helm.sh/resource-policy=keep`).
+    username: "talos"
+    database: "talos"
+    # Set automatically by install.sh; leave empty in values.yaml so
+    # `helm template` against a clean checkout doesn't render a
+    # plaintext placeholder.
+    password: ""
+    passwordSecret:
+      # Whether the chart should EMIT the credentials Secret. install.sh
+      # always creates it out-of-band (so plaintext never round-trips
+      # through `helm get values`) and sets this to false. `helm
+      # template` smoke tests can flip it on by passing
+      # `--set postgres.auth.password=<dummy>` along with this flag.
+      create: false
+
+  persistence:
+    enabled: true
+    # k3s default (local-path) is correct for single-node. For
+    # multi-node clusters, pin to a network-attached class
+    # (ebs-gp3 / persistent-disk-balanced / azuredisk-csi).
+    storageClass: ""
+    size: "20Gi"
+
+  resources:
+    # Calibrated for a 4 GiB VM where Postgres shares the host with
+    # worker, controller, NATS, Neo4j, MinIO, Vault, frontend.
+    # 1 GiB hard cap pairs with shared_buffers=256MB in
+    # postgresql.conf — leaves ~512 MiB for OS page cache /
+    # connection backends / WAL buffers.
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1500m"
+      memory: 1Gi
+
+  # postgresql.conf tuning. Each value falls back to the in-template
+  # default when omitted; override here only when you have a
+  # workload-specific reason. See templates/postgres/configmap.yaml
+  # for the units + rationale per knob.
+  config:
+    maxConnections: 60
+    sharedBuffers: "256MB"
+    effectiveCacheSize: "512MB"
+    workMem: "4MB"
+    maintenanceWorkMem: "64MB"
+    maxWalSize: "2GB"
+
+  backup:
+    enabled: true
+    # 03:00 UTC daily — quiet hour for the user-facing workflow
+    # schedules (no scheduled cron entries between 02-05 UTC in the
+    # default Talos workflow set).
+    schedule: "0 3 * * *"
+    activeDeadlineSeconds: 1800
+    # Keep the last N dumps. With ~10 MiB/dump for a modest Talos
+    # install, 7 dumps fit comfortably inside a 10 GiB PVC.
+    retentionCount: 7
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    persistence:
+      # ALWAYS leave this on outside `helm template` smoke tests.
+      # emptyDir backups die with the pod and defeat the purpose.
+      enabled: true
+      storageClass: ""
+      size: "10Gi"
+
+  # For the `enabled: false` path the operator points the chart at
+  # an external managed Postgres via bootstrapSecret.data.DATABASE_URL.
+  # Kept here for documentation only; the chart doesn't consume this
+  # field — install.sh writes the connection string directly into the
+  # bootstrap Secret.
   external:
-    # Full connection string including user, password, host, port, db.
-    # Example: postgres://talos:PASSWORD@db.example.com:5432/talos
-    # Leave empty to require it be injected via external-secrets.
     url: ""
 
 redis:

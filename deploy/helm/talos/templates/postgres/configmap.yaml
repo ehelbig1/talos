@@ -1,0 +1,83 @@
+{{- if .Values.postgres.enabled -}}
+# postgresql.conf tuning, baked into the image's read-only filesystem
+# via a ConfigMap mount. The values here are calibrated for a single-
+# node k3s on a 4-8 GiB VM with a single-user Talos workload:
+#
+#   shared_buffers (256 MiB)        ≈ 25 % of the pod memory limit (1 GiB)
+#   effective_cache_size (512 MiB)  ≈ what we expect the OS to cache,
+#                                     deliberately conservative because
+#                                     Neo4j + worker + NATS share the
+#                                     same page cache.
+#   work_mem (4 MiB)                Default. Multiply by max_connections
+#                                     × parallel_workers to bound worst
+#                                     case per-query memory.
+#   maintenance_work_mem (64 MiB)   VACUUM / CREATE INDEX headroom; one
+#                                     such operation runs at a time.
+#   max_connections (60)            Talos controller pool typically holds
+#                                     ≤ 20 conns; 60 gives headroom for
+#                                     migrations + pg_dump + interactive
+#                                     debugging without exhausting RAM
+#                                     budget.
+#   max_wal_size (2 GiB)            Bounds the WAL's disk footprint.
+#                                     min_wal_size avoids constant
+#                                     recycle churn under bursty writes.
+#   random_page_cost (1.1)          k3s local-path is SSD-backed on the
+#                                     VM disk — tell the planner so it
+#                                     prefers indexes over sequential
+#                                     scans.
+#   log_min_duration_statement      Log queries > 1 s. Cheap to leave on;
+#                                     surfaces the worst regressions in
+#                                     `kubectl logs` without flooding.
+#   log_connections / disconnections  Audit trail of who's connecting,
+#                                     surfaces stuck pools.
+#
+# IMPORTANT: when changing any value here, also bump
+# `.Values.postgres.podAnnotations.checksum/config` (or just trust the
+# template's auto-checksum below) so the StatefulSet rolls the pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "talos.componentName" (list . "postgres-config") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "postgres") | nindent 4 }}
+data:
+  postgresql.conf: |
+    # Connections
+    listen_addresses = '*'
+    max_connections = {{ .Values.postgres.config.maxConnections | default 60 }}
+
+    # Memory
+    shared_buffers = {{ .Values.postgres.config.sharedBuffers | default "256MB" }}
+    effective_cache_size = {{ .Values.postgres.config.effectiveCacheSize | default "512MB" }}
+    work_mem = {{ .Values.postgres.config.workMem | default "4MB" }}
+    maintenance_work_mem = {{ .Values.postgres.config.maintenanceWorkMem | default "64MB" }}
+
+    # WAL / checkpointing
+    wal_buffers = 16MB
+    checkpoint_completion_target = 0.9
+    min_wal_size = 256MB
+    max_wal_size = {{ .Values.postgres.config.maxWalSize | default "2GB" }}
+
+    # Planner — SSD profile
+    random_page_cost = 1.1
+    effective_io_concurrency = 200
+    default_statistics_target = 100
+
+    # Parallelism — single-user, keep modest
+    max_worker_processes = 2
+    max_parallel_workers_per_gather = 1
+    max_parallel_workers = 2
+
+    # Observability
+    log_min_duration_statement = 1000ms
+    log_connections = on
+    log_disconnections = on
+    log_lock_waits = on
+    log_temp_files = 0
+    log_line_prefix = '%t [%p] %u@%d '
+    log_timezone = 'UTC'
+
+    # Safety
+    password_encryption = scram-sha-256
+{{- end }}

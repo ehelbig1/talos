@@ -1,0 +1,129 @@
+{{- if and .Values.postgres.enabled .Values.postgres.backup.enabled -}}
+# Daily pg_dump → local-path PVC for the single-node Talos deployment.
+#
+# Limitations to be aware of (and accept for this deployment model):
+#   * Backups live on the same physical disk as the primary DB —
+#     useful for accidental DROP / migration mistakes / app-level
+#     corruption, USELESS for disk failure.
+#   * No off-host backup target. Operators who care should configure
+#     an S3 / B2 mirror (rclone CronJob alongside this one), or
+#     promote to a managed Postgres with snapshot-based PITR.
+#   * Retention: keep the last `postgres.backup.retentionCount`
+#     dumps. The cleanup runs inside the same Job so a failed dump
+#     never deletes prior backups.
+#
+# Resource policy: small CPU/mem requests; pg_dump is mostly I/O.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "talos.componentName" (list . "postgres-backup") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "postgres-backup") | nindent 4 }}
+spec:
+  schedule: {{ .Values.postgres.backup.schedule | default "0 3 * * *" | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: {{ .Values.postgres.backup.activeDeadlineSeconds | default 1800 }}
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "talos.componentLabels" (list . "postgres-backup") | nindent 12 }}
+        spec:
+          restartPolicy: OnFailure
+          {{- include "talos.imagePullSecrets" . | nindent 10 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            runAsGroup: 70
+            fsGroup: 70
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-dump
+              image: {{ include "talos.image" .Values.postgres.image }}
+              imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 70
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "talos.componentName" (list . "postgres-credentials") }}
+                      key: POSTGRES_USER
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "talos.componentName" (list . "postgres-credentials") }}
+                      key: POSTGRES_PASSWORD
+                - name: PGDATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "talos.componentName" (list . "postgres-credentials") }}
+                      key: POSTGRES_DB
+                - name: PGHOST
+                  value: {{ include "talos.componentName" (list . "postgres") | quote }}
+                - name: PGPORT
+                  value: "5432"
+                - name: RETENTION_COUNT
+                  value: {{ .Values.postgres.backup.retentionCount | default 7 | quote }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -euo pipefail
+                  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+                  dump="/backups/talos-${ts}.sql.gz"
+                  echo "[pg-dump] $(date -u): dumping ${PGDATABASE}@${PGHOST} -> ${dump}"
+                  # --no-owner / --no-privileges keeps the dump
+                  # restorable into a fresh DB owned by a different
+                  # role (useful when restoring into a managed
+                  # Postgres later).
+                  pg_dump \
+                      --format=plain \
+                      --no-owner \
+                      --no-privileges \
+                      --quote-all-identifiers \
+                      | gzip -c > "${dump}"
+                  echo "[pg-dump] $(date -u): dump complete, size $(wc -c < "${dump}") bytes"
+                  # Retention — keep the newest N files, delete the rest.
+                  # `ls -1t` sorts newest-first; tail -n+$((N+1)) skips
+                  # the first N and removes the rest.
+                  cd /backups
+                  ls -1t talos-*.sql.gz | tail -n "+$((RETENTION_COUNT + 1))" \
+                      | xargs -r rm -v
+                  echo "[pg-dump] $(date -u): retention pass complete"
+              resources:
+                {{- toYaml .Values.postgres.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: "256Mi"
+            {{- if .Values.postgres.backup.persistence.enabled }}
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ include "talos.componentName" (list . "postgres-backup") }}
+            {{- else }}
+            # No-PVC fallback for `helm template` smoke tests. NEVER
+            # use this in real deployments — backups die with the pod.
+            - name: backups
+              emptyDir:
+                sizeLimit: "1Gi"
+            {{- end }}
+{{- end }}
