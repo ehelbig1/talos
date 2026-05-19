@@ -61,6 +61,13 @@ SERVICES=("${SERVICES_DEFAULT[@]}")
 DO_PUSH=1
 DO_SIGN=1
 UPDATE_ENV_FILE=""
+# Default to linux/amd64 because the production k3s VM is x86_64.
+# Apple-Silicon Macs default Docker to linux/arm64; building without
+# explicit platform produces images the VM can't exec — symptom is
+# `exec /usr/local/cargo/bin/sqlx: exec format error` in the
+# migrations Job. Override via --platform if you're targeting a
+# different cluster arch.
+PLATFORM="linux/amd64"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -68,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --no-push)   DO_PUSH=0; shift ;;
         --no-sign)   DO_SIGN=0; shift ;;
         --update-env) UPDATE_ENV_FILE="$2"; shift 2 ;;
+        --platform)  PLATFORM="$2"; shift 2 ;;
         --help|-h)
             sed -n '2,40p' "$0"
             exit 0 ;;
@@ -123,10 +131,19 @@ fi
 ok "Git: ${GIT_SHA} (short=${SHORT_SHA}, dirty=${GIT_DIRTY})"
 ok "Registry: ${REGISTRY}/${TALOS_GHCR_OWNER}/talos-{controller,worker,frontend}"
 ok "Services: ${SERVICES[*]}"
+ok "Platform: ${PLATFORM}"
 echo
 
 # ── Build ─────────────────────────────────────────────────────────────
-log "Building ${#SERVICES[@]} image(s) via docker compose"
+log "Building ${#SERVICES[@]} image(s) via docker compose for ${PLATFORM}"
+
+# DOCKER_DEFAULT_PLATFORM forces BuildKit to produce images for the
+# specified target arch regardless of host arch. On Apple Silicon this
+# means QEMU-emulated x86_64 compilation — slower (~3x cold) but
+# necessary because the production VM is x86_64. See PLATFORM block
+# in flag parsing for the rationale.
+export DOCKER_DEFAULT_PLATFORM="$PLATFORM"
+
 export GIT_SHA_OVERRIDE="$GIT_SHA"
 export GIT_DIRTY_OVERRIDE="$GIT_DIRTY"
 # Pass GIT_SHA_OVERRIDE through to the controller's build.rs (see
