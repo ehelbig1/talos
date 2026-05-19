@@ -138,9 +138,12 @@ ok "Build complete"
 echo
 
 # ── Tag + Push ────────────────────────────────────────────────────────
-declare -A DIGESTS  # service -> sha256:...
+# Parallel arrays instead of `declare -A` — macOS ships bash 3.2 (no
+# associative arrays). `SERVICES[i]` matches `DIGESTS[i]` by index.
+DIGESTS=()
 
-for svc in "${SERVICES[@]}"; do
+for i in "${!SERVICES[@]}"; do
+    svc="${SERVICES[$i]}"
     LOCAL_TAG="talos-${svc}"
     IMAGE="${REGISTRY}/${TALOS_GHCR_OWNER}/talos-${svc}"
     SHA_TAG="${IMAGE}:main-${SHORT_SHA}"
@@ -152,6 +155,7 @@ for svc in "${SERVICES[@]}"; do
 
     if [[ "$DO_PUSH" -eq 0 ]]; then
         warn "  --no-push: skipping registry upload for ${svc}"
+        DIGESTS[$i]=""
         continue
     fi
 
@@ -170,7 +174,7 @@ for svc in "${SERVICES[@]}"; do
               | awk -F@ '{print $2}')"
     [[ -n "$DIGEST" ]] || die "could not resolve digest for ${svc}"
 
-    DIGESTS["$svc"]="$DIGEST"
+    DIGESTS[$i]="$DIGEST"
     ok "${svc} pushed: ${DIGEST}"
     echo
 done
@@ -178,8 +182,9 @@ done
 # ── Sign ──────────────────────────────────────────────────────────────
 if [[ "$DO_SIGN" -eq 1 && "$DO_PUSH" -eq 1 ]]; then
     log "Signing pushed images (keyless, Sigstore + Rekor)"
-    for svc in "${SERVICES[@]}"; do
-        DIGEST="${DIGESTS[$svc]:-}"
+    for i in "${!SERVICES[@]}"; do
+        svc="${SERVICES[$i]}"
+        DIGEST="${DIGESTS[$i]:-}"
         [[ -n "$DIGEST" ]] || continue
         IMAGE="${REGISTRY}/${TALOS_GHCR_OWNER}/talos-${svc}@${DIGEST}"
         log "  cosign sign ${svc}@${DIGEST:0:24}…"
@@ -200,9 +205,10 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
     echo "═══════════════════════════════════════════════════════════"
     echo "  Publish complete — copy these into /etc/talos/install.env"
     echo "═══════════════════════════════════════════════════════════"
-    for svc in "${SERVICES[@]}"; do
+    for i in "${!SERVICES[@]}"; do
+        svc="${SERVICES[$i]}"
         VAR="TALOS_$(echo "$svc" | tr '[:lower:]' '[:upper:]')_DIGEST"
-        echo "${VAR}=${DIGESTS[$svc]}"
+        echo "${VAR}=${DIGESTS[$i]}"
     done
     echo "═══════════════════════════════════════════════════════════"
     echo
@@ -216,9 +222,10 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
         # macOS sed needs `-i ''`; GNU sed wants `-i` alone. Detect.
         SED_INPLACE=(-i)
         if [[ "$(uname)" == "Darwin" ]]; then SED_INPLACE=(-i ''); fi
-        for svc in "${SERVICES[@]}"; do
+        for i in "${!SERVICES[@]}"; do
+            svc="${SERVICES[$i]}"
             VAR="TALOS_$(echo "$svc" | tr '[:lower:]' '[:upper:]')_DIGEST"
-            DIGEST="${DIGESTS[$svc]}"
+            DIGEST="${DIGESTS[$i]}"
             # Replace the first matching `^[[:space:]]*VAR=...` line.
             # The line might be indented (install.env in the operator's
             # cluster has 2-space indent on every key — historical
