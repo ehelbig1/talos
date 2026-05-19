@@ -65,7 +65,10 @@ ARG COSIGN_VERSION=v2.4.1
 ARG COSIGN_SHA256=8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 \
- && curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+ && curl -fsSL \
+      --retry 5 --retry-delay 5 --retry-connrefused \
+      --connect-timeout 30 --max-time 180 \
+      "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
       -o /usr/local/bin/cosign \
  && echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c - \
  && chmod +x /usr/local/bin/cosign \
