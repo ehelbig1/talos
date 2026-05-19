@@ -31,6 +31,66 @@ spec:
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "talos.podSecurityContext" . | nindent 8 }}
+      {{- if .Values.postgres.enabled }}
+      # Wait for the in-cluster Postgres pod to be Ready before
+      # sqlx migrate runs. Helm's hook ordering ensures the postgres
+      # StatefulSet OBJECT exists before this Job (the StatefulSet's
+      # hook-weight=-11 < this Job's hook-weight=0), but Helm does
+      # NOT wait for non-Job hook resources to reach Ready before
+      # moving on. So without this initContainer, migrations fires
+      # against a postgres pod that's still in `initdb` and gets
+      # connection refused (kube-proxy RSTs because the Service has
+      # no Endpoints yet).
+      #
+      # Uses the same image as the postgres pod so pg_isready is
+      # guaranteed available, and avoids a separate image pull.
+      # Wrapped in `sh -c` so PATH lookup finds pg_isready regardless
+      # of distro (alpine /usr/local/bin vs debian /usr/bin).
+      # Polls every 2 s, with no internal timeout — relies on the
+      # Job's `activeDeadlineSeconds` (default 900 s) as the outer
+      # bound. If Postgres never comes up, the Job fails on that
+      # deadline rather than looping forever.
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ include "talos.image" .Values.postgres.image }}
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PGHOST
+              value: {{ include "talos.componentName" (list . "postgres") | quote }}
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.componentName" (list . "postgres-credentials") }}
+                  key: POSTGRES_USER
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.componentName" (list . "postgres-credentials") }}
+                  key: POSTGRES_DB
+          command:
+            - sh
+            - -c
+            - |
+              echo "waiting for postgres at ${PGHOST}:${PGPORT}…"
+              i=0
+              until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -q; do
+                  i=$((i + 1))
+                  if [ $((i % 15)) -eq 0 ]; then
+                      echo "still waiting (${i} polls)…"
+                  fi
+                  sleep 2
+              done
+              echo "postgres ready after ${i} polls"
+      {{- end }}
       containers:
         - name: migrate
           image: {{- if .Values.migrations.image.repository }}

@@ -24,10 +24,17 @@ metadata:
     # pre-install/pre-upgrade hook itself, so the Postgres resources
     # have to be pre-install/pre-upgrade hooks with a *more negative*
     # weight; otherwise on a fresh install the migration job tries to
-    # connect to a Postgres pod that doesn't exist yet. Helm waits for
-    # a StatefulSet hook's pods to be Ready (readyReplicas == replicas)
-    # before moving on, so by the time the migrations Job runs,
-    # pg_isready is green.
+    # connect to a Postgres pod that doesn't exist yet.
+    #
+    # IMPORTANT: Helm only waits for **Job** hooks to reach the
+    # Succeeded state — for StatefulSet (or Deployment) hooks it
+    # returns the moment the apply call completes, NOT when the pods
+    # become Ready. So the weight ordering only ensures the SS object
+    # exists before migrations fire; it does NOT ensure pg_isready is
+    # green. The migrations Job has an initContainer that polls
+    # pg_isready against the postgres Service until it succeeds —
+    # that's what actually blocks migrations until Postgres is ready.
+    # (see templates/migrations/job.yaml).
     #
     # Side effect: every `helm upgrade` recreates the StatefulSet
     # (~30 s Postgres restart). PVCs from volumeClaimTemplates aren't
@@ -116,41 +123,41 @@ spec:
           # MCP-895 fix.
           startupProbe:
             exec:
+              # Wrap in `sh -c` so PATH lookup finds pg_isready regardless of
+              # whether the image installs it at /usr/local/bin (Alpine) or
+              # /usr/bin (Debian/pgvector). The kubelet's exec syscall doesn't
+              # do PATH resolution; the shell wrapper does.
               command:
-                - /usr/local/bin/pg_isready
-                - -U
-                - $(POSTGRES_USER)
-                - -d
-                - $(POSTGRES_DB)
-                - -h
-                - "127.0.0.1"
+                - sh
+                - -c
+                - "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB -h 127.0.0.1"
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 30
           livenessProbe:
             exec:
+              # Wrap in `sh -c` so PATH lookup finds pg_isready regardless of
+              # whether the image installs it at /usr/local/bin (Alpine) or
+              # /usr/bin (Debian/pgvector). The kubelet's exec syscall doesn't
+              # do PATH resolution; the shell wrapper does.
               command:
-                - /usr/local/bin/pg_isready
-                - -U
-                - $(POSTGRES_USER)
-                - -d
-                - $(POSTGRES_DB)
-                - -h
-                - "127.0.0.1"
+                - sh
+                - -c
+                - "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB -h 127.0.0.1"
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 6
           readinessProbe:
             exec:
+              # Wrap in `sh -c` so PATH lookup finds pg_isready regardless of
+              # whether the image installs it at /usr/local/bin (Alpine) or
+              # /usr/bin (Debian/pgvector). The kubelet's exec syscall doesn't
+              # do PATH resolution; the shell wrapper does.
               command:
-                - /usr/local/bin/pg_isready
-                - -U
-                - $(POSTGRES_USER)
-                - -d
-                - $(POSTGRES_DB)
-                - -h
-                - "127.0.0.1"
+                - sh
+                - -c
+                - "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB -h 127.0.0.1"
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
