@@ -11,7 +11,7 @@ regex = "1.12"
 serde_json.workspace = true
 # MCP-1036: bounded_preview for caller-supplied reflection in error messages.
 talos-text-util = { path = "../talos-text-util" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [lints]

@@ -42,11 +42,11 @@ talos-secrets-manager = { path = "../talos-secrets-manager" }
 # MCP-1050: canonical truncate_at_char_boundary for webhook UA truncation.
 talos-text-util = { path = "../talos-text-util" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
-talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
+talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 zeroize = "1.8"

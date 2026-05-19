@@ -15,7 +15,7 @@ serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # MCP-1032: bounded_preview for caller-supplied reflection in schema validation errors.
 talos-text-util = { path = "../talos-text-util" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing.workspace = true

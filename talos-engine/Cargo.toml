@@ -41,9 +41,9 @@ talos-retry-intelligence = { path = "../talos-retry-intelligence" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
-talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
-talos-workflow-engine-nats = { path = "../../talos-workflow-engine/talos-workflow-engine-nats" }
+talos-workflow-engine = { path = "../talos-workflow-engine" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+talos-workflow-engine-nats = { path = "../talos-workflow-engine-nats" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }

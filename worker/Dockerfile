@@ -6,9 +6,10 @@
 # against the same glibc/OpenSSL versions. Bump together when rotating.
 FROM rust:1.91@sha256:867f1d1162913c401378a8504fb17fe2032c760dc316448766f150a130204aad AS builder
 
-# talos crates live at /app/talos so that `../../talos-workflow-engine/...`
-# path deps in talos/worker/Cargo.toml resolve to /app/talos-workflow-engine/,
-# matching the local-dev directory layout.
+# All Talos crates — including the engine + protocol crates folded
+# back from the sibling repo in May-2026 — live in this single
+# workspace. The Dockerfile no longer needs `additional_contexts` to
+# pull the engine from an external path.
 WORKDIR /app/talos
 
 # Install mold — a modern linker that is 5-10x faster than GNU ld for the final link step.
@@ -17,12 +18,6 @@ RUN apt-get update && apt-get install -y mold && rm -rf /var/lib/apt/lists/*
 # opt-level=1 uses ~4x less LLVM memory than release; 8 jobs is safe on a 16-CPU host.
 ENV CARGO_BUILD_JOBS=8
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold --cfg rustix_use_libc"
-
-# Pull the extracted workflow-engine crates from the sibling build context
-# declared in docker-compose.yml (`additional_contexts.workflow_engine`).
-# Kept as a separate COPY so its layer caches independently of the local
-# workspace tree below.
-COPY --from=workflow_engine . /app/talos-workflow-engine/
 
 # Copy the entire workspace in one shot. .dockerignore is the contract:
 # it excludes **/target, .env*, private keys, frontend node_modules, .git,

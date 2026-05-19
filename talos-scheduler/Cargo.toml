@@ -25,8 +25,8 @@ talos-module-executions = { path = "../talos-module-executions" }
 talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }

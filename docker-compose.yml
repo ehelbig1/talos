@@ -108,8 +108,6 @@ services:
     build:
       context: .
       dockerfile: controller/Dockerfile
-      additional_contexts:
-        workflow_engine: ../talos-workflow-engine
       args:
         DATABASE_URL: ${DATABASE_URL}
     container_name: talos-migrate
@@ -260,8 +258,6 @@ services:
     build:
       context: .
       dockerfile: controller/Dockerfile
-      additional_contexts:
-        workflow_engine: ../talos-workflow-engine
       args:
         DATABASE_URL: ${DATABASE_URL}
         # Build-time git state — captured by build.rs and surfaced in
@@ -428,8 +424,6 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
-      additional_contexts:
-        workflow_engine: ../talos-workflow-engine
     environment:
       NATS_URL: nats://nats:4222
       NATS_USER: ${NATS_USER:?NATS_USER required in .env}

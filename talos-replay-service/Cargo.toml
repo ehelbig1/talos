@@ -29,8 +29,8 @@ talos-capability-world = { path = "../talos-capability-world" }
 # this service exposes is "execute one WASM job + diff result", which
 # is exactly the surface the existing handlers had inline.
 talos-replay-diff = { path = "../talos-replay-diff" }
-talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-engine = { path = "../talos-workflow-engine" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 worker = { path = "../worker" }
 
 [lints]

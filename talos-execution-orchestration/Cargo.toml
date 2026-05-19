@@ -37,8 +37,8 @@ talos-execution-result-collector = { path = "../talos-execution-result-collector
 talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }
 
 [dev-dependencies]

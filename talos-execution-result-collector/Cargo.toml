@@ -12,8 +12,8 @@ chrono = { workspace = true, features = ["serde"] }
 serde_json.workspace = true
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-execution-repository = { path = "../talos-execution-repository" }
-talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-engine = { path = "../talos-workflow-engine" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 tracing.workspace = true
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 

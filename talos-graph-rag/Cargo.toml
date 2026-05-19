@@ -15,7 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true

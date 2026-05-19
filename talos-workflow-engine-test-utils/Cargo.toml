@@ -1,0 +1,63 @@
+[package]
+name = "talos-workflow-engine-test-utils"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+description = "In-memory and capture implementations of every talos-workflow-engine-core trait, for unit-testing executors without a database, secrets manager, or transport."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["workflow", "engine", "testing", "mock", "in-memory"]
+categories = ["asynchronous", "development-tools::testing"]
+repository = "https://github.com/aegix-dev/talos-workflow-engine"
+homepage = "https://github.com/aegix-dev/talos-workflow-engine"
+
+[dependencies]
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.3", default-features = false, optional = true }
+async-trait = "0.1"
+dashmap = "6.1"
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+[features]
+default = ["minimal", "llm-primitives"]
+# Pulls in `talos-workflow-engine` so the `minimal_engine()` convenience
+# constructor is available. Consumers who only want the trait stubs
+# (capture, memory, noop, dispatch, approval modules) can drop this
+# feature with `default-features = false` to shed the `-engine` dep
+# and its transitive `rhai`/`cap-std`/`petgraph`/`aes-gcm`/`hmac`
+# compile cost.
+minimal = ["dep:talos-workflow-engine"]
+# Propagates to sibling crates so helpers compile against the same
+# feature surface as the engine consumer. Only meaningful when the
+# `minimal` feature is also active (no engine to propagate to
+# otherwise); the propagation list stays consistent either way.
+llm-primitives = [
+    "talos-workflow-engine-core/llm-primitives",
+    "talos-workflow-engine?/llm-primitives",
+]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+# `.lock().expect("poisoned")` panics on a genuinely unrecoverable
+# mutex state in test utilities — don't force every method into a
+# # Panics doc for a panic that can't fire in normal use.
+missing_panics_doc = "allow"
+# Fluent `with_*` builders return `Self`. Adding `#[must_use]` to each
+# is noise; the builder pattern's entire point is the chained return.
+return_self_not_must_use = "allow"
+# Manual `Debug` impls elide internal state (captured secret values,
+# raw event buffers) — the "all fields" lint is exactly wrong for our
+# intent-to-hide-state pattern.
+missing_fields_in_debug = "allow"

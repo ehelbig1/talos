@@ -52,9 +52,10 @@ RUN git clone --filter=tree:0 https://github.com/RustSec/advisory-db /opt/talos-
 # ════════════════════════════════════════════════════════════════════════════
 FROM rust:1.91@sha256:867f1d1162913c401378a8504fb17fe2032c760dc316448766f150a130204aad AS builder
 
-# talos crates live at /app/talos so that `../../talos-workflow-engine/...`
-# path deps in talos/controller/Cargo.toml resolve to /app/talos-workflow-engine/,
-# matching the local-dev directory layout.
+# All Talos crates — including the engine + protocol crates folded
+# back from the sibling repo in May-2026 — live in this single
+# workspace. The Dockerfile no longer needs `additional_contexts` to
+# pull the engine from an external path.
 WORKDIR /app/talos
 RUN rustup default stable
 
@@ -73,12 +74,6 @@ ARG GIT_SHA_OVERRIDE=unknown
 ARG GIT_DIRTY_OVERRIDE=false
 ENV GIT_SHA_OVERRIDE=${GIT_SHA_OVERRIDE}
 ENV GIT_DIRTY_OVERRIDE=${GIT_DIRTY_OVERRIDE}
-
-# Pull the extracted workflow-engine crates from the sibling build context
-# declared in docker-compose.yml (`additional_contexts.workflow_engine`).
-# Kept as a separate COPY so its layer caches independently of the local
-# workspace tree below.
-COPY --from=workflow_engine . /app/talos-workflow-engine/
 
 # Copy the entire workspace in one shot. .dockerignore is the contract:
 # it excludes **/target, .env*, private keys, frontend node_modules, .git,

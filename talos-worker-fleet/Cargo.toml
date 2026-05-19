@@ -12,7 +12,7 @@ async-nats = "0.47"
 dashmap = "6.1"
 serde_json.workspace = true
 futures = "0.3"
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true

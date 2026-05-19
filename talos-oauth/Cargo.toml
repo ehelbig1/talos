@@ -25,7 +25,7 @@ talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 # MCP-1028: truncate-then-redact discipline on audit log error_message.
 talos-text-util = { path = "../talos-text-util" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true

@@ -1,0 +1,587 @@
+//! Unit tests for `crate::engine`.
+//!
+//! Mounted as a sibling module via `#[cfg(test)] #[path =
+//! "engine_tests.rs"] mod tests;` in `engine.rs` so this file behaves
+//! like an inline `#[cfg(test)] mod tests { ... }` block — `use
+//! super::*;` resolves to the engine module's items, including the
+//! `pub(crate)` fields the tests need to assert on directly.
+
+use super::*;
+use talos_workflow_engine_core::EdgeLogic;
+
+fn make_graph(edges: &[(usize, usize)], num_nodes: usize) -> DiGraph<Uuid, EdgeLogic> {
+    let mut g: DiGraph<Uuid, EdgeLogic> = DiGraph::new();
+    let nodes: Vec<NodeIndex> = (0..num_nodes).map(|_| g.add_node(Uuid::new_v4())).collect();
+    for &(from, to) in edges {
+        g.add_edge(
+            nodes[from],
+            nodes[to],
+            EdgeLogic {
+                source_handle: "output".to_string(),
+                target_handle: "input".to_string(),
+                mapping: None,
+                condition: None,
+                edge_type: Default::default(),
+            },
+        );
+    }
+    g
+}
+
+#[test]
+fn linear_chain_simple_3_nodes() {
+    // A → B → C
+    let g = make_graph(&[(0, 1), (1, 2)], 3);
+    let chains = detect_linear_chains(&g);
+    assert_eq!(chains.len(), 1, "should detect exactly one chain");
+    assert_eq!(chains[0].len(), 3, "chain should include all 3 nodes");
+}
+
+#[test]
+fn no_chain_for_fork() {
+    // A → B, A → C
+    let g = make_graph(&[(0, 1), (0, 2)], 3);
+    let chains = detect_linear_chains(&g);
+    assert!(
+        chains.is_empty(),
+        "Fork has no 2+ linear chain: {:?}",
+        chains
+    );
+}
+
+#[test]
+fn no_chain_for_join() {
+    // A → C, B → C
+    let g = make_graph(&[(0, 2), (1, 2)], 3);
+    let chains = detect_linear_chains(&g);
+    assert!(chains.is_empty(), "Join has no 2+ linear chain");
+}
+
+#[test]
+fn chain_with_single_edge() {
+    // A → B (trivial 2-node chain)
+    let g = make_graph(&[(0, 1)], 2);
+    let chains = detect_linear_chains(&g);
+    assert_eq!(chains.len(), 1);
+    assert_eq!(chains[0].len(), 2);
+}
+
+#[test]
+fn single_node_no_chain() {
+    let g = make_graph(&[], 1);
+    let chains = detect_linear_chains(&g);
+    assert!(chains.is_empty(), "Single node produces no chain");
+}
+
+#[test]
+fn diamond_graph_no_full_chain() {
+    // A → B → D, A → C → D
+    // B and C each have in-degree=1, out-degree=1 — but D has in-degree=2
+    let g = make_graph(&[(0, 1), (0, 2), (1, 3), (2, 3)], 4);
+    let chains = detect_linear_chains(&g);
+    // A→B could be a chain (A out-degree=2 breaks it), so no chain >= 2.
+    // Actually A has out-degree=2, so neither B nor C's predecessors qualify
+    // as chain starts... let's just verify no chain spans the diamond.
+    for chain in &chains {
+        assert!(chain.len() < 3, "No chain of length >=3 in diamond graph");
+    }
+}
+
+#[test]
+fn parallel_chains() {
+    // A → B → C and D → E (two independent chains)
+    let g = make_graph(&[(0, 1), (1, 2), (3, 4)], 5);
+    let chains = detect_linear_chains(&g);
+    assert_eq!(chains.len(), 2, "should find exactly 2 chains");
+    let lengths: Vec<usize> = chains.iter().map(|c| c.len()).collect();
+    assert!(lengths.contains(&3), "one chain of length 3");
+    assert!(lengths.contains(&2), "one chain of length 2");
+}
+
+// ── collapse_subworkflow_output tests ───────────────────────────────────
+// These tests pin the contract that judge/reflective-retry/ensemble rely on:
+// a sub-workflow with exactly one terminal node returns that node's output
+// directly; multiple terminals fall back to a label-keyed map.
+
+/// Build an engine where nodes are laid out in index order, labels
+/// are assigned by position, and edges are (`src_label`, `dst_label`) pairs.
+/// Returns (engine, label -> uuid).
+fn build_sub_engine(
+    labels: &[&str],
+    edges: &[(&str, &str)],
+) -> (ParallelWorkflowEngine, HashMap<String, Uuid>) {
+    let mut engine = ParallelWorkflowEngine::new();
+    let mut label_to_uuid: HashMap<String, Uuid> = HashMap::new();
+    let mut label_to_idx: HashMap<String, NodeIndex> = HashMap::new();
+    for label in labels {
+        let uuid = Uuid::new_v4();
+        let idx = engine.graph.add_node(uuid);
+        engine.node_labels.insert(uuid, label.to_string());
+        label_to_uuid.insert(label.to_string(), uuid);
+        label_to_idx.insert(label.to_string(), idx);
+    }
+    for (src, dst) in edges {
+        let s = label_to_idx[*src];
+        let d = label_to_idx[*dst];
+        engine.graph.add_edge(
+            s,
+            d,
+            EdgeLogic {
+                source_handle: "output".to_string(),
+                target_handle: "input".to_string(),
+                mapping: None,
+                condition: None,
+                edge_type: Default::default(),
+            },
+        );
+    }
+    (engine, label_to_uuid)
+}
+
+#[test]
+fn collapse_single_terminal_returns_unwrapped_output() {
+    // Canonical judge case: one node, returns record shape — caller sees fields directly.
+    let (engine, uuids) = build_sub_engine(&["judge"], &[]);
+    let mut results = HashMap::new();
+    results.insert(
+        uuids["judge"],
+        serde_json::json!({"score": 0.94, "passed": true, "reasoning": "ok", "feedback": "good"}),
+    );
+    let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
+    assert_eq!(out.get("score").and_then(|v| v.as_f64()), Some(0.94));
+    assert_eq!(out.get("passed").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(out.get("reasoning").and_then(|v| v.as_str()), Some("ok"));
+    assert_eq!(out.get("feedback").and_then(|v| v.as_str()), Some("good"));
+}
+
+#[test]
+fn collapse_linear_chain_returns_only_terminal() {
+    // A → B → C. Only C is terminal; its output is the sub-workflow output.
+    let (engine, uuids) = build_sub_engine(&["a", "b", "c"], &[("a", "b"), ("b", "c")]);
+    let mut results = HashMap::new();
+    results.insert(uuids["a"], serde_json::json!({"stage": "a", "n": 1}));
+    results.insert(uuids["b"], serde_json::json!({"stage": "b", "n": 2}));
+    results.insert(uuids["c"], serde_json::json!({"stage": "c", "n": 3}));
+    let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
+    assert_eq!(out.get("stage").and_then(|v| v.as_str()), Some("c"));
+    assert_eq!(out.get("n").and_then(|v| v.as_i64()), Some(3));
+}
+
+#[test]
+fn collapse_multiple_terminals_returns_label_keyed_map() {
+    // Two independent terminals: fallback to label-keyed map.
+    let (engine, uuids) = build_sub_engine(&["alpha", "beta"], &[]);
+    let mut results = HashMap::new();
+    results.insert(uuids["alpha"], serde_json::json!({"v": 1}));
+    results.insert(uuids["beta"], serde_json::json!({"v": 2}));
+    let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
+    assert_eq!(
+        out.get("alpha")
+            .and_then(|v| v.get("v"))
+            .and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        out.get("beta")
+            .and_then(|v| v.get("v"))
+            .and_then(|v| v.as_i64()),
+        Some(2)
+    );
+}
+
+#[test]
+fn collapse_skips_trigger_and_skipped_nodes() {
+    // Trigger + one skipped middle node + one real terminal.
+    let (engine, uuids) = build_sub_engine(
+        &["__trigger__", "skipped", "real"],
+        &[("__trigger__", "skipped"), ("skipped", "real")],
+    );
+    let mut results = HashMap::new();
+    results.insert(
+        uuids["__trigger__"],
+        serde_json::json!({"trigger": "ignored"}),
+    );
+    results.insert(
+        uuids["skipped"],
+        serde_json::json!({"__skipped": true, "noise": "x"}),
+    );
+    results.insert(uuids["real"], serde_json::json!({"answer": "42"}));
+    let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
+    assert_eq!(out.get("answer").and_then(|v| v.as_str()), Some("42"));
+    assert!(out.get("trigger").is_none(), "trigger must not leak");
+    assert!(out.get("noise").is_none(), "skipped must not leak");
+}
+
+#[test]
+fn collapse_strips_engine_envelope_on_terminal() {
+    // unwrap_output recognises {input: X, score: ..., passed: ...} as a wrapper
+    // when every inner key is also at the outer level. Terminal node output
+    // should pass through unwrap_output.
+    let (engine, uuids) = build_sub_engine(&["judge"], &[]);
+    let mut results = HashMap::new();
+    // Real-world shape: engine-wrapped output where inner fields are also hoisted.
+    results.insert(
+        uuids["judge"],
+        serde_json::json!({
+            "input": {"score": 0.7, "passed": true},
+            "score": 0.7,
+            "passed": true,
+        }),
+    );
+    let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
+    assert_eq!(out.get("score").and_then(|v| v.as_f64()), Some(0.7));
+    assert_eq!(out.get("passed").and_then(|v| v.as_bool()), Some(true));
+}
+
+#[test]
+fn collapse_empty_results_returns_empty_object() {
+    let (engine, _) = build_sub_engine(&["a"], &[]);
+    let results: HashMap<Uuid, JsonValue> = HashMap::new();
+    let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
+    assert_eq!(out, serde_json::Value::Object(serde_json::Map::new()));
+}
+
+#[test]
+fn collapse_fork_non_terminal_shadows_do_not_overwrite_terminal() {
+    // A → B (terminal). A is not a terminal. Both happen to emit a "score" field.
+    // Terminal's fields must win — but since only one terminal exists, the map
+    // is NOT the output shape; instead B's output is returned directly.
+    let (engine, uuids) = build_sub_engine(&["a", "b"], &[("a", "b")]);
+    let mut results = HashMap::new();
+    results.insert(uuids["a"], serde_json::json!({"score": 0.1}));
+    results.insert(uuids["b"], serde_json::json!({"score": 0.9}));
+    let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
+    assert_eq!(out.get("score").and_then(|v| v.as_f64()), Some(0.9));
+}
+
+#[test]
+fn collapse_diamond_two_terminals_returns_both_labels() {
+    // A → {B, C}. Both B and C are terminals (no aggregator).
+    let (engine, uuids) = build_sub_engine(&["a", "b", "c"], &[("a", "b"), ("a", "c")]);
+    let mut results = HashMap::new();
+    results.insert(uuids["a"], serde_json::json!({"stage": "a"}));
+    results.insert(uuids["b"], serde_json::json!({"stage": "b"}));
+    results.insert(uuids["c"], serde_json::json!({"stage": "c"}));
+    let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
+    // Multiple terminals → label-keyed map including non-terminal a.
+    assert_eq!(
+        out.get("a")
+            .and_then(|v| v.get("stage"))
+            .and_then(|v| v.as_str()),
+        Some("a")
+    );
+    assert_eq!(
+        out.get("b")
+            .and_then(|v| v.get("stage"))
+            .and_then(|v| v.as_str()),
+        Some("b")
+    );
+    assert_eq!(
+        out.get("c")
+            .and_then(|v| v.get("stage"))
+            .and_then(|v| v.as_str()),
+        Some("c")
+    );
+}
+
+// Seal-output validation tests live in
+// `talos-workflow-engine-core::secret_envelope` alongside the
+// `validate_seal_output` pub fn, since the helper is a pure
+// structural check that external dispatchers can also reuse.
+
+#[test]
+fn agent_loop_max_history_defaults_to_constant() {
+    let engine = ParallelWorkflowEngine::new();
+    assert_eq!(
+        engine.agent_loop_max_history(),
+        DEFAULT_AGENT_LOOP_MAX_HISTORY
+    );
+    assert_eq!(DEFAULT_AGENT_LOOP_MAX_HISTORY, 20);
+}
+
+#[test]
+fn agent_loop_max_history_setter_round_trips() {
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_agent_loop_max_history(5);
+    assert_eq!(engine.agent_loop_max_history(), 5);
+    engine.set_agent_loop_max_history(0);
+    assert_eq!(engine.agent_loop_max_history(), 0);
+}
+
+#[test]
+fn default_sandbox_root_is_under_temp_dir() {
+    // Cross-platform default — derived from std::env::temp_dir() so
+    // it works on Windows, sandboxed macOS apps, locked-down
+    // containers, etc. Asserting `starts_with(temp_dir)` rather
+    // than a literal "/tmp/..." string is the whole point of the
+    // 2026-04 cross-platform fix.
+    let root = crate::default_sandbox_root();
+    assert!(
+        root.starts_with(std::env::temp_dir()),
+        "{:?} not under {:?}",
+        root,
+        std::env::temp_dir()
+    );
+    assert!(
+        root.ends_with(crate::DEFAULT_SANDBOX_DIR_NAME),
+        "{:?} doesn't end with {:?}",
+        root,
+        crate::DEFAULT_SANDBOX_DIR_NAME
+    );
+}
+
+#[test]
+fn engine_default_sandbox_root_uses_function() {
+    // The engine's own default at construction time must match
+    // `default_sandbox_root()`. Otherwise consumers reading the
+    // setter docs ("default is `Some(default_sandbox_root())`") get
+    // a different value than the engine actually uses.
+    let engine = ParallelWorkflowEngine::new();
+    let expected = Some(crate::default_sandbox_root().to_path_buf());
+    assert_eq!(engine.sandbox_root, expected);
+}
+
+#[test]
+fn wait_handler_returns_none_for_non_wait_nodes() {
+    // Sanity check: try_dispatch_wait must short-circuit cleanly
+    // for any other SystemNodeKind (and for plain module nodes).
+    // Otherwise the reactor would short-circuit incorrectly and
+    // pause workflows that were never asked to.
+    let mut engine = ParallelWorkflowEngine::new();
+    let module_node = Uuid::new_v4();
+    engine.add_node(module_node, Some(Uuid::new_v4()), None, None);
+    assert!(engine
+        .try_dispatch_wait(module_node, Uuid::new_v4())
+        .is_none());
+
+    let collect_node = Uuid::new_v4();
+    engine.add_node(
+        collect_node,
+        None,
+        None,
+        Some(talos_workflow_engine_core::SystemNodeKind::Collect),
+    );
+    assert!(engine
+        .try_dispatch_wait(collect_node, Uuid::new_v4())
+        .is_none());
+}
+
+#[test]
+fn wait_handler_returns_pause_envelope_with_message() {
+    // Wait { message: Some(...) } produces a __waiting__ envelope
+    // carrying the message — that's the signal the consumer's
+    // CheckpointStore + resume orchestration relies on.
+    let mut engine = ParallelWorkflowEngine::new();
+    let wait_node = Uuid::new_v4();
+    engine.add_node(
+        wait_node,
+        None,
+        None,
+        Some(talos_workflow_engine_core::SystemNodeKind::Wait {
+            message: Some("approve please".into()),
+        }),
+    );
+    let exec_id = Uuid::new_v4();
+    let outcome = engine.try_dispatch_wait(wait_node, exec_id).expect("pause");
+    let crate::scheduler_handlers::WaitOutcome::Pause { waiting_output } = outcome;
+    assert_eq!(waiting_output["__waiting__"].as_bool(), Some(true));
+    assert_eq!(waiting_output["message"].as_str(), Some("approve please"));
+    assert_eq!(
+        waiting_output["node_id"].as_str(),
+        Some(wait_node.to_string().as_str())
+    );
+    assert_eq!(
+        waiting_output["execution_id"].as_str(),
+        Some(exec_id.to_string().as_str())
+    );
+}
+
+#[test]
+fn wait_handler_returns_pause_envelope_without_message() {
+    // Wait { message: None } omits the message key rather than
+    // emitting `"message": null` — keeps the envelope minimal.
+    let mut engine = ParallelWorkflowEngine::new();
+    let wait_node = Uuid::new_v4();
+    engine.add_node(
+        wait_node,
+        None,
+        None,
+        Some(talos_workflow_engine_core::SystemNodeKind::Wait { message: None }),
+    );
+    let outcome = engine
+        .try_dispatch_wait(wait_node, Uuid::new_v4())
+        .expect("pause");
+    let crate::scheduler_handlers::WaitOutcome::Pause { waiting_output } = outcome;
+    assert_eq!(waiting_output["__waiting__"].as_bool(), Some(true));
+    assert!(waiting_output.get("message").is_none());
+}
+
+#[cfg(feature = "llm-primitives")]
+#[test]
+fn inline_judge_passes_when_score_meets_threshold() {
+    use talos_workflow_engine_test_utils::noop::StubExpressionEvaluator;
+
+    let mut engine = ParallelWorkflowEngine::new();
+    // The stub evaluator returns the configured JSON for every
+    // expression — we don't care which expression the judge sees,
+    // only that the dispatch handler parses the verdict and gates
+    // on pass_threshold correctly.
+    engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_json(
+        serde_json::json!({
+            "score": 0.9,
+            "passed": true,
+            "reasoning": "looks good",
+            "feedback": "ship it",
+        }),
+    )));
+
+    let parent = serde_json::json!({ "answer": "yes" });
+    let out = engine.dispatch_inline_judge(parent.clone(), "score(answer)", Some(0.5), "error");
+
+    assert_eq!(
+        out.get("__judge_passed__").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        out.get("__judge_score__").and_then(|v| v.as_f64()),
+        Some(0.9)
+    );
+    // Original parent inputs survive on the pass path so downstream
+    // nodes see the value the judge approved.
+    assert_eq!(out.get("answer").and_then(|v| v.as_str()), Some("yes"));
+}
+
+#[cfg(feature = "llm-primitives")]
+#[test]
+fn inline_judge_rejects_when_score_below_threshold() {
+    use talos_workflow_engine_test_utils::noop::StubExpressionEvaluator;
+
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_json(
+        serde_json::json!({
+            "score": 0.3,
+            "passed": true,           // raw says pass, but threshold gates it
+            "reasoning": "weak",
+            "feedback": "try again",
+        }),
+    )));
+
+    let parent = serde_json::json!({ "answer": "maybe" });
+    let out = engine.dispatch_inline_judge(parent, "score(answer)", Some(0.7), "error");
+
+    assert_eq!(out.get("__error").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        out.get("__judge_passed__").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        out.get("__judge_score__").and_then(|v| v.as_f64()),
+        Some(0.3)
+    );
+}
+
+#[cfg(feature = "llm-primitives")]
+#[test]
+fn inline_judge_emits_error_envelope_when_no_evaluator_wired() {
+    // No expression evaluator → eval_json fails → error envelope.
+    // Important contract: the engine doesn't panic when the
+    // evaluator is missing, even on the inline path.
+    let engine = ParallelWorkflowEngine::new();
+    let out = engine.dispatch_inline_judge(serde_json::json!({}), "anything", None, "error");
+    assert_eq!(out.get("__error").and_then(|v| v.as_bool()), Some(true));
+    assert!(
+        out.get("error_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("InlineJudge expression failed"),
+        "unexpected envelope: {out}"
+    );
+}
+
+#[test]
+fn agent_loop_max_history_propagates_through_adapter_set() {
+    // Sub-workflow dispatch closures clone an AdapterSet and
+    // hydrate fresh engines from it. The cap MUST ride along or
+    // sub-engines silently fall back to the default — exactly the
+    // adapter-drop footgun documented in talos-workflow-engine/AGENTS.md.
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_agent_loop_max_history(7);
+    let cloned = engine.adapter_set().into_engine();
+    assert_eq!(cloned.agent_loop_max_history(), 7);
+}
+
+#[test]
+fn engine_limit_defaults_match_documented_constants() {
+    // Anchor each engine field's default to the public DEFAULT_* const
+    // it advertises in docs. Drift here would silently change behaviour
+    // for downstream consumers reading the defaults from one source
+    // and getting another.
+    let engine = ParallelWorkflowEngine::new();
+    assert_eq!(
+        engine.max_prefetch_successors(),
+        DEFAULT_MAX_PREFETCH_SUCCESSORS
+    );
+    assert_eq!(engine.max_workflow_nodes(), DEFAULT_MAX_WORKFLOW_NODES);
+    assert_eq!(
+        engine.max_node_output_bytes(),
+        DEFAULT_MAX_NODE_OUTPUT_BYTES
+    );
+    assert_eq!(engine.max_fuel_per_node(), DEFAULT_MAX_FUEL_PER_NODE);
+    // Sanity-pin the documented values too.
+    assert_eq!(DEFAULT_MAX_PREFETCH_SUCCESSORS, 8);
+    assert_eq!(DEFAULT_MAX_WORKFLOW_NODES, 500);
+    assert_eq!(DEFAULT_MAX_NODE_OUTPUT_BYTES, 5 * 1024 * 1024);
+    assert_eq!(DEFAULT_MAX_FUEL_PER_NODE, 50_000_000);
+}
+
+#[test]
+fn engine_limit_setters_round_trip() {
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_max_prefetch_successors(2);
+    engine.set_max_workflow_nodes(10);
+    engine.set_max_node_output_bytes(1024);
+    engine.set_max_fuel_per_node(1_000);
+    assert_eq!(engine.max_prefetch_successors(), 2);
+    assert_eq!(engine.max_workflow_nodes(), 10);
+    assert_eq!(engine.max_node_output_bytes(), 1024);
+    assert_eq!(engine.max_fuel_per_node(), 1_000);
+}
+
+#[test]
+fn engine_limits_propagate_through_adapter_set() {
+    // Sub-workflow dispatch closures clone an `AdapterSet` and hydrate
+    // fresh engines from it. Each new limit MUST ride along — without
+    // this propagation, a parent's lowered `max_fuel_per_node` (etc.)
+    // would silently revert to the default inside any agent-loop body
+    // or sub-workflow invocation. Per the AGENTS.md "miss any one step
+    // and sub-workflow dispatch silently drops the adapter" rule.
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_max_prefetch_successors(3);
+    engine.set_max_workflow_nodes(11);
+    engine.set_max_node_output_bytes(2048);
+    engine.set_max_fuel_per_node(7_000);
+    let cloned = engine.adapter_set().into_engine();
+    assert_eq!(cloned.max_prefetch_successors(), 3);
+    assert_eq!(cloned.max_workflow_nodes(), 11);
+    assert_eq!(cloned.max_node_output_bytes(), 2048);
+    assert_eq!(cloned.max_fuel_per_node(), 7_000);
+}
+
+#[test]
+fn add_node_respects_configured_max_workflow_nodes() {
+    // Lock in that lowering the cap actually trims `add_node`. The
+    // hardcoded 500 was a hidden ceiling for code-gen workflows; this
+    // test ensures the new setter is wired into the gate.
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_max_workflow_nodes(2);
+    engine.add_node(Uuid::new_v4(), Some(Uuid::new_v4()), None, None);
+    engine.add_node(Uuid::new_v4(), Some(Uuid::new_v4()), None, None);
+    // Third add_node must be rejected.
+    let third = Uuid::new_v4();
+    engine.add_node(third, Some(Uuid::new_v4()), None, None);
+    assert!(
+        engine.node_map().get(&third).is_none(),
+        "third add_node should have been dropped past the cap"
+    );
+    assert_eq!(engine.graph().node_count(), 2);
+}

@@ -1,0 +1,81 @@
+[package]
+name = "talos-workflow-engine-nats"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+description = "NATS-backed NodeDispatcher + JobTransport for the talos-workflow-engine crate. Implements a signed-NATS job protocol for dispatching workflow nodes to a pool of workers."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["workflow", "engine", "nats", "dispatcher", "async"]
+categories = ["asynchronous", "network-programming"]
+repository = "https://github.com/aegix-dev/talos-workflow-engine"
+homepage = "https://github.com/aegix-dev/talos-workflow-engine"
+
+[dependencies]
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.3", default-features = false }
+async-nats = "0.47"
+async-trait = "0.1"
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[features]
+default = ["llm-primitives"]
+# Propagates to `talos-workflow-engine` so a consumer that activates
+# LLM primitives gets a consistent feature surface across crates.
+llm-primitives = [
+    "talos-workflow-engine-core/llm-primitives",
+    "talos-workflow-engine/llm-primitives",
+]
+
+[lints.rust]
+unsafe_code = "forbid"
+# `missing_docs` deliberately not set during the initial port — the
+# moved code inherits the talos-workflow-engine crate's doc density; a
+# follow-up pass can enable it once the crate has stabilised.
+unreachable_pub = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+# Pragmatic for a port: the moved body inherited patterns from
+# pre-extraction that are fine in context. Silencing these as a bundle
+# is cleaner than per-site `#[allow]`s during the move.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+match_wildcard_for_single_variants = "allow"
+implicit_hasher = "allow"
+doc_markdown = "allow"
+redundant_closure_for_method_calls = "allow"
+uninlined_format_args = "allow"
+map_unwrap_or = "allow"
+single_match_else = "allow"
+option_if_let_else = "allow"
+single_match = "allow"
+ref_option = "allow"
+items_after_statements = "allow"
+match_same_arms = "allow"
+default_trait_access = "allow"
+implicit_clone = "allow"
+needless_pass_by_value = "allow"
+similar_names = "allow"
+if_not_else = "allow"
+redundant_else = "allow"
+wildcard_imports = "allow"
+semicolon_if_nothing_returned = "allow"
+manual_string_new = "allow"
+unnecessary_wraps = "allow"
+trivially_copy_pass_by_ref = "allow"
+unused_self = "allow"
+unused_async = "allow"

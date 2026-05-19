@@ -102,6 +102,16 @@ members = [
     "controller",
     "worker",
     "talos_sdk_macros",
+    # Engine + protocol crates — formerly a sibling repository at
+    # ../talos-workflow-engine. Folded back in May-2026 to simplify
+    # releases: a single `cargo check --workspace` covers controller,
+    # worker, AND engine; image builds drop the docker-compose
+    # `additional_contexts.workflow_engine` indirection.
+    "talos-workflow-engine-core",
+    "talos-workflow-engine",
+    "talos-workflow-engine-nats",
+    "talos-workflow-engine-test-utils",
+    "talos-workflow-job-protocol",
 ]
 
 # Shared package metadata. Crates opt in via `version.workspace = true`

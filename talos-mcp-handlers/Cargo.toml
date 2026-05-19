@@ -79,9 +79,9 @@ talos-hot-update-service = { path = "../talos-hot-update-service" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-creation = { path = "../talos-workflow-creation" }
 talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
-talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-engine = { path = "../talos-workflow-engine" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-types = { path = "../talos-workflow-types" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }

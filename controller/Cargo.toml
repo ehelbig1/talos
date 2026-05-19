@@ -25,7 +25,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 uuid = { version = "1.20", features = ["serde", "v4", "v5"] }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-dlp = { path = "../talos-dlp" }
 talos-secrets = { path = "../talos-secrets" }
 talos-memory = { path = "../talos-memory" }
@@ -122,9 +122,9 @@ talos-api = { path = "../talos-api" }
 talos-mcp-handlers = { path = "../talos-mcp-handlers" }
 talos-api-docs = { path = "../talos-api-docs" }
 talos-ws-auth = { path = "../talos-ws-auth" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
-talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
-talos-workflow-engine-nats = { path = "../../talos-workflow-engine/talos-workflow-engine-nats" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+talos-workflow-engine = { path = "../talos-workflow-engine" }
+talos-workflow-engine-nats = { path = "../talos-workflow-engine-nats" }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono", "migrate"] } # `migrate` enables sqlx::migrate! macro for auto-applying migrations at controller startup. RUSTSEC-2024-0363 fix already in 0.8.
 pgvector = { version = "0.4", features = ["sqlx"] }
 neo4rs = "0.8"

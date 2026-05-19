@@ -1,0 +1,146 @@
+[package]
+name = "talos-workflow-engine"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Parallel DAG-based workflow executor built on the talos-workflow-engine-core trait boundaries."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["workflow", "engine", "dag", "executor", "parallel"]
+categories = ["asynchronous", "concurrency"]
+repository = "https://github.com/aegix-dev/talos-workflow-engine"
+homepage = "https://github.com/aegix-dev/talos-workflow-engine"
+
+[dependencies]
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+anyhow = "1.0"
+async-trait = "0.1"
+cap-std = "3.4"
+dashmap = "6.1.0"
+futures = "0.3"
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
+petgraph = "0.6"
+regex = "1.12"
+rhai = { version = "1.19", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+# Cancellation primitive for `run_with_transport_cancellable`. The
+# engine doesn't take any other piece of `tokio-util`; keep the
+# default-features off and the surface narrow.
+tokio-util = { version = "0.7", default-features = false }
+tracing = "0.1"
+uuid = { version = "1.20", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# `examples/` use the test-utils crate to wire the engine with
+# in-memory / no-op adapters so the runnable example stays self-contained.
+talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils", version = "0.3" }
+# Property-based tests for the chain detector (graph topology
+# invariants that hand-rolled tests can't realistically cover). Held
+# to dev-deps only — the engine itself is property-test-free.
+proptest = "1.5"
+# Microbenchmarks for the scheduler — see `benches/scheduler.rs`. Kept
+# in default features (no html_reports) so cargo bench stays minimal.
+criterion = { version = "0.5", default-features = false }
+# `tokio_util::sync::CancellationToken` re-exported here so the
+# integration tests can construct one without re-declaring the dep.
+tokio-util = { version = "0.7", default-features = false }
+
+[[bench]]
+name = "scheduler"
+harness = false
+
+[features]
+default = ["llm-primitives"]
+# Enables the engine-side dispatch for LLM/agent-specific sub-workflow
+# kinds (Judge, InlineJudge, Ensemble, LlmDispatch, AgentLoop, ReActLoop,
+# ReflectiveRetry, ConfidenceGate). Propagates to `talos-workflow-engine-core`'s
+# `llm-primitives` feature so the variants are visible in the enum.
+# Drop the feature to compile a leaner binary for non-LLM use cases.
+llm-primitives = ["talos-workflow-engine-core/llm-primitives"]
+
+[lints.rust]
+unsafe_code = "forbid"
+# `missing_docs` is enforced inline at `src/lib.rs` (`#![deny(missing_docs)]`)
+# so that test-only modules can opt out via inline `#![allow]` if a
+# test ever needs an undocumented helper.
+unreachable_pub = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+# Pragmatic for a port: engine body inherited patterns from pre-extraction
+# that are fine in context. Silencing these as a bundle is cleaner than
+# per-site `#[allow]`s during the move. Each of these is a stylistic
+# pedantic lint that fires on pre-existing code — a follow-up pass can
+# revisit once the code has stabilised in its new home.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+redundant_closure_for_method_calls = "allow"
+uninlined_format_args = "allow"
+map_unwrap_or = "allow"
+single_match_else = "allow"
+option_if_let_else = "allow"
+single_match = "allow"
+ref_option = "allow"
+items_after_statements = "allow"
+match_same_arms = "allow"
+manual_let_else = "allow"
+default_trait_access = "allow"
+implicit_clone = "allow"
+manual_clamp = "allow"
+unused_self = "allow"
+needless_pass_by_value = "allow"
+implicit_hasher = "allow"
+similar_names = "allow"
+if_not_else = "allow"
+redundant_else = "allow"
+wildcard_imports = "allow"
+semicolon_if_nothing_returned = "allow"
+manual_string_new = "allow"
+unnecessary_wraps = "allow"
+trivially_copy_pass_by_ref = "allow"
+needless_continue = "allow"
+struct_field_names = "allow"
+used_underscore_binding = "allow"
+unnecessary_semicolon = "allow"
+type_complexity = "allow"
+unnecessary_lazy_evaluations = "allow"
+cloned_instead_of_copied = "allow"
+no_effect_underscore_binding = "allow"
+checked_conversions = "allow"
+unnecessary_debug_formatting = "allow"
+redundant_pattern_matching = "allow"
+map_identity = "allow"
+unnecessary_map_or = "allow"
+inefficient_to_string = "allow"
+collapsible_match = "allow"
+elidable_lifetime_names = "allow"
+explicit_iter_loop = "allow"
+inconsistent_struct_constructor = "allow"
+needless_raw_string_hashes = "allow"
+verbose_bit_mask = "allow"
+unreadable_literal = "allow"
+unused_async = "allow"
+while_let_loop = "allow"
+bool_to_int_with_if = "allow"
+mismatching_type_param_order = "allow"
+redundant_clone = "allow"
+needless_collect = "allow"
+iter_on_single_items = "allow"
+format_push_string = "allow"
+range_plus_one = "allow"
+manual_is_variant_and = "allow"
+doc_lazy_continuation = "allow"
+redundant_closure = "allow"
+unchecked_duration_subtraction = "allow"

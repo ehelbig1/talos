@@ -39,8 +39,8 @@ talos-engine = { path = "../talos-engine" }
 talos-execution-orchestration = { path = "../talos-execution-orchestration" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-memory = { path = "../talos-memory" }
-talos-workflow-engine = { path = "../../talos-workflow-engine/talos-workflow-engine" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-engine = { path = "../talos-workflow-engine" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tower-cookies = "0.11"
 worker = { path = "../worker" }
 talos-google-calendar = { path = "../talos-google-calendar" }
@@ -60,7 +60,7 @@ talos-totp-2fa = { path = "../talos-totp-2fa" }
 talos-webhooks = { path = "../talos-webhooks" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-creation = { path = "../talos-workflow-creation" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-types = { path = "../talos-workflow-types" }
 talos-workflow-versions = { path = "../talos-workflow-versions" }

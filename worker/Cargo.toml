@@ -29,8 +29,8 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.11", features = ["serde", "v4"] }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
-talos-workflow-engine-core = { path = "../../talos-workflow-engine/talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-dlp = { path = "../talos-dlp" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-secrets = { path = "../talos-secrets" }

@@ -1,0 +1,50 @@
+[package]
+name = "talos-workflow-job-protocol"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Signed, HMAC-authenticated job-protocol wire format for dispatching workflow nodes between a workflow engine and a worker pool. Ships with envelope-encrypted secret transport and replay-resistant nonces."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["workflow", "protocol", "hmac", "job", "wire-format"]
+categories = ["asynchronous", "cryptography", "network-programming"]
+repository = "https://github.com/aegix-dev/talos-workflow-engine"
+homepage = "https://github.com/aegix-dev/talos-workflow-engine"
+
+[dependencies]
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+# Encryption and signing (for secure secret transport and job authentication)
+aes-gcm = "0.10"
+rand = { version = "0.8", default-features = true, features = ["std"] }
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+
+[features]
+default = []
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Pragmatic carve-outs for a port: the moved body inherited patterns
+# from pre-extraction that are fine in context. A follow-up pass can
+# tighten these once the crate has stabilised in its new home.
+doc_markdown = "allow"
+doc_link_with_quotes = "allow"
+implicit_clone = "allow"
+inefficient_to_string = "allow"
+map_unwrap_or = "allow"
+redundant_closure_for_method_calls = "allow"
+uninlined_format_args = "allow"

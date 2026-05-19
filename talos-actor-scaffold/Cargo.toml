@@ -18,7 +18,7 @@ talos-memory = { path = "../talos-memory" }
 talos-module-repository = { path = "../talos-module-repository" }
 # MCP-1030: bounded_preview for caller-supplied reflection in error messages.
 talos-text-util = { path = "../talos-text-util" }
-talos-workflow-job-protocol = { path = "../../talos-workflow-engine/talos-workflow-job-protocol" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 tracing.workspace = true
 uuid.workspace = true
