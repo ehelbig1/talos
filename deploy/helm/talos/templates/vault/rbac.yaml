@@ -1,16 +1,30 @@
 {{- if and .Values.vault.enabled .Values.vault.init.enabled -}}
 {{- $bootstrapSecret := include "talos.bootstrapSecretName" . -}}
 {{- $controllerDeploy := include "talos.componentName" (list . "controller") -}}
-# Scoped Role for the vault-init Job's secret-patcher container.
+{{- $vaultPod := printf "%s-0" (include "talos.componentName" (list . "vault")) -}}
+# Scoped Role for the vault-init Job.
 #
-# Two operations on two named resources only:
-#   - get + patch on the bootstrap Secret (to replace the VAULT_TOKEN
-#     placeholder with the freshly-minted talos-controller token).
-#   - patch on the controller Deployment (to trigger a rollout so the
-#     new VAULT_TOKEN takes effect; envFromSecret reads at pod start).
+# Permissions, each pinned to a single resource by name so a
+# compromise of this SA token can't pivot to anything else in the
+# namespace:
 #
-# resourceNames pinning means a compromise of this SA token cannot read
-# any other Secret or modify any other Deployment in the namespace.
+#   - get + patch on the bootstrap Secret (rotate VAULT_TOKEN
+#     placeholder → freshly-minted talos-controller token).
+#   - get + patch on the controller Deployment (trigger rollout so
+#     the new VAULT_TOKEN takes effect; envFromSecret reads at pod
+#     start).
+#   - get on the vault Pod (poll for readiness before exec).
+#   - create on the vault Pod's `exec` subresource (drive all
+#     Vault-side operations — init / unseal / policy / token mint —
+#     via `kubectl exec` against the running Vault pod instead of
+#     dual-container handoff). This is the May-2026 rewrite
+#     (vault/init-job.yaml header comment) that collapsed the
+#     5-failure-mode dual-container shape into a single runner.
+#
+# pods/exec is the only "broad-looking" verb here. resourceNames
+# pinning on the parent pod restricts it to exactly the one
+# `talos-vault-0` pod — a compromised SA token cannot exec into the
+# controller, frontend, or any other in-namespace pod.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -29,6 +43,16 @@ rules:
     resourceNames:
       - {{ $controllerDeploy | quote }}
     verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames:
+      - {{ $vaultPod | quote }}
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    resourceNames:
+      - {{ $vaultPod | quote }}
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
