@@ -16,6 +16,16 @@ spec:
     metadata:
       labels:
         {{- include "talos.componentLabels" (list . "neo4j") | nindent 8 }}
+      annotations:
+        # Neo4j caches NEO4J_AUTH at server start; rotating the secret
+        # without a restart leaves it on the OLD password (controller
+        # connections fail with "The client is unauthorized due to
+        # authentication failure" — observed every deploy day until
+        # MCP-1231). The neo4j-auth secret is what the StatefulSet's
+        # env actually consumes; bootstrap-secret hashing is included
+        # too because the chart rotates BOTH together (install.sh §6).
+        checksum/neo4j-auth-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.componentName" (list . "neo4j"))) }}
+        checksum/bootstrap-secret-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.bootstrapSecretName" .)) }}
     spec:
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:

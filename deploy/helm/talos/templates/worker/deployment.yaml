@@ -22,10 +22,15 @@ spec:
     metadata:
       labels:
         {{- include "talos.componentLabels" (list . "worker") | nindent 8 }}
-      {{- with .Values.worker.podAnnotations }}
       annotations:
+        # Roll the worker pod when the bootstrap secret's content
+        # changes (NATS_USER / NATS_PASSWORD / WORKER_SHARED_KEY are
+        # all in there). See `talos.secretChecksum` helper for why
+        # this matters and how `helm lookup` makes it work.
+        checksum/bootstrap-secret-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.bootstrapSecretName" .)) }}
+        {{- with .Values.worker.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "talos.componentName" (list . "worker") }}
       {{- include "talos.imagePullSecrets" . | nindent 6 }}

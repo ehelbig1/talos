@@ -61,6 +61,15 @@ spec:
         # equivalent for the StatefulSet's own values changes (those
         # cause a spec diff which triggers a rollout naturally).
         checksum/config: {{ include (print $.Template.BasePath "/postgres/configmap.yaml") . | sha256sum }}
+        # Re-roll when the credentials secret content rotates. The
+        # Postgres container caches POSTGRES_PASSWORD at initdb time
+        # (first install) and at server-start authentication time;
+        # rotating without a restart leaves the running pod accepting
+        # the OLD password while every new client uses the NEW one
+        # — silent auth failures everywhere. install.sh §6 keeps the
+        # secret out of the bootstrap blob so each rotation hashes
+        # independently.
+        checksum/postgres-credentials-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.componentName" (list . "postgres-credentials"))) }}
     spec:
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:

@@ -23,8 +23,18 @@ spec:
       labels:
         {{- include "talos.componentLabels" (list . "controller") | nindent 8 }}
       annotations:
-        # Roll pods when the configmap or secret changes.
+        # Roll pods when the configmap or any consumed secret changes.
+        # The configmap checksum is content-based (hashes the rendered
+        # YAML in this repo). The secret checksums are LIVE — they query
+        # the cluster at helm-render time (lookup()), so when install.sh
+        # rotates a secret OUT OF BAND, the next helm upgrade picks up
+        # the data change and rolls the pod automatically. See
+        # `talos.secretChecksum` helper for the rationale.
         checksum/config: {{ include (print $.Template.BasePath "/controller/configmap.yaml") . | sha256sum }}
+        checksum/bootstrap-secret-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.bootstrapSecretName" .)) }}
+        {{- if .Values.postgres.enabled }}
+        checksum/postgres-credentials-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.componentName" (list . "postgres-credentials"))) }}
+        {{- end }}
         {{- with .Values.controller.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

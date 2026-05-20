@@ -18,6 +18,17 @@ spec:
         {{- include "talos.componentLabels" (list . "nats") | nindent 8 }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/nats/configmap.yaml") . | sha256sum }}
+        # NATS reads NATS_USER / NATS_PASSWORD from the bootstrap
+        # secret at server-start time and caches them in memory. When
+        # install.sh rotates the bootstrap secret, the running NATS
+        # pod stays on the OLD password — every controller/worker
+        # connection after rotation fails with "authorization
+        # violation" (we hit this twice during the 2026-05-19 → 20
+        # in-cluster Postgres deploy and had to `kubectl delete pod
+        # talos-nats-0` manually each time). Hashing the secret's
+        # data here makes the next helm upgrade roll NATS
+        # automatically when the bootstrap content changes.
+        checksum/bootstrap-secret-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.bootstrapSecretName" .)) }}
     spec:
       terminationGracePeriodSeconds: 60
       {{- include "talos.imagePullSecrets" . | nindent 6 }}

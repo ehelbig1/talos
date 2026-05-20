@@ -154,6 +154,42 @@ Render env entries sourced from a Secret key. Pass list of (secretName, [keys]).
 {{- end }}
 {{- end -}}
 
+{{/*
+Secret-content checksum for the `checksum/<secret>-data` pod annotation
+pattern. Hashes ONLY the secret's `.data` (the actual values), not
+managed metadata — those change on every helm operation and would
+cause spurious rolls. When the secret doesn't exist yet (first
+install, or `helm template` with no cluster), returns a fixed
+placeholder so the annotation is stable across first-render attempts.
+
+Usage:
+    annotations:
+      checksum/bootstrap-secret-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.bootstrapSecretName" .)) }}
+
+Why this matters: install.sh manages the bootstrap + postgres-
+credentials + neo4j Secrets OUT OF BAND (so plaintext never
+round-trips through `helm get values`). When the operator rotates
+one of them (via `kubectl delete secret ... && rerun install.sh`),
+the dependent pods don't automatically restart — `envFrom: secretKeyRef`
+reads the secret only at pod-creation time. Pre-MCP-1231 the operator
+had to `kubectl delete pod talos-nats-0 talos-neo4j-0` manually after
+every rotation (we hit this on the 2026-05-19 in-cluster Postgres
+deploy and again on the 2026-05-20 rebuild). With this annotation,
+the next `helm upgrade` notices the secret data changed → annotation
+hash changes → pod template hash changes → Deployment/StatefulSet
+rolls the pod automatically.
+*/}}
+{{- define "talos.secretChecksum" -}}
+{{- $ns   := .ns   -}}
+{{- $name := .name -}}
+{{- $secret := lookup "v1" "Secret" $ns $name -}}
+{{- if and $secret $secret.data -}}
+{{ $secret.data | toYaml | sha256sum }}
+{{- else -}}
+no-secret-yet
+{{- end -}}
+{{- end -}}
+
 {{/* Image pull secrets block. */}}
 {{- define "talos.imagePullSecrets" -}}
 {{- with .Values.global.imagePullSecrets -}}
