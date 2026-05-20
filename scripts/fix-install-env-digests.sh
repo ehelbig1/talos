@@ -13,14 +13,58 @@
 #   2. Appends the three correct full-length digests from the latest
 #      publish-images.sh run (2026-05-19).
 #
-# Run as: sudo bash /opt/talos/scripts/fix-install-env-digests.sh
+# Run as: sudo bash /opt/talos/scripts/fix-install-env-digests.sh \
+#           --controller sha256:abc... \
+#           --worker     sha256:def... \
+#           --frontend   sha256:ghi...
+#
+# Each --<service> flag is optional — if omitted, the script falls
+# back to the env vars TALOS_CONTROLLER_DIGEST etc. (set in the
+# shell or sourced from a file before invocation). At least one of
+# the three must be supplied somehow, otherwise the script aborts.
 set -euo pipefail
 
 ENV_FILE="${TALOS_ENV_FILE:-/etc/talos/install.env}"
 
-CONTROLLER_DIGEST="sha256:89d0843c2aca7d656e59a697702774458f190671bb2420244697f49f09de28bf"
-WORKER_DIGEST="sha256:00d6cb99a3977a3c46c0db9b30a7b713cd2a7073af5588364c67e428a52517cd"
-FRONTEND_DIGEST="sha256:f6ba99978f97f322e467c77f1169277f09d8b0a2cf93e6c32b9e5b4180ce8d4b"
+# Flag parsing — these override env vars when both are present.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --controller)  TALOS_CONTROLLER_DIGEST="$2"; shift 2 ;;
+        --worker)      TALOS_WORKER_DIGEST="$2";     shift 2 ;;
+        --frontend)    TALOS_FRONTEND_DIGEST="$2";   shift 2 ;;
+        --env-file)    ENV_FILE="$2";                shift 2 ;;
+        -h|--help)
+            sed -n '2,25p' "$0"
+            exit 0 ;;
+        *)
+            echo "✗ unknown flag: $1" >&2
+            exit 1 ;;
+    esac
+done
+
+# Pull from env (set by flag above OR exported before invocation).
+CONTROLLER_DIGEST="${TALOS_CONTROLLER_DIGEST:-}"
+WORKER_DIGEST="${TALOS_WORKER_DIGEST:-}"
+FRONTEND_DIGEST="${TALOS_FRONTEND_DIGEST:-}"
+
+if [[ -z "$CONTROLLER_DIGEST" && -z "$WORKER_DIGEST" && -z "$FRONTEND_DIGEST" ]]; then
+    echo "✗ at least one of --controller / --worker / --frontend (or the matching" >&2
+    echo "  TALOS_*_DIGEST env vars) must be supplied" >&2
+    exit 1
+fi
+
+# Validate each provided digest matches sha256:<64-hex>.
+validate_digest() {
+    local name="$1" val="$2"
+    [[ -z "$val" ]] && return 0  # absent → skip; caller intends to leave that one
+    if ! [[ "$val" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+        echo "✗ $name digest must match sha256:<64-hex>, got: $val" >&2
+        exit 1
+    fi
+}
+validate_digest "--controller" "$CONTROLLER_DIGEST"
+validate_digest "--worker"     "$WORKER_DIGEST"
+validate_digest "--frontend"   "$FRONTEND_DIGEST"
 
 [[ -f "$ENV_FILE" ]] || { echo "ERROR: $ENV_FILE not found" >&2; exit 1; }
 
@@ -57,14 +101,21 @@ awk '
     }
 ' "$ENV_FILE" > "$TMP"
 
-# Append the fresh digests.
-cat >> "$TMP" <<EOF
-
-# Image digests pinned by scripts/fix-install-env-digests.sh ($TS)
-TALOS_CONTROLLER_DIGEST=$CONTROLLER_DIGEST
-TALOS_WORKER_DIGEST=$WORKER_DIGEST
-TALOS_FRONTEND_DIGEST=$FRONTEND_DIGEST
-EOF
+# Append the fresh digests. Only emit lines for digests that were
+# actually supplied — if the operator only ran with --controller,
+# the worker / frontend digests stay at whatever they had before
+# the awk pass stripped them. (awk strips ALL TALOS_*_DIGEST=
+# lines unconditionally — that's OK for the worker/frontend
+# case below because we're not deleting any env-file content that
+# matters; their previous values either came from a prior run of
+# this script or from the operator's manual edit, and we'd want
+# the operator to pass them in explicitly to lock them in.)
+{
+    printf '\n# Image digests pinned by scripts/fix-install-env-digests.sh (%s)\n' "$TS"
+    [[ -n "$CONTROLLER_DIGEST" ]] && printf 'TALOS_CONTROLLER_DIGEST=%s\n' "$CONTROLLER_DIGEST"
+    [[ -n "$WORKER_DIGEST"     ]] && printf 'TALOS_WORKER_DIGEST=%s\n'     "$WORKER_DIGEST"
+    [[ -n "$FRONTEND_DIGEST"   ]] && printf 'TALOS_FRONTEND_DIGEST=%s\n'   "$FRONTEND_DIGEST"
+} >> "$TMP"
 
 # Atomic swap.
 sudo mv "$TMP" "$ENV_FILE"
