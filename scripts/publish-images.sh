@@ -15,16 +15,23 @@
 #      label and warn loudly)
 #
 # Usage:
-#   sudo bash scripts/publish-images.sh                  # build + push + sign all 3
+#   bash scripts/publish-images.sh                       # build + push (NO sign by default)
 #   bash scripts/publish-images.sh --service controller  # one service only
 #   bash scripts/publish-images.sh --no-push             # smoke test, no upload
-#   bash scripts/publish-images.sh --no-sign             # skip cosign step
+#   bash scripts/publish-images.sh --sign                # also cosign-sign (batched —
+#                                                          ONE browser tab for all images)
 #   bash scripts/publish-images.sh --update-env /etc/talos/install.env
 #                                                         # patch the env file in-place
 #
+# Signing default: OFF. The chart's Sigstore enforcement is opt-in
+# (TALOS_SIGSTORE_REQUIRED), so signing is dead weight for the typical
+# operator. Production deploys with enforcement enabled should pass
+# `--sign` OR `TALOS_PUBLISH_SIGN=1 bash scripts/publish-images.sh`.
+#
 # Environment overrides:
-#   TALOS_GHCR_OWNER   default: parsed from `git remote get-url origin`
-#   GHCR_TOKEN         passed to `docker login` if you're not already authed
+#   TALOS_GHCR_OWNER     default: parsed from `git remote get-url origin`
+#   GHCR_TOKEN           passed to `docker login` if you're not already authed
+#   TALOS_PUBLISH_SIGN=1 enable signing without passing --sign every time
 #
 # Verification (operator-side, after sign step):
 #   cosign verify \
@@ -59,7 +66,21 @@ fi
 # Flag parsing.
 SERVICES=("${SERVICES_DEFAULT[@]}")
 DO_PUSH=1
-DO_SIGN=1
+# Sign-by-default flipped to OFF (2026-05-20). Two reasons:
+#   1. The chart's Sigstore enforcement is opt-in (TALOS_SIGSTORE_REQUIRED).
+#      For the default operator running with enforcement disabled, the
+#      signature is dead weight that costs 3 browser OAuth roundtrips
+#      per publish.
+#   2. When the operator DOES want signing, the new batched flow signs
+#      all three images in a single `cosign sign` invocation that
+#      reuses ONE OAuth token across all three Fulcio cert issues.
+#      No more 3-tab browser cascade.
+# Operators on production clusters with Sigstore enforcement should
+# pass `--sign` explicitly OR set TALOS_PUBLISH_SIGN=1 in their env.
+DO_SIGN=0
+if [[ "${TALOS_PUBLISH_SIGN:-0}" == "1" ]]; then
+    DO_SIGN=1
+fi
 UPDATE_ENV_FILE=""
 # Default to linux/amd64 because the production k3s VM is x86_64.
 # Apple-Silicon Macs default Docker to linux/arm64; building without
@@ -74,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --service)   SERVICES=("$2"); shift 2 ;;
         --no-push)   DO_PUSH=0; shift ;;
         --no-sign)   DO_SIGN=0; shift ;;
+        --sign)      DO_SIGN=1; shift ;;
         --update-env) UPDATE_ENV_FILE="$2"; shift 2 ;;
         --platform)  PLATFORM="$2"; shift 2 ;;
         --help|-h)
@@ -227,24 +249,46 @@ for i in "${!SERVICES[@]}"; do
 done
 
 # ── Sign ──────────────────────────────────────────────────────────────
+# Batched-sign: pass ALL image@digest refs to a single `cosign sign`
+# invocation. Cosign keyless does ONE OAuth flow up-front, then
+# issues a fresh Fulcio cert per image (each cert is bound to the
+# same OAuth identity). The previous one-call-per-image loop opened
+# THREE browser tabs for a 3-service publish — annoying after the
+# first publish, infuriating on the tenth.
+#
+# Fallback: if the operator's cosign version is too old to accept
+# multiple image args, we fall back to the per-image loop. cosign
+# has supported batched signing since v2.0 (Sep 2023); the chart's
+# pinned 2.4.1 in worker/Dockerfile, so the modern path is the
+# common case.
 if [[ "$DO_SIGN" -eq 1 && "$DO_PUSH" -eq 1 ]]; then
-    log "Signing pushed images (keyless, Sigstore + Rekor)"
+    SIGN_REFS=()
     for i in "${!SERVICES[@]}"; do
         svc="${SERVICES[$i]}"
         DIGEST="${DIGESTS[$i]:-}"
         [[ -n "$DIGEST" ]] || continue
-        IMAGE="${REGISTRY}/${TALOS_GHCR_OWNER}/talos-${svc}@${DIGEST}"
-        log "  cosign sign ${svc}@${DIGEST:0:24}…"
-        # COSIGN_EXPERIMENTAL=1 enables keyless. Identity comes from
-        # your GitHub OAuth flow that cosign launches in a browser.
-        # The cert is short-lived (~10 min) and Rekor records the
-        # signature publicly — same transparency-log story as the
-        # workflow path, just bound to your individual identity
-        # instead of a workflow URI.
-        COSIGN_EXPERIMENTAL=1 cosign sign --yes "$IMAGE"
+        SIGN_REFS+=("${REGISTRY}/${TALOS_GHCR_OWNER}/talos-${svc}@${DIGEST}")
     done
-    ok "All images signed"
-    echo
+    if [[ ${#SIGN_REFS[@]} -eq 0 ]]; then
+        warn "No digests to sign — push must have been skipped"
+    else
+        log "Signing ${#SIGN_REFS[@]} image(s) in a single cosign call (keyless, Sigstore + Rekor)"
+        # COSIGN_EXPERIMENTAL=1 enables keyless. Identity comes from
+        # your GitHub OAuth flow that cosign launches in a browser —
+        # ONCE — and the token gets reused across every image in this
+        # invocation. The cert per image is short-lived (~10 min) and
+        # Rekor records each signature publicly.
+        if ! COSIGN_EXPERIMENTAL=1 cosign sign --yes "${SIGN_REFS[@]}"; then
+            warn "Batched cosign sign failed — falling back to per-image loop"
+            warn "(this WILL open one browser tab per image)"
+            for ref in "${SIGN_REFS[@]}"; do
+                log "  cosign sign $ref"
+                COSIGN_EXPERIMENTAL=1 cosign sign --yes "$ref"
+            done
+        fi
+        ok "${#SIGN_REFS[@]} image(s) signed"
+        echo
+    fi
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────
