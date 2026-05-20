@@ -135,7 +135,7 @@ ok "Platform: ${PLATFORM}"
 echo
 
 # ── Build ─────────────────────────────────────────────────────────────
-log "Building ${#SERVICES[@]} image(s) via docker compose for ${PLATFORM}"
+log "Building ${#SERVICES[@]} image(s) for ${PLATFORM}"
 
 # DOCKER_DEFAULT_PLATFORM forces BuildKit to produce images for the
 # specified target arch regardless of host arch. On Apple Silicon this
@@ -146,11 +146,41 @@ export DOCKER_DEFAULT_PLATFORM="$PLATFORM"
 
 export GIT_SHA_OVERRIDE="$GIT_SHA"
 export GIT_DIRTY_OVERRIDE="$GIT_DIRTY"
-# Pass GIT_SHA_OVERRIDE through to the controller's build.rs (see
-# controller/Dockerfile). `docker compose build` reads from the
-# environment when the variable is referenced in build.args in
-# docker-compose.yml — `release.yml` uses the same pattern.
-docker compose build "${SERVICES[@]}"
+
+# Build each service. Most use `docker compose build` (picks up build
+# args from docker-compose.yml), but the frontend gets a separate
+# `docker build` against frontend/Dockerfile (production) — the
+# compose file points the frontend service at Dockerfile.dev for
+# local-dev `docker compose up` (Vite hot-reload), which is the
+# wrong mode for production:
+#   * vite --host 0.0.0.0 wants to write to /app/node_modules/.vite-temp
+#     but our chart sets readOnlyRootFilesystem=true → ENOENT
+#   * no minification, no production assets, ships dev-only HMR
+#     overhead to every client
+# The prod Dockerfile does `npm run build` then serves the static
+# bundle via nginx — the correct production shape.
+COMPOSE_SERVICES=()
+NEEDS_FRONTEND_BUILD=0
+for svc in "${SERVICES[@]}"; do
+    if [[ "$svc" == "frontend" ]]; then
+        NEEDS_FRONTEND_BUILD=1
+    else
+        COMPOSE_SERVICES+=("$svc")
+    fi
+done
+
+if [[ ${#COMPOSE_SERVICES[@]} -gt 0 ]]; then
+    docker compose build "${COMPOSE_SERVICES[@]}"
+fi
+
+if [[ "$NEEDS_FRONTEND_BUILD" -eq 1 ]]; then
+    log "Building frontend separately (prod Dockerfile, not Dockerfile.dev)"
+    docker build \
+        --platform "$PLATFORM" \
+        -f frontend/Dockerfile \
+        -t talos-frontend \
+        frontend/
+fi
 ok "Build complete"
 echo
 
