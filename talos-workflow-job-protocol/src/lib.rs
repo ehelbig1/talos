@@ -731,6 +731,26 @@ pub struct JobRequest {
     /// GET requests execute normally for data fetching.
     #[serde(default)]
     pub dry_run: bool,
+
+    /// H-1: signed reply-inbox commitment.
+    ///
+    /// When `Some(subject)`, the worker MUST publish its `JobResult`
+    /// to exactly this NATS subject — regardless of what arrives in
+    /// the unsigned `msg.reply` NATS header. Pre-fix, an on-wire
+    /// attacker (or anyone with NATS publish rights) could substitute
+    /// `msg.reply` with an arbitrary subject (e.g. `talos.admin.*`)
+    /// and the worker would happily publish a legitimately-signed
+    /// JobResult there, leaking execution output.
+    ///
+    /// Populated by the dispatcher when the transport supports
+    /// inbox pre-allocation (`JobTransport::new_reply_inbox`).
+    /// `None` falls back to the legacy "trust msg.reply" path for
+    /// backward compatibility with older controllers / transports.
+    ///
+    /// HMAC-bound via the signing payload (appended at end per the
+    /// wire-format stability rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_topic: Option<String>,
 }
 
 impl JobRequest {
@@ -835,8 +855,16 @@ impl JobRequest {
             format!("{}:{}", s.as_bytes().len(), s)
         }
 
+        // H-1: reply_topic. Sentinel `-` for None so absence is
+        // tamper-evident (an attacker can't strip the field to
+        // downgrade verification). Length-prefixed because the inbox
+        // subject is variable-length and contains `.` separators (so
+        // it could collide against adjacent fields under naive
+        // concatenation).
+        let reply_topic_str = self.reply_topic.as_deref().unwrap_or("-");
+
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             lp(&self.module_uri),
@@ -864,6 +892,11 @@ impl JobRequest {
             lp(&allowed_secrets_str),
             lp(&allowed_sql_str),
             self.allow_tier2_exposure,
+            // H-1: reply_topic appended AT THE END so an on-wire
+            // attacker can't redirect a worker's signed JobResult to
+            // an attacker-controlled subject via the unsigned
+            // msg.reply NATS header.
+            lp(&reply_topic_str),
         )
         .into_bytes()
     }
@@ -1221,6 +1254,15 @@ pub struct PipelineJobRequest {
     /// matches pre-feature behavior for unrestricted actors.
     #[serde(default)]
     pub max_llm_tier: LlmTier,
+
+    /// H-1: signed reply-inbox commitment. Same semantics as
+    /// [`JobRequest::reply_topic`] — the worker MUST publish its
+    /// `PipelineJobResult` to this exact NATS subject when set,
+    /// regardless of `msg.reply`. `None` falls back to the legacy
+    /// trust-msg.reply path. HMAC-bound at the end of the signing
+    /// payload (wire-format stability rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_topic: Option<String>,
 }
 
 impl PipelineJobRequest {
@@ -1305,8 +1347,11 @@ impl PipelineJobRequest {
         let step_hashes_joined = step_hashes.join(":");
         let step_integrations_joined = step_integrations.join(",");
 
+        // H-1 (pipeline): reply_topic — same semantics as JobRequest.
+        let reply_topic_str = self.reply_topic.as_deref().unwrap_or("-");
+
         format!(
-            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             self.job_nonce,
@@ -1326,6 +1371,8 @@ impl PipelineJobRequest {
             self.max_llm_tier.as_signing_str(),
             // M-5 (pipeline): per-step capability grants appended AT THE END.
             lp(&step_caps_str),
+            // H-1 (pipeline): reply_topic appended AT THE END.
+            lp(&reply_topic_str),
         )
         .into_bytes()
     }
@@ -1796,6 +1843,7 @@ mod tests {
             expected_wasm_hash: None,
             max_fuel: 0,
             dry_run: false,
+            reply_topic: None,
         };
         req.sign(&key).unwrap();
 
@@ -1843,6 +1891,7 @@ mod tests {
             expected_wasm_hash: None,
             max_fuel: 0,
             dry_run: false,
+            reply_topic: None,
         };
 
         req.sign(&key).unwrap();
@@ -1882,6 +1931,7 @@ mod tests {
             expected_wasm_hash: None,
             max_fuel: 0,
             dry_run: false,
+            reply_topic: None,
         };
         req.sign(&key).unwrap();
         req.module_uri = "wasm://evil-module/v1".to_string(); // tamper
@@ -1955,6 +2005,7 @@ mod tests {
             expected_wasm_hash: None,
             max_fuel: 0,
             dry_run: false,
+            reply_topic: None,
         };
         req.sign(&key).unwrap();
         // An attacker cannot escalate from GET-only to POST by modifying the field.
@@ -1994,6 +2045,7 @@ mod tests {
             expected_wasm_hash: None,
             max_fuel: 0,
             dry_run: false,
+            reply_topic: None,
         };
         req.sign(&key).unwrap();
         // Reordering must not affect verification (sorted before hashing).
@@ -2047,6 +2099,7 @@ mod tests {
             expected_wasm_hash: None,
             max_fuel: 0,
             dry_run: false,
+            reply_topic: None,
         }
     }
 
@@ -2208,6 +2261,81 @@ mod tests {
         assert!(
             result.verify(&key, 300).is_err(),
             "tampered logs must fail verification (L-10)"
+        );
+    }
+
+    /// H-1: tampering with `reply_topic` MUST invalidate the signature.
+    /// Pre-fix the field was excluded from the signing payload, so a
+    /// NATS-channel attacker could redirect the worker's signed
+    /// JobResult to an attacker-controlled subject.
+    #[test]
+    fn tampered_reply_topic_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.reply_topic = Some("_INBOX.legit.abc123".to_string());
+        req.sign(&key).unwrap();
+
+        // Tamper: swap to a malicious subject.
+        req.reply_topic = Some("talos.admin.commands".to_string());
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered reply_topic must fail verification (H-1)"
+        );
+    }
+
+    /// H-1: reply_topic None → Some MUST also be tamper-evident
+    /// (sentinel `-` differs from a real subject).
+    #[test]
+    fn reply_topic_none_to_some_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+        req.reply_topic = Some("talos.admin.commands".to_string());
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "injecting reply_topic must fail verification (H-1)"
+        );
+    }
+
+    /// H-1: reply_topic Some → None MUST also be tamper-evident
+    /// (stripping the field shouldn't downgrade verification to the
+    /// legacy "trust msg.reply" path).
+    #[test]
+    fn reply_topic_some_to_none_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.reply_topic = Some("_INBOX.legit.abc123".to_string());
+        req.sign(&key).unwrap();
+        req.reply_topic = None;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "stripping reply_topic must fail verification (H-1)"
+        );
+    }
+
+    /// H-1: tampering at the pipeline level — same property as
+    /// JobRequest. PipelineJobRequest tampering is per-pipeline,
+    /// not per-step, so we tamper the field at the root.
+    #[test]
+    fn tampered_pipeline_reply_topic_fails_verification() {
+        let key = test_key();
+        let mut req = PipelineJobRequest {
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            steps: vec![],
+            total_timeout_ms: 60_000,
+            share_sandbox: false,
+            signature: vec![],
+            job_nonce: String::new(),
+            user_id: Uuid::nil(),
+            max_llm_tier: LlmTier::default(),
+            reply_topic: Some("_INBOX.legit.xyz".to_string()),
+        };
+        req.sign(&key).unwrap();
+        req.reply_topic = Some("talos.admin.commands".to_string());
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline reply_topic must fail verification (H-1)"
         );
     }
 

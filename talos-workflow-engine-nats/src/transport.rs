@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use talos_workflow_engine_core::{BoxError, JobTransport};
 
 /// Newtype wrapper around `async_nats::Client` that implements
@@ -58,5 +59,54 @@ impl JobTransport for NatsTransport {
             .await
             .map_err(|e| -> BoxError { e.to_string().into() })?;
         Ok(reply.payload.to_vec())
+    }
+
+    /// H-1: pre-allocate a unique NATS inbox subject via
+    /// [`async_nats::Client::new_inbox`]. The returned string is
+    /// safe to bind into the JobRequest's `reply_topic` and then
+    /// hand back to [`request_with_reply_inbox`].
+    fn new_reply_inbox(&self) -> Option<String> {
+        Some(self.client.new_inbox())
+    }
+
+    /// H-1: subscribe to `reply_inbox` BEFORE publishing so we don't
+    /// race the worker's reply, then publish with reply set to the
+    /// same inbox, and await exactly one message on the subscription.
+    ///
+    /// Lifetime contract:
+    /// - The subscription is dropped at function return (via the
+    ///   `_sub` guard going out of scope). NATS auto-unsubscribes
+    ///   when the local `Subscriber` is dropped, so we don't leak
+    ///   subscriptions on broker or timeout failures.
+    /// - The caller wraps this in `tokio::time::timeout` per the
+    ///   trait-level contract; a malicious worker that never
+    ///   replies cannot block this method forever.
+    async fn request_with_reply_inbox(
+        &self,
+        topic: &str,
+        reply_inbox: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, BoxError> {
+        let mut sub = self
+            .client
+            .subscribe(reply_inbox.to_string())
+            .await
+            .map_err(|e| -> BoxError { format!("inbox subscribe: {e}").into() })?;
+        self.client
+            .publish_with_reply(
+                topic.to_string(),
+                reply_inbox.to_string(),
+                payload.into(),
+            )
+            .await
+            .map_err(|e| -> BoxError { format!("publish_with_reply: {e}").into() })?;
+        // Best-effort flush so the publish doesn't sit in the local
+        // outbox while we wait for a reply. Errors here are not fatal
+        // — `next()` will simply time out if the broker disconnects.
+        let _ = self.client.flush().await;
+        match sub.next().await {
+            Some(msg) => Ok(msg.payload.to_vec()),
+            None => Err("inbox subscription closed before reply arrived".into()),
+        }
     }
 }

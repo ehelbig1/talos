@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
         user_id,
         max_llm_tier: LlmTier::Tier1,
         dry_run: false,
+        reply_topic: None,
     };
     let key = [0u8; 32];
     req.sign(&key).map_err(|e| anyhow::anyhow!("sign: {e}"))?;
@@ -156,6 +157,7 @@ async fn main() -> Result<()> {
         share_sandbox: false,
         user_id,
         max_llm_tier: LlmTier::Tier1,
+        reply_topic: None,
     };
     pipeline
         .sign(&key)

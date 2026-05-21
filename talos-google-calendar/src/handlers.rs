@@ -1292,6 +1292,7 @@ pub async fn process_webhook_events(
             // See talos-gmail/src/dispatch.rs for rationale.
             max_fuel: exec_info.max_fuel,
             dry_run: false,
+            reply_topic: None,
             actor_id: None,
             user_id,
         };

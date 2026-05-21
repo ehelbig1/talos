@@ -72,4 +72,44 @@ pub trait JobTransport: Send + Sync {
     /// Send `payload` to the worker pool at `topic` and await a reply.
     /// See the trait-level docs for the full contract.
     async fn request(&self, topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError>;
+
+    /// H-1: Pre-allocate a unique reply-inbox subject for the next
+    /// [`request_with_reply_inbox`] call.
+    ///
+    /// When `Some(inbox)`, the dispatcher binds the inbox subject
+    /// into the JobRequest's signed `reply_topic` field, so the
+    /// worker can verify the wire `msg.reply` against the
+    /// HMAC-protected value and refuse to publish results to an
+    /// attacker-redirected subject.
+    ///
+    /// `None` (default) signals that the transport does not support
+    /// inbox pre-allocation. Callers fall back to the legacy
+    /// [`request`] flow, which trusts the unsigned wire `msg.reply`.
+    /// Test transports and stub impls can stay on the default.
+    fn new_reply_inbox(&self) -> Option<String> {
+        None
+    }
+
+    /// H-1: Publish `payload` to `topic` with `reply_inbox` as the
+    /// reply-subject and await one reply on that inbox. The caller
+    /// is responsible for having bound `reply_inbox` into the
+    /// signed payload via [`new_reply_inbox`] first.
+    ///
+    /// The default implementation delegates to [`request`] (ignoring
+    /// the inbox) so transports that don't override are still
+    /// usable — they just don't get the reply-topic binding
+    /// guarantee. Callers MUST check [`new_reply_inbox`] first to
+    /// know whether this method has a useful implementation; the
+    /// dispatcher does exactly that.
+    ///
+    /// [`request`]: Self::request
+    /// [`new_reply_inbox`]: Self::new_reply_inbox
+    async fn request_with_reply_inbox(
+        &self,
+        topic: &str,
+        _reply_inbox: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, BoxError> {
+        self.request(topic, payload).await
+    }
 }

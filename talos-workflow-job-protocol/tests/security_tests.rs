@@ -40,6 +40,7 @@ fn make_job_request() -> JobRequest {
         user_id: Uuid::nil(),
         max_fuel: 0,
         dry_run: false,
+        reply_topic: None,
     }
 }
 
@@ -295,6 +296,7 @@ fn pipeline_tampered_step_count_fails() {
         share_sandbox: false,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -321,6 +323,7 @@ fn pipeline_tampered_share_sandbox_fails() {
         share_sandbox: false,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -506,6 +509,7 @@ fn tampered_pipeline_step_integration_name_fails() {
         share_sandbox: false,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };

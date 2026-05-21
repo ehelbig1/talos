@@ -558,6 +558,62 @@ async fn publish_bytes_with_retry(
 /// don't currently exist, but the fire-and-forget code path is kept
 /// for future use (e.g. async work-queue dispatches that don't await
 /// the result inline).
+/// H-1: Reconcile the wire-format NATS `msg.reply` (untrusted —
+/// flows over an unsigned header an attacker can modify) with the
+/// HMAC-bound `JobRequest::reply_topic` (signed, trustworthy when
+/// present). Returns the subject the worker SHOULD publish the
+/// signed JobResult to, or `None` if no reply path is available.
+///
+/// Decision matrix:
+/// - (Some(signed), Some(wire)) where signed == wire → trust both;
+///   return Some(signed). Hot path.
+/// - (Some(signed), Some(wire)) where signed != wire → log a
+///   SECURITY-level warning AND publish to the SIGNED value. The
+///   wire value is attacker-controllable; the signed value is the
+///   one the controller committed to.
+/// - (Some(signed), None) → publish to the signed value. Indicates
+///   the wire header was stripped in transit (rare; treat the
+///   signed value as authoritative).
+/// - (None, Some(wire)) → publish to the wire value. Backward-compat
+///   path for controllers / transports that don't pre-allocate
+///   inboxes. The legacy "trust msg.reply" exposure remains but
+///   only when reply_topic isn't bound.
+/// - (None, None) → no reply path; the worker logs the result
+///   elsewhere (e.g. fire-and-forget topic).
+///
+/// Pure function so the policy is unit-testable without a NATS
+/// broker. The `job_id` parameter is for log correlation only.
+pub(crate) fn pick_trusted_reply_topic(
+    job_id: uuid::Uuid,
+    signed: Option<&str>,
+    wire: Option<&str>,
+) -> Option<String> {
+    match (signed, wire) {
+        (Some(s), Some(w)) if s == w => Some(s.to_string()),
+        (Some(s), Some(w)) => {
+            ::tracing::error!(
+                job_id = %job_id,
+                signed_reply = %s,
+                wire_reply = %w,
+                "SECURITY: H-1 reply_topic mismatch — wire msg.reply does not match \
+                 HMAC-bound JobRequest.reply_topic. Publishing to the SIGNED value; \
+                 wire value is likely attacker-tampered."
+            );
+            Some(s.to_string())
+        }
+        (Some(s), None) => {
+            ::tracing::warn!(
+                job_id = %job_id,
+                signed_reply = %s,
+                "H-1: msg.reply stripped in transit; publishing to HMAC-bound reply_topic"
+            );
+            Some(s.to_string())
+        }
+        (None, Some(w)) => Some(w.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// M-7: Hard ceiling on the serialized JobResult bytes the worker
 /// will attempt to publish to NATS. Without a pre-publish cap, an
 /// oversized `output_payload` (legitimately large or hostile) silently
@@ -2168,7 +2224,15 @@ async fn main() -> anyhow::Result<()> {
                             let nc_clone = single_nc.clone();
                             let runtime_clone = single_runtime.clone();
                             let key_clone = single_key.clone();
-                            let reply_to = msg.reply.map(|r: async_nats::Subject| r.to_string());
+                            let wire_reply = msg.reply.map(|r: async_nats::Subject| r.to_string());
+                            // H-1: prefer the HMAC-bound `req.reply_topic`
+                            // over the unsigned wire `msg.reply`. See
+                            // `pick_trusted_reply_topic` for the matrix.
+                            let reply_to = pick_trusted_reply_topic(
+                                req.job_id,
+                                req.reply_topic.as_deref(),
+                                wire_reply.as_deref(),
+                            );
 
                             tokio::task::spawn(async move {
                                 let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
@@ -2261,7 +2325,15 @@ async fn main() -> anyhow::Result<()> {
                             let nc_clone = pipe_nc.clone();
                             let runtime_clone = pipe_runtime.clone();
                             let key_clone = pipe_key.clone();
-                            let reply_to = msg.reply.clone().map(|r: async_nats::Subject| r.to_string());
+                            let wire_reply = msg.reply.clone().map(|r: async_nats::Subject| r.to_string());
+                            // H-1: see `pick_trusted_reply_topic` —
+                            // pipeline path uses the same wire/signed
+                            // reconciliation as single-node jobs.
+                            let reply_to = pick_trusted_reply_topic(
+                                req.job_id,
+                                req.reply_topic.as_deref(),
+                                wire_reply.as_deref(),
+                            );
 
                             tokio::task::spawn(async move {
                                 let mut result =
@@ -2950,6 +3022,87 @@ mod oci_layer_tests {
         std::env::set_var("WORKER_MAX_JOB_RESULT_BYTES", "8388608"); // 8 MiB
         assert_eq!(max_job_result_bytes(), 8_388_608);
         std::env::remove_var("WORKER_MAX_JOB_RESULT_BYTES");
+    }
+
+    // ─── H-1: pick_trusted_reply_topic decision matrix ────────────────────
+    //
+    // The whole point of H-1 is that a NATS-channel attacker who
+    // substitutes `msg.reply` cannot redirect the worker's signed
+    // JobResult to an attacker-controlled subject. These tests pin
+    // the policy at the function boundary so a future "simplification"
+    // can't silently re-introduce the regression.
+
+    #[test]
+    fn pick_reply_signed_and_wire_match() {
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, Some("_INBOX.abc"), Some("_INBOX.abc"));
+        assert_eq!(r.as_deref(), Some("_INBOX.abc"));
+    }
+
+    #[test]
+    fn pick_reply_signed_and_wire_mismatch_returns_signed() {
+        // SECURITY: an attacker substituted `msg.reply` — the worker
+        // MUST publish to the signed value, not the wire value.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(
+            jid,
+            Some("_INBOX.legit"),
+            Some("talos.admin.commands"),
+        );
+        assert_eq!(
+            r.as_deref(),
+            Some("_INBOX.legit"),
+            "wire taking priority would be the security regression"
+        );
+    }
+
+    #[test]
+    fn pick_reply_signed_only() {
+        // msg.reply stripped in transit; signed value is authoritative.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, Some("_INBOX.signed"), None);
+        assert_eq!(r.as_deref(), Some("_INBOX.signed"));
+    }
+
+    #[test]
+    fn pick_reply_wire_only_backward_compat() {
+        // Legacy controller / non-NATS transport that doesn't
+        // pre-allocate inboxes. The worker accepts msg.reply
+        // verbatim — this is the path the H-1 binding closes for
+        // upgraded controllers but keeps available for old ones.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, None, Some("_INBOX.legacy"));
+        assert_eq!(r.as_deref(), Some("_INBOX.legacy"));
+    }
+
+    #[test]
+    fn pick_reply_neither_present() {
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, None, None);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn pick_reply_mismatch_does_not_publish_to_attacker_subject() {
+        // Specific regression guard: an attacker substituting a
+        // sensitive admin subject MUST NOT result in the worker
+        // publishing there. This is the whole point of H-1.
+        let jid = uuid::Uuid::new_v4();
+        let bad_subjects = [
+            "talos.admin.commands",
+            "talos.jobs",          // would create a NATS loop
+            "talos.pipeline.jobs", // same
+            "$SYS.REQ.ACCOUNT",    // NATS system subject
+            "_INBOX.attacker.xyz", // inbox-prefix but not the signed one
+        ];
+        for bad in bad_subjects {
+            let r = pick_trusted_reply_topic(jid, Some("_INBOX.legit"), Some(bad));
+            assert_eq!(
+                r.as_deref(),
+                Some("_INBOX.legit"),
+                "H-1 regression: wire subject {bad:?} leaked through"
+            );
+        }
     }
 }
 // build test 1773350887

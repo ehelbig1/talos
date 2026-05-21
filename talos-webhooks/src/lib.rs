@@ -1173,6 +1173,7 @@ impl WebhookRouter {
                         // MCP-1089: propagate per-module max_fuel.
                         max_fuel: exec_info.max_fuel,
                         dry_run: false,
+                        reply_topic: None,
                         actor_id: None,
                         user_id,
                     };
@@ -2468,6 +2469,7 @@ impl WebhookRouter {
                     // MCP-1089: propagate per-module max_fuel (DLQ replay path).
                     max_fuel: exec_info.max_fuel,
                     dry_run: false,
+                    reply_topic: None,
                     actor_id: None,
                     user_id,
                 };

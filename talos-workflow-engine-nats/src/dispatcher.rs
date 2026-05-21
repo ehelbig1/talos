@@ -85,6 +85,23 @@ pub(crate) fn get_pipeline_job_topic(user_id: Option<Uuid>, priority: u8) -> Str
     }
 }
 
+/// H-1: route the outbound request through the inbox-aware
+/// transport method when an inbox was pre-allocated, falling back
+/// to the legacy `request` path otherwise. Keeps the retry-loop
+/// call sites tidy (one helper instead of an `if`/`else` inlined
+/// inside the timeout wrapper).
+async fn send_with_optional_inbox(
+    transport: &dyn JobTransport,
+    topic: &str,
+    reply_inbox: Option<&str>,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, talos_workflow_engine_core::BoxError> {
+    match reply_inbox {
+        Some(inbox) => transport.request_with_reply_inbox(topic, inbox, payload).await,
+        None => transport.request(topic, payload).await,
+    }
+}
+
 /// Dispatch a NATS request with retry and exponential backoff.
 ///
 /// Retries both NATS delivery errors and application-level job failures.
@@ -104,13 +121,24 @@ pub(crate) async fn dispatch_with_retry(
     max_retries: u32,
     base_backoff_ms: u64,
     pipeline_resign_key: Option<&[u8]>,
+    // H-1: when `Some(inbox)`, every transport.request goes through
+    // the inbox-aware path so the wire `msg.reply` matches the
+    // HMAC-bound `reply_topic` in the JobRequest. When `None`, falls
+    // back to the legacy unsigned-reply path for transports that
+    // don't pre-allocate inboxes (in-process test stubs, etc.).
+    reply_inbox: Option<String>,
 ) -> Result<Vec<u8>, String> {
     let mut attempts: u32 = 0;
     let mut current_payload = payload;
     loop {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            transport.request(&topic, current_payload.clone()),
+            send_with_optional_inbox(
+                transport,
+                &topic,
+                reply_inbox.as_deref(),
+                current_payload.clone(),
+            ),
         )
         .await;
 
@@ -231,13 +259,20 @@ pub(crate) async fn execute_job_with_retry(
     // passes references into the loop.
     retry_classifier: &dyn RetryClassifier,
     expression_evaluator: &dyn ExpressionEvaluator,
+    // H-1: see `dispatch_with_retry` for the contract.
+    reply_inbox: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
     let mut current_payload = payload;
     loop {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            transport.request(&topic, current_payload.clone()),
+            send_with_optional_inbox(
+                transport,
+                &topic,
+                reply_inbox.as_deref(),
+                current_payload.clone(),
+            ),
         )
         .await;
 
@@ -614,6 +649,15 @@ impl NodeDispatcher for NatsNodeDispatcher {
             );
         }
 
+        // H-1: pre-allocate a reply inbox so we can bind it into the
+        // signed `JobRequest::reply_topic`. NatsTransport returns
+        // `Some(inbox)`; test transports / non-NATS impls return
+        // `None`, in which case we fall back to the legacy
+        // trust-msg.reply path. Doing this BEFORE signing is the
+        // whole point — once signed, the worker can verify wire
+        // `msg.reply` against the HMAC-protected value.
+        let reply_inbox = self.transport.new_reply_inbox();
+
         // 1. Assemble the wire-format `JobRequest`.
         let mut req = JobRequest {
             // Reuse a caller-supplied job id when present so a
@@ -652,6 +696,11 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // preserving wire compat with existing workers.
             user_id: job.user_id.unwrap_or_else(uuid::Uuid::nil),
             max_llm_tier: job.max_llm_tier,
+            // H-1: stamp the pre-allocated inbox into the request
+            // BEFORE signing. The worker will verify wire
+            // `msg.reply == req.reply_topic` and refuse to publish
+            // results to anything else.
+            reply_topic: reply_inbox.clone(),
         };
 
         // 2. Sign.
@@ -728,6 +777,10 @@ impl NodeDispatcher for NatsNodeDispatcher {
             job.node_id,
             self.retry_classifier.as_ref(),
             self.expression_evaluator.as_ref(),
+            // H-1: thread the signed reply inbox down so the retry
+            // loop publishes via `request_with_reply_inbox` instead
+            // of the unsigned-reply `request`.
+            reply_inbox,
         )
         .await
         .map_err(|e| -> BoxError { e.into() })?;
@@ -774,6 +827,11 @@ impl NodeDispatcher for NatsNodeDispatcher {
 
         let max_priority = steps.iter().map(|s| s.priority).max().unwrap_or(100);
 
+        // H-1: pre-allocate a reply inbox so we can bind it into the
+        // signed `PipelineJobRequest::reply_topic`. Same shape as
+        // the single-node `dispatch` above.
+        let reply_inbox = self.transport.new_reply_inbox();
+
         // 2. Assemble the chain-level wire request.
         let mut req = PipelineJobRequest {
             job_id: request.job_id.unwrap_or_else(uuid::Uuid::new_v4),
@@ -788,6 +846,9 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // dispatch above).
             user_id: request.user_id.unwrap_or_else(uuid::Uuid::nil),
             max_llm_tier: request.max_llm_tier,
+            // H-1: bind the pre-allocated inbox into the signing
+            // payload. Worker will refuse to publish anywhere else.
+            reply_topic: reply_inbox.clone(),
         };
 
         // 3. Sign (chain-level HMAC, independent of any per-step signing).
@@ -825,6 +886,9 @@ impl NodeDispatcher for NatsNodeDispatcher {
             self.worker_shared_key
                 .as_ref()
                 .map(WorkerSharedKey::as_bytes),
+            // H-1: signed reply inbox so the worker publishes the
+            // pipeline result to the HMAC-bound subject only.
+            reply_inbox,
         )
         .await
         .map_err(|e| -> BoxError { e.into() })?;

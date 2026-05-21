@@ -16,6 +16,9 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version =
 talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.3", default-features = false }
 async-nats = "0.47"
 async-trait = "0.1"
+# H-1: `Subscriber::next` (StreamExt::next) for the reply-inbox
+# pre-allocation path in `transport.rs`.
+futures = "0.3"
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
