@@ -450,7 +450,22 @@ pub(crate) const MAX_INBOUND_HEADER_VALUE_BYTES: usize = 16 * 1024;
 // result now via the recognised-falsy arm).
 static ALLOW_PRIVATE_HOST_TARGETS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
-        talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false)
+        let enabled =
+            talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
+        // L-2: structured WARN at first lookup so operators see in
+        // production logs that the SSRF defense is relaxed. The flag
+        // is a "trust me, I know what I'm doing" escape hatch — it
+        // should be visible at runtime, not silent.
+        if enabled {
+            tracing::warn!(
+                "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true — \
+                 SSRF defense relaxed for hostnames in allowed_hosts. \
+                 IP literals to private ranges remain blocked. \
+                 This trust assumes operator-authored modules only; do NOT \
+                 enable on multi-tenant or untrusted-module-author deployments."
+            );
+        }
+        enabled
     });
 
 // ============================================================================

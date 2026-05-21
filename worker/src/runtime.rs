@@ -137,6 +137,29 @@ fn aot_key_ring() -> &'static AotKeyRing {
             verification_keys.extend(prev_keys);
         }
 
+        // L-5: structured fingerprint log of the AOT signing key (and
+        // each verification key) at startup so an operator can grep
+        // both worker logs across a fleet and confirm they agree.
+        // Compromise of this key allows an attacker to forge
+        // pre-deserialize blobs — i.e. arbitrary native code
+        // execution via `Component::deserialize`. The 32-bit (8 hex
+        // char) prefix is enough to detect drift; the full key
+        // never leaves the process.
+        {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = Hmac::<Sha256>::new_from_slice(&signing_key)
+                .expect("HMAC-SHA256 accepts any key length");
+            mac.update(b"talos-aot-key-fingerprint-v1");
+            let tag = mac.finalize().into_bytes();
+            let fp_short = hex::encode(&tag[..4]);
+            tracing::info!(
+                aot_signing_key_fp = %fp_short,
+                verification_key_count = verification_keys.len(),
+                "AOT HMAC key loaded; compare fingerprint across worker fleet for drift detection"
+            );
+        }
+
         AotKeyRing {
             signing_key,
             verification_keys,

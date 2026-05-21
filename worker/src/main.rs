@@ -1839,6 +1839,64 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // L-4: Sigstore startup sanity — verify `cosign` is actually
+    // executable when policy is non-Disabled. Pre-fix the missing
+    // binary surfaced as a per-pull "cosign_unavailable" error;
+    // production deploys that THOUGHT verification was running
+    // discovered the gap only when an unsigned artifact slipped
+    // through (or, in Required mode, when every pull failed).
+    // Failing at boot in Required mode is loud, immediate, and
+    // points at the right config knob.
+    {
+        let sigstore_policy = SigstorePolicy::from_env();
+        if sigstore_policy != SigstorePolicy::Disabled {
+            match tokio::process::Command::new("cosign")
+                .arg("version")
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    let version_line = String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .next()
+                        .unwrap_or("(unknown)")
+                        .to_string();
+                    ::tracing::info!(
+                        cosign_version = %version_line,
+                        policy = ?sigstore_policy,
+                        "Sigstore startup sanity check: cosign binary OK"
+                    );
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    if sigstore_policy == SigstorePolicy::Required {
+                        return Err(anyhow::anyhow!(
+                            "cosign binary present but `cosign version` exited non-zero (stderr: {stderr}). \
+                             Required policy refuses to boot."
+                        ));
+                    }
+                    ::tracing::warn!(
+                        stderr = %stderr,
+                        "Sigstore startup sanity check: cosign returned non-zero — verifications will fail"
+                    );
+                }
+                Err(e) => {
+                    if sigstore_policy == SigstorePolicy::Required {
+                        return Err(anyhow::anyhow!(
+                            "cosign binary not executable ({e}) and Sigstore policy is Required. \
+                             Install cosign in the worker image or set TALOS_SIGSTORE_REQUIRED=audit \
+                             during migration."
+                        ));
+                    }
+                    ::tracing::warn!(
+                        error = %e,
+                        "Sigstore startup sanity check: cosign not executable — Audit mode will warn-and-continue on every pull"
+                    );
+                }
+            }
+        }
+    }
+
     // M-1: validate Sigstore identity regexp at startup so an operator
     // who set `TALOS_SIGSTORE_REQUIRED=true` with a permissive pattern
     // discovers the policy is broken HERE — not silently per-pull when
