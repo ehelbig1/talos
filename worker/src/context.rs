@@ -169,6 +169,17 @@ pub struct TalosContext {
     /// Per-execution call counters for rate-limited host functions.
     /// Each counter tracks calls within the current execution.
     pub http_call_count: AtomicU64,
+    /// M-6: per-host HTTP counter. The global `http_call_count` caps
+    /// total fetches at `MAX_HTTP_CALLS_PER_EXECUTION` (1000); without
+    /// a per-host cap, a single guest can issue all 1000 calls to one
+    /// upstream and turn the worker into a third-party DoS
+    /// amplification primitive. The per-host limit
+    /// (`MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION` in host_impl.rs)
+    /// stacks on top of the global cap. Host strings are lowercased
+    /// at insertion so `Example.com` and `example.com` share a slot.
+    /// `DashMap` chosen for lock-free updates on the hot path —
+    /// `Mutex<HashMap>` would serialize every HTTP call.
+    pub http_calls_per_host: dashmap::DashMap<String, u64>,
     pub db_query_count: AtomicU64,
     pub messaging_publish_count: AtomicU64,
     /// MCP-523: per-execution email-send count. Pre-fix `wit_email::send`
@@ -647,6 +658,7 @@ impl TalosContext {
             cancelled: std::sync::atomic::AtomicBool::new(false),
             quota_usage: std::sync::Mutex::new(HashMap::new()),
             http_call_count: AtomicU64::new(0),
+            http_calls_per_host: dashmap::DashMap::new(),
             db_query_count: AtomicU64::new(0),
             messaging_publish_count: AtomicU64::new(0),
             email_send_count: AtomicU64::new(0),
@@ -1172,6 +1184,19 @@ impl TalosContext {
         }
     }
 
+    /// M-6: atomic check-and-bump of the per-host HTTP counter.
+    /// Returns `true` if the per-host budget for `host` still has
+    /// headroom and the counter was incremented; `false` if the host
+    /// is at `limit`.
+    ///
+    /// Hosts are lowercased at entry so `Example.com` and
+    /// `example.com` share a slot. The `DashMap` entry API is
+    /// linearizable per-key, so concurrent admissions from the same
+    /// execution serialize correctly without an outer lock.
+    pub fn check_per_host_rate_limit(&self, host: &str, limit: u64) -> bool {
+        per_host_check_and_bump(&self.http_calls_per_host, host, limit)
+    }
+
     /// Atomically deduct `microseconds` from the crypto time budget.
     /// Returns `true` if budget remains, `false` if exhausted.
     pub fn deduct_crypto_budget(&self, microseconds: u64) -> bool {
@@ -1206,3 +1231,99 @@ impl TalosContext {
 // That path no longer exists — writes go through NATS-RPC
 // (`spawn_state_write_through`) and reads are in-memory only during
 // an execution. Deleted 2026-04-14.
+
+
+/// Pure-function core of `TalosContext::check_per_host_rate_limit`,
+/// extracted so the per-host rate-limit algorithm is unit-testable
+/// without constructing a full TalosContext. Lowercases the host
+/// (so case variants share a slot), short-circuits when limit == 0,
+/// and uses the DashMap entry API for linearizable per-key updates.
+pub(crate) fn per_host_check_and_bump(
+    counts: &dashmap::DashMap<String, u64>,
+    host: &str,
+    limit: u64,
+) -> bool {
+    if limit == 0 {
+        return true;
+    }
+    let key = host.to_ascii_lowercase();
+    let mut entry = counts.entry(key).or_insert(0);
+    if *entry >= limit {
+        return false;
+    }
+    *entry += 1;
+    true
+}
+
+#[cfg(test)]
+mod per_host_rate_limit_tests {
+    use super::per_host_check_and_bump;
+
+    #[test]
+    fn limit_zero_is_unlimited() {
+        // limit == 0 means "no per-host cap" — match the global
+        // check_rate_limit convention so 0-via-env or unset behaves
+        // identically. The counter is NOT incremented in this path.
+        let counts = dashmap::DashMap::new();
+        for _ in 0..10_000 {
+            assert!(per_host_check_and_bump(&counts, "example.com:443", 0));
+        }
+        assert!(counts.is_empty(), "counter must not be touched when limit=0");
+    }
+
+    #[test]
+    fn admits_up_to_limit_then_rejects() {
+        let counts = dashmap::DashMap::new();
+        for _ in 0..5 {
+            assert!(per_host_check_and_bump(&counts, "a.example.com:443", 5));
+        }
+        // The 6th call must be rejected.
+        assert!(!per_host_check_and_bump(&counts, "a.example.com:443", 5));
+        // Counter does NOT advance past the limit.
+        assert_eq!(*counts.get("a.example.com:443").unwrap(), 5);
+    }
+
+    #[test]
+    fn different_hosts_have_independent_budgets() {
+        let counts = dashmap::DashMap::new();
+        for _ in 0..3 {
+            assert!(per_host_check_and_bump(&counts, "a.com:443", 3));
+        }
+        // a.com is full but b.com still has its full budget.
+        assert!(!per_host_check_and_bump(&counts, "a.com:443", 3));
+        for _ in 0..3 {
+            assert!(per_host_check_and_bump(&counts, "b.com:443", 3));
+        }
+        assert!(!per_host_check_and_bump(&counts, "b.com:443", 3));
+    }
+
+    #[test]
+    fn case_insensitive_host_collision() {
+        // Example.com and example.com share a budget — otherwise an
+        // attacker could double their effective per-host budget by
+        // alternating case.
+        let counts = dashmap::DashMap::new();
+        for _ in 0..2 {
+            assert!(per_host_check_and_bump(&counts, "Example.com:443", 2));
+        }
+        // Third request — different case, same logical host.
+        assert!(!per_host_check_and_bump(&counts, "example.com:443", 2));
+        assert!(!per_host_check_and_bump(&counts, "EXAMPLE.COM:443", 2));
+    }
+
+    #[test]
+    fn rejected_attempts_do_not_advance_counter() {
+        // Once we're at the cap, subsequent rejected attempts must
+        // not silently push the counter higher (would matter if we
+        // ever exposed the counter for diagnostic purposes).
+        let counts = dashmap::DashMap::new();
+        for _ in 0..2 {
+            assert!(per_host_check_and_bump(&counts, "a:80", 2));
+        }
+        for _ in 0..5 {
+            assert!(!per_host_check_and_bump(&counts, "a:80", 2));
+        }
+        assert_eq!(*counts.get("a:80").unwrap(), 2);
+    }
+}
+
