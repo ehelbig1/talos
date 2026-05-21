@@ -1140,6 +1140,32 @@ impl TalosRuntime {
 
         config.wasm_component_model(true);
 
+        // ── WASM proposal lockdown (H2) ──────────────────────────────────────
+        // Explicit opt-out of every WASM proposal Talos's component-model
+        // workload doesn't need. Each enabled proposal is additional
+        // attack surface in the codegen pipeline (Cranelift); historical
+        // wasmtime CVEs have repeatedly landed in SIMD lowering, GC, and
+        // the bulk-memory codegen. Keep ONLY what the component model
+        // strictly requires:
+        //   - bulk_memory: required by component-model lowering (memory.copy/fill)
+        //   - reference_types: required by component-model lowering (externref/funcref)
+        // Everything else is explicitly disabled. If a future Talos
+        // module legitimately needs SIMD or threads, flip the relevant
+        // line WITH a justification comment — the default must stay off.
+        //
+        // Pinning these makes the policy explicit regardless of upstream
+        // default changes between wasmtime point releases.
+        config.wasm_threads(false);
+        config.wasm_simd(false);
+        config.wasm_relaxed_simd(false);
+        config.wasm_multi_memory(false);
+        config.wasm_memory64(false);
+        config.wasm_gc(false);
+        config.wasm_function_references(false);
+        config.wasm_tail_call(false);
+        config.wasm_bulk_memory(true);
+        config.wasm_reference_types(true);
+
         // EPOCH INTERRUPTION DISABLED — requires a background thread calling
         // engine.increment_epoch() periodically AND store.set_epoch_deadline(N)
         // before each execution.  Without both, the default deadline (0) equals
@@ -1229,7 +1255,10 @@ impl TalosRuntime {
 
         let engine = Engine::new(&config)?;
         tracing::info!(
-            wasmtime_version = "43.0.1",
+            // Keep this in sync with worker/Cargo.toml's wasmtime dep
+            // when bumping the version. wasmtime doesn't expose a
+            // runtime VERSION constant, so the value is a literal here.
+            wasmtime_version = "43.0.2",
             allocator = if disable_pooling {
                 "on-demand (TALOS_DISABLE_POOLING=true)"
             } else {

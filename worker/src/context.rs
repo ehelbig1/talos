@@ -330,6 +330,13 @@ impl AsyncWrite for BufferWriter {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        // Marker stamped into the buffer the first time we drop tail
+        // bytes, so an operator reading the captured stderr can tell
+        // truncation apart from genuine module output ending. Without
+        // this, a malicious module could fill the buffer with forged
+        // "verified by" lines to displace real diagnostic output and
+        // the silent truncation would leave no trace.
+        const TRUNCATION_MARKER: &[u8] = b"\n[stderr truncated by host at MAX_STDERR_CAPTURE_BYTES]\n";
         if let Ok(mut guard) = self.buffer.lock() {
             // MCP-593: cap host-side allocation. Returning `buf.len()`
             // even when we silently drop the tail keeps the WASM guest
@@ -341,6 +348,21 @@ impl AsyncWrite for BufferWriter {
             if remaining > 0 {
                 let take = buf.len().min(remaining);
                 guard.extend_from_slice(&buf[..take]);
+                // If this write filled the buffer AND there were more
+                // bytes the guest tried to emit, append the truncation
+                // marker once (overwriting the last bytes if needed so
+                // total length stays at MAX_STDERR_CAPTURE_BYTES + marker).
+                if take < buf.len() {
+                    // Reserve marker space at the tail by trimming if
+                    // necessary. This ensures the marker is always at
+                    // the END so it's easy to grep for.
+                    let target_len = MAX_STDERR_CAPTURE_BYTES
+                        .saturating_sub(TRUNCATION_MARKER.len());
+                    if guard.len() > target_len {
+                        guard.truncate(target_len);
+                    }
+                    guard.extend_from_slice(TRUNCATION_MARKER);
+                }
             }
         }
         Poll::Ready(Ok(buf.len()))
