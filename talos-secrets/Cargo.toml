@@ -16,6 +16,10 @@ tokio = { version = "1", features = ["sync", "rt", "macros"] }
 hmac = "0.12"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
+# L-13 (2026-05-22): random slot-handle allocation. Defense-in-depth
+# against guest enumeration of adjacent slot IDs; see
+# `fresh_slot_handle` in `talos_vault.rs`.
+rand = { version = "0.8", default-features = false, features = ["std", "getrandom"] }
 
 [lints]
 workspace = true

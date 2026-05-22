@@ -66,6 +66,170 @@ fn reject_reserved_topic_prefix(topic: &str) -> bool {
         .any(|prefix| topic.starts_with(prefix))
 }
 
+/// L-17 (2026-05-22): shape-based introspection-query detector.
+/// Returns true if the GraphQL `query` text looks like it's asking
+/// for schema introspection at the top level (`__schema` or
+/// `__type`). False otherwise.
+///
+/// Detection strategy:
+///   1. Strip GraphQL block / line comments (#... up to EOL).
+///   2. Find the first `{` (the root selection-set opener).
+///   3. Scan ahead for `__schema` or `__type` *before* any inner
+///      `{` — that is, at the root selection level. Introspection
+///      fields buried in fragments or aliases are not flagged
+///      (intentional limitation; see callsite comment).
+///
+/// Pure function so the policy is unit-testable. Conservatively
+/// returns `false` on malformed input — the request will fail
+/// downstream at the remote GraphQL endpoint anyway; we don't want
+/// to over-block legitimate-but-weird queries.
+pub(crate) fn looks_like_graphql_introspection(query: &str) -> bool {
+    // Strip line comments (GraphQL uses `#` for comments).
+    let stripped: String = query
+        .lines()
+        .map(|line| match line.find('#') {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Find the root `{`. If there isn't one, this isn't a
+    // selection-set query (e.g. it's a malformed query, a query
+    // operation with no body, or a non-query operation like a
+    // bare introspection-shape mutation — none of which actually
+    // introspect at GraphQL semantics).
+    let Some(brace_idx) = stripped.find('{') else {
+        return false;
+    };
+    let after_brace = &stripped[brace_idx + 1..];
+
+    // Walk character-by-character looking for `__schema` or `__type`
+    // at the root selection level. Track depth via subsequent
+    // braces; a nested `{` opens a level we're not interested in
+    // anymore (the original selection has moved on past the
+    // introspection check window).
+    let bytes = after_brace.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'{' {
+            // Entered a nested selection — we've already passed
+            // the root selections, give up.
+            return false;
+        }
+        if b == b'_' && bytes.get(i + 1).copied() == Some(b'_') {
+            // Try to match `__schema` or `__type` (followed by a
+            // non-identifier character so `__schema_extension`
+            // doesn't false-match).
+            let rest = &after_brace[i..];
+            let candidates = ["__schema", "__type"];
+            for tok in candidates {
+                if rest.len() >= tok.len() && rest.starts_with(tok) {
+                    let next = rest.as_bytes().get(tok.len()).copied();
+                    let is_word_boundary = match next {
+                        None => true,
+                        Some(c) => !(c.is_ascii_alphanumeric() || c == b'_'),
+                    };
+                    if is_word_boundary {
+                        return true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[cfg(test)]
+mod introspection_detector_tests {
+    use super::looks_like_graphql_introspection;
+
+    #[test]
+    fn detects_top_level_schema_query() {
+        assert!(looks_like_graphql_introspection("{ __schema { types { name } } }"));
+    }
+
+    #[test]
+    fn detects_top_level_type_query() {
+        assert!(looks_like_graphql_introspection("{ __type(name: \"User\") { name } }"));
+    }
+
+    #[test]
+    fn detects_with_query_keyword() {
+        assert!(looks_like_graphql_introspection(
+            "query IntrospectionQuery { __schema { types { name } } }"
+        ));
+    }
+
+    #[test]
+    fn ignores_user_field_named_similarly() {
+        // `__schema_extension` is a custom field on the schema,
+        // not the meta-field. Word-boundary check should prevent
+        // false-positive.
+        assert!(!looks_like_graphql_introspection(
+            "{ user { __schema_extension } }"
+        ));
+    }
+
+    #[test]
+    fn ignores_introspection_buried_in_nested_selection() {
+        // Documented limitation: only top-level introspection
+        // selections are flagged. A query where `__schema` is
+        // nested inside a user field isn't really doing GraphQL
+        // introspection in the normal sense — there's no field
+        // named `user.__schema` at the schema level — and false-
+        // positives here would block more than they protect.
+        assert!(!looks_like_graphql_introspection(
+            "{ user { profile { __schema { types } } } }"
+        ));
+    }
+
+    #[test]
+    fn handles_comments_before_schema() {
+        assert!(looks_like_graphql_introspection(
+            "# explore schema\n{ __schema { types { name } } }"
+        ));
+    }
+
+    #[test]
+    fn returns_false_on_normal_query() {
+        assert!(!looks_like_graphql_introspection(
+            "query { user(id: 1) { name email } }"
+        ));
+    }
+
+    #[test]
+    fn returns_false_on_malformed_query() {
+        // Defensive: malformed → false. We don't want to over-
+        // block; the downstream GraphQL endpoint will reject it
+        // for the right reason.
+        assert!(!looks_like_graphql_introspection("not a query at all"));
+        assert!(!looks_like_graphql_introspection(""));
+    }
+
+    #[test]
+    fn detects_query_with_alias() {
+        // GraphQL aliases: `s: __schema { ... }` is also an
+        // introspection query. Our shape-based scan walks token-
+        // by-token until a nested `{` so a leading alias `s:` is
+        // skipped and the `__schema` selection is still flagged.
+        assert!(looks_like_graphql_introspection(
+            "{ s: __schema { types { name } } }"
+        ));
+    }
+
+    #[test]
+    fn does_not_double_count_word_boundary() {
+        // `__schemafoo` is a custom field — must NOT match. The
+        // word-boundary check guards against this.
+        assert!(!looks_like_graphql_introspection(
+            "{ __schemafoo { name } }"
+        ));
+    }
+}
+
 /// MCP-756 (2026-05-13): NATS subjects rarely exceed 256 bytes (the
 /// protocol limit is configurable but defaults are tiny). 1024 is a
 /// generous cap that fits any reasonable subject hierarchy while
@@ -5757,6 +5921,81 @@ impl TalosContext {
         if let Some(ref vars) = variables {
             if vars.len() > MAX_GRAPHQL_QUERY_BYTES {
                 return Err(wit_graphql::Error::Invalidvariables);
+            }
+        }
+
+        // L-17 (2026-05-22): GraphQL introspection detector + opt-in
+        // block. A guest with `http-node` (or higher) capability and a
+        // remote GraphQL endpoint in its `allowed_hosts` allowlist
+        // can currently enumerate the remote schema via `__schema` /
+        // `__type` queries. Whether that's actually a problem
+        // depends on the endpoint — public APIs (GitHub GraphQL,
+        // GitLab) deliberately ship introspection on; private
+        // internal endpoints often don't. We default to ALLOW
+        // (introspection is a legitimate GraphQL feature) but emit
+        // a structured event on every attempt so operators have
+        // visibility, and gate a hard block behind two opt-in
+        // signals:
+        //
+        //   1. **Tier-1 actor** — privacy-class actors (Ollama-only)
+        //      shouldn't be probing third-party schema shapes; block
+        //      unconditionally so the existing Tier-1 data-egress
+        //      gate has no companion-bypass surface.
+        //   2. **`TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION=1` env var**
+        //      — operator-wide deny for clusters that don't run
+        //      schema-aware clients.
+        //
+        // Detection is shape-based, not parse-based: we look for the
+        // top-level `__schema` or `__type` selection. A
+        // sophisticated attacker can hide introspection inside a
+        // fragment or alias — that's a known limitation; the
+        // structured event still fires and operators alerting on
+        // `event_kind = "graphql_introspection_attempt"` see the
+        // raw query length and host. Full parse-based detection
+        // would require pulling in a GraphQL parser (e.g.
+        // `async-graphql-parser`) on the worker's WASM execution
+        // hot path — not justified for a defense-in-depth check.
+        if looks_like_graphql_introspection(&query) {
+            let actor_tier =
+                self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
+            let env_block = std::env::var("TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                == Some("1")
+                || std::env::var("TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                    == Some("true");
+            let blocked = actor_tier || env_block;
+
+            // Always emit the structured event so dashboards see
+            // attempts even in allow-mode deployments.
+            tracing::warn!(
+                target: "talos_security_audit",
+                module_id = ?self.module_id,
+                event_kind = "graphql_introspection_attempt",
+                url = %url,
+                query_bytes = query.len(),
+                actor_tier1 = actor_tier,
+                env_block = env_block,
+                blocked,
+                "WASM module attempted a GraphQL introspection query"
+            );
+
+            if blocked {
+                self.record_capability_denied(
+                    "graphql-execute",
+                    if actor_tier { "tier1-introspection" } else { "env-introspection-block" },
+                    &url,
+                )
+                .await;
+                return Err(wit_graphql::Error::Networkerror);
             }
         }
 

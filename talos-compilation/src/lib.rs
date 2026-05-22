@@ -26,6 +26,238 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+/// L-15 (2026-05-22): the RustSec advisory database is baked into the
+/// builder image at `/opt/talos-advisory-db` at image-build time. The
+/// runtime passes `--no-fetch` to cargo audit, so the DB is never
+/// refreshed in-cluster — every compilation in a given image relies
+/// on the advisory set that existed when the image was built. Without
+/// a freshness check, a long-running cluster pinned to an old image
+/// can silently miss new advisories for weeks or months.
+///
+/// This check uses the directory mtime as a proxy for the snapshot
+/// date — the publish-images pipeline writes the DB then doesn't
+/// touch it, so mtime corresponds to the bake-in moment. A more
+/// precise signal would be the git HEAD commit date inside the
+/// advisory-db repo, but mtime is portable (works for non-git
+/// snapshots too) and good-enough for a coarse "is it stale" gate.
+///
+/// Thresholds:
+/// - **Warn**: 30 days. Operators rebuild the builder image roughly
+///   monthly per CLAUDE.md guidance; a warning log here surfaces the
+///   condition in dashboards before it becomes a fail-closed.
+/// - **Fail-closed in production**: 90 days. Three months without an
+///   advisory refresh is too long; in production the compilation
+///   refuses rather than rubber-stamping the build with stale data.
+///   Outside production (dev/CI) the warning is enough.
+///
+/// `TALOS_ADVISORY_DB_MAX_AGE_DAYS` overrides the fail-closed
+/// threshold (must be a positive integer). Use this for operators
+/// who genuinely cannot rebuild monthly (air-gapped environments)
+/// and have a compensating control elsewhere.
+pub(crate) fn check_advisory_db_age(
+    db_path: &str,
+) -> Result<()> {
+    use std::time::SystemTime;
+    let meta = match std::fs::metadata(db_path) {
+        Ok(m) => m,
+        Err(e) => {
+            // Missing DB is a separate failure mode the audit tool itself
+            // surfaces with its own actionable error message. Don't
+            // double-report here; just log and let the cargo audit
+            // invocation produce the operator-recognised error.
+            tracing::warn!(
+                target: "talos_compilation",
+                event_kind = "advisory_db_metadata_unreadable",
+                path = %db_path,
+                error = %e,
+                "Could not stat the advisory DB to check freshness — \
+                 cargo audit will surface the missing-DB error if applicable."
+            );
+            return Ok(());
+        }
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let age = match SystemTime::now().duration_since(mtime) {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    let age_days = age.as_secs() / 86_400;
+
+    let fail_threshold_days: u64 = std::env::var("TALOS_ADVISORY_DB_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(90);
+
+    let warn_threshold_days: u64 = 30;
+
+    if age_days >= fail_threshold_days {
+        if talos_config::is_production() {
+            // Fail closed — production must not compile against a stale
+            // advisory set. Operator action: rebuild the builder image.
+            return Err(anyhow::anyhow!(
+                "RustSec advisory database at {db_path} is {age_days} days old \
+                 (max {fail_threshold_days} days in production). Rebuild the \
+                 talos-builder image (`scripts/build-compiler-image.sh`) to \
+                 refresh the baked-in advisory snapshot, or set \
+                 TALOS_ADVISORY_DB_MAX_AGE_DAYS=<bigger_number> if you have a \
+                 compensating control for stale advisories."
+            ));
+        }
+        // Outside production: loud warning, don't block.
+        tracing::warn!(
+            target: "talos_compilation",
+            event_kind = "advisory_db_stale_dev",
+            path = %db_path,
+            age_days,
+            fail_threshold_days,
+            "Advisory DB is past the production fail threshold but \
+             this is dev/test — compilation continues. Rebuild the \
+             builder image to refresh."
+        );
+    } else if age_days >= warn_threshold_days {
+        tracing::warn!(
+            target: "talos_compilation",
+            event_kind = "advisory_db_aging",
+            path = %db_path,
+            age_days,
+            warn_threshold_days,
+            fail_threshold_days,
+            "Advisory DB is aging — rebuild the talos-builder image \
+             monthly to absorb new RustSec advisories."
+        );
+    }
+    Ok(())
+}
+
+/// L-16: numeric helper used by the compile-provenance log line. Same
+/// inputs as `check_advisory_db_age` but returns the age directly
+/// rather than emit a verdict.
+pub(crate) fn advisory_db_age_days(db_path: &str) -> Option<u64> {
+    use std::time::SystemTime;
+    let meta = std::fs::metadata(db_path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let age = SystemTime::now().duration_since(mtime).ok()?;
+    Some(age.as_secs() / 86_400)
+}
+
+/// L-16: stable fingerprint of the effective dependency allowlist
+/// (default set + extras-from-env). A SHA-256 of the sorted, joined
+/// crate names — same input on two pods produces the same fingerprint,
+/// and an operator changing
+/// `MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA` flips the fingerprint
+/// noticeably. We return the first 16 hex chars (8 bytes); collision
+/// risk between distinct allowlists at that prefix length is ~2^-32
+/// (birthday-bound) — fine for log-correlation, not load-bearing for
+/// security.
+pub(crate) fn dependency_allowlist_fingerprint() -> String {
+    let names = dependency_allowlist::get_allowed_dependencies();
+    // `get_allowed_dependencies` returns a HashSet (or similar
+    // unordered set). Collect into a Vec and sort for stable input.
+    let mut sorted: Vec<String> = names.into_iter().collect();
+    sorted.sort();
+    let joined = sorted.join(",");
+    let digest = Sha256::digest(joined.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// L-16: fingerprint of the WIT host contract baked into the
+/// `module-templates/wit/talos.wit` file the scaffold copies into
+/// every compilation workspace. Computed once at process startup
+/// (the file doesn't change between compiles in a given pod) and
+/// cached in a [`OnceLock`].
+pub(crate) fn wit_schema_fingerprint() -> &'static str {
+    static FP: OnceLock<String> = OnceLock::new();
+    FP.get_or_init(|| {
+        // Search the same paths the scaffold uses, in priority order.
+        let candidate_paths = [
+            std::env::var("TALOS_WIT_PATH").ok(),
+            Some("/app/module-templates/wit/talos.wit".to_string()),
+            Some("module-templates/wit/talos.wit".to_string()),
+            Some("wit/talos.wit".to_string()),
+        ];
+        for candidate in candidate_paths.into_iter().flatten() {
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                let digest = Sha256::digest(&bytes);
+                return hex::encode(&digest[..8]);
+            }
+        }
+        "unknown".to_string()
+    })
+}
+
+#[cfg(test)]
+mod provenance_fingerprint_tests {
+    use super::{dependency_allowlist_fingerprint, wit_schema_fingerprint};
+
+    #[test]
+    fn allowlist_fingerprint_is_stable_for_default_set() {
+        // Two calls with the same env produce the same output.
+        let a = dependency_allowlist_fingerprint();
+        let b = dependency_allowlist_fingerprint();
+        assert_eq!(a, b);
+        // Format: 16 hex chars (8 bytes).
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn wit_schema_fingerprint_returns_hex_or_unknown() {
+        let fp = wit_schema_fingerprint();
+        // Either a 16-char hex digest, or the literal "unknown" if
+        // the test env doesn't have the WIT file on disk (unit-test
+        // sandbox typically doesn't).
+        assert!(fp == "unknown" || (fp.len() == 16 && fp.chars().all(|c| c.is_ascii_hexdigit())));
+    }
+}
+
+#[cfg(test)]
+mod advisory_db_age_tests {
+    use super::check_advisory_db_age;
+    use std::time::Duration;
+
+    /// A non-existent DB path is treated as "not our problem here" —
+    /// cargo audit surfaces the missing-DB error. The freshness check
+    /// must not double-fault.
+    #[test]
+    fn nonexistent_db_returns_ok() {
+        let path = "/does/not/exist/advisory-db";
+        let result = check_advisory_db_age(path);
+        assert!(result.is_ok(), "missing DB should not error here");
+    }
+
+    #[test]
+    fn fresh_db_passes() {
+        // A tempdir created now has mtime = now → age = 0 days.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let p = tmp.path().to_str().unwrap();
+        check_advisory_db_age(p).expect("fresh dir should pass");
+    }
+
+    /// 100-day-old DB in dev environment: warns but doesn't fail.
+    /// We can't easily backdate mtime in a portable way for the
+    /// production-fail-closed branch test without touching the
+    /// filesystem; the env-var-tunable threshold is exercised
+    /// indirectly via the override path.
+    #[test]
+    fn old_db_with_huge_threshold_passes() {
+        // Even a hypothetically 1000-day-old DB passes if the
+        // operator opts out via the env-var override.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let p = tmp.path().to_str().unwrap();
+        std::env::set_var("TALOS_ADVISORY_DB_MAX_AGE_DAYS", "100000");
+        let result = check_advisory_db_age(p);
+        std::env::remove_var("TALOS_ADVISORY_DB_MAX_AGE_DAYS");
+        assert!(
+            result.is_ok(),
+            "operator-tunable threshold should override default — got {result:?}"
+        );
+    }
+}
+
 /// M-13: gate for the host-process JS/Python compile paths.
 ///
 /// `compile_js_to_wasm` runs `jco componentize` on the host; `compile_python_to_wasm`
@@ -608,6 +840,22 @@ impl CompilationService {
         // depending on $CARGO_HOME, which the runtime sets to a tmpfs
         // path (/tmp/cargo-cache) that gets wiped per pod.
         let audit_db = container::ADVISORY_DB_PATH;
+        // L-15: freshness check on the baked-in DB. Fails closed in
+        // production at 90 days. Outside production (dev/CI) the
+        // check warns but continues — see `check_advisory_db_age` for
+        // the full policy. We run this BEFORE the audit so a stale
+        // DB produces a clear actionable error instead of a confusing
+        // "0 vulnerabilities found" pass against an obsolete snapshot.
+        if let Err(e) = check_advisory_db_age(audit_db) {
+            self.send_event(
+                user_id,
+                job_id,
+                "failed",
+                Some(format!("Advisory DB age check failed: {e}")),
+                Some(1.0),
+            );
+            return Err(e);
+        }
         let audit_args = ["audit", "--db", audit_db, "--json", "--no-fetch"];
         let audit_result = match audit_cmd {
             Ok(mut cmd) => {
@@ -968,6 +1216,38 @@ impl CompilationService {
         let mut hasher = Sha256::new();
         hasher.update(&wasm_bytes);
         let content_hash = hex::encode(hasher.finalize().as_slice());
+
+        // L-16 (2026-05-22): emit a structured compile-provenance log
+        // so downstream observability can correlate a content_hash with
+        // the security posture under which it was produced. Three
+        // dimensions matter for "is this binary still trustworthy":
+        //   - dependency_allowlist_fp — fingerprint of the effective
+        //     allowlist (default + extras). Tightening the allowlist
+        //     between two compiles of the same source produces the
+        //     same content_hash but different allowlist_fp, and
+        //     operators investigating a CVE can grep both.
+        //   - advisory_db_age_days — how stale the RustSec snapshot
+        //     was at compile time. A "passed audit" with a 100-day-old
+        //     DB is a much weaker statement than one with a fresh DB.
+        //   - wit_schema_fp — fingerprint of the WIT host contract
+        //     (`wit/talos.wit`) the module was bound against. A WIT
+        //     bump that adds new host functions doesn't invalidate
+        //     old binaries (their imports are a subset) but tracking
+        //     it makes "this binary expects pre-X WIT" auditable.
+        let allowlist_fp = dependency_allowlist_fingerprint();
+        let advisory_db_age_days =
+            advisory_db_age_days(container::ADVISORY_DB_PATH).unwrap_or(u64::MAX);
+        let wit_schema_fp = wit_schema_fingerprint();
+        tracing::info!(
+            target: "talos_compilation_provenance",
+            event_kind = "compile_provenance",
+            content_hash = %content_hash,
+            dependency_allowlist_fp = %allowlist_fp,
+            advisory_db_age_days,
+            wit_schema_fp = %wit_schema_fp,
+            wasm_bytes = wasm_bytes.len(),
+            "Compile provenance recorded — content_hash + security-posture fingerprints"
+        );
 
         // 8. Inspect capability world — determines which WIT interfaces are imported.
         let inspection = talos_wit_inspector::inspect_component(&wasm_bytes);

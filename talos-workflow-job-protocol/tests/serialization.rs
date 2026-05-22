@@ -53,6 +53,7 @@ fn job_result_roundtrip() {
         execution_time_ms: 123,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     };
     let ser = serde_json::to_string(&res).expect("serialize result");
     let de: JobResult = serde_json::from_str(&ser).expect("deserialize result");
@@ -184,6 +185,7 @@ fn pipeline_job_result_roundtrip() {
         total_time_ms: 100,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     };
 
     let ser = serde_json::to_string(&res).expect("serialize PipelineJobResult");
@@ -206,6 +208,7 @@ fn pipeline_job_result_sign_and_verify() {
         total_time_ms: 150,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     };
 
     res.sign(&key).expect("sign pipeline job result");
@@ -226,6 +229,7 @@ fn pipeline_job_result_tampered_output_fails() {
         total_time_ms: 150,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     };
     res.sign(&key).unwrap();
 
