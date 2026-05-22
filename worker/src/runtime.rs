@@ -3156,9 +3156,10 @@ impl TalosRuntime {
 
     /// Execute a pre-compiled WASM module (AOT mode).
     ///
-    /// Uses the trusted linker because the original WASM bytes are unavailable
-    /// for capability inspection.  AOT components must have been validated at
-    /// upload time.
+    /// Linker tier is selected from the supplied `cap`, matching the JIT path
+    /// at `Self::execute()`. AOT artefacts that import host functions outside
+    /// their declared capability world will fail to instantiate against the
+    /// chosen linker — the same fail-closed posture as fresh compilation.
     pub async fn execute_precompiled(
         &self,
         precompiled_bytes: &[u8],
@@ -3189,8 +3190,8 @@ impl TalosRuntime {
     /// Internal execution method for pre-loaded components.
     /// Used by both JIT and AOT execution paths.
     ///
-    /// Uses the trusted linker — callers are responsible for ensuring the component
-    /// was pre-validated against the correct capability level.
+    /// Linker tier is selected from the supplied `cap` via `select_tier`;
+    /// `CapabilityWorld::Unknown` fails closed.
     #[allow(clippy::too_many_arguments)]
     async fn execute_component_internal(
         &self,
@@ -3240,8 +3241,13 @@ impl TalosRuntime {
         store.set_epoch_deadline(epoch_ticks_for_timeout(timeout));
         store.set_fuel(self.fuel_limit)?;
 
-        // Use the trusted linker for AOT/pre-loaded components.
-        let pre = self.trusted_linker.instantiate_pre(&component)?;
+        // Defense-in-depth: pick the linker for the DECLARED capability world
+        // rather than always using the trusted (automation-node) surface.
+        // A component whose imports exceed `cap`'s linker tier will fail to
+        // instantiate here, which is the desired fail-closed behaviour and
+        // matches the JIT path. `Unknown` cap fails closed via `select_tier`.
+        let (linker, _instance_cache) = self.select_tier(&cap)?;
+        let pre = linker.instantiate_pre(&component)?;
         let instance = pre.instantiate_async(&mut store).await?;
         let run_func = instance.get_func(&mut store, "run").ok_or_else(|| {
             anyhow::anyhow!(

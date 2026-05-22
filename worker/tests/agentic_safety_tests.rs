@@ -42,9 +42,11 @@ async fn ssrf_blocks_loopback_v4() {
     use worker::bindings::talos::core::http::{self as wit_http, Host};
     let mut ctx = make_context(CapabilityWorld::Http);
 
+    // `https://` so the scheme gate doesn't short-circuit the SSRF
+    // check — this test exists to demonstrate the IP-literal block.
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://127.0.0.1/admin".to_string(),
+        url: "https://127.0.0.1/admin".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -63,7 +65,7 @@ async fn ssrf_blocks_private_10_network() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://10.0.0.1/secret".to_string(),
+        url: "https://10.0.0.1/secret".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -82,7 +84,7 @@ async fn ssrf_blocks_link_local() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://169.254.169.254/latest/meta-data".to_string(),
+        url: "https://169.254.169.254/latest/meta-data".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -101,7 +103,7 @@ async fn ssrf_blocks_ipv6_loopback() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://[::1]/admin".to_string(),
+        url: "https://[::1]/admin".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -110,6 +112,31 @@ async fn ssrf_blocks_ipv6_loopback() {
     assert!(
         matches!(result, Err(wit_http::Error::Forbiddenhost)),
         "IPv6 loopback should be blocked"
+    );
+}
+
+#[tokio::test]
+async fn insecure_scheme_blocked_by_default() {
+    // Companion to the SSRF tests: confirm http:// is refused at the
+    // scheme gate before any host/SSRF resolution, regardless of
+    // whether the target IP is public. Without this, an operator
+    // reading the audit ledger would think every plaintext fetch was
+    // an SSRF probe.
+    use worker::bindings::talos::core::http::{self as wit_http, Host};
+    let mut ctx = make_context(CapabilityWorld::Http);
+
+    let req = wit_http::Request {
+        method: wit_http::Method::Get,
+        url: "http://example.com/".to_string(),
+        headers: vec![],
+        body: vec![],
+        timeout_ms: None,
+    };
+    let result = ctx.fetch(req).await;
+    assert!(
+        matches!(result, Err(wit_http::Error::Invalidurl)),
+        "plaintext http:// must be refused by the scheme gate by default; \
+         got {result:?}"
     );
 }
 

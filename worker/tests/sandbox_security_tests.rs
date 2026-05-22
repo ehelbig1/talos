@@ -219,7 +219,7 @@ async fn ssrf_blocks_loopback_127_0_0_1() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://127.0.0.1/admin".to_string(),
+        url: "https://127.0.0.1/admin".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -238,7 +238,7 @@ async fn ssrf_blocks_loopback_127_x() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://127.0.0.2:8080/".to_string(),
+        url: "https://127.0.0.2:8080/".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -257,7 +257,7 @@ async fn ssrf_blocks_private_10_network() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://10.0.0.1/secret".to_string(),
+        url: "https://10.0.0.1/secret".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -276,7 +276,7 @@ async fn ssrf_blocks_private_172_16_network() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://172.16.0.1/internal".to_string(),
+        url: "https://172.16.0.1/internal".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -295,7 +295,7 @@ async fn ssrf_blocks_private_192_168_network() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://192.168.1.1/router".to_string(),
+        url: "https://192.168.1.1/router".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -314,7 +314,7 @@ async fn ssrf_blocks_link_local_metadata_endpoint() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://169.254.169.254/latest/meta-data".to_string(),
+        url: "https://169.254.169.254/latest/meta-data".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -333,7 +333,7 @@ async fn ssrf_blocks_ipv6_loopback() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://[::1]/admin".to_string(),
+        url: "https://[::1]/admin".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -352,7 +352,7 @@ async fn ssrf_blocks_ipv6_unique_local() {
 
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://[fc00::1]/internal".to_string(),
+        url: "https://[fc00::1]/internal".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: None,
@@ -374,7 +374,7 @@ async fn ssrf_allows_public_ip() {
     // but it must NOT be Forbiddenhost.
     let req = wit_http::Request {
         method: wit_http::Method::Get,
-        url: "http://8.8.8.8/".to_string(),
+        url: "https://8.8.8.8/".to_string(),
         headers: vec![],
         body: vec![],
         timeout_ms: Some(100), // very short timeout to avoid real connection

@@ -28,40 +28,102 @@
 //! operator-friendly error path; the resolver-side check is the
 //! correctness gate.
 //!
-//! ## Behaviour
+//! ## Per-host bypass scoping (M4 follow-up)
 //!
-//! * `WORKER_ALLOW_PRIVATE_HOST_TARGETS=1` bypass — when set, the
-//!   resolver passes through to the system resolver without filtering.
-//!   This matches the host-function-entry bypass logic so operators
-//!   running local-development sibling-service setups keep working.
-//! * All other modes — every returned `SocketAddr` is checked via
-//!   `classify_private_ip`. A `SocketAddr` whose IP is in the
-//!   deny-list is filtered out. If ALL addresses are filtered, the
-//!   resolver returns an empty iterator; reqwest then errors with a
-//!   "could not connect" type message and the request fails closed.
+//! The original M4 resolver took a binary global bypass: setting
+//! `WORKER_ALLOW_PRIVATE_HOST_TARGETS=1` disabled private-IP filtering
+//! for EVERY hostname resolved through that worker's reqwest client.
+//! The host-function-entry pre-call check (`validate_no_dns_rebinding`)
+//! scoped the bypass correctly — only specific allowlisted hostnames —
+//! but the resolver-level gate did not, so the operator-visible deny
+//! relied on the pre-call check holding. A future bypass of the
+//! pre-call check would have given the guest unfiltered DNS for any
+//! host once the env var was set.
+//!
+//! Closure: the resolver now carries the SAME per-execution scoping
+//! that the pre-call check uses. The bypass requires BOTH:
+//!   1. `WORKER_ALLOW_PRIVATE_HOST_TARGETS=1` env (global toggle), AND
+//!   2. The queried hostname is in the per-execution explicit list
+//!      (the module's `allowed_hosts`, minus any `*` wildcard entries).
+//! Hostnames NOT in the explicit list are always filtered, even when
+//! the env var is set. This matches the host-function pre-call bypass
+//! condition `WORKER_ALLOW_PRIVATE_HOST_TARGETS && allowed_hosts.iter().any(|p| p != "*" && p == host)`.
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-/// Default-policy resolver: uses the OS resolver via
-/// `tokio::net::lookup_host`, then filters out any address that fails
-/// `classify_private_ip`. Pure wrapper — no per-request state.
+/// SSRF-aware resolver scoped to a single execution's allowed-hosts.
+///
+/// Each `TalosContext::new` constructs one of these from the module's
+/// `allowed_hosts` list, attaches it to the per-execution reqwest
+/// client, and drops it with the context when the execution ends.
+///
+/// `explicit_private_host_allowed`: hostnames for which the resolver
+/// MAY return private IPs when the operator-level env var
+/// `WORKER_ALLOW_PRIVATE_HOST_TARGETS=1` is set. Constructed from the
+/// caller's `allowed_hosts` with `*` wildcards stripped so a module
+/// declaring `["*"]` cannot also opt into the private-IP bypass. An
+/// empty set means "always filter every private IP regardless of env".
 #[derive(Debug, Clone, Default)]
-pub struct SsrfFilteringResolver;
+pub struct SsrfFilteringResolver {
+    explicit_private_host_allowed: Arc<HashSet<String>>,
+}
+
+impl SsrfFilteringResolver {
+    /// Build a resolver scoped to a module's `allowed_hosts`. Any `*`
+    /// wildcard entries are filtered out (a wildcard allowlist must
+    /// not also unlock the private-IP bypass). Hostnames are lowercased
+    /// to match the case-insensitive convention used elsewhere in the
+    /// worker's HTTP path.
+    pub fn for_allowed_hosts(allowed_hosts: &[String]) -> Self {
+        let explicit = allowed_hosts
+            .iter()
+            .filter(|h| h.as_str() != "*")
+            .map(|h| h.to_ascii_lowercase())
+            .collect::<HashSet<String>>();
+        Self {
+            explicit_private_host_allowed: Arc::new(explicit),
+        }
+    }
+
+    /// Test helper: build a resolver with the bypass available for the
+    /// given hostnames regardless of the env var.
+    #[cfg(test)]
+    pub fn with_explicit_hosts(hosts: &[&str]) -> Self {
+        Self::for_allowed_hosts(&hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>())
+    }
+
+    /// Pure bypass decision so the scoping is unit-testable without
+    /// the env or DNS. The resolver follows the same logic at runtime.
+    fn bypass_allowed(&self, host_lower: &str, env_toggle_on: bool) -> bool {
+        env_toggle_on && self.explicit_private_host_allowed.contains(host_lower)
+    }
+}
 
 impl Resolve for SsrfFilteringResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_string();
+        let host_lower = host.to_ascii_lowercase();
+        let explicit_allowed = self.explicit_private_host_allowed.clone();
         Box::pin(async move {
             // The reqwest `Name` carries only the hostname; the port
             // is injected by reqwest's connect layer based on the URL
             // scheme. We use port 80 here as a placeholder because
             // tokio's `lookup_host` needs a port to return SocketAddr
             // (the port is rewritten by reqwest before the connect).
-            let bypass = std::env::var("WORKER_ALLOW_PRIVATE_HOST_TARGETS")
+            let env_toggle = std::env::var("WORKER_ALLOW_PRIVATE_HOST_TARGETS")
                 .ok()
                 .as_deref()
                 == Some("1");
+            // Per-execution scoping: the env toggle alone is not
+            // sufficient — the hostname must ALSO appear in this
+            // execution's explicit allowed-hosts (no `*`). This
+            // matches the host-function-entry bypass condition so
+            // the two layers agree on which hosts may resolve to
+            // private IPs.
+            let bypass = env_toggle && explicit_allowed.contains(&host_lower);
 
             let lookup = tokio::net::lookup_host(format!("{}:80", host)).await;
             let addrs = match lookup {
@@ -84,6 +146,8 @@ impl Resolve for SsrfFilteringResolver {
                                     host = %host,
                                     ip = %sa.ip(),
                                     policy,
+                                    env_toggle,
+                                    explicit_scoped = explicit_allowed.contains(&host_lower),
                                     "SSRF resolver: filtered private IP from DNS result"
                                 );
                                 false
@@ -116,7 +180,7 @@ mod tests {
     async fn unparseable_hosts_error_via_lookup() {
         // Resolving an obviously-bogus host returns Err from the OS
         // resolver and propagates as-is. The filter never runs.
-        let r = SsrfFilteringResolver;
+        let r = SsrfFilteringResolver::default();
         let name = Name::from_str("this-host-genuinely-does-not-exist-talos-test.invalid")
             .expect("Name::from_str");
         let result = r.resolve(name).await;
@@ -129,5 +193,42 @@ mod tests {
                 assert!(v.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn wildcard_entries_do_not_unlock_bypass() {
+        // `*` in allowed_hosts grants HTTP wildcard but MUST NOT
+        // unlock the private-IP bypass. The resolver's per-host set
+        // is empty after wildcard filtering, so the bypass decision
+        // returns false even with the env toggle on.
+        let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()]);
+        assert!(!r.bypass_allowed("any-host.example.com", true));
+        assert!(!r.bypass_allowed("any-host.example.com", false));
+    }
+
+    #[test]
+    fn explicit_host_requires_env_toggle() {
+        let r = SsrfFilteringResolver::with_explicit_hosts(&["host.docker.internal"]);
+        // Env off — bypass denied.
+        assert!(!r.bypass_allowed("host.docker.internal", false));
+        // Env on — bypass allowed for THIS host only.
+        assert!(r.bypass_allowed("host.docker.internal", true));
+        // Env on but different host — bypass denied (per-host scoping).
+        assert!(!r.bypass_allowed("api.public.example.com", true));
+    }
+
+    #[test]
+    fn hostname_matching_is_case_insensitive() {
+        let r = SsrfFilteringResolver::with_explicit_hosts(&["Host.Docker.Internal"]);
+        // Stored lowercased; queries normalised before lookup at runtime.
+        assert!(r.bypass_allowed("host.docker.internal", true));
+        assert!(r.bypass_allowed("HOST.DOCKER.INTERNAL".to_ascii_lowercase().as_str(), true));
+    }
+
+    #[test]
+    fn empty_explicit_set_blocks_all_bypass() {
+        let r = SsrfFilteringResolver::default();
+        assert!(!r.bypass_allowed("anything", true));
+        assert!(!r.bypass_allowed("anything", false));
     }
 }
