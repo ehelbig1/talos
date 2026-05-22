@@ -97,8 +97,30 @@ impl SsrfFilteringResolver {
 
     /// Pure bypass decision so the scoping is unit-testable without
     /// the env or DNS. The resolver follows the same logic at runtime.
+    ///
+    /// Three AND conditions must hold for the bypass to apply:
+    ///   1. `env_toggle_on` — operator has set the global env toggle.
+    ///   2. `!production` — the deployment is dev/test; production
+    ///      ignores the env toggle entirely (wasm-security-review
+    ///      2026-05-22).
+    ///   3. The queried hostname is in this execution's explicit
+    ///      `allowed_hosts` (no `*` wildcards).
     fn bypass_allowed(&self, host_lower: &str, env_toggle_on: bool) -> bool {
-        env_toggle_on && self.explicit_private_host_allowed.contains(host_lower)
+        self.bypass_allowed_with_prod(host_lower, env_toggle_on, false)
+    }
+
+    /// Production-aware variant. Public for testing — callers in
+    /// production paths use the env- and production-aware shape via
+    /// `resolve()`.
+    pub(crate) fn bypass_allowed_with_prod(
+        &self,
+        host_lower: &str,
+        env_toggle_on: bool,
+        production: bool,
+    ) -> bool {
+        env_toggle_on
+            && !production
+            && self.explicit_private_host_allowed.contains(host_lower)
     }
 }
 
@@ -117,13 +139,31 @@ impl Resolve for SsrfFilteringResolver {
                 .ok()
                 .as_deref()
                 == Some("1");
+            // wasm-security-review (2026-05-22): refuse the bypass in
+            // production regardless of the env toggle. The flag is a
+            // dev-only convenience (reaching `host.docker.internal`
+            // from a worker pod, etc.); leaving it active in
+            // production widens the SSRF blast radius for what is at
+            // best a marginal local-dev workflow improvement. The
+            // host-function-entry pre-call check in `host_impl.rs`
+            // mirrors this restriction.
+            let production = talos_config::is_production();
+            if env_toggle && production {
+                tracing::warn!(
+                    host = %host,
+                    "WORKER_ALLOW_PRIVATE_HOST_TARGETS=1 is ignored in production — \
+                     the env toggle is dev-only. Unset it on the deployment, or \
+                     unset RUST_ENV=production if this is a single-pod dev cluster."
+                );
+            }
             // Per-execution scoping: the env toggle alone is not
             // sufficient — the hostname must ALSO appear in this
-            // execution's explicit allowed-hosts (no `*`). This
-            // matches the host-function-entry bypass condition so
-            // the two layers agree on which hosts may resolve to
-            // private IPs.
-            let bypass = env_toggle && explicit_allowed.contains(&host_lower);
+            // execution's explicit allowed-hosts (no `*`). Same shape
+            // as `bypass_allowed_with_prod` so the unit-test pure
+            // function agrees with this runtime path.
+            let bypass = env_toggle
+                && !production
+                && explicit_allowed.contains(&host_lower);
 
             let lookup = tokio::net::lookup_host(format!("{}:80", host)).await;
             let addrs = match lookup {
@@ -230,5 +270,18 @@ mod tests {
         let r = SsrfFilteringResolver::default();
         assert!(!r.bypass_allowed("anything", true));
         assert!(!r.bypass_allowed("anything", false));
+    }
+
+    /// wasm-security-review (2026-05-22): production gate refuses the
+    /// bypass regardless of env toggle + allowlist hit.
+    #[test]
+    fn production_ignores_env_toggle() {
+        let r = SsrfFilteringResolver::with_explicit_hosts(&["host.docker.internal"]);
+        // Dev mode + env on + hostname allowed → bypass.
+        assert!(r.bypass_allowed_with_prod("host.docker.internal", true, false));
+        // Production + env on + hostname allowed → still NO bypass.
+        assert!(!r.bypass_allowed_with_prod("host.docker.internal", true, true));
+        // Production + env off → no bypass (sanity).
+        assert!(!r.bypass_allowed_with_prod("host.docker.internal", false, true));
     }
 }

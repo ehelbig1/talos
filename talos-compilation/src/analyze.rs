@@ -20,6 +20,22 @@ use uuid::Uuid;
 pub fn lint_source_code(source: &str) -> Vec<CompilationError> {
     let mut warnings = Vec::new();
 
+    // wasm-security-review (2026-05-22): pre-pass for sandbox-escape
+    // patterns that aren't natively reachable from WASM (no syscalls,
+    // no fork/exec, no FFI runtime) but cause confusing rustc errors
+    // and waste a 60s compile slot when an unfamiliar module author
+    // tries them. Detecting at the lint layer emits a clear "not
+    // permitted" message instead of "linker error: cannot find
+    // symbol fork@@GLIBC". Each pattern below is tied to a specific
+    // forbidden class.
+    //
+    // Each check honours an inline opt-out comment on the matched
+    // line (`// lint-allow: unsafe-code`, etc.) for the rare module
+    // that has a documented justification reviewed by an operator.
+    // The runtime still rejects sandbox escapes regardless — these
+    // lints are about UX clarity, not enforcement.
+    warnings.extend(scan_forbidden_patterns(source));
+
     // Pre-pass: warn when no WIT world declaration is found in source.
     // Without an explicit `world = "..."` annotation, the scaffold falls
     // back to TALOS_DEFAULT_WIT_WORLD (default `minimal-node`), which is
@@ -132,6 +148,157 @@ pub fn lint_source_code(source: &str) -> Vec<CompilationError> {
     }
 
     warnings
+}
+
+/// wasm-security-review (2026-05-22): emit a clear "not permitted in
+/// WASM modules" lint when source uses a pattern that cannot work in
+/// the sandbox. Pure function for unit testing.
+///
+/// Patterns checked (each on its own line, honouring opt-outs):
+///   * `unsafe {` block / `unsafe fn` — there's no legitimate need
+///     for `unsafe` in WASM module source (no FFI, no raw pointers
+///     into host memory). Opt-out: `// lint-allow: unsafe-code`.
+///   * `extern "C"` — FFI declaration. Resolves at link time in
+///     WASM, but the most common follow-on is a syscall attempt
+///     that links cleanly and then fails at runtime with a host-
+///     trap. Opt-out: `// lint-allow: extern-c`.
+///   * `std::process::` — fork/exec/spawn paths. Not available in
+///     WASIp2 (the talos worker doesn't bind any `wasi:process` /
+///     `wasi:cli/run` interfaces). Compile fails with a confusing
+///     "cannot find function `Command::new` in module `process`"
+///     when the std feature isn't even compiled in. Opt-out:
+///     `// lint-allow: std-process`.
+///
+/// Each lint suppresses on lines that are line-comments or contain
+/// the opt-out marker. String literals containing the keyword (e.g.
+/// `"unsafe { ... }"`) are skipped via `is_inside_string_literal`.
+pub(crate) fn scan_forbidden_patterns(source: &str) -> Vec<CompilationError> {
+    let mut out = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        let line_no = (idx + 1) as i32;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+
+        // 1. unsafe { … } / unsafe fn / unsafe trait / unsafe impl
+        //    — but NOT `pub unsafe fn` from a doc comment or a string.
+        if let Some(pos) = find_keyword_outside_string(line, "unsafe") {
+            // Must be a "real" unsafe — followed by `{`, `fn`, `trait`,
+            // `impl`, or `extern`. This avoids matching `is_unsafe` or
+            // identifiers that contain the substring.
+            let after = line[pos + "unsafe".len()..].trim_start();
+            let starts_real = after.starts_with('{')
+                || after.starts_with("fn ")
+                || after.starts_with("fn\t")
+                || after.starts_with("trait ")
+                || after.starts_with("trait\t")
+                || after.starts_with("impl ")
+                || after.starts_with("impl\t")
+                || after.starts_with("extern");
+            if starts_real && !line.contains("// lint-allow: unsafe-code") {
+                out.push(CompilationError {
+                    line: Some(line_no),
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message:
+                        "forbidden-unsafe: `unsafe` blocks/items are not permitted in WASM \
+                         modules. There is no FFI, no raw-pointer escape, and no syscall \
+                         surface that requires `unsafe` from guest code. If you have a \
+                         documented justification, add `// lint-allow: unsafe-code` to \
+                         this line."
+                            .to_string(),
+                    severity: "error".to_string(),
+                });
+            }
+        }
+
+        // 2. extern "C" / extern "system" / extern "Rust"
+        //    Allow `extern crate xyz;` (no string literal after extern).
+        if let Some(pos) = find_keyword_outside_string(line, "extern") {
+            let after = line[pos + "extern".len()..].trim_start();
+            if after.starts_with('"') && !line.contains("// lint-allow: extern-c") {
+                out.push(CompilationError {
+                    line: Some(line_no),
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message:
+                        "forbidden-extern: `extern \"...\"` FFI declarations are not \
+                         permitted in WASM modules. Host functions are reached through \
+                         the typed WIT interfaces (talos::core::*), not raw FFI. If you \
+                         have a documented justification, add `// lint-allow: extern-c` \
+                         to this line."
+                            .to_string(),
+                    severity: "error".to_string(),
+                });
+            }
+        }
+
+        // 3. std::process::… — Command, Stdio, spawn, exit, etc.
+        if find_keyword_outside_string(line, "std::process::").is_some()
+            && !line.contains("// lint-allow: std-process")
+        {
+            out.push(CompilationError {
+                line: Some(line_no),
+                column: None,
+                end_line: None,
+                end_column: None,
+                message:
+                    "forbidden-process: `std::process::*` is not available in WASM \
+                     modules — there is no fork/exec/spawn surface in WASIp2 and the \
+                     talos worker does not bind any process-control host functions. \
+                     If you need to invoke another module, use the workflow engine's \
+                     subworkflow / chain-dispatch primitives instead. If you have a \
+                     documented justification, add `// lint-allow: std-process` to \
+                     this line."
+                        .to_string(),
+                severity: "error".to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// String-literal-aware keyword search. Returns the byte offset of
+/// the first occurrence of `keyword` that is NOT inside a `"..."`
+/// string literal, or `None`. Treats `\"` as escaped quote.
+fn find_keyword_outside_string(line: &str, keyword: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let kbytes = keyword.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i + kbytes.len() <= bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if &bytes[i..i + kbytes.len()] == kbytes {
+            // Require word boundary on the LEFT (so `is_unsafe`
+            // doesn't fire). Right-side context is up to the caller.
+            let left_is_word = i > 0
+                && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if !left_is_word {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Whitespace-tolerant detection of the engine envelope parse:
@@ -289,5 +456,101 @@ impl CompilationService {
             name
         );
         Ok(all)
+    }
+}
+
+#[cfg(test)]
+mod forbidden_pattern_tests {
+    use super::scan_forbidden_patterns;
+
+    fn err_msgs(source: &str) -> Vec<String> {
+        scan_forbidden_patterns(source)
+            .into_iter()
+            .filter(|e| e.severity == "error")
+            .map(|e| e.message)
+            .collect()
+    }
+
+    #[test]
+    fn flags_unsafe_block() {
+        let errs = err_msgs("fn run() { unsafe { do_thing(); } }");
+        assert!(errs.iter().any(|m| m.contains("forbidden-unsafe")));
+    }
+
+    #[test]
+    fn flags_unsafe_fn() {
+        let errs = err_msgs("unsafe fn dangerous() {}");
+        assert!(errs.iter().any(|m| m.contains("forbidden-unsafe")));
+    }
+
+    #[test]
+    fn allows_unsafe_in_string_literal() {
+        let errs = err_msgs(r#"let s = "unsafe { x }";"#);
+        assert!(errs.iter().all(|m| !m.contains("forbidden-unsafe")));
+    }
+
+    #[test]
+    fn allows_identifier_containing_unsafe() {
+        // `is_unsafe`, `marked_unsafe`, etc. must not fire — the
+        // word-boundary check on the LEFT prevents this.
+        let errs = err_msgs("let is_unsafe = true;");
+        assert!(errs.iter().all(|m| !m.contains("forbidden-unsafe")));
+    }
+
+    #[test]
+    fn honours_unsafe_opt_out() {
+        let errs = err_msgs("unsafe { real(); } // lint-allow: unsafe-code");
+        assert!(errs.iter().all(|m| !m.contains("forbidden-unsafe")));
+    }
+
+    #[test]
+    fn flags_extern_c() {
+        let errs = err_msgs(r#"extern "C" { fn malloc(n: usize) -> *mut u8; }"#);
+        assert!(errs.iter().any(|m| m.contains("forbidden-extern")));
+    }
+
+    #[test]
+    fn flags_extern_system() {
+        let errs = err_msgs(r#"extern "system" fn whatever() {}"#);
+        assert!(errs.iter().any(|m| m.contains("forbidden-extern")));
+    }
+
+    #[test]
+    fn allows_extern_crate() {
+        let errs = err_msgs("extern crate something;");
+        assert!(errs.iter().all(|m| !m.contains("forbidden-extern")));
+    }
+
+    #[test]
+    fn honours_extern_opt_out() {
+        let errs =
+            err_msgs(r#"extern "C" { fn x(); } // lint-allow: extern-c"#);
+        assert!(errs.iter().all(|m| !m.contains("forbidden-extern")));
+    }
+
+    #[test]
+    fn flags_std_process() {
+        let errs = err_msgs("let out = std::process::Command::new(\"ls\");");
+        assert!(errs.iter().any(|m| m.contains("forbidden-process")));
+    }
+
+    #[test]
+    fn allows_std_process_in_string() {
+        let errs = err_msgs(r#"let s = "look at std::process::Command";"#);
+        assert!(errs.iter().all(|m| !m.contains("forbidden-process")));
+    }
+
+    #[test]
+    fn honours_std_process_opt_out() {
+        let errs = err_msgs(
+            "let out = std::process::Command::new(\"ls\"); // lint-allow: std-process",
+        );
+        assert!(errs.iter().all(|m| !m.contains("forbidden-process")));
+    }
+
+    #[test]
+    fn skips_line_comments() {
+        let errs = err_msgs("// example: unsafe { x }");
+        assert!(errs.is_empty());
     }
 }

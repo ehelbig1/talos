@@ -268,14 +268,17 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 
 | Risk | Severity | Likelihood | Rationale |
 |------|----------|------------|-----------|
-| No formal verification of WASM component model adapter | Critical | Very Low | wasmtime is memory-safe Rust with active security team. Mitigated by capability worlds limiting blast radius. |
+| No formal verification of WASM component model adapter | Critical | Very Low | wasmtime is memory-safe Rust with active security team. Mitigated by capability worlds limiting blast radius. See `docs/wasmtime-version-tracking.md` for upgrade cadence. |
 | Single-region deployment | High | Low | Multi-region scaffolded but not proven. Mitigated by database replication and job queue durability. |
 | DLP patterns are regex-based (no ML-based PII detection) | Medium | Medium | Known PII formats covered. Novel PII patterns may pass through. Mitigated by ExternalDlpProvider hook for enterprise ML systems. |
 | Master key in environment variable | Critical | Low | Standard practice but not HSM-backed. Recommend migration to AWS KMS / GCP Cloud KMS for production. |
-| DNS rebinding bypasses SSRF check | High | Low | URL validated at config time, not at request time. Recommend re-resolution with TTL check. |
+| DNS rebinding bypasses SSRF check | High | Low | URL validated at config time, not at request time. **Closed (M4, 2026-05-22)**: `SsrfFilteringResolver` reapplies the private-IP filter at the reqwest resolve point, closing the TOCTOU window. See `worker/src/ssrf_resolver.rs`. |
 | Long-lived API keys | Medium | Medium | Scoped but no mandatory expiry. Recommend adding rotation reminders and maximum lifetime. |
 | Distributed brute-force from many IPs | Medium | Medium | Per-IP rate limiting only. Recommend CDN/WAF layer with global rate limiting. |
 | Redis unavailability causes fail-closed auth | Low | Low | By design, but may cause availability impact. |
+| `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true` runs proc-macros / `build.rs` unsandboxed on the controller host | Critical | Low (opt-in only) | Production fail-closes by default if no container runtime is detected. The flag is an **explicit operator opt-in** for single-tenant deployments where the operator authors all modules (so untrusted source never enters the build pipeline). Every fallback compilation emits a structured `compilation_unsandboxed_fallback` WARN event (target=`talos_compilation`); operators MUST alert on this if the flag is ever set. Multi-tenant deployments MUST NOT set this flag — they are required to install podman or docker in the controller pod. See `talos-compilation/src/container.rs:148–190`. |
+| `WORKER_ALLOW_PRIVATE_HOST_TARGETS=1` permits private IPs for explicitly-listed `allowed_hosts` | Medium | Low (opt-in, narrowly scoped) | Per-execution scoping (M4): the bypass requires BOTH the global env toggle AND the literal hostname in the module's `allowed_hosts` (wildcards stripped). Used for local-development cases (`host.docker.internal`). MUST NOT be set in production. |
+| `TALOS_AOT_HMAC_KEY` length check is byte-length only (no entropy measurement) | Medium | Low | 32-byte minimum is enforced; the canonical operator instruction is `openssl rand -hex 32` (256-bit entropy). Entropy measurement is impractical to enforce in code; mitigated by the security_audit MCP tool's check and operator documentation. |
 
 ---
 

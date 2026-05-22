@@ -614,19 +614,32 @@ pub(crate) const MAX_INBOUND_HEADER_VALUE_BYTES: usize = 16 * 1024;
 // result now via the recognised-falsy arm).
 static ALLOW_PRIVATE_HOST_TARGETS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
-        let enabled =
+        let raw_enabled =
             talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
-        // L-2: structured WARN at first lookup so operators see in
-        // production logs that the SSRF defense is relaxed. The flag
-        // is a "trust me, I know what I'm doing" escape hatch — it
-        // should be visible at runtime, not silent.
-        if enabled {
+        // wasm-security-review (2026-05-22): refuse to honour the flag
+        // in production. The flag is a dev-only convenience (reaching
+        // `host.docker.internal` etc.) and shouldn't widen the SSRF
+        // blast radius on a production deployment. Matches the
+        // `ssrf_resolver` production gate so the two layers agree on
+        // when the bypass is actually live.
+        let is_prod = talos_config::is_production();
+        let enabled = raw_enabled && !is_prod;
+        if raw_enabled && is_prod {
+            tracing::warn!(
+                "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true is ignored in production. \
+                 The env toggle is dev-only — unset it on this deployment, or \
+                 unset RUST_ENV=production if this is a single-pod dev cluster."
+            );
+        } else if enabled {
+            // L-2: structured WARN at first lookup so operators see in
+            // dev logs that the SSRF defense is relaxed. The flag is a
+            // "trust me, I know what I'm doing" escape hatch — it
+            // should be visible at runtime, not silent.
             tracing::warn!(
                 "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true — \
                  SSRF defense relaxed for hostnames in allowed_hosts. \
                  IP literals to private ranges remain blocked. \
-                 This trust assumes operator-authored modules only; do NOT \
-                 enable on multi-tenant or untrusted-module-author deployments."
+                 Dev-only — production deployments ignore this flag."
             );
         }
         enabled
