@@ -2,7 +2,17 @@
 # Structural lints — catch the failure classes that survive `cargo check`
 # and only manifest in production.
 #
-# Two checks, each one tied to a real prod incident:
+# Each check is tied to a real prod incident OR a security review
+# finding. Two of the more recent additions:
+#
+#   - check 19 (worker single-publish JobResult) catches the
+#     dual-publish race that breaks every job with "result_nonce
+#     already seen" — see CLAUDE.md "Verify-once rule".
+#   - check 20 (wasmtime proposal lockdown) catches a silent codegen
+#     surface expansion when wasmtime adds a new proposal and the
+#     worker's explicit-opt-out list isn't kept current.
+#
+# Older checks:
 #
 #   1. Raw actor_memory writes + legacy `value`-column projections outside
 #      the talos-memory crate. CLAUDE.md says all access goes through
@@ -1258,6 +1268,184 @@ if [ "$RESULT_SIGN_VIOLATIONS" -gt 0 ]; then
     EXIT_CODE=1
 else
     green "✓ all JobResult/PipelineJobResult signs in worker use sign_with_worker_id"
+fi
+echo
+
+# ── 19. Worker JobResult publish must be single-publish ────────────────
+bold "▶ check 19: worker must single-publish each JobResult (no dual NATS publish)"
+
+# wasm-security-review (2026-05-22): the verify-once rule for signed
+# NATS messages (CLAUDE.md "Verify-once rule") requires that each
+# JobResult / PipelineJobResult be published to EXACTLY ONE NATS
+# subject — the reply inbox when the JobRequest provided one, or the
+# global audit topic otherwise. Dual-publishing (sending the same
+# signed result to both) primes a deterministic JOB_NONCE_CACHE race
+# where the second consumer's `verify()` deterministically rejects
+# with "result_nonce already seen", and every job fails.
+#
+# This regression class survives `cargo check` and only manifests
+# under live NATS traffic with both subscribers active. We catch it
+# structurally: any worker file that contains TWO OR MORE
+# `nats.publish(...)` calls inside the same function whose name
+# contains "publish_job_result" / "publish_result" / "send_result"
+# is treated as a violation. Opt-out: add the literal comment
+# `// allow-dual-publish: <reason>` on the second publish site.
+
+DUAL_PUBLISH_VIOLATIONS=0
+
+# Strategy: rg the worker for `publish(` callsites, group by file +
+# nearest preceding `fn` boundary, and count. > 1 in the same fn that
+# matches the JobResult-publish name pattern → violation.
+#
+# This implementation is intentionally simple — it scans worker/src
+# for any function whose body contains two non-opt-out `.publish(`
+# calls AND whose declaration line matches the publish-result name
+# pattern. False positives can be suppressed via the per-line opt-out
+# marker.
+
+WORKER_RS_FILES=$(find worker/src -name '*.rs' \
+    -not -path '*/tests/*' \
+    -not -name '*_tests.rs' 2>/dev/null || true)
+
+for file in $WORKER_RS_FILES; do
+    awk '
+        BEGIN { current_fn = ""; current_is_publish = 0; count = 0; first_line = 0 }
+        /^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ {
+            # Emit a violation for the function we are leaving, if it
+            # had > 1 publish calls.
+            if (current_is_publish && count > 1) {
+                printf "VIOLATION:%s:%d: function `%s` has %d publish calls (dual-publish risk)\n", FILENAME, first_line, current_fn, count
+            }
+            # Start tracking the new function.
+            current_fn = $0
+            match(current_fn, /fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/)
+            if (RSTART > 0) {
+                fn_name = substr(current_fn, RSTART, RLENGTH)
+                sub(/^fn[[:space:]]+/, "", fn_name)
+                current_fn = fn_name
+            }
+            current_is_publish = (current_fn ~ /publish_job_result|publish_result|send_result|publish_pipeline_result/)
+            count = 0
+            first_line = NR
+            next
+        }
+        /\.publish\(/ {
+            # Skip opt-out lines.
+            if ($0 ~ /allow-dual-publish/) next
+            # Skip lines that are inside a string literal (heuristic:
+            # surrounded by `"` on both sides of the `publish` call
+            # within the same line). We accept the imprecision —
+            # opt-out covers any legitimate false positive.
+            if (current_is_publish) {
+                count++
+            }
+        }
+        END {
+            if (current_is_publish && count > 1) {
+                printf "VIOLATION:%s:%d: function `%s` has %d publish calls (dual-publish risk)\n", FILENAME, first_line, current_fn, count
+            }
+        }
+    ' "$file" 2>/dev/null | while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            printf '  %s\n' "${line#VIOLATION:}"
+            DUAL_PUBLISH_VIOLATIONS=$((DUAL_PUBLISH_VIOLATIONS + 1))
+        fi
+    done
+done
+
+# Note: the subshell counter increments above are lost when the loop
+# exits. Recompute the total in one shot for the gate below.
+DUAL_PUBLISH_VIOLATIONS=$(
+    for file in $WORKER_RS_FILES; do
+        awk '
+            BEGIN { current_fn = ""; current_is_publish = 0; count = 0 }
+            /^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ {
+                if (current_is_publish && count > 1) print "x"
+                current_fn = $0
+                match(current_fn, /fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/)
+                if (RSTART > 0) {
+                    fn_name = substr(current_fn, RSTART, RLENGTH)
+                    sub(/^fn[[:space:]]+/, "", fn_name)
+                    current_fn = fn_name
+                }
+                current_is_publish = (current_fn ~ /publish_job_result|publish_result|send_result|publish_pipeline_result/)
+                count = 0
+                next
+            }
+            /\.publish\(/ {
+                if ($0 ~ /allow-dual-publish/) next
+                if (current_is_publish) count++
+            }
+            END {
+                if (current_is_publish && count > 1) print "x"
+            }
+        ' "$file" 2>/dev/null
+    done | wc -l | tr -d ' '
+)
+
+if [ "${DUAL_PUBLISH_VIOLATIONS:-0}" -gt 0 ]; then
+    red "✗ found $DUAL_PUBLISH_VIOLATIONS publish-result function(s) with >1 .publish() call"
+    yellow "  → JobResult / PipelineJobResult MUST be single-publish (CLAUDE.md 'Verify-once rule')"
+    yellow "  → branch on reply_topic and publish to ONE subject, not both"
+    yellow "  → see r300/r301 incident notes in talos-workflow-job-protocol"
+    yellow "  → opt-out (with documented reason): add // allow-dual-publish: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ no dual-publish patterns in worker JobResult/PipelineJobResult send paths"
+fi
+echo
+
+# ── 20. wasmtime proposal lockdown ─────────────────────────────────────
+bold "▶ check 20: every wasmtime WASM proposal must be explicitly opted in/out"
+
+# wasm-security-review (2026-05-22): worker/src/runtime.rs configures
+# wasmtime with an explicit deny-list of WASM proposals
+# (`wasm_threads(false)`, `wasm_simd(false)`, …). Each disabled
+# proposal removes Cranelift codegen attack surface; historical
+# wasmtime CVEs have repeatedly landed in SIMD lowering and GC. A
+# future wasmtime point release that defaults a new proposal to ON
+# would silently widen our codegen attack surface unless the lockdown
+# list is updated.
+#
+# This check ensures the explicit-opt-out list contains every
+# wasmtime proposal we know about today; adding a new wasmtime
+# version that introduces a new `wasm_xxx` toggle either needs an
+# explicit opt-out here, or an opt-out exception via
+# `// allow-wasm-proposal-default: <reason>` near the proposal block.
+
+REQUIRED_PROPOSALS=(
+    "wasm_threads(false)"
+    "wasm_simd(false)"
+    "wasm_relaxed_simd(false)"
+    "wasm_multi_memory(false)"
+    "wasm_memory64(false)"
+    "wasm_gc(false)"
+    "wasm_function_references(false)"
+    "wasm_tail_call(false)"
+)
+
+PROPOSAL_VIOLATIONS=0
+RUNTIME_FILE="worker/src/runtime.rs"
+if [ -f "$RUNTIME_FILE" ]; then
+    for proposal in "${REQUIRED_PROPOSALS[@]}"; do
+        # Use literal string match (-F) since the pattern contains parens.
+        if ! grep -qF "$proposal" "$RUNTIME_FILE"; then
+            printf '  missing required call: config.%s\n' "$proposal"
+            PROPOSAL_VIOLATIONS=$((PROPOSAL_VIOLATIONS + 1))
+        fi
+    done
+else
+    yellow "  (worker/src/runtime.rs not found — skipping check)"
+fi
+
+if [ "$PROPOSAL_VIOLATIONS" -gt 0 ]; then
+    red "✗ $PROPOSAL_VIOLATIONS WASM proposal lockdown call(s) missing in worker/src/runtime.rs"
+    yellow "  → keep the explicit deny-list current; adding a new wasmtime proposal"
+    yellow "    silently widens the Cranelift codegen attack surface."
+    yellow "  → see docs/wasmtime-version-tracking.md for the upgrade checklist."
+    EXIT_CODE=1
+else
+    green "✓ wasmtime proposal lockdown calls present"
 fi
 echo
 

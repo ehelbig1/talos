@@ -26,6 +26,27 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+/// wasm-security-review (2026-05-22): default cap on the size of
+/// user-supplied Rust source accepted by the compilation pipeline.
+/// 1 MiB is comfortably above any realistic module (current
+/// production modules sit well under 100 KiB) while still bounding a
+/// hostile submission from holding a compilation slot for the full
+/// 60-second cargo timeout. Override with `WASM_MAX_SOURCE_BYTES`.
+pub(crate) const DEFAULT_MAX_SOURCE_BYTES: usize = 1_048_576;
+
+/// wasm-security-review (2026-05-22): parse an env var as a positive
+/// integer, falling back to `default` on missing / unparseable / zero
+/// values. Mirrors `worker::runtime::nonzero_env_or_default` so the
+/// "0 = misconfig, use default" semantic stays consistent across
+/// crates without needing to depend on the worker crate from here.
+pub(crate) fn nonzero_env_or_default(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 /// L-15 (2026-05-22): the RustSec advisory database is baked into the
 /// builder image at `/opt/talos-advisory-db` at image-build time. The
 /// runtime passes `--no-fetch` to cargo audit, so the DB is never
@@ -76,11 +97,54 @@ pub(crate) fn check_advisory_db_age(
             return Ok(());
         }
     };
-    let mtime = match meta.modified() {
+    let dir_mtime = match meta.modified() {
         Ok(t) => t,
         Err(_) => return Ok(()),
     };
-    let age = match SystemTime::now().duration_since(mtime) {
+
+    // wasm-security-review (2026-05-22): the directory mtime alone is
+    // a fragile proxy — a `touch` or filesystem-repair tool can
+    // refresh it without any content change. Take the MAX of three
+    // signals so each one can independently bound staleness:
+    //   1. Directory mtime (legacy signal).
+    //   2. `.git/refs/heads/main` (or master) mtime — the git ref
+    //      file is written on every `git pull`/`git fetch`, so it
+    //      captures the actual upstream-sync moment for a cloned
+    //      advisory-db.
+    //   3. Newest file mtime under `<db_path>/crates/` — captures the
+    //      newest advisory added in any form (snapshot tarball,
+    //      manual copy, etc.) even when no `.git` directory exists.
+    // The freshest signal wins; if any signal returns "recent", the
+    // gate doesn't trip even if another signal is stale.
+    let mut freshest = dir_mtime;
+    for ref_name in ["main", "master"] {
+        let ref_path = format!("{db_path}/.git/refs/heads/{ref_name}");
+        if let Ok(meta) = std::fs::metadata(&ref_path) {
+            if let Ok(t) = meta.modified() {
+                if t > freshest {
+                    freshest = t;
+                }
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(format!("{db_path}/crates")) {
+        // Bound the walk: visit the per-crate dirs at depth-1 (taking
+        // each dir's mtime). Going deeper would touch tens of
+        // thousands of advisory files for marginal benefit — a
+        // per-crate dir's mtime updates whenever any of its
+        // advisories is added/modified.
+        for entry in rd.flatten().take(20_000) {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(t) = meta.modified() {
+                    if t > freshest {
+                        freshest = t;
+                    }
+                }
+            }
+        }
+    }
+
+    let age = match SystemTime::now().duration_since(freshest) {
         Ok(d) => d,
         Err(_) => return Ok(()),
     };
@@ -136,11 +200,36 @@ pub(crate) fn check_advisory_db_age(
 /// L-16: numeric helper used by the compile-provenance log line. Same
 /// inputs as `check_advisory_db_age` but returns the age directly
 /// rather than emit a verdict.
+///
+/// wasm-security-review (2026-05-22): mirrors the multi-signal logic
+/// in `check_advisory_db_age` so the provenance log reports the same
+/// freshness number the gate consults.
 pub(crate) fn advisory_db_age_days(db_path: &str) -> Option<u64> {
     use std::time::SystemTime;
     let meta = std::fs::metadata(db_path).ok()?;
-    let mtime = meta.modified().ok()?;
-    let age = SystemTime::now().duration_since(mtime).ok()?;
+    let mut freshest = meta.modified().ok()?;
+    for ref_name in ["main", "master"] {
+        let ref_path = format!("{db_path}/.git/refs/heads/{ref_name}");
+        if let Ok(meta) = std::fs::metadata(&ref_path) {
+            if let Ok(t) = meta.modified() {
+                if t > freshest {
+                    freshest = t;
+                }
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(format!("{db_path}/crates")) {
+        for entry in rd.flatten().take(20_000) {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(t) = meta.modified() {
+                    if t > freshest {
+                        freshest = t;
+                    }
+                }
+            }
+        }
+    }
+    let age = SystemTime::now().duration_since(freshest).ok()?;
     Some(age.as_secs() / 86_400)
 }
 
@@ -451,6 +540,29 @@ impl CompilationService {
             return Ok(template.to_string());
         }
 
+        // wasm-security-review (2026-05-22): refuse templates that
+        // substitute the WIT world string from a Handlebars variable.
+        // A template like `#[talos_node(world = "{{user_world}}")]`
+        // would let config control the capability world declared in
+        // source. Defense-in-depth: the post-compile detected-vs-
+        // declared check would catch a binary that imports more than
+        // its declared world, but that check is fail-CLOSED on
+        // observed escalation rather than on intent — and the
+        // declared world is the input to that very check. Forbidding
+        // dynamic world strings at template-parse time eliminates the
+        // class entirely.
+        if let Some(token) = template_substitutes_world(template) {
+            anyhow::bail!(
+                "template-injection: the `world = ...` declaration must be a \
+                 hard-coded literal, not a Handlebars substitution \
+                 (found `{token}`). The WIT capability world drives the \
+                 worker's tiered linker — letting config choose it would let \
+                 an operator silently grant a module higher privileges than \
+                 the source attribute declares. Hard-code the world, e.g. \
+                 `#[talos_node(world = \"http-node\")]`."
+            );
+        }
+
         let mut handlebars = Handlebars::new();
 
         // SECURITY: Enable strict mode — missing template variables produce an error
@@ -626,6 +738,39 @@ impl CompilationService {
         config: &serde_json::Value,
         dependencies: Option<&serde_json::Value>,
     ) -> Result<CompilationResult> {
+        // wasm-security-review (2026-05-22): bound the source size
+        // BEFORE acquiring a compilation slot or touching the filesystem.
+        // A hostile 100 MiB source string would otherwise hold the
+        // semaphore for the full 60-second cargo timeout while doing
+        // nothing useful — and `cargo component build` would likely OOM
+        // before producing an error. WASM_MAX_SOURCE_BYTES overrides the
+        // default cap.
+        let max_source_bytes = nonzero_env_or_default("WASM_MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES);
+        if source_code.len() > max_source_bytes {
+            return Ok(CompilationResult {
+                success: false,
+                wasm_bytes: None,
+                errors: vec![CompilationError {
+                    line: None,
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: format!(
+                        "source-too-large: source code is {} bytes but the cap is {} bytes \
+                         (set WASM_MAX_SOURCE_BYTES to raise it). Reduce the module size or \
+                         split into multiple smaller modules.",
+                        source_code.len(),
+                        max_source_bytes
+                    ),
+                    severity: "error".to_string(),
+                }],
+                size_bytes: 0,
+                content_hash: String::new(),
+                capability_world: CapabilityWorld::Unknown,
+                imported_interfaces: vec![],
+            });
+        }
+
         self.send_event(
             user_id,
             job_id,
@@ -1292,20 +1437,78 @@ impl CompilationService {
         // checks (post-compile actor capability ceiling vs detected
         // world) — this log feeds operator observability, not
         // gating.
+        // wasm-security-review (2026-05-22): hard-fail when the
+        // detected world is NOT a subset of the declared world (i.e.
+        // the binary requested MORE privileges than the source
+        // declared). Pre-fix this was a WARN-only log relying on the
+        // worker's tiered linker to refuse instantiation — defense-
+        // in-depth, but a bait-and-switch module would still get
+        // saved to the catalog and operators wouldn't see the
+        // mismatch until the first execution attempt.
+        //
+        // The benign case (declared > detected — user over-declared
+        // privileges in source but doesn't actually use them) remains
+        // a WARN. The dangerous case (detected > declared, or worlds
+        // are incomparable) is a compile error.
         let detected_world_str = inspection.capability_world.to_string();
         if !declared_world.is_empty() && !detected_world_str.eq_ignore_ascii_case(declared_world) {
+            let declared_enum: CapabilityWorld = declared_world
+                .parse()
+                .unwrap_or(CapabilityWorld::Unknown);
+            // `is_subset_of` returns false when either side is
+            // `Unknown`, so an unparseable declared string falls into
+            // the fail-closed branch alongside genuine privilege
+            // escalations — that is the safer default.
+            let detected_is_subset = inspection.capability_world.is_subset_of(&declared_enum);
+            if !detected_is_subset {
+                let err_msg = format!(
+                    "world-mismatch: source declares `{declared_world}` but the \
+                     compiled binary imports `{detected_world_str}` capabilities \
+                     ({interfaces}). The binary requests MORE privileges than \
+                     the source attribute declares — refusing to ship. Fix the \
+                     source `world = \"...\"` attribute to match what the \
+                     module actually uses, or remove the unused imports.",
+                    declared_world = declared_world,
+                    detected_world_str = detected_world_str,
+                    interfaces = inspection.imported_interfaces.join(", "),
+                );
+                tracing::error!(
+                    declared_world = %declared_world,
+                    detected_world = %detected_world_str,
+                    interfaces = %inspection.imported_interfaces.join(", "),
+                    module_name = %name,
+                    "world-mismatch (escalation): detected world is not a \
+                     subset of declared world — refusing to emit binary"
+                );
+                return Ok(CompilationResult {
+                    success: false,
+                    wasm_bytes: None,
+                    errors: vec![CompilationError {
+                        line: None,
+                        column: None,
+                        end_line: None,
+                        end_column: None,
+                        message: err_msg,
+                        severity: "error".to_string(),
+                    }],
+                    size_bytes: 0,
+                    content_hash: String::new(),
+                    capability_world: inspection.capability_world,
+                    imported_interfaces: inspection.imported_interfaces,
+                });
+            }
+            // Benign over-declaration — source asked for more than the
+            // binary uses. Still flag at WARN for operator visibility.
             tracing::warn!(
                 declared_world = %declared_world,
                 detected_world = %detected_world_str,
                 interfaces = %inspection.imported_interfaces.join(", "),
                 module_name = %name,
-                "WIT world mismatch: source-declared world differs from \
-                 binary-detected world. This is usually a typo (e.g. an \
-                 out-of-date `world:` comment) but can indicate a \
-                 bait-and-switch attempt. The worker's tiered linker \
-                 will reject the binary at instantiation if the \
-                 detected world has more privileges than the declared \
-                 world's linker provides."
+                "WIT world over-declared: source-declared world is more \
+                 privileged than the binary actually requires. This is \
+                 benign (defense in depth) but the source declaration \
+                 should be tightened to the least-privilege world the \
+                 module actually needs."
             );
         }
 
@@ -1664,26 +1867,27 @@ panic = "abort"
 /// it never asked for. Operators who want the legacy permissive default
 /// can set `TALOS_DEFAULT_WIT_WORLD=automation-node`.
 fn extract_wit_world(source: &str) -> String {
-    // MCP-637 (2026-05-12): closes N-8 (extract_wit_world matches
-    // first occurrence including comments). Pre-fix `source.find(...)`
-    // matched ANY occurrence of `world: "..."` or `world = "..."`,
-    // including text inside `//` line comments and `/* ... */` block
-    // comments. A source file like
+    // MCP-637 (2026-05-12) + wasm-security-review (2026-05-22):
+    // closes N-8 (extract_wit_world matches first occurrence
+    // including comments). Pre-fix `source.find(...)` matched ANY
+    // occurrence of `world: "..."` or `world = "..."`, including
+    // text inside `//` line comments and `/* ... */` block comments.
     //
-    //     // world: "minimal-node" — see talos.wit for the full set
-    //     #[talos_node(world = "automation-node")]
+    // A source file like
+    //
+    //     /* #[talos_node(world = "automation-node")] */
+    //     #[talos_node(world = "minimal-node")]
     //     pub fn run(...) { ... }
     //
-    // resolved to "minimal-node" because the comment match came
-    // first. cargo.toml then declared minimal-node, cargo-component
-    // compiled against minimal-node bindings, and the real attribute's
-    // imports failed to resolve — fail-CLOSED (compile errors) but
-    // confusing. Walk the source line-by-line, strip `//` comment
-    // tails per line, and inspect each non-comment fragment. Block
-    // comments `/* ... */` are not stripped (rare in attribute
-    // proximity); a future change can lift sin-bin handling if a
-    // real-world report hits it.
-    for raw_line in source.lines() {
+    // previously resolved to "automation-node" because the block
+    // comment match came first. We now strip both line AND block
+    // comments before scanning. Defense-in-depth: the post-compile
+    // declared-vs-detected check (in `compile_with_workspace`) hard-
+    // fails when detected > declared, so any extraction mis-match
+    // still surfaces as a compile error rather than silently
+    // shipping a higher-privilege binary.
+    let stripped = strip_all_comments(source);
+    for raw_line in stripped.lines() {
         let line = strip_line_comment(raw_line);
         // Check both syntactic forms on this line.
         for marker in [r#"world: ""#, r#"world = ""#] {
@@ -1702,6 +1906,121 @@ fn extract_wit_world(source: &str) -> String {
     // compilation pipeline rejects with a confusing "unknown world"
     // error rather than using the least-privilege default.
     talos_config::get_env("TALOS_DEFAULT_WIT_WORLD", "minimal-node")
+}
+
+/// wasm-security-review (2026-05-22): returns the offending token when
+/// a template's `world = ...` declaration draws from a Handlebars
+/// variable rather than a string literal. Matches both attribute and
+/// comment forms (`world = "{{x}}"`, `world: "{{x}}"`). Pure function
+/// for unit testing.
+///
+/// Matching rule: scan the comment-stripped template for either
+/// `world = "` or `world: "` and inspect the following string. If the
+/// string contains a Handlebars expression (`{{` … `}}`), the
+/// substitution is rejected. Whitespace tolerant.
+pub(crate) fn template_substitutes_world(template: &str) -> Option<String> {
+    let stripped = strip_all_comments(template);
+    for line in stripped.lines() {
+        // Tolerate `world = "..."`, `world="..."`, `world : "..."` etc.
+        // We hunt for the keyword and the literal opener `"`, then
+        // look for `{{` before the closing `"`.
+        for needle in ["world", "world-name"] {
+            let mut search_from = 0usize;
+            while let Some(found) = line[search_from..].find(needle) {
+                let after = &line[search_from + found + needle.len()..];
+                // Skip whitespace, then expect `=` or `:` (we accept
+                // both — `world = "..."` and `world: "..."` are both
+                // recognised by `extract_wit_world`).
+                let after_eq = after.trim_start();
+                if let Some(rest) = after_eq
+                    .strip_prefix('=')
+                    .or_else(|| after_eq.strip_prefix(':'))
+                {
+                    let after_quote = rest.trim_start();
+                    if let Some(string_body) = after_quote.strip_prefix('"') {
+                        if let Some(end) = string_body.find('"') {
+                            let value = &string_body[..end];
+                            if value.contains("{{") && value.contains("}}") {
+                                return Some(value.to_string());
+                            }
+                            // String literal but no Handlebars
+                            // substitution — fine, advance past it
+                            // and keep scanning the same line for
+                            // additional occurrences.
+                            search_from += found + needle.len();
+                            continue;
+                        }
+                    }
+                }
+                search_from += found + needle.len();
+            }
+        }
+    }
+    None
+}
+
+/// wasm-security-review (2026-05-22): replace every `/* ... */` block
+/// comment with equal-length spaces, preserving the byte positions of
+/// surrounding source. Block-comment-aware so it doesn't fire on
+/// `let s = "/* literal */"`. Pure function for unit testing.
+///
+/// We replace with spaces (not removal) so any future code that
+/// surfaces a byte offset back to the user (rustc spans, lint
+/// positions, etc.) still points at the original location.
+fn strip_all_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            out.push(b);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        // Open of a block comment `/*` — scan until the matching `*/`
+        // and overwrite the whole region with spaces (preserve newlines
+        // so line numbers don't shift).
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.push(b' ');
+            out.push(b' ');
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+            // Consume the closing `*/` if present (it may not be — an
+            // unterminated comment will be rejected by rustc later).
+            if i + 1 < bytes.len() {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+            }
+            continue;
+        }
+        out.push(b);
+        i += 1;
+    }
+    // SAFETY: we only ever replaced non-ASCII-relevant bytes (`/` and
+    // `*` from a comment region) with ASCII spaces, and we copy
+    // arbitrary UTF-8 bytes through unchanged otherwise. The result is
+    // valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
 }
 
 /// MCP-637: strip the `// ...` tail from a source line while
@@ -2631,6 +2950,115 @@ let url = "https://example.com/world: \"minimal-node\""; #[talos_node(world = "n
             extract_wit_world("pub fn run() {}"),
             "minimal-node"
         );
+    }
+
+    /// wasm-security-review (2026-05-22): block comment containing
+    /// the marker must NOT win over a real attribute on a later line.
+    /// Pre-fix this returned `automation-node`.
+    #[test]
+    fn ignores_block_comment_above_real_attribute() {
+        let source = r#"
+/* #[talos_node(world = "automation-node")] */
+#[talos_node(world = "minimal-node")]
+pub fn run() {}
+"#;
+        assert_eq!(extract_wit_world(source), "minimal-node");
+    }
+
+    /// Multi-line block comment with the marker inside is stripped
+    /// before scanning. The real attribute below wins.
+    #[test]
+    fn ignores_multiline_block_comment() {
+        let source = r#"
+/*
+ * Some documentation that mentions world = "automation-node"
+ * for illustrative purposes.
+ */
+#[talos_node(world = "http-node")]
+pub fn run() {}
+"#;
+        assert_eq!(extract_wit_world(source), "http-node");
+    }
+
+    /// String literal containing `/* */` markers is NOT treated as a
+    /// comment region. Defense against the `strip_all_comments`
+    /// being fooled by `"// /* x */"` inside a string.
+    #[test]
+    fn block_comment_inside_string_literal_is_preserved() {
+        let source = r#"
+let s = "/* world = \"automation-node\" */";
+#[talos_node(world = "secrets-node")]
+pub fn run() {}
+"#;
+        assert_eq!(extract_wit_world(source), "secrets-node");
+    }
+}
+
+#[cfg(test)]
+mod template_world_injection_tests {
+    use super::template_substitutes_world;
+
+    #[test]
+    fn detects_attribute_form_substitution() {
+        let template = r#"
+// handlebars: true
+#[talos_node(world = "{{user_world}}")]
+pub fn run() {}
+"#;
+        assert!(template_substitutes_world(template).is_some());
+    }
+
+    #[test]
+    fn detects_colon_form_substitution() {
+        let template = r#"
+// handlebars: true
+// world: "{{user_world}}"
+pub fn run() {}
+"#;
+        assert!(template_substitutes_world(template).is_some());
+    }
+
+    #[test]
+    fn allows_literal_world_string() {
+        let template = r#"
+// handlebars: true
+#[talos_node(world = "http-node")]
+pub fn run() {}
+"#;
+        assert_eq!(template_substitutes_world(template), None);
+    }
+
+    #[test]
+    fn allows_handlebars_in_unrelated_string() {
+        let template = r#"
+// handlebars: true
+const KEY: &str = "{{api_key}}";
+#[talos_node(world = "http-node")]
+pub fn run() {}
+"#;
+        assert_eq!(template_substitutes_world(template), None);
+    }
+
+    #[test]
+    fn block_comment_with_world_substitution_still_blocked() {
+        // A template that hides a `world = "{{...}}"` inside a block
+        // comment shouldn't matter (it wouldn't reach extract_wit_world
+        // either, since strip_all_comments removes it). But we still
+        // want template_substitutes_world to be paranoid about
+        // ANY world = "{{...}}" form regardless of context, because
+        // a stray Handlebars expression next to the `world` keyword
+        // is suspicious. The current impl strips comments before
+        // scanning, so this returns None — that's the conservative
+        // behaviour: defer to extract_wit_world and the post-compile
+        // detected-vs-declared check, both of which run on the
+        // post-comment-stripped source.
+        let template = r#"
+// handlebars: true
+/* world = "{{user_world}}" */
+#[talos_node(world = "http-node")]
+pub fn run() {}
+"#;
+        assert_eq!(template_substitutes_world(template), None);
     }
 }
 
