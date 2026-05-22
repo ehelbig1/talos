@@ -147,6 +147,41 @@ impl CompilationService {
             );
         }
 
+        // Startup-time advisory for the host-language fallback flag.
+        // The per-compile warning inside `require_host_lang_toolchain_allowed`
+        // is operator-blind until someone actually attempts a JS/Python
+        // compile — an attacker who knows the flag is set could fire
+        // their malicious module on the FIRST compile attempt, before
+        // any warning has surfaced. This boot-time log makes the
+        // dangerous mode impossible to overlook in production.
+        //
+        // Fires once per process at construction, not per request,
+        // so log volume is bounded.
+        if talos_config::is_production()
+            && matches!(
+                std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("true" | "1" | "yes")
+            )
+        {
+            tracing::warn!(
+                target: "talos_compilation::startup_advisory",
+                flag = "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
+                "PRODUCTION DEPLOYMENT WITH HOST-LANGUAGE FALLBACK ENABLED. \
+                 JavaScript and Python user-supplied source will be \
+                 compiled by host-side toolchains WITHOUT container \
+                 isolation. componentize-py executes arbitrary Python \
+                 introspection at build time — effectively `exec(user_source)`. \
+                 Single-tenant homelab use only. If this is a multi-tenant \
+                 deployment, UNSET this variable immediately. \
+                 See docs/platform-primitive-checklist.md (M-13)."
+            );
+        }
+
         Self {
             workspace_root,
             wit_path,
@@ -444,6 +479,17 @@ impl CompilationService {
             .await?;
         tracing::info!(elapsed_ms = compile_start.elapsed().as_millis() as u64, name, job_id = %job_id, "Compilation phase: workspace created");
 
+        // Compute the source-declared WIT world here so we can compare
+        // it against the binary-inspected world post-compile. A mismatch
+        // means the macro expansion targeted a different world than the
+        // raw-source declaration suggested — either a bait-and-switch
+        // attempt or, more likely, a typo/comment-confusion bug. The
+        // worker's tiered linker will reject the binary at instantiation
+        // (defense-in-depth holds) but flagging the mismatch at compile
+        // time gives operators a clearer failure mode than "module fails
+        // to load on every dispatch".
+        let declared_world = extract_wit_world(&rendered_code);
+
         // L-37: run the rest of compilation in an inner method so the
         // single workspace-cleanup site below covers EVERY exit path
         // (success, audit-fail, build-fail, validation-fail, panic). The
@@ -459,6 +505,7 @@ impl CompilationService {
                 &package_name,
                 lint_warnings,
                 compile_start,
+                &declared_world,
             )
             .await;
 
@@ -483,6 +530,10 @@ impl CompilationService {
         package_name: &str,
         lint_warnings: Vec<CompilationError>,
         compile_start: std::time::Instant,
+        // Source-declared capability world (from `extract_wit_world`).
+        // Compared against the binary-inspected world after compilation
+        // to detect declared/actual mismatches (see step 8).
+        declared_world: &str,
     ) -> Result<CompilationResult> {
         // 1.4. Pre-generate `Cargo.lock` so `cargo audit --no-fetch`
         // (which runs inside `--network=none`) has a real lockfile to
@@ -925,6 +976,58 @@ impl CompilationService {
             interfaces = %inspection.imported_interfaces.join(", "),
             "Capability world detected"
         );
+
+        // 8a. Reconcile declared (source) vs detected (binary) world.
+        //
+        // `extract_wit_world` parses the user's source for the
+        // `world = "..."` declaration; `inspect_component` inspects the
+        // compiled WASM's imported interfaces and infers the
+        // capability tier. The two should agree.
+        //
+        // Mismatch causes:
+        // 1. **Typo / comment-confusion** — e.g. an out-of-date `//
+        //    world: "minimal-node"` comment in the source while the
+        //    actual `#[talos_module]` attribute targets `agent-node`.
+        //    Most common, harmless beyond confusion.
+        // 2. **Bait-and-switch** — source declares `minimal-node`
+        //    (least privilege, looks safe in code review) but the
+        //    macro expansion or scaffold inserts higher-tier imports.
+        //    The worker's tiered linker would reject this at
+        //    instantiation (the binary's imports won't resolve
+        //    against the minimal-node linker), but flagging it here
+        //    surfaces the bug to the operator before the module is
+        //    ever dispatched.
+        // 3. **Inspector limitations** — `inspect_component`
+        //    classifies based on the set of imported interfaces; a
+        //    binary that imports a SUBSET of its declared world's
+        //    interfaces may classify as a lower tier than declared.
+        //    This is benign (it means the user over-declared
+        //    privileges in source but doesn't actually use them).
+        //
+        // We log at WARN with structured fields so operators can
+        // alert on this; we do NOT fail the compile because case
+        // 3 is benign and case 1/2 are surfaced anyway when the
+        // worker tries to instantiate. The `talos-mcp-handlers`
+        // and `talos-inline-compile-service` layers do additional
+        // checks (post-compile actor capability ceiling vs detected
+        // world) — this log feeds operator observability, not
+        // gating.
+        let detected_world_str = inspection.capability_world.to_string();
+        if !declared_world.is_empty() && !detected_world_str.eq_ignore_ascii_case(declared_world) {
+            tracing::warn!(
+                declared_world = %declared_world,
+                detected_world = %detected_world_str,
+                interfaces = %inspection.imported_interfaces.join(", "),
+                module_name = %name,
+                "WIT world mismatch: source-declared world differs from \
+                 binary-detected world. This is usually a typo (e.g. an \
+                 out-of-date `world:` comment) but can indicate a \
+                 bait-and-switch attempt. The worker's tiered linker \
+                 will reject the binary at instantiation if the \
+                 detected world has more privileges than the declared \
+                 world's linker provides."
+            );
+        }
 
         // 9. (workspace cleanup handled by outer compile_to_wasm_with_config)
         let size_bytes = wasm_bytes.len() as i32;

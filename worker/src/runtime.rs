@@ -2754,6 +2754,8 @@ impl TalosRuntime {
             has_nats: self.nats_client.is_some(),
             has_db: false, // worker is credential-free since Phase 2.3 — DB access is via NATS-RPC
             has_fs: self.fs_dir.is_some(),
+            nonce_cache_size: talos_workflow_job_protocol::job_nonce_cache_size(),
+            nonce_cache_capacity: talos_workflow_job_protocol::JOB_NONCE_CACHE_CAPACITY,
         }
     }
 
@@ -3307,6 +3309,15 @@ pub struct RuntimeHealthStatus {
     pub has_nats: bool,
     /// Whether filesystem is configured
     pub has_fs: bool,
+    /// Process-local job-nonce replay cache: current entry count.
+    /// Surfaced so operators can correlate "approaching capacity"
+    /// with upstream traffic rate and tune the cap / intake gate.
+    pub nonce_cache_size: usize,
+    /// Hard cap of the replay cache. `nonce_cache_size /
+    /// nonce_cache_capacity` is the headroom; sustained values close
+    /// to 1.0 indicate either legitimate high throughput or a replay
+    /// flood.
+    pub nonce_cache_capacity: usize,
 }
 
 // ============================================================================

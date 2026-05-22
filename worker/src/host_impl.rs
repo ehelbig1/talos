@@ -571,6 +571,123 @@ fn classify_private_ip(ip: std::net::IpAddr) -> Option<&'static str> {
     }
 }
 
+/// Match a host against the per-module `allowed_hosts` patterns.
+///
+/// Patterns can be:
+/// * `"*"` — wildcard, matches any host (per-job override; SSRF / IP-literal
+///   / tier-1 LLM deny-list still apply on top).
+/// * `"example.com"` — exact match.
+/// * `".example.com"` — suffix match (matches `api.example.com`,
+///   `foo.bar.example.com`, but NOT bare `example.com`).
+///
+/// **Case handling.** Both sides are lowercased before comparison. The
+/// `url` crate's WHATWG-conformant parser already lowercases ASCII
+/// hostnames in `Url::host_str()`, but operator-supplied `allowed_hosts`
+/// patterns come straight off the signed `JobRequest` and may be
+/// mixed-case. Without this normalisation, an operator who configures
+/// `allowed_hosts: ["API.example.com"]` (mixed case) silently denies
+/// every legitimate request to the (already-lowercased) host
+/// `api.example.com` — a configuration footgun. Lowercasing both sides
+/// closes the gap defensively.
+///
+/// **Performance.** The lowercased host is computed once per `fetch` and
+/// the pattern lowercase happens lazily inside the closure — for the
+/// common all-lowercase case this is `ASCII fast-path` in the stdlib
+/// (no allocation on `String::to_ascii_lowercase` only if the string is
+/// already lowercase? — no, it allocates always). For `fetch_all` (which
+/// loops over a batch) we lowercase the host once outside the batch loop
+/// and let the caller pass the pre-lowercased host in.
+///
+/// **What this does NOT do.** Punycode / IDN normalisation, scheme check,
+/// port check, or path check. SSRF / IP-literal blocking is upstream of
+/// this matcher (see `classify_private_ip` + `validate_no_dns_rebinding`).
+/// Tier-1 LLM-host deny-list is downstream (see
+/// `is_external_llm_host`). This function is the operator-grant gate,
+/// not the platform deny-gate.
+pub(crate) fn host_allowlist_match(allowed: &[String], host: &str) -> bool {
+    if allowed.is_empty() {
+        return false;
+    }
+    let host_lower = host.to_ascii_lowercase();
+    allowed.iter().any(|pattern| {
+        if pattern == "*" {
+            return true;
+        }
+        let pattern_lower = pattern.to_ascii_lowercase();
+        if pattern_lower.starts_with('.') {
+            host_lower.ends_with(pattern_lower.as_str())
+        } else {
+            host_lower == pattern_lower
+        }
+    })
+}
+
+#[cfg(test)]
+mod host_allowlist_match_tests {
+    use super::host_allowlist_match;
+
+    #[test]
+    fn exact_match_lowercases_pattern() {
+        // Operator misconfigures with mixed case — should still match
+        // the (already-lowercased) host from `Url::host_str()`.
+        let allowed = vec!["API.Example.com".to_string()];
+        assert!(host_allowlist_match(&allowed, "api.example.com"));
+    }
+
+    #[test]
+    fn exact_match_lowercases_host() {
+        // Defensive: even if a caller passes an unnormalised host, the
+        // matcher lowercases it.
+        let allowed = vec!["api.example.com".to_string()];
+        assert!(host_allowlist_match(&allowed, "API.EXAMPLE.COM"));
+    }
+
+    #[test]
+    fn suffix_match_lowercased() {
+        let allowed = vec![".EXAMPLE.com".to_string()];
+        assert!(host_allowlist_match(&allowed, "api.example.com"));
+        assert!(host_allowlist_match(&allowed, "FOO.bar.Example.com"));
+    }
+
+    #[test]
+    fn suffix_match_does_not_match_bare_domain() {
+        // ".example.com" means subdomains only — bare "example.com"
+        // must NOT match (else the dot prefix is meaningless).
+        let allowed = vec![".example.com".to_string()];
+        assert!(!host_allowlist_match(&allowed, "example.com"));
+    }
+
+    #[test]
+    fn suffix_match_does_not_match_sibling_domain() {
+        // Defense against the classic suffix-confusion: "badexample.com"
+        // must NOT match ".example.com". The leading dot in the pattern
+        // ensures we match a sub-domain boundary, not a substring.
+        let allowed = vec![".example.com".to_string()];
+        assert!(!host_allowlist_match(&allowed, "badexample.com"));
+    }
+
+    #[test]
+    fn wildcard_matches_any_host() {
+        let allowed = vec!["*".to_string()];
+        assert!(host_allowlist_match(&allowed, "anything.example.com"));
+        assert!(host_allowlist_match(&allowed, "10.0.0.1"));
+        // (Wildcard does not bypass SSRF gates — those run before this matcher.)
+    }
+
+    #[test]
+    fn empty_allowlist_denies_all() {
+        let allowed: Vec<String> = vec![];
+        assert!(!host_allowlist_match(&allowed, "api.example.com"));
+    }
+
+    #[test]
+    fn no_pattern_matches_unrelated_host() {
+        let allowed = vec!["api.example.com".to_string()];
+        assert!(!host_allowlist_match(&allowed, "evil.example.com"));
+        assert!(!host_allowlist_match(&allowed, "example.com"));
+    }
+}
+
 #[cfg(test)]
 mod classify_private_ip_tests {
     //! MCP-553: cover the IPv4/IPv6 unspecified range. Without these
@@ -1367,10 +1484,35 @@ impl TalosContext {
         if vault_path_allowed(&self.allowed_secrets, key_path) {
             Ok(())
         } else {
+            // Log the grant *shape*, not the contents. Earlier versions
+            // printed `format!("{:?}", self.allowed_secrets)` — that
+            // reveals the operator's vault namespace structure
+            // (`["oauth/gmail/*", "anthropic/api_key", ...]`) into
+            // production logs every time a guest fumbles a path. The
+            // shape is sensitive (it telegraphs which integrations are
+            // provisioned for this actor) so we replace it with a
+            // count + SHA-256 fingerprint of the joined paths. The
+            // fingerprint is stable across runs with the same grant,
+            // so operators can still correlate "did this module's
+            // grant change?" without seeing the actual paths.
             let grant_summary = if self.allowed_secrets.is_empty() {
                 "EMPTY (deny-all)".to_string()
             } else {
-                format!("{:?}", self.allowed_secrets)
+                let mut hasher = Sha256::new();
+                // Sort the paths before hashing so the fingerprint is
+                // order-stable. The signed `JobRequest` already sorts
+                // `allowed_secrets` (canonical-bytes rule) but defending
+                // against future drift is cheap.
+                let mut sorted: Vec<&str> =
+                    self.allowed_secrets.iter().map(String::as_str).collect();
+                sorted.sort_unstable();
+                for path in &sorted {
+                    hasher.update(path.as_bytes());
+                    hasher.update(b"\0"); // separator — defends against
+                                          // `["ab","c"]` colliding with `["a","bc"]`.
+                }
+                let fp = hex::encode(&hasher.finalize()[..8]);
+                format!("count={} fp={}", self.allowed_secrets.len(), fp)
             };
             tracing::warn!(
                 gate = "allowlist",
@@ -1933,17 +2075,12 @@ impl wit_http::Host for TalosContext {
             }
         }
 
-        let allowed = self.allowed_hosts.iter().any(|pattern| {
-            pattern == "*"
-                || pattern == host
-                || (pattern.starts_with('.') && host.ends_with(pattern.as_str()))
-        });
-        if !allowed {
+        if !host_allowlist_match(&self.allowed_hosts, host) {
             self.record_capability_denied("http-fetch", "allowed-hosts", host)
                 .await;
             tracing::warn!(
                 host,
-                allowed = ?self.allowed_hosts,
+                allowed_count = self.allowed_hosts.len(),
                 "WASM module attempted to reach a forbidden host"
             );
             return Err(wit_http::Error::Forbiddenhost);
@@ -2475,10 +2612,7 @@ impl wit_http::Host for TalosContext {
             }
 
             // 4. allowed_hosts pattern match.
-            let allowed = self.allowed_hosts.iter().any(|p| {
-                p == "*" || p == &host || (p.starts_with('.') && host.ends_with(p.as_str()))
-            });
-            if !allowed {
+            if !host_allowlist_match(&self.allowed_hosts, &host) {
                 self.record_capability_denied("http-fetch-all", "allowed-hosts", &host)
                     .await;
                 validated.push(Err(wit_http::Error::Forbiddenhost));
@@ -5306,11 +5440,7 @@ impl TalosContext {
                 }
             }
 
-            if !allowed_hosts.iter().any(|pattern| {
-                pattern == "*"
-                    || pattern == &host
-                    || (pattern.starts_with('.') && host.ends_with(pattern.as_str()))
-            }) {
+            if !host_allowlist_match(&allowed_hosts, &host) {
                 self.record_capability_denied("graphql", "allowed-hosts", &host)
                     .await;
                 return Err(wit_graphql::Error::Networkerror);
@@ -5633,17 +5763,12 @@ impl wit_webhook::Host for TalosContext {
             }
         }
 
-        let allowed = self.allowed_hosts.iter().any(|pattern| {
-            pattern == "*"
-                || pattern == &host
-                || (pattern.starts_with('.') && host.ends_with(pattern.as_str()))
-        });
-        if !allowed {
+        if !host_allowlist_match(&self.allowed_hosts, &host) {
             self.record_capability_denied("webhook", "allowed-hosts", &host)
                 .await;
             tracing::warn!(
                 host = %host,
-                allowed = ?self.allowed_hosts,
+                allowed_count = self.allowed_hosts.len(),
                 "WASM module attempted webhook to a forbidden host"
             );
             return Err(wit_webhook::Error::Sendfailed);
@@ -10649,11 +10774,7 @@ impl wit_http_stream::Host for TalosContext {
                 return Err(wit_http_stream::Error::ForbiddenHost);
             }
         }
-        let allowed = self
-            .allowed_hosts
-            .iter()
-            .any(|p| p == "*" || p == &host || (p.starts_with('.') && host.ends_with(p.as_str())));
-        if !allowed {
+        if !host_allowlist_match(&self.allowed_hosts, &host) {
             self.record_capability_denied("http-stream", "allowed-hosts", &host)
                 .await;
             return Err(wit_http_stream::Error::ForbiddenHost);

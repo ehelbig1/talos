@@ -188,8 +188,14 @@ pub struct DispatchJob {
     /// LLM data-egress ceiling for this job. The worker enforces this
     /// at `llm::*` host-function entry: a `Tier1` ceiling refuses to
     /// resolve keys for Anthropic / `OpenAI` / Gemini and the call fails
-    /// closed. Default `Tier2` (no restriction) for backward compat.
-    /// Sourced from `actors.max_llm_tier` for actor-bound executions.
+    /// closed.
+    ///
+    /// **Default `Tier1`** (fail-closed). Real dispatch paths override
+    /// this via `ActorRepository::apply_actor_to_engine`, which sources
+    /// the value from `actors.max_llm_tier` for actor-bound executions
+    /// and fail-closes to Tier1 on DB errors. Tier1 as the default
+    /// ensures any code path that bypasses the canonical builder lands
+    /// in the most-restrictive ceiling.
     pub max_llm_tier: crate::LlmTier,
 
     // ── Retry policy ─────────────────────────────────────────────────
@@ -267,7 +273,27 @@ impl Default for DispatchJob {
             encrypted_secrets_nonce: Vec::new(),
             priority: 100,
             dry_run: false,
-            max_llm_tier: crate::LlmTier::Tier2,
+            // SECURITY: default to Tier1 (local-only LLM egress). This
+            // is the fail-closed posture — any code path that constructs
+            // a `DispatchJob` without going through the canonical
+            // `talos_engine::builder::for_workflow` (which calls
+            // `ActorRepository::apply_actor_to_engine` and stamps the
+            // actor's configured ceiling) will land here.
+            //
+            // Pre-r306 the default was `Tier2`, which fail-OPENED: a
+            // bypass of the canonical builder would silently grant
+            // external-LLM egress. Real dispatch is unaffected because
+            // `apply_actor_to_engine` overrides this field before any
+            // job is dispatched — but for tests, ad-hoc tooling, and
+            // any future dispatch path that forgets the actor-stamping
+            // step, Tier1 is the right default.
+            //
+            // Actor-less dispatch paths that *legitimately* need Tier2
+            // (per CLAUDE.md "Module-bound dispatch (Gmail/GCal/webhook
+            // push notifications) is intentionally Tier-2 default")
+            // must opt in explicitly via the builder, not implicitly via
+            // the default.
+            max_llm_tier: crate::LlmTier::Tier1,
             max_retries: 0,
             backoff_ms: 0,
             retry_condition: None,
@@ -468,8 +494,10 @@ impl DispatchJobBuilder {
     }
 
     /// LLM data-egress ceiling for the dispatched job. `Tier1`
-    /// restricts the worker to local Ollama; `Tier2` (default) allows
-    /// external providers. Sourced from `actors.max_llm_tier`.
+    /// restricts the worker to local Ollama; `Tier2` allows external
+    /// providers. The builder default is `Tier1` (fail-closed); real
+    /// dispatch paths overwrite via the actor-stamping step. Sourced
+    /// from `actors.max_llm_tier`.
     pub fn max_llm_tier(mut self, tier: crate::LlmTier) -> Self {
         self.inner.max_llm_tier = tier;
         self
@@ -669,8 +697,10 @@ pub struct ChainDispatchRequest {
     /// LLM data-egress ceiling for the chain. Same enforcement as
     /// `DispatchJob::max_llm_tier` — every step's `TalosContext` gets
     /// stamped with this and refuses external providers when `Tier1`.
-    /// Default `Tier2` (no restriction) for backward compat. Sourced
-    /// from `actors.max_llm_tier` on the owning workflow's actor.
+    ///
+    /// **Default `Tier1`** (fail-closed). Sourced from
+    /// `actors.max_llm_tier` on the owning workflow's actor via the
+    /// canonical builder.
     pub max_llm_tier: crate::LlmTier,
     /// Aggregate budget for the whole chain (sum of per-step budgets
     /// plus any slack the caller wants).
@@ -820,6 +850,34 @@ mod tests {
         assert_eq!(job.user_id, None);
         assert!(job.encrypted_secrets_ciphertext.is_empty());
         assert!(job.encrypted_secrets_nonce.is_empty());
+    }
+
+    #[test]
+    fn default_llm_tier_is_tier1_fail_closed() {
+        // SECURITY: `DispatchJob::default()` MUST return `Tier1`. Any
+        // code path that constructs a `DispatchJob` without going
+        // through `talos_engine::builder::for_workflow` (and thus
+        // `ActorRepository::apply_actor_to_engine`) lands in the
+        // most-restrictive ceiling rather than fail-opening to Tier2.
+        //
+        // If this test fails, the default was probably flipped back to
+        // Tier2 — re-read the doc-comment on the field before changing
+        // it; pre-r306 the default WAS Tier2 and that was a real
+        // defense-in-depth gap.
+        let job = DispatchJob::default();
+        assert_eq!(
+            job.max_llm_tier,
+            crate::LlmTier::Tier1,
+            "DispatchJob::default() must fail-closed to Tier1"
+        );
+
+        // Same for the builder entry point — since `builder()` calls
+        // `default()` under the hood, this is a redundant check but
+        // makes the lock-in obvious to a future reader inspecting the
+        // builder.
+        let (exec, node, module) = ids();
+        let built = DispatchJob::builder(exec, node, module, JsonValue::Null).build();
+        assert_eq!(built.max_llm_tier, crate::LlmTier::Tier1);
     }
 
     #[test]

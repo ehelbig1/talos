@@ -599,7 +599,8 @@ pub struct ParallelWorkflowEngine {
     /// LLM data-egress tier ceiling. Controller stamps this from
     /// `actors.max_llm_tier` before running. Propagated to every
     /// `DispatchJob` and thus into every `JobRequest` the worker sees.
-    /// Default `Tier2` (no restriction).
+    /// Default `Tier1` (fail-closed) — see `set_max_llm_tier` for the
+    /// canonical stamp path.
     pub(crate) max_llm_tier: talos_workflow_engine_core::LlmTier,
     /// Parent workflow definition id. Threaded into the
     /// [`NodeLifecycleHook::on_node_completed`] context so per-workflow
@@ -751,9 +752,9 @@ pub struct AdapterSet {
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
     dry_run: bool,
-    /// LLM data-egress tier ceiling. Default `Tier2` (no restriction)
-    /// for backward compat; controller stamps in the actor's ceiling
-    /// (`actors.max_llm_tier`) via `set_max_llm_tier` before running.
+    /// LLM data-egress tier ceiling. Default `Tier1` (fail-closed);
+    /// controller stamps in the actor's ceiling (`actors.max_llm_tier`)
+    /// via `set_max_llm_tier` before running.
     max_llm_tier: talos_workflow_engine_core::LlmTier,
     sandbox_root: Option<std::path::PathBuf>,
     agent_loop_max_history: usize,
@@ -873,7 +874,14 @@ impl ParallelWorkflowEngine {
             rate_limits: HashMap::new(),
             node_timeouts: HashMap::new(),
             actor_id: None,
-            max_llm_tier: talos_workflow_engine_core::LlmTier::Tier2,
+            // SECURITY: default to Tier1 (local-only LLM egress).
+            // `ActorRepository::apply_actor_to_engine` overrides this
+            // before `run()` / `run_with_seed()` so real dispatch is
+            // unaffected. Tier1 is the fail-closed posture for any
+            // code path that forgets the canonical actor-stamping step.
+            // Paired with `DispatchJob::default()`'s Tier1 default so
+            // the engine→dispatch chain is uniformly fail-closed.
+            max_llm_tier: talos_workflow_engine_core::LlmTier::Tier1,
             actor_context: None,
             module_prefetch_cache: Arc::new(dashmap::DashMap::new()),
             sub_workflow_cache: HashMap::new(),
