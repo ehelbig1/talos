@@ -398,6 +398,170 @@ fn get_oci_client(is_http: bool) -> &'static oci_distribution::Client {
     }
 }
 
+/// Is `host` a cloud-metadata service hostname or IP literal?
+///
+/// These hosts MUST NEVER appear as an OCI registry — they exist only
+/// to serve short-lived credentials to the workload running on that
+/// VM. A worker that issues an OCI pull against one of these
+/// addresses is being SSRF'd into leaking the controller pod's
+/// IMDS/STS token (or whatever the cloud's metadata service hands out
+/// to authenticated callers).
+///
+/// `host` is the registry component of a parsed `oci_distribution::Reference`,
+/// which is the hostname-with-optional-port (e.g. `"169.254.169.254:5000"`).
+/// The port is stripped before comparison so `169.254.169.254:5000` still
+/// matches the IPv4 literal.
+///
+/// **Cases covered:**
+/// * IMDS v1/v2 (AWS, Azure, OpenStack, DigitalOcean): `169.254.169.254`
+/// * GCE: `metadata.google.internal` (DNS), `metadata` (short-form),
+///   `169.254.169.254` (same IP as AWS)
+/// * AWS EC2 IMDSv2 IPv6: `fd00:ec2::254`
+/// * Oracle Cloud: `169.254.169.254` (same)
+/// * Alibaba Cloud: `100.100.100.200`
+///
+/// Comparison is case-insensitive for DNS names; IP literals are
+/// compared by parsing both sides as `IpAddr` so spelling tricks
+/// (`169.254.169.0254`, `0xa9.0xfe.0xa9.0xfe`, `2852039166`) don't
+/// bypass — `Ipv4Addr::from_str` accepts only canonical dotted-quad
+/// form, but a future hostile encoding could be added here as the
+/// threat landscape evolves.
+pub(crate) fn is_metadata_service_host(host: &str) -> bool {
+    // Strip port. The OCI registry component is one of:
+    //   1. `host` — bare DNS / IPv4
+    //   2. `host:port` — DNS / IPv4 with port
+    //   3. `[v6addr]:port` — IPv6 literal with port (bracketed)
+    //   4. `v6addr` — bare IPv6 literal (e.g. `fd00:ec2::254`)
+    //
+    // The ambiguity is case 4 vs case 2: `fd00:ec2::254` has a final
+    // `:254` that looks like a port to a naive `rsplit_once(':')`.
+    // We disambiguate by trying to parse the whole string as an
+    // IpAddr first — if it parses, no port stripping needed.
+    let host_no_port: &str = if host.parse::<std::net::IpAddr>().is_ok() {
+        // Bare IPv4 or bare IPv6 — use as-is.
+        host
+    } else if let Some(end) = host.strip_prefix('[') {
+        // `[v6addr]` or `[v6addr]:port` — strip brackets, drop suffix.
+        match end.split_once(']') {
+            Some((v6, _after_bracket)) => v6,
+            None => host, // malformed — let `parse::<IpAddr>` fail below
+        }
+    } else if let Some((before, after)) = host.rsplit_once(':') {
+        // `host:port`. The port suffix must be ASCII digits; otherwise
+        // the colon is part of an unbracketed IPv6 (already handled
+        // above by the IpAddr parse) and we shouldn't strip.
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            before
+        } else {
+            host
+        }
+    } else {
+        host
+    };
+
+    // DNS-name matches (case-insensitive).
+    let dns_matches = [
+        "metadata.google.internal",
+        "metadata",
+        "metadata.aws.amazon.com",
+    ];
+    for name in dns_matches {
+        if host_no_port.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+
+    // IP-literal matches.
+    if let Ok(ip) = host_no_port.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                // 169.254.169.254 — AWS/Azure/GCP/Oracle/DO IMDS.
+                if v4.octets() == [169, 254, 169, 254] {
+                    return true;
+                }
+                // 100.100.100.200 — Alibaba Cloud metadata.
+                if v4.octets() == [100, 100, 100, 200] {
+                    return true;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                // fd00:ec2::254 — AWS IMDSv2 IPv6.
+                // Decompresses to `fd00:0ec2:0:0:0:0:0:0254`, so the
+                // segment layout is `[0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]`.
+                let segs = v6.segments();
+                if segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254] {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod is_metadata_service_host_tests {
+    use super::is_metadata_service_host;
+
+    #[test]
+    fn aws_imds_v4_blocked() {
+        assert!(is_metadata_service_host("169.254.169.254"));
+        assert!(is_metadata_service_host("169.254.169.254:80"));
+        assert!(is_metadata_service_host("169.254.169.254:5000"));
+    }
+
+    #[test]
+    fn alibaba_metadata_blocked() {
+        assert!(is_metadata_service_host("100.100.100.200"));
+        assert!(is_metadata_service_host("100.100.100.200:80"));
+    }
+
+    #[test]
+    fn aws_imds_v6_blocked() {
+        // fd00:ec2::254 (unbracketed)
+        assert!(is_metadata_service_host("fd00:ec2::254"));
+        // bracketed with port
+        assert!(is_metadata_service_host("[fd00:ec2::254]:443"));
+    }
+
+    #[test]
+    fn gce_metadata_dns_blocked() {
+        assert!(is_metadata_service_host("metadata.google.internal"));
+        assert!(is_metadata_service_host("METADATA.GOOGLE.INTERNAL"));
+        assert!(is_metadata_service_host("metadata"));
+        assert!(is_metadata_service_host("Metadata"));
+        assert!(is_metadata_service_host("metadata.google.internal:80"));
+    }
+
+    #[test]
+    fn legitimate_registries_allowed() {
+        // Local-cluster setups must not be blocked.
+        assert!(!is_metadata_service_host("ghcr.io"));
+        assert!(!is_metadata_service_host("registry:5000"));
+        assert!(!is_metadata_service_host("localhost:5000"));
+        assert!(!is_metadata_service_host("127.0.0.1:5000"));
+        assert!(!is_metadata_service_host("registry.svc.cluster.local"));
+        // Public registries.
+        assert!(!is_metadata_service_host("docker.io"));
+        assert!(!is_metadata_service_host("quay.io"));
+        assert!(!is_metadata_service_host(
+            "us-docker.pkg.dev"
+        ));
+    }
+
+    #[test]
+    fn near_misses_allowed() {
+        // Unicode lookalikes — host_no_port comparison is byte-exact for IPs.
+        // The host parser would have rejected non-ASCII anyway, but defense in depth.
+        assert!(!is_metadata_service_host("169.254.169.253"));
+        assert!(!is_metadata_service_host("169.254.169.255"));
+        // Different but related private ranges.
+        assert!(!is_metadata_service_host("169.254.0.1"));
+        // Not a registry name pattern.
+        assert!(!is_metadata_service_host("registry-metadata.example.com"));
+    }
+}
+
 fn unix_path_re() -> &'static regex::Regex {
     RE_UNIX_PATH
         .get_or_init(|| regex::Regex::new(r"/[\w/.-]+\.(rs|toml|json)").expect("invalid regex"))
@@ -925,6 +1089,47 @@ async fn execute_job(
         use oci_distribution::Reference;
 
         if let Ok(reference) = image_ref.parse::<Reference>() {
+            // SECURITY: registry-host SSRF gate.
+            //
+            // The module_uri is HMAC-bound in the JobRequest, so an
+            // on-wire attacker can't redirect us to a different
+            // registry. But a compromised controller — or a stored
+            // module record pointing at the wrong host — could try to
+            // point the worker at a metadata-service endpoint and
+            // exfiltrate cloud creds. We refuse to make ANY OCI
+            // request against a known metadata-service hostname / IP
+            // regardless of other gates.
+            //
+            // NOT a blanket RFC-1918 block: legitimate setups use
+            // localhost:5000 / registry:5000 / kube DNS like
+            // registry.svc.cluster.local. We only refuse hosts that
+            // are NEVER legitimate registries. Sigstore verification
+            // would catch unsigned bytes from any host anyway, but
+            // the metadata-service exposure is the worst-case (token
+            // leak via HTTP body / headers / error message); fail
+            // closed BEFORE making the network round-trip.
+            if is_metadata_service_host(reference.registry()) {
+                let err = format!(
+                    "registry_host_denied: cloud metadata service host \
+                     is never a legitimate OCI registry"
+                );
+                ::tracing::error!(
+                    module_uri = %req.module_uri,
+                    registry = %reference.registry(),
+                    "OCI fetch attempted against cloud metadata host — refusing"
+                );
+                _span.end_error(&err);
+                return JobResult {
+                    job_id: req.job_id,
+                    status: JobStatus::Failed,
+                    output_payload: serde_json::json!({"error": err}),
+                    logs: vec![],
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                    signature: vec![],
+                    result_nonce: String::new(),
+                };
+            }
+
             // In a development environment with a local registry, we need to allow HTTP.
             // SECURITY: Ensure HTTP downgrade is never allowed in production.
             // MCP-668 (2026-05-13): route through `talos_config::is_production()`
@@ -998,6 +1203,21 @@ async fn execute_job(
             // SECURITY: this is the runtime trust boundary. Disabled mode
             // is for dev only — production deploys MUST set
             // TALOS_SIGSTORE_REQUIRED=true.
+            //
+            // `sigstore_pass_in_this_run` tracks the verdict so we can
+            // skip the Redis cache write on Audit-mode failure: a future
+            // pull would otherwise serve attacker-controlled bytes from
+            // cache without re-verifying signature. Required mode is
+            // already fail-closed (returns Failed below), so this flag
+            // is only consulted for the Audit-failure path.
+            //
+            // Starts `true` because Disabled mode + missing-identity-in-
+            // Audit-mode both fall through without a verification
+            // attempt; treating those as "attested" preserves
+            // operator-chosen intent (Disabled = trust the registry;
+            // Audit-with-missing-identity = misconfiguration warning,
+            // not a verification failure).
+            let mut sigstore_pass_in_this_run = true;
             let sigstore_policy = SigstorePolicy::from_env();
             if sigstore_policy != SigstorePolicy::Disabled {
                 let identity_regexp =
@@ -1067,9 +1287,21 @@ async fn execute_job(
                                 ::tracing::warn!(
                                     module_uri = %req.module_uri,
                                     reason = %reason,
-                                    "Sigstore verification failed but policy is audit — continuing"
+                                    "Sigstore verification failed but policy is audit — \
+                                     continuing execution but NOT caching bytes"
                                 );
                                 _span.add_event("sigstore_verify_failed_audit");
+                                // Mark this pull unattested so the
+                                // Redis-cache write below is skipped.
+                                // Without this, an Audit-mode failure
+                                // poisons the cache: the same module_uri
+                                // would short-circuit signature
+                                // verification on the next request
+                                // (cache hits bypass the full OCI path).
+                                // Operators flipping from Audit →
+                                // Required mid-flight would not
+                                // re-verify cached entries.
+                                sigstore_pass_in_this_run = false;
                             }
                             SigstorePolicy::Disabled => unreachable!(),
                         },
@@ -1203,18 +1435,44 @@ async fn execute_job(
                                 // which becomes a leak on registries with many tags.
                                 // Tag-based URIs (mutable) refresh daily; digest-based
                                 // URIs (immutable) just re-cache the same bytes.
-                                if let Some(redis_client) = runtime.redis_client() {
-                                    if let Ok(mut conn) =
-                                        redis_client.get_multiplexed_async_connection().await
-                                    {
-                                        let _: Result<(), _> = redis::cmd("SET")
-                                            .arg(&redis_key)
-                                            .arg(&layer.data)
-                                            .arg("EX")
-                                            .arg(OCI_CACHE_TTL_SECS)
-                                            .query_async(&mut conn)
-                                            .await;
+                                //
+                                // SECURITY: only cache when both layers
+                                // of attestation passed in THIS pull —
+                                // sigstore signature AND layer digest.
+                                // The digest check is already a
+                                // precondition of this `Verified` arm;
+                                // the sigstore check is gated below.
+                                // Caching on a sigstore-Audit failure
+                                // would poison the cache so future
+                                // pulls bypass verification entirely
+                                // (cache hits short-circuit the OCI
+                                // path). Skipping the SET keeps the
+                                // bytes from being served to *other*
+                                // jobs while still honouring the
+                                // operator-chosen Audit-mode intent
+                                // for THIS execution.
+                                if sigstore_pass_in_this_run {
+                                    if let Some(redis_client) = runtime.redis_client() {
+                                        if let Ok(mut conn) =
+                                            redis_client.get_multiplexed_async_connection().await
+                                        {
+                                            let _: Result<(), _> = redis::cmd("SET")
+                                                .arg(&redis_key)
+                                                .arg(&layer.data)
+                                                .arg("EX")
+                                                .arg(OCI_CACHE_TTL_SECS)
+                                                .query_async(&mut conn)
+                                                .await;
+                                        }
                                     }
+                                } else {
+                                    ::tracing::info!(
+                                        module_uri = %req.module_uri,
+                                        "OCI bytes attested by digest only \
+                                         (sigstore failed in audit mode) — \
+                                         skipping cache write so future pulls \
+                                         re-verify against the registry"
+                                    );
                                 }
 
                                 // Fresh pull with Sigstore + digest checks both

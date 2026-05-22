@@ -118,6 +118,39 @@ fn check_and_record_job_nonce(nonce: &str, ts: u64, max_age_secs: u64) -> bool {
     JOB_NONCE_CACHE.check_and_record(nonce, ts, max_age_secs)
 }
 
+/// Current entry count of the process-local job-nonce replay cache.
+///
+/// Surfaced for `/health` / metrics endpoints so operators can correlate
+/// "approaching `NONCE_CACHE_HARD_CAP`" (200k) with upstream traffic
+/// rate. Sustained near-cap usage suggests either legitimate high
+/// throughput (raise the cap) or a replay flood (gate at the NATS
+/// subject level upstream).
+///
+/// Reading the cache size takes the same mutex as
+/// `check_and_record_job_nonce`. The lock is held only long enough to
+/// call `.len()`; the contention impact at typical query rates is
+/// negligible (microseconds).
+///
+/// Returns `0` if the cache lock is currently poisoned (which only
+/// happens if a previous panic occurred mid-mutation). The
+/// `check_and_record` path itself is poison-tolerant so the cache
+/// remains functional — this accessor errs on the side of "0" rather
+/// than panic-on-read.
+pub fn job_nonce_cache_size() -> usize {
+    JOB_NONCE_CACHE
+        .seen
+        .lock()
+        .map(|g| g.len())
+        .unwrap_or(0)
+}
+
+/// Hard cap for the job-nonce replay cache.
+///
+/// Exposed so health endpoints can report the headroom (`size / cap`)
+/// alongside the raw size. The constant lives in this crate to keep a
+/// single source of truth.
+pub const JOB_NONCE_CACHE_CAPACITY: usize = NONCE_CACHE_HARD_CAP;
+
 #[cfg(test)]
 #[allow(dead_code)] // helper for future tests that exercise replay protection
 fn clear_job_nonce_cache_for_test() {
@@ -1170,6 +1203,25 @@ impl JobResult {
 // ============================================================================
 
 /// A single step in a pipeline job dispatched via NATS.
+///
+/// **Security invariant: no per-step LLM tier override.** The tier
+/// ceiling applies uniformly to every step in a pipeline and is sourced
+/// from `PipelineJobRequest::max_llm_tier`. Do NOT add a
+/// `max_llm_tier` field here. Per-step tier granularity is precisely
+/// the surface area we don't want — it would create a path where a
+/// subtle refactor accidentally sets one step to Tier2 inside an
+/// otherwise-Tier1 pipeline, leaking the data the pipeline was supposed
+/// to keep local.
+///
+/// If a future requirement genuinely needs per-step tiering (e.g.
+/// "step 1 enriches with public data via Anthropic, step 2 processes
+/// private data locally"), the right shape is to split into two
+/// pipelines with explicit hand-off — not to widen this struct. The
+/// worker stamps `PipelineJobRequest::max_llm_tier` uniformly onto
+/// every step's `TalosContext` (see `Runtime::execute_pipeline` at the
+/// `context.max_llm_tier = max_llm_tier` line); a per-step override
+/// would have to land there too, and breaking that single stamp is
+/// where any tier-leak regression would show up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineStep {
     pub module_id: Uuid,
@@ -1456,6 +1508,30 @@ pub struct PipelineStepResult {
 }
 
 /// Result of a pipeline job returned by the Worker via NATS.
+///
+/// **Verify-once invariant** (mirrors [`JobResult`]). A signed
+/// `PipelineJobResult` MUST be `verify()`-ed exactly once per
+/// controller process at its **primary action point** — the site
+/// where the result becomes a durable side effect that would be
+/// wrong to apply twice (the dispatcher's result-handling path).
+/// Any passive observer (audit subscriber, metrics emitter,
+/// idempotent-DB-write subscriber, etc.) MUST use
+/// [`verify_no_replay`](Self::verify_no_replay) instead.
+///
+/// Reason: `verify()` mutates the process-local `JOB_NONCE_CACHE` to
+/// reject the same nonce on subsequent calls. Two `verify()` calls
+/// against the same signed message land in the same shared cache —
+/// the second deterministically fails with
+/// `"result_nonce already seen"`. This is the same regression class
+/// that broke `JobResult` in r300/r301 (see CLAUDE.md "Verify-once
+/// rule for signed NATS messages"); adding the split API to
+/// `PipelineJobResult` up front is the prophylactic — cheap when the
+/// type is born, total when a second subscriber slips in later.
+///
+/// The worker MUST single-publish each `PipelineJobResult` to ONE
+/// NATS subject (reply inbox OR audit topic, branched on `reply_topic`
+/// presence). Dual-publishing primes the cache race even when both
+/// consumers correctly use the split API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineJobResult {
     pub job_id: Uuid,
