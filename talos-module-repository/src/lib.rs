@@ -2559,6 +2559,51 @@ impl ModuleRepository {
         Ok(rows)
     }
 
+    /// M3 (2026-05-22): variant of `find_dependent_workflows_dual_id` that
+    /// also returns each dependent workflow's `actor_id` so the
+    /// hot-update service can enforce a capability-world ceiling against
+    /// every actor that currently binds the module.
+    ///
+    /// Returns (workflow_id, workflow_name, Option<actor_id>). Workflows
+    /// without an actor_id pass through as `None` — they don't impose a
+    /// ceiling. Same 50-row cap and same dual-UUID matcher as the sibling
+    /// method; kept as a separate query so callers that don't care about
+    /// actor_id pay nothing.
+    pub async fn find_dependent_workflows_with_actors_dual_id(
+        &self,
+        module_id: Uuid,
+        template_id: Option<Uuid>,
+    ) -> Result<Vec<(Uuid, String, Option<Uuid>)>> {
+        let pattern_self = format!("%{}%", module_id);
+        let pattern_template = template_id.map(|tid| format!("%{}%", tid));
+        let rows: Vec<(Uuid, String, Option<Uuid>)> = match &pattern_template {
+            Some(pt) if pt != &pattern_self => {
+                sqlx::query_as(
+                    "SELECT id, name, actor_id FROM workflows \
+                 WHERE (graph_json LIKE $1 OR graph_json LIKE $2) \
+                   AND (status IS NULL OR status != 'archived') \
+                 ORDER BY updated_at DESC LIMIT 50",
+                )
+                .bind(&pattern_self)
+                .bind(pt)
+                .fetch_all(&self.db_pool)
+                .await?
+            }
+            _ => {
+                sqlx::query_as(
+                    "SELECT id, name, actor_id FROM workflows \
+                 WHERE graph_json LIKE $1 \
+                   AND (status IS NULL OR status != 'archived') \
+                 ORDER BY updated_at DESC LIMIT 50",
+                )
+                .bind(&pattern_self)
+                .fetch_all(&self.db_pool)
+                .await?
+            }
+        };
+        Ok(rows)
+    }
+
     /// Phase 5: update `allowed_secrets` on the unified `modules` table.
     /// Returns `(rows, 0)` for signature stability with callers that
     /// expected the pre-Phase-5 `(node_templates_rows, wasm_modules_rows)`

@@ -23,7 +23,7 @@ talos-config = { path = "../talos-config" }
 # MCP-1036: bounded_preview for caller-supplied reflection in error messages.
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "process"] }
 tracing.workspace = true
 uuid.workspace = true
 

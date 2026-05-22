@@ -74,6 +74,15 @@ pub enum HotUpdateError {
     NoWasmBytes,
     #[error("Compilation failed: {0}")]
     CompilerInvocation(String),
+    /// M3 (2026-05-22): the requested `capability_world` exceeds the
+    /// strictest actor-capability ceiling among workflows currently
+    /// binding this module. Returned BEFORE the compile budget is
+    /// spent (~30-60 s); operator-facing message names the offending
+    /// workflow + actor so the gap is easy to close (either lower
+    /// the new world or `grant_capability_ceiling` to raise the
+    /// actor's max).
+    #[error("{0}")]
+    CapabilityCeilingViolation(String),
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +108,12 @@ pub struct HotUpdateService {
     module_repo: Arc<ModuleRepository>,
     workflow_repo: Arc<WorkflowRepository>,
     compiler: Arc<CompilationService>,
+    /// M3 (2026-05-22): db_pool used by both the actor-capability
+    /// ceiling check and the `spawn_log_admin_event` audit write.
+    /// Kept as a separate field (rather than reaching through
+    /// module_repo) so the service composes cleanly with future
+    /// callers that don't expose their pool through a repo wrapper.
+    db_pool: sqlx::PgPool,
 }
 
 impl HotUpdateService {
@@ -106,11 +121,13 @@ impl HotUpdateService {
         module_repo: Arc<ModuleRepository>,
         workflow_repo: Arc<WorkflowRepository>,
         compiler: Arc<CompilationService>,
+        db_pool: sqlx::PgPool,
     ) -> Self {
         Self {
             module_repo,
             workflow_repo,
             compiler,
+            db_pool,
         }
     }
 
@@ -178,6 +195,142 @@ impl HotUpdateService {
                 talos_capability_downgrade::check_downgrade(&ctx.name, &old_w, &new_w)
             {
                 downgrade_warnings.push(msg);
+            }
+        }
+
+        // 4b. M3 (2026-05-22): actor capability-ceiling gate. If this
+        //     module is currently bound by any workflow whose actor
+        //     has `max_capability_world < effective_world`, refuse
+        //     the hot-update — the recompiled module would otherwise
+        //     execute under an actor that isn't authorised for the
+        //     new tier, escalating the actor's effective privileges
+        //     out-of-band of any `grant_capability_ceiling` audit.
+        //
+        //     The check happens BEFORE the expensive compile
+        //     (~30-60 s) so a doomed hot-update fails fast. Mirrors
+        //     the `InlineCompileService` pattern (r304) used by
+        //     `add_node_to_workflow`'s inline-Rust branch.
+        //
+        //     We pick the STRICTEST actor ceiling across all bindings
+        //     — i.e. the lowest rank among any actor's max world.
+        //     If new_world's rank > strictest_actor_rank, reject.
+        //     Workflows with no actor_id pass through (they don't
+        //     impose a ceiling). Lookup failures fail-closed at WARN
+        //     so a transient DB blip doesn't silently bypass.
+        //
+        //     `actor_world_rank_strict` returns `Option<u8>` —
+        //     unknown / malformed actor worlds collapse to rank 0
+        //     (the strictest, `minimal-node`), so a bad row in
+        //     `actors.max_capability_world` fails closed rather than
+        //     defaulting to "trusted".
+        //
+        //     `world_rank` returns 7 (highest) for unknown new
+        //     worlds; combined with the
+        //     `is_compilable_world(effective_world)` check below at
+        //     step 4 we already validated `effective_world` is one
+        //     of the canonical strings, so the rank is well-defined.
+        {
+            let new_rank = talos_capability_world::world_rank(&effective_world);
+            // Find every workflow currently binding this module,
+            // along with its actor_id.
+            let bindings = match self
+                .module_repo
+                .find_dependent_workflows_with_actors_dual_id(module_id, ctx.template_id)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        %module_id,
+                        error = %e,
+                        "M3: failed to enumerate dependent workflows for ceiling check — \
+                         failing closed (refusing hot-update)"
+                    );
+                    return Err(HotUpdateError::CapabilityCeilingViolation(
+                        "Could not enumerate dependent workflows for capability ceiling check \
+                         (database error). Hot-update refused for safety."
+                            .into(),
+                    ));
+                }
+            };
+            for (workflow_id, workflow_name, actor_opt) in &bindings {
+                let Some(actor_id) = actor_opt else { continue };
+                let actor_max = talos_actor_repository::get_actor_max_world(
+                    &self.db_pool,
+                    *actor_id,
+                )
+                .await;
+                let Some(actor_max) = actor_max else {
+                    // Actor row missing — fail closed. A binding that
+                    // points at a non-existent actor is already
+                    // broken; refuse to escalate it further.
+                    return Err(HotUpdateError::CapabilityCeilingViolation(format!(
+                        "Workflow '{}' ({}) binds actor {} but the actor row is missing — \
+                         refusing hot-update.",
+                        workflow_name, workflow_id, actor_id
+                    )));
+                };
+                let actor_rank =
+                    talos_capability_world::actor_world_rank_strict(&actor_max).unwrap_or(0);
+                if new_rank > actor_rank {
+                    return Err(HotUpdateError::CapabilityCeilingViolation(format!(
+                        "Capability ceiling violation: hot-update would recompile module '{}' to \
+                         world '{}', but workflow '{}' ({}) binds actor {} whose \
+                         max_capability_world is '{}'. \
+                         Either pick a lower capability_world for this hot-update, or run \
+                         grant_capability_ceiling(actor_id: '{}', world: '{}') to raise the actor's ceiling.",
+                        ctx.name,
+                        effective_world,
+                        workflow_name,
+                        workflow_id,
+                        actor_id,
+                        actor_max,
+                        actor_id,
+                        effective_world,
+                    )));
+                }
+            }
+
+            // M3: log every world change (upgrade OR downgrade) to
+            // `admin_event_log` for forensics. The fire-and-forget
+            // helper handles DLP redaction + truncation; we never
+            // block the hot-update on the audit write.
+            if effective_world != ctx.capability_world {
+                let kind = if new_rank
+                    > talos_capability_world::world_rank(&ctx.capability_world)
+                {
+                    "upgrade"
+                } else {
+                    "change"
+                };
+                let summary = format!(
+                    "hot_update_module capability {}: module='{}' module_id={} \
+                     old_world='{}' new_world='{}' bindings={}",
+                    kind,
+                    ctx.name,
+                    module_id,
+                    ctx.capability_world,
+                    effective_world,
+                    bindings.len(),
+                );
+                let details = serde_json::json!({
+                    "module_id": module_id,
+                    "module_name": ctx.name,
+                    "old_capability_world": ctx.capability_world,
+                    "new_capability_world": effective_world,
+                    "kind": kind,
+                    "dependent_workflow_count": bindings.len(),
+                    "dependent_workflow_ids": bindings.iter().map(|(id, _, _)| id).collect::<Vec<_>>(),
+                });
+                talos_actor_repository::spawn_log_admin_event(
+                    self.db_pool.clone(),
+                    user_id,
+                    "hot_update_capability_change",
+                    "module",
+                    Some(module_id),
+                    summary,
+                    Some(details),
+                );
             }
         }
 

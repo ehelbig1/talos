@@ -11,6 +11,7 @@ pub mod metrics_server;
 pub mod runtime;
 pub mod s3_signer;
 pub mod sql_validator;
+pub mod ssrf_resolver;
 pub mod tracing;
 pub mod wit_inspector;
 

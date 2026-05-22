@@ -14,6 +14,81 @@ use wasmtime::{
 use crate::context::TalosContext;
 use crate::wit_inspector::CapabilityWorld;
 
+/// M1 (2026-05-22): epoch-interruption ticker cadence. The background
+/// task calls `engine.increment_epoch()` once per interval; per-Store
+/// `set_epoch_deadline(N)` then trips after `N` ticks (so deadline_ms
+/// granularity = `EPOCH_TICK_INTERVAL_MS`).
+///
+/// Trade-off: shorter interval = finer-grained interruption (catches
+/// runaway sooner) but more atomic increments on the ticker thread.
+/// 100 ms is the canonical wasmtime example for epoch interruption
+/// and matches the wall-clock-timeout granularity operators expect.
+pub const EPOCH_TICK_INTERVAL_MS: u64 = 100;
+
+/// Convert a wall-clock duration into the equivalent number of epoch
+/// ticks (rounded UP so we never trip the interrupt before the
+/// wall-clock timeout would have fired). Returns at least 1 — a
+/// deadline of 0 trips at the first WASM yield point, which would
+/// match the pre-M1 disabled-epoch behaviour and defeat the gate.
+///
+/// Pure function so the rounding policy is unit-testable.
+pub(crate) fn epoch_ticks_for_timeout(timeout: Duration) -> u64 {
+    let ms = timeout.as_millis() as u64;
+    let ticks = ms.div_ceil(EPOCH_TICK_INTERVAL_MS);
+    ticks.max(1)
+}
+
+/// Spawn a background tokio task that increments the engine's epoch
+/// counter every `EPOCH_TICK_INTERVAL_MS`. Returns a `JoinHandle` the
+/// caller can keep (or drop — the task lives for the lifetime of the
+/// process, but cancellation drops cleanly).
+///
+/// `Engine` clones are cheap (internal `Arc`) so the closure owns its
+/// own handle without sharing with the runtime's primary engine.
+pub fn spawn_epoch_ticker(engine: Engine) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(EPOCH_TICK_INTERVAL_MS));
+        // Skip the first immediate tick so the engine epoch doesn't
+        // tick at process startup before any deadlines are set.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            engine.increment_epoch();
+        }
+    })
+}
+
+#[cfg(test)]
+mod epoch_helper_tests {
+    use super::*;
+
+    #[test]
+    fn ticks_round_up_so_we_never_trip_early() {
+        // 1 ms → 1 tick (round up from 0.01)
+        assert_eq!(epoch_ticks_for_timeout(Duration::from_millis(1)), 1);
+        // 100 ms → 1 tick exact
+        assert_eq!(epoch_ticks_for_timeout(Duration::from_millis(100)), 1);
+        // 101 ms → 2 ticks (round up)
+        assert_eq!(epoch_ticks_for_timeout(Duration::from_millis(101)), 2);
+        // 1 s → 10 ticks
+        assert_eq!(epoch_ticks_for_timeout(Duration::from_secs(1)), 10);
+        // 30 s → 300 ticks (default execution timeout)
+        assert_eq!(epoch_ticks_for_timeout(Duration::from_secs(30)), 300);
+        // 7 day Trusted/Governance ceiling → ~6M ticks, well within u64.
+        let week = Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(epoch_ticks_for_timeout(week), 6_048_000);
+    }
+
+    #[test]
+    fn zero_timeout_clamps_to_one_tick() {
+        // Defensive: a zero-duration timeout would otherwise produce a
+        // deadline of 0 = current epoch, which trips at the first
+        // yield point — exactly the pre-M1 behaviour we're closing.
+        assert_eq!(epoch_ticks_for_timeout(Duration::ZERO), 1);
+    }
+}
+
 /// Per-execution security policy carried from the controller.
 /// Threaded through the runtime call chain and applied to `TalosContext`.
 #[derive(Clone, Debug, Default)]
@@ -49,7 +124,12 @@ pub struct SecurityPolicy {
 /// History:
 ///   TALOSV1 — wasmtime 41.0.3, uniform fuel cost
 ///   TALOSV2 — wasmtime 43.0.1, per-operator fuel costs, concurrency_support
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV2";
+///   TALOSV3 — M1 (2026-05-22): epoch_interruption enabled. AOT
+///             artifacts encode the epoch-check instruction sequence,
+///             so a TALOSV2 blob (compiled without epoch_interruption)
+///             would skip the per-yield-point check at runtime and
+///             defeat the gate. Bump rejects old blobs cleanly.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV3";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -1102,6 +1182,15 @@ impl TalosRuntime {
         self.redis_client.clone()
     }
 
+    /// M1 (2026-05-22): expose the engine handle so callers (worker
+    /// `main`) can start the background epoch-ticker via
+    /// `spawn_epoch_ticker`. `Engine` is cheap to clone (internal
+    /// `Arc`); cloning gives the ticker an independent handle without
+    /// borrowing through the runtime.
+    pub fn engine_handle(&self) -> Engine {
+        self.engine.clone()
+    }
+
     pub fn new() -> Result<Self> {
         Self::with_resources(None, None, None)
     }
@@ -1189,16 +1278,45 @@ impl TalosRuntime {
         config.wasm_bulk_memory(true);
         config.wasm_reference_types(true);
 
-        // EPOCH INTERRUPTION DISABLED — requires a background thread calling
-        // engine.increment_epoch() periodically AND store.set_epoch_deadline(N)
-        // before each execution.  Without both, the default deadline (0) equals
-        // the engine's starting epoch (0), tripping the interrupt check at the
-        // very first WASM yield point on every execution.
+        // M1 (2026-05-22): epoch interruption enabled as a third
+        // independent kill switch alongside fuel + wall-clock timeout.
         //
-        // Timeouts are already covered by two mechanisms:
-        //   1. tokio::time::timeout  — wall-clock deadline, wraps call_async
-        //   2. consume_fuel          — instruction-count budget (CPU runaway)
-        // config.epoch_interruption(true);
+        // How the three interlock:
+        //   1. consume_fuel        — bounds total CPU work (per-op
+        //                            cost × ops). Trips on tight
+        //                            in-WASM loops.
+        //   2. tokio::time::timeout — wraps `call_async`. Trips on
+        //                            wall-clock regardless of what
+        //                            the guest is doing — but ONLY at
+        //                            an async yield point. A guest
+        //                            stuck in pure synchronous WASM
+        //                            won't yield.
+        //   3. epoch interruption  — wasmtime polls a deadline at
+        //                            every loop backedge + function
+        //                            entry; trips on either deadline
+        //                            exceeded OR explicit interrupt.
+        //                            Closes the gap between (1) and
+        //                            (2) — guest stuck in sync WASM
+        //                            with cheap operators (fuel
+        //                            cost = 1 per op) still trips
+        //                            this within one
+        //                            EPOCH_TICK_INTERVAL.
+        //
+        // The matching call sites for each Store:
+        //   * `Store::set_epoch_deadline(ticks_ahead)` — the deadline
+        //     is set in `select_tier` callers BEFORE `call_async`.
+        //     The deadline is denominated in epoch ticks (one per
+        //     `EPOCH_TICK_INTERVAL`); we set it from the per-job
+        //     `timeout` so it matches the wall-clock budget.
+        //   * Background ticker — `TalosRuntime::spawn_epoch_ticker`
+        //     calls `engine.increment_epoch()` once per
+        //     EPOCH_TICK_INTERVAL on a dedicated tokio task.
+        //
+        // Cost: one atomic increment per tick on the ticker thread
+        // + a relaxed load at every loop backedge / function entry
+        // in the guest. Negligible compared to the security value
+        // of having a third independent kill switch.
+        config.epoch_interruption(true);
 
         // ========================================================================
         // WASM Stack Size
@@ -1984,6 +2102,15 @@ impl TalosRuntime {
         // SECURITY: Apply Resource Limits — enforced by TalosContext::ResourceLimiter impl
         store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
 
+        // M1 (2026-05-22): set the epoch interruption deadline. The
+        // ticker in `spawn_epoch_ticker` increments the engine epoch
+        // every `EPOCH_TICK_INTERVAL_MS`; this Store traps when the
+        // engine reaches `current_epoch + deadline_ticks`. Closes the
+        // gap where fuel and wall-clock timeout could both miss a
+        // tight sync-WASM loop with cheap operators that never yields
+        // to the tokio runtime.
+        store.set_epoch_deadline(epoch_ticks_for_timeout(timeout));
+
         // Derive string hash from pre-computed bytes (avoids recomputing)
         let module_hash_str = hex::encode(module_hash_bytes);
         let start_time = std::time::Instant::now();
@@ -2353,6 +2480,9 @@ impl TalosRuntime {
         // SECURITY: Apply Resource Limits
         store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
 
+        // M1: epoch interruption deadline — see top of file.
+        store.set_epoch_deadline(epoch_ticks_for_timeout(timeout));
+
         // Provide fuel to cap CPU usage
         store.set_fuel(self.fuel_limit)?;
 
@@ -2617,6 +2747,8 @@ impl TalosRuntime {
 
             let mut store = Store::try_new(&self.engine, context)?;
             store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
+            // M1: epoch interruption deadline — per-step.
+            store.set_epoch_deadline(epoch_ticks_for_timeout(step_timeout));
             store.set_fuel(step.max_fuel)?;
 
             // Instantiate from the cached InstancePre.
@@ -3103,6 +3235,8 @@ impl TalosRuntime {
         let mut store = Store::try_new(&self.engine, context)?;
 
         store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
+        // M1: epoch interruption deadline.
+        store.set_epoch_deadline(epoch_ticks_for_timeout(timeout));
         store.set_fuel(self.fuel_limit)?;
 
         // Use the trusted linker for AOT/pre-loaded components.
