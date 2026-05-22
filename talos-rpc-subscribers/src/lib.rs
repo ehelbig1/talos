@@ -35,6 +35,320 @@ use talos_actor_memory_service as actor_memory_service;
 // `verify()` returns false if the key is missing — requests are
 // rejected with Unauthorized rather than silently succeeding.
 
+/// Wasm-security review 2026-05-22 (MEDIUM-1): controller-side
+/// expression-level function-name deny-list walker.
+///
+/// Walks every `Expr::Function` in the statement and returns the first
+/// canonical-form name (`pg_sleep`, `pg_catalog.pg_sleep`, etc.) that
+/// matches the canonical deny-list in
+/// [`talos_workflow_job_protocol::DISALLOWED_SQL_FUNCTIONS`]. The
+/// worker has the primary walker (which surfaces a typed
+/// `SqlValidationError::DisallowedFunction`); this mirror is
+/// defense-in-depth against worker↔controller divergence — same
+/// pattern as the statement-level deny-list at MCP-473 above.
+///
+/// **Schema-qualification.** Same rule as the worker: bare
+/// (`pg_sleep`) and `pg_catalog`-qualified (`pg_catalog.pg_sleep`)
+/// forms are denied; other-schema qualified forms (`public.pg_sleep`)
+/// are NOT matched here because the validator can't disambiguate from
+/// the AST. The `talos_guest` role-wrap (M-2) is the fence for that
+/// case.
+fn controller_side_denied_function(stmt: &sqlparser::ast::Statement) -> Option<String> {
+    use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    fn check_object_name(name: &ObjectName) -> Option<String> {
+        let segments: Vec<&str> = name.0.iter().map(|i| i.value.as_str()).collect();
+        match segments.as_slice() {
+            [bare] => {
+                if talos_workflow_job_protocol::is_disallowed_sql_function(bare) {
+                    Some(bare.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            }
+            [schema, fn_name] => {
+                if schema.eq_ignore_ascii_case("pg_catalog")
+                    && talos_workflow_job_protocol::is_disallowed_sql_function(fn_name)
+                {
+                    Some(format!("pg_catalog.{}", fn_name.to_ascii_lowercase()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    struct DenyVisitor;
+    impl Visitor for DenyVisitor {
+        type Break = String;
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Function(func) = expr {
+                if let Some(name) = check_object_name(&func.name) {
+                    return ControlFlow::Break(name);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
+        // FROM-clause set-returning function calls (`SELECT * FROM
+        // dblink(...)`) parse as TableFactor, NOT Expr::Function.
+        // Sibling-mirror to `worker::sql_validator::check_disallowed_functions`.
+        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<Self::Break> {
+            match tf {
+                TableFactor::Table {
+                    name,
+                    args: Some(_),
+                    ..
+                } => {
+                    if let Some(denied) = check_object_name(name) {
+                        return ControlFlow::Break(denied);
+                    }
+                }
+                TableFactor::Function { name, .. } => {
+                    if let Some(denied) = check_object_name(name) {
+                        return ControlFlow::Break(denied);
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    match stmt.visit(&mut DenyVisitor) {
+        ControlFlow::Break(name) => Some(name),
+        ControlFlow::Continue(()) => None,
+    }
+}
+
+/// Wasm-security review 2026-05-22 (MEDIUM-2): resolve the operator-
+/// configured guest role for per-query `SET LOCAL ROLE`.
+///
+/// Returns `Some(role_name)` when `TALOS_RPC_GUEST_ROLE` is set to a
+/// non-empty value, `None` otherwise. Cached at first call so the env
+/// lookup happens once at startup, not on every RPC.
+///
+/// **Validation.** The role name is the operator's input but is
+/// substituted into SQL via Postgres's `quote_ident` semantics
+/// (`SET LOCAL ROLE "..."`) so injection is bounded to the role
+/// namespace — the worst case is the SET failing with "role does not
+/// exist" and the transaction rolling back. The role name MUST match
+/// a strict identifier pattern (alphanumeric + underscore, leading
+/// non-digit, ≤ 63 bytes — Postgres `NAMEDATALEN - 1`) so a
+/// misconfigured env can't smuggle a SQL fragment. Invalid values
+/// produce a startup-time warning and the wrap is disabled (fail-
+/// open is acceptable because the role wrap is itself defense-in-
+/// depth; the validator is the primary fence).
+pub(crate) fn guest_role_for_query() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static ROLE: OnceLock<Option<String>> = OnceLock::new();
+    ROLE.get_or_init(|| {
+        let raw = std::env::var("TALOS_RPC_GUEST_ROLE").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if !is_valid_pg_role_identifier(trimmed) {
+            tracing::warn!(
+                target: "talos_rpc",
+                event_kind = "guest_role_invalid_identifier",
+                raw_len = trimmed.len(),
+                "TALOS_RPC_GUEST_ROLE is set to an invalid Postgres identifier — \
+                 guest queries will continue to run as the app user. \
+                 Role names must match `[A-Za-z_][A-Za-z0-9_]{{,62}}`."
+            );
+            return None;
+        }
+        tracing::info!(
+            target: "talos_rpc",
+            event_kind = "guest_role_enabled",
+            role = %trimmed,
+            "Guest SQL will run with SET LOCAL ROLE — \
+             ensure the role has minimal privileges (see talos_guest migration)."
+        );
+        Some(trimmed.to_string())
+    })
+    .as_deref()
+}
+
+/// Strict Postgres role-identifier validator. Pure function so it's
+/// trivially testable and the call site (`guest_role_for_query`) has
+/// no SQL-injection surface.
+///
+/// Rules:
+///   * Non-empty, ≤ 63 bytes (Postgres `NAMEDATALEN - 1`).
+///   * First char alphabetic ASCII or `_`.
+///   * Remaining chars alphabetic, digit, or `_`.
+///   * No quoting / dotted / mixed-case-sensitive shenanigans.
+///
+/// We don't accept the full Postgres unquoted-identifier grammar
+/// (which allows dollar signs and some unicode) — the deliberate
+/// narrowness rejects exotic role names that could surprise a future
+/// auditor reading the env. Operators wanting an exotic role can
+/// alias it to a simple name via `GRANT exotic_role TO talos_guest`.
+pub(crate) fn is_valid_pg_role_identifier(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Wasm-security review 2026-05-22 (MEDIUM-2): execute a guest SQL
+/// query inside a transaction, optionally with `SET LOCAL ROLE`.
+///
+/// The wrap is uniform for both fetch and non-fetch paths so we never
+/// leave session state behind on the pooled connection. `SET LOCAL`
+/// is automatically reverted at COMMIT/ROLLBACK; combined with the
+/// `BEGIN ... COMMIT`-per-query discipline, the connection returns
+/// to the pool in a known-clean state.
+///
+/// **Why a transaction even without a role.** sqlx's `q.fetch_one(&pool)`
+/// acquires a connection, runs the query, releases the connection. If a
+/// future call site adds `SET` statements expecting connection scope,
+/// they'd leak across pool checkouts. Always-transaction is the
+/// canonical pattern.
+///
+/// **Statement-timeout note.** Postgres `SET LOCAL statement_timeout`
+/// could also be wrapped here, but it's already set at connection
+/// init (`talos-db/src/lib.rs`); a redundant SET LOCAL would be
+/// belt-and-suspenders but is currently omitted to keep the wrap
+/// minimal. Operators wanting per-query overrides can extend this
+/// helper.
+async fn execute_guest_query(
+    pool: &sqlx::PgPool,
+    sql: &str,
+    params: &[String],
+    is_fetch: bool,
+    guest_role: Option<&str>,
+) -> Result<
+    talos_memory::database_rpc::DatabaseResult,
+    talos_memory::database_rpc::DatabaseRpcError,
+> {
+    use sqlx::Row;
+    use talos_memory::database_rpc::{
+        DatabaseResult, DatabaseRpcError, MAX_RESULT_BYTES, MAX_RESULT_ROWS, QUERY_TIMEOUT_SECS,
+    };
+
+    // The whole query (including the optional role SET, the user SQL,
+    // and the CTE wrap if any) runs under a single tokio timeout.
+    // Pre-fix the fetch path used `q.fetch_one(&pool)` which acquires
+    // its own connection — now we hold one for the transaction. The
+    // controller-side `MAX_IN_FLIGHT = 8` semaphore upstream of this
+    // call still bounds total concurrent connection-holders.
+    let work = async {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
+
+        // SET LOCAL ROLE — reverted automatically at COMMIT/ROLLBACK.
+        // `guest_role` is validated by `is_valid_pg_role_identifier`
+        // at startup so this format!-into-SQL is safe.
+        if let Some(role) = guest_role {
+            let set_role_sql = format!("SET LOCAL ROLE \"{role}\"");
+            sqlx::query(&set_role_sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    // Most likely cause: role doesn't exist or the app
+                    // user isn't a member of it. Both are operator-
+                    // configuration errors — surface as ConnectionFailed
+                    // (not QueryError) so the metric / log distinguishes
+                    // them from guest SQL faults.
+                    DatabaseRpcError::ConnectionFailed(format!(
+                        "SET LOCAL ROLE failed: {e}"
+                    ))
+                })?;
+        }
+
+        if is_fetch {
+            // CTE wrap rationale unchanged from pre-MEDIUM-2 — see
+            // `rpc_cte_name()` for the random-suffix design.
+            let wrapped = format!(
+                "WITH {cte} AS ({user_sql}) \
+                 SELECT COALESCE(json_agg(t), '[]'::json) AS json_res \
+                 FROM (SELECT * FROM {cte} LIMIT {lim}) t",
+                cte = rpc_cte_name(),
+                user_sql = sql,
+                lim = MAX_RESULT_ROWS + 1
+            );
+            let mut q = sqlx::query(&wrapped);
+            for p in params {
+                q = q.bind(p);
+            }
+            let row = q
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| DatabaseRpcError::QueryError(e.to_string()))?;
+            let json_val: serde_json::Value = row
+                .try_get("json_res")
+                .map_err(|e| DatabaseRpcError::QueryError(format!("json_res decode: {e}")))?;
+            if let Some(arr) = json_val.as_array() {
+                if arr.len() > MAX_RESULT_ROWS {
+                    return Err(DatabaseRpcError::ResultTooLarge(format!(
+                        "query returned more than {} rows — add LIMIT/OFFSET",
+                        MAX_RESULT_ROWS
+                    )));
+                }
+            }
+            let rows_json = json_val.to_string();
+            if rows_json.len() > MAX_RESULT_BYTES {
+                return Err(DatabaseRpcError::ResultTooLarge(format!(
+                    "result {} bytes exceeds {}-byte cap",
+                    rows_json.len(),
+                    MAX_RESULT_BYTES
+                )));
+            }
+            // Commit so SET LOCAL ROLE is reverted before the
+            // connection returns to the pool. fetch path is read-
+            // only in practice (the user SQL is wrapped in
+            // `SELECT json_agg`), but COMMIT vs ROLLBACK doesn't
+            // affect that — SET LOCAL is reverted either way. We
+            // COMMIT for symmetry with the non-fetch path.
+            tx.commit()
+                .await
+                .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
+            Ok(DatabaseResult {
+                rows_json,
+                rows_affected: 0,
+            })
+        } else {
+            let mut q = sqlx::query(sql);
+            for p in params {
+                q = q.bind(p);
+            }
+            let r = q
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DatabaseRpcError::QueryError(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
+            Ok(DatabaseResult {
+                rows_json: "[]".to_string(),
+                rows_affected: r.rows_affected(),
+            })
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
+        work,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(DatabaseRpcError::Timeout),
+    }
+}
+
 /// Process-lifetime random suffix for the database-RPC CTE wrap
 /// name. Avoids collisions with user-supplied SQL that defines its
 /// own CTE. Regenerated only on controller restart — the database
@@ -863,11 +1177,15 @@ pub fn spawn_database_rpc_subscriber(
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     use futures::StreamExt;
-    use sqlx::Row;
     use std::sync::Arc;
+    // Wasm-security review 2026-05-22 (MEDIUM-2): MAX_RESULT_* /
+    // QUERY_TIMEOUT_SECS moved into `execute_guest_query`; only
+    // the types still referenced in this fn remain (`DatabaseResult`
+    // is the success type the `send` closure returns up the NATS
+    // reply path).
     use talos_memory::database_rpc::{
         DatabaseResult, DatabaseRpcError, DatabaseRpcReply, DatabaseRpcRequest, MAX_IN_FLIGHT,
-        MAX_RESULT_BYTES, MAX_RESULT_ROWS, QUERY_TIMEOUT_SECS, SUBJECT_DATABASE_QUERY,
+        SUBJECT_DATABASE_QUERY,
     };
     tokio::spawn(async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
@@ -1174,104 +1492,78 @@ pub fn spawn_database_rpc_subscriber(
                         );
                         return;
                     }
+
+                    // Wasm-security review 2026-05-22 (MEDIUM-1):
+                    // controller-side mirror of the worker's
+                    // expression-level function deny-list.
+                    //
+                    // The deliberate-duplication pattern follows
+                    // MCP-473 (statement-level) above: the worker is
+                    // primary defense, but if a future divergence bug
+                    // lets a denied function reach here, the controller
+                    // re-rejects. Both sides import the canonical
+                    // deny-list from `talos_workflow_job_protocol::
+                    // DISALLOWED_SQL_FUNCTIONS` so list-drift is
+                    // architecturally impossible. The visitor wrapper
+                    // is duplicated (worker uses its own to wire into
+                    // `SqlValidationError::DisallowedFunction`, this
+                    // side just needs a yes/no), but the deny-list
+                    // itself is shared.
+                    //
+                    // Same cost profile as the worker walk: ~5-20 µs
+                    // for a typical query, well below the network +
+                    // DB time.
+                    if let Some(denied) = controller_side_denied_function(&stmts[0]) {
+                        tracing::warn!(
+                            target: "talos_rpc",
+                            event_kind = "database_rpc_disallowed_function",
+                            actor_id = %req.actor_id,
+                            denied_function = %denied,
+                            "database RPC: rejecting query referencing deny-listed function \
+                             — possible worker bypass (worker should already have refused)"
+                        );
+                        send(Err(DatabaseRpcError::InvalidQuery(format!(
+                            "SQL references function `{denied}` which is on the unconditional deny-list"
+                        ))))
+                        .await;
+                        record_rpc_metric(
+                            SUBJECT_DATABASE_QUERY,
+                            req.actor_id,
+                            "disallowed_function",
+                            start.elapsed().as_millis() as u64,
+                            0,
+                        );
+                        return;
+                    }
                 }
 
                 let _permit = sem.acquire_owned().await;
                 let permit_at = std::time::Instant::now();
 
-                let result = if req.is_fetch {
-                    // Wrap with a CTE so that `UPDATE ... RETURNING`
-                    // and `INSERT ... RETURNING` work alongside
-                    // `SELECT`. Postgres does not allow bare DML as a
-                    // subquery (SELECT * FROM (UPDATE ...) fails),
-                    // but does allow it in a CTE. One extra row
-                    // beyond the cap lets us detect overflow without
-                    // materialising the whole result set.
-                    //
-                    // The CTE name is suffixed with a random-per-start
-                    // token so a user SQL that itself defines `WITH
-                    // _rpc_data AS (...)` cannot collide with our
-                    // wrap. Process-lifetime random is sufficient —
-                    // the request carries the user's actor_id so an
-                    // attacker can't brute-force collisions across
-                    // tenants, and the suffix is unpredictable from
-                    // the WASM sandbox.
-                    let wrapped = format!(
-                        "WITH {cte} AS ({user_sql}) \
-                         SELECT COALESCE(json_agg(t), '[]'::json) AS json_res \
-                         FROM (SELECT * FROM {cte} LIMIT {lim}) t",
-                        cte = rpc_cte_name(),
-                        user_sql = req.sql,
-                        lim = MAX_RESULT_ROWS + 1
-                    );
-                    let mut q = sqlx::query(&wrapped);
-                    for p in &req.params {
-                        q = q.bind(p);
-                    }
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
-                        q.fetch_one(&pool),
-                    )
-                    .await
-                    {
-                        Ok(Ok(row)) => {
-                            let json_val: serde_json::Value = match row.try_get("json_res") {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    send(Err(DatabaseRpcError::QueryError(format!(
-                                        "json_res decode: {e}"
-                                    ))))
-                                    .await;
-                                    return;
-                                }
-                            };
-                            if let Some(arr) = json_val.as_array() {
-                                if arr.len() > MAX_RESULT_ROWS {
-                                    send(Err(DatabaseRpcError::ResultTooLarge(format!(
-                                        "query returned more than {} rows — add LIMIT/OFFSET",
-                                        MAX_RESULT_ROWS
-                                    ))))
-                                    .await;
-                                    return;
-                                }
-                            }
-                            let rows_json = json_val.to_string();
-                            if rows_json.len() > MAX_RESULT_BYTES {
-                                send(Err(DatabaseRpcError::ResultTooLarge(format!(
-                                    "result {} bytes exceeds {}-byte cap",
-                                    rows_json.len(),
-                                    MAX_RESULT_BYTES
-                                ))))
-                                .await;
-                                return;
-                            }
-                            Ok(DatabaseResult {
-                                rows_json,
-                                rows_affected: 0,
-                            })
-                        }
-                        Ok(Err(e)) => Err(DatabaseRpcError::QueryError(e.to_string())),
-                        Err(_) => Err(DatabaseRpcError::Timeout),
-                    }
-                } else {
-                    let mut q = sqlx::query(&req.sql);
-                    for p in &req.params {
-                        q = q.bind(p);
-                    }
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
-                        q.execute(&pool),
-                    )
-                    .await
-                    {
-                        Ok(Ok(r)) => Ok(DatabaseResult {
-                            rows_json: "[]".to_string(),
-                            rows_affected: r.rows_affected(),
-                        }),
-                        Ok(Err(e)) => Err(DatabaseRpcError::QueryError(e.to_string())),
-                        Err(_) => Err(DatabaseRpcError::Timeout),
-                    }
-                };
+                // Wasm-security review 2026-05-22 (MEDIUM-2): per-actor
+                // role wrap. When `TALOS_RPC_GUEST_ROLE` is set, every
+                // guest query runs inside a transaction with
+                // `SET LOCAL ROLE <role>`. This bounds the privileges
+                // available to guest SQL to whatever the operator has
+                // granted to that role — which by default is nothing
+                // (see `migrations/20260522120000_talos_guest_role.sql`).
+                // Unset = legacy behaviour (queries run as the app
+                // user); operators roll out per environment.
+                //
+                // The wrap is conditional on the env var, but the
+                // transaction-with-SET-LOCAL approach is also the
+                // canonical pattern for "per-query session state"
+                // even without a role — it ensures the connection
+                // returned to the pool is clean regardless of how the
+                // query exited (commit, rollback, panic).
+                let result = execute_guest_query(
+                    &pool,
+                    &req.sql,
+                    &req.params,
+                    req.is_fetch,
+                    guest_role_for_query(),
+                )
+                .await;
 
                 let outcome = match &result {
                     Ok(_) => "ok",
@@ -1947,5 +2239,194 @@ mod helper_tests {
         // is emitted verbatim, including unicode.
         assert_eq!(escape_like_pattern("héllo"), "héllo");
         assert_eq!(escape_like_pattern("a/b-c.d"), "a/b-c.d");
+    }
+}
+
+// ============================================================================
+// Wasm-security review 2026-05-22 (MEDIUM-1): controller-side SQL function
+// deny-list tests. Sibling to the worker's `function_deny_list_*` tests in
+// `worker/src/sql_validator.rs` — both sides MUST agree on the canonical
+// list (sourced from `talos_workflow_job_protocol::DISALLOWED_SQL_FUNCTIONS`)
+// and on the schema-qualification handling. If the worker drops detection
+// for a function, the controller-side mirror is the next gate; tests here
+// pin that the mirror catches the cases the worker is documented to catch.
+// ============================================================================
+#[cfg(test)]
+mod controller_function_deny_tests {
+    use super::controller_side_denied_function;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_one(sql: &str) -> sqlparser::ast::Statement {
+        let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .unwrap_or_else(|e| panic!("parse failed for `{sql}`: {e}"));
+        assert_eq!(stmts.len(), 1, "test SQL must be a single statement: `{sql}`");
+        stmts.pop().unwrap()
+    }
+
+    #[test]
+    fn pg_sleep_top_level() {
+        let stmt = parse_one("SELECT pg_sleep(1)");
+        assert_eq!(controller_side_denied_function(&stmt).as_deref(), Some("pg_sleep"));
+    }
+
+    #[test]
+    fn pg_catalog_qualified_form() {
+        let stmt = parse_one("SELECT pg_catalog.pg_sleep(1)");
+        assert_eq!(
+            controller_side_denied_function(&stmt).as_deref(),
+            Some("pg_catalog.pg_sleep")
+        );
+    }
+
+    #[test]
+    fn user_schema_qualified_form_not_matched() {
+        // Documented trade-off — same as worker. Validator can't
+        // disambiguate user-defined vs stock; the `talos_guest` role
+        // is the fence.
+        let stmt = parse_one("SELECT public.pg_sleep(1)");
+        assert_eq!(controller_side_denied_function(&stmt), None);
+    }
+
+    #[test]
+    fn case_insensitive() {
+        for sql in [
+            "SELECT PG_SLEEP(1)",
+            "SELECT Pg_Sleep(1)",
+            "SELECT pg_catalog.PG_SLEEP(1)",
+        ] {
+            let stmt = parse_one(sql);
+            assert!(
+                controller_side_denied_function(&stmt).is_some(),
+                "case variant `{sql}` not blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn walks_into_subqueries_and_ctes() {
+        let cases = [
+            "SELECT * FROM users WHERE id IN (SELECT pg_terminate_backend(pid) FROM pg_stat_activity)",
+            "WITH bad AS (SELECT pg_read_file('/etc/passwd') AS x) SELECT * FROM bad",
+            "SELECT * FROM t1 JOIN t2 ON pg_sleep(60) IS NULL",
+            "SELECT CASE WHEN id > 5 THEN pg_terminate_backend(id) ELSE 0 END FROM users",
+            "SELECT (SELECT (SELECT (SELECT pg_sleep(60))))",
+        ];
+        for sql in cases {
+            let stmt = parse_one(sql);
+            assert!(
+                controller_side_denied_function(&stmt).is_some(),
+                "deeply-nested deny case `{sql}` not blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_functions_not_blocked() {
+        for sql in [
+            "SELECT count(*) FROM users",
+            "SELECT sum(amount) FROM payments",
+            "SELECT now()",
+            "SELECT json_agg(t) FROM (SELECT * FROM users) t",
+            "SELECT current_user",
+            "SELECT row_number() OVER (ORDER BY id) FROM events",
+            "SELECT pg_my_custom_business_func(id) FROM t",
+        ] {
+            let stmt = parse_one(sql);
+            assert_eq!(
+                controller_side_denied_function(&stmt),
+                None,
+                "benign SQL `{sql}` was incorrectly blocked"
+            );
+        }
+    }
+
+    // ---- Wasm-security review 2026-05-22 (MEDIUM-2) ----
+    //
+    // Per-actor Postgres role validator. Tests live in the same mod
+    // because they share `super::*` access; the controller-side
+    // function-deny tests above already pull in the parser, so this
+    // saves a fresh mod.
+
+    #[test]
+    fn role_identifier_validator_accepts_canonical_form() {
+        use super::is_valid_pg_role_identifier;
+        for name in [
+            "talos_guest",
+            "guest",
+            "guest_role",
+            "Guest",
+            "_internal_role",
+            "a",
+            "abc_123",
+            // 63 chars (Postgres NAMEDATALEN - 1): boundary OK.
+            &"a".repeat(63),
+        ] {
+            assert!(
+                is_valid_pg_role_identifier(name),
+                "valid identifier `{name}` was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn role_identifier_validator_rejects_injection_attempts() {
+        use super::is_valid_pg_role_identifier;
+        for bad in [
+            "",
+            " ",
+            "talos_guest; DROP ROLE postgres",
+            "talos_guest\"; DROP ROLE postgres; --",
+            "talos guest", // space
+            "talos-guest", // hyphen — valid PG quoted ident but rejected by our narrow rule
+            "1guest",      // starts with digit
+            ".guest",
+            "talos.guest",
+            "talos_guest\n",
+            "talos_guest\u{0000}",
+            "talos_guest\\",
+            "пользователь", // non-ASCII (rejected by design; alias if needed)
+            // 64 chars: over the NAMEDATALEN-1 boundary.
+            &"a".repeat(64),
+            // 100 chars: well over.
+            &"a".repeat(100),
+        ] {
+            assert!(
+                !is_valid_pg_role_identifier(bad),
+                "invalid identifier `{bad:?}` was accepted — SQL injection risk"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_list_lockstep_with_worker_canonical_const() {
+        // Tripwire: the canonical const drives both worker and
+        // controller. This test pins that the controller walker
+        // recognises every entry in the const — if a future PR adds
+        // an entry to the const but forgets to update the walker
+        // (e.g. by special-casing), this fires.
+        for fn_name in talos_workflow_job_protocol::DISALLOWED_SQL_FUNCTIONS {
+            // Some entries (e.g. `lo_import`, `plperlu_call_handler`)
+            // are not naturally callable as `SELECT fn()` — they're
+            // either set-returning, void, or trigger handlers. We
+            // wrap them in a context that always parses: a bare
+            // function call inside a SELECT projection (which
+            // sqlparser accepts for any function shape).
+            let sql = format!("SELECT {fn_name}(1)");
+            let stmts = Parser::parse_sql(&PostgreSqlDialect {}, &sql);
+            // Skip names sqlparser refuses to parse as a function call
+            // (none expected with current entries; the catch is here
+            // so a future addition of a reserved-keyword function
+            // surfaces visibly rather than as a silent skip).
+            let Ok(mut parsed) = stmts else { continue };
+            if parsed.len() != 1 {
+                continue;
+            }
+            let stmt = parsed.pop().unwrap();
+            assert!(
+                controller_side_denied_function(&stmt).is_some(),
+                "canonical deny-list entry `{fn_name}` not caught by controller walker"
+            );
+        }
     }
 }

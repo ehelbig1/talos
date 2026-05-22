@@ -141,16 +141,103 @@ pub(crate) enum SigstorePolicy {
 }
 
 impl SigstorePolicy {
+    /// Parse the operator's `TALOS_SIGSTORE_REQUIRED` env var into a policy.
+    ///
+    /// Recognised values:
+    ///   * `required` / `true` / `1` → `Required`
+    ///   * `audit` / `warn`          → `Audit`
+    ///   * `disabled` / `off` / `0`  → `Disabled` (explicit opt-out)
+    ///   * unset / empty / anything else → `Disabled` (silent default)
+    ///
+    /// **The silent-default branch is policed by [`enforce_production_policy_explicit`]**.
+    /// In production we refuse to boot unless the operator has explicitly
+    /// chosen one of the recognised values — the silent fallthrough is a
+    /// deployment trap we caught in the 2026-05-22 wasm-security review
+    /// (MEDIUM-4): an operator who forgot to set the env var got Sigstore
+    /// silently disabled with no startup warning, defeating the entire
+    /// signature-verification chain. The pure parse here stays minimal and
+    /// fail-safe (unknown → Disabled, never up-grading to a stricter policy);
+    /// the production-gate lives at the boot path so dev/test environments
+    /// keep the lenient default.
     fn from_env() -> Self {
-        match std::env::var("TALOS_SIGSTORE_REQUIRED")
-            .unwrap_or_default()
-            .as_str()
-        {
+        Self::from_env_str(&std::env::var("TALOS_SIGSTORE_REQUIRED").unwrap_or_default())
+    }
+
+    /// Pure parse helper. Split out so unit tests don't touch process env.
+    fn from_env_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "required" => Self::Required,
             "audit" | "warn" => Self::Audit,
+            // Explicit opt-out aliases. Operators who *want* Disabled in
+            // production set one of these so the production gate below
+            // sees an explicit choice instead of silent emptiness.
+            "disabled" | "off" | "0" | "false" | "no" => Self::Disabled,
+            // Anything else (including empty) → Disabled, but the
+            // production gate refuses to boot in this state. Tests on
+            // dev hosts continue to see the silent default.
             _ => Self::Disabled,
         }
     }
+
+    /// Was the operator explicit about the Sigstore policy?
+    ///
+    /// Distinguishes "operator set `TALOS_SIGSTORE_REQUIRED=disabled`,
+    /// accepting the risk" from "operator forgot to set anything". The
+    /// production gate refuses to boot in the second state.
+    fn raw_env_is_explicit(raw: &str) -> bool {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "true"
+                | "1"
+                | "required"
+                | "audit"
+                | "warn"
+                | "disabled"
+                | "off"
+                | "0"
+                | "false"
+                | "no"
+        )
+    }
+}
+
+/// Production-only gate: refuse to boot when the operator hasn't made an
+/// explicit Sigstore choice.
+///
+/// Mirrors the `TALOS_AOT_HMAC_KEY` startup discipline at
+/// [`runtime::aot_key_ring`]: in production, fail loud at boot rather than
+/// devolving to a "silent unverified" posture that looks identical to
+/// "verification ran and passed" from the operator's monitoring.
+///
+/// Returns `Ok(policy)` in three cases:
+///   1. We're not in production (dev/test) — the silent default is fine.
+///   2. Operator set an explicit recognised value — any of them is fine,
+///      including `disabled`, because operator chose it knowingly.
+///   3. Operator set `audit` or `required` — fine by definition.
+///
+/// Returns `Err` in production when the env var is unset / empty / set to
+/// an unrecognised value — the operator's intent is ambiguous, refuse to
+/// guess.
+fn enforce_production_sigstore_policy_explicit() -> anyhow::Result<SigstorePolicy> {
+    let raw = std::env::var("TALOS_SIGSTORE_REQUIRED").unwrap_or_default();
+    let policy = SigstorePolicy::from_env_str(&raw);
+
+    if !talos_config::is_production() {
+        return Ok(policy);
+    }
+
+    if SigstorePolicy::raw_env_is_explicit(&raw) {
+        return Ok(policy);
+    }
+
+    Err(anyhow::anyhow!(
+        "CRITICAL: TALOS_SIGSTORE_REQUIRED must be set explicitly in production. \
+         Set to `required` for fail-closed signature verification (recommended), \
+         `audit` for warn-and-continue during a migration window, or `disabled` \
+         to explicitly accept the security risk of running unsigned WASM artifacts. \
+         Refusing to boot rather than silently devolving to no-verification — \
+         see worker/src/main.rs::SigstorePolicy for rationale."
+    ))
 }
 
 /// Reasons a Sigstore identity regexp is too permissive to enforce.
@@ -2372,6 +2459,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Wasm-security review 2026-05-22 (MEDIUM-4): production gate. In
+    // production we refuse to boot unless the operator has made an
+    // explicit Sigstore choice (required / audit / disabled). Pre-fix,
+    // `from_env` silently fell through to `Disabled` when the env var
+    // was unset — the operator's monitoring saw a clean startup and
+    // had no signal that signature verification was off. Mirrors the
+    // `TALOS_AOT_HMAC_KEY` boot discipline so production failures are
+    // loud and immediate. Dev/test hosts (`is_production() == false`)
+    // continue to see the silent default.
+    enforce_production_sigstore_policy_explicit()?;
+
     // L-4: Sigstore startup sanity — verify `cosign` is actually
     // executable when policy is non-Disabled. Pre-fix the missing
     // binary surfaced as a per-pull "cosign_unavailable" error;
@@ -3490,6 +3588,156 @@ mod oci_layer_tests {
         // didn't run" signal in logs rather than silent failures.
         assert_eq!(SigstorePolicy::from_env(), SigstorePolicy::Disabled);
         std::env::remove_var("TALOS_SIGSTORE_REQUIRED");
+    }
+
+    // ---- Wasm-security review 2026-05-22 (MEDIUM-4) ----
+    //
+    // Production-gate the silent-Disabled fallthrough. The pure parser
+    // (`from_env_str`) keeps the lenient default; the production gate
+    // (`enforce_production_sigstore_policy_explicit`) refuses to boot
+    // when the operator hasn't made an explicit choice. Mirrors the
+    // `TALOS_AOT_HMAC_KEY` boot discipline. Tests below pin both the
+    // parse contract and the explicit-vs-silent distinction; the
+    // production-gate function itself is tested indirectly via the
+    // `raw_env_is_explicit` predicate (the gate just composes parser
+    // + predicate + production flag).
+
+    #[test]
+    fn sigstore_policy_parses_explicit_disabled_aliases() {
+        // Operators wanting Disabled in production set one of these
+        // so the production-gate sees an explicit choice.
+        for v in ["disabled", "off", "0", "false", "no"] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                SigstorePolicy::Disabled,
+                "value `{v}` should map to Disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn sigstore_policy_parser_handles_case_and_whitespace() {
+        // Operators copy values out of secret managers / CI logs which
+        // sometimes add whitespace or uppercase. The pure parser
+        // normalises both. Pre-fix, `Required` was case-sensitive and
+        // " REQUIRED" silently mapped to Disabled.
+        assert_eq!(SigstorePolicy::from_env_str("REQUIRED"), SigstorePolicy::Required);
+        assert_eq!(SigstorePolicy::from_env_str("Required"), SigstorePolicy::Required);
+        assert_eq!(SigstorePolicy::from_env_str("  audit  "), SigstorePolicy::Audit);
+        assert_eq!(SigstorePolicy::from_env_str("\tDISABLED\n"), SigstorePolicy::Disabled);
+    }
+
+    #[test]
+    fn sigstore_raw_env_is_explicit_distinguishes_silent_from_chosen() {
+        // The production gate fires ONLY when the operator's choice
+        // is ambiguous (empty / unrecognised). Every recognised value —
+        // including the Disabled aliases — counts as explicit.
+        for v in [
+            "required", "true", "1",
+            "audit", "warn",
+            "disabled", "off", "0", "false", "no",
+            "  REQUIRED  ", // case + whitespace normalisation
+        ] {
+            assert!(
+                SigstorePolicy::raw_env_is_explicit(v),
+                "`{v}` must be considered explicit"
+            );
+        }
+
+        // The silent-default footgun cases the production-gate
+        // protects against.
+        for v in ["", "  ", "\t\n", "yes-please", "true-ish", "maybe", "off-ish"] {
+            assert!(
+                !SigstorePolicy::raw_env_is_explicit(v),
+                "`{v}` must be considered NOT explicit (production-gate target)"
+            );
+        }
+    }
+
+    #[test]
+    fn sigstore_production_gate_admits_when_not_in_production() {
+        // Sanity: the production gate is a no-op on dev/test hosts.
+        // Tests run with `is_production() == false` by default; if
+        // this ever stops being true, the assertion below will fail
+        // loudly and we'll know to revisit.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TALOS_SIGSTORE_REQUIRED");
+        // No env var set; in dev this MUST be Ok(Disabled).
+        let result = enforce_production_sigstore_policy_explicit();
+        assert!(
+            result.is_ok(),
+            "production gate must admit silent-default on dev hosts — got {result:?}"
+        );
+        assert_eq!(result.unwrap(), SigstorePolicy::Disabled);
+    }
+
+    #[test]
+    fn sigstore_production_gate_admits_every_explicit_value_on_dev() {
+        // Operator-recognised values pass the gate in any environment.
+        let _g = ENV_LOCK.lock().unwrap();
+        for v in ["required", "audit", "disabled"] {
+            std::env::set_var("TALOS_SIGSTORE_REQUIRED", v);
+            let result = enforce_production_sigstore_policy_explicit();
+            assert!(result.is_ok(), "explicit `{v}` must pass the gate — got {result:?}");
+        }
+        std::env::remove_var("TALOS_SIGSTORE_REQUIRED");
+    }
+
+    #[test]
+    fn sigstore_production_gate_refuses_silent_default_in_production() {
+        // The point of the gate. With `RUST_ENV=production` AND
+        // `TALOS_SIGSTORE_REQUIRED` unset / empty / garbage, the boot
+        // path must return Err — refusing to start rather than
+        // silently devolving to no-verification.
+        let _g = ENV_LOCK.lock().unwrap();
+        let prior_rust_env = std::env::var("RUST_ENV").ok();
+        let prior_sigstore = std::env::var("TALOS_SIGSTORE_REQUIRED").ok();
+
+        std::env::set_var("RUST_ENV", "production");
+
+        for ambiguous in ["", "  ", "yes-please", "true-ish"] {
+            if ambiguous.is_empty() {
+                std::env::remove_var("TALOS_SIGSTORE_REQUIRED");
+            } else {
+                std::env::set_var("TALOS_SIGSTORE_REQUIRED", ambiguous);
+            }
+            let result = enforce_production_sigstore_policy_explicit();
+            assert!(
+                result.is_err(),
+                "production gate must refuse silent / unrecognised value `{ambiguous:?}` — got {result:?}"
+            );
+            let err_msg = format!("{}", result.unwrap_err());
+            assert!(
+                err_msg.contains("TALOS_SIGSTORE_REQUIRED"),
+                "error message must name the env var so operators find the fix — got `{err_msg}`"
+            );
+            // Actionable error: must mention all three remediation paths.
+            assert!(err_msg.contains("required"), "error must mention `required` option");
+            assert!(err_msg.contains("audit"), "error must mention `audit` option");
+            assert!(err_msg.contains("disabled"), "error must mention `disabled` option");
+        }
+
+        // And the converse: setting an explicit value in production
+        // passes the gate.
+        for explicit in ["required", "audit", "disabled"] {
+            std::env::set_var("TALOS_SIGSTORE_REQUIRED", explicit);
+            let result = enforce_production_sigstore_policy_explicit();
+            assert!(
+                result.is_ok(),
+                "production gate must admit explicit `{explicit}` — got {result:?}"
+            );
+        }
+
+        // Restore prior env state so we don't poison other tests
+        // sharing ENV_LOCK.
+        match prior_rust_env {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
+        }
+        match prior_sigstore {
+            Some(v) => std::env::set_var("TALOS_SIGSTORE_REQUIRED", v),
+            None => std::env::remove_var("TALOS_SIGSTORE_REQUIRED"),
+        }
     }
 
     #[test]

