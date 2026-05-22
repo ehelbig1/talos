@@ -13,6 +13,7 @@ regex = "1.12"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+talos-actor-repository = { path = "../talos-actor-repository" }
 talos-capability-world = { path = "../talos-capability-world" }
 talos-capability-downgrade = { path = "../talos-capability-downgrade" }
 talos-compilation = { path = "../talos-compilation" }
@@ -20,6 +21,7 @@ talos-module-repository = { path = "../talos-module-repository" }
 talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
 thiserror.workspace = true
 tracing.workspace = true
 uuid = { version = "1", features = ["v4", "v5", "serde"] }

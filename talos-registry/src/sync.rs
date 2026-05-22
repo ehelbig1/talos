@@ -34,6 +34,173 @@ use std::env;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+// ───────────────────────────────────────────────────────────────────────
+// H2 (2026-05-22): Sigstore verification for the `_index` catalog
+// artifact AND each per-template artifact. Pre-fix only the worker
+// verified signatures on layer pulls at execution time; the controller-
+// side catalog sync trusted whatever the registry returned. A tampered
+// or MITM'd `_index` could inject arbitrary template entries pointing
+// at attacker-controlled image tags. The individual templates would
+// still be sigstore-verified at worker execution time, but the catalog
+// itself (and the discovery surface it controls) was unauthenticated.
+//
+// We mirror the worker's policy enum (`Disabled` / `Audit` / `Required`)
+// so the operator-facing env vars are identical:
+//   * TALOS_SIGSTORE_REQUIRED  (true | audit | <unset>)
+//   * TALOS_SIGSTORE_IDENTITY_REGEXP
+//   * TALOS_SIGSTORE_OIDC_ISSUER (default: GitHub Actions OIDC)
+// ───────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SigstorePolicy {
+    Disabled,
+    Audit,
+    Required,
+}
+
+impl SigstorePolicy {
+    fn from_env() -> Self {
+        match env::var("TALOS_SIGSTORE_REQUIRED")
+            .unwrap_or_default()
+            .as_str()
+        {
+            "true" | "1" | "required" => Self::Required,
+            "audit" | "warn" => Self::Audit,
+            _ => Self::Disabled,
+        }
+    }
+}
+
+/// Verify an OCI artifact's Sigstore signature via the `cosign` binary.
+/// Pure-argv wrapper around `cosign verify --certificate-identity-regexp
+/// <REGEXP> --certificate-oidc-issuer <ISSUER>` — the same shape used by
+/// the worker. Returns `Ok(())` on a clean verification; the caller
+/// chooses how to react to `Err(...)` based on policy.
+async fn cosign_verify_artifact(
+    reference: &str,
+    identity_regexp: &str,
+    oidc_issuer: &str,
+) -> std::result::Result<(), String> {
+    let output = tokio::process::Command::new("cosign")
+        .args([
+            "verify",
+            "--certificate-identity-regexp",
+            identity_regexp,
+            "--certificate-oidc-issuer",
+            oidc_issuer,
+            "--output",
+            "json",
+            reference,
+        ])
+        .output()
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "cosign binary not found or unexecutable — install cosign in the controller image"
+            );
+            "cosign_unavailable".to_string()
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    tracing::warn!(
+        reference = %reference,
+        exit_code = output.status.code().unwrap_or(-1),
+        stderr = %stderr,
+        "cosign verify failed (controller-side index/template sync)"
+    );
+    Err("signature_verification_failed".to_string())
+}
+
+/// Verify an OCI artifact against the configured Sigstore policy.
+/// Returns:
+///   * `Ok(true)`  — verification passed (or policy is Disabled).
+///   * `Ok(false)` — Audit-mode failure: the caller MAY proceed but
+///                   should log + meter; the artifact is unattested.
+///   * `Err(...)`  — Required-mode failure OR misconfiguration that
+///                   the caller must surface as a sync error.
+///
+/// Mirrors the worker's verdict structure so the contract is uniform
+/// across both processes. The identity regexp is checked for the
+/// known catch-all foot-guns (`.*`, `.+`, etc.) so an operator who
+/// sets `TALOS_SIGSTORE_REQUIRED=true` with a permissive pattern
+/// discovers it HERE rather than per-pull.
+async fn verify_oci_artifact_signature(reference: &Reference) -> Result<bool> {
+    let policy = SigstorePolicy::from_env();
+    if policy == SigstorePolicy::Disabled {
+        return Ok(true);
+    }
+    let identity_regexp = env::var("TALOS_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
+    if identity_regexp.is_empty() {
+        let msg = "TALOS_SIGSTORE_IDENTITY_REGEXP is empty — \
+                   refusing to verify with no identity pin";
+        match policy {
+            SigstorePolicy::Required => anyhow::bail!("{msg} (Required policy)"),
+            SigstorePolicy::Audit => {
+                tracing::warn!("{msg} (Audit mode: continuing without verification)");
+                return Ok(false);
+            }
+            SigstorePolicy::Disabled => unreachable!(),
+        }
+    }
+    // Reject obvious catch-alls so the operator can't silently neuter
+    // the gate via env. Pure substring match against known patterns —
+    // a defense-in-depth check on top of the worker-side startup
+    // validation. Sibling of `validate_sigstore_identity_regexp` in
+    // worker/src/main.rs; the canonical home is the worker's helper
+    // (the controller never invokes `cosign verify` from anywhere
+    // else, so duplicating the short matcher here is cheaper than
+    // adding a shared `talos-sigstore-policy` crate for one function).
+    let trimmed = identity_regexp.trim();
+    if matches!(
+        trimmed,
+        ".*" | ".+" | "." | "^.*$" | "^.+$" | "^.$" | "^.*" | ".*$"
+    ) {
+        let msg = format!(
+            "TALOS_SIGSTORE_IDENTITY_REGEXP is too broad (`{trimmed}`) — \
+             pin it to your workflow URL pattern"
+        );
+        match policy {
+            SigstorePolicy::Required => anyhow::bail!("{msg} (Required policy)"),
+            SigstorePolicy::Audit => {
+                tracing::warn!("{msg} (Audit mode: continuing without verification)");
+                return Ok(false);
+            }
+            SigstorePolicy::Disabled => unreachable!(),
+        }
+    }
+    let oidc_issuer = env::var("TALOS_SIGSTORE_OIDC_ISSUER")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://token.actions.githubusercontent.com".to_string());
+    let reference_str = reference.to_string();
+    match cosign_verify_artifact(&reference_str, &identity_regexp, &oidc_issuer).await {
+        Ok(()) => {
+            tracing::debug!(
+                reference = %reference_str,
+                "Sigstore verification passed for OCI artifact"
+            );
+            Ok(true)
+        }
+        Err(reason) => match policy {
+            SigstorePolicy::Required => anyhow::bail!(
+                "Sigstore verification failed for {reference_str}: {reason}"
+            ),
+            SigstorePolicy::Audit => {
+                tracing::warn!(
+                    reference = %reference_str,
+                    reason = %reason,
+                    "Sigstore verification failed in Audit mode — artifact unattested"
+                );
+                Ok(false)
+            }
+            SigstorePolicy::Disabled => unreachable!(),
+        },
+    }
+}
+
 use super::ModuleRegistry;
 
 /// Default namespace within the registry where templates live, e.g.
@@ -262,6 +429,20 @@ async fn try_pull_index(
         .parse()
         .context("Construct index Reference")?;
 
+    // H2: verify the index artifact's Sigstore signature BEFORE
+    // parsing the config blob. A tampered or MITM'd index could
+    // inject malicious template entries (pointing at attacker-
+    // controlled image refs); without the signature gate, those
+    // entries get persisted to the modules table and become the
+    // discovery surface for every operator workflow. The
+    // per-template `sync_template` call below ALSO verifies, so
+    // this is two layers of attestation: the index itself, and the
+    // individual artifacts it advertises. Failures under Audit
+    // policy are logged but allowed to proceed (migration window).
+    let _index_attested = verify_oci_artifact_signature(&reference)
+        .await
+        .with_context(|| format!("Sigstore verify _index artifact {reference}"))?;
+
     match oci.pull_manifest_and_config(&reference, auth).await {
         Ok((_manifest, config_str, _config_digest)) => {
             let parsed: IndexConfig = serde_json::from_str(&config_str)
@@ -463,6 +644,17 @@ async fn sync_template(
     let reference: Reference = format!("{repo}:{}", entry.tag)
         .parse()
         .with_context(|| format!("Construct Reference for {repo}:{}", entry.tag))?;
+
+    // H2: verify each per-template artifact's Sigstore signature
+    // BEFORE pulling and persisting its config blob. Catalog sync
+    // can't trust the index alone — each individual artifact is a
+    // separate attestation. Required policy fails the whole
+    // template sync; Audit policy logs and continues (the worker
+    // still re-verifies at execution time, so Audit is a real
+    // migration window).
+    let _template_attested = verify_oci_artifact_signature(&reference)
+        .await
+        .with_context(|| format!("Sigstore verify template artifact {reference}"))?;
 
     let (_manifest, config_str, _config_digest) = oci
         .pull_manifest_and_config(&reference, auth)

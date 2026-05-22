@@ -528,7 +528,7 @@ fn classify_private_ipv4(addr: std::net::Ipv4Addr) -> Option<&'static str> {
 ///
 /// IPv4-mapped IPv6 (`::ffff:A.B.C.D`) is canonicalized first so a guest
 /// can't bypass IPv4 rules by spelling them in IPv6.
-fn classify_private_ip(ip: std::net::IpAddr) -> Option<&'static str> {
+pub(crate) fn classify_private_ip(ip: std::net::IpAddr) -> Option<&'static str> {
     match ip {
         std::net::IpAddr::V4(addr) => classify_private_ipv4(addr),
         std::net::IpAddr::V6(addr) => {

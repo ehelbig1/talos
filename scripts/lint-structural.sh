@@ -1085,6 +1085,67 @@ else
 fi
 echo
 
+# ── 16: WIT contract drift between host and templates ──────────────
+bold "▶ check 16: wit/talos.wit ↔ module-templates/wit/talos.wit drift"
+
+# L3 (2026-05-22): the worker's authoritative WIT lives in
+# `wit/talos.wit`; module-templates carry a copy at
+# `module-templates/wit/talos.wit` so the compilation pipeline can
+# bake the right bindings into each template's workspace. If the two
+# diverge — e.g. a host fn is added or signature-changed in the
+# authoritative file but the templates copy is missed — every
+# template compilation produces a binary that fails at the worker's
+# linker because the imported world doesn't match the host's
+# exposed shape.
+#
+# The runtime failure is loud (instantiation panics with a
+# "missing import" or "type mismatch" error) but only fires at
+# execution time. Catching the drift at PR time saves an entire
+# build-deploy-fail cycle.
+#
+# This lint runs a byte-for-byte diff. Operators who legitimately
+# want the two files to differ (e.g. mid-migration where the
+# templates copy lags by one WIT version) can add a literal
+# `# allow-wit-drift: <reason>` comment to EITHER file's header
+# (within first 20 lines).
+HOST_WIT="$ROOT/wit/talos.wit"
+TEMPLATES_WIT="$ROOT/module-templates/wit/talos.wit"
+if [ -f "$HOST_WIT" ] && [ -f "$TEMPLATES_WIT" ]; then
+    # Opt-out check first
+    if head -20 "$HOST_WIT" 2>/dev/null | grep -q 'allow-wit-drift' \
+       || head -20 "$TEMPLATES_WIT" 2>/dev/null | grep -q 'allow-wit-drift'; then
+        yellow "⊘ WIT drift check bypassed by allow-wit-drift marker"
+    elif ! diff -q "$HOST_WIT" "$TEMPLATES_WIT" >/dev/null 2>&1; then
+        red "✗ wit/talos.wit and module-templates/wit/talos.wit differ"
+        yellow "  → these files MUST match byte-for-byte. The host file"
+        yellow "    (wit/talos.wit) is authoritative; the templates copy"
+        yellow "    (module-templates/wit/talos.wit) is what each template"
+        yellow "    workspace gets at compile time. Divergence means every"
+        yellow "    template compiled here will fail at worker instantiation"
+        yellow "    with 'missing import' or 'type mismatch'."
+        yellow ""
+        yellow "  → fix by copying the authoritative file:"
+        yellow "    cp wit/talos.wit module-templates/wit/talos.wit"
+        yellow ""
+        yellow "  → opt-out: add '# allow-wit-drift: <reason>' to either"
+        yellow "    file's first 20 lines during a planned migration."
+        yellow ""
+        yellow "  diff (first 30 lines):"
+        diff "$HOST_WIT" "$TEMPLATES_WIT" 2>/dev/null | head -30 | sed 's/^/    /'
+        EXIT_CODE=1
+    else
+        green "✓ wit/talos.wit ↔ module-templates/wit/talos.wit are in sync"
+    fi
+else
+    if [ ! -f "$HOST_WIT" ]; then
+        yellow "⚠ $HOST_WIT not found — skipping WIT-drift check"
+    fi
+    if [ ! -f "$TEMPLATES_WIT" ]; then
+        yellow "⚠ $TEMPLATES_WIT not found — skipping WIT-drift check"
+    fi
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"

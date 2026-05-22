@@ -43,6 +43,7 @@ mod metrics_server;
 mod runtime;
 mod s3_signer;
 mod sql_validator;
+mod ssrf_resolver;
 mod trace_nats;
 mod tracing;
 mod wit_inspector;
@@ -319,6 +320,63 @@ pub(crate) async fn verify_oci_signature(
         "cosign verify failed"
     );
     Err("signature_verification_failed".to_string())
+}
+
+/// Parse a `MAJOR.MINOR.PATCH` semver triple out of an arbitrary string.
+/// Pure function so the M5 cosign-version-pin policy is unit-testable.
+/// Returns `None` when no dotted triple of integers is found. The first
+/// triple encountered wins — cosign's `version` output puts the binary's
+/// own version on a line preceded by `GitVersion:` or the bare semver,
+/// and we don't want to over-fit on the exact format because it has
+/// shifted across cosign releases.
+pub(crate) fn parse_cosign_version(stdout: &str) -> Option<(u32, u32, u32)> {
+    // Scan for any token shaped like `vX.Y.Z` or `X.Y.Z` (with an
+    // optional `-suffix` we ignore).
+    for token in stdout.split(|c: char| !c.is_ascii_digit() && c != '.') {
+        if let Some(triple) = parse_semver_triple(token) {
+            return Some(triple);
+        }
+    }
+    None
+}
+
+/// Parse a strict `MAJOR.MINOR.PATCH` triple. Pure; companion to
+/// `parse_cosign_version`.
+pub(crate) fn parse_semver_triple(s: &str) -> Option<(u32, u32, u32)> {
+    let trimmed = s.trim().trim_start_matches('v');
+    let mut parts = trimmed.split('.');
+    let maj: u32 = parts.next()?.parse().ok()?;
+    let min: u32 = parts.next()?.parse().ok()?;
+    // PATCH may carry a `-suffix`; truncate at the first non-digit.
+    let patch_raw = parts.next()?;
+    let patch_str: String = patch_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if patch_str.is_empty() {
+        return None;
+    }
+    let patch: u32 = patch_str.parse().ok()?;
+    Some((maj, min, patch))
+}
+
+/// Resolve the `cosign` binary on PATH and compute its SHA-256. Used by
+/// the M5 startup `TALOS_COSIGN_SHA256` pin to detect a swapped binary.
+async fn resolve_and_hash_cosign_binary() -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("which")
+        .arg("cosign")
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to invoke `which cosign`: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!("`which cosign` exited non-zero — binary not on PATH");
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        anyhow::bail!("`which cosign` produced empty output");
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read cosign at {path}: {e}"))?;
+    use sha2::Digest as _;
+    Ok(format!("{:x}", sha2::Sha256::digest(&bytes)))
 }
 
 /// Decision returned by `verify_oci_layer` — small enum to make the security-
@@ -1047,43 +1105,21 @@ async fn execute_job(
             image_ref = image_ref.replace("localhost:5001", "registry:5000");
         }
 
-        // First check Redis for cached OCI artifact
-        let mut found_bytes = None;
-        let redis_key = format!("oci_cache:{}", &req.module_uri);
-        if let Some(redis_client) = runtime.redis_client() {
-            if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
-                if let Ok(Some(b)) = redis::cmd("GET")
-                    .arg(&redis_key)
-                    .query_async::<Option<Vec<u8>>>(&mut conn)
-                    .await
-                {
-                    // H-3: re-apply the size cap on cache hits too — a
-                    // poisoned Redis (or a cache populated under a
-                    // higher cap that has since been lowered) must not
-                    // bypass the host-side OOM defense.
-                    let layer_cap = max_oci_layer_bytes();
-                    if (b.len() as u64) > layer_cap {
-                        ::tracing::error!(
-                            module_uri = %req.module_uri,
-                            cached_size = b.len(),
-                            cap_bytes = layer_cap,
-                            "Redis OCI cache hit exceeds layer cap — discarding cache entry, will refetch from registry"
-                        );
-                        // Evict the oversized entry so the next pull
-                        // doesn't keep hitting it. Best-effort; failure
-                        // to delete is logged but doesn't block.
-                        let _: Result<(), _> = redis::cmd("DEL")
-                            .arg(&redis_key)
-                            .query_async::<()>(&mut conn)
-                            .await;
-                    } else {
-                        _span.add_event("oci_cache_hit");
-                        _span.set_attribute("module_source", "redis_oci_cache");
-                        found_bytes = Some(b);
-                    }
-                }
-            }
-        }
+        // H1 (2026-05-22): cache lookup is digest-keyed, not URI-keyed.
+        // Pre-fix the cache used `oci_cache:{module_uri}` which, for
+        // mutable tags like `…:latest`, served whatever bytes the
+        // previous pull stored — even if the registry had since
+        // repointed the tag to different bytes. With the digest in the
+        // key, a tag repoint produces a fresh cache entry under the
+        // new digest; the old entry expires naturally on its TTL.
+        //
+        // The lookup itself is deferred until AFTER we've fetched the
+        // manifest below — only then do we know the canonical layer
+        // digest for THIS tag at THIS moment. Manifest fetch is small
+        // (a few KB of JSON, no decompression); for high-throughput
+        // workloads this adds one round-trip per execution but
+        // eliminates the cache-poisoning window.
+        let mut found_bytes: Option<Vec<u8>> = None;
 
         use oci_distribution::secrets::RegistryAuth;
         use oci_distribution::Reference;
@@ -1317,13 +1353,19 @@ async fn execute_job(
             // and OOMs the worker before any of our integrity checks
             // (Sigstore, layer-digest, hash) run.
             //
-            // The check uses `pull_manifest` which does a separate HTTP
-            // round-trip. On cold-cache misses this adds ~50–200 ms;
-            // on warm-cache hits we skip the whole OCI path entirely
-            // so the latency is bounded to first-pull-per-module.
+            // H1 (2026-05-22): the manifest fetch also tells us the
+            // canonical LAYER digest for this tag at this moment. We
+            // use that digest to key the Redis cache so a tag-repoint
+            // produces a fresh cache entry under the new digest. The
+            // manifest fetch is small (a few KB of JSON, no
+            // decompression); for high-throughput workloads this adds
+            // one round-trip per execution but eliminates the
+            // cache-poisoning window that existed when the cache was
+            // URI-keyed.
             let layer_cap = max_oci_layer_bytes();
+            let mut expected_layer_digest: Option<String> = None;
             match client.pull_manifest(&reference, &auth).await {
-                Ok((manifest, _digest)) => {
+                Ok((manifest, _manifest_digest)) => {
                     // `pull_manifest` returns either an Image manifest
                     // (single-arch artifact, has `.layers`) or an
                     // ImageIndex (multi-arch fan-out, has `.manifests`).
@@ -1332,12 +1374,17 @@ async fn execute_job(
                     // multi-arch image list which we don't currently
                     // support. Match both shapes — ImageIndex falls
                     // through to `pull()` which handles it (or errors).
-                    let declared_sizes: Vec<i64> = match &manifest {
+                    let (declared_sizes, layer_digest) = match &manifest {
                         oci_distribution::manifest::OciManifest::Image(img) => {
-                            img.layers.iter().map(|d| d.size).collect()
+                            let sizes: Vec<i64> = img.layers.iter().map(|d| d.size).collect();
+                            let digest = img.layers.first().map(|d| d.digest.clone());
+                            (sizes, digest)
                         }
-                        oci_distribution::manifest::OciManifest::ImageIndex(_) => Vec::new(),
+                        oci_distribution::manifest::OciManifest::ImageIndex(_) => {
+                            (Vec::new(), None)
+                        }
                     };
+                    expected_layer_digest = layer_digest;
                     if let ManifestSizeVerdict::Oversized { declared, cap } =
                         check_manifest_layer_sizes(&declared_sizes, layer_cap)
                     {
@@ -1368,6 +1415,11 @@ async fn execute_job(
                     // and let it report the real error (could be auth,
                     // not-found, etc.). The defense-in-depth `data.len()`
                     // check below still guards against the actual OOM.
+                    // Note: without a manifest fetch we have no
+                    // canonical layer digest, so the cache lookup
+                    // below is a no-op and the M2 hardening
+                    // (`refuse_unverified_oci_manifests`) will refuse
+                    // the pull bytes too unless explicitly opted in.
                     ::tracing::debug!(
                         module_uri = %req.module_uri,
                         error = %e,
@@ -1376,6 +1428,88 @@ async fn execute_job(
                 }
             }
 
+            // H1: digest-keyed cache lookup. Only runs when we
+            // successfully resolved a layer digest from the manifest
+            // above — otherwise there's nothing safe to key off.
+            //
+            // Cache hit re-verifies the cached bytes against the
+            // expected digest before serving (defense in depth against
+            // a Redis-write attacker). The cache is ONLY written below
+            // after both sigstore + digest checks pass in this run, so
+            // a hit implies prior attestation; we mark
+            // `bytes_attested_in_this_run` accordingly so the
+            // downstream `expected_wasm_hash` fallback doesn't kick in
+            // and re-fail for cached-but-no-hash-provided jobs.
+            let redis_key = match &expected_layer_digest {
+                Some(d) => Some(format!("oci_cache:{}", d)),
+                None => None,
+            };
+            if let (Some(digest), Some(key)) = (&expected_layer_digest, &redis_key) {
+                if let Some(redis_client) = runtime.redis_client() {
+                    if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
+                        if let Ok(Some(b)) = redis::cmd("GET")
+                            .arg(key)
+                            .query_async::<Option<Vec<u8>>>(&mut conn)
+                            .await
+                        {
+                            if (b.len() as u64) > layer_cap {
+                                ::tracing::error!(
+                                    module_uri = %req.module_uri,
+                                    cached_size = b.len(),
+                                    cap_bytes = layer_cap,
+                                    "Redis OCI cache hit exceeds layer cap — discarding cache entry, will refetch from registry"
+                                );
+                                let _: Result<(), _> = redis::cmd("DEL")
+                                    .arg(key)
+                                    .query_async::<()>(&mut conn)
+                                    .await;
+                            } else {
+                                // Re-verify cached bytes against the
+                                // declared digest. A Redis-write
+                                // attacker who replaced the value but
+                                // not the key would fail here.
+                                match verify_oci_layer(&b, Some(digest.as_str())) {
+                                    LayerVerdict::Verified { .. } => {
+                                        _span.add_event("oci_cache_hit");
+                                        _span.set_attribute("module_source", "redis_oci_cache");
+                                        bytes_attested_in_this_run = true;
+                                        found_bytes = Some(b);
+                                    }
+                                    LayerVerdict::DigestMismatch { expected, computed } => {
+                                        ::tracing::error!(
+                                            module_uri = %req.module_uri,
+                                            expected = %expected,
+                                            computed = %computed,
+                                            "Redis OCI cache hit failed digest re-verification — evicting and refetching"
+                                        );
+                                        let _: Result<(), _> = redis::cmd("DEL")
+                                            .arg(key)
+                                            .query_async::<()>(&mut conn)
+                                            .await;
+                                    }
+                                    LayerVerdict::AcceptedUnverified => {
+                                        // Unreachable: we passed
+                                        // Some(digest) above so the
+                                        // None arm doesn't fire. Belt-
+                                        // and-braces: evict to force a
+                                        // fresh pull rather than serving
+                                        // unverified bytes.
+                                        let _: Result<(), _> = redis::cmd("DEL")
+                                            .arg(key)
+                                            .query_async::<()>(&mut conn)
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Only do the full layer pull on cache miss. The pull is
+            // the expensive part (network + decompression); on cache
+            // hit we already have validated bytes and skip it.
+            if found_bytes.is_none() {
             match client.pull(&reference, &auth, accepted_media_types).await {
                 Ok(image) => {
                     // The WASM binary is typically the first layer in a Wasm OCI artifact.
@@ -1418,23 +1552,33 @@ async fn execute_job(
                                 result_nonce: String::new(),
                             };
                         }
-                        let manifest_digest = image
+                        // H1: prefer the digest we already learned from
+                        // the pre-pull manifest fetch (`expected_layer_digest`,
+                        // captured in the outer scope). Falling back to the
+                        // pull-response's `image.manifest.layers[0].digest`
+                        // covers the (rare) path where the pre-fetch failed
+                        // but the full pull succeeded; both shapes flow
+                        // through the same `verify_oci_layer` check.
+                        let pull_response_digest = image
                             .manifest
                             .as_ref()
                             .and_then(|m| m.layers.first())
-                            .map(|d| d.digest.as_str());
-                        match verify_oci_layer(&layer.data, manifest_digest) {
+                            .map(|d| d.digest.clone());
+                        let effective_digest = expected_layer_digest
+                            .clone()
+                            .or(pull_response_digest);
+                        match verify_oci_layer(&layer.data, effective_digest.as_deref()) {
                             LayerVerdict::Verified { digest } => {
                                 _span.set_attribute("oci_layer_digest", digest);
                                 _span.add_event("oci_pull_success");
 
-                                // Populate the Redis cache so the next pull of this
-                                // exact module_uri short-circuits the registry round-trip.
-                                // TTL bounds growth — without it, cache size scales
-                                // monotonically with distinct module_uris ever seen,
-                                // which becomes a leak on registries with many tags.
-                                // Tag-based URIs (mutable) refresh daily; digest-based
-                                // URIs (immutable) just re-cache the same bytes.
+                                // Populate the Redis cache so the next pull of
+                                // this layer-digest short-circuits the registry
+                                // round-trip. TTL bounds growth — without it,
+                                // cache size scales monotonically with distinct
+                                // digests ever seen. Tag repoints produce new
+                                // digests and new cache entries; old entries
+                                // expire on their own TTL.
                                 //
                                 // SECURITY: only cache when both layers
                                 // of attestation passed in THIS pull —
@@ -1451,18 +1595,27 @@ async fn execute_job(
                                 // jobs while still honouring the
                                 // operator-chosen Audit-mode intent
                                 // for THIS execution.
+                                //
+                                // The cache write only happens when we
+                                // actually have a digest-keyed `redis_key`
+                                // (set above). Without one, there's no
+                                // canonical key for future re-verification —
+                                // skipping the write is correct.
                                 if sigstore_pass_in_this_run {
-                                    if let Some(redis_client) = runtime.redis_client() {
-                                        if let Ok(mut conn) =
-                                            redis_client.get_multiplexed_async_connection().await
-                                        {
-                                            let _: Result<(), _> = redis::cmd("SET")
-                                                .arg(&redis_key)
-                                                .arg(&layer.data)
-                                                .arg("EX")
-                                                .arg(OCI_CACHE_TTL_SECS)
-                                                .query_async(&mut conn)
-                                                .await;
+                                    if let Some(key) = redis_key.as_deref() {
+                                        if let Some(redis_client) = runtime.redis_client() {
+                                            if let Ok(mut conn) = redis_client
+                                                .get_multiplexed_async_connection()
+                                                .await
+                                            {
+                                                let _: Result<(), _> = redis::cmd("SET")
+                                                    .arg(key)
+                                                    .arg(&layer.data)
+                                                    .arg("EX")
+                                                    .arg(OCI_CACHE_TTL_SECS)
+                                                    .query_async(&mut conn)
+                                                    .await;
+                                            }
                                         }
                                     }
                                 } else {
@@ -1503,13 +1656,59 @@ async fn execute_job(
                                 };
                             }
                             LayerVerdict::AcceptedUnverified => {
-                                ::tracing::warn!(
-                                    module_uri = %req.module_uri,
-                                    "OCI manifest had no layer descriptor — accepting bytes \
-                                     unverified (registry returned a malformed manifest)"
-                                );
-                                _span.add_event("oci_pull_success_unverified");
-                                found_bytes = Some(layer.data);
+                                // M2 (2026-05-22): refuse to execute
+                                // bytes that lack a manifest layer
+                                // descriptor by default. Previously
+                                // accepted with a WARN; that meant a
+                                // compromised registry could serve a
+                                // malformed manifest with arbitrary
+                                // bytes and the worker would run them
+                                // (the sigstore + size caps still
+                                // ran, but no content-addressable
+                                // attestation tied the bytes to the
+                                // registry's claim about them).
+                                //
+                                // Operators with legacy registries
+                                // that genuinely produce manifests
+                                // without layer descriptors can set
+                                // `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1`
+                                // to restore the old behaviour, at the
+                                // cost of accepting unverified bytes.
+                                if std::env::var("TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS")
+                                    .ok()
+                                    .as_deref()
+                                    == Some("1")
+                                {
+                                    ::tracing::warn!(
+                                        module_uri = %req.module_uri,
+                                        "OCI manifest had no layer descriptor — \
+                                         accepting bytes unverified \
+                                         (TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1)"
+                                    );
+                                    _span.add_event("oci_pull_success_unverified");
+                                    found_bytes = Some(layer.data);
+                                } else {
+                                    let err = "oci_manifest_missing_layer_descriptor: \
+                                               registry returned a manifest with no \
+                                               layer digest — refusing to execute. Set \
+                                               TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
+                                               to allow legacy registries.";
+                                    ::tracing::error!(
+                                        module_uri = %req.module_uri,
+                                        "OCI manifest had no layer descriptor — \
+                                         refusing to execute (M2 hardening)"
+                                    );
+                                    _span.end_error(err);
+                                    return JobResult {
+                                        job_id: req.job_id,
+                                        status: JobStatus::Failed,
+                                        output_payload: serde_json::json!({"error": err}),
+                                        logs: vec![],
+                                        execution_time_ms: start.elapsed().as_millis() as u64,
+                                        signature: vec![],
+                                        result_nonce: String::new(),
+                                    };
+                                }
                             }
                         }
                     }
@@ -1521,6 +1720,7 @@ async fn execute_job(
                     _span.add_event(&sanitized_error);
                 }
             }
+            } // end `if found_bytes.is_none()` cache-miss block
         }
 
         match found_bytes {
@@ -2114,11 +2314,128 @@ async fn main() -> anyhow::Result<()> {
                 .await
             {
                 Ok(out) if out.status.success() => {
-                    let version_line = String::from_utf8_lossy(&out.stdout)
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let version_line = stdout
                         .lines()
                         .next()
                         .unwrap_or("(unknown)")
                         .to_string();
+
+                    // M5 (2026-05-22): version-pin cosign so a swapped-in
+                    // older binary (predating critical CVE fixes) or a
+                    // replaced binary doesn't silently pass through.
+                    // `TALOS_COSIGN_MIN_VERSION` is the minimum
+                    // semver-ish version accepted; default `2.0.0`
+                    // matches the cosign 2.x line which is the
+                    // long-supported branch with hardened defaults.
+                    //
+                    // Parse rule: pull the first dotted `X.Y.Z` token
+                    // out of stdout (cosign output format has shifted
+                    // across versions; the version triple is the only
+                    // stable shape). Fail-closed in Required mode if
+                    // we can't parse anything; warn-and-continue under
+                    // Audit. This is operator-tunable via the env so
+                    // a future cosign 3.x bump doesn't require code
+                    // changes.
+                    let min_version = std::env::var("TALOS_COSIGN_MIN_VERSION")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "2.0.0".to_string());
+                    match parse_cosign_version(&stdout) {
+                        Some((maj, min, patch)) => {
+                            let parsed_observed = (maj, min, patch);
+                            let parsed_min = parse_semver_triple(&min_version)
+                                .unwrap_or((2, 0, 0));
+                            if parsed_observed < parsed_min {
+                                let msg = format!(
+                                    "cosign version {}.{}.{} is below required minimum {} \
+                                     (set TALOS_COSIGN_MIN_VERSION to override)",
+                                    parsed_observed.0,
+                                    parsed_observed.1,
+                                    parsed_observed.2,
+                                    min_version,
+                                );
+                                if sigstore_policy == SigstorePolicy::Required {
+                                    return Err(anyhow::anyhow!(
+                                        "Sigstore startup sanity check failed: {msg}"
+                                    ));
+                                }
+                                ::tracing::warn!(
+                                    cosign_version = %version_line,
+                                    min_version = %min_version,
+                                    "{msg} (Audit mode: continuing)"
+                                );
+                            }
+                        }
+                        None => {
+                            if sigstore_policy == SigstorePolicy::Required {
+                                return Err(anyhow::anyhow!(
+                                    "Could not parse cosign version from stdout: {version_line:?}. \
+                                     Required policy refuses to boot without a verified version pin."
+                                ));
+                            }
+                            ::tracing::warn!(
+                                stdout = %stdout,
+                                "Could not parse cosign version — version-pin check skipped (Audit mode)"
+                            );
+                        }
+                    }
+
+                    // M5 part B: optional SHA-256 pin of the cosign
+                    // binary itself. When set, the worker hashes the
+                    // resolved cosign executable and refuses to boot
+                    // if the hash doesn't match. This closes the
+                    // "swap cosign with a wrapper that always exits 0"
+                    // attack path. Most operators won't set this;
+                    // sigstore-enforcement clusters that want defense
+                    // in depth absolutely should.
+                    if let Some(expected_sha256) = std::env::var("TALOS_COSIGN_SHA256")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                    {
+                        match resolve_and_hash_cosign_binary().await {
+                            Ok(actual) => {
+                                use subtle::ConstantTimeEq as _;
+                                let actual_lower = actual.to_lowercase();
+                                let expected_lower = expected_sha256.trim().to_lowercase();
+                                let eq: bool = actual_lower
+                                    .as_bytes()
+                                    .ct_eq(expected_lower.as_bytes())
+                                    .into();
+                                if !eq {
+                                    if sigstore_policy == SigstorePolicy::Required {
+                                        return Err(anyhow::anyhow!(
+                                            "cosign binary sha256 mismatch: expected {expected_lower}, \
+                                             got {actual_lower}. Required policy refuses to boot."
+                                        ));
+                                    }
+                                    ::tracing::warn!(
+                                        expected = %expected_lower,
+                                        actual = %actual_lower,
+                                        "cosign binary sha256 mismatch (Audit mode: continuing)"
+                                    );
+                                } else {
+                                    ::tracing::info!(
+                                        sha256 = %actual_lower,
+                                        "cosign binary sha256 pin verified"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if sigstore_policy == SigstorePolicy::Required {
+                                    return Err(anyhow::anyhow!(
+                                        "Could not hash cosign binary for SHA-256 pin: {e}. \
+                                         Required policy refuses to boot."
+                                    ));
+                                }
+                                ::tracing::warn!(
+                                    error = %e,
+                                    "Could not hash cosign binary — sha256 pin check skipped (Audit mode)"
+                                );
+                            }
+                        }
+                    }
+
                     ::tracing::info!(
                         cosign_version = %version_line,
                         policy = ?sigstore_policy,
@@ -2446,6 +2763,19 @@ async fn main() -> anyhow::Result<()> {
         None,                       // No file system sandbox for now
     )?);
     println!("      Runtime created with NATS logging enabled (worker is credential-free; database access via NATS-RPC)");
+
+    // M1 (2026-05-22): start the epoch-interruption ticker. Wasmtime
+    // checks the engine's epoch counter at every loop backedge and
+    // function entry; without a ticker the counter never advances and
+    // the per-Store `set_epoch_deadline(N)` calls below would either
+    // (a) never trip (deadline always in the future) or (b) trip at
+    // the first yield (deadline == current epoch == 0). The ticker
+    // gives the worker a third independent kill switch alongside fuel
+    // + tokio wall-clock timeout. Cheap (one atomic increment per
+    // EPOCH_TICK_INTERVAL_MS) and the JoinHandle is dropped so the
+    // task runs for the lifetime of the process.
+    let _epoch_ticker_handle = crate::runtime::spawn_epoch_ticker(runtime.engine_handle());
+    println!("      Epoch-interruption ticker started (third kill switch alongside fuel + wall-clock timeout)");
 
     // ========================================================================
     // METRICS SERVER

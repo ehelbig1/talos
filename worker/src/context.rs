@@ -484,7 +484,76 @@ impl TalosContext {
             buffer: stderr_capture.clone(),
         });
 
-        builder.preopened_dir(ephemeral_dir.path(), "/", DirPerms::all(), FilePerms::all())?;
+        // L1 (2026-05-22): gate the filesystem preopen by capability world.
+        //
+        // Pre-fix: every WASM execution got a preopened `/` with
+        // DirPerms::all() + FilePerms::all(), regardless of whether the
+        // module's declared capability world actually included
+        // filesystem access. The blast radius was bounded to the
+        // ephemeral per-instance tempdir, but defense-in-depth says
+        // worlds without filesystem capability should not have ANY
+        // file handle available — the WASI preopen surface is itself
+        // attack surface (path-resolution bugs, symlink-following
+        // tricks against cap-std, etc.).
+        //
+        // Three tiers of preopen:
+        //   * Filesystem / Trusted (Automation) — full read/write,
+        //     matches the linker-tier design. Modules in these worlds
+        //     genuinely need filesystem access for their host fns.
+        //   * Database / Agent — read-only preopen so std::fs::read
+        //     of operator-mounted lookup tables works, but no writes.
+        //     The `files-node` write surface is NOT linked in for
+        //     these worlds anyway; read-only is the right ceiling.
+        //   * Everything else (Minimal/Http/Network/Secrets/Messaging/
+        //     Cache/Governance/Unknown) — NO preopen. Guest std::fs
+        //     calls fail with "Capability denied".
+        //
+        // Defense-in-depth fact-check: the `files-node` host functions
+        // (read/write/delete/list_dir) are linked ONLY in the
+        // Filesystem and Trusted tiers (see `build_filesystem_linker`,
+        // `build_trusted_linker`). So a minimal-node module that
+        // somehow imports `talos:core/files` already fails to link.
+        // This L1 fix closes the lower-level surface — raw WASI
+        // file-syscalls via the preopen.
+        use crate::wit_inspector::CapabilityWorld;
+        match capability_world {
+            CapabilityWorld::Filesystem | CapabilityWorld::Trusted => {
+                builder.preopened_dir(
+                    ephemeral_dir.path(),
+                    "/",
+                    DirPerms::all(),
+                    FilePerms::all(),
+                )?;
+            }
+            CapabilityWorld::Database | CapabilityWorld::Agent => {
+                // Read-only: these worlds may legitimately read
+                // operator-mounted config files but never need to
+                // write into the per-execution tempdir.
+                builder.preopened_dir(
+                    ephemeral_dir.path(),
+                    "/",
+                    DirPerms::READ,
+                    FilePerms::READ,
+                )?;
+            }
+            // Worlds without any filesystem capability: no preopen.
+            // Guest `std::fs::*` calls return "Capability denied".
+            CapabilityWorld::Minimal
+            | CapabilityWorld::Http
+            | CapabilityWorld::Network
+            | CapabilityWorld::Secrets
+            | CapabilityWorld::Messaging
+            | CapabilityWorld::Cache
+            | CapabilityWorld::Governance
+            | CapabilityWorld::Unknown => {
+                // No preopened directory. The `files` host functions
+                // are also unlinked for these worlds (see
+                // `build_*_linker` in runtime.rs) so the only
+                // filesystem surface a guest can attempt is via raw
+                // WASI syscalls — which now error out at the
+                // capability boundary.
+            }
+        }
 
         // Network access for wasi:sockets (WASIP2) — only granted when the
         // component's capability world includes outbound network I/O.
@@ -698,6 +767,22 @@ impl TalosContext {
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .redirect(reqwest::redirect::Policy::none())
                 .pool_max_idle_per_host(10)
+                // M4 (2026-05-22): SSRF-aware DNS resolver. Re-applies
+                // `classify_private_ip` to every address the OS
+                // resolver returns BEFORE reqwest connects, closing
+                // the TOCTOU window between the per-call DNS check
+                // (`validate_no_dns_rebinding` / inline checks) and
+                // reqwest's own internal resolve+connect step.
+                // Without this, an attacker controlling DNS for an
+                // allowlisted hostname could return a public IP at
+                // pre-validation and a private IP at the connect
+                // step, slipping past the deny-list. The pre-call
+                // check stays in place — it provides the audit-log
+                // signal — but the resolver-side check is the
+                // correctness gate.
+                .dns_resolver(std::sync::Arc::new(
+                    crate::ssrf_resolver::SsrfFilteringResolver,
+                ))
                 .build()
                 .expect("worker: failed to build hardened reqwest client with no-redirect policy"),
             // MCP-937 (2026-05-15): filter empty-string env values so a

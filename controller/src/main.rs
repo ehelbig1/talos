@@ -3220,6 +3220,7 @@ async fn main() -> anyhow::Result<()> {
         module_repo.clone(),
         workflow_repo.clone(),
         compiler.clone(),
+        db_pool.clone(),
     ));
 
     // Execution-orchestration service. Single shared instance backs

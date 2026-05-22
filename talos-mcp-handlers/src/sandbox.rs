@@ -2265,7 +2265,11 @@ async fn handle_hot_update_module(
             &HotUpdateError::ModuleNotFound.to_string(),
         )),
         Err(e @ HotUpdateError::InvalidArg(_))
-        | Err(e @ HotUpdateError::DependencyValidation(_)) => {
+        | Err(e @ HotUpdateError::DependencyValidation(_))
+        // M3 (2026-05-22): capability-ceiling violation is operator-
+        // resolvable (lower the world OR grant_capability_ceiling); -32602
+        // (invalid params) is the right operator signal.
+        | Err(e @ HotUpdateError::CapabilityCeilingViolation(_)) => {
             Some(mcp_error(req_id.clone(), -32602, &e.to_string()))
         }
         // MCP-611 (2026-05-12): `CompilerInvocation` wraps an `anyhow::Error`
