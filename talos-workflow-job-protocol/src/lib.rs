@@ -188,6 +188,89 @@ pub fn job_nonce_cache_size() -> usize {
         .unwrap_or(0)
 }
 
+/// Maximum length of a `worker_id` in bytes. Pod names and host names
+/// in practice fit well under 64 bytes (Kubernetes' RFC-1123 label cap
+/// is 63 chars); 128 leaves slack for synthetic prefixes/suffixes.
+pub const MAX_WORKER_ID_LEN: usize = 128;
+
+/// Validate a self-reported worker identity before binding it into a
+/// HMAC-signed result. The charset (`A-Z`, `a-z`, `0-9`, `.`, `-`, `_`)
+/// is restricted so the colon-delimited signing-payload format stays
+/// unambiguous — without this, a worker_id containing `:` could shift
+/// the field boundary and let the same HMAC verify under a different
+/// interpretation of the payload.
+///
+/// An empty `worker_id` is permitted (the back-compat `sign()` wrapper
+/// passes the empty string) and renders as `""` in the signing payload.
+/// Production worker code is expected to supply a non-empty value.
+pub fn validate_worker_id(worker_id: &str) -> Result<(), String> {
+    if worker_id.len() > MAX_WORKER_ID_LEN {
+        return Err(format!(
+            "worker_id too long: {} bytes (max {MAX_WORKER_ID_LEN})",
+            worker_id.len()
+        ));
+    }
+    if !worker_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(
+            "worker_id contains invalid chars (allowed: A-Z a-z 0-9 . - _)".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod worker_id_validation_tests {
+    use super::validate_worker_id;
+
+    #[test]
+    fn accepts_empty() {
+        validate_worker_id("").unwrap();
+    }
+
+    #[test]
+    fn accepts_typical_pod_name() {
+        validate_worker_id("talos-worker-abc-12345").unwrap();
+    }
+
+    #[test]
+    fn accepts_uuid_style() {
+        validate_worker_id("ab12cd34-ef56-7890-1234-567890abcdef").unwrap();
+    }
+
+    #[test]
+    fn rejects_colon() {
+        // The signing payload is colon-delimited; embedded `:` would
+        // shift the field boundary.
+        assert!(validate_worker_id("worker:1").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace() {
+        assert!(validate_worker_id("worker 1").is_err());
+        assert!(validate_worker_id("worker\n1").is_err());
+    }
+
+    #[test]
+    fn rejects_null_byte() {
+        assert!(validate_worker_id("worker\0").is_err());
+    }
+
+    #[test]
+    fn rejects_overlong() {
+        let big = "a".repeat(super::MAX_WORKER_ID_LEN + 1);
+        assert!(validate_worker_id(&big).is_err());
+    }
+
+    #[test]
+    fn accepts_max_length() {
+        let max = "a".repeat(super::MAX_WORKER_ID_LEN);
+        validate_worker_id(&max).unwrap();
+    }
+}
+
 /// Hard cap for the job-nonce replay cache.
 ///
 /// Exposed so health endpoints can report the headroom (`size / cap`)
@@ -1382,6 +1465,20 @@ pub struct JobResult {
     /// Nonce for replay prevention: `"{unix_secs}:{random_hex}"`.
     #[serde(default)]
     pub result_nonce: String,
+    /// Self-reported worker identity, HMAC-bound by [`JobResult::sign_with_worker_id`].
+    ///
+    /// Plain pre-shared HMAC keys cannot distinguish results from worker-A vs.
+    /// worker-B — any process holding `WORKER_SHARED_KEY` can sign for any
+    /// `job_id`. Binding the worker's own id into the signed payload gives the
+    /// controller forensic visibility (which pod produced which result) and
+    /// opens the path to per-worker HKDF subkeys in a future rev.
+    ///
+    /// Charset is restricted (`[A-Za-z0-9._-]{0,128}`) so the colon-delimited
+    /// signing payload format stays unambiguous. Empty string is permitted for
+    /// the [`JobResult::sign`] back-compat wrapper; production worker code uses
+    /// [`JobResult::sign_with_worker_id`].
+    #[serde(default)]
+    pub worker_id: String,
 }
 
 impl JobResult {
@@ -1395,6 +1492,15 @@ impl JobResult {
     /// with the logs field in flight could inject misleading log lines
     /// without invalidating the signature. No capability impact, but
     /// audit-trail integrity matters for incident response.
+    ///
+    /// L-11 (2026-05-22): `worker_id` is appended at the end of the
+    /// signing payload so a result captured from one worker can't be
+    /// re-published as if it came from another. The charset is enforced
+    /// by [`validate_worker_id`] so the colon-delimited format stays
+    /// unambiguous (no `:` smuggling). Empty `worker_id` is permitted
+    /// (renders as `""`) — the [`JobResult::sign`] back-compat wrapper
+    /// leaves it empty; production worker code calls
+    /// [`JobResult::sign_with_worker_id`].
     fn signing_payload(&self) -> Vec<u8> {
         use sha2::Digest;
         let status_str = match self.status {
@@ -1409,7 +1515,7 @@ impl JobResult {
         // 64-char hex digest so the signing payload size is bounded.
         let logs_hash = hex::encode(Sha256::digest(self.logs.join("\n").as_bytes()));
         format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             status_str,
             self.result_nonce,
@@ -1417,15 +1523,41 @@ impl JobResult {
             self.execution_time_ms,
             // L-10: appended AT THE END per the wire-format stability rule.
             logs_hash,
+            // L-11: appended AT THE END (after L-10) per the same rule.
+            self.worker_id,
         )
         .into_bytes()
     }
 
-    /// Sign the result using the pre-shared `key`.
+    /// Sign the result using the pre-shared `key`. **Back-compat wrapper —
+    /// production worker code should call
+    /// [`JobResult::sign_with_worker_id`] so the worker identity is bound
+    /// into the signature.**
     ///
-    /// Sets `self.signature` and `self.result_nonce`.
-    /// Call this after all other fields have been populated.
+    /// Sets `self.signature` and `self.result_nonce`. The `worker_id`
+    /// field is left untouched (empty by default), so the signed payload
+    /// commits to an empty identity. Test fixtures that don't care about
+    /// per-worker attribution use this path; the worker process must use
+    /// `sign_with_worker_id`. A `lint-structural.sh` check rejects raw
+    /// `.sign(` in the `worker/` tree to prevent regressions.
     pub fn sign(&mut self, key: &[u8]) -> Result<(), String> {
+        self.sign_with_worker_id(key, "")
+    }
+
+    /// Sign the result and bind the worker's self-reported identity.
+    ///
+    /// `worker_id` is validated by [`validate_worker_id`] (charset
+    /// `[A-Za-z0-9._-]{0,128}`); invalid ids fail closed before any HMAC
+    /// is computed so a misconfigured worker can't accidentally publish a
+    /// malformed-but-signed result.
+    pub fn sign_with_worker_id(
+        &mut self,
+        key: &[u8],
+        worker_id: &str,
+    ) -> Result<(), String> {
+        validate_worker_id(worker_id)?;
+        self.worker_id = worker_id.to_string();
+
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| format!("system time error: {e}"))?
@@ -1893,6 +2025,11 @@ pub struct PipelineJobResult {
     pub signature: Vec<u8>,
     /// Nonce for replay prevention.
     pub result_nonce: String,
+    /// Self-reported worker identity, HMAC-bound by
+    /// [`PipelineJobResult::sign_with_worker_id`]. See [`JobResult::worker_id`]
+    /// for the security rationale — same model for both result types.
+    #[serde(default)]
+    pub worker_id: String,
 }
 
 impl PipelineJobResult {
@@ -1941,7 +2078,7 @@ impl PipelineJobResult {
             hex::encode(Sha256::digest(step_digests.join("\n").as_bytes()));
 
         format!(
-            "pipeline_result:{}:{}:{}:{}:{}:{}",
+            "pipeline_result:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             status_str,
             self.result_nonce,
@@ -1949,12 +2086,34 @@ impl PipelineJobResult {
             output_hash,
             // Appended AT THE END per the wire-format stability rule.
             step_results_hash,
+            // L-11 (2026-05-22): worker_id appended AT THE END (after the
+            // step-results hash) per the same rule. See
+            // [`JobResult::signing_payload`] for the full rationale.
+            self.worker_id,
         )
         .into_bytes()
     }
 
-    /// Sign the pipeline result using the pre-shared `key`.
+    /// Sign the pipeline result using the pre-shared `key`. **Back-compat
+    /// wrapper — production worker code should call
+    /// [`PipelineJobResult::sign_with_worker_id`] so the worker identity
+    /// is bound into the signature.** See [`JobResult::sign`] for the
+    /// matching contract on single-node results.
     pub fn sign(&mut self, key: &[u8]) -> Result<(), String> {
+        self.sign_with_worker_id(key, "")
+    }
+
+    /// Sign the pipeline result and bind the worker's self-reported
+    /// identity. Mirror of [`JobResult::sign_with_worker_id`] — same
+    /// charset validation, same fail-closed-on-invalid-id contract.
+    pub fn sign_with_worker_id(
+        &mut self,
+        key: &[u8],
+        worker_id: &str,
+    ) -> Result<(), String> {
+        validate_worker_id(worker_id)?;
+        self.worker_id = worker_id.to_string();
+
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| format!("system time error: {e}"))?
@@ -2462,6 +2621,7 @@ mod tests {
             execution_time_ms: 150,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
 
         result.sign(&key).unwrap();
@@ -2482,6 +2642,7 @@ mod tests {
             execution_time_ms: 150,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
         result.sign(&key).unwrap();
         result.output_payload = serde_json::json!({"answer": 99}); // tamper
@@ -2506,6 +2667,7 @@ mod tests {
             execution_time_ms: 1,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
         a.sign(&key).unwrap();
 
@@ -2542,6 +2704,7 @@ mod tests {
             execution_time_ms: 1,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
         a.sign(&key).unwrap();
         a.verify_as(&key, 300, Verifier::Observer).unwrap();
@@ -2560,6 +2723,7 @@ mod tests {
             execution_time_ms: 1,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
         a.sign(&key).unwrap();
         a.output_payload = serde_json::json!({"answer": 99});
@@ -2656,6 +2820,7 @@ mod tests {
             execution_time_ms: 0,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
         assert!(result.verify(&key, 300).is_err());
     }
@@ -2842,6 +3007,7 @@ mod tests {
             execution_time_ms: 100,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
         result.sign(&key).unwrap();
 
@@ -2942,6 +3108,7 @@ mod tests {
             execution_time_ms: 0,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
         result.sign(&key).unwrap();
         result.verify(&key, 300).expect("empty-logs result should verify");

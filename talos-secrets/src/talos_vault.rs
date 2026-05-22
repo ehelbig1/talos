@@ -1,6 +1,6 @@
 use dashmap::DashMap;
+use rand::{rngs::OsRng, RngCore};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use zeroize::Zeroizing;
 
@@ -53,7 +53,6 @@ pub struct TalosVaultProvider {
     /// Slot registry — the ONLY place decrypted values live after construction.
     /// Entries are removed by `release()`, which zeroes the value on drop.
     slots: DashMap<SlotHandle, SlotEntry>,
-    counter: AtomicU64,
     /// Pre-loaded plaintext map. In v2 this will be replaced with on-demand
     /// DB resolution. Values are wrapped in Zeroizing so they zero on drop.
     resolved: HashMap<String, Zeroizing<String>>,
@@ -61,6 +60,44 @@ pub struct TalosVaultProvider {
     /// Enforces a rotation boundary: after `max_slot_age_secs`, the slot is considered
     /// potentially stale and calls to `into_auth_header` / `sign` return an error.
     max_slot_age_secs: u64,
+}
+
+/// Allocate a fresh slot handle as a 63-bit CSPRNG-random value.
+///
+/// **Why random and not a sequential counter?** A guest WASM module
+/// receives slot handles via the `secrets::get-secret` host call and
+/// stores them as `u64`. With sequential allocation starting at 1, a
+/// guest can trivially enumerate (`handle ± 1`) to probe slot IDs that
+/// might exist. Today the WIT contract caps probing to within one
+/// `Store` (each execution has its own [`TalosVaultProvider`]), so an
+/// out-of-bounds probe just returns `Notfound`. The defense-in-depth
+/// benefit:
+///
+///   1. If the per-execution scope is ever weakened (e.g. shared
+///      providers across executions for caching), enumeration becomes
+///      a real cross-tenant leak. Random handles fail closed in that
+///      future.
+///   2. A randomized handle makes the "use-after-release" pattern
+///      visibly broken — a freed handle 7 is overwhelmingly unlikely
+///      to be re-issued to a sibling slot.
+///
+/// The handle is 63 bits (top bit cleared) so it always fits in a
+/// signed 64-bit integer too — some logging / metrics backends
+/// downstream treat very large `u64` values as floats and lose
+/// precision; clearing the high bit avoids that.
+///
+/// Collision probability with 63 bits over 1000 slots is on the order
+/// of 1e-15 (birthday-bound) — far below any realistic concern. The
+/// resolve path inserts into a [`DashMap`] which would just overwrite
+/// on collision; we accept that microscopic risk for the simpler
+/// code path.
+fn fresh_slot_handle() -> SlotHandle {
+    let mut buf = [0u8; 8];
+    OsRng.fill_bytes(&mut buf);
+    let v = u64::from_le_bytes(buf) & 0x7FFF_FFFF_FFFF_FFFF;
+    // Make sure we never return 0 — some downstream code uses 0 as a
+    // sentinel "no slot" value. Probability of hitting 0 is ~1e-19.
+    SlotHandle(if v == 0 { 1 } else { v })
 }
 
 /// MCP-509: case-insensitive HTTP auth-scheme prefix detection.
@@ -89,7 +126,6 @@ impl TalosVaultProvider {
             .collect();
         Self {
             slots: DashMap::new(),
-            counter: AtomicU64::new(1),
             resolved,
             max_slot_age_secs: DEFAULT_MAX_SLOT_AGE_SECS,
         }
@@ -138,8 +174,10 @@ impl SecretProvider for TalosVaultProvider {
             .resolved
             .get(path)
             .ok_or_else(|| anyhow::anyhow!("secret path not found: {path}"))?;
-        let id = self.counter.fetch_add(1, Ordering::Relaxed);
-        let handle = SlotHandle(id);
+        // L-13 (2026-05-22): allocate a 63-bit random handle instead
+        // of a sequential counter. See `fresh_slot_handle` for the
+        // defense-in-depth rationale (guest enumeration resistance).
+        let handle = fresh_slot_handle();
         // Clone into a fresh SlotEntry — value is Zeroizing<String>, created_at records now.
         self.slots
             .insert(handle, SlotEntry::new((**plaintext).clone()));
@@ -234,6 +272,59 @@ impl SecretProvider for TalosVaultProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L-13: slot handles must be CSPRNG-random (not sequential) so a
+    /// guest can't enumerate adjacent handles. We assert two
+    /// properties:
+    ///   1. Successive handles differ by more than 1 with overwhelming
+    ///      probability — a sequential allocator would always differ
+    ///      by exactly 1.
+    ///   2. The high bit is cleared (fits in a signed 64-bit int).
+    #[tokio::test]
+    async fn slot_handles_are_random_not_sequential() {
+        let mut map = HashMap::new();
+        for i in 0..50 {
+            map.insert(format!("path/{i}"), format!("val{i}"));
+        }
+        let provider = TalosVaultProvider::from_resolved(map);
+        let exec_id = uuid::Uuid::new_v4();
+
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let h = provider
+                .resolve(&format!("path/{i}"), exec_id)
+                .await
+                .unwrap();
+            handles.push(h.0);
+        }
+
+        // Distinctness — DashMap would overwrite on collision, but
+        // 50 draws from a 63-bit space should never collide in
+        // practice (birthday-bound is ~3.5 billion draws for 50%).
+        let mut sorted = handles.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), handles.len(), "handles collided");
+
+        // Adjacency check — sequential allocation would yield
+        // |sorted[i+1] - sorted[i]| == 1 for every pair. Random
+        // allocation produces large gaps. Assert that at least one
+        // gap is much larger than 1 (CSPRNG with 50 draws from a
+        // 63-bit space gives expected min-gap ≈ 2^57 / 50 ≈ 1e15).
+        let any_large_gap = sorted
+            .windows(2)
+            .any(|w| w[1].saturating_sub(w[0]) > 1024);
+        assert!(
+            any_large_gap,
+            "handles look sequential — slot allocator regressed?"
+        );
+
+        // High bit cleared — fits in i64 without precision loss.
+        for h in &handles {
+            assert!(*h < (1u64 << 63), "handle high bit set: {h}");
+            assert!(*h != 0, "handle must not be 0 sentinel");
+        }
+    }
 
     #[tokio::test]
     async fn slot_lifecycle_and_release() {

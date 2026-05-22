@@ -265,6 +265,20 @@ pub(crate) enum SigstoreRegexpRejection {
     /// fork named `template-publish.yml-evil.yml` can match the same
     /// prefix.
     MissingWorkflowAnchor,
+    /// L-14 (2026-05-22): the pattern starts with `https://github.com/`
+    /// (the GitHub-Actions Fulcio identity prefix) but does not contain
+    /// `.github/workflows/`. Sigstore identities for GitHub Actions
+    /// OIDC ALWAYS include the workflow path — a pattern like
+    /// `^https://github\.com/.*` would match every signed artifact from
+    /// every owner/repo on github.com, defeating the per-workflow
+    /// trust anchor.
+    MissingGithubWorkflowPath,
+    /// L-14: the pattern contains `github.com/.*\.github/workflows/`
+    /// or similar wildcard between `github.com/` and the workflow
+    /// path. This expands the trust set to any owner/repo with a
+    /// matching workflow filename — including a forked repo with the
+    /// same filename. Pin the owner/repo literally.
+    UnpinnedGithubOwnerRepo,
 }
 
 impl SigstoreRegexpRejection {
@@ -284,6 +298,20 @@ impl SigstoreRegexpRejection {
                  but is missing the trailing `@` anchor — a fork named \
                  `workflow.yml-evil.yml` could match the same prefix. \
                  End the pattern with `@` to anchor at the ref separator."
+            }
+            Self::MissingGithubWorkflowPath => {
+                "TALOS_SIGSTORE_IDENTITY_REGEXP targets `github.com` but does not \
+                 require the `.github/workflows/` path — every Sigstore identity \
+                 issued by GitHub Actions OIDC contains that path, so a pattern \
+                 without it would match unrelated artifacts from any owner/repo. \
+                 Use a pattern like \
+                 `^https://github\\.com/OWNER/REPO/\\.github/workflows/WORKFLOW\\.yml@`."
+            }
+            Self::UnpinnedGithubOwnerRepo => {
+                "TALOS_SIGSTORE_IDENTITY_REGEXP has a wildcard between `github.com/` \
+                 and `.github/workflows/` — owner and repo MUST be literal so a \
+                 fork with the same workflow filename can't satisfy the regex. \
+                 Replace `github\\.com/.*` with `github\\.com/OWNER/REPO/`."
             }
         }
     }
@@ -344,6 +372,61 @@ pub(crate) fn validate_sigstore_identity_regexp(
         let after_workflows = &regexp[workflows_idx + ".github/workflows/".len()..];
         if !after_workflows.contains('@') {
             return Err(SigstoreRegexpRejection::MissingWorkflowAnchor);
+        }
+    }
+    // L-14 (2026-05-22): additional anchoring checks for github.com
+    // patterns. Sigstore identities issued by GitHub Actions OIDC
+    // always have the form
+    // `https://github.com/{owner}/{repo}/.github/workflows/{file}.yml@{ref}`.
+    // A pattern that targets github.com but is missing either the
+    // `.github/workflows/` path or pins the owner/repo with a
+    // wildcard would expand the trust set far beyond the operator's
+    // intent (any fork with the same workflow name signs as us).
+    //
+    // We match both `github\.com/` (regex-escaped) and `github.com/`
+    // (raw) since operators write the pattern either way.
+    let github_idx = regexp
+        .find("github\\.com/")
+        .map(|i| (i, "github\\.com/".len()))
+        .or_else(|| {
+            regexp
+                .find("github.com/")
+                .map(|i| (i, "github.com/".len()))
+        });
+    if let Some((idx, prefix_len)) = github_idx {
+        // 1. Pattern must reference a workflow path. Without it, every
+        //    OIDC identity from any GitHub repo would satisfy the
+        //    regex (e.g. `^https://github\.com/.*`).
+        if !regexp.contains(".github/workflows/") {
+            return Err(SigstoreRegexpRejection::MissingGithubWorkflowPath);
+        }
+        // 2. Owner/repo segment between `github.com/` and
+        //    `.github/workflows/` must be literal — no wildcards.
+        //    `.` (any-char), `.*`, `.+`, `\w+`, `[^/]+`, `\S+`
+        //    between the two anchors all defeat per-repo pinning.
+        let after_host = &regexp[idx + prefix_len..];
+        if let Some(workflows_at) = after_host.find(".github/workflows/") {
+            let owner_repo_segment = &after_host[..workflows_at];
+            // Bare `.` is the canonical wildcard; `.*` / `.+` / `[]`
+            // / `\w` likewise. Backslash-escaped `\.` is a literal
+            // dot in the repo name (e.g. `my.repo`) and is fine, so
+            // we strip those before scanning. Same for `\-`.
+            let scan = owner_repo_segment
+                .replace("\\.", "")
+                .replace("\\-", "")
+                .replace("\\_", "");
+            // Any of these tokens between host and workflows path
+            // indicates a wildcard.
+            let suspicious_tokens =
+                [".*", ".+", "[^", "\\w", "\\S", "\\d", "(?", ".{", "()"];
+            if suspicious_tokens.iter().any(|t| scan.contains(t)) {
+                return Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo);
+            }
+            // A bare `.` (any-character) outside an escape is also
+            // suspicious. Scan for it in the post-strip text.
+            if scan.contains('.') {
+                return Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo);
+            }
         }
     }
     Ok(())
@@ -980,7 +1063,140 @@ pub(crate) fn pick_trusted_reply_topic(
             Some(s.to_string())
         }
         (None, Some(w)) => Some(w.to_string()),
-        (None, None) => None,
+        (None, None) => {
+            // L-12 (2026-05-22): the result will be published to the
+            // global `talos.results.{job_id}` topic by the caller
+            // (publish_result_with_retry). That path is intended for the
+            // controller's audit subscriber — but if neither the
+            // signed `reply_topic` NOR the wire `msg.reply` is set AND
+            // the operator hasn't configured an audit subscriber, the
+            // result effectively disappears (broker delivers to zero
+            // subscribers, no error returned). Emit a structured event
+            // here so the condition is visible in dashboards and a
+            // misconfigured dispatch path doesn't degrade silently.
+            //
+            // `target: "talos_worker_metrics"` lets operators alert via
+            // a single filter; `event_kind` is the stable identifier.
+            ::tracing::warn!(
+                target: "talos_worker_metrics",
+                job_id = %job_id,
+                event_kind = "job_result_no_reply",
+                "neither signed reply_topic nor wire msg.reply set — result \
+                 will publish to the global audit topic only. If no audit \
+                 subscriber is configured this result is lost."
+            );
+            None
+        }
+    }
+}
+
+/// L-11 (2026-05-22): The worker's self-reported identity, bound into
+/// every signed [`JobResult`] / [`PipelineJobResult`] via
+/// [`talos_workflow_job_protocol::JobResult::sign_with_worker_id`].
+///
+/// Resolution order:
+///   1. `TALOS_WORKER_ID` env var (operator-supplied, explicit).
+///   2. `HOSTNAME` env var (Kubernetes injects this automatically as
+///      the pod name — typically `talos-worker-<rs>-<5hex>`).
+///   3. A random 16-byte hex string generated once at startup
+///      (`fallback-<hex>`). This branch only fires in dev containers
+///      that have neither env set.
+///
+/// The result is sanitized to the
+/// [`talos_workflow_job_protocol::validate_worker_id`] charset
+/// (`[A-Za-z0-9._-]{0,128}`) and cached in a [`OnceLock`] so every
+/// `JobResult.sign()` call site reads the same value without
+/// re-parsing env each time.
+///
+/// Note: this is NOT cryptographic identity — any process holding
+/// `WORKER_SHARED_KEY` can sign as any `worker_id`. It is forensic
+/// visibility (which pod produced which result, surfaced in the
+/// controller's audit log) plus the wire-format anchor that a future
+/// per-worker HKDF subkey scheme can dispatch on.
+pub(crate) fn worker_identity() -> &'static str {
+    use std::sync::OnceLock;
+    static WORKER_ID: OnceLock<String> = OnceLock::new();
+
+    WORKER_ID.get_or_init(|| {
+        // Sanitize: replace any character outside the allowed charset
+        // with `-` so an OS-provided hostname (which can legitimately
+        // contain characters that fail `validate_worker_id`) still
+        // produces a valid signing-payload field. We truncate to the
+        // MAX_WORKER_ID_LEN to satisfy the same validator.
+        fn sanitize(raw: &str) -> String {
+            let mut s: String = raw
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            if s.len() > talos_workflow_job_protocol::MAX_WORKER_ID_LEN {
+                s.truncate(talos_workflow_job_protocol::MAX_WORKER_ID_LEN);
+            }
+            s
+        }
+
+        // 1. TALOS_WORKER_ID — explicit operator override.
+        if let Ok(v) = std::env::var("TALOS_WORKER_ID") {
+            let v = v.trim();
+            if !v.is_empty() {
+                let sanitized = sanitize(v);
+                if !sanitized.is_empty() {
+                    return sanitized;
+                }
+            }
+        }
+
+        // 2. HOSTNAME — Kubernetes pod name in cluster deployments.
+        if let Ok(v) = std::env::var("HOSTNAME") {
+            let v = v.trim();
+            if !v.is_empty() {
+                let sanitized = sanitize(v);
+                if !sanitized.is_empty() {
+                    return sanitized;
+                }
+            }
+        }
+
+        // 3. Random fallback — dev / CI containers without HOSTNAME.
+        use rand::RngCore;
+        let mut buf = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        let id = format!("fallback-{}", hex::encode(buf));
+        ::tracing::warn!(
+            worker_id = %id,
+            "TALOS_WORKER_ID and HOSTNAME both unset — using random fallback. \
+             Set TALOS_WORKER_ID (or rely on Kubernetes pod-name HOSTNAME) for \
+             stable forensic attribution across restarts."
+        );
+        id
+    })
+}
+
+#[cfg(test)]
+mod worker_identity_tests {
+    use super::worker_identity;
+
+    #[test]
+    fn returns_validatable_id() {
+        let id = worker_identity();
+        // Whatever the resolution branch, the output must satisfy the
+        // protocol's validator — that's what the worker is going to
+        // pass to `sign_with_worker_id` in production.
+        talos_workflow_job_protocol::validate_worker_id(id)
+            .expect("resolved worker_id must satisfy validate_worker_id");
+    }
+
+    #[test]
+    fn cached_across_calls() {
+        // OnceLock semantics: stable address means stable string.
+        let a: &'static str = worker_identity();
+        let b: &'static str = worker_identity();
+        assert_eq!(a.as_ptr(), b.as_ptr(), "worker_identity must be cached");
     }
 }
 
@@ -1040,6 +1256,7 @@ fn truncate_oversized_job_result(
         execution_time_ms: result.execution_time_ms,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     }
 }
 
@@ -1074,7 +1291,14 @@ async fn publish_result_with_retry(
             "JobResult exceeds NATS publish cap — substituting a small Failed result so the controller doesn't time out"
         );
         let mut replacement = truncate_oversized_job_result(result, serialized.len(), cap);
-        if let Err(e) = replacement.sign(shared_key.as_bytes()) {
+        // L-11: bind the worker's identity into the signature so the
+        // controller's audit log records which pod emitted the
+        // truncated-replacement result. See `worker_identity` for the
+        // resolution chain.
+        if let Err(e) = replacement.sign_with_worker_id(
+            shared_key.as_bytes(),
+            worker_identity(),
+        ) {
             return Err(format!(
                 "Failed to sign oversized-result replacement: {e}"
             ));
@@ -1168,6 +1392,7 @@ async fn execute_job(
             execution_time_ms: start.elapsed().as_millis() as u64,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
     }
 
@@ -1188,6 +1413,7 @@ async fn execute_job(
                 execution_time_ms: start.elapsed().as_millis() as u64,
                 signature: vec![],
                 result_nonce: String::new(),
+                worker_id: String::new(),
             };
         }
     }
@@ -1219,6 +1445,7 @@ async fn execute_job(
                     execution_time_ms: start.elapsed().as_millis() as u64,
                     signature: vec![],
                     result_nonce: String::new(),
+                    worker_id: String::new(),
                 };
             }
         }
@@ -1320,6 +1547,7 @@ async fn execute_job(
                     execution_time_ms: start.elapsed().as_millis() as u64,
                     signature: vec![],
                     result_nonce: String::new(),
+                    worker_id: String::new(),
                 };
             }
 
@@ -1350,6 +1578,7 @@ async fn execute_job(
                     execution_time_ms: start.elapsed().as_millis() as u64,
                     signature: vec![],
                     result_nonce: String::new(),
+                    worker_id: String::new(),
                 };
             } else {
                 false
@@ -1451,6 +1680,7 @@ async fn execute_job(
                             execution_time_ms: start.elapsed().as_millis() as u64,
                             signature: vec![],
                             result_nonce: String::new(),
+                            worker_id: String::new(),
                         };
                     }
                 } else {
@@ -1474,6 +1704,7 @@ async fn execute_job(
                                     execution_time_ms: start.elapsed().as_millis() as u64,
                                     signature: vec![],
                                     result_nonce: String::new(),
+                                    worker_id: String::new(),
                                 };
                             }
                             SigstorePolicy::Audit => {
@@ -1564,6 +1795,7 @@ async fn execute_job(
                             execution_time_ms: start.elapsed().as_millis() as u64,
                             signature: vec![],
                             result_nonce: String::new(),
+                            worker_id: String::new(),
                         };
                     }
                 }
@@ -1707,6 +1939,7 @@ async fn execute_job(
                                 execution_time_ms: start.elapsed().as_millis() as u64,
                                 signature: vec![],
                                 result_nonce: String::new(),
+                                worker_id: String::new(),
                             };
                         }
                         // H1: prefer the digest we already learned from
@@ -1810,6 +2043,7 @@ async fn execute_job(
                                     execution_time_ms: start.elapsed().as_millis() as u64,
                                     signature: vec![],
                                     result_nonce: String::new(),
+                                    worker_id: String::new(),
                                 };
                             }
                             LayerVerdict::AcceptedUnverified => {
@@ -1864,6 +2098,7 @@ async fn execute_job(
                                         execution_time_ms: start.elapsed().as_millis() as u64,
                                         signature: vec![],
                                         result_nonce: String::new(),
+                                        worker_id: String::new(),
                                     };
                                 }
                             }
@@ -1892,6 +2127,7 @@ async fn execute_job(
                     execution_time_ms: start.elapsed().as_millis() as u64,
                     signature: vec![],
                     result_nonce: String::new(),
+                    worker_id: String::new(),
                 };
             }
         }
@@ -1944,6 +2180,7 @@ async fn execute_job(
                     execution_time_ms: start.elapsed().as_millis() as u64,
                     signature: vec![],
                     result_nonce: String::new(),
+                    worker_id: String::new(),
                 };
             }
             _span.set_attribute_int("module_size_bytes", b.len() as i64);
@@ -1963,6 +2200,7 @@ async fn execute_job(
                 execution_time_ms: start.elapsed().as_millis() as u64,
                 signature: vec![],
                 result_nonce: String::new(),
+                worker_id: String::new(),
             };
         }
     } else {
@@ -1995,6 +2233,7 @@ async fn execute_job(
                         execution_time_ms: start.elapsed().as_millis() as u64,
                         signature: vec![],
                         result_nonce: String::new(),
+                        worker_id: String::new(),
                     };
                 }
                 _span.set_attribute_int("module_size_bytes", b.len() as i64);
@@ -2015,6 +2254,7 @@ async fn execute_job(
                     execution_time_ms: start.elapsed().as_millis() as u64,
                     signature: vec![],
                     result_nonce: String::new(),
+                    worker_id: String::new(),
                 };
             }
         }
@@ -2051,6 +2291,7 @@ async fn execute_job(
                     execution_time_ms: start.elapsed().as_millis() as u64,
                     signature: vec![],
                     result_nonce: String::new(),
+                    worker_id: String::new(),
                 };
             }
             ::tracing::debug!(
@@ -2105,6 +2346,7 @@ async fn execute_job(
                     execution_time_ms: start.elapsed().as_millis() as u64,
                     signature: vec![],
                     result_nonce: String::new(),
+                    worker_id: String::new(),
                 };
             }
             ::tracing::warn!(
@@ -2210,6 +2452,7 @@ async fn execute_job(
                 execution_time_ms: duration_ms,
                 signature: vec![],
                 result_nonce: String::new(),
+                worker_id: String::new(),
             }
         }
         Ok(Err(e)) => {
@@ -2228,6 +2471,7 @@ async fn execute_job(
                 execution_time_ms: duration_ms,
                 signature: vec![],
                 result_nonce: String::new(),
+                worker_id: String::new(),
             }
         }
         Err(_) => {
@@ -2245,6 +2489,7 @@ async fn execute_job(
                 execution_time_ms: duration_ms,
                 signature: vec![],
                 result_nonce: String::new(),
+                worker_id: String::new(),
             }
         }
     }
@@ -2284,6 +2529,7 @@ async fn execute_pipeline_job(
             total_time_ms: start.elapsed().as_millis() as u64,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
     }
 
@@ -2309,6 +2555,7 @@ async fn execute_pipeline_job(
             total_time_ms: start.elapsed().as_millis() as u64,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
     }
 
@@ -2336,6 +2583,7 @@ async fn execute_pipeline_job(
                         total_time_ms: start.elapsed().as_millis() as u64,
                         signature: vec![],
                         result_nonce: String::new(),
+                        worker_id: String::new(),
                     };
                 }
             }
@@ -2400,6 +2648,7 @@ async fn execute_pipeline_job(
                 total_time_ms,
                 signature: vec![],
                 result_nonce: String::new(),
+                worker_id: String::new(),
             }
         }
         Err(e) => {
@@ -2418,6 +2667,7 @@ async fn execute_pipeline_job(
                 total_time_ms,
                 signature: vec![],
                 result_nonce: String::new(),
+                worker_id: String::new(),
             }
         }
     }
@@ -3104,7 +3354,11 @@ async fn main() -> anyhow::Result<()> {
                             tokio::task::spawn(async move {
                                 let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
 
-                                if let Err(e) = result.sign(key_clone.as_bytes()) {
+                                // L-11: bind worker identity for audit attribution.
+                                if let Err(e) = result.sign_with_worker_id(
+                                    key_clone.as_bytes(),
+                                    worker_identity(),
+                                ) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign job result");
                                 }
 
@@ -3206,7 +3460,11 @@ async fn main() -> anyhow::Result<()> {
                                 let mut result =
                                     execute_pipeline_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
 
-                                if let Err(e) = result.sign(key_clone.as_bytes()) {
+                                // L-11: bind worker identity for audit attribution.
+                                if let Err(e) = result.sign_with_worker_id(
+                                    key_clone.as_bytes(),
+                                    worker_identity(),
+                                ) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign pipeline result");
                                 }
 
@@ -3260,8 +3518,13 @@ async fn main() -> anyhow::Result<()> {
                                         total_time_ms: result.total_time_ms,
                                         signature: vec![],
                                         result_nonce: String::new(),
+                                        worker_id: String::new(),
                                     };
-                                    if let Err(e) = replacement.sign(key_clone.as_bytes()) {
+                                    // L-11: bind worker identity for audit attribution.
+                                    if let Err(e) = replacement.sign_with_worker_id(
+                                        key_clone.as_bytes(),
+                                        worker_identity(),
+                                    ) {
                                         ::tracing::error!(
                                             job_id = %result.job_id,
                                             error = %e,
@@ -3875,6 +4138,89 @@ mod oci_layer_tests {
         );
     }
 
+    // ─── L-14: github.com permissive-pattern anchoring ─────────────────────
+
+    #[test]
+    fn sigstore_regexp_github_without_workflow_path_is_rejected() {
+        // The simplest permissive pattern: matches every OIDC identity
+        // from github.com regardless of repo or workflow.
+        let pattern = "^https://github\\.com/.*";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingGithubWorkflowPath),
+            "github.com pattern without workflows path must be rejected"
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_github_owner_wildcarded_is_rejected() {
+        // The classical "any owner, any repo, my workflow file" attack
+        // surface — a forked repo with the same workflow filename
+        // could sign as us.
+        for pattern in [
+            "^https://github\\.com/.*/\\.github/workflows/publish\\.yml@",
+            "^https://github\\.com/.+/talos/\\.github/workflows/publish\\.yml@",
+            "^https://github\\.com/[^/]+/talos/\\.github/workflows/publish\\.yml@",
+        ] {
+            assert_eq!(
+                validate_sigstore_identity_regexp(pattern),
+                Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo),
+                "unpinned owner/repo pattern must be rejected: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn sigstore_regexp_github_repo_wildcarded_is_rejected() {
+        // Wildcard in the REPO position is still unpinned — `talos.*`
+        // (any-character then any-suffix) matches any repo name
+        // starting with `talos`.
+        let pattern = "^https://github\\.com/myorg/talos.*/\\.github/workflows/publish\\.yml@";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_github_dot_in_owner_or_repo_is_literal_when_escaped() {
+        // Some orgs/repos legitimately contain `.` — `my.org` or
+        // `my-tool.io`. Escaped `\.` is a literal dot and should NOT
+        // trip the unpinned-wildcard check.
+        let pattern =
+            "^https://github\\.com/my\\.org/my\\.repo/\\.github/workflows/publish\\.yml@";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "escaped literal dot in owner/repo should pass: {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_github_pinned_owner_repo_is_accepted() {
+        // The canonical correct form, per CLAUDE.md guidance.
+        let pattern =
+            "^https://github\\.com/ehelbig1/talos/\\.github/workflows/template-publish\\.yml@";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "pinned owner/repo with @-anchor must pass: {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_unescaped_github_host_is_handled() {
+        // Some operators write `github.com` without the regex-escape
+        // for `.` (technically broader — `.` matches any char — but
+        // we don't reject it here because it's a separate issue).
+        // The path-presence check should still fire on the raw form.
+        let pattern = "^https://github.com/.*";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingGithubWorkflowPath)
+        );
+    }
+
     // ─── H-3: OCI manifest size gate ──────────────────────────────────────
 
     #[test]
@@ -3982,6 +4328,7 @@ mod oci_layer_tests {
             execution_time_ms: 42,
             signature: vec![0; 32],
             result_nonce: "1700000000:abc".to_string(),
+            worker_id: String::new(),
         };
         let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
         // Identity bound: same job_id so the controller can correlate.
@@ -4015,6 +4362,7 @@ mod oci_layer_tests {
             execution_time_ms: 0,
             signature: vec![],
             result_nonce: String::new(),
+            worker_id: String::new(),
         };
         let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
         let bytes = serde_json::to_vec(&replacement).unwrap();

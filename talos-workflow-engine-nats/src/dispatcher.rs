@@ -297,6 +297,26 @@ pub(crate) async fn execute_job_with_retry(
                     ) {
                         return Err(format!("Job result signature verification failed: {}", e));
                     }
+                    // L-11 (2026-05-22): record the worker_id committed to
+                    // by the signed result. `worker_id` is the
+                    // self-reported identity of the worker process that
+                    // produced this result (HMAC-bound by
+                    // `sign_with_worker_id`). Logging it here gives
+                    // operators forensic attribution per job — if a
+                    // result is malformed or anomalous, the worker pod
+                    // is identifiable in the audit trail.
+                    //
+                    // Empty `worker_id` indicates a pre-L-11 worker or a
+                    // test fixture; that's expected during deployment
+                    // rollouts and is not an error.
+                    if !job_result.worker_id.is_empty() {
+                        tracing::debug!(
+                            target: "talos_job_audit",
+                            job_id = %job_result.job_id,
+                            worker_id = %job_result.worker_id,
+                            "JobResult verified — worker attribution recorded"
+                        );
+                    }
                 }
 
                 // Check both job-level status AND payload-level success field.
@@ -918,6 +938,16 @@ impl NodeDispatcher for NatsNodeDispatcher {
                 .map_err(|e| -> BoxError {
                     format!("Pipeline result signature verification failed: {e}").into()
                 })?;
+            // L-11: forensic attribution — see the matching block in
+            // `dispatch_single` above for the security rationale.
+            if !result.worker_id.is_empty() {
+                tracing::debug!(
+                    target: "talos_job_audit",
+                    job_id = %result.job_id,
+                    worker_id = %result.worker_id,
+                    "PipelineJobResult verified — worker attribution recorded"
+                );
+            }
         }
 
         // 8. Map per-step results back into the abstract shape.

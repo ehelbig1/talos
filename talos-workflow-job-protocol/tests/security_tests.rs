@@ -382,6 +382,7 @@ fn tampered_job_result_status_fails() {
         execution_time_ms: 100,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     };
     result.sign(&key).unwrap();
 
@@ -405,6 +406,7 @@ fn tampered_job_result_execution_time_fails() {
         execution_time_ms: 100,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     };
     result.sign(&key).unwrap();
 
@@ -540,6 +542,7 @@ fn signed_job_result(key: &[u8]) -> JobResult {
         execution_time_ms: 42,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     };
     result.sign(key).unwrap();
     result
@@ -667,6 +670,7 @@ fn signed_pipeline_result(key: &[u8]) -> talos_workflow_job_protocol::PipelineJo
         total_time_ms: 42,
         signature: vec![],
         result_nonce: String::new(),
+        worker_id: String::new(),
     };
     result.sign(key).unwrap();
     result
@@ -759,4 +763,113 @@ fn pipeline_verify_no_replay_does_not_pollute_cache() {
     result
         .verify(&key, 300)
         .expect("primary verify after verify_no_replay must succeed");
+}
+
+// ────────────────────────────────────────────────────────────────────
+// L-11: worker_id binding. A worker's self-reported identity is part
+// of the signed canonical bytes; an on-wire attacker who flips the
+// worker_id (e.g. to point blame at a different pod for forensic
+// confusion) breaks the HMAC.
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn tampered_job_result_worker_id_fails() {
+    let key = test_key();
+    let mut result = JobResult {
+        job_id: Uuid::new_v4(),
+        status: JobStatus::Success,
+        output_payload: json!({"ok": true}),
+        logs: vec![],
+        execution_time_ms: 7,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+    };
+    result
+        .sign_with_worker_id(&key, "worker-a")
+        .expect("sign with worker-a");
+    // Forge: keep signature, swap worker_id to a different pod's
+    // identity. The HMAC must reject — the worker_id is part of the
+    // signing payload.
+    result.worker_id = "worker-b".into();
+    assert!(
+        result.verify(&key, 300).is_err(),
+        "worker_id tamper must fail HMAC verification"
+    );
+}
+
+#[test]
+fn tampered_pipeline_result_worker_id_fails() {
+    let key = test_key();
+    let mut result = talos_workflow_job_protocol::PipelineJobResult {
+        job_id: Uuid::new_v4(),
+        step_results: vec![],
+        final_output: json!({"step": "ok"}),
+        overall_status: JobStatus::Success,
+        total_time_ms: 7,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+    };
+    result
+        .sign_with_worker_id(&key, "worker-a")
+        .expect("sign with worker-a");
+    result.worker_id = "worker-b".into();
+    assert!(
+        result.verify(&key, 300).is_err(),
+        "pipeline worker_id tamper must fail HMAC verification"
+    );
+}
+
+#[test]
+fn worker_id_invalid_chars_rejected_at_sign_time() {
+    // Validation happens BEFORE HMAC compute, so a malformed
+    // worker_id fails closed without producing an artifact at all.
+    let key = test_key();
+    let mut result = JobResult {
+        job_id: Uuid::new_v4(),
+        status: JobStatus::Success,
+        output_payload: json!({"ok": true}),
+        logs: vec![],
+        execution_time_ms: 7,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+    };
+    // Embedded colon — would shift the signing-payload field
+    // boundary if accepted.
+    let err = result
+        .sign_with_worker_id(&key, "worker:1")
+        .expect_err("colon must be rejected");
+    assert!(
+        err.contains("worker_id"),
+        "error must name the offending field — got: {err}"
+    );
+    // Signature must NOT have been written (fail-closed contract).
+    assert!(
+        result.signature.is_empty(),
+        "signature must not be set when worker_id validation fails"
+    );
+}
+
+#[test]
+fn worker_id_empty_passes_for_backcompat() {
+    // The bare `sign()` wrapper leaves worker_id empty for test
+    // fixtures; empty must still verify cleanly.
+    let key = test_key();
+    let mut result = JobResult {
+        job_id: Uuid::new_v4(),
+        status: JobStatus::Success,
+        output_payload: json!({"ok": true}),
+        logs: vec![],
+        execution_time_ms: 7,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+    };
+    result.sign(&key).expect("bare sign must succeed");
+    result
+        .verify(&key, 300)
+        .expect("bare sign result must verify");
+    assert_eq!(result.worker_id, "");
 }

@@ -1146,6 +1146,121 @@ else
 fi
 echo
 
+# ── 17. encrypted_secrets: Default::default() in dispatch paths ────────
+bold "▶ check 17: encrypted_secrets: Default::default() outside tests"
+
+# CLAUDE.md (2026-04-16 loop-node dispatch regression): every engine
+# dispatch path MUST call build_encrypted_secrets() (or the equivalent
+# inline block) to populate JobRequest.encrypted_secrets. Shipping
+# `encrypted_secrets: Default::default()` to NATS means the module
+# silently loses access to ALL secrets — vault:// headers fail with
+# Notfound, LLM calls fail with missing keys, and the only signal is
+# the WASM module's own error message (often hours of debugging
+# later). The lesson was learned in production; the lint exists so
+# the next new dispatch path can't quietly repeat the regression.
+#
+# The lint matches the two equivalent forms:
+#     encrypted_secrets: Default::default()
+#     encrypted_secrets: EncryptedSecrets::default()
+#
+# Test fixtures legitimately want the empty/default form (they don't
+# exercise the secrets pipeline). The check excludes paths under
+# `tests/`, `*_tests.rs`, and the protocol crate itself (where the
+# Default impl lives + is unit-tested). If a production site has a
+# documented reason — like a fire-and-forget dispatch where secrets
+# are never needed — add a literal comment within 4 lines above:
+#   // allow-empty-encrypted-secrets: <reason>
+ES_VIOLATIONS=0
+while IFS= read -r line; do
+    file="$(echo "$line" | cut -d: -f1)"
+    lineno="$(echo "$line" | cut -d: -f2)"
+    # Skip test files explicitly (defense-in-depth — the grep already
+    # excludes them by directory).
+    case "$file" in
+        */tests/*|*_tests.rs|*/talos-workflow-job-protocol/*)
+            continue
+            ;;
+    esac
+    es_start=$((lineno > 4 ? lineno - 4 : 1))
+    if sed -n "${es_start},${lineno}p" "$file" 2>/dev/null \
+            | grep -q 'allow-empty-encrypted-secrets'; then
+        continue
+    fi
+    printf '  %s\n' "$line"
+    ES_VIOLATIONS=$((ES_VIOLATIONS + 1))
+done < <(grep -rEn \
+            'encrypted_secrets:[[:space:]]*(EncryptedSecrets::)?Default::default\(\)' \
+            --include='*.rs' \
+            --exclude-dir=target \
+            --exclude-dir=tests \
+            controller/src worker/src talos-engine talos-workflow-engine \
+            talos-workflow-engine-nats talos-execution-orchestration \
+            talos-continuation-trigger talos-webhooks talos-google-calendar \
+            talos-gmail talos-replay-service talos-jobs talos-rpc-subscribers \
+            talos-hot-update-service talos-inline-compile-service \
+            2>/dev/null \
+        || true)
+
+if [ "$ES_VIOLATIONS" -gt 0 ]; then
+    red "✗ found $ES_VIOLATIONS sites"
+    yellow "  → use build_encrypted_secrets() / encrypt_secrets_for_job()"
+    yellow "  → or add // allow-empty-encrypted-secrets: <reason> if intentional"
+    EXIT_CODE=1
+else
+    green "✓ no encrypted_secrets: Default::default() in dispatch paths"
+fi
+echo
+
+# ── 18. bare .sign() on JobResult / PipelineJobResult in worker ────────
+bold "▶ check 18: JobResult/.sign() in worker (must use sign_with_worker_id)"
+
+# L-11 (2026-05-22): production worker code MUST bind worker identity
+# into every signed JobResult / PipelineJobResult via
+# .sign_with_worker_id(key, worker_identity()). The back-compat
+# .sign(key) wrapper is retained ONLY for test fixtures that don't
+# care about per-worker attribution. Without this lint, a future
+# contributor adding a new dispatch path could call the back-compat
+# wrapper and quietly degrade the audit-trail forensic guarantee.
+#
+# This check fires only on `worker/src/**/*.rs`. The protocol crate's
+# own tests + the JobRequest::sign (request, not result) flows are
+# out of scope.
+RESULT_SIGN_VIOLATIONS=0
+while IFS= read -r line; do
+    file="$(echo "$line" | cut -d: -f1)"
+    case "$file" in
+        */tests/*|*_tests.rs)
+            continue
+            ;;
+    esac
+    # Match `<ident>.sign(` where the receiver is a JobResult or
+    # PipelineJobResult — heuristic: the variable name contains
+    # "result" or "replacement" (used in truncate_oversized_*).
+    if echo "$line" | grep -qiE '\b(result|replacement)\.sign\('; then
+        # Skip the canonical sign_with_worker_id call (it contains
+        # the literal "_with_worker_id" right after `.sign`).
+        if echo "$line" | grep -q '\.sign_with_worker_id'; then
+            continue
+        fi
+        printf '  %s\n' "$line"
+        RESULT_SIGN_VIOLATIONS=$((RESULT_SIGN_VIOLATIONS + 1))
+    fi
+done < <(grep -rEn '\.sign\(' \
+            --include='*.rs' \
+            --exclude-dir=target \
+            worker/src 2>/dev/null \
+        || true)
+
+if [ "$RESULT_SIGN_VIOLATIONS" -gt 0 ]; then
+    red "✗ found $RESULT_SIGN_VIOLATIONS sites in worker/src using bare .sign()"
+    yellow "  → use .sign_with_worker_id(key, worker_identity())"
+    yellow "  → see L-11 in talos-workflow-job-protocol/src/lib.rs"
+    EXIT_CODE=1
+else
+    green "✓ all JobResult/PipelineJobResult signs in worker use sign_with_worker_id"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
