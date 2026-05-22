@@ -313,6 +313,118 @@ pub fn is_tier2_llm_vault_path(vault_path: &str) -> bool {
     is_llm_provider_vault_path(vault_path)
 }
 
+/// Postgres function names that WASM modules must never invoke from
+/// `database::execute_query`. Canonical single-source-of-truth for both
+/// the worker (`worker::sql_validator`) and the controller's database-RPC
+/// re-parse path (`talos-rpc-subscribers`).
+///
+/// **Why a function deny-list is needed.** The statement-level deny-list
+/// blocks `COPY`, `SET ROLE`, `PREPARE`, etc. — but a benign-looking
+/// `SELECT pg_read_server_files('/etc/passwd')` parses as a Query and
+/// passes every other gate. The validator must walk `Expr::Function`
+/// nodes inside SELECT bodies and refuse any whose unqualified name (or
+/// `pg_catalog.*` qualified form) appears below.
+///
+/// **Three risk classes:**
+///
+/// 1. **Filesystem read.** `pg_read_server_files` / `pg_read_file` /
+///    `pg_read_binary_file` / `pg_ls_dir` / `pg_stat_file` /
+///    `pg_ls_logdir` / `pg_ls_waldir` / `pg_ls_archive_statusdir` /
+///    `pg_ls_tmpdir` — read arbitrary files on the database host. The
+///    `talos_guest` role wrap (M-2) revokes EXECUTE where possible, but
+///    PUBLIC keeps the default grant on many of these in stock
+///    PostgreSQL — relying on the role alone is fragile. Block AST-side
+///    for defense in depth.
+///
+/// 2. **Sleep / budget burn.** `pg_sleep` / `pg_sleep_for` /
+///    `pg_sleep_until` — consume the full `statement_timeout` (60 s
+///    default) without releasing the controller-side semaphore permit
+///    (`MAX_IN_FLIGHT = 8`). 8 concurrent sleeping queries from a
+///    malicious actor stalls every other actor's DB RPC for the
+///    timeout window. Combined with the 500 queries-per-execution
+///    cap, the validator catches the DoS vector at parse time.
+///
+/// 3. **Backend / config manipulation.** `pg_terminate_backend` /
+///    `pg_cancel_backend` — kill arbitrary Postgres sessions belonging
+///    to other tenants. `pg_reload_conf` / `pg_rotate_logfile` —
+///    operator-only maintenance ops. `lo_import` / `lo_export` —
+///    large-object FS I/O (the LO equivalent of `COPY FROM/TO`).
+///
+/// **Match rules:**
+///
+/// - Case-insensitive (Postgres normalises identifier case to lower for
+///   unquoted identifiers; `PG_SLEEP(1)` is the same call as `pg_sleep(1)`).
+/// - Matches both bare (`pg_sleep`) and schema-qualified (`pg_catalog.pg_sleep`)
+///   forms — the visitor handles the schema strip before consulting this
+///   list.
+/// - Does NOT match user-defined functions with the same name. User code
+///   that defines a `public.pg_sleep` is a footgun on its own (search_path
+///   shadowing) and the validator can't disambiguate from the AST alone;
+///   the role-wrap (M-2) is the fence for that case.
+///
+/// **Extending the list.** Adding a new entry requires updating both the
+/// worker tests (`worker/src/sql_validator.rs`) and the controller-side
+/// mirror tests (`talos-rpc-subscribers`). The deliberate-duplication
+/// comment in the subscriber documents why both sides exist.
+pub const DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
+    // ── Filesystem read ─────────────────────────────────────────────────
+    "pg_read_server_files",
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_stat_file",
+    "pg_ls_logdir",
+    "pg_ls_waldir",
+    "pg_ls_archive_statusdir",
+    "pg_ls_tmpdir",
+    // ── Sleep / budget burn ─────────────────────────────────────────────
+    "pg_sleep",
+    "pg_sleep_for",
+    "pg_sleep_until",
+    // ── Backend control ─────────────────────────────────────────────────
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    // ── Config / maintenance ────────────────────────────────────────────
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_promote",
+    // ── Large object FS I/O (lo_import / lo_export) ─────────────────────
+    "lo_import",
+    "lo_export",
+    // ── dblink — bypass network egress controls via PG-side connection ──
+    "dblink",
+    "dblink_exec",
+    "dblink_connect",
+    "dblink_send_query",
+    "dblink_open",
+    // ── PL/perl / PL/python untrusted variants — RCE via stored proc ────
+    // These are typically not installed but if they ARE installed in the
+    // operator's cluster, calling them from guest SQL is RCE.
+    "plperlu_call_handler",
+    "plpythonu_call_handler",
+    "plpython3u_call_handler",
+];
+
+/// True iff `name` (case-insensitive, schema component already stripped)
+/// appears in [`DISALLOWED_SQL_FUNCTIONS`]. The schema strip is the
+/// caller's responsibility — the AST visitor walks `ObjectName` and
+/// passes the trailing identifier here, also re-checking the `pg_catalog`
+/// qualified form because user code may write `pg_catalog.pg_sleep` to
+/// bypass search-path tricks.
+///
+/// Constant-time match isn't needed — function names are not secrets and
+/// the entire deny-list is public. The linear scan over ~25 short strings
+/// is faster than the hash-table setup cost.
+pub fn is_disallowed_sql_function(name: &str) -> bool {
+    // Lowercase comparison. PG normalises unquoted identifiers to lower
+    // at parse time, but sqlparser preserves the original case so we
+    // normalise here for the comparison.
+    let lower = name.to_ascii_lowercase();
+    DISALLOWED_SQL_FUNCTIONS
+        .iter()
+        .any(|denied| *denied == lower.as_str())
+}
+
 /// True iff `path` is consumed by a controller-internal subsystem (LLM
 /// client cache, OAuth refresh loop) rather than by any WASM module's
 /// `allowed_secrets` grant. Used by the orphaned-secrets hygiene check
@@ -437,6 +549,107 @@ mod llm_provider_path_tests {
         assert!(!is_controller_internal_vault_path(""));
         assert!(!is_controller_internal_vault_path("github/pat"));
         assert!(!is_controller_internal_vault_path("custom/secret"));
+    }
+}
+
+// ============================================================================
+// Wasm-security review 2026-05-22 (MEDIUM-1): SQL function deny-list tests
+// ============================================================================
+#[cfg(test)]
+mod disallowed_sql_function_tests {
+    use super::{is_disallowed_sql_function, DISALLOWED_SQL_FUNCTIONS};
+
+    #[test]
+    fn every_canonical_entry_is_matched() {
+        // Tripwire: if the const and the matcher ever drift the matcher
+        // would silently miss entries the operator THOUGHT were blocked.
+        for f in DISALLOWED_SQL_FUNCTIONS {
+            assert!(
+                is_disallowed_sql_function(f),
+                "canonical deny-list entry `{f}` is not matched by is_disallowed_sql_function"
+            );
+        }
+    }
+
+    #[test]
+    fn match_is_case_insensitive() {
+        // PG normalises unquoted identifiers to lower; `PG_SLEEP(1)`,
+        // `Pg_Sleep(1)`, and `pg_sleep(1)` are the same call. The
+        // sqlparser AST may preserve original case, so the matcher
+        // must normalise.
+        assert!(is_disallowed_sql_function("PG_SLEEP"));
+        assert!(is_disallowed_sql_function("Pg_Sleep"));
+        assert!(is_disallowed_sql_function("pg_sleep"));
+        assert!(is_disallowed_sql_function("PG_READ_SERVER_FILES"));
+        assert!(is_disallowed_sql_function("LO_IMPORT"));
+    }
+
+    #[test]
+    fn unrelated_function_names_not_matched() {
+        // Tripwire against an overly-broad refactor (e.g. switching to
+        // a `starts_with("pg_")` check that would block legitimate
+        // user functions like `pg_my_custom_func`).
+        for f in [
+            "count",
+            "sum",
+            "now",
+            "current_user",
+            "json_agg",
+            "row_number",
+            "version", // Note: version() is allowed (read-only info)
+            "pg_typeof", // diagnostic, no escalation
+            "pg_my_custom_business_func",
+        ] {
+            assert!(
+                !is_disallowed_sql_function(f),
+                "benign function `{f}` must NOT be matched by the deny-list"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_string_not_matched() {
+        // Edge case: empty function name (shouldn't happen from the
+        // parser, but defensively).
+        assert!(!is_disallowed_sql_function(""));
+    }
+
+    #[test]
+    fn deny_list_covers_three_risk_classes() {
+        // Pin the categorical coverage so a future refactor that drops
+        // any class (e.g. "let's only block filesystem reads") shows up
+        // as a failing test rather than a silent policy regression.
+
+        // Filesystem read
+        for f in [
+            "pg_read_server_files",
+            "pg_read_file",
+            "pg_read_binary_file",
+            "pg_ls_dir",
+            "pg_stat_file",
+        ] {
+            assert!(is_disallowed_sql_function(f), "filesystem-read `{f}` must be denied");
+        }
+
+        // Sleep / budget burn
+        for f in ["pg_sleep", "pg_sleep_for", "pg_sleep_until"] {
+            assert!(is_disallowed_sql_function(f), "sleep `{f}` must be denied");
+        }
+
+        // Backend control / config
+        for f in [
+            "pg_terminate_backend",
+            "pg_cancel_backend",
+            "pg_reload_conf",
+            "pg_rotate_logfile",
+        ] {
+            assert!(is_disallowed_sql_function(f), "backend-control `{f}` must be denied");
+        }
+
+        // Large-object I/O + dblink network bypass
+        for f in ["lo_import", "lo_export", "dblink", "dblink_connect"] {
+            assert!(is_disallowed_sql_function(f), "io/dblink `{f}` must be denied");
+        }
     }
 }
 

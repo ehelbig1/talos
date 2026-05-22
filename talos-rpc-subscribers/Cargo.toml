@@ -15,12 +15,23 @@ serde_json.workspace = true
 # as defense-in-depth against worker↔Postgres parser-divergence. Same
 # version as the worker uses so both sides agree on what's a single
 # statement.
-sqlparser = "0.53"
+#
+# Wasm-security review 2026-05-22 (MEDIUM-1): `visitor` feature
+# enabled so the controller can mirror the worker's AST walk for
+# `Expr::Function` deny-list checks (filesystem-reading / sleep /
+# backend-killing pg_* functions that the statement-level deny-list
+# misses).
+sqlparser = { version = "0.53", features = ["visitor"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
+# Wasm-security review 2026-05-22 (MEDIUM-1): canonical SQL function
+# deny-list lives here so worker + controller subscriber agree byte-
+# identically. Same single-source-of-truth pattern as
+# `LLM_PROVIDER_VAULT_PATHS` / `EXTERNAL_LLM_HOSTS`.
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
