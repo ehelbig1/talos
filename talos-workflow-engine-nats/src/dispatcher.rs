@@ -282,9 +282,19 @@ pub(crate) async fn execute_job_with_retry(
                 let job_result: JobResult = serde_json::from_slice(&response)
                     .map_err(|e| format!("Failed to parse job result: {}", e))?;
 
-                // Verify signature if worker key is available
+                // Verify signature if worker key is available.
+                // L-4: typed Primary verifier — this dispatcher is the
+                // sole inline consumer of the reply on this inbox, and
+                // it converts the result into the engine's durable
+                // side effect. Any audit observer subscribing to a
+                // separate `talos.results.*` topic uses
+                // `Verifier::Observer` (see controller/src/main.rs).
                 if let Some(key) = worker_shared_key {
-                    if let Err(e) = job_result.verify(key, 300) {
+                    if let Err(e) = job_result.verify_as(
+                        key,
+                        300,
+                        talos_workflow_job_protocol::Verifier::Primary,
+                    ) {
                         return Err(format!("Job result signature verification failed: {}", e));
                     }
                 }
@@ -897,8 +907,14 @@ impl NodeDispatcher for NatsNodeDispatcher {
         let result: PipelineJobResult = serde_json::from_slice(&response_bytes)
             .map_err(|e| -> BoxError { format!("Failed to parse pipeline result: {e}").into() })?;
         if let Some(key) = self.worker_shared_key.as_ref() {
+            // L-4: PipelineJobResult Primary verifier — same role as
+            // the JobResult dispatcher above.
             result
-                .verify(key.as_bytes(), 300)
+                .verify_as(
+                    key.as_bytes(),
+                    300,
+                    talos_workflow_job_protocol::Verifier::Primary,
+                )
                 .map_err(|e| -> BoxError {
                     format!("Pipeline result signature verification failed: {e}").into()
                 })?;

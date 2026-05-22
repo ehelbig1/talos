@@ -11,10 +11,10 @@
 //! indirectly through the public host API.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use wasmtime::ResourceLimiter;
 use worker::context::TalosContext;
+use worker::expose_fallback::ExposeFallback;
 use worker::CapabilityWorld;
 
 // ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ fn make_context_with(world: CapabilityWorld, max_memory_mb: usize) -> TalosConte
         None,
         false,
         None,
-        Arc::new(AtomicU64::new(0)),
+        Arc::new(ExposeFallback::new()),
     )
     .expect("failed to create TalosContext")
 }

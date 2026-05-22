@@ -1623,9 +1623,19 @@ impl ParallelWorkflowEngine {
     /// Thin wrapper around [`build_encrypted_secrets_for`] that sources
     /// `vault_paths` from the node's own config and has no additional
     /// declared paths. Prefer this form on call sites that hold `&self`.
+    ///
+    /// L-1 (2026-05-22): binds the dispatching `execution_id` as
+    /// AEAD AAD on the AES-GCM tag. The worker decrypts with the
+    /// same AAD (from `JobRequest.workflow_execution_id`) — a
+    /// ciphertext transposed between executions under the same
+    /// shared key fails decryption at the worker, providing an
+    /// in-protocol integrity gate independent of the JobRequest
+    /// HMAC. The caller passes `execution_id` because the engine
+    /// itself doesn't hold one — it's a per-dispatch parameter.
     pub(crate) async fn build_encrypted_secrets(
         &self,
         node_id: Uuid,
+        execution_id: Uuid,
         worker_shared_key: &Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> talos_workflow_job_protocol::EncryptedSecrets {
         let (Some(resolver), Some(key)) = (self.secrets_resolver.as_ref(), worker_shared_key)
@@ -1646,6 +1656,7 @@ impl ParallelWorkflowEngine {
             &[],
             key.as_bytes(),
             self.max_llm_tier,
+            execution_id.as_bytes(),
         )
         .await
     }

@@ -1134,6 +1134,10 @@ impl WebhookRouter {
                             Some(&secrets_manager),
                             module_id,
                             user_id,
+                            // L-1: AAD = job_id (= workflow_execution_id
+                            // below). The worker's decrypt AAD will be
+                            // pulled from `workflow_execution_id`.
+                            job_id,
                         )
                         .await;
                     let mut req = talos_workflow_job_protocol::JobRequest {
@@ -1217,12 +1221,15 @@ impl WebhookRouter {
                     // rule, and we use NATS request-reply with an
                     // auto-generated inbox subject — the controller's
                     // `talos.results.*` subscriber does not see this
-                    // payload). So `verify()` (primary, inserts into
-                    // JOB_NONCE_CACHE) is correct here, matching the engine
-                    // dispatcher pattern in
-                    // talos-workflow-engine-nats/src/dispatcher.rs:198.
+                    // payload). L-4: `Verifier::Primary` makes the role
+                    // explicit at the call site — this is the canonical
+                    // primary verifier for results on this reply inbox.
                     if let Some(key) = &worker_shared_key_clone {
-                        if let Err(e) = result.verify(key.as_bytes(), 300) {
+                        if let Err(e) = result.verify_as(
+                            key.as_bytes(),
+                            300,
+                            talos_workflow_job_protocol::Verifier::Primary,
+                        ) {
                             tracing::warn!(
                                 trigger_id = %trigger_id,
                                 "Webhook job result signature verification failed: {}",
@@ -2443,6 +2450,10 @@ impl WebhookRouter {
                             Some(&secrets_manager),
                             module_id,
                             user_id,
+                            // L-1: AAD = job_id (= workflow_execution_id
+                            // above). DLQ replay reuses the same id
+                            // shape as the live path.
+                            job_id,
                         )
                         .await,
                     timeout_ms: 3_000,

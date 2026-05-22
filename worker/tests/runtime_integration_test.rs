@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use worker::expose_fallback::ExposeFallback;
 use worker::wit_inspector::CapabilityWorld;
 use worker::TalosRuntime;
 
@@ -106,7 +106,7 @@ async fn test_runtime_resource_limiting() {
         None,
         false,
         None,
-        Arc::new(AtomicU64::new(0)),
+        Arc::new(ExposeFallback::new()),
     )
     .unwrap();
 

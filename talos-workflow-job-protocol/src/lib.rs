@@ -7,7 +7,7 @@
 //! - A `job_nonce` (timestamp + random hex) is included to prevent replay attacks.
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use hmac::{Hmac, Mac};
@@ -27,6 +27,50 @@ type HmacSha256 = Hmac<Sha256>;
 /// `FUTURE_SKEW + max_age_secs` total). A 5 s ≈ 5000 ms asymmetric
 /// window is a common choice for signed-NATS RPC.
 const MAX_FUTURE_SKEW_SECS: u64 = 5;
+
+// ============================================================================
+// Verifier role marker (L-4, 2026-05-22)
+// ============================================================================
+//
+// Pre-r300/r301 the controller had two consumers of every JobResult —
+// the primary inline dispatcher AND a background audit subscriber —
+// and BOTH called `verify()`, which inserts the result nonce into the
+// process-local `JOB_NONCE_CACHE`. The second verifier always lost
+// the race with "result_nonce already seen", failing every workflow.
+// The fix was twofold: (a) the worker single-publishes each result
+// to one subject; (b) the split `verify` / `verify_no_replay` API.
+//
+// `verify` / `verify_no_replay` are still correct, but the choice
+// between them is encoded only in the method name — a future caller
+// can grep for one and copy-paste it into the wrong role. The
+// `Verifier` enum forces the caller to declare intent at the type
+// level, and `verify_as` dispatches on it. New code should prefer
+// this API; the bare `verify` / `verify_no_replay` are kept for
+// existing callers and tests.
+
+/// L-4 marker that selects which verification flavour a caller wants.
+///
+/// Declaring intent at the type level prevents the regression class
+/// behind the r300 incident: an audit subscriber accidentally calling
+/// `verify()` instead of `verify_no_replay()` and racing the primary
+/// verifier into "result_nonce already seen" errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verifier {
+    /// **Primary** verifier: the single inline consumer that converts
+    /// the signed result into a durable side effect (DB write, reply
+    /// to a NATS request inbox, return to a webhook caller). Records
+    /// the nonce in the process-local replay cache so the same
+    /// signed result cannot be applied twice. There must be EXACTLY
+    /// ONE primary verifier per result per controller process.
+    Primary,
+    /// **Observer** verifier: a passive consumer (audit subscriber,
+    /// metrics emitter) whose only side effect is idempotent under
+    /// replay. HMAC + freshness are checked; the nonce is NOT
+    /// inserted into the replay cache. Use this whenever the same
+    /// signed result might reach another consumer that already runs
+    /// as the [`Primary`](Self::Primary).
+    Observer,
+}
 
 // ============================================================================
 // Replay-resistant nonce cache (single-use within freshness window)
@@ -542,13 +586,59 @@ impl talos_workflow_engine_core::SecretEnvelope for AesGcmSecretEnvelope {
             .map_err(|e| -> talos_workflow_engine_core::BoxError { e.into() })?;
         Ok((enc.ciphertext, enc.nonce))
     }
+
+    /// L-1: override the default to actually bind `aad` into the
+    /// AES-GCM tag.
+    async fn seal_with_aad(
+        &self,
+        secrets: &HashMap<String, String>,
+        shared_key: &[u8],
+        aad: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), talos_workflow_engine_core::BoxError> {
+        if secrets.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let enc = EncryptedSecrets::encrypt_with_aad(secrets, shared_key, aad)
+            .map_err(|e| -> talos_workflow_engine_core::BoxError { e.into() })?;
+        Ok((enc.ciphertext, enc.nonce))
+    }
 }
 
 impl EncryptedSecrets {
     /// Encrypt a secrets map using AES-256-GCM.
     ///
     /// `key` must be exactly 32 bytes (256 bits).
+    ///
+    /// L-1 (2026-05-22): backwards-compatible no-AAD wrapper. New
+    /// call sites should prefer [`Self::encrypt_with_aad`] passing
+    /// `job_id.as_bytes()` as the AAD — that ties the AES-GCM
+    /// authentication tag to the specific job and makes a transposed
+    /// ciphertext (lifted from one JobRequest into another with the
+    /// same shared key) fail to decrypt rather than relying solely
+    /// on the wider JobRequest HMAC to catch the tamper.
     pub fn encrypt(secrets: &HashMap<String, String>, key: &[u8]) -> Result<Self, String> {
+        Self::encrypt_with_aad(secrets, key, &[])
+    }
+
+    /// L-1: Encrypt a secrets map with `aad` bound into the AES-GCM
+    /// authentication tag.
+    ///
+    /// The recommended `aad` is the job identifier (e.g.
+    /// `job_id.as_bytes()`) — that produces an in-protocol binding
+    /// between the ciphertext and the JobRequest it travels in.
+    /// Decryption MUST be done with the same `aad` via
+    /// [`Self::decrypt_with_aad`]; otherwise the tag will not
+    /// validate and decryption will fail closed.
+    ///
+    /// Empty `aad` is equivalent to [`Self::encrypt`] — the
+    /// AES-GCM construction degenerates to "no AAD" and ciphertext
+    /// is byte-identical to the no-AAD path (assuming the same
+    /// nonce, which is randomly generated per call).
+    pub fn encrypt_with_aad(
+        secrets: &HashMap<String, String>,
+        key: &[u8],
+        aad: &[u8],
+    ) -> Result<Self, String> {
         if key.len() != 32 {
             return Err(format!(
                 "WORKER_SHARED_KEY must be 32 bytes, got {}",
@@ -572,7 +662,13 @@ impl EncryptedSecrets {
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad,
+                },
+            )
             .map_err(|e| format!("encrypt secrets: {e}"))?;
 
         Ok(Self {
@@ -584,7 +680,23 @@ impl EncryptedSecrets {
     /// Decrypt back into a secrets map.
     ///
     /// `key` must be the same 32-byte key used for encryption.
+    /// Backwards-compatible no-AAD wrapper — passes empty AAD.
+    /// Use [`Self::decrypt_with_aad`] for new call sites.
     pub fn decrypt(&self, key: &[u8]) -> Result<HashMap<String, String>, String> {
+        self.decrypt_with_aad(key, &[])
+    }
+
+    /// L-1: Decrypt with `aad` bound into the AES-GCM tag check.
+    ///
+    /// The AAD passed here MUST byte-equal the AAD used at encrypt
+    /// time. If they differ, the tag will not validate and this
+    /// method returns the standard "wrong key or tampered ciphertext"
+    /// error — same fail-closed surface as a bit-flipped ciphertext.
+    pub fn decrypt_with_aad(
+        &self,
+        key: &[u8],
+        aad: &[u8],
+    ) -> Result<HashMap<String, String>, String> {
         if key.len() != 32 {
             return Err(format!(
                 "WORKER_SHARED_KEY must be 32 bytes, got {}",
@@ -600,7 +712,13 @@ impl EncryptedSecrets {
         let nonce = Nonce::from_slice(&self.nonce);
 
         let plaintext = cipher
-            .decrypt(nonce, self.ciphertext.as_ref())
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: self.ciphertext.as_ref(),
+                    aad,
+                },
+            )
             .map_err(|_| "decryption failed — wrong key or tampered ciphertext".to_string())?;
 
         serde_json::from_slice(&plaintext).map_err(|e| format!("deserialize secrets: {e}"))
@@ -1139,6 +1257,25 @@ impl JobResult {
         Ok(())
     }
 
+    /// L-4 typed verifier: dispatches to [`Self::verify`] for
+    /// [`Verifier::Primary`] and [`Self::verify_no_replay`] for
+    /// [`Verifier::Observer`]. New code should prefer this method —
+    /// the role becomes explicit at the call site instead of being
+    /// encoded only in the method name.
+    pub fn verify_as(
+        &self,
+        key: &[u8],
+        max_age_secs: u64,
+        role: Verifier,
+    ) -> Result<(), String> {
+        match role {
+            Verifier::Primary => self.verify(key, max_age_secs),
+            Verifier::Observer => {
+                self.verify_no_replay(key, max_age_secs).map(|_| ())
+            }
+        }
+    }
+
     /// Verify HMAC signature and nonce freshness **without** recording
     /// the nonce in the replay cache. Returns the parsed timestamp on
     /// success, allowing the caller to chain a manual cache update if
@@ -1643,6 +1780,22 @@ impl PipelineJobResult {
         Ok(())
     }
 
+    /// L-4 typed verifier — same dispatch as
+    /// [`JobResult::verify_as`]. Use this method in new code.
+    pub fn verify_as(
+        &self,
+        key: &[u8],
+        max_age_secs: u64,
+        role: Verifier,
+    ) -> Result<(), String> {
+        match role {
+            Verifier::Primary => self.verify(key, max_age_secs),
+            Verifier::Observer => {
+                self.verify_no_replay(key, max_age_secs).map(|_| ())
+            }
+        }
+    }
+
     /// Verify HMAC signature and nonce freshness without recording the
     /// nonce in the replay cache. Returns the parsed timestamp on
     /// success.
@@ -1887,6 +2040,76 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// L-1: AAD round-trip — encrypt with AAD, decrypt with the same
+    /// AAD, get the original plaintext back.
+    #[test]
+    fn aad_round_trip_succeeds() {
+        let key = test_key();
+        let mut secrets = HashMap::new();
+        secrets.insert("anthropic/api_key".to_string(), "sk-xyz".to_string());
+        let aad = b"job:abc-123";
+        let enc = EncryptedSecrets::encrypt_with_aad(&secrets, &key, aad).unwrap();
+        let dec = enc.decrypt_with_aad(&key, aad).unwrap();
+        assert_eq!(dec, secrets);
+    }
+
+    /// L-1: decrypting with a DIFFERENT AAD must fail. This is the
+    /// core anti-transposition property — an attacker who lifts an
+    /// EncryptedSecrets blob from one JobRequest into another (under
+    /// the same shared key) cannot decrypt the lifted ciphertext if
+    /// the new JobRequest's AAD differs from the original.
+    #[test]
+    fn aad_mismatch_fails_decryption() {
+        let key = test_key();
+        let mut secrets = HashMap::new();
+        secrets.insert("anthropic/api_key".to_string(), "sk-xyz".to_string());
+        let enc = EncryptedSecrets::encrypt_with_aad(&secrets, &key, b"job:abc").unwrap();
+        // Same key, same ciphertext — but different AAD context.
+        let bad = enc.decrypt_with_aad(&key, b"job:zzz");
+        assert!(
+            bad.is_err(),
+            "decrypt with different AAD must fail (anti-transposition gate)"
+        );
+        let msg = bad.unwrap_err();
+        assert!(
+            msg.contains("decryption failed"),
+            "expected GCM tag error, got: {msg}"
+        );
+    }
+
+    /// L-1: backwards compatibility — `encrypt`/`decrypt` (no AAD)
+    /// continue to interoperate with each other. Critical so
+    /// existing dispatch paths that haven't migrated to the AAD form
+    /// keep working.
+    #[test]
+    fn no_aad_round_trip_still_works() {
+        let key = test_key();
+        let mut secrets = HashMap::new();
+        secrets.insert("k".to_string(), "v".to_string());
+        let enc = EncryptedSecrets::encrypt(&secrets, &key).unwrap();
+        let dec = enc.decrypt(&key).unwrap();
+        assert_eq!(dec, secrets);
+    }
+
+    /// L-1: encrypt-no-AAD + decrypt-with-AAD must fail. Confirms the
+    /// AES-GCM tag binding is one-way — there's no "matches when one
+    /// side is empty" silent-success path.
+    #[test]
+    fn mixed_aad_modes_fail_decryption() {
+        let key = test_key();
+        let mut secrets = HashMap::new();
+        secrets.insert("k".to_string(), "v".to_string());
+        let enc = EncryptedSecrets::encrypt(&secrets, &key).unwrap();
+        // Encrypted with empty AAD; decrypt with non-empty AAD.
+        let bad = enc.decrypt_with_aad(&key, b"any");
+        assert!(bad.is_err());
+
+        let enc2 = EncryptedSecrets::encrypt_with_aad(&secrets, &key, b"any").unwrap();
+        // Encrypted with AAD; decrypt with empty (legacy `decrypt`).
+        let bad2 = enc2.decrypt(&key);
+        assert!(bad2.is_err());
+    }
+
     #[test]
     fn test_replay_within_window_is_rejected() {
         // Sign a request, verify it once (admitted), then verify the
@@ -2050,6 +2273,85 @@ mod tests {
         result.sign(&key).unwrap();
         result.output_payload = serde_json::json!({"answer": 99}); // tamper
         assert!(result.verify(&key, 300).is_err());
+    }
+
+    /// L-4: `verify_as(Verifier::Primary)` matches `verify()` exactly —
+    /// records the nonce, so a second `Primary` call against the same
+    /// result trips the replay cache. `verify_as(Verifier::Observer)`
+    /// matches `verify_no_replay()` — no cache mutation, so repeated
+    /// `Observer` calls succeed and an `Observer` followed by a
+    /// `Primary` also succeeds (the primary records the nonce on its
+    /// first call).
+    #[test]
+    fn verifier_primary_records_replay_observer_does_not() {
+        let key = test_key();
+        let mut a = JobResult {
+            job_id: Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({}),
+            logs: vec![],
+            execution_time_ms: 1,
+            signature: vec![],
+            result_nonce: String::new(),
+        };
+        a.sign(&key).unwrap();
+
+        // Observer is idempotent — repeated calls succeed.
+        a.verify_as(&key, 300, Verifier::Observer).unwrap();
+        a.verify_as(&key, 300, Verifier::Observer).unwrap();
+
+        // Primary records the nonce — second Primary call must fail.
+        a.verify_as(&key, 300, Verifier::Primary).unwrap();
+        let second = a.verify_as(&key, 300, Verifier::Primary);
+        assert!(
+            second.is_err(),
+            "second Primary verify must trip the replay cache"
+        );
+        let msg = second.unwrap_err();
+        assert!(
+            msg.contains("already seen"),
+            "expected replay-cache error, got: {msg}"
+        );
+    }
+
+    /// L-4: an Observer-first-then-Primary sequence is the canonical
+    /// production pattern (audit subscriber runs concurrently with
+    /// the primary). Both must succeed; only the second Primary
+    /// would fail (covered by the test above).
+    #[test]
+    fn verifier_observer_then_primary_both_succeed() {
+        let key = test_key();
+        let mut a = JobResult {
+            job_id: Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({}),
+            logs: vec![],
+            execution_time_ms: 1,
+            signature: vec![],
+            result_nonce: String::new(),
+        };
+        a.sign(&key).unwrap();
+        a.verify_as(&key, 300, Verifier::Observer).unwrap();
+        a.verify_as(&key, 300, Verifier::Primary).unwrap();
+    }
+
+    /// L-4: tampering still gates both roles via the HMAC check.
+    #[test]
+    fn verifier_rejects_tampered_signature_in_both_roles() {
+        let key = test_key();
+        let mut a = JobResult {
+            job_id: Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"answer": 42}),
+            logs: vec![],
+            execution_time_ms: 1,
+            signature: vec![],
+            result_nonce: String::new(),
+        };
+        a.sign(&key).unwrap();
+        a.output_payload = serde_json::json!({"answer": 99});
+        assert!(a.verify_as(&key, 300, Verifier::Observer).is_err());
+        assert!(a.verify_as(&key, 300, Verifier::Primary).is_err());
     }
 
     #[test]

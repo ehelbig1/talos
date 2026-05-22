@@ -78,10 +78,15 @@ pub struct TalosContext {
     /// raw secret values.
     pub allow_tier2_exposure: bool,
 
-    /// In-memory fallback counter for global Tier-2 expose-secret rate limiting.
-    /// Used when Redis is unavailable to avoid failing open on the daily per-user limit.
-    /// Shared across all executions in this worker process via Arc<AtomicU64>.
-    pub global_expose_fallback_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Per-user in-memory fallback counter for the Tier-2 `expose_secret`
+    /// daily cap, used when Redis is unavailable or unconfigured.
+    ///
+    /// M-2 (2026-05-22): the prior `Arc<AtomicU64>` was process-wide, so
+    /// one tenant exhausting the counter starved every other tenant on
+    /// that worker until the pod restarted. The current shape isolates
+    /// per `(user_id, date)` and self-resets at the day rollover. Shared
+    /// across all executions via `Arc<ExposeFallback>`.
+    pub global_expose_fallback: std::sync::Arc<crate::expose_fallback::ExposeFallback>,
 
     /// Workflow ID for tracing / logging.
     pub workflow_id: Option<String>,
@@ -317,6 +322,48 @@ impl StdoutStream for ChannelStdout {
     }
 }
 
+/// L-5 (2026-05-22): null sink for WASI stdout when no `token_sender`
+/// channel is wired. Pre-fix the worker called `builder.inherit_stdout()`,
+/// which routed guest stdout to the worker process's own stdout. A
+/// per-Store dropped after execution bounds the cross-job confidentiality
+/// risk, but inherited stdout mingled guest output with worker logs and
+/// could fill operator log volumes from a chatty (or hostile) module.
+/// The null sink discards all writes — the WASI guest sees a successful
+/// write so it doesn't burn fuel on retry. Pair with an explicit
+/// `token_sender` channel if the operator wants stdout captured.
+#[derive(Clone, Copy, Default)]
+struct NullStdout;
+
+impl IsTerminal for NullStdout {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for NullStdout {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(NullWriter)
+    }
+}
+
+struct NullWriter;
+
+impl AsyncWrite for NullWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Captures WASI stderr writes (e.g. panic messages) into an in-process buffer.
 /// The Arc<Mutex<Vec<u8>>> is shared between the WasiCtx and the outer runtime
 /// so that panic text can be read after the Store is consumed.
@@ -443,7 +490,7 @@ impl TalosContext {
         nats_client: Option<Arc<async_nats::Client>>,
         allow_wasi_network: bool,
         token_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-        global_expose_fallback_count: Arc<std::sync::atomic::AtomicU64>,
+        global_expose_fallback: Arc<crate::expose_fallback::ExposeFallback>,
     ) -> anyhow::Result<Self> {
         // ── Ephemeral sandbox ────────────────────────────────────────────────
         // Create the per-execution temporary directory.  It is automatically
@@ -473,7 +520,13 @@ impl TalosContext {
         if let Some(tx) = token_sender {
             builder.stdout(ChannelStdout { sender: tx });
         } else {
-            builder.inherit_stdout();
+            // L-5: discard guest stdout when no capture channel is
+            // wired. Inheriting the worker process's stdout would
+            // commingle untrusted guest output with operator logs and
+            // let a chatty module bloat log volumes — even though each
+            // Store is dropped per-job so confidentiality across jobs
+            // is bounded.
+            builder.stdout(NullStdout);
         }
 
         // Capture WASI stderr into an in-process buffer instead of inheriting the
@@ -707,7 +760,7 @@ impl TalosContext {
             expose_call_count: std::sync::atomic::AtomicU64::new(0),
             secret_tier2_exposed: std::sync::atomic::AtomicBool::new(false),
             allow_tier2_exposure: false,
-            global_expose_fallback_count,
+            global_expose_fallback,
             workflow_id: None,
             execution_id: None,
             module_id: None,

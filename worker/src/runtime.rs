@@ -749,10 +749,11 @@ pub struct TalosRuntime {
     /// Populated from the `WASM_RESULT_CACHE_TTL_SECS` env var at runtime
     /// construction to avoid repeated lookups.
     default_result_cache_ttl_secs: Option<u64>,
-    /// In-memory fallback counter for global Tier-2 expose-secret rate limiting.
-    /// Shared across ALL executions in this worker process. Used when Redis is
-    /// unavailable to avoid failing open on the daily per-user limit.
-    global_expose_fallback_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-user in-memory fallback for the Tier-2 `expose_secret` daily
+    /// cap. Shared across ALL executions in this worker process via
+    /// `Arc<ExposeFallback>` — see [`crate::expose_fallback`] for the
+    /// M-2 tenant-isolation rationale.
+    global_expose_fallback: Arc<crate::expose_fallback::ExposeFallback>,
 }
 
 // ── Linker builders ──────────────────────────────────────────────────────────
@@ -1548,7 +1549,7 @@ impl TalosRuntime {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|n| *n > 0),
-            global_expose_fallback_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            global_expose_fallback: Arc::new(crate::expose_fallback::ExposeFallback::new()),
         })
     }
 
@@ -2037,7 +2038,7 @@ impl TalosRuntime {
             self.nats_client.clone(),
             allow_wasi_network,
             token_sender,
-            self.global_expose_fallback_count.clone(),
+            self.global_expose_fallback.clone(),
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.
@@ -2458,7 +2459,7 @@ impl TalosRuntime {
             self.nats_client.clone(),
             allow_wasi_network,
             stdout_sender,
-            self.global_expose_fallback_count.clone(),
+            self.global_expose_fallback.clone(),
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.
@@ -2708,7 +2709,7 @@ impl TalosRuntime {
                 self.nats_client.clone(),
                 allow_wasi_network,
                 None,
-                self.global_expose_fallback_count.clone(),
+                self.global_expose_fallback.clone(),
             )?;
             // Attach OpenTelemetry metrics so host functions can record events.
             if let Some(ref m) = self.metrics {
@@ -3215,7 +3216,7 @@ impl TalosRuntime {
             self.nats_client.clone(),
             allow_wasi_network,
             None,
-            self.global_expose_fallback_count.clone(),
+            self.global_expose_fallback.clone(),
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.

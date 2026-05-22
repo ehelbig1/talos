@@ -181,6 +181,11 @@ impl ParallelWorkflowEngine {
                 .unwrap_or(module_default_fuel)
                 .min(self.max_fuel_per_node);
 
+            // L-1: AAD = execution_id binds each step's AES-GCM tag to
+            // this dispatch. All steps in a pipeline share the same AAD
+            // because they share an execution_id — that's deliberate;
+            // step-level granularity is enforced by the wider JobRequest
+            // HMAC over the step list.
             let encrypted_secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
                 (Some(resolver), Some(key)) => {
                     build_encrypted_secrets_for(
@@ -192,6 +197,7 @@ impl ParallelWorkflowEngine {
                         &[],
                         key.as_bytes(),
                         self.max_llm_tier,
+                        execution_id.as_bytes(),
                     )
                     .await
                 }

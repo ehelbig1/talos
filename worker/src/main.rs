@@ -37,6 +37,7 @@ mod audit;
 mod bindings;
 mod circuit_breaker;
 mod context;
+mod expose_fallback;
 mod host_impl;
 mod metrics;
 mod metrics_server;
@@ -69,14 +70,21 @@ const OCI_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 /// allocator's 128 MiB per-instance bound only protects memory
 /// inside wasmtime, not host-side `Vec` allocations).
 ///
-/// 64 MiB is well above any realistic Talos module — the largest
+/// M-1 (2026-05-22): tightened from 64 MiB → 32 MiB. The largest
 /// templates in the catalog are < 8 MiB AOT-compiled, < 1 MiB
-/// uncompiled — so this cap won't fire on legitimate traffic. Bump
-/// it (via `WORKER_MAX_OCI_LAYER_BYTES`) if a future template ever
-/// approaches the limit. Defense-in-depth check at both pre-pull
-/// (manifest's declared size) and post-pull (actual `data.len()`)
-/// because a malicious manifest can lie about layer size.
-const DEFAULT_MAX_OCI_LAYER_BYTES: u64 = 64 * 1024 * 1024;
+/// uncompiled, so 32 MiB is still ~4× headroom over realistic
+/// traffic. The pre-pull manifest check filters typical attacks
+/// using the manifest-declared (compressed) size, but a registry
+/// that lies about layer size — or serves a properly-signed
+/// compression-bomb payload (compressed << decompressed) — can
+/// drive the host allocator past the cap before the post-pull
+/// `data.len()` check at the call site sees it. Lowering the
+/// default ceiling reduces the OOM blast radius without affecting
+/// legitimate templates. Operators with bespoke large modules
+/// raise via `WORKER_MAX_OCI_LAYER_BYTES`; defense-in-depth
+/// check at both pre-pull (manifest's declared size) and
+/// post-pull (actual `data.len()`).
+const DEFAULT_MAX_OCI_LAYER_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Env-configurable override for [`DEFAULT_MAX_OCI_LAYER_BYTES`].
 /// `0` / unset / malformed → use the default. Loaded lazily on
@@ -398,15 +406,31 @@ pub(crate) enum LayerVerdict<'a> {
 /// function — no I/O, no allocations beyond the sha256 itself — so it can be
 /// unit-tested without a registry. Called from the worker's OCI fetch path
 /// before the bytes are cached or executed.
+///
+/// L-2 (2026-05-22): comparison is constant-time via
+/// `subtle::ConstantTimeEq`. Neither input is secret here (manifest digest
+/// is public; the computed digest is recomputable from public bytes), so
+/// the timing-leak threat model doesn't strictly apply — but keeping the
+/// comparison constant-time matches the rest of the workspace's
+/// crypto-equality discipline (`talos_memory::rpc_auth`, AOT HMAC,
+/// `TALOS_COSIGN_SHA256`) and removes a sharp edge if this code is ever
+/// pasted into a key-dependent path.
 pub(crate) fn verify_oci_layer<'a>(
     layer_data: &[u8],
     manifest_digest: Option<&'a str>,
 ) -> LayerVerdict<'a> {
     use sha2::Digest as _;
+    use subtle::ConstantTimeEq as _;
     let computed = format!("sha256:{:x}", sha2::Sha256::digest(layer_data));
     match manifest_digest {
-        Some(expected) if expected == computed => LayerVerdict::Verified { digest: expected },
-        Some(expected) => LayerVerdict::DigestMismatch { expected, computed },
+        Some(expected) => {
+            let eq: bool = expected.as_bytes().ct_eq(computed.as_bytes()).into();
+            if eq {
+                LayerVerdict::Verified { digest: expected }
+            } else {
+                LayerVerdict::DigestMismatch { expected, computed }
+            }
+        }
         None => LayerVerdict::AcceptedUnverified,
     }
 }
@@ -1045,10 +1069,19 @@ async fn execute_job(
     }
 
     // SECURITY: Decrypt secrets from the encrypted payload.
+    // L-1 (2026-05-22): AAD = workflow_execution_id. Controller-side
+    // encryption binds this same identifier into the AES-GCM tag, so
+    // a ciphertext transposed between executions (under the same
+    // shared key) fails the tag check here. The execution_id is
+    // already HMAC-bound in the JobRequest signing payload, so it
+    // can't be tampered with on the wire.
     let secrets: HashMap<String, String> = if req.encrypted_secrets.is_empty() {
         HashMap::new()
     } else {
-        match req.encrypted_secrets.decrypt(shared_key.as_bytes()) {
+        match req
+            .encrypted_secrets
+            .decrypt_with_aad(shared_key.as_bytes(), req.workflow_execution_id.as_bytes())
+        {
             Ok(s) => s,
             Err(e) => {
                 ::tracing::error!(job_id = %req.job_id, error = %e, "Failed to decrypt job secrets");
@@ -2156,12 +2189,17 @@ async fn execute_pipeline_job(
     }
 
     // Build PipelineStepSpecs by decrypting per-step secrets.
+    // L-1: AAD = workflow_execution_id, shared across all steps in
+    // this pipeline (matches the encryption-side binding).
     let mut step_specs: Vec<PipelineStepSpec> = Vec::with_capacity(req.steps.len());
     for step in &req.steps {
         let secrets = if step.encrypted_secrets.is_empty() {
             std::collections::HashMap::new()
         } else {
-            match step.encrypted_secrets.decrypt(shared_key.as_bytes()) {
+            match step
+                .encrypted_secrets
+                .decrypt_with_aad(shared_key.as_bytes(), req.workflow_execution_id.as_bytes())
+            {
                 Ok(s) => s,
                 Err(e) => {
                     ::tracing::error!(job_id = %req.job_id, error = %e, "Failed to decrypt pipeline step secrets");
@@ -2389,10 +2427,31 @@ async fn main() -> anyhow::Result<()> {
                     // attack path. Most operators won't set this;
                     // sigstore-enforcement clusters that want defense
                     // in depth absolutely should.
-                    if let Some(expected_sha256) = std::env::var("TALOS_COSIGN_SHA256")
+                    //
+                    // L-3 (2026-05-22): under Required policy, advise
+                    // operators who run WITHOUT a hash pin that an
+                    // attacker with worker-pod write access (sidecar
+                    // exploit, init-container compromise) can swap the
+                    // cosign binary for a wrapper that always exits 0 —
+                    // bypassing every other Sigstore gate. Loud WARN at
+                    // startup so the gap is visible in production logs;
+                    // not fail-closed because Required-without-pin is a
+                    // legitimate (if weaker) deployment posture and the
+                    // pin requires per-image hash bookkeeping operators
+                    // may roll out separately from this code change.
+                    let cosign_pin = std::env::var("TALOS_COSIGN_SHA256")
                         .ok()
-                        .filter(|v| !v.is_empty())
-                    {
+                        .filter(|v| !v.is_empty());
+                    if cosign_pin.is_none() && sigstore_policy == SigstorePolicy::Required {
+                        ::tracing::warn!(
+                            policy = ?sigstore_policy,
+                            "TALOS_COSIGN_SHA256 not set under Required Sigstore policy — \
+                             cosign binary will not be hash-verified at startup. Set \
+                             TALOS_COSIGN_SHA256 to the sha256 of the bundled cosign \
+                             binary for defense-in-depth against binary-swap attacks."
+                        );
+                    }
+                    if let Some(expected_sha256) = cosign_pin {
                         match resolve_and_hash_cosign_binary().await {
                             Ok(actual) => {
                                 use subtle::ConstantTimeEq as _;
@@ -2520,6 +2579,33 @@ async fn main() -> anyhow::Result<()> {
     // sign their NATS requests. The controller registers the same
     // key on its side for verification (see controller/src/main.rs).
     talos_memory::rpc_auth::register_hmac_key(Arc::new(shared_key.as_bytes().to_vec()));
+
+    // M-3 (2026-05-22): log the SQL empty-allowlist policy at startup
+    // so operators can confirm the mode they're running. Default is
+    // `DenyMutations` (least-privilege); `AllowAllNonDdl` is the
+    // legacy permissive mode reachable via
+    // `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST=1`. Logged at INFO so it
+    // appears once at boot without spamming normal traffic.
+    {
+        let sql_policy = sql_validator::EmptyAllowlistPolicy::from_env();
+        match sql_policy {
+            sql_validator::EmptyAllowlistPolicy::DenyMutations => {
+                ::tracing::info!(
+                    policy = "DenyMutations",
+                    "SQL validator: empty allowlist permits SELECT/EXPLAIN only (default)"
+                );
+            }
+            sql_validator::EmptyAllowlistPolicy::AllowAllNonDdl => {
+                ::tracing::warn!(
+                    policy = "AllowAllNonDdl",
+                    "SQL validator: legacy permissive mode is enabled via \
+                     TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST — JobRequests with empty \
+                     allowed_sql_operations admit every non-DDL non-AlwaysBlocked \
+                     statement type. Prefer setting allowed_sql_operations explicitly."
+                );
+            }
+        }
+    }
 
     // ========================================================================
     // OBSERVABILITY INITIALIZATION

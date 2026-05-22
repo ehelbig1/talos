@@ -502,19 +502,91 @@ fn statement_returns_rows(stmt: &Statement) -> bool {
     }
 }
 
+/// Policy governing how an EMPTY `allowed_operations` slice is
+/// interpreted by [`validate_sql_with_policy`].
+///
+/// M-3 (2026-05-22): the legacy `validate_sql` contract treated an
+/// empty allowlist as "no restriction beyond DDL / always-blocked".
+/// That made INSERT / UPDATE / DELETE / MERGE / CALL permitted by
+/// default — which is a footgun if the controller dispatches a
+/// database-node job without explicitly setting `allowed_sql_operations`.
+/// The new default ([`DenyMutations`](Self::DenyMutations)) is
+/// least-privilege: empty allowlist permits only SELECT (and EXPLAIN,
+/// which is read-only). To enable mutations, the controller MUST
+/// dispatch a JobRequest with an explicit allowlist.
+///
+/// Operators with workflows that depend on the legacy permissive
+/// behaviour can opt back in with
+/// `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST=1`. Auditable in operator
+/// startup logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyAllowlistPolicy {
+    /// Empty allowlist permits only read-only statements (SELECT,
+    /// EXPLAIN). All mutations require an explicit allowlist entry.
+    /// The default in production.
+    DenyMutations,
+    /// Empty allowlist permits every non-DDL non-AlwaysBlocked
+    /// statement. The pre-M-3 behaviour. Legacy compatibility only;
+    /// `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST=1` opts back in.
+    AllowAllNonDdl,
+}
+
+impl EmptyAllowlistPolicy {
+    /// Resolve the policy from the worker's environment. Default is
+    /// `DenyMutations`. Truthy values that flip to legacy permissive
+    /// mode: `1` / `true` / `yes` (case-insensitive).
+    pub fn from_env() -> Self {
+        match std::env::var("TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("1") | Some("true") | Some("yes") => Self::AllowAllNonDdl,
+            _ => Self::DenyMutations,
+        }
+    }
+}
+
 /// Returns `Ok(ValidatedStmt)` describing the statement on success,
 /// or `Err(SqlValidationError)` if the query violates the policy.
+///
+/// Calls [`validate_sql_with_policy`] with the operator-configured
+/// [`EmptyAllowlistPolicy::from_env`] policy — the default in
+/// production is `DenyMutations`. Pass an explicit policy via
+/// [`validate_sql_with_policy`] in tests / call sites that need
+/// repeatable behaviour.
 ///
 /// Security properties:
 /// - **Fail-closed**: If the SQL cannot be parsed, it is rejected.
 /// - **Single-statement**: Only one statement per query is allowed.
 /// - **DDL blocked**: CREATE, DROP, ALTER, TRUNCATE, GRANT, REVOKE are always rejected.
-/// - **Allowlist enforcement**: If `allowed_operations` is non-empty, only listed types
-///   (plus SELECT which is always allowed) are permitted.
+/// - **Allowlist enforcement** (default `DenyMutations`):
+///     - Non-empty allowlist: only listed types plus SELECT/EXPLAIN are permitted.
+///     - Empty allowlist: only SELECT/EXPLAIN are permitted.
 /// - **CTE mutation detection**: Writable CTEs are checked against the allowlist.
 pub fn validate_sql(
     sql: &str,
     allowed_operations: &[String],
+) -> Result<ValidatedStmt, SqlValidationError> {
+    validate_sql_with_policy(sql, allowed_operations, empty_allowlist_policy())
+}
+
+/// Cached resolution of [`EmptyAllowlistPolicy::from_env`] so the env
+/// lookup happens once at first use, not on every host-fn call.
+fn empty_allowlist_policy() -> EmptyAllowlistPolicy {
+    use std::sync::OnceLock;
+    static POLICY: OnceLock<EmptyAllowlistPolicy> = OnceLock::new();
+    *POLICY.get_or_init(EmptyAllowlistPolicy::from_env)
+}
+
+/// Same as [`validate_sql`] but takes an explicit
+/// [`EmptyAllowlistPolicy`] instead of reading the operator env var.
+/// Used by tests and by call sites that need to override the default.
+pub fn validate_sql_with_policy(
+    sql: &str,
+    allowed_operations: &[String],
+    empty_policy: EmptyAllowlistPolicy,
 ) -> Result<ValidatedStmt, SqlValidationError> {
     let dialect = PostgreSqlDialect {};
 
@@ -570,15 +642,32 @@ pub fn validate_sql(
         check_cte_mutations(query, allowed_operations)?;
     }
 
-    // Enforce allowlist (SELECT is always permitted)
-    if !allowed_operations.is_empty() && stmt_type != "SELECT" {
-        let permitted = allowed_operations
-            .iter()
-            .any(|op| op.eq_ignore_ascii_case(stmt_type));
-        if !permitted {
-            return Err(SqlValidationError::DisallowedOperation(
-                stmt_type.to_string(),
-            ));
+    // M-3 (2026-05-22): empty allowlist no longer means "anything
+    // non-DDL goes". Under `DenyMutations`, only SELECT / EXPLAIN
+    // pass when the allowlist is empty — every mutation requires an
+    // explicit grant in the JobRequest. Legacy permissive behaviour
+    // is gated behind `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST=1`.
+    if stmt_type != "SELECT" && stmt_type != "EXPLAIN" {
+        if allowed_operations.is_empty() {
+            match empty_policy {
+                EmptyAllowlistPolicy::DenyMutations => {
+                    return Err(SqlValidationError::DisallowedOperation(
+                        stmt_type.to_string(),
+                    ));
+                }
+                EmptyAllowlistPolicy::AllowAllNonDdl => {
+                    // Fall through — legacy permissive mode admits.
+                }
+            }
+        } else {
+            let permitted = allowed_operations
+                .iter()
+                .any(|op| op.eq_ignore_ascii_case(stmt_type));
+            if !permitted {
+                return Err(SqlValidationError::DisallowedOperation(
+                    stmt_type.to_string(),
+                ));
+            }
         }
     }
 
@@ -665,12 +754,73 @@ mod tests {
         assert!(validate_sql("DELETE FROM t WHERE id = $1", &ops).is_ok());
     }
 
+    /// M-3 (2026-05-22): under the new default policy
+    /// (`DenyMutations`), an empty allowlist permits SELECT/EXPLAIN
+    /// only. Mutation statements are rejected as `DisallowedOperation`.
     #[test]
-    fn empty_allowlist_allows_all_non_ddl() {
-        // Empty allowlist = no restriction beyond DDL blocking
-        assert!(validate_sql("INSERT INTO t (a) VALUES ($1)", &[]).is_ok());
-        assert!(validate_sql("UPDATE t SET x = $1", &[]).is_ok());
-        assert!(validate_sql("DELETE FROM t WHERE id = $1", &[]).is_ok());
+    fn empty_allowlist_denies_mutations_by_default() {
+        assert!(matches!(
+            validate_sql("INSERT INTO t (a) VALUES ($1)", &[]).unwrap_err(),
+            SqlValidationError::DisallowedOperation(s) if s == "INSERT"
+        ));
+        assert!(matches!(
+            validate_sql("UPDATE t SET x = $1", &[]).unwrap_err(),
+            SqlValidationError::DisallowedOperation(s) if s == "UPDATE"
+        ));
+        assert!(matches!(
+            validate_sql("DELETE FROM t WHERE id = $1", &[]).unwrap_err(),
+            SqlValidationError::DisallowedOperation(s) if s == "DELETE"
+        ));
+        // SELECT / EXPLAIN still pass under the default.
+        assert!(validate_sql("SELECT 1", &[]).is_ok());
+        assert!(validate_sql("EXPLAIN SELECT 1", &[]).is_ok());
+    }
+
+    /// Legacy permissive behaviour is reachable via the explicit
+    /// policy override (operators set
+    /// `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST=1` to flip the env-based
+    /// default).
+    #[test]
+    fn empty_allowlist_permissive_policy_allows_mutations() {
+        let p = EmptyAllowlistPolicy::AllowAllNonDdl;
+        assert!(validate_sql_with_policy("INSERT INTO t (a) VALUES ($1)", &[], p).is_ok());
+        assert!(validate_sql_with_policy("UPDATE t SET x = $1", &[], p).is_ok());
+        assert!(validate_sql_with_policy("DELETE FROM t WHERE id = $1", &[], p).is_ok());
+    }
+
+    /// CALL / MERGE — newer mutation surfaces. Under the default
+    /// policy they're treated like INSERT/UPDATE/DELETE.
+    #[test]
+    fn empty_allowlist_denies_call_and_merge() {
+        assert!(matches!(
+            validate_sql("CALL my_procedure($1, $2)", &[]).unwrap_err(),
+            SqlValidationError::DisallowedOperation(_)
+        ));
+        // MERGE syntax can be PostgreSQL or Snowflake-dialect — both
+        // should hit the same gate.
+        let merge_sql =
+            "MERGE INTO target USING src ON target.id = src.id WHEN MATCHED THEN UPDATE SET val = src.val";
+        // sqlparser may or may not parse this in PostgreSqlDialect; if
+        // it does, we want DisallowedOperation, if not, ParseError —
+        // both are fail-closed.
+        let res = validate_sql(merge_sql, &[]);
+        assert!(matches!(
+            res.unwrap_err(),
+            SqlValidationError::DisallowedOperation(_) | SqlValidationError::ParseError(_)
+        ));
+    }
+
+    /// Explicit allowlist still works as documented: listed types
+    /// pass, unlisted are rejected.
+    #[test]
+    fn explicit_allowlist_overrides_default() {
+        let ops = vec!["INSERT".to_string()];
+        assert!(validate_sql("INSERT INTO t (a) VALUES ($1)", &ops).is_ok());
+        // UPDATE not in the list — denied even though INSERT is.
+        assert!(matches!(
+            validate_sql("UPDATE t SET x = $1", &ops).unwrap_err(),
+            SqlValidationError::DisallowedOperation(_)
+        ));
     }
 
     #[test]
@@ -712,14 +862,26 @@ mod tests {
 
     #[test]
     fn returns_correct_statement_type() {
+        // Mutation classifications round-trip through the validator
+        // with an explicit allowlist for each type (the post-M-3
+        // default rejects empty-allowlist mutations).
         assert_eq!(validate_sql("SELECT 1", &[]).unwrap().stmt_type, "SELECT");
         assert_eq!(
-            validate_sql("INSERT INTO t (a) VALUES (1)", &[]).unwrap().stmt_type,
+            validate_sql("INSERT INTO t (a) VALUES (1)", &["INSERT".to_string()])
+                .unwrap()
+                .stmt_type,
             "INSERT"
         );
-        assert_eq!(validate_sql("UPDATE t SET a = 1", &[]).unwrap().stmt_type, "UPDATE");
         assert_eq!(
-            validate_sql("DELETE FROM t WHERE id = 1", &[]).unwrap().stmt_type,
+            validate_sql("UPDATE t SET a = 1", &["UPDATE".to_string()])
+                .unwrap()
+                .stmt_type,
+            "UPDATE"
+        );
+        assert_eq!(
+            validate_sql("DELETE FROM t WHERE id = 1", &["DELETE".to_string()])
+                .unwrap()
+                .stmt_type,
             "DELETE"
         );
     }
@@ -745,7 +907,7 @@ mod tests {
 
     #[test]
     fn returns_rows_insert_without_returning_is_false() {
-        let v = validate_sql("INSERT INTO t (a) VALUES ($1)", &[]).unwrap();
+        let v = validate_sql("INSERT INTO t (a) VALUES ($1)", &["INSERT".to_string()]).unwrap();
         assert!(!v.returns_rows, "INSERT without RETURNING should not return rows");
     }
 
@@ -758,8 +920,11 @@ mod tests {
         // controller CTE-wrapped → PG rejected → INSERT never ran.
         // AST-based detection sees no Returning node in the Insert
         // AST and correctly returns false.
-        let v = validate_sql("INSERT INTO logs (msg) VALUES ('user returning home')", &[])
-            .unwrap();
+        let v = validate_sql(
+            "INSERT INTO logs (msg) VALUES ('user returning home')",
+            &["INSERT".to_string()],
+        )
+        .unwrap();
         assert!(
             !v.returns_rows,
             "string-literal 'returning' must not flip returns_rows"
