@@ -196,6 +196,32 @@ impl SecretProvider for TalosVaultProvider {
         // copies into HeaderValue's own buffer; the wrapper drops + wipes
         // when the binding goes out of scope.
         let raw: &str = entry.value.as_str(); // auditable plaintext exit point
+
+        // 2026-05-22 wasm-security review (L-1): defense-in-depth header
+        // injection guard. `http::HeaderValue::from_str` (reqwest's
+        // downstream gate) rejects CR/LF/NUL today, so a vault value
+        // containing `\r\nX-Injected: ...` is caught at header
+        // construction. We fail-closed HERE so:
+        //   1. The error fingers the offending vault path in the host
+        //      log instead of a generic "invalid header value" from
+        //      reqwest deep in the request stack.
+        //   2. Future call sites that bypass `HeaderValue` (raw socket
+        //      write, alternative HTTP client) inherit the guarantee
+        //      automatically.
+        //   3. The guard is wrapper-agnostic — the auth-scheme prefix
+        //      logic below operates on validated bytes.
+        // Reject rather than strip: silent sanitization masks a
+        // tampered vault value; the operator wants to know.
+        if let Some(bad) = raw
+            .bytes()
+            .find(|b| matches!(b, 0x00 | b'\r' | b'\n'))
+        {
+            anyhow::bail!(
+                "secret value for header '{header_name}' contains a forbidden control \
+                 byte (0x{bad:02x}); CR/LF/NUL would split HTTP headers — refusing"
+            );
+        }
+
         // MCP-509: HTTP auth schemes are case-insensitive per RFC 7235
         // §2.1. Pre-fix the case-sensitive `starts_with("Bearer ")` /
         // `starts_with("Basic ")` check would prepend `Bearer ` to a
@@ -391,6 +417,71 @@ mod tests {
                 stored,
                 "stored {:?} must pass through without double-prefix",
                 stored
+            );
+        }
+    }
+
+    /// 2026-05-22 wasm-security review (L-1): vault values containing
+    /// CR / LF / NUL must be rejected before they reach
+    /// `HeaderValue::from_str`. Lets the host log finger the offending
+    /// vault path rather than surfacing a generic "invalid header value"
+    /// error from deep inside reqwest. Belt-and-suspenders against a
+    /// future caller that bypasses `HeaderValue` (raw socket write,
+    /// alternative HTTP client) — the guard moves up the stack to the
+    /// vault boundary.
+    #[tokio::test]
+    async fn control_bytes_in_secret_are_rejected() {
+        for (label, bad_value) in [
+            ("crlf", "valid-prefix\r\nX-Injected: attacker"),
+            ("lone-lf", "valid\nX-Injected: attacker"),
+            ("lone-cr", "valid\rX-Injected: attacker"),
+            ("nul", "valid\0attacker"),
+            ("trailing-lf", "valid-token\n"),
+            ("embedded-crlf-mid", "abc\r\nX: y\r\ndef"),
+        ] {
+            let mut map = HashMap::new();
+            map.insert("test/bad".into(), bad_value.to_string());
+            let provider = TalosVaultProvider::from_resolved(map);
+            let handle = provider
+                .resolve("test/bad", uuid::Uuid::new_v4())
+                .await
+                .unwrap();
+            let result = provider.into_auth_header(handle, "Authorization");
+            assert!(
+                result.is_err(),
+                "{label}: value with control byte must be rejected, got {:?}",
+                result.as_ref().map(|v| v.as_str())
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("forbidden control byte"),
+                "{label}: error must explain reason, got: {err}"
+            );
+        }
+    }
+
+    /// Negative case: a value with high-byte or other ASCII printables
+    /// must still pass. Guards against an over-zealous rewrite that
+    /// rejects UTF-8 or normal punctuation.
+    #[tokio::test]
+    async fn normal_values_still_pass_after_control_byte_check() {
+        for stored in [
+            "sk-abcd1234",
+            "Bearer eyJhbGciOiJIUzI1NiJ9",
+            "user:pass-with-+%/=",
+            "value with tabs\tinside",
+            // Tab (0x09) is a valid HTTP header byte; should NOT be rejected.
+        ] {
+            let mut map = HashMap::new();
+            map.insert("test/ok".into(), stored.to_string());
+            let provider = TalosVaultProvider::from_resolved(map);
+            let handle = provider
+                .resolve("test/ok", uuid::Uuid::new_v4())
+                .await
+                .unwrap();
+            assert!(
+                provider.into_auth_header(handle, "Authorization").is_ok(),
+                "legitimate value {stored:?} was rejected"
             );
         }
     }

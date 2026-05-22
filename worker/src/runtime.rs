@@ -138,34 +138,139 @@ pub struct SecurityPolicy {
 ///             cap was a runtime-asserted property without a
 ///             cryptographic binding. Operators with V3 AOT caches
 ///             will see them rejected; modules recompile on next use.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV4";
+///   TALOSV5 — L-2 (2026-05-22 wasm-security review): engine-config
+///             fingerprint binding. The HMAC input now includes the
+///             SHA-256 of `ENGINE_CONFIG_FINGERPRINT` so any change to
+///             a wasmtime `Config::` knob (fuel costs, pool sizes,
+///             opt level, feature flags) automatically invalidates
+///             cached blobs. Pre-V5 a maintainer who tweaked the
+///             engine config without bumping `AOT_VERSION_HDR` would
+///             silently load stale precompiled bytes into the
+///             reconfigured engine — `Component::deserialize` UB.
+///             Operators with V4 AOT caches will see them rejected;
+///             modules recompile on next use.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV5";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
+
+/// Canonical encoding of every wasmtime `Config::` knob the worker sets
+/// in `TalosRuntime::with_resources`. Mixed into the AOT HMAC input so
+/// that any change to the engine configuration automatically
+/// invalidates cached AOT blobs — they fail HMAC verification on load
+/// and fall back to recompile, never feeding a serialized component to
+/// a differently-configured engine (the canonical UB shape for
+/// `Component::deserialize`).
+///
+/// 2026-05-22 wasm-security review (L-2): defense-in-depth on top of
+/// `AOT_VERSION_HDR`. The version header is the major-version
+/// invalidation knob; the fingerprint is the fine-grained gate that
+/// catches a maintainer who tweaks (say) fuel costs, opt level, or
+/// pooling parameters without bumping the version header. Both feed
+/// the HMAC, so either change invalidates blobs.
+///
+/// **MAINTENANCE CONTRACT**: every line below must mirror a single
+/// `config.foo(...)` call inside `TalosRuntime::with_resources`. When
+/// you add, remove, or modify ANY `Config::` call, update the matching
+/// fingerprint line. The unit test
+/// `engine_config_fingerprint_is_pinned` pins the SHA-256 of this
+/// constant — touching either side without the other trips the test
+/// and forces conscious acknowledgment of the drift.
+///
+/// Production-mode-only knobs (`wasm_backtrace_details`, `debug_info`,
+/// `wasm_backtrace_max_frames`) are NOT in the fingerprint because
+/// they vary per-deploy (prod vs dev). They're documented at the
+/// Config call site as "log-only / diagnostic" — they don't affect
+/// serialized-component compatibility.
+const ENGINE_CONFIG_FINGERPRINT: &[u8] = b"talos-engine-config-v1\n\
+    wasmtime=43.0.2\n\
+    concurrency_support=true\n\
+    consume_fuel=true\n\
+    op_cost.memory_grow=255\n\
+    op_cost.table_grow=128\n\
+    op_cost.memory_fill=5\n\
+    op_cost.memory_copy=5\n\
+    wasm_component_model=true\n\
+    wasm_threads=false\n\
+    wasm_simd=false\n\
+    wasm_relaxed_simd=false\n\
+    wasm_multi_memory=false\n\
+    wasm_memory64=false\n\
+    wasm_gc=false\n\
+    wasm_function_references=false\n\
+    wasm_tail_call=false\n\
+    wasm_bulk_memory=true\n\
+    wasm_reference_types=true\n\
+    epoch_interruption=true\n\
+    async_stack_size=4194304\n\
+    max_wasm_stack=2097152\n\
+    memory_reservation=134217728\n\
+    pooling.total_component_instances=500\n\
+    pooling.max_component_instance_size=10485760\n\
+    pooling.max_core_instances_per_component=20\n\
+    pooling.max_memories_per_component=20\n\
+    pooling.total_memories=2000\n\
+    pooling.max_memory_size=134217728\n\
+    pooling.max_tables_per_component=20\n\
+    pooling.total_tables=2000\n\
+    pooling.total_stacks=500\n\
+    pooling.linear_memory_keep_resident=8388608\n\
+    pooling.table_keep_resident=20000\n\
+    pooling.decommit_batch_size=8\n\
+    pooling.max_unused_warm_slots=50\n\
+    pooling.memory_protection_keys=auto-linux-x86_64\n\
+    parallel_compilation=true\n\
+    cranelift_opt_level=speed\n";
+
+/// SHA-256 of [`ENGINE_CONFIG_FINGERPRINT`], computed once and reused
+/// across every AOT sign/verify call. `OnceLock` keeps the cost to a
+/// single hash at startup — every subsequent `aot_hmac_input` call
+/// just memcpys the cached 32-byte digest into the HMAC input buffer.
+fn engine_config_fingerprint_hash() -> &'static [u8; 32] {
+    use sha2::{Digest, Sha256};
+    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(ENGINE_CONFIG_FINGERPRINT);
+        hasher.finalize().into()
+    })
+}
 
 /// Compute the canonical HMAC input for an AOT blob. Factored out so
 /// `precompile_module` (sign) and `load_precompiled` (verify) share a
 /// single source of truth — drift between the two sides would silently
 /// invalidate every cached blob until a recompile.
 ///
-/// Domain: `AOT_VERSION_HDR || 0xff || cap.as_str() || 0xff || serialized`.
+/// Domain: `AOT_VERSION_HDR || 0xff || cap.as_str() || 0xff ||
+/// engine_config_fingerprint_hash() || 0xff || serialized`.
 /// The 0xff separators rule out concatenation collisions across the
-/// three components even though `cap.as_str()` returns one of a fixed
+/// four components even though `cap.as_str()` returns one of a fixed
 /// non-prefix-overlapping set — defense-in-depth in case the set is
 /// extended later. The version header is FIRST so a future bump (V4 →
 /// V5) trivially invalidates V4 tags without needing to flush
-/// per-cap caches.
+/// per-cap caches. The engine-config fingerprint hash is THIRD so a
+/// config knob change (fuel cost, pool size, opt level, …) invalidates
+/// cached blobs without requiring an `AOT_VERSION_HDR` bump.
 fn aot_hmac_input(
     cap: &crate::wit_inspector::CapabilityWorld,
     serialized: &[u8],
 ) -> Vec<u8> {
     let cap_tag = cap.as_str().as_bytes();
+    let config_fp = engine_config_fingerprint_hash();
     let mut buf = Vec::with_capacity(
-        AOT_VERSION_HDR.len() + 1 + cap_tag.len() + 1 + serialized.len(),
+        AOT_VERSION_HDR.len()
+            + 1
+            + cap_tag.len()
+            + 1
+            + config_fp.len()
+            + 1
+            + serialized.len(),
     );
     buf.extend_from_slice(AOT_VERSION_HDR);
     buf.push(0xff);
     buf.extend_from_slice(cap_tag);
+    buf.push(0xff);
+    buf.extend_from_slice(config_fp);
     buf.push(0xff);
     buf.extend_from_slice(serialized);
     buf
@@ -234,6 +339,122 @@ mod aot_hmac_input_tests {
         // version header is the first thing in the input.
         let input = aot_hmac_input(&CapabilityWorld::Minimal, b"any");
         assert!(input.starts_with(super::AOT_VERSION_HDR));
+    }
+
+    /// 2026-05-22 wasm-security review (L-2): the engine-config
+    /// fingerprint hash MUST appear in the HMAC input so that any
+    /// `Config::` knob change invalidates cached AOT blobs without
+    /// requiring an `AOT_VERSION_HDR` bump. Without this binding, a
+    /// future maintainer who tweaks (say) fuel costs forgets to bump
+    /// the version header, and the next pod restart silently loads
+    /// stale blobs against the new engine — `Component::deserialize`
+    /// UB territory.
+    #[test]
+    fn engine_config_fingerprint_is_in_hmac_input() {
+        let input = aot_hmac_input(&CapabilityWorld::Minimal, b"any");
+        let fp = super::engine_config_fingerprint_hash();
+        // The 32-byte SHA-256 of ENGINE_CONFIG_FINGERPRINT must be a
+        // contiguous subslice of the HMAC input. (We don't require a
+        // specific offset — the canonical layout is asserted by
+        // `hmac_input_layout_is_canonical` below.)
+        assert!(
+            input.windows(fp.len()).any(|w| w == fp.as_slice()),
+            "engine config fingerprint hash must appear in HMAC input"
+        );
+    }
+
+    /// Pin the canonical HMAC input layout. Failure here means
+    /// someone changed the order of bytes in `aot_hmac_input` —
+    /// which silently invalidates every existing AOT blob. If the
+    /// change is intentional, bump `AOT_VERSION_HDR` (so old blobs
+    /// reject with a clean version-mismatch error instead of an
+    /// HMAC failure) AND update this test.
+    #[test]
+    fn hmac_input_layout_is_canonical() {
+        let cap = CapabilityWorld::Minimal;
+        let payload = b"X";
+        let input = aot_hmac_input(&cap, payload);
+
+        // VERSION || 0xff || cap || 0xff || config_fp(32) || 0xff || payload
+        let mut expected = Vec::new();
+        expected.extend_from_slice(super::AOT_VERSION_HDR);
+        expected.push(0xff);
+        expected.extend_from_slice(cap.as_str().as_bytes());
+        expected.push(0xff);
+        expected.extend_from_slice(super::engine_config_fingerprint_hash());
+        expected.push(0xff);
+        expected.extend_from_slice(payload);
+
+        assert_eq!(
+            input, expected,
+            "HMAC input layout drift — bump AOT_VERSION_HDR if intentional"
+        );
+    }
+
+    /// 2026-05-22 wasm-security review (L-2): pin the SHA-256 of
+    /// `ENGINE_CONFIG_FINGERPRINT` to a known value. This test FAILS
+    /// when a maintainer edits the fingerprint string (intended or
+    /// not) — forcing conscious acknowledgment that AOT blobs in the
+    /// fleet are about to invalidate. To update:
+    ///   1. Confirm the `Config::` builder change in
+    ///      `TalosRuntime::with_resources` is correct.
+    ///   2. Update the matching line in `ENGINE_CONFIG_FINGERPRINT`.
+    ///   3. Re-run this test to read the new hash from the failure
+    ///      message, then paste it into `EXPECTED` below.
+    ///   4. Mention the change in `AOT_VERSION_HDR`'s History section
+    ///      so operators can correlate the cache flush.
+    ///
+    /// The 4-step ritual is the whole point — it converts "silent UB
+    /// from forgotten config bump" into "explicit test failure that
+    /// teaches the maintainer the contract."
+    #[test]
+    fn engine_config_fingerprint_is_pinned() {
+        // Pinned SHA-256 of the canonical fingerprint constant.
+        // If this fails, ENGINE_CONFIG_FINGERPRINT was edited.
+        // See test doc for the update procedure.
+        const EXPECTED: &str =
+            "637f69bd756f8c07ee378f4870fbada7809c23080685da82d290536aff02f924";
+        let actual = hex::encode(super::engine_config_fingerprint_hash());
+        assert_eq!(
+            actual, EXPECTED,
+            "ENGINE_CONFIG_FINGERPRINT was edited. Update EXPECTED in this test, \
+             AND consider whether to bump AOT_VERSION_HDR so operators see a clean \
+             version-mismatch error in their logs instead of an HMAC verification \
+             failure on stale cached blobs."
+        );
+    }
+
+    /// Engine-config-fingerprint binding test: signing a payload with
+    /// one fingerprint and verifying with a different one must
+    /// produce different HMAC inputs (and therefore different tags).
+    #[test]
+    fn different_config_fingerprints_yield_different_inputs() {
+        use sha2::{Digest, Sha256};
+        // We can't easily mutate the pinned fingerprint constant, but
+        // we can construct synthetic inputs that mirror the layout
+        // with a swapped fingerprint and verify they're distinct.
+        let real_input = aot_hmac_input(&CapabilityWorld::Http, b"payload");
+
+        let mut hijacked_input = Vec::new();
+        hijacked_input.extend_from_slice(super::AOT_VERSION_HDR);
+        hijacked_input.push(0xff);
+        hijacked_input.extend_from_slice(CapabilityWorld::Http.as_str().as_bytes());
+        hijacked_input.push(0xff);
+        // Use a deterministically-different 32-byte fingerprint —
+        // sha256("attacker-altered-config") — to model a worker
+        // running with a tampered config that an attacker tried to
+        // pass off as the original.
+        let mut hasher = Sha256::new();
+        hasher.update(b"attacker-altered-config");
+        let fake_fp: [u8; 32] = hasher.finalize().into();
+        hijacked_input.extend_from_slice(&fake_fp);
+        hijacked_input.push(0xff);
+        hijacked_input.extend_from_slice(b"payload");
+
+        assert_ne!(
+            real_input, hijacked_input,
+            "config-fingerprint swap must produce a distinct HMAC input"
+        );
     }
 }
 
@@ -1309,6 +1530,28 @@ impl TalosRuntime {
         nats_client: Option<Arc<async_nats::Client>>,
         fs_dir: Option<Arc<cap_std::fs::Dir>>,
     ) -> Result<Self> {
+        // ══════════════════════════════════════════════════════════════════════
+        // ENGINE CONFIG — MAINTENANCE CONTRACT (2026-05-22 wasm-security review)
+        // ──────────────────────────────────────────────────────────────────────
+        // Every `Config::` call below MUST have a matching line in
+        // `ENGINE_CONFIG_FINGERPRINT` (see top of this file). The fingerprint
+        // hash is mixed into the AOT HMAC input, so any change here without
+        // a matching fingerprint update will:
+        //   1. Trip the `engine_config_fingerprint_is_pinned` unit test at
+        //      `cargo test` time, OR
+        //   2. (If the test is somehow skipped) Silently load stale AOT
+        //      blobs into a differently-configured engine — UB territory.
+        // The unit test is the canonical gate. When you add/change/remove a
+        // `Config::` call:
+        //   1. Update the matching line in `ENGINE_CONFIG_FINGERPRINT`.
+        //   2. Run `cargo test -p worker engine_config_fingerprint_is_pinned`.
+        //   3. Paste the actual hash from the failure into `EXPECTED`.
+        //   4. Add an entry to `AOT_VERSION_HDR`'s History section.
+        // Production-only knobs (`wasm_backtrace_details`, `debug_info`,
+        // `wasm_backtrace_max_frames`) are EXCLUDED from the fingerprint —
+        // they vary per-deploy and don't affect serialized-component
+        // compatibility.
+        // ══════════════════════════════════════════════════════════════════════
         let mut config = Config::new();
 
         // ── Async / Concurrency ─────────────────────────────────────────────
@@ -2395,21 +2638,61 @@ impl TalosRuntime {
                 // Modules compiled with panic="unwind" (all fresh sandbox compilations)
                 // have their panics caught by the macro-injected catch_unwind before
                 // reaching here, so this is truly a last-resort fallback.
-                let stderr_trimmed = captured_stderr.trim();
-                if !stderr_trimmed.is_empty()
+                //
+                // 2026-05-22 wasm-security review (L-3): DLP-redact the
+                // captured stderr before it crosses any boundary.
+                // A guest that panics with `format!("auth failed for
+                // token {sk}")` would otherwise reach (a) operator
+                // tracing logs at WARN/ERROR level and (b) the JobResult
+                // error message that the controller forwards to UI
+                // clients. Controller-side `redact_json` covers (b) at
+                // DB-store time, but (a) is purely worker-local and
+                // bypasses that gate. Apply the same `redact_str` here
+                // that wraps HTTP response bodies (host_impl.rs:8341,
+                // 10156) so the worker's own log stream cannot leak
+                // patterns the DLP service is configured to mask
+                // (`sk-*`, `ghp_*`, Bearer tokens, etc.).
+                //
+                // Redaction is applied ONCE to the trimmed buffer and
+                // the sanitised string is used in both the returned
+                // error and the tracing log line so the two surfaces
+                // agree. We DON'T redact inside `extract_panic_message_from_stderr`
+                // — that function is a pure parser and is unit-tested
+                // independently; redaction is a transport-boundary
+                // concern, not a parser concern.
+                let stderr_trimmed_raw = captured_stderr.trim();
+                let stderr_trimmed_redacted: std::borrow::Cow<'_, str> =
+                    if stderr_trimmed_raw.is_empty() {
+                        std::borrow::Cow::Borrowed("")
+                    } else {
+                        std::borrow::Cow::Owned(talos_dlp_provider::redact_str(stderr_trimmed_raw))
+                    };
+                if !stderr_trimmed_raw.is_empty()
                     && (err_str.contains("trap") || err_debug.contains("trap"))
                 {
                     // Try to extract a clean "PANIC: message" from the stderr dump.
                     // If parseable, present identically to catch_unwind output so
                     // callers see a consistent format regardless of panic strategy.
-                    if let Some(panic_msg) = extract_panic_message_from_stderr(stderr_trimmed) {
+                    // Run the parser over the REDACTED stderr so any secret
+                    // embedded in the panic message itself (e.g. `panic!("token
+                    // = {sk}")`) is masked in the extracted line too — the
+                    // redact_str patterns are positional and idempotent so
+                    // applying them before parse vs. after gives the same
+                    // output for everything except the (vanishingly rare)
+                    // case where the panic message contains the literal
+                    // string "panicked at" — operationally not a concern.
+                    if let Some(panic_msg) =
+                        extract_panic_message_from_stderr(&stderr_trimmed_redacted)
+                    {
                         return Err(anyhow::anyhow!("PANIC: {}", panic_msg));
                     }
                     // Unknown trap with stderr — include both for diagnostics.
+                    // The wasmtime error itself (`e`) is operator-supplied
+                    // wasmtime output, no guest content, no redaction needed.
                     return Err(anyhow::anyhow!(
                         "WASM trap: {}\nPanic output:\n{}",
                         e,
-                        stderr_trimmed
+                        stderr_trimmed_redacted
                     ));
                 }
                 // Log full trap details (Display + Debug) to help identify root cause.
@@ -2419,7 +2702,7 @@ impl TalosRuntime {
                 tracing::error!(
                     err_display = %e,
                     err_debug = ?e,
-                    stderr = %captured_stderr.trim(),
+                    stderr = %stderr_trimmed_redacted,
                     "WASM trap (no stderr / no fuel): full diagnostics"
                 );
                 return Err(anyhow::anyhow!("WASM trap encountered"));
@@ -3235,8 +3518,8 @@ impl TalosRuntime {
         if hdr != VERSION_HDR {
             anyhow::bail!(
                 "Precompiled WASM version mismatch – expected {} (wasmtime 43, \
-                 cap-world-bound HMAC). This blob was compiled with an older \
-                 Talos version. Recompile the module.",
+                 cap-world + engine-config-bound HMAC). This blob was compiled \
+                 with an older Talos version. Recompile the module.",
                 std::str::from_utf8(VERSION_HDR).unwrap_or("?")
             );
         }
@@ -3706,6 +3989,82 @@ mod tests {
         let stderr = "thread '<unnamed>' panicked at 'stack overflow', src/lib.rs:0:0\n";
         let msg = extract_panic_message_from_stderr(stderr).expect("should extract");
         assert_eq!(msg, "stack overflow");
+    }
+
+    /// 2026-05-22 wasm-security review (L-3): captured stderr crosses
+    /// the worker → controller boundary (as an error message) AND lands
+    /// in worker tracing logs. A guest that panics with a secret in
+    /// the panic message (`panic!("token = {sk}")`) would otherwise
+    /// leak it through both surfaces. The trap-handler code path
+    /// applies `talos_dlp_provider::redact_str` to `stderr_trimmed`
+    /// BEFORE either surface sees it.
+    ///
+    /// This test is a unit-level contract check: redacting a stderr
+    /// blob that contains a canonical DLP-recognised pattern
+    /// (`sk-` API key) must mask the pattern. We exercise the same
+    /// `redact_str` call the runtime makes; the full integration
+    /// (panic → stderr capture → trap path → redact) is exercised
+    /// in `tests/sandbox_security_tests.rs` end-to-end.
+    #[test]
+    fn redact_str_masks_canonical_api_key_pattern() {
+        // sk- prefix + ≥6 body chars is one of the documented redaction
+        // shapes; the worker's runtime feeds this exact function the
+        // captured stderr in the trap-fallback path (runtime.rs around
+        // the L-3 fix site). The exact `[REDACTED:*]` marker varies by
+        // which pattern fires first (TOKEN for `token=…`, API_KEY for
+        // `sk-…`) — what matters is that the secret value is gone AND
+        // a redaction marker took its place.
+        let secret = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!(
+            "thread '<unnamed>' panicked at '{secret} leaked', src/lib.rs:7:5\n"
+        );
+        let redacted = talos_dlp_provider::redact_str(&raw);
+        assert!(
+            !redacted.contains(secret),
+            "redact_str must mask the sk-* secret value, got: {redacted}"
+        );
+        assert!(
+            redacted.contains("[REDACTED:"),
+            "redact_str must substitute a redaction marker, got: {redacted}"
+        );
+        // The non-secret surrounding text must survive — the parser
+        // downstream (`extract_panic_message_from_stderr`) needs the
+        // `panicked at '…'` envelope intact to extract the message.
+        assert!(
+            redacted.contains("panicked at"),
+            "redaction must not destroy panic envelope structure"
+        );
+    }
+
+    /// L-3 follow-up: verify a bare `sk-` token (no surrounding
+    /// `token=` context) also gets redacted. Belt-and-suspenders that
+    /// the `[REDACTED:API_KEY]` pattern fires for the canonical
+    /// prefix-only shape, which is what most panic messages would
+    /// look like (`panic!("auth failed: {sk_key}")`).
+    #[test]
+    fn redact_str_masks_bare_sk_prefix() {
+        let secret = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!("panicked at 'auth failed: {secret}'");
+        let redacted = talos_dlp_provider::redact_str(&raw);
+        assert!(
+            !redacted.contains(secret),
+            "bare sk-* must be redacted, got: {redacted}"
+        );
+        assert!(
+            redacted.contains("[REDACTED:API_KEY]"),
+            "bare sk-* should hit the API_KEY pattern, got: {redacted}"
+        );
+    }
+
+    /// Same redaction is idempotent — running through `redact_str`
+    /// twice produces the same output. Guards against future
+    /// refactors that inadvertently double-apply.
+    #[test]
+    fn redact_str_is_idempotent() {
+        let raw = "panicked at 'sk-AAAAAAAAAAAAAAAAAAAA leaked'";
+        let once = talos_dlp_provider::redact_str(raw);
+        let twice = talos_dlp_provider::redact_str(&once);
+        assert_eq!(once, twice, "redact_str should be idempotent");
     }
 
     // -----------------------------------------------------------------------
