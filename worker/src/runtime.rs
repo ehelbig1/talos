@@ -129,10 +129,113 @@ pub struct SecurityPolicy {
 ///             so a TALOSV2 blob (compiled without epoch_interruption)
 ///             would skip the per-yield-point check at runtime and
 ///             defeat the gate. Bump rejects old blobs cleanly.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV3";
+///   TALOSV4 — capability-world binding. The HMAC input now includes
+///             the declared `CapabilityWorld` tag (`as_str()`), so a
+///             blob compiled for `minimal` cannot be successfully
+///             loaded against any other cap-world's linker — the
+///             verification fails before `Component::deserialize` is
+///             reached. Pre-V4 the HMAC covered ONLY `serialized`, so
+///             cap was a runtime-asserted property without a
+///             cryptographic binding. Operators with V3 AOT caches
+///             will see them rejected; modules recompile on next use.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV4";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
+
+/// Compute the canonical HMAC input for an AOT blob. Factored out so
+/// `precompile_module` (sign) and `load_precompiled` (verify) share a
+/// single source of truth — drift between the two sides would silently
+/// invalidate every cached blob until a recompile.
+///
+/// Domain: `AOT_VERSION_HDR || 0xff || cap.as_str() || 0xff || serialized`.
+/// The 0xff separators rule out concatenation collisions across the
+/// three components even though `cap.as_str()` returns one of a fixed
+/// non-prefix-overlapping set — defense-in-depth in case the set is
+/// extended later. The version header is FIRST so a future bump (V4 →
+/// V5) trivially invalidates V4 tags without needing to flush
+/// per-cap caches.
+fn aot_hmac_input(
+    cap: &crate::wit_inspector::CapabilityWorld,
+    serialized: &[u8],
+) -> Vec<u8> {
+    let cap_tag = cap.as_str().as_bytes();
+    let mut buf = Vec::with_capacity(
+        AOT_VERSION_HDR.len() + 1 + cap_tag.len() + 1 + serialized.len(),
+    );
+    buf.extend_from_slice(AOT_VERSION_HDR);
+    buf.push(0xff);
+    buf.extend_from_slice(cap_tag);
+    buf.push(0xff);
+    buf.extend_from_slice(serialized);
+    buf
+}
+
+#[cfg(test)]
+mod aot_hmac_input_tests {
+    //! Pure tests for the canonical HMAC-input layout. Cover the
+    //! security-critical bindings (version, cap, bytes) without
+    //! invoking the wasmtime Engine — the layout is the only thing
+    //! the two ends of the signing/verifying contract share.
+    use super::aot_hmac_input;
+    use crate::wit_inspector::CapabilityWorld;
+
+    #[test]
+    fn different_caps_produce_different_inputs() {
+        let payload = b"identical-serialized-bytes";
+        let a = aot_hmac_input(&CapabilityWorld::Minimal, payload);
+        let b = aot_hmac_input(&CapabilityWorld::Trusted, payload);
+        assert_ne!(
+            a, b,
+            "Minimal and Trusted must produce distinct HMAC inputs for the same bytes"
+        );
+    }
+
+    #[test]
+    fn different_payloads_produce_different_inputs() {
+        let a = aot_hmac_input(&CapabilityWorld::Http, b"payload-1");
+        let b = aot_hmac_input(&CapabilityWorld::Http, b"payload-2");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn same_cap_same_payload_is_deterministic() {
+        let a = aot_hmac_input(&CapabilityWorld::Agent, b"x");
+        let b = aot_hmac_input(&CapabilityWorld::Agent, b"x");
+        assert_eq!(a, b, "input layout must be deterministic for caching");
+    }
+
+    #[test]
+    fn separator_prevents_concatenation_collisions() {
+        // If we'd built the input as `VERSION || cap || serialized`
+        // (no separators), `cap="http"` + `serialized="x"` would
+        // collide with `cap="ht"` + `serialized="tpx"` because the
+        // join byte-sequence is identical. The 0xff separator makes
+        // that impossible. `cap.as_str()` returns ASCII-only, so a
+        // 0xff byte cannot appear in the cap tag and the separator
+        // cleanly delimits.
+        let a = aot_hmac_input(&CapabilityWorld::Http, b"x");
+        let synthetic_attack = {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(super::AOT_VERSION_HDR);
+            buf.push(0xff);
+            buf.extend_from_slice(b"ht");
+            buf.push(0xff);
+            buf.extend_from_slice(b"tpx");
+            buf
+        };
+        assert_ne!(a, synthetic_attack);
+    }
+
+    #[test]
+    fn version_header_is_first_byte_in_input() {
+        // A V4 → V5 bump must trivially invalidate every V4 tag
+        // without depending on the cap-tag ordering. Sanity: the
+        // version header is the first thing in the input.
+        let input = aot_hmac_input(&CapabilityWorld::Minimal, b"any");
+        assert!(input.starts_with(super::AOT_VERSION_HDR));
+    }
+}
 
 /// Holds signing and verification keys for AOT blob integrity.
 ///
@@ -2161,7 +2264,7 @@ impl TalosRuntime {
                 span.set_attribute_bool("cache_hit", false);
                 let compilation_start = std::time::Instant::now();
                 let component = if wasm_bytes.starts_with(AOT_VERSION_HDR) {
-                    self.load_precompiled(wasm_bytes)?
+                    self.load_precompiled(wasm_bytes, cap.clone())?
                 } else {
                     Component::new(&self.engine, wasm_bytes)?
                 };
@@ -2497,7 +2600,7 @@ impl TalosRuntime {
                 entry.clone()
             } else {
                 let component = if wasm_bytes.starts_with(AOT_VERSION_HDR) {
-                    self.load_precompiled(wasm_bytes)?
+                    self.load_precompiled(wasm_bytes, cap.clone())?
                 } else {
                     Component::new(&self.engine, wasm_bytes)?
                 };
@@ -2682,7 +2785,7 @@ impl TalosRuntime {
                     entry.clone()
                 } else {
                     let component = if step.wasm_bytes.starts_with(AOT_VERSION_HDR) {
-                        self.load_precompiled(&step.wasm_bytes)?
+                        self.load_precompiled(&step.wasm_bytes, cap.clone())?
                     } else {
                         wasmtime::component::Component::new(&self.engine, &step.wasm_bytes)?
                     };
@@ -2948,7 +3051,7 @@ impl TalosRuntime {
 
             let component_result: anyhow::Result<Component> =
                 if wasm_bytes.starts_with(AOT_VERSION_HDR) {
-                    self.load_precompiled(&wasm_bytes)
+                    self.load_precompiled(&wasm_bytes, cap.clone())
                 } else {
                     Component::new(&self.engine, &wasm_bytes).map_err(Into::into)
                 };
@@ -3021,29 +3124,62 @@ impl TalosRuntime {
     /// Pre‑compile a WASM module to native code (AOT compilation).
     /// Generates a serialized, pre‑compiled module that loads 10‑100× faster.
     ///
-    /// Blob format: `[TALOSV2 (7 bytes)] [HMAC-SHA256 (32 bytes)] [serialized component]`
+    /// Blob format: `[TALOSV4 (7 bytes)] [HMAC-SHA256 (32 bytes)] [serialized component]`
     ///
-    /// The HMAC prevents tampered blobs from reaching `unsafe Component::deserialize`.
-    pub fn precompile_module(&self, wasm_bytes: &[u8]) -> Result<Vec<u8>> {
+    /// The HMAC prevents tampered blobs from reaching `unsafe
+    /// Component::deserialize`. `cap` is included in the HMAC input
+    /// (see `aot_hmac_input`) so the resulting tag is unique to this
+    /// (version, cap, bytes) triple — a blob signed for
+    /// `CapabilityWorld::Minimal` cannot be successfully loaded as
+    /// any other cap-world, regardless of how it reaches the
+    /// `load_precompiled` call site.
+    ///
+    /// `CapabilityWorld::Unknown` is rejected up front because it
+    /// fails `select_tier` at load time anyway and signing
+    /// arbitrary-cap blobs would muddle the operator forensic trail.
+    pub fn precompile_module(
+        &self,
+        wasm_bytes: &[u8],
+        cap: crate::wit_inspector::CapabilityWorld,
+    ) -> Result<Vec<u8>> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
 
+        if matches!(cap, crate::wit_inspector::CapabilityWorld::Unknown) {
+            anyhow::bail!(
+                "Refusing to AOT-precompile with CapabilityWorld::Unknown — \
+                 the resulting blob could not be loaded by `load_precompiled` \
+                 anyway (select_tier rejects Unknown)."
+            );
+        }
+
         // Structured logging replaces raw stdout prints for observability.
-        tracing::info!(bytes = wasm_bytes.len(), "AOT pre‑compiling WASM module");
+        tracing::info!(
+            bytes = wasm_bytes.len(),
+            capability_world = %cap.as_str(),
+            "AOT pre‑compiling WASM module"
+        );
 
         let compile_start = std::time::Instant::now();
         let serialized = self.engine.precompile_component(wasm_bytes)?;
         let compile_time = compile_start.elapsed();
 
-        // Compute HMAC-SHA256 over the serialized blob to protect integrity.
-        // Always sign with the current key from the key ring.
+        // Compute HMAC-SHA256 over the canonical (version, cap, bytes)
+        // input to protect integrity AND cryptographically bind the
+        // blob to a specific cap-world. Always sign with the current
+        // key from the key ring.
         let key_ring = aot_key_ring();
         let mut mac = Hmac::<Sha256>::new_from_slice(&key_ring.signing_key)
             .map_err(|e| anyhow::anyhow!("Failed to create AOT HMAC: {}", e))?;
-        mac.update(&serialized);
+        mac.update(&aot_hmac_input(&cap, &serialized));
         let tag: [u8; AOT_HMAC_LEN] = mac.finalize().into_bytes().into();
 
         // Layout: VERSION_HDR | HMAC_TAG | serialized_component
+        // The cap-world is NOT serialized into the blob — it's carried
+        // alongside the blob by the caller (e.g. the module metadata)
+        // and re-supplied to `load_precompiled`. A mismatch between
+        // signing-time cap and loading-time cap fails the HMAC check
+        // before any unsafe deserialize.
         let mut out = Vec::with_capacity(AOT_VERSION_HDR.len() + AOT_HMAC_LEN + serialized.len());
         out.extend_from_slice(AOT_VERSION_HDR);
         out.extend_from_slice(&tag);
@@ -3054,6 +3190,7 @@ impl TalosRuntime {
             input_bytes = wasm_bytes.len(),
             output_bytes = out.len(),
             speedup = out.len() as f64 / wasm_bytes.len() as f64,
+            capability_world = %cap.as_str(),
             "AOT pre‑compilation complete"
         );
 
@@ -3062,14 +3199,26 @@ impl TalosRuntime {
 
     /// Load a pre-compiled WASM module (AOT deserialization).
     ///
-    /// Verifies the HMAC-SHA256 integrity tag before calling the unsafe
-    /// `Component::deserialize` API.  A tampered or truncated blob will be
-    /// rejected with an error before any unsafe code is reached.
+    /// Verifies the HMAC-SHA256 integrity tag — computed over
+    /// `(version_hdr, expected_cap, serialized)` — before calling the
+    /// unsafe `Component::deserialize` API. A tampered, truncated, or
+    /// cap-mismatched blob will be rejected with an error before any
+    /// unsafe code is reached.
+    ///
+    /// `expected_cap` is the capability world the caller intends to
+    /// execute the component under (e.g. derived from the module's
+    /// metadata). A blob signed for a different cap will fail HMAC
+    /// verification — the cryptographic binding ensures the linker
+    /// tier and the precompiled bytes agree.
     ///
     /// # Safety
     /// Pre-compiled modules MUST be compiled with the EXACT SAME version of Wasmtime
     /// and the EXACT SAME engine configuration. Always verify compatibility before loading.
-    pub fn load_precompiled(&self, precompiled_bytes: &[u8]) -> Result<Component> {
+    pub fn load_precompiled(
+        &self,
+        precompiled_bytes: &[u8],
+        expected_cap: crate::wit_inspector::CapabilityWorld,
+    ) -> Result<Component> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         use subtle::ConstantTimeEq;
@@ -3085,8 +3234,10 @@ impl TalosRuntime {
         let (hdr, after_hdr) = precompiled_bytes.split_at(VERSION_HDR.len());
         if hdr != VERSION_HDR {
             anyhow::bail!(
-                "Precompiled WASM version mismatch – expected TALOSV2 (wasmtime 43). \
-                 This blob was compiled with an older Talos version. Recompile the module."
+                "Precompiled WASM version mismatch – expected {} (wasmtime 43, \
+                 cap-world-bound HMAC). This blob was compiled with an older \
+                 Talos version. Recompile the module.",
+                std::str::from_utf8(VERSION_HDR).unwrap_or("?")
             );
         }
 
@@ -3103,15 +3254,19 @@ impl TalosRuntime {
         // ── Step 2: verify HMAC-SHA256 integrity tag ─────────────────────────
         // Try each key in the key ring (current key first, then previous keys).
         // This enables graceful key rotation without invalidating cached blobs.
+        // The HMAC input incorporates expected_cap, so a cap-world mismatch
+        // surfaces as a verification failure here — no separate cap-tag-in-blob
+        // is needed.
         let (stored_tag, serialized) = after_hdr.split_at(AOT_HMAC_LEN);
         let key_ring = aot_key_ring();
+        let hmac_input = aot_hmac_input(&expected_cap, serialized);
         let mut verified = false;
         let mut matched_key_index = 0usize;
 
         for (idx, key) in key_ring.verification_keys.iter().enumerate() {
             let mut mac = Hmac::<Sha256>::new_from_slice(key)
                 .map_err(|e| anyhow::anyhow!("Failed to create AOT HMAC: {}", e))?;
-            mac.update(serialized);
+            mac.update(&hmac_input);
             let expected_tag = mac.finalize().into_bytes();
 
             // Constant-time comparison to prevent timing side-channels.
@@ -3124,8 +3279,10 @@ impl TalosRuntime {
 
         if !verified {
             anyhow::bail!(
-                "AOT blob HMAC verification failed — blob may have been tampered with or \
-                 compiled by a different instance. Recompile the module."
+                "AOT blob HMAC verification failed — blob may have been tampered with, \
+                 compiled by a different instance, or compiled for a different \
+                 capability world (expected={}). Recompile the module.",
+                expected_cap.as_str()
             );
         }
 
@@ -3134,20 +3291,24 @@ impl TalosRuntime {
         if matched_key_index > 0 {
             tracing::info!(
                 key_index = matched_key_index,
+                capability_world = %expected_cap.as_str(),
                 "AOT blob verified with previous key (index {}) — consider recompiling to use current key",
                 matched_key_index
             );
         }
 
         // ── Step 3: deserialize ───────────────────────────────────────────────
-        // SAFETY: The binary blob has just been cryptographically verified using HMAC-SHA256
-        // under the trusted master key, ensuring the serialized bytes were produced locally
-        // and are un-tampered.
+        // SAFETY: The binary blob has just been cryptographically verified
+        // using HMAC-SHA256 under the trusted master key. The tag covers
+        // (version, expected_cap, serialized), so this point is reached only
+        // when the serialized bytes were produced locally for this exact
+        // cap-world.
         let component = unsafe { Component::deserialize(&self.engine, serialized)? };
 
         tracing::info!(
             duration_ms = deserialize_start.elapsed().as_millis(),
             payload_bytes = serialized.len(),
+            capability_world = %expected_cap.as_str(),
             "AOT deserialization complete"
         );
 
@@ -3169,7 +3330,11 @@ impl TalosRuntime {
         max_memory_mb: usize,
         input: JsonValue,
     ) -> Result<JsonValue> {
-        let component = self.load_precompiled(precompiled_bytes)?;
+        // The cap argument is bound into the HMAC input — a blob
+        // signed for a different cap-world fails verification here
+        // BEFORE the unsafe deserialize, even if both shared the same
+        // signing key. See `aot_hmac_input` for the canonical input.
+        let component = self.load_precompiled(precompiled_bytes, cap.clone())?;
 
         self.execute_component_internal(
             component,
@@ -3320,12 +3485,16 @@ impl TalosRuntime {
         input: JsonValue,
     ) -> Result<JsonValue> {
         if let Some(precompiled) = precompiled_bytes {
-            match self.load_precompiled(precompiled) {
+            // Inspect the original WASM bytes (not the precompiled
+            // blob) to determine the capability tier — that's the
+            // source of truth for what the module imports. The cap
+            // is then bound into the HMAC input, so a (precompiled,
+            // wasm_bytes) pair whose caps disagree fails verification
+            // before reaching the unsafe deserialize.
+            let cap = crate::wit_inspector::inspect_component(wasm_bytes).capability_world;
+            match self.load_precompiled(precompiled, cap.clone()) {
                 Ok(component) => {
                     tracing::info!("AOT: Using pre-compiled module");
-                    // Inspect the original WASM bytes (not precompiled) to determine
-                    // the capability tier.  This is the correct source of truth.
-                    let cap = crate::wit_inspector::inspect_component(wasm_bytes).capability_world;
                     // All worlds except Minimal and Unknown allow outbound network access.
                     let allow_wasi_network =
                         !matches!(cap, CapabilityWorld::Minimal | CapabilityWorld::Unknown);
