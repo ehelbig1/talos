@@ -688,6 +688,108 @@ mod host_allowlist_match_tests {
     }
 }
 
+/// Outcome of the URL-scheme check applied to every outbound WIT
+/// host call (`fetch`, `fetch_all`, `webhook::send`, `graphql::execute`,
+/// `http_stream::connect`). Plaintext HTTP is denied by default
+/// because:
+///   1. `vault://` header substitution can interpolate a secret into
+///      a plaintext request, exfiltrating it to any on-path observer.
+///   2. The SSRF gates protect the network destination but cannot
+///      protect data in flight.
+///   3. The Talos SDK's idiomatic config flow encourages outbound
+///      calls to first-party APIs which are uniformly HTTPS.
+///
+/// Operators with a legitimate plaintext target (dev sidecars, local
+/// services already gated by `WORKER_ALLOW_PRIVATE_HOST_TARGETS`)
+/// opt in with `WASM_ALLOW_INSECURE_HTTP=1`. The opt-in is process-
+/// wide because it covers per-execution `http://` use rather than
+/// per-execution policy.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UrlSchemeVerdict {
+    /// Scheme is `https`. Always allowed.
+    Https,
+    /// Scheme is something other than `https` AND the operator-level
+    /// opt-in is set. Allowed, but the caller MUST emit an audit row
+    /// so the deviation is visible to operators.
+    InsecureAllowedByOptIn { scheme: String },
+    /// Scheme is not `https` and there is no opt-in. Deny.
+    InsecureRefused { scheme: String },
+}
+
+/// Pure scheme-policy decision. Side-effect free so the security-
+/// critical default is unit-testable without touching DNS, sockets,
+/// or the env. Callers translate the verdict into the right deny
+/// + audit shape for their host-fn boundary.
+pub(crate) fn classify_url_scheme(scheme: &str, insecure_opt_in: bool) -> UrlSchemeVerdict {
+    // The scheme is already lowercased by `url::Url::parse`. Compare
+    // exact for determinism; treat anything else as insecure.
+    if scheme == "https" {
+        return UrlSchemeVerdict::Https;
+    }
+    if insecure_opt_in {
+        UrlSchemeVerdict::InsecureAllowedByOptIn {
+            scheme: scheme.to_string(),
+        }
+    } else {
+        UrlSchemeVerdict::InsecureRefused {
+            scheme: scheme.to_string(),
+        }
+    }
+}
+
+/// Read the operator-level opt-in env var. Recognised forms: `1`,
+/// `true`, `yes` (case-insensitive). Anything else is treated as off.
+/// Empty / unset → off — same fail-closed default as
+/// `TALOS_ALLOW_UNATTESTED_WASM`.
+pub(crate) fn insecure_http_opt_in() -> bool {
+    std::env::var("WASM_ALLOW_INSECURE_HTTP")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod url_scheme_policy_tests {
+    use super::{classify_url_scheme, UrlSchemeVerdict};
+
+    #[test]
+    fn https_always_allowed() {
+        assert_eq!(classify_url_scheme("https", false), UrlSchemeVerdict::Https);
+        assert_eq!(classify_url_scheme("https", true), UrlSchemeVerdict::Https);
+    }
+
+    #[test]
+    fn http_refused_by_default() {
+        assert!(matches!(
+            classify_url_scheme("http", false),
+            UrlSchemeVerdict::InsecureRefused { .. }
+        ));
+    }
+
+    #[test]
+    fn http_allowed_when_opt_in_set() {
+        assert!(matches!(
+            classify_url_scheme("http", true),
+            UrlSchemeVerdict::InsecureAllowedByOptIn { .. }
+        ));
+    }
+
+    #[test]
+    fn unusual_schemes_treated_as_insecure() {
+        // `file://`, `ftp://`, custom — all denied by default. The
+        // outer reqwest connect would refuse most of these anyway,
+        // but failing closed here keeps the policy uniform.
+        assert!(matches!(
+            classify_url_scheme("file", false),
+            UrlSchemeVerdict::InsecureRefused { .. }
+        ));
+        assert!(matches!(
+            classify_url_scheme("ftp", false),
+            UrlSchemeVerdict::InsecureRefused { .. }
+        ));
+    }
+}
+
 #[cfg(test)]
 mod classify_private_ip_tests {
     //! MCP-553: cover the IPv4/IPv6 unspecified range. Without these
@@ -2030,6 +2132,39 @@ impl wit_http::Host for TalosContext {
         // Validate and parse the URL first.
         let url: url::Url = req.url.parse().map_err(|_| wit_http::Error::Invalidurl)?;
 
+        // HTTPS-only by default. Plaintext outbound traffic can leak
+        // `vault://` headers; the SSRF gate protects destination but
+        // not data-in-flight. Operators with a legitimate plaintext
+        // target opt in via `WASM_ALLOW_INSECURE_HTTP=1`.
+        match classify_url_scheme(url.scheme(), insecure_http_opt_in()) {
+            UrlSchemeVerdict::Https => {}
+            UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
+                tracing::warn!(
+                    scheme = %scheme,
+                    host = %url.host_str().unwrap_or(""),
+                    "WASM module sent insecure-scheme HTTP request — \
+                     allowed by WASM_ALLOW_INSECURE_HTTP=1 (operator opt-in). \
+                     Confirm this is intended; plaintext traffic can leak vault:// \
+                     headers in flight."
+                );
+            }
+            UrlSchemeVerdict::InsecureRefused { scheme } => {
+                self.record_capability_denied(
+                    "http-fetch",
+                    "insecure-scheme",
+                    &format!("{scheme} {}", url.host_str().unwrap_or("")),
+                )
+                .await;
+                tracing::warn!(
+                    scheme = %scheme,
+                    host = %url.host_str().unwrap_or(""),
+                    "WASM module attempted non-https HTTP request — denied. \
+                     Set WASM_ALLOW_INSECURE_HTTP=1 to permit plaintext outbound."
+                );
+                return Err(wit_http::Error::Invalidurl);
+            }
+        }
+
         // Enforce the host allowlist.  An empty list means DENY ALL — the module
         // must be configured with an explicit allowlist, or use "*" to allow any host.
         let host = url.host_str().unwrap_or("");
@@ -2585,6 +2720,29 @@ impl wit_http::Host for TalosContext {
                 }
             };
             let host = url.host_str().unwrap_or("").to_string();
+
+            // 1b. HTTPS-only by default (see `classify_url_scheme` doc).
+            // Operator opt-in via `WASM_ALLOW_INSECURE_HTTP=1`.
+            match classify_url_scheme(url.scheme(), insecure_http_opt_in()) {
+                UrlSchemeVerdict::Https => {}
+                UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
+                    tracing::warn!(
+                        scheme = %scheme,
+                        host = %host,
+                        "fetch_all: insecure-scheme request allowed by WASM_ALLOW_INSECURE_HTTP=1"
+                    );
+                }
+                UrlSchemeVerdict::InsecureRefused { scheme } => {
+                    self.record_capability_denied(
+                        "http-fetch-all",
+                        "insecure-scheme",
+                        &format!("{scheme} {host}"),
+                    )
+                    .await;
+                    validated.push(Err(wit_http::Error::Invalidurl));
+                    continue;
+                }
+            }
 
             // 2. Allowlist must be configured.
             if self.allowed_hosts.is_empty() {
@@ -5417,6 +5575,36 @@ impl TalosContext {
         {
             let parsed: url::Url = url.parse().map_err(|_| wit_graphql::Error::Networkerror)?;
             let host = parsed.host_str().unwrap_or("").to_string();
+
+            // HTTPS-only by default. The GraphQL Error enum has no
+            // dedicated insecure-scheme variant; `Networkerror` is the
+            // mapping used for every URL-validation failure on this
+            // path (matches the empty-allowlist arm below).
+            match classify_url_scheme(parsed.scheme(), insecure_http_opt_in()) {
+                UrlSchemeVerdict::Https => {}
+                UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
+                    tracing::warn!(
+                        scheme = %scheme,
+                        host = %host,
+                        "graphql: insecure-scheme request allowed by WASM_ALLOW_INSECURE_HTTP=1"
+                    );
+                }
+                UrlSchemeVerdict::InsecureRefused { scheme } => {
+                    self.record_capability_denied(
+                        "graphql",
+                        "insecure-scheme",
+                        &format!("{scheme} {host}"),
+                    )
+                    .await;
+                    tracing::warn!(
+                        scheme = %scheme,
+                        host = %host,
+                        "WASM module attempted non-https GraphQL request — denied."
+                    );
+                    return Err(wit_graphql::Error::Networkerror);
+                }
+            }
+
             if allowed_hosts.is_empty() {
                 self.record_capability_denied("graphql", "no-allowlist-configured", &host)
                     .await;
@@ -5738,6 +5926,35 @@ impl wit_webhook::Host for TalosContext {
         // SSRF protection: validate URL and enforce host allowlist (same as HTTP fetch).
         let parsed_url: url::Url = url.parse().map_err(|_| wit_webhook::Error::Sendfailed)?;
         let host = parsed_url.host_str().unwrap_or("").to_string();
+
+        // HTTPS-only by default. Webhook deliveries are the highest-
+        // value plaintext target since they carry a signed payload
+        // bound to a guest secret; intercepting the wire is enough to
+        // replay it. Operator opt-in only.
+        match classify_url_scheme(parsed_url.scheme(), insecure_http_opt_in()) {
+            UrlSchemeVerdict::Https => {}
+            UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
+                tracing::warn!(
+                    scheme = %scheme,
+                    host = %host,
+                    "webhook::send: insecure-scheme request allowed by WASM_ALLOW_INSECURE_HTTP=1"
+                );
+            }
+            UrlSchemeVerdict::InsecureRefused { scheme } => {
+                self.record_capability_denied(
+                    "webhook",
+                    "insecure-scheme",
+                    &format!("{scheme} {host}"),
+                )
+                .await;
+                tracing::warn!(
+                    scheme = %scheme,
+                    host = %host,
+                    "WASM module attempted non-https webhook send — denied."
+                );
+                return Err(wit_webhook::Error::Sendfailed);
+            }
+        }
 
         // Enforce the host allowlist. Empty list means DENY ALL.
         if self.allowed_hosts.is_empty() {
@@ -10758,6 +10975,37 @@ impl wit_http_stream::Host for TalosContext {
             .map_err(|_| wit_http_stream::Error::InvalidUrl)?;
 
         let host = parsed.host_str().unwrap_or("").to_string();
+
+        // HTTPS-only by default. SSE streams stay open for the full
+        // event window so an on-path attacker who can read plaintext
+        // wins ANY secret rotated through `vault://` headers for the
+        // life of the connection — strictly worse than a one-shot
+        // fetch. Operator opt-in via `WASM_ALLOW_INSECURE_HTTP=1`.
+        match classify_url_scheme(parsed.scheme(), insecure_http_opt_in()) {
+            UrlSchemeVerdict::Https => {}
+            UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
+                tracing::warn!(
+                    scheme = %scheme,
+                    host = %host,
+                    "http-stream: insecure-scheme stream allowed by WASM_ALLOW_INSECURE_HTTP=1"
+                );
+            }
+            UrlSchemeVerdict::InsecureRefused { scheme } => {
+                self.record_capability_denied(
+                    "http-stream",
+                    "insecure-scheme",
+                    &format!("{scheme} {host}"),
+                )
+                .await;
+                tracing::warn!(
+                    scheme = %scheme,
+                    host = %host,
+                    "WASM module attempted non-https SSE stream — denied."
+                );
+                return Err(wit_http_stream::Error::InvalidUrl);
+            }
+        }
+
         if self.allowed_hosts.is_empty() {
             self.record_capability_denied("http-stream", "no-allowlist-configured", &host)
                 .await;

@@ -301,11 +301,16 @@ pub(crate) async fn verify_oci_signature(
     oidc_issuer: &str,
 ) -> Result<(), String> {
     let argv = cosign_verify_argv(reference, identity_regexp, oidc_issuer);
-    let output = match tokio::process::Command::new("cosign")
-        .args(&argv)
-        .output()
-        .await
-    {
+    // Prefer the absolute path pinned at startup so this invocation
+    // targets the SAME binary that the M5 `TALOS_COSIGN_SHA256` gate
+    // just hashed. When unpinned (tests, audit-mode without a hash
+    // pin, pre-startup), fall back to PATH lookup — the operator-
+    // visible warning at startup already covers that posture.
+    let mut command = match cosign_pinned_path() {
+        Some(path) => tokio::process::Command::new(path),
+        None => tokio::process::Command::new("cosign"),
+    };
+    let output = match command.args(&argv).output().await {
         Ok(o) => o,
         Err(e) => {
             // ENOENT (cosign missing) is operator misconfig — surface it
@@ -365,8 +370,33 @@ pub(crate) fn parse_semver_triple(s: &str) -> Option<(u32, u32, u32)> {
     Some((maj, min, patch))
 }
 
-/// Resolve the `cosign` binary on PATH and compute its SHA-256. Used by
-/// the M5 startup `TALOS_COSIGN_SHA256` pin to detect a swapped binary.
+/// Process-wide pinned absolute path to the `cosign` binary, resolved
+/// once at startup and reused for every verification call.
+///
+/// L-3 follow-up: every `tokio::process::Command::new("cosign")` re-walks
+/// `PATH`, so the M5 `TALOS_COSIGN_SHA256` startup check (which hashes the
+/// binary at the path returned by `which cosign` at boot) could be
+/// circumvented by a later `PATH` mutation — the verify call would resolve
+/// a different binary than the one that was hashed. Pinning the absolute
+/// path at startup and reusing it makes the M5 hash check apply to every
+/// subsequent invocation. Defense-in-depth in the immutable-container
+/// happy path; correctness in any environment where `PATH` is mutable.
+static COSIGN_BINARY_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Read the pinned cosign path if startup resolution succeeded. Callers
+/// in `verify_oci_signature` use this; when `None` (e.g. tests or a
+/// pre-startup call), fall back to invoking `cosign` by name — the
+/// behavioural difference is only the loss of the PATH-pin guarantee.
+pub(crate) fn cosign_pinned_path() -> Option<&'static std::path::Path> {
+    COSIGN_BINARY_PATH.get().map(|p| p.as_path())
+}
+
+/// Resolve the `cosign` binary on PATH, pin its absolute path for the
+/// process lifetime, and compute its SHA-256.
+///
+/// The path pin is set as a side-effect of a successful resolve so the
+/// M5 hash pin gate at startup and the per-invocation execution path
+/// agree on which binary is being checked.
 async fn resolve_and_hash_cosign_binary() -> anyhow::Result<String> {
     let output = tokio::process::Command::new("which")
         .arg("cosign")
@@ -380,11 +410,18 @@ async fn resolve_and_hash_cosign_binary() -> anyhow::Result<String> {
     if path.is_empty() {
         anyhow::bail!("`which cosign` produced empty output");
     }
-    let bytes = tokio::fs::read(&path)
+    let path_buf = std::path::PathBuf::from(&path);
+    let bytes = tokio::fs::read(&path_buf)
         .await
         .map_err(|e| anyhow::anyhow!("failed to read cosign at {path}: {e}"))?;
     use sha2::Digest as _;
-    Ok(format!("{:x}", sha2::Sha256::digest(&bytes)))
+    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    // Pin the resolved absolute path for the process lifetime so every
+    // `verify_oci_signature` invocation targets the same binary the M5
+    // startup gate just hashed. `set` is idempotent on success — a later
+    // resolve (e.g. in a test) is silently ignored.
+    let _ = COSIGN_BINARY_PATH.set(path_buf);
+    Ok(hash)
 }
 
 /// Decision returned by `verify_oci_layer` — small enum to make the security-

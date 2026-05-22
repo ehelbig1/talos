@@ -461,6 +461,40 @@ pub struct SseEventInternal {
     pub id: Option<String>,
 }
 
+/// Per-execution hardened reqwest client.
+///
+/// Pulled into a free helper (rather than left inline in
+/// `TalosContext::new`) so the `SsrfFilteringResolver` can borrow
+/// `allowed_hosts` before the latter is moved into the struct, and so
+/// the security-critical client posture (no redirects, 5s handshake
+/// budget, SSRF-aware DNS) is grep-able in one place.
+///
+/// Security posture summary:
+///   * No automatic redirect-following — a 30x to a private IP would
+///     bypass the per-call DNS validation that operates on the
+///     original URL only.
+///   * 5s connect timeout — bounds TLS-handshake stalls so a SSRF
+///     target hardened against TLS probes can't consume the full
+///     per-call timeout on the handshake alone (MCP-1058).
+///   * Per-host idle-pool cap (10) — limits resource churn while
+///     keeping a useful connection-reuse path open.
+///   * SSRF-aware DNS resolver scoped to this execution's allowed
+///     hosts — every address the OS resolver returns is re-classified
+///     via `classify_private_ip` BEFORE reqwest connects, closing the
+///     TOCTOU window between the per-call check and the connect step.
+fn build_per_execution_http_client(allowed_hosts: &[String]) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("Talos-Worker/1.0")
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(10)
+        .dns_resolver(std::sync::Arc::new(
+            crate::ssrf_resolver::SsrfFilteringResolver::for_allowed_hosts(allowed_hosts),
+        ))
+        .build()
+        .expect("worker: failed to build hardened reqwest client with no-redirect policy")
+}
+
 impl TalosContext {
     /// Create a new execution context with an ephemeral file-system sandbox.
     ///
@@ -742,6 +776,12 @@ impl TalosContext {
             std::sync::Arc::from(p)
         };
 
+        // Build the per-execution reqwest client BEFORE moving
+        // `allowed_hosts` into the struct so the SSRF resolver can be
+        // scoped to this execution's explicit hostnames. See the
+        // resolver doc-comment for the per-host bypass rationale.
+        let http_client = build_per_execution_http_client(&allowed_hosts);
+
         Ok(Self {
             wasi,
             table,
@@ -815,29 +855,7 @@ impl TalosContext {
             // black-holed host) would otherwise consume the full
             // per-call timeout on the handshake alone. 5s matches the
             // workspace-canonical handshake budget.
-            http_client: reqwest::Client::builder()
-                .user_agent("Talos-Worker/1.0")
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .pool_max_idle_per_host(10)
-                // M4 (2026-05-22): SSRF-aware DNS resolver. Re-applies
-                // `classify_private_ip` to every address the OS
-                // resolver returns BEFORE reqwest connects, closing
-                // the TOCTOU window between the per-call DNS check
-                // (`validate_no_dns_rebinding` / inline checks) and
-                // reqwest's own internal resolve+connect step.
-                // Without this, an attacker controlling DNS for an
-                // allowlisted hostname could return a public IP at
-                // pre-validation and a private IP at the connect
-                // step, slipping past the deny-list. The pre-call
-                // check stays in place — it provides the audit-log
-                // signal — but the resolver-side check is the
-                // correctness gate.
-                .dns_resolver(std::sync::Arc::new(
-                    crate::ssrf_resolver::SsrfFilteringResolver,
-                ))
-                .build()
-                .expect("worker: failed to build hardened reqwest client with no-redirect policy"),
+            http_client,
             // MCP-937 (2026-05-15): filter empty-string env values so a
             // Helm-placeholder `S3_ENDPOINT=""` (or any of the three S3
             // creds) doesn't propagate `Some("")` into the
@@ -1014,6 +1032,16 @@ impl ResourceLimiter for TalosContext {
                 MAX_TABLE_SIZE,
                 "WASM table limit exceeded — denying allocation"
             );
+            // Reuse the `oom_error_message` path so the trap-handling site in
+            // `runtime.rs` surfaces an operator-actionable message instead of
+            // a generic trap. Without this the guest aborts with no signal
+            // about which resource limit was hit.
+            self.oom_error_message = Some(format!(
+                "WASM module exceeded its table-entry limit of {} (tried to grow to {}). \
+                 This typically indicates an unbounded indirect-call or function-pointer \
+                 table; refactor to reduce dispatch fan-out.",
+                MAX_TABLE_SIZE, desired
+            ));
             return Ok(false);
         }
         Ok(true)

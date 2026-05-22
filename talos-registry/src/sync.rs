@@ -71,6 +71,40 @@ impl SigstorePolicy {
     }
 }
 
+/// Process-wide pinned absolute path to the `cosign` binary on the
+/// controller side. Mirrors the worker's pin (worker/src/main.rs) so
+/// every verification invocation targets the SAME binary that the
+/// controller's startup resolution touched. Without this, each
+/// `Command::new("cosign")` re-walks `PATH` — fine in an immutable
+/// container, exploitable anywhere `PATH` is mutable.
+static COSIGN_BINARY_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Resolve `cosign` on PATH once and cache the absolute path. Called
+/// lazily from `cosign_verify_artifact`; subsequent calls hit the
+/// cache. A resolution failure does NOT cache a sentinel — the next
+/// verification call will retry, so a slow / racy startup environment
+/// converges instead of permanently failing closed.
+async fn resolve_cosign_path_cached() -> Option<&'static std::path::Path> {
+    if let Some(p) = COSIGN_BINARY_PATH.get() {
+        return Some(p.as_path());
+    }
+    let output = tokio::process::Command::new("which")
+        .arg("cosign")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let path_buf = std::path::PathBuf::from(path);
+    let _ = COSIGN_BINARY_PATH.set(path_buf);
+    COSIGN_BINARY_PATH.get().map(|p| p.as_path())
+}
+
 /// Verify an OCI artifact's Sigstore signature via the `cosign` binary.
 /// Pure-argv wrapper around `cosign verify --certificate-identity-regexp
 /// <REGEXP> --certificate-oidc-issuer <ISSUER>` — the same shape used by
@@ -81,7 +115,13 @@ async fn cosign_verify_artifact(
     identity_regexp: &str,
     oidc_issuer: &str,
 ) -> std::result::Result<(), String> {
-    let output = tokio::process::Command::new("cosign")
+    // Prefer the cached absolute path so PATH mutations between
+    // startup and verification time can't swap the binary.
+    let mut command = match resolve_cosign_path_cached().await {
+        Some(path) => tokio::process::Command::new(path),
+        None => tokio::process::Command::new("cosign"),
+    };
+    let output = command
         .args([
             "verify",
             "--certificate-identity-regexp",
