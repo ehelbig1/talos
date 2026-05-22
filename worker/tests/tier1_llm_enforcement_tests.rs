@@ -30,9 +30,9 @@
 //! re-tested at the integration layer.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use worker::context::TalosContext;
+use worker::expose_fallback::ExposeFallback;
 use worker::CapabilityWorld;
 
 /// Helper: build a TalosContext with Tier-1 ceiling AND an
@@ -50,7 +50,7 @@ fn make_tier1_context_with_llm_host(world: CapabilityWorld, llm_host: &str) -> T
         None,
         false,
         None,
-        Arc::new(AtomicU64::new(0)),
+        Arc::new(ExposeFallback::new()),
     )
     .expect("failed to create TalosContext");
     ctx.max_llm_tier = talos_workflow_job_protocol::LlmTier::Tier1;

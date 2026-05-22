@@ -11,9 +11,9 @@
 //! end-to-end security properties.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use worker::context::TalosContext;
+use worker::expose_fallback::ExposeFallback;
 use worker::CapabilityWorld;
 
 /// Helper: create a TalosContext with the given capability world.
@@ -28,7 +28,7 @@ fn make_context(world: CapabilityWorld) -> TalosContext {
         None,
         false,
         None,
-        Arc::new(AtomicU64::new(0)),
+        Arc::new(ExposeFallback::new()),
     )
     .expect("failed to create TalosContext")
 }

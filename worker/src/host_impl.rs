@@ -3611,26 +3611,40 @@ impl wit_secrets::Host for TalosContext {
 
         // Global rate limit: per-user daily limit across all executions (Redis-backed).
         if let Some(user_id) = self.user_id {
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let today_utc = chrono::Utc::now();
+            let today_naive = today_utc.date_naive();
+            let today = today_utc.format("%Y-%m-%d").to_string();
             let key = format!("talos:tier2_expose:{}:{}", user_id, today);
 
+            // M-2 (2026-05-22): replaces the prior process-wide
+            // `Arc<AtomicU64>` fallback with a per-user
+            // `(date, counter)` map. Pre-fix one tenant exhausting the
+            // counter denied service to every other tenant on the
+            // worker pod until restart. The new shape isolates
+            // tenants AND self-rotates at the day boundary. Both the
+            // Redis-error and Redis-absent paths route through the
+            // same fallback helper — keeping MCP-722's "never-configured
+            // = same fail-closed path as outage" invariant intact.
+            use crate::expose_fallback::FallbackVerdict;
             let global_allowed = if let Some(ref redis) = self.redis_client {
                 match Self::check_global_expose_limit(redis, &key).await {
                     Ok(allowed) => allowed,
                     Err(e) => {
-                        // SECURITY: Redis unavailable — use in-memory fallback counter instead
-                        // of failing open. This prevents bypassing the daily limit by
-                        // triggering Redis unavailability.
-                        let fallback_count = self
-                            .global_expose_fallback_count
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let allowed = fallback_count < MAX_TIER2_EXPOSES_PER_USER_PER_DAY;
+                        let verdict = self.global_expose_fallback.check_and_increment(
+                            user_id,
+                            today_naive,
+                            MAX_TIER2_EXPOSES_PER_USER_PER_DAY,
+                        );
+                        let (allowed, fallback_count) = match verdict {
+                            FallbackVerdict::Allowed { count } => (true, count),
+                            FallbackVerdict::Denied { count } => (false, count),
+                        };
                         tracing::warn!(
                             user_id = %user_id,
                             error = %e,
                             fallback_count,
                             "Redis global expose limit check failed, using in-memory fallback ({}/{})",
-                            fallback_count + 1,
+                            fallback_count,
                             MAX_TIER2_EXPOSES_PER_USER_PER_DAY
                         );
                         allowed
@@ -3638,32 +3652,26 @@ impl wit_secrets::Host for TalosContext {
                 }
             } else {
                 // MCP-722 (2026-05-13): Redis ABSENT (env-unconfigured)
-                // must follow the same fallback path as Redis-ERROR. Pre-fix
-                // this arm returned `true` unconditionally, silently
-                // bypassing the daily per-user cap whenever an operator
-                // ran the worker without Redis configured. The
-                // MAX_TIER2_EXPOSES_PER_USER_PER_DAY documentation said
-                // 100/user/day; the actual behaviour collapsed to the
-                // per-execution cap (10) × unlimited executions, since
-                // each execution gets its own counter. The Redis-error
-                // path was hardened against "triggering Redis
-                // unavailability to bypass the cap" (comment above) — but
-                // never-configured was a sibling bypass that escaped the
-                // same hardening because the conditional shape was
-                // `if let Some(redis)` rather than always running the
-                // fallback when Redis returned nothing useful. Same
-                // counter (`global_expose_fallback_count` is process-wide,
-                // shared across all executions via `Arc<AtomicU64>`), so
-                // the cap applies in lockstep.
-                let fallback_count = self
-                    .global_expose_fallback_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let allowed = fallback_count < MAX_TIER2_EXPOSES_PER_USER_PER_DAY;
+                // must follow the same fallback path as Redis-ERROR.
+                // Pre-fix this arm returned `true` unconditionally,
+                // silently bypassing the daily per-user cap whenever
+                // an operator ran the worker without Redis configured.
+                // M-2 (2026-05-22): the fallback is now per-user, not
+                // process-wide — see expose_fallback.rs.
+                let verdict = self.global_expose_fallback.check_and_increment(
+                    user_id,
+                    today_naive,
+                    MAX_TIER2_EXPOSES_PER_USER_PER_DAY,
+                );
+                let (allowed, fallback_count) = match verdict {
+                    FallbackVerdict::Allowed { count } => (true, count),
+                    FallbackVerdict::Denied { count } => (false, count),
+                };
                 tracing::warn!(
                     user_id = %user_id,
                     fallback_count,
                     "Redis not configured for global expose limit; using in-memory fallback ({}/{})",
-                    fallback_count + 1,
+                    fallback_count,
                     MAX_TIER2_EXPOSES_PER_USER_PER_DAY
                 );
                 allowed

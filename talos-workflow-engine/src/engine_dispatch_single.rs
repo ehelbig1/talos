@@ -265,6 +265,7 @@ impl ParallelWorkflowEngine {
             .min(self.max_fuel_per_node);
 
         // Resolve encrypted secrets payload (opaque bytes at this layer).
+        // L-1: AAD = execution_id binds the AES-GCM tag to this dispatch.
         let encrypted_secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
             (Some(resolver), Some(key)) => {
                 let vault_paths = extract_vault_paths(&module_config);
@@ -277,6 +278,7 @@ impl ParallelWorkflowEngine {
                     &wasm_module.allowed_secrets,
                     key.as_bytes(),
                     self.max_llm_tier,
+                    execution_id.as_bytes(),
                 )
                 .await
             }

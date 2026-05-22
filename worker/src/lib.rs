@@ -5,6 +5,7 @@ pub mod audit;
 pub mod bindings;
 pub mod circuit_breaker;
 pub mod context;
+pub mod expose_fallback;
 pub mod host_impl;
 pub mod metrics;
 pub mod metrics_server;

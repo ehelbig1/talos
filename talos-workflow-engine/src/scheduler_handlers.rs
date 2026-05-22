@@ -1684,7 +1684,7 @@ impl ParallelWorkflowEngine {
 
             let body_timeout_secs = self.node_timeout_for(body_uuid).unwrap_or(30);
             let encrypted_secrets = self
-                .build_encrypted_secrets(body_module_id, worker_shared_key)
+                .build_encrypted_secrets(body_module_id, execution_id, worker_shared_key)
                 .await;
             let body_job = DispatchJob {
                 execution_id,

@@ -184,6 +184,29 @@ pub trait SecretEnvelope: Send + Sync {
         secrets: &HashMap<String, String>,
         shared_key: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), BoxError>;
+
+    /// L-1 (2026-05-22): same contract as [`Self::seal`], with `aad`
+    /// bound into the AEAD authentication tag.
+    ///
+    /// The recommended `aad` is the dispatching job's identifier
+    /// (e.g. `job_id.as_bytes()` — the raw 16-byte UUID). Binding
+    /// that into the tag makes a transposed ciphertext (lifted from
+    /// one JobRequest into another under the same shared key) fail
+    /// to decrypt at the worker, providing an in-protocol integrity
+    /// gate independent of the JobRequest HMAC.
+    ///
+    /// The default impl ignores `aad` and falls through to [`Self::seal`]
+    /// — this keeps existing custom envelopes compiling without
+    /// modification. Production envelopes (the reference
+    /// `AesGcmSecretEnvelope`) override this method.
+    async fn seal_with_aad(
+        &self,
+        secrets: &HashMap<String, String>,
+        shared_key: &[u8],
+        _aad: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), BoxError> {
+        self.seal(secrets, shared_key).await
+    }
 }
 
 #[cfg(test)]

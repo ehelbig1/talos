@@ -1248,6 +1248,11 @@ pub async fn process_webhook_events(
             secrets_manager.as_ref(),
             module_uuid,
             user_id,
+            // L-1: AAD = execution_id (= job_id for single-node
+            // dispatches). The JobRequest below sets
+            // `workflow_execution_id = job_id`, matching the worker
+            // decrypt AAD.
+            job_id,
         )
         .await;
 

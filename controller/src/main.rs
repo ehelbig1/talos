@@ -3014,8 +3014,21 @@ async fn main() -> anyhow::Result<()> {
                         // request-reply, so this subscriber is mostly dormant
                         // — kept as the canonical landing point for future
                         // truly-async dispatches (work-queue style).
+                        // L-4: typed Observer verifier — this audit
+                        // subscriber on `talos.results.*` only writes
+                        // an idempotent UPDATE; primary verification
+                        // happens at the request-reply inbox in the
+                        // engine dispatcher / webhook handler. Using
+                        // `Verifier::Observer` documents the role at
+                        // the type level so a future refactor can't
+                        // accidentally convert this site to a primary
+                        // verifier and reintroduce the r300 regression.
                         if let Some(ref key) = worker_shared_key_for_results {
-                            if let Err(e) = result.verify_no_replay(key.as_bytes(), 300) {
+                            if let Err(e) = result.verify_as(
+                                key.as_bytes(),
+                                300,
+                                talos_workflow_job_protocol::Verifier::Observer,
+                            ) {
                                 tracing::warn!(
                                     "Rejected job result {}: signature verification failed — {}",
                                     job_id,

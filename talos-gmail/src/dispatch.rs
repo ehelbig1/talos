@@ -237,6 +237,11 @@ async fn dispatch_single_message(
         ctx.secrets_manager.as_ref(),
         module_id,
         user_id,
+        // L-1: AAD = execution_id. This dispatch sets
+        // `JobRequest.workflow_execution_id = execution_id` (and
+        // also `job_id = execution_id`), so the worker decrypts with
+        // the same AAD.
+        execution_id,
     )
     .await;
 

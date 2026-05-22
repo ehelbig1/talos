@@ -39,6 +39,7 @@ use uuid::Uuid;
 /// the combined map is empty, the function returns
 /// `EncryptedSecrets::default()` (empty ciphertext) rather than
 /// encrypting an empty map.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_encrypted_secrets_for(
     resolver: &dyn SecretsResolver,
     envelope: &dyn SecretEnvelope,
@@ -53,6 +54,13 @@ pub(crate) async fn build_encrypted_secrets_for(
     // what crosses the wire (encrypted or not) tightens the blast radius
     // if a future bypass slips through.
     max_llm_tier: talos_workflow_engine_core::LlmTier,
+    // L-1 (2026-05-22): AEAD additional-authenticated-data binding.
+    // The recommended value is the dispatching JobRequest's
+    // `job_id.as_bytes()` — that ties the AES-GCM tag to the specific
+    // job this ciphertext is meant for, so a ciphertext transposed
+    // into a different JobRequest (under the same shared key) fails
+    // tag validation at the worker.
+    aad: &[u8],
 ) -> talos_workflow_job_protocol::EncryptedSecrets {
     // 1. Module-grant secrets.
     let mut secrets_map = resolver
@@ -114,7 +122,15 @@ pub(crate) async fn build_encrypted_secrets_for(
     if secrets_map.is_empty() {
         return talos_workflow_job_protocol::EncryptedSecrets::default();
     }
-    match envelope.seal(&secrets_map, worker_shared_key).await {
+    // L-1: route through the AAD-binding seal so the per-job AEAD
+    // context is part of the AES-GCM tag. The default trait impl
+    // falls back to plain `seal` (no AAD) so custom envelopes that
+    // haven't migrated still compile and produce decryptable bytes
+    // when paired with a worker on the legacy decrypt path.
+    match envelope
+        .seal_with_aad(&secrets_map, worker_shared_key, aad)
+        .await
+    {
         Ok((ciphertext, nonce)) => {
             // Validate the seal output structurally — a misconfigured
             // envelope that returns a short nonce or a mismatched

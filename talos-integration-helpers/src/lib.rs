@@ -53,10 +53,17 @@ use uuid::Uuid;
 /// `Zeroizing<String>` from the LLM-keys cache is cloned at the map
 /// boundary into a plain `String`; the cache copy zeroizes when
 /// `llm_keys` is dropped at the end of this function.
+/// L-1 (2026-05-22): the `execution_id` parameter is bound as AEAD
+/// AAD on the AES-GCM tag — the worker decrypts with the same AAD
+/// pulled from `JobRequest.workflow_execution_id`. Callers MUST pass
+/// the SAME `execution_id` they will set on the JobRequest;
+/// otherwise the worker's tag check fails and the dispatch errors
+/// with "decryption failed".
 pub async fn build_dispatch_encrypted_secrets(
     secrets_manager: Option<&Arc<SecretsManager>>,
     module_id: Uuid,
     user_id: Uuid,
+    execution_id: Uuid,
 ) -> EncryptedSecrets {
     let Some(sm) = secrets_manager else {
         tracing::debug!(
@@ -124,7 +131,16 @@ pub async fn build_dispatch_encrypted_secrets(
         }
     }
 
-    match EncryptedSecrets::encrypt(&secrets_map, key.as_bytes()) {
+    // L-1: bind execution_id as AEAD AAD on the AES-GCM tag — the
+    // worker decrypts with the same AAD pulled from
+    // `JobRequest.workflow_execution_id`. Empty secrets_map still
+    // returns `EncryptedSecrets::default()` (empty ciphertext +
+    // empty nonce) — that path bypasses AAD entirely on both sides.
+    match EncryptedSecrets::encrypt_with_aad(
+        &secrets_map,
+        key.as_bytes(),
+        execution_id.as_bytes(),
+    ) {
         Ok(es) => es,
         Err(e) => {
             tracing::warn!(
