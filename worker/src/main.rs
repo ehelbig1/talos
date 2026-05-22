@@ -59,6 +59,64 @@ const MAX_CONCURRENT_PIPELINE_JOBS: usize = 20;
 /// on every miss, so the TTL is harmless there.
 const OCI_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
+/// H-3: Maximum decompressed OCI layer size the worker will accept.
+///
+/// `oci_distribution::Client::pull` buffers each layer into a
+/// `Vec<u8>` AFTER gzip decompression. Without a cap, a hostile or
+/// compromised registry can serve a small gzipped layer that
+/// decompresses to many gigabytes and OOMs the worker (the pooling
+/// allocator's 128 MiB per-instance bound only protects memory
+/// inside wasmtime, not host-side `Vec` allocations).
+///
+/// 64 MiB is well above any realistic Talos module — the largest
+/// templates in the catalog are < 8 MiB AOT-compiled, < 1 MiB
+/// uncompiled — so this cap won't fire on legitimate traffic. Bump
+/// it (via `WORKER_MAX_OCI_LAYER_BYTES`) if a future template ever
+/// approaches the limit. Defense-in-depth check at both pre-pull
+/// (manifest's declared size) and post-pull (actual `data.len()`)
+/// because a malicious manifest can lie about layer size.
+const DEFAULT_MAX_OCI_LAYER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Env-configurable override for [`DEFAULT_MAX_OCI_LAYER_BYTES`].
+/// `0` / unset / malformed → use the default. Loaded lazily on
+/// first OCI pull (cheap; not a hot path).
+fn max_oci_layer_bytes() -> u64 {
+    std::env::var("WORKER_MAX_OCI_LAYER_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_OCI_LAYER_BYTES)
+}
+
+/// Decision returned by [`check_manifest_layer_sizes`] — keeps the
+/// security-critical policy testable in isolation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ManifestSizeVerdict {
+    /// All declared layer sizes are within bounds.
+    Ok,
+    /// At least one layer's declared `size` exceeds the cap. Carries
+    /// both the offending declared size and the cap for log lines.
+    Oversized { declared: i64, cap: u64 },
+}
+
+/// Pre-pull check: refuse to fetch an OCI artifact whose manifest
+/// declares any layer larger than `cap`. Pure function so the policy
+/// is unit-testable without a registry. Negative `size` values (the
+/// manifest spec allows i64 but values < 0 are nonsense) are treated
+/// as oversized so a forged manifest can't bypass the gate by claiming
+/// a negative size.
+pub(crate) fn check_manifest_layer_sizes(
+    layer_sizes: &[i64],
+    cap: u64,
+) -> ManifestSizeVerdict {
+    for &size in layer_sizes {
+        if size < 0 || (size as u64) > cap {
+            return ManifestSizeVerdict::Oversized { declared: size, cap };
+        }
+    }
+    ManifestSizeVerdict::Ok
+}
+
 /// Sigstore enforcement modes for OCI artifact signature verification.
 /// Resolved once at process startup from `TALOS_SIGSTORE_REQUIRED`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,6 +142,115 @@ impl SigstorePolicy {
             _ => Self::Disabled,
         }
     }
+}
+
+/// Reasons a Sigstore identity regexp is too permissive to enforce.
+/// Returned by [`validate_sigstore_identity_regexp`] so the worker can
+/// fail closed at startup instead of accepting a setting that defeats
+/// the entire signature-verification chain. Pure data so it's easy to
+/// match on / test.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SigstoreRegexpRejection {
+    /// The string is empty — the caller should treat this as
+    /// "explicitly not configured" rather than a parse error, but in
+    /// `Required` mode it's still a hard failure (see callsite).
+    Empty,
+    /// One of the known catch-all patterns: `.*`, `.+`, `.`, `^.*$`,
+    /// etc. A regex this broad accepts any Fulcio cert identity, which
+    /// is the same as having no verification at all.
+    TooBroad,
+    /// The pattern doesn't compile as a regex. Fail closed early so
+    /// `cosign verify` doesn't error in production with an opaque
+    /// upstream message.
+    InvalidRegex,
+    /// The pattern would match a GitHub repo or workflow URL prefix
+    /// without ever anchoring the trailing `@` separator. Per the
+    /// CLAUDE.md guidance: without the `@`, an attacker who creates a
+    /// fork named `template-publish.yml-evil.yml` can match the same
+    /// prefix.
+    MissingWorkflowAnchor,
+}
+
+impl SigstoreRegexpRejection {
+    pub(crate) fn human_reason(&self) -> &'static str {
+        match self {
+            Self::Empty => "TALOS_SIGSTORE_IDENTITY_REGEXP is empty",
+            Self::TooBroad => {
+                "TALOS_SIGSTORE_IDENTITY_REGEXP matches anything — pin it to your \
+                 workflow URL pattern (e.g. \
+                 `^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@`)"
+            }
+            Self::InvalidRegex => {
+                "TALOS_SIGSTORE_IDENTITY_REGEXP is not a valid regex — `cosign verify` will reject every artifact"
+            }
+            Self::MissingWorkflowAnchor => {
+                "TALOS_SIGSTORE_IDENTITY_REGEXP looks like a GitHub workflow pattern \
+                 but is missing the trailing `@` anchor — a fork named \
+                 `workflow.yml-evil.yml` could match the same prefix. \
+                 End the pattern with `@` to anchor at the ref separator."
+            }
+        }
+    }
+}
+
+/// Validate `regexp` for use as `--certificate-identity-regexp` in
+/// `cosign verify`. Pure function so the security policy is easy to
+/// test and cannot drift between callsites. Returns `Ok(())` if the
+/// pattern is acceptable; `Err(reason)` otherwise.
+///
+/// Policy:
+/// 1. Empty string is rejected (callers may special-case Empty for
+///    `Disabled` policy mode, but the underlying check stays the
+///    same).
+/// 2. Known catch-all patterns are rejected. Treating `.*` /
+///    `.+` / `.` / `^.*$` / `^.+$` as too broad covers the most
+///    common foot-gun — an operator who sets the regexp to "any"
+///    while leaving `TALOS_SIGSTORE_REQUIRED=true` would silently
+///    defeat verification.
+/// 3. The pattern must compile as a regex.
+/// 4. Patterns targeting `github.com/.../.github/workflows/...`
+///    MUST end with `@` (per the workflow-URL anchor convention
+///    documented in CLAUDE.md). Missing this trailing `@` is
+///    spoofable via a fork repo named `workflow.yml-evil.yml`.
+pub(crate) fn validate_sigstore_identity_regexp(
+    regexp: &str,
+) -> Result<(), SigstoreRegexpRejection> {
+    if regexp.is_empty() {
+        return Err(SigstoreRegexpRejection::Empty);
+    }
+    // Reject known catch-all patterns. Trim whitespace first so a
+    // pasted env-var with stray spaces still triggers the check.
+    let trimmed = regexp.trim();
+    matches!(
+        trimmed,
+        ".*" | ".+" | "." | "^.*$" | "^.+$" | "^.$" | "^.*" | ".*$"
+    )
+    .then(|| Err::<(), _>(SigstoreRegexpRejection::TooBroad))
+    .transpose()?;
+    // The pattern must compile or `cosign` will reject every artifact.
+    if regex::Regex::new(regexp).is_err() {
+        return Err(SigstoreRegexpRejection::InvalidRegex);
+    }
+    // Workflow-URL convention: if the pattern mentions
+    // `.github/workflows/`, the file extension `.yml` (or `.yaml`)
+    // must be immediately followed by `@` so the ref separator is
+    // anchored. Without it, a fork repo named
+    // `workflow.yml-evil.yml` would match the same prefix.
+    //
+    // The check looks for the `@` to appear AFTER `workflows/` in the
+    // pattern source. Both the "ends with @" form (e.g.
+    // `…template-publish\.yml@`) and the ref-pinned form (e.g.
+    // `…template-publish\.yml@refs/heads/main$`) satisfy it.
+    if let Some(workflows_idx) = regexp.find(".github/workflows/") {
+        // Slice past the `workflows/` literal so any preceding `@`
+        // (would be unusual but harmless) doesn't accidentally
+        // satisfy the check.
+        let after_workflows = &regexp[workflows_idx + ".github/workflows/".len()..];
+        if !after_workflows.contains('@') {
+            return Err(SigstoreRegexpRejection::MissingWorkflowAnchor);
+        }
+    }
+    Ok(())
 }
 
 /// Build the `cosign verify` argv for a given OCI reference. Pure
@@ -391,17 +558,163 @@ async fn publish_bytes_with_retry(
 /// don't currently exist, but the fire-and-forget code path is kept
 /// for future use (e.g. async work-queue dispatches that don't await
 /// the result inline).
+/// H-1: Reconcile the wire-format NATS `msg.reply` (untrusted —
+/// flows over an unsigned header an attacker can modify) with the
+/// HMAC-bound `JobRequest::reply_topic` (signed, trustworthy when
+/// present). Returns the subject the worker SHOULD publish the
+/// signed JobResult to, or `None` if no reply path is available.
+///
+/// Decision matrix:
+/// - (Some(signed), Some(wire)) where signed == wire → trust both;
+///   return Some(signed). Hot path.
+/// - (Some(signed), Some(wire)) where signed != wire → log a
+///   SECURITY-level warning AND publish to the SIGNED value. The
+///   wire value is attacker-controllable; the signed value is the
+///   one the controller committed to.
+/// - (Some(signed), None) → publish to the signed value. Indicates
+///   the wire header was stripped in transit (rare; treat the
+///   signed value as authoritative).
+/// - (None, Some(wire)) → publish to the wire value. Backward-compat
+///   path for controllers / transports that don't pre-allocate
+///   inboxes. The legacy "trust msg.reply" exposure remains but
+///   only when reply_topic isn't bound.
+/// - (None, None) → no reply path; the worker logs the result
+///   elsewhere (e.g. fire-and-forget topic).
+///
+/// Pure function so the policy is unit-testable without a NATS
+/// broker. The `job_id` parameter is for log correlation only.
+pub(crate) fn pick_trusted_reply_topic(
+    job_id: uuid::Uuid,
+    signed: Option<&str>,
+    wire: Option<&str>,
+) -> Option<String> {
+    match (signed, wire) {
+        (Some(s), Some(w)) if s == w => Some(s.to_string()),
+        (Some(s), Some(w)) => {
+            ::tracing::error!(
+                job_id = %job_id,
+                signed_reply = %s,
+                wire_reply = %w,
+                "SECURITY: H-1 reply_topic mismatch — wire msg.reply does not match \
+                 HMAC-bound JobRequest.reply_topic. Publishing to the SIGNED value; \
+                 wire value is likely attacker-tampered."
+            );
+            Some(s.to_string())
+        }
+        (Some(s), None) => {
+            ::tracing::warn!(
+                job_id = %job_id,
+                signed_reply = %s,
+                "H-1: msg.reply stripped in transit; publishing to HMAC-bound reply_topic"
+            );
+            Some(s.to_string())
+        }
+        (None, Some(w)) => Some(w.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// M-7: Hard ceiling on the serialized JobResult bytes the worker
+/// will attempt to publish to NATS. Without a pre-publish cap, an
+/// oversized `output_payload` (legitimately large or hostile) silently
+/// fails at the broker layer (default NATS `max_payload` is 1 MiB)
+/// and the controller times out waiting for a reply that will never
+/// arrive. The worker has already done the work; the failure is in
+/// the last-mile transport with no signal to either side.
+///
+/// 4 MiB matches the typical `max_payload` we configure on the NATS
+/// JetStream servers in production (it can be bumped via NATS config).
+/// `WORKER_MAX_JOB_RESULT_BYTES=0` falls back to the default; an
+/// explicit positive value overrides.
+const DEFAULT_MAX_JOB_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+fn max_job_result_bytes() -> usize {
+    std::env::var("WORKER_MAX_JOB_RESULT_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_JOB_RESULT_BYTES)
+}
+
+/// M-7: Replace an oversized `JobResult` with a small "output too
+/// large" error result that still signs and publishes successfully.
+/// Pure data transform so the policy is unit-testable.
+///
+/// Preserves `job_id`, `status` (downgraded to `Failed`), and
+/// `execution_time_ms` so callers can still correlate; drops the
+/// oversized `output_payload` and `logs` (replaces with a single
+/// diagnostic line). The new result MUST be re-signed by the caller
+/// before publishing — the signature carries `output_hash` so it
+/// would be invalid otherwise.
+fn truncate_oversized_job_result(
+    result: &JobResult,
+    serialized_len: usize,
+    cap: usize,
+) -> JobResult {
+    JobResult {
+        job_id: result.job_id,
+        status: JobStatus::Failed,
+        output_payload: serde_json::json!({
+            "error": "job_result_too_large",
+            "diag": {
+                "serialized_bytes": serialized_len,
+                "cap_bytes": cap,
+                "note": "Worker dropped the original output_payload to keep \
+                         under WORKER_MAX_JOB_RESULT_BYTES. Reduce module \
+                         output size or raise the cap if this is legitimate."
+            }
+        }),
+        logs: vec![format!(
+            "[host] dropped {serialized_len}-byte result (cap {cap})"
+        )],
+        execution_time_ms: result.execution_time_ms,
+        signature: vec![],
+        result_nonce: String::new(),
+    }
+}
+
 async fn publish_result_with_retry(
     nc: &async_nats::Client,
     result: &JobResult,
     max_attempts: u32,
     reply_topic: Option<String>,
+    shared_key: &talos_workflow_engine_core::WorkerSharedKey,
 ) -> Result<(), String> {
-    let payload = match serde_json::to_vec(&result) {
-        Ok(v) => bytes::Bytes::from(v),
+    // Serialize once so we can size-check before deciding how to
+    // publish. serde_json::to_vec on a JobResult is cheap (single
+    // pass) and we'd serialize anyway downstream.
+    let serialized = match serde_json::to_vec(&result) {
+        Ok(v) => v,
         Err(e) => {
             return Err(format!("Failed to serialize result: {}", e));
         }
+    };
+
+    let cap = max_job_result_bytes();
+    let payload = if serialized.len() > cap {
+        // M-7: degrade to a "result too large" error message so the
+        // controller gets a signed Failed status instead of a silent
+        // broker rejection + timeout. Sign the replacement; bail with
+        // a Err only if signing itself fails (which would indicate the
+        // shared key is mis-configured and is already loud upstream).
+        ::tracing::error!(
+            job_id = %result.job_id,
+            serialized_bytes = serialized.len(),
+            cap_bytes = cap,
+            "JobResult exceeds NATS publish cap — substituting a small Failed result so the controller doesn't time out"
+        );
+        let mut replacement = truncate_oversized_job_result(result, serialized.len(), cap);
+        if let Err(e) = replacement.sign(shared_key.as_bytes()) {
+            return Err(format!(
+                "Failed to sign oversized-result replacement: {e}"
+            ));
+        }
+        match serde_json::to_vec(&replacement) {
+            Ok(v) => bytes::Bytes::from(v),
+            Err(e) => return Err(format!("Failed to serialize replacement: {e}")),
+        }
+    } else {
+        bytes::Bytes::from(serialized)
     };
 
     if let Some(reply) = reply_topic {
@@ -580,9 +893,30 @@ async fn execute_job(
                     .query_async::<Option<Vec<u8>>>(&mut conn)
                     .await
                 {
-                    _span.add_event("oci_cache_hit");
-                    _span.set_attribute("module_source", "redis_oci_cache");
-                    found_bytes = Some(b);
+                    // H-3: re-apply the size cap on cache hits too — a
+                    // poisoned Redis (or a cache populated under a
+                    // higher cap that has since been lowered) must not
+                    // bypass the host-side OOM defense.
+                    let layer_cap = max_oci_layer_bytes();
+                    if (b.len() as u64) > layer_cap {
+                        ::tracing::error!(
+                            module_uri = %req.module_uri,
+                            cached_size = b.len(),
+                            cap_bytes = layer_cap,
+                            "Redis OCI cache hit exceeds layer cap — discarding cache entry, will refetch from registry"
+                        );
+                        // Evict the oversized entry so the next pull
+                        // doesn't keep hitting it. Best-effort; failure
+                        // to delete is logged but doesn't block.
+                        let _: Result<(), _> = redis::cmd("DEL")
+                            .arg(&redis_key)
+                            .query_async::<()>(&mut conn)
+                            .await;
+                    } else {
+                        _span.add_event("oci_cache_hit");
+                        _span.set_attribute("module_source", "redis_oci_cache");
+                        found_bytes = Some(b);
+                    }
                 }
             }
         }
@@ -743,6 +1077,73 @@ async fn execute_job(
                 }
             }
 
+            // H-3: pre-pull manifest size gate. Fetch the manifest by
+            // itself first (small payload, no decompression) and refuse
+            // to pull the full image if any layer's declared size
+            // exceeds the cap. Without this, a hostile registry could
+            // serve a gzipped 100 MB layer that decompresses to 10 GB
+            // and OOMs the worker before any of our integrity checks
+            // (Sigstore, layer-digest, hash) run.
+            //
+            // The check uses `pull_manifest` which does a separate HTTP
+            // round-trip. On cold-cache misses this adds ~50–200 ms;
+            // on warm-cache hits we skip the whole OCI path entirely
+            // so the latency is bounded to first-pull-per-module.
+            let layer_cap = max_oci_layer_bytes();
+            match client.pull_manifest(&reference, &auth).await {
+                Ok((manifest, _digest)) => {
+                    // `pull_manifest` returns either an Image manifest
+                    // (single-arch artifact, has `.layers`) or an
+                    // ImageIndex (multi-arch fan-out, has `.manifests`).
+                    // Wasm artifacts are single-arch in practice;
+                    // ImageIndex would mean the registry returned a
+                    // multi-arch image list which we don't currently
+                    // support. Match both shapes — ImageIndex falls
+                    // through to `pull()` which handles it (or errors).
+                    let declared_sizes: Vec<i64> = match &manifest {
+                        oci_distribution::manifest::OciManifest::Image(img) => {
+                            img.layers.iter().map(|d| d.size).collect()
+                        }
+                        oci_distribution::manifest::OciManifest::ImageIndex(_) => Vec::new(),
+                    };
+                    if let ManifestSizeVerdict::Oversized { declared, cap } =
+                        check_manifest_layer_sizes(&declared_sizes, layer_cap)
+                    {
+                        let err = format!(
+                            "oci_layer_too_large: manifest declares layer of {declared} bytes, \
+                             cap is {cap} (set WORKER_MAX_OCI_LAYER_BYTES to override)"
+                        );
+                        ::tracing::error!(
+                            module_uri = %req.module_uri,
+                            declared_size = declared,
+                            cap_bytes = cap,
+                            "OCI manifest declares oversized layer — refusing to pull"
+                        );
+                        _span.end_error(&err);
+                        return JobResult {
+                            job_id: req.job_id,
+                            status: JobStatus::Failed,
+                            output_payload: serde_json::json!({"error": err}),
+                            logs: vec![],
+                            execution_time_ms: start.elapsed().as_millis() as u64,
+                            signature: vec![],
+                            result_nonce: String::new(),
+                        };
+                    }
+                }
+                Err(e) => {
+                    // Don't fail closed here — fall through to `pull()`
+                    // and let it report the real error (could be auth,
+                    // not-found, etc.). The defense-in-depth `data.len()`
+                    // check below still guards against the actual OOM.
+                    ::tracing::debug!(
+                        module_uri = %req.module_uri,
+                        error = %e,
+                        "pull_manifest pre-check failed — proceeding to pull() which will report the real error"
+                    );
+                }
+            }
+
             match client.pull(&reference, &auth, accepted_media_types).await {
                 Ok(image) => {
                     // The WASM binary is typically the first layer in a Wasm OCI artifact.
@@ -754,6 +1155,37 @@ async fn execute_job(
                     // helper `verify_oci_layer` so the security-critical decision
                     // is unit-testable.
                     if let Some(layer) = image.layers.into_iter().next() {
+                        // H-3 defense in depth: even if the manifest
+                        // claimed a small layer (pre-pull check passed)
+                        // OR the registry skipped the manifest's size
+                        // field, refuse if the actual decompressed
+                        // bytes exceed the cap. Reject WITHOUT caching
+                        // so a poisoned layer doesn't persist in Redis
+                        // to OOM the next worker.
+                        if (layer.data.len() as u64) > layer_cap {
+                            let err = format!(
+                                "oci_layer_too_large_post_pull: actual layer is {} bytes, \
+                                 cap is {} (manifest may have lied about declared size)",
+                                layer.data.len(),
+                                layer_cap
+                            );
+                            ::tracing::error!(
+                                module_uri = %req.module_uri,
+                                actual_size = layer.data.len(),
+                                cap_bytes = layer_cap,
+                                "OCI layer exceeds cap post-pull — refusing to execute or cache"
+                            );
+                            _span.end_error(&err);
+                            return JobResult {
+                                job_id: req.job_id,
+                                status: JobStatus::Failed,
+                                output_payload: serde_json::json!({"error": err}),
+                                logs: vec![],
+                                execution_time_ms: start.elapsed().as_millis() as u64,
+                                signature: vec![],
+                                result_nonce: String::new(),
+                            };
+                        }
                         let manifest_digest = image
                             .manifest
                             .as_ref()
@@ -871,6 +1303,34 @@ async fn execute_job(
         }
 
         if let Some(b) = found_bytes {
+            // H-3: cap also applies to the direct `redis:wasm:` path —
+            // an attacker with Redis write access could plant an
+            // oversized WASM blob here too. Reject before the bytes
+            // reach wasmtime so the OOM defense applies uniformly
+            // across all load sources.
+            let layer_cap = max_oci_layer_bytes();
+            if (b.len() as u64) > layer_cap {
+                let err = format!(
+                    "wasm_module_too_large: redis:wasm: blob is {} bytes, cap is {layer_cap}",
+                    b.len()
+                );
+                ::tracing::error!(
+                    module_uri = %req.module_uri,
+                    blob_size = b.len(),
+                    cap_bytes = layer_cap,
+                    "redis:wasm: blob exceeds cap — refusing to execute"
+                );
+                _span.end_error(&err);
+                return JobResult {
+                    job_id: req.job_id,
+                    status: JobStatus::Failed,
+                    output_payload: serde_json::json!({"error": err}),
+                    logs: vec![],
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                    signature: vec![],
+                    result_nonce: String::new(),
+                };
+            }
             _span.set_attribute_int("module_size_bytes", b.len() as i64);
             _span.set_attribute("module_source", "redis");
             b
@@ -894,6 +1354,34 @@ async fn execute_job(
         // FALLBACK: Read from file system if bytes not provided
         match std::fs::read(&req.module_uri) {
             Ok(b) => {
+                // H-3: cap applies to filesystem loads too. Even though
+                // the controller would normally bound this via
+                // `expected_wasm_hash` (set from `wasm_modules.content_hash`),
+                // a malicious controller or compromised pod could
+                // request a giant path. Reject loudly.
+                let layer_cap = max_oci_layer_bytes();
+                if (b.len() as u64) > layer_cap {
+                    let err = format!(
+                        "wasm_module_too_large: filesystem file is {} bytes, cap is {layer_cap}",
+                        b.len()
+                    );
+                    ::tracing::error!(
+                        module_uri = %req.module_uri,
+                        file_size = b.len(),
+                        cap_bytes = layer_cap,
+                        "filesystem WASM exceeds cap — refusing to execute"
+                    );
+                    _span.end_error(&err);
+                    return JobResult {
+                        job_id: req.job_id,
+                        status: JobStatus::Failed,
+                        output_payload: serde_json::json!({"error": err}),
+                        logs: vec![],
+                        execution_time_ms: start.elapsed().as_millis() as u64,
+                        signature: vec![],
+                        result_nonce: String::new(),
+                    };
+                }
                 _span.set_attribute_int("module_size_bytes", b.len() as i64);
                 _span.set_attribute("module_source", "filesystem");
                 b
@@ -966,11 +1454,24 @@ async fn execute_job(
             // A Redis-write attacker (compromised pod, shared infra) could
             // substitute arbitrary WASM into the cache — without
             // `expected_wasm_hash` we have no evidence to detect it.
-            // Fail closed in production; warn-and-continue in dev so
-            // local-registry workflows keep working.
-            // MCP-668 (2026-05-13): empty-string-safe production gate.
+            //
+            // M-5: gate this fallback on a POSITIVE opt-in
+            // (`TALOS_ALLOW_UNATTESTED_WASM=1`) instead of "if not
+            // production". Pre-fix a dev image accidentally promoted to
+            // production, or a container with `RUST_ENV` unset, would
+            // silently accept arbitrary cache bytes. The new policy is
+            // fail-closed by default: misconfiguration refuses to run.
+            // Operators who need the dev shortcut must set the env var
+            // explicitly. The legacy production gate stays as
+            // belt-and-braces — production never accepts unattested
+            // bytes regardless of the override.
             let is_prod = talos_config::is_production();
-            if is_prod {
+            let allow_unattested = std::env::var("TALOS_ALLOW_UNATTESTED_WASM")
+                .ok()
+                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+            let block_unattested = is_prod || !allow_unattested;
+            if block_unattested {
                 ::tracing::error!(
                     job_id = %req.job_id,
                     module_uri = %req.module_uri,
@@ -995,7 +1496,8 @@ async fn execute_job(
                 job_id = %req.job_id,
                 module_uri = %req.module_uri,
                 "WASM loaded from unattested storage without expected_wasm_hash \
-                 (dev mode — would fail closed in production)"
+                 (TALOS_ALLOW_UNATTESTED_WASM=1 set — would fail closed without this override). \
+                 Always supply expected_wasm_hash or attest in-run via Sigstore in production."
             );
         } else {
             // Bytes were attested in this run via Sigstore + digest checks.
@@ -1318,7 +1820,125 @@ async fn main() -> anyhow::Result<()> {
 
     let shared_key =
         load_worker_shared_key().map_err(|e| anyhow::anyhow!("WORKER_SHARED_KEY error: {}", e))?;
-    println!("[0/5] Loaded WORKER_SHARED_KEY (32 bytes)");
+    // M-3 (partial): log a SHA-256 fingerprint of the shared key at
+    // startup so config drift between controller and worker is visible
+    // without exposing the key material. Operators can grep both
+    // process logs for `worker_shared_key_fp=` and confirm they match
+    // — if they don't, all signed RPCs will fail verification and the
+    // error surfaces here instead of as opaque "signature verification
+    // failed" later. We log only the first 8 hex chars (32 bits) which
+    // is enough to detect mismatch with negligible info leak.
+    {
+        use sha2::Digest as _;
+        let fp_full = sha2::Sha256::digest(shared_key.as_bytes());
+        let fp_short = hex::encode(&fp_full[..4]);
+        println!("[0/5] Loaded WORKER_SHARED_KEY (32 bytes, fp={fp_short})");
+        ::tracing::info!(
+            worker_shared_key_fp = %fp_short,
+            "WORKER_SHARED_KEY loaded; compare this fingerprint against the controller's log line for drift detection"
+        );
+    }
+
+    // L-4: Sigstore startup sanity — verify `cosign` is actually
+    // executable when policy is non-Disabled. Pre-fix the missing
+    // binary surfaced as a per-pull "cosign_unavailable" error;
+    // production deploys that THOUGHT verification was running
+    // discovered the gap only when an unsigned artifact slipped
+    // through (or, in Required mode, when every pull failed).
+    // Failing at boot in Required mode is loud, immediate, and
+    // points at the right config knob.
+    {
+        let sigstore_policy = SigstorePolicy::from_env();
+        if sigstore_policy != SigstorePolicy::Disabled {
+            match tokio::process::Command::new("cosign")
+                .arg("version")
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    let version_line = String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .next()
+                        .unwrap_or("(unknown)")
+                        .to_string();
+                    ::tracing::info!(
+                        cosign_version = %version_line,
+                        policy = ?sigstore_policy,
+                        "Sigstore startup sanity check: cosign binary OK"
+                    );
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    if sigstore_policy == SigstorePolicy::Required {
+                        return Err(anyhow::anyhow!(
+                            "cosign binary present but `cosign version` exited non-zero (stderr: {stderr}). \
+                             Required policy refuses to boot."
+                        ));
+                    }
+                    ::tracing::warn!(
+                        stderr = %stderr,
+                        "Sigstore startup sanity check: cosign returned non-zero — verifications will fail"
+                    );
+                }
+                Err(e) => {
+                    if sigstore_policy == SigstorePolicy::Required {
+                        return Err(anyhow::anyhow!(
+                            "cosign binary not executable ({e}) and Sigstore policy is Required. \
+                             Install cosign in the worker image or set TALOS_SIGSTORE_REQUIRED=audit \
+                             during migration."
+                        ));
+                    }
+                    ::tracing::warn!(
+                        error = %e,
+                        "Sigstore startup sanity check: cosign not executable — Audit mode will warn-and-continue on every pull"
+                    );
+                }
+            }
+        }
+    }
+
+    // M-1: validate Sigstore identity regexp at startup so an operator
+    // who set `TALOS_SIGSTORE_REQUIRED=true` with a permissive pattern
+    // discovers the policy is broken HERE — not silently per-pull when
+    // every malicious-signature artifact passes verification. In
+    // `Required` mode any rejection is fatal; in `Audit` mode we WARN
+    // and continue (audit is the migration window). `Disabled` mode
+    // skips this entirely.
+    {
+        let sigstore_policy_at_startup = SigstorePolicy::from_env();
+        if sigstore_policy_at_startup != SigstorePolicy::Disabled {
+            let regexp = std::env::var("TALOS_SIGSTORE_IDENTITY_REGEXP")
+                .unwrap_or_default();
+            match validate_sigstore_identity_regexp(&regexp) {
+                Ok(()) => {
+                    ::tracing::info!(
+                        policy = ?sigstore_policy_at_startup,
+                        "Sigstore identity regexp validated at startup"
+                    );
+                }
+                Err(rejection) => match sigstore_policy_at_startup {
+                    SigstorePolicy::Required => {
+                        return Err(anyhow::anyhow!(
+                            "TALOS_SIGSTORE_IDENTITY_REGEXP rejected at startup ({:?}): {}. \
+                             Fix the env var and restart — \
+                             refusing to run under Required policy with broken config.",
+                            rejection,
+                            rejection.human_reason()
+                        ));
+                    }
+                    SigstorePolicy::Audit => {
+                        ::tracing::warn!(
+                            rejection = ?rejection,
+                            reason = %rejection.human_reason(),
+                            "TALOS_SIGSTORE_IDENTITY_REGEXP rejected under Audit policy — \
+                             would fail closed under Required"
+                        );
+                    }
+                    SigstorePolicy::Disabled => unreachable!(),
+                },
+            }
+        }
+    }
 
     // Install the same key into talos-memory's RPC auth slot so the
     // WIT `agent_memory::*` and `graph_memory::*` host functions can
@@ -1662,7 +2282,15 @@ async fn main() -> anyhow::Result<()> {
                             let nc_clone = single_nc.clone();
                             let runtime_clone = single_runtime.clone();
                             let key_clone = single_key.clone();
-                            let reply_to = msg.reply.map(|r: async_nats::Subject| r.to_string());
+                            let wire_reply = msg.reply.map(|r: async_nats::Subject| r.to_string());
+                            // H-1: prefer the HMAC-bound `req.reply_topic`
+                            // over the unsigned wire `msg.reply`. See
+                            // `pick_trusted_reply_topic` for the matrix.
+                            let reply_to = pick_trusted_reply_topic(
+                                req.job_id,
+                                req.reply_topic.as_deref(),
+                                wire_reply.as_deref(),
+                            );
 
                             tokio::task::spawn(async move {
                                 let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
@@ -1681,7 +2309,15 @@ async fn main() -> anyhow::Result<()> {
                                     _ => {}
                                 }
 
-                                if let Err(e) = publish_result_with_retry(&nc_clone, &result, 3, reply_to).await {
+                                if let Err(e) = publish_result_with_retry(
+                                    &nc_clone,
+                                    &result,
+                                    3,
+                                    reply_to,
+                                    &key_clone,
+                                )
+                                .await
+                                {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to publish job result");
                                 }
 
@@ -1747,7 +2383,15 @@ async fn main() -> anyhow::Result<()> {
                             let nc_clone = pipe_nc.clone();
                             let runtime_clone = pipe_runtime.clone();
                             let key_clone = pipe_key.clone();
-                            let reply_to = msg.reply.clone().map(|r: async_nats::Subject| r.to_string());
+                            let wire_reply = msg.reply.clone().map(|r: async_nats::Subject| r.to_string());
+                            // H-1: see `pick_trusted_reply_topic` —
+                            // pipeline path uses the same wire/signed
+                            // reconciliation as single-node jobs.
+                            let reply_to = pick_trusted_reply_topic(
+                                req.job_id,
+                                req.reply_topic.as_deref(),
+                                wire_reply.as_deref(),
+                            );
 
                             tokio::task::spawn(async move {
                                 let mut result =
@@ -1776,8 +2420,51 @@ async fn main() -> anyhow::Result<()> {
                                     _ => {}
                                 }
 
-                                let payload_vec = serde_json::to_vec(&result).unwrap_or_default();
-                                let payload = bytes::Bytes::from(payload_vec);
+                                // M-7: size-gate pipeline results too. Same
+                                // motivation as single-node: oversized payloads
+                                // silently fail at the NATS broker; degrade to a
+                                // small Failed result so the controller gets a
+                                // signed reply.
+                                let serialized = serde_json::to_vec(&result).unwrap_or_default();
+                                let cap = max_job_result_bytes();
+                                let payload = if serialized.len() > cap {
+                                    ::tracing::error!(
+                                        job_id = %result.job_id,
+                                        serialized_bytes = serialized.len(),
+                                        cap_bytes = cap,
+                                        "PipelineJobResult exceeds NATS publish cap — substituting Failed status"
+                                    );
+                                    let mut replacement = PipelineJobResult {
+                                        job_id: result.job_id,
+                                        overall_status: JobStatus::Failed,
+                                        step_results: vec![],
+                                        final_output: serde_json::json!({
+                                            "error": "pipeline_result_too_large",
+                                            "diag": {
+                                                "serialized_bytes": serialized.len(),
+                                                "cap_bytes": cap,
+                                                "note": "Worker dropped the original step_results/final_output to keep \
+                                                         under WORKER_MAX_JOB_RESULT_BYTES. Reduce per-step output size or \
+                                                         raise the cap if this is legitimate."
+                                            }
+                                        }),
+                                        total_time_ms: result.total_time_ms,
+                                        signature: vec![],
+                                        result_nonce: String::new(),
+                                    };
+                                    if let Err(e) = replacement.sign(key_clone.as_bytes()) {
+                                        ::tracing::error!(
+                                            job_id = %result.job_id,
+                                            error = %e,
+                                            "Failed to sign oversized pipeline replacement"
+                                        );
+                                    }
+                                    bytes::Bytes::from(
+                                        serde_json::to_vec(&replacement).unwrap_or_default(),
+                                    )
+                                } else {
+                                    bytes::Bytes::from(serialized)
+                                };
 
                                 // Single-publish architecture (mirrors single-job
                                 // results, see publish_result_with_retry above for
@@ -2135,5 +2822,345 @@ mod oci_layer_tests {
     // Serial guard for env-mutating tests in this module. Without it,
     // cargo's parallel test runner can race on the global env.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ─── M-1: Sigstore identity regexp validator ───────────────────────────
+    //
+    // The validator is the only thing standing between a footgun like
+    // `TALOS_SIGSTORE_IDENTITY_REGEXP=".*"` and a Required-mode
+    // production deploy that silently accepts any Fulcio cert. These
+    // tests cover the rejection classes and the happy path so a
+    // future refactor can't relax the policy without explicit intent.
+
+    #[test]
+    fn sigstore_regexp_empty_is_rejected() {
+        assert_eq!(
+            validate_sigstore_identity_regexp(""),
+            Err(SigstoreRegexpRejection::Empty)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_catchall_patterns_are_rejected() {
+        for pattern in [".*", ".+", ".", "^.*$", "^.+$", "^.$", "^.*", ".*$"] {
+            assert_eq!(
+                validate_sigstore_identity_regexp(pattern),
+                Err(SigstoreRegexpRejection::TooBroad),
+                "pattern {pattern:?} should be rejected as too broad"
+            );
+        }
+    }
+
+    #[test]
+    fn sigstore_regexp_catchall_with_whitespace_is_rejected() {
+        // Operators sometimes paste env vars with leading/trailing
+        // spaces. Without trim, " .* " would slip through.
+        assert_eq!(
+            validate_sigstore_identity_regexp(" .* "),
+            Err(SigstoreRegexpRejection::TooBroad)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_invalid_regex_is_rejected() {
+        // Unclosed bracket: cosign would fail at runtime with an opaque
+        // upstream error. Fail closed at startup instead.
+        assert_eq!(
+            validate_sigstore_identity_regexp("^https://github\\.com/owner/talos/["),
+            Err(SigstoreRegexpRejection::InvalidRegex)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_workflow_pattern_without_at_anchor_is_rejected() {
+        // The CLAUDE.md guidance is explicit: a workflow-URL pattern
+        // missing the trailing `@` is spoofable via a fork repo named
+        // `workflow.yml-evil.yml`. This test guards that policy.
+        let pattern = "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingWorkflowAnchor)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_workflow_pattern_with_at_anchor_is_accepted() {
+        let pattern = "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml@";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "well-formed workflow pattern with @ anchor should pass: got {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_workflow_pattern_anchored_to_ref_is_accepted() {
+        // Patterns sometimes also pin the ref name after the `@`:
+        // `…/foo.yml@refs/heads/main$`. The `$` anchor is fine — we
+        // just need the `@` somewhere before any final `$`.
+        let pattern = "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "workflow pattern with @refs/...$ tail should pass"
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_non_github_pattern_is_accepted() {
+        // We only enforce the @-anchor convention on github.com
+        // workflow URLs. Operators using GitLab CI, custom OIDC
+        // providers, or other identity formats are out of scope for
+        // that specific check — they get the regex-validity and
+        // catchall checks only.
+        assert!(
+            validate_sigstore_identity_regexp("^https://gitlab\\.com/owner/talos/").is_ok()
+        );
+    }
+
+    // ─── H-3: OCI manifest size gate ──────────────────────────────────────
+
+    #[test]
+    fn manifest_size_under_cap_is_accepted() {
+        // The realistic case — a normal-sized WASM artifact.
+        assert_eq!(
+            check_manifest_layer_sizes(&[5 * 1024 * 1024], 64 * 1024 * 1024),
+            ManifestSizeVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn manifest_size_exactly_at_cap_is_accepted() {
+        // Boundary: equal to cap is OK (off-by-one guard).
+        assert_eq!(
+            check_manifest_layer_sizes(&[64 * 1024 * 1024], 64 * 1024 * 1024),
+            ManifestSizeVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn manifest_size_one_byte_over_cap_is_rejected() {
+        let verdict =
+            check_manifest_layer_sizes(&[64 * 1024 * 1024 + 1], 64 * 1024 * 1024);
+        assert!(
+            matches!(verdict, ManifestSizeVerdict::Oversized { .. }),
+            "should reject when 1 byte over cap; got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_negative_size_is_rejected() {
+        // A forged manifest could try to bypass the gate by claiming
+        // a negative size (`size: i64` allows it per spec). Treat any
+        // negative value as oversized — fail closed.
+        assert!(matches!(
+            check_manifest_layer_sizes(&[-1], 64 * 1024 * 1024),
+            ManifestSizeVerdict::Oversized { declared: -1, .. }
+        ));
+    }
+
+    #[test]
+    fn manifest_with_one_oversized_layer_among_many_is_rejected() {
+        // Multi-layer artifacts: if ANY layer is oversized, refuse.
+        let layers = [1024, 2048, 1_000_000_000_000];
+        assert!(matches!(
+            check_manifest_layer_sizes(&layers, 64 * 1024 * 1024),
+            ManifestSizeVerdict::Oversized { .. }
+        ));
+    }
+
+    #[test]
+    fn manifest_empty_layers_is_accepted() {
+        // A manifest with no layers is OK at the size-gate level —
+        // downstream code will report "WASM payload not found".
+        assert_eq!(
+            check_manifest_layer_sizes(&[], 64 * 1024 * 1024),
+            ManifestSizeVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn max_oci_layer_bytes_uses_default_when_env_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+        assert_eq!(max_oci_layer_bytes(), DEFAULT_MAX_OCI_LAYER_BYTES);
+    }
+
+    #[test]
+    fn max_oci_layer_bytes_uses_default_when_env_is_zero() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WORKER_MAX_OCI_LAYER_BYTES", "0");
+        // 0 means "use default" — same convention as the rest of the
+        // worker's nonzero-or-default env helpers (see
+        // `nonzero_env_or_default` in runtime.rs).
+        assert_eq!(max_oci_layer_bytes(), DEFAULT_MAX_OCI_LAYER_BYTES);
+        std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+    }
+
+    #[test]
+    fn max_oci_layer_bytes_uses_default_when_env_malformed() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WORKER_MAX_OCI_LAYER_BYTES", "not-a-number");
+        assert_eq!(max_oci_layer_bytes(), DEFAULT_MAX_OCI_LAYER_BYTES);
+        std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+    }
+
+    #[test]
+    fn max_oci_layer_bytes_respects_valid_env_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WORKER_MAX_OCI_LAYER_BYTES", "33554432"); // 32 MiB
+        assert_eq!(max_oci_layer_bytes(), 33_554_432);
+        std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+    }
+
+    // ─── M-7: JobResult publish-size cap ──────────────────────────────────
+
+    #[test]
+    fn truncate_oversized_replaces_payload_and_marks_failed() {
+        let original = JobResult {
+            job_id: uuid::Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"huge": "x".repeat(10_000)}),
+            logs: vec!["a".to_string(); 1000],
+            execution_time_ms: 42,
+            signature: vec![0; 32],
+            result_nonce: "1700000000:abc".to_string(),
+        };
+        let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
+        // Identity bound: same job_id so the controller can correlate.
+        assert_eq!(replacement.job_id, original.job_id);
+        // Status downgraded to Failed — the original Success is no
+        // longer accurate because the result didn't reach the
+        // controller.
+        assert_eq!(replacement.status, JobStatus::Failed);
+        // Payload replaced with a small diagnostic blob.
+        assert!(replacement.output_payload.get("error").is_some());
+        assert!(replacement.output_payload.get("diag").is_some());
+        // Logs and execution time preserved for correlation.
+        assert!(!replacement.logs.is_empty());
+        assert_eq!(replacement.execution_time_ms, 42);
+        // Signature MUST be cleared so the caller can't accidentally
+        // publish an unsigned replacement (the caller is expected to
+        // re-sign before publishing).
+        assert!(replacement.signature.is_empty());
+        assert!(replacement.result_nonce.is_empty());
+    }
+
+    #[test]
+    fn truncate_oversized_replacement_serializes_under_cap() {
+        // The replacement itself must fit comfortably under any
+        // reasonable cap, otherwise we'd loop forever.
+        let original = JobResult {
+            job_id: uuid::Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"huge": "x".repeat(10_000_000)}),
+            logs: vec![],
+            execution_time_ms: 0,
+            signature: vec![],
+            result_nonce: String::new(),
+        };
+        let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
+        let bytes = serde_json::to_vec(&replacement).unwrap();
+        // Replacement is small — well under any realistic cap.
+        assert!(
+            bytes.len() < 4096,
+            "replacement should serialize to a small payload; got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn max_job_result_bytes_uses_default_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WORKER_MAX_JOB_RESULT_BYTES");
+        assert_eq!(max_job_result_bytes(), DEFAULT_MAX_JOB_RESULT_BYTES);
+    }
+
+    #[test]
+    fn max_job_result_bytes_respects_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WORKER_MAX_JOB_RESULT_BYTES", "8388608"); // 8 MiB
+        assert_eq!(max_job_result_bytes(), 8_388_608);
+        std::env::remove_var("WORKER_MAX_JOB_RESULT_BYTES");
+    }
+
+    // ─── H-1: pick_trusted_reply_topic decision matrix ────────────────────
+    //
+    // The whole point of H-1 is that a NATS-channel attacker who
+    // substitutes `msg.reply` cannot redirect the worker's signed
+    // JobResult to an attacker-controlled subject. These tests pin
+    // the policy at the function boundary so a future "simplification"
+    // can't silently re-introduce the regression.
+
+    #[test]
+    fn pick_reply_signed_and_wire_match() {
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, Some("_INBOX.abc"), Some("_INBOX.abc"));
+        assert_eq!(r.as_deref(), Some("_INBOX.abc"));
+    }
+
+    #[test]
+    fn pick_reply_signed_and_wire_mismatch_returns_signed() {
+        // SECURITY: an attacker substituted `msg.reply` — the worker
+        // MUST publish to the signed value, not the wire value.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(
+            jid,
+            Some("_INBOX.legit"),
+            Some("talos.admin.commands"),
+        );
+        assert_eq!(
+            r.as_deref(),
+            Some("_INBOX.legit"),
+            "wire taking priority would be the security regression"
+        );
+    }
+
+    #[test]
+    fn pick_reply_signed_only() {
+        // msg.reply stripped in transit; signed value is authoritative.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, Some("_INBOX.signed"), None);
+        assert_eq!(r.as_deref(), Some("_INBOX.signed"));
+    }
+
+    #[test]
+    fn pick_reply_wire_only_backward_compat() {
+        // Legacy controller / non-NATS transport that doesn't
+        // pre-allocate inboxes. The worker accepts msg.reply
+        // verbatim — this is the path the H-1 binding closes for
+        // upgraded controllers but keeps available for old ones.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, None, Some("_INBOX.legacy"));
+        assert_eq!(r.as_deref(), Some("_INBOX.legacy"));
+    }
+
+    #[test]
+    fn pick_reply_neither_present() {
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, None, None);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn pick_reply_mismatch_does_not_publish_to_attacker_subject() {
+        // Specific regression guard: an attacker substituting a
+        // sensitive admin subject MUST NOT result in the worker
+        // publishing there. This is the whole point of H-1.
+        let jid = uuid::Uuid::new_v4();
+        let bad_subjects = [
+            "talos.admin.commands",
+            "talos.jobs",          // would create a NATS loop
+            "talos.pipeline.jobs", // same
+            "$SYS.REQ.ACCOUNT",    // NATS system subject
+            "_INBOX.attacker.xyz", // inbox-prefix but not the signed one
+        ];
+        for bad in bad_subjects {
+            let r = pick_trusted_reply_topic(jid, Some("_INBOX.legit"), Some(bad));
+            assert_eq!(
+                r.as_deref(),
+                Some("_INBOX.legit"),
+                "H-1 regression: wire subject {bad:?} leaked through"
+            );
+        }
+    }
 }
 // build test 1773350887

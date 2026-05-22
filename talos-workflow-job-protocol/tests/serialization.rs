@@ -34,6 +34,7 @@ fn job_request_roundtrip() {
         user_id: Uuid::nil(),
         max_fuel: 0,
         dry_run: false,
+        reply_topic: None,
         max_llm_tier: LlmTier::default(),
     };
     let ser = serde_json::to_string(&req).expect("serialize request");
@@ -100,6 +101,7 @@ fn pipeline_job_request_roundtrip() {
         share_sandbox: true,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        reply_topic: None,
         job_nonce: "0:deadbeef".to_string(),
         user_id: Uuid::new_v4(),
     };
@@ -126,6 +128,7 @@ fn pipeline_job_request_sign_and_verify() {
         share_sandbox: false,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -149,6 +152,7 @@ fn pipeline_job_request_tampered_step_fails() {
         share_sandbox: false,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };

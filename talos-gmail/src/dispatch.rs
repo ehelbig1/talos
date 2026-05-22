@@ -279,6 +279,7 @@ async fn dispatch_single_message(
         // dispatch which already plumbs per-module fuel.
         max_fuel: exec_info.max_fuel,
         dry_run: false,
+        reply_topic: None,
         actor_id: None,
         user_id,
     };

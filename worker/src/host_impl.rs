@@ -24,6 +24,20 @@ use sha2::{Digest, Sha256};
 
 /// Maximum HTTP fetch calls per execution (prevents external API flooding).
 const MAX_HTTP_CALLS_PER_EXECUTION: u64 = 1000;
+/// M-6: maximum HTTP fetch calls to a SINGLE upstream host per execution.
+///
+/// Without this cap, a guest module can spend its global budget
+/// (`MAX_HTTP_CALLS_PER_EXECUTION = 1000`) entirely against one host
+/// and turn the worker into a third-party DoS amplification primitive
+/// (1000 requests/sec from a typical fleet, with allowed_hosts
+/// granted by a legitimate operator).
+///
+/// 200 is a fifth of the global cap — comfortable headroom for
+/// legitimate paginated fetch loops while making the abuse pattern
+/// unattractive. The circuit breaker (`circuit_breaker.rs`) handles
+/// failure-driven cutoffs separately; this gate is about healthy-
+/// upstream load shaping.
+const MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION: u64 = 200;
 /// Maximum database queries per execution.
 const MAX_DB_QUERIES_PER_EXECUTION: u64 = 500;
 /// Maximum NATS publish calls per execution.
@@ -436,7 +450,22 @@ pub(crate) const MAX_INBOUND_HEADER_VALUE_BYTES: usize = 16 * 1024;
 // result now via the recognised-falsy arm).
 static ALLOW_PRIVATE_HOST_TARGETS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
-        talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false)
+        let enabled =
+            talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
+        // L-2: structured WARN at first lookup so operators see in
+        // production logs that the SSRF defense is relaxed. The flag
+        // is a "trust me, I know what I'm doing" escape hatch — it
+        // should be visible at runtime, not silent.
+        if enabled {
+            tracing::warn!(
+                "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true — \
+                 SSRF defense relaxed for hostnames in allowed_hosts. \
+                 IP literals to private ranges remain blocked. \
+                 This trust assumes operator-authored modules only; do NOT \
+                 enable on multi-tenant or untrusted-module-author deployments."
+            );
+        }
+        enabled
     });
 
 // ============================================================================
@@ -1441,6 +1470,16 @@ impl TalosContext {
             .and_then(|id| uuid::Uuid::parse_str(id).ok())
             .unwrap_or_else(uuid::Uuid::new_v4);
 
+        // L-1: hash the vault path once so the host-side log and the
+        // guest-visible error can be cross-correlated without leaking
+        // the literal path into guest memory. SHA-256(path)[..16]
+        // gives 8 bytes of identity — collision-free for any
+        // realistic vault-path inventory while keeping the log line
+        // compact.
+        let vault_path_hash = {
+            let h = Sha256::digest(vault_path.as_bytes());
+            hex::encode(&h[..8])
+        };
         match self.provider.resolve(vault_path, exec_id).await {
             Ok(handle) => {
                 let header_result = self.provider.into_auth_header(handle, header_name);
@@ -1458,16 +1497,22 @@ impl TalosContext {
                     Err(e) => {
                         tracing::error!(
                             vault_path,
+                            vault_path_hash = %vault_path_hash,
                             header_name,
                             error = %e,
                             "vault:// header resolution failed"
                         );
+                        // L-1: redact the literal path in the
+                        // guest-visible error — leak only the
+                        // truncated hash so an operator can grep the
+                        // host log for the matching `vault_path_hash`
+                        // and see the real path there. Cause is kept
+                        // generic; specific reasons (allowlist,
+                        // ownership, missing) are in the host log.
                         Err(format!(
-                            "Header '{}' references vault://{} but resolution failed: {}. \
-                             Check: (1) secret exists at that path, \
-                             (2) module's allowed_secrets includes it, \
-                             (3) secret owner matches workflow owner.",
-                            header_name, vault_path, e
+                            "Header '{header_name}' references a vault secret \
+                             that could not be resolved (vault_path_hash={vault_path_hash}). \
+                             Operator: grep host logs for this hash to see the literal path."
                         ))
                     }
                 }
@@ -1475,16 +1520,15 @@ impl TalosContext {
             Err(e) => {
                 tracing::error!(
                     vault_path,
+                    vault_path_hash = %vault_path_hash,
                     header_name,
                     error = %e,
                     "vault:// path not resolvable"
                 );
                 Err(format!(
-                    "Header '{}' references vault://{} but the secret could not be resolved: {}. \
-                     Check: (1) secret exists at that path, \
-                     (2) module's allowed_secrets includes it, \
-                     (3) secret owner matches workflow owner.",
-                    header_name, vault_path, e
+                    "Header '{header_name}' references a vault secret \
+                     that could not be resolved (vault_path_hash={vault_path_hash}). \
+                     Operator: grep host logs for this hash to see the literal path."
                 ))
             }
         }
@@ -1939,6 +1983,32 @@ impl wit_http::Host for TalosContext {
             tracing::warn!(module_id = ?self.module_id, "HTTP call rate limit exceeded");
             if let Some(ref m) = self.metrics {
                 m.record_rate_limit_exceeded("http");
+            }
+            return Err(wit_http::Error::Forbiddenhost);
+        }
+        // M-6: per-host rate limit charged AFTER the global cap admits.
+        // Failure here yields the global counter back? — no, intentionally
+        // not: the global cap is the worker-level budget for compute spent
+        // on validation + DNS + setup, and a per-host overage still cost
+        // that effort. Burning the global slot keeps the abuse pattern
+        // expensive for the attacker. The host string is normalized to
+        // host:port (lowercased) inside `check_per_host_rate_limit`.
+        let host_for_limit = match url.port_or_known_default() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        if !self.check_per_host_rate_limit(
+            &host_for_limit,
+            MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION,
+        ) {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                host = %host,
+                limit = MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION,
+                "HTTP per-host rate limit exceeded — refusing to amplify load to a single upstream"
+            );
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("http_per_host");
             }
             return Err(wit_http::Error::Forbiddenhost);
         }
@@ -2453,6 +2523,32 @@ impl wit_http::Host for TalosContext {
                     "http-fetch-all",
                     "method-allowlist",
                     &format!("{} {}", method_str, host),
+                )
+                .await;
+                validated.push(Err(wit_http::Error::Forbiddenhost));
+                continue;
+            }
+
+            // M-6: per-host rate limit applied per-entry, BEFORE the
+            // global counter bump below. A batch with 200 entries all
+            // targeting the same host gets the first
+            // MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION admitted and the
+            // rest rejected — partial-success, same shape as the
+            // sibling per-request validation checks above. This
+            // prevents `fetch_all` from being a per-host-limit
+            // bypass.
+            let host_for_limit = match url.port_or_known_default() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            };
+            if !self.check_per_host_rate_limit(
+                &host_for_limit,
+                MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION,
+            ) {
+                self.record_capability_denied(
+                    "http-fetch-all",
+                    "per-host-rate-limit",
+                    &host_for_limit,
                 )
                 .await;
                 validated.push(Err(wit_http::Error::Forbiddenhost));

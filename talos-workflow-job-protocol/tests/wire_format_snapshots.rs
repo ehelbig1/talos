@@ -97,6 +97,7 @@ fn deterministic_job_request() -> JobRequest {
         user_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0009),
         max_fuel: 1_000_000,
         dry_run: false,
+        reply_topic: None,
     }
 }
 
@@ -107,20 +108,20 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
-    // Reach into the public sign method indirectly by calling sign()
-    // and then *overwriting* the random nonce — but sign() itself
-    // re-derives the nonce. We instead recompute the HMAC ourselves
-    // over the same canonical bytes. The format string is documented
-    // on `JobRequest::sign` and exercised separately by every
-    // existing roundtrip test, so reproducing it here mirrors the
-    // production path exactly.
+    // MUST mirror `JobRequest::signing_payload` exactly — same field
+    // order, same length-prefix discipline (L-9), same sentinels for
+    // Option fields (M-4 / M-5 / H-1). Any drift here masks a
+    // protocol change behind an updated expected_hex; production
+    // verify will then fail at the round-trip assertion below.
     use sha2::Digest;
     let input_hash = hex::encode(Sha256::digest(req.input_payload.to_string().as_bytes()));
     let secrets_hash = hex::encode(Sha256::digest(&req.encrypted_secrets.ciphertext));
     let mut hosts = req.allowed_hosts.clone();
     hosts.sort_unstable();
+    let hosts_str = hosts.join(",");
     let mut methods = req.allowed_methods.clone();
     methods.sort_unstable();
+    let methods_str = methods.join(",");
     let wasm_hash = if let Some(b) = req.wasm_bytes.as_deref() {
         hex::encode(Sha256::digest(b))
     } else if let Some(ref h) = req.expected_wasm_hash {
@@ -129,21 +130,40 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
         "none".to_string()
     };
     let integration_name = req.integration_name.as_deref().unwrap_or("-");
+    let actor_id_str = req
+        .actor_id
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let mut allowed_secrets_sorted = req.allowed_secrets.clone();
+    allowed_secrets_sorted.sort_unstable();
+    let allowed_secrets_str = allowed_secrets_sorted.join(",");
+    let mut allowed_sql_sorted = req.allowed_sql_operations.clone();
+    allowed_sql_sorted.sort_unstable();
+    let allowed_sql_str = allowed_sql_sorted.join(",");
+    let reply_topic_str = req.reply_topic.as_deref().unwrap_or("-");
+    fn lp(s: &str) -> String {
+        format!("{}:{}", s.as_bytes().len(), s)
+    }
     let payload = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         req.job_id,
         req.workflow_execution_id,
-        req.module_uri,
+        lp(&req.module_uri),
         req.job_nonce,
         input_hash,
         secrets_hash,
         req.timeout_ms,
-        hosts.join(","),
-        methods.join(","),
+        lp(&hosts_str),
+        lp(&methods_str),
         wasm_hash,
-        integration_name,
+        lp(integration_name),
         req.user_id,
         req.max_llm_tier.as_signing_str(),
+        lp(&actor_id_str),
+        lp(&allowed_secrets_str),
+        lp(&allowed_sql_str),
+        req.allow_tier2_exposure,
+        lp(reply_topic_str),
     );
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());
@@ -160,7 +180,13 @@ fn job_request_json_snapshot() {
 
     // Captured 2026-04-20 against this crate's protocol shape.
     // Update verbatim when the wire format intentionally changes.
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[255,69,30,24,103,166,160,158,209,157,187,62,170,135,45,25,138,88,48,87,250,196,66,133,168,42,104,52,240,25,109,58],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","dry_run":false}"#;
+    // Updated 2026-05-21: snapshot includes the canonical signing
+    // bytes after the L-9 length-prefix discipline, M-4 actor_id
+    // binding, M-5 capability-grant binding, and H-1 reply_topic
+    // binding all landed. reply_topic = None is omitted from the
+    // JSON via `skip_serializing_if`, so the shape is unchanged
+    // here; only the `signature` bytes shift.
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[104,148,176,248,116,245,0,61,91,172,197,30,238,212,180,169,149,173,36,2,150,202,28,12,39,199,95,66,50,237,118,107],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","dry_run":false}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted — see test docstring for resolution"
@@ -178,7 +204,10 @@ fn job_request_signature_snapshot() {
     // The signature field is the HMAC-SHA256 over the canonical
     // bytes; locking the hex digest pins the format implicitly.
     let actual_hex = hex::encode(&req.signature);
-    let expected_hex = "ff451e1867a6a09ed19dbb3eaa872d198a583057fac44285a82a6834f0196d3a";
+    // Updated 2026-05-21: see `job_request_json_snapshot` comment
+    // for the protocol bump that shifted this digest. Recomputed
+    // against the current `JobRequest::signing_payload`.
+    let expected_hex = "6894b0f874f5003d5bacc51eeed4b4a995ad240296ca1c0c27c75f4232ed766b";
     assert_eq!(
         actual_hex, expected_hex,
         "JobRequest signing payload drifted — see test docstring for resolution"
@@ -243,6 +272,7 @@ fn pipeline_job_request_json_snapshot() {
         total_timeout_ms: 60_000,
         share_sandbox: false,
         max_llm_tier: LlmTier::default(),
+        reply_topic: None,
     };
     let actual = serde_json::to_string(&req).expect("serialize");
     let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000010","workflow_execution_id":"00000000-0000-0000-0000-000000000011","steps":[{"module_id":"00000000-0000-0000-0000-000000000013","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000013","wasm_bytes":[0,97,115,109],"config":{"setting":"value"},"allowed_hosts":["api.example.com"],"allowed_methods":["GET"],"allowed_secrets":[],"allowed_sql_operations":[],"allow_tier2_exposure":false,"encrypted_secrets":{"ciphertext":[170],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"max_fuel":1000000,"max_memory_mb":128,"timeout_ms":30000,"priority":100,"expected_wasm_hash":"deadbeef"}],"total_timeout_ms":60000,"share_sandbox":false,"signature":[202,254],"job_nonce":"0:00000000000000000000000000000000","user_id":"00000000-0000-0000-0000-000000000012","max_llm_tier":"tier2"}"#;

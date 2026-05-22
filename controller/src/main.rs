@@ -2066,6 +2066,23 @@ async fn main() -> anyhow::Result<()> {
     // Unauthorized.
     match talos_workflow_job_protocol::load_worker_shared_key() {
         Ok(key) => {
+            // M-3 (partial): log the same SHA-256 fingerprint format
+            // the worker emits at startup so operators can grep both
+            // process logs for `worker_shared_key_fp=` and confirm
+            // they match. A mismatch means the controller and worker
+            // were configured with different env values — every signed
+            // RPC will fail verification and the error surfaces as
+            // opaque "signature verification failed" until this log
+            // line reveals the drift.
+            {
+                use sha2::Digest as _;
+                let fp_full = sha2::Sha256::digest(key.as_bytes());
+                let fp_short = hex::encode(&fp_full[..4]);
+                tracing::info!(
+                    worker_shared_key_fp = %fp_short,
+                    "WORKER_SHARED_KEY loaded; compare this fingerprint against the worker's log line for drift detection"
+                );
+            }
             talos_memory::rpc_auth::register_hmac_key(std::sync::Arc::new(key.as_bytes().to_vec()));
             tracing::info!("talos-memory RPC HMAC key registered");
         }
