@@ -381,10 +381,27 @@ pub const EXTERNAL_LLM_HOSTS: &[&str] = &[
 /// True iff `host` (already lowercased) matches one of the reserved
 /// external LLM hostnames. Uses exact + suffix match so region
 /// subdomains (`eu.api.openai.com`) also trigger.
+///
+/// **Trailing-dot normalisation.** `url::Url::parse("https://api.anthropic.com./...")`
+/// returns `"api.anthropic.com."` (the FQDN trailing dot is preserved per
+/// RFC 1738 / RFC 3986). DNS resolution treats the trailing dot as
+/// equivalent to the dotless form — the same A/AAAA record is returned —
+/// so leaving the deny-list strict would let a guest reach
+/// `api.anthropic.com.` while the matcher silently passed. We strip the
+/// trailing dot defensively at the matcher entry so every one of the five
+/// worker enforcement surfaces (`fetch`, `fetch_all`, `graphql::execute`,
+/// `webhook::send`, `http_stream::connect`) inherits the fix from one
+/// place. Repeating the strip at every call site would be brittle.
 pub fn is_external_llm_host(host_lower: &str) -> bool {
+    // Defense in depth — callers are documented to pass an already-lowercased
+    // host but we normalise here too: an upstream regression that forwards a
+    // mixed-case or trailing-dot value shouldn't silently bypass the gate.
+    let normalised = host_lower
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     EXTERNAL_LLM_HOSTS
         .iter()
-        .any(|reserved| *reserved == host_lower || host_lower.ends_with(&format!(".{reserved}")))
+        .any(|reserved| *reserved == normalised || normalised.ends_with(&format!(".{reserved}")))
 }
 
 /// True iff `vault_path` references a Tier-2 LLM provider's credentials.
@@ -632,6 +649,80 @@ mod llm_provider_path_tests {
         assert!(!is_controller_internal_vault_path(""));
         assert!(!is_controller_internal_vault_path("github/pat"));
         assert!(!is_controller_internal_vault_path("custom/secret"));
+    }
+}
+
+// ============================================================================
+// Wasm-security review 2026-05-23: is_external_llm_host normalisation tests
+// ============================================================================
+//
+// Threat model. The five worker call sites that gate Tier-1 LLM egress —
+// `wit_http::fetch` / `fetch_all`, `wit_graphql::execute`,
+// `wit_webhook::send`, `wit_http_stream::connect` — feed `host_str()` from a
+// `url::Url` into `is_external_llm_host`. `url::Url::parse` preserves the
+// trailing dot on an FQDN, so a Tier-1 actor could write
+// `https://api.anthropic.com./v1/messages` and the strict equality check
+// would silently pass: DNS resolves the trailing-dot form to the same
+// record. These tests pin the defensive normalisation at the matcher entry.
+#[cfg(test)]
+mod external_llm_host_normalisation_tests {
+    use super::is_external_llm_host;
+
+    #[test]
+    fn bare_host_matches() {
+        assert!(is_external_llm_host("api.anthropic.com"));
+        assert!(is_external_llm_host("api.openai.com"));
+        assert!(is_external_llm_host("generativelanguage.googleapis.com"));
+    }
+
+    #[test]
+    fn trailing_dot_does_not_bypass() {
+        // The exploit shape: `https://api.anthropic.com./v1/messages` —
+        // `url::Url::host_str()` returns the trailing-dot form. Pre-fix the
+        // matcher returned false; post-fix the strip normalises before
+        // compare.
+        assert!(is_external_llm_host("api.anthropic.com."));
+        assert!(is_external_llm_host("api.openai.com."));
+        assert!(is_external_llm_host("generativelanguage.googleapis.com."));
+    }
+
+    #[test]
+    fn trailing_dot_on_subdomain_does_not_bypass() {
+        // Suffix-match limb must also normalise — region subdomains are
+        // the documented suffix-match motivator.
+        assert!(is_external_llm_host("eu.api.openai.com."));
+        assert!(is_external_llm_host("us-east-1.api.anthropic.com."));
+    }
+
+    #[test]
+    fn mixed_case_does_not_bypass() {
+        // Documented as caller-responsibility, but defense-in-depth at the
+        // matcher entry guards against an upstream regression that forgets
+        // to lowercase. The normalisation must apply BOTH lowercasing AND
+        // trailing-dot strip — neither alone is sufficient.
+        assert!(is_external_llm_host("API.ANTHROPIC.COM"));
+        assert!(is_external_llm_host("API.ANTHROPIC.COM."));
+        assert!(is_external_llm_host("Eu.Api.OpenAI.com."));
+    }
+
+    #[test]
+    fn unrelated_hosts_still_do_not_match() {
+        // Negative path — the strip must not be so aggressive that it
+        // matches dot-suffixed lookalikes.
+        assert!(!is_external_llm_host("example.com"));
+        assert!(!is_external_llm_host("example.com."));
+        assert!(!is_external_llm_host("anthropic.com")); // bare apex is NOT in deny list
+        assert!(!is_external_llm_host("badanthropic.com."));
+        assert!(!is_external_llm_host("api.anthropic.com.attacker.example"));
+    }
+
+    #[test]
+    fn empty_and_dot_only_do_not_match() {
+        // Edge cases that the trim could theoretically corrupt — confirm
+        // they remain non-matches.
+        assert!(!is_external_llm_host(""));
+        assert!(!is_external_llm_host("."));
+        assert!(!is_external_llm_host(".."));
     }
 }
 
@@ -1102,9 +1193,17 @@ pub struct JobRequest {
     /// not survive the Wizer snapshot step.
     ///
     /// Accepts both bare names ("minimal") and WIT world names ("minimal-node",
-    /// "automation-node").  Not included in the HMAC signing payload — it is a
-    /// performance hint, not a capability grant (the linker enforces real
-    /// security at instantiation time).
+    /// "automation-node").
+    ///
+    /// H-3 (2026-05-23): NOW HMAC-bound at the end of the signing payload.
+    /// The previous "performance hint, linker enforces real security at
+    /// instantiation time" disclaimer was only true when the worker
+    /// re-derived the world from the WASM binary; for precompiled (Wizer)
+    /// modules whose embedded world name doesn't survive, the controller's
+    /// hint IS the policy decision. Binding it into the signature closes
+    /// the tampering path where an attacker on the NATS subject would flip
+    /// `minimal-node` → `automation-node` and trick the worker into
+    /// selecting a wider tiered linker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_world: Option<String>,
 
@@ -1310,8 +1409,37 @@ impl JobRequest {
         // concatenation).
         let reply_topic_str = self.reply_topic.as_deref().unwrap_or("-");
 
+        // Wasm-security review 2026-05-23 (H-3, H-7): bind the remaining
+        // policy-controlling fields. Each was previously unsigned, which
+        // gave anyone with NATS-publish rights on the job subject a
+        // tamper window:
+        //
+        // - `capability_world` (H-3). Pre-fix doc described it as a
+        //   performance hint, "linker enforces real security at
+        //   instantiation time." That's only true if the worker
+        //   ALWAYS re-derives the world from the WASM binary. For
+        //   `precompiled_wasm` (Wizer-snapshotted) the world name may
+        //   not survive — in which case the controller's hint IS the
+        //   policy. An attacker who flips `minimal-node` → `automation-node`
+        //   on the wire could select a wider tiered linker that resolves
+        //   host fns the module would otherwise lack. Sentinel `-` for
+        //   None.
+        // - `dry_run` (H-7). Tamperer flips `true → false` to convert
+        //   planning-mode into a real-side-effect run (real HTTP POSTs,
+        //   real webhooks, real DB writes).
+        // - `priority` (H-7). Queue-jumping / starving — a NATS-publish
+        //   attacker can promote arbitrary jobs to drown out legitimate
+        //   high-priority work.
+        // - `deadline_unix_secs` (H-7). Tamperer sets a past timestamp
+        //   to force premature failure; reading the field is one of
+        //   the worker's loop conditions.
+        // - `cancellation_token` (H-7). Stripping the token leaves an
+        //   in-flight job uncancellable — resource hog / cost overrun.
+        let capability_world_str = self.capability_world.as_deref().unwrap_or("-");
+        let cancellation_token_str = self.cancellation_token.as_deref().unwrap_or("-");
+
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             lp(&self.module_uri),
@@ -1344,6 +1472,16 @@ impl JobRequest {
             // an attacker-controlled subject via the unsigned
             // msg.reply NATS header.
             lp(&reply_topic_str),
+            // H-3 (2026-05-23): capability_world appended AT THE END.
+            lp(capability_world_str),
+            // H-7 (2026-05-23): dry_run appended AT THE END.
+            self.dry_run,
+            // H-7 (2026-05-23): priority appended AT THE END.
+            self.priority,
+            // H-7 (2026-05-23): deadline_unix_secs appended AT THE END.
+            self.deadline_unix_secs,
+            // H-7 (2026-05-23): cancellation_token appended AT THE END.
+            lp(cancellation_token_str),
         )
         .into_bytes()
     }
@@ -1884,8 +2022,86 @@ impl PipelineJobRequest {
         // H-1 (pipeline): reply_topic — same semantics as JobRequest.
         let reply_topic_str = self.reply_topic.as_deref().unwrap_or("-");
 
+        // C-2 (2026-05-23, critical fix): per-step policy commitment.
+        //
+        // Pre-fix `PipelineJobRequest::signing_payload` bound the
+        // wasm-integrity hash + integration_name + capability grants per
+        // step, plus job-level fields (user, tier, reply_topic). It did
+        // NOT bind any of `config` (the step input!), `allowed_hosts`,
+        // `allowed_methods`, `encrypted_secrets.{ciphertext,nonce}`,
+        // `max_fuel`, `max_memory_mb`, `timeout_ms`, `priority`,
+        // `cancellation_token`. Anyone with NATS publish on the pipeline
+        // subject could:
+        //   - rewrite a step's config — the signed-and-attested module
+        //     executes attacker-supplied input under signed secrets;
+        //   - widen `allowed_hosts` / `allowed_methods` to exfiltrate
+        //     via attacker-controlled URL + still-signed `vault://`
+        //     header;
+        //   - swap one step's `encrypted_secrets.ciphertext` for
+        //     another's (engine.rs uses `workflow_execution_id` as AAD,
+        //     which is shared across steps — both blobs are decryptable
+        //     by the worker for this pipeline);
+        //   - inflate `max_fuel` / `max_memory_mb` / `timeout_ms` for
+        //     resource exhaustion;
+        //   - strip `cancellation_token` to keep an in-flight pipeline
+        //     uncancellable;
+        //   - promote `priority` for queue-jumping.
+        //
+        // The fix mirrors the single-node `JobRequest::signing_payload`
+        // shape: hash each variable-length field (input / secrets) to
+        // fixed-width hex, length-prefix the string-valued segments
+        // (sorted hosts / methods, cancellation_token), and encode the
+        // u8/u64 numerics as decimal. Steps are separated by `;;` (the
+        // same separator already used by `step_caps_str`) and each
+        // intra-step field by `|`.
+        let step_policies: Vec<String> = self
+            .steps
+            .iter()
+            .map(|s| {
+                let config_hash =
+                    hex::encode(Sha256::digest(s.config.to_string().as_bytes()));
+                let secrets_ct_hash =
+                    hex::encode(Sha256::digest(&s.encrypted_secrets.ciphertext));
+                let mut hosts = s.allowed_hosts.clone();
+                hosts.sort_unstable();
+                let hosts_str = hosts.join(",");
+                let mut methods = s.allowed_methods.clone();
+                methods.sort_unstable();
+                let methods_str = methods.join(",");
+                let cancellation_token_str = s.cancellation_token.as_deref().unwrap_or("-");
+                // Length-prefix every user-controlled string so a `|`
+                // or `;;` inside a field cannot collide with the inter-
+                // field / inter-step separator.
+                //
+                // Field order (positional, do not reorder — this is
+                // wire-format-stable from this revision forward):
+                //   1. config_hash               (64-char hex)
+                //   2. secrets_ct_hash           (64-char hex)
+                //   3. lp(hosts_str)             (length-prefixed)
+                //   4. lp(methods_str)           (length-prefixed)
+                //   5. max_fuel                  (u64 decimal)
+                //   6. max_memory_mb             (usize decimal)
+                //   7. timeout_ms                (u64 decimal)
+                //   8. priority                  (u8 decimal)
+                //   9. lp(cancellation_token)    (length-prefixed)
+                format!(
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                    config_hash,
+                    secrets_ct_hash,
+                    lp(&hosts_str),
+                    lp(&methods_str),
+                    s.max_fuel,
+                    s.max_memory_mb,
+                    s.timeout_ms,
+                    s.priority,
+                    lp(cancellation_token_str),
+                )
+            })
+            .collect();
+        let step_policies_str = step_policies.join(";;");
+
         format!(
-            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             self.job_nonce,
@@ -1907,6 +2123,11 @@ impl PipelineJobRequest {
             lp(&step_caps_str),
             // H-1 (pipeline): reply_topic appended AT THE END.
             lp(&reply_topic_str),
+            // C-2 (2026-05-23): per-step policy (config, hosts, methods,
+            // secrets ciphertext, fuel/mem/timeout, priority,
+            // cancellation_token) appended AT THE END per the
+            // wire-format stability rule.
+            lp(&step_policies_str),
         )
         .into_bytes()
     }
@@ -3112,5 +3333,367 @@ mod tests {
         };
         result.sign(&key).unwrap();
         result.verify(&key, 300).expect("empty-logs result should verify");
+    }
+
+    // ========================================================================
+    // Wasm-security review 2026-05-23: tampering tests for the H-3 / H-7 / C-2
+    // signing-payload extensions.
+    // ========================================================================
+    //
+    // Each `tampered_<field>_fails_verification` test follows the same shape:
+    // 1. Build a clean request and sign it.
+    // 2. Mutate exactly one field that USED to be unsigned.
+    // 3. Re-verify and assert failure.
+    //
+    // Pre-fix, every one of these mutations would have passed verification —
+    // anyone with NATS publish on the job subject could perform the mutation
+    // in flight without the worker detecting it.
+
+    /// H-3: `capability_world` is now HMAC-bound. Pre-fix an attacker could
+    /// flip `minimal-node` → `automation-node` to trick the worker into
+    /// selecting a wider tiered linker (important for precompiled WASM
+    /// where the embedded world name may not survive Wizer).
+    #[test]
+    fn tampered_capability_world_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.capability_world = Some("minimal-node".to_string());
+        req.sign(&key).unwrap();
+
+        req.capability_world = Some("automation-node".to_string());
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered capability_world must fail verification (H-3)"
+        );
+    }
+
+    /// H-3: stripping the `capability_world` (Some → None) must also be
+    /// tamper-evident — the sentinel `-` for None makes the absence
+    /// signed.
+    #[test]
+    fn capability_world_some_to_none_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.capability_world = Some("minimal-node".to_string());
+        req.sign(&key).unwrap();
+
+        req.capability_world = None;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "stripping capability_world must fail verification (H-3)"
+        );
+    }
+
+    /// H-7: `dry_run` is now HMAC-bound. Pre-fix an attacker could flip
+    /// `true → false` to convert a planning-mode run into a real one
+    /// (real HTTP POSTs, real webhooks).
+    #[test]
+    fn tampered_dry_run_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.dry_run = true;
+        req.sign(&key).unwrap();
+
+        req.dry_run = false;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered dry_run must fail verification (H-7)"
+        );
+    }
+
+    /// H-7: `priority` is now HMAC-bound. Pre-fix an attacker could
+    /// promote arbitrary jobs to starve legitimate high-priority work.
+    #[test]
+    fn tampered_priority_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.priority = 100;
+        req.sign(&key).unwrap();
+
+        req.priority = 1;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered priority must fail verification (H-7)"
+        );
+    }
+
+    /// H-7: `deadline_unix_secs` is now HMAC-bound. Pre-fix an attacker
+    /// could set a past timestamp to force premature failure.
+    #[test]
+    fn tampered_deadline_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.deadline_unix_secs = 0;
+        req.sign(&key).unwrap();
+
+        req.deadline_unix_secs = 1;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered deadline_unix_secs must fail verification (H-7)"
+        );
+    }
+
+    /// H-7: `cancellation_token` is now HMAC-bound. Pre-fix an attacker
+    /// could strip the token, leaving an in-flight job uncancellable.
+    #[test]
+    fn tampered_cancellation_token_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.cancellation_token = Some("token-abc".to_string());
+        req.sign(&key).unwrap();
+
+        req.cancellation_token = None;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered cancellation_token must fail verification (H-7)"
+        );
+    }
+
+    /// H-3 + H-7 (combined positive case): a clean round-trip with all
+    /// the newly-bound fields populated must verify.
+    #[test]
+    fn newly_bound_fields_round_trip() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.capability_world = Some("automation-node".to_string());
+        req.dry_run = true;
+        req.priority = 200;
+        req.deadline_unix_secs = 1_700_000_000;
+        req.cancellation_token = Some("abc-123".to_string());
+        req.sign(&key).unwrap();
+
+        req.verify(&key, 300).expect(
+            "clean request with newly-bound H-3/H-7 fields must verify",
+        );
+    }
+
+    // ========================================================================
+    // C-2: PipelineJobRequest::signing_payload extension tests.
+    // ========================================================================
+    //
+    // Pre-fix the pipeline signing payload bound only step_hashes,
+    // step_integrations, step_caps (allowed_secrets / sql / tier2),
+    // max_llm_tier, reply_topic, and the job-level fields — it did NOT
+    // bind per-step config, allowed_hosts, allowed_methods, encrypted
+    // secrets ciphertext, max_fuel, max_memory_mb, timeout_ms, priority,
+    // or cancellation_token. Each of the tests below mutates exactly
+    // one of those fields and asserts the signature no longer verifies.
+
+    fn make_test_pipeline_step() -> PipelineStep {
+        PipelineStep {
+            module_id: Uuid::new_v4(),
+            module_uri: "wasm://m/v1".to_string(),
+            wasm_bytes: None,
+            config: serde_json::json!({"input": "original"}),
+            allowed_hosts: vec!["api.example.com".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_secrets: vec!["slack/token".to_string()],
+            allowed_sql_operations: vec!["SELECT".to_string()],
+            allow_tier2_exposure: false,
+            encrypted_secrets: EncryptedSecrets::default(),
+            max_fuel: 1_000_000,
+            max_memory_mb: 64,
+            timeout_ms: 30_000,
+            priority: 100,
+            cancellation_token: None,
+            expected_wasm_hash: None,
+            integration_name: None,
+        }
+    }
+
+    fn make_test_pipeline(steps: Vec<PipelineStep>) -> PipelineJobRequest {
+        PipelineJobRequest {
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            steps,
+            total_timeout_ms: 60_000,
+            share_sandbox: false,
+            signature: vec![],
+            job_nonce: String::new(),
+            user_id: Uuid::nil(),
+            max_llm_tier: LlmTier::default(),
+            reply_topic: None,
+        }
+    }
+
+    /// C-2: pipeline `config` is now HMAC-bound. Pre-fix the worker
+    /// would execute the signed-and-attested module against
+    /// attacker-supplied config under the signed secrets blob.
+    #[test]
+    fn pipeline_tampered_step_config_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
+        req.sign(&key).unwrap();
+
+        req.steps[0].config = serde_json::json!({"input": "tampered"});
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline step config must fail verification (C-2)"
+        );
+    }
+
+    /// C-2: pipeline `allowed_hosts` is now HMAC-bound. Pre-fix an
+    /// attacker could widen the allowlist to exfiltrate via
+    /// attacker-controlled URL + signed `vault://` header.
+    #[test]
+    fn pipeline_tampered_step_hosts_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
+        req.sign(&key).unwrap();
+
+        req.steps[0].allowed_hosts.push("attacker.example".to_string());
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline allowed_hosts must fail verification (C-2)"
+        );
+    }
+
+    /// C-2: pipeline `allowed_methods` is now HMAC-bound.
+    #[test]
+    fn pipeline_tampered_step_methods_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
+        req.sign(&key).unwrap();
+
+        req.steps[0].allowed_methods.push("DELETE".to_string());
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline allowed_methods must fail verification (C-2)"
+        );
+    }
+
+    /// C-2: pipeline `encrypted_secrets.ciphertext` is now HMAC-bound.
+    /// Pre-fix the AAD (workflow_execution_id) was shared across all
+    /// steps in one pipeline, so an attacker could swap one step's
+    /// ciphertext for another's and the worker would happily decrypt.
+    #[test]
+    fn pipeline_tampered_step_secrets_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
+        req.sign(&key).unwrap();
+
+        req.steps[0].encrypted_secrets.ciphertext = vec![0xff; 32];
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline encrypted_secrets must fail verification (C-2)"
+        );
+    }
+
+    /// C-2: pipeline `max_fuel` / `max_memory_mb` / `timeout_ms` are now
+    /// HMAC-bound. Pre-fix an attacker could inflate any of them for
+    /// resource exhaustion / cost overrun.
+    #[test]
+    fn pipeline_tampered_step_resource_caps_fail_verification() {
+        let key = test_key();
+        let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
+        req.sign(&key).unwrap();
+
+        // Inflate fuel.
+        req.steps[0].max_fuel = 1_000_000_000;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline max_fuel must fail (C-2)"
+        );
+        req.steps[0].max_fuel = 1_000_000;
+        req.signature = vec![]; // resign baseline
+        req.sign(&key).unwrap();
+
+        // Inflate memory.
+        req.steps[0].max_memory_mb = 4096;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline max_memory_mb must fail (C-2)"
+        );
+        req.steps[0].max_memory_mb = 64;
+        req.signature = vec![];
+        req.sign(&key).unwrap();
+
+        // Inflate timeout.
+        req.steps[0].timeout_ms = 600_000;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline timeout_ms must fail (C-2)"
+        );
+    }
+
+    /// C-2: pipeline `priority` is now HMAC-bound.
+    #[test]
+    fn pipeline_tampered_step_priority_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
+        req.sign(&key).unwrap();
+
+        req.steps[0].priority = 1;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered pipeline priority must fail verification (C-2)"
+        );
+    }
+
+    /// C-2: pipeline `cancellation_token` is now HMAC-bound. None → Some
+    /// and Some → None must both fail.
+    #[test]
+    fn pipeline_tampered_step_cancellation_token_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
+        req.steps[0].cancellation_token = Some("tok-1".to_string());
+        req.sign(&key).unwrap();
+
+        req.steps[0].cancellation_token = None;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "stripping pipeline cancellation_token must fail (C-2)"
+        );
+    }
+
+    /// C-2: clean round-trip — a pipeline with all the C-2 fields
+    /// populated must verify successfully.
+    #[test]
+    fn pipeline_signing_round_trip() {
+        let key = test_key();
+        let mut step = make_test_pipeline_step();
+        step.config = serde_json::json!({"k": "v", "n": 42});
+        step.cancellation_token = Some("tok-xyz".to_string());
+        let mut req = make_test_pipeline(vec![step]);
+        req.sign(&key).unwrap();
+
+        req.verify(&key, 300).expect(
+            "clean pipeline with C-2 fields populated must verify",
+        );
+    }
+
+    /// C-2: per-step independence — mutating step 1 must invalidate the
+    /// whole signature even though step 0 is untouched.
+    #[test]
+    fn pipeline_tampered_second_step_config_fails() {
+        let key = test_key();
+        let s0 = make_test_pipeline_step();
+        let mut s1 = make_test_pipeline_step();
+        s1.config = serde_json::json!({"step": 1});
+        let mut req = make_test_pipeline(vec![s0, s1]);
+        req.sign(&key).unwrap();
+
+        // Tamper the SECOND step's config.
+        req.steps[1].config = serde_json::json!({"step": "tampered"});
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampering a non-first step's config must still fail (C-2)"
+        );
+    }
+
+    /// C-2: order-independence — re-ordering `allowed_hosts` within a
+    /// step must NOT invalidate. Mirrors the existing
+    /// `test_allowed_methods_order_independent` invariant.
+    #[test]
+    fn pipeline_step_hosts_order_independent() {
+        let key = test_key();
+        let mut step = make_test_pipeline_step();
+        step.allowed_hosts = vec!["b.com".to_string(), "a.com".to_string()];
+        let mut req = make_test_pipeline(vec![step]);
+        req.sign(&key).unwrap();
+
+        req.steps[0].allowed_hosts = vec!["a.com".to_string(), "b.com".to_string()];
+        req.verify(&key, 300)
+            .expect("re-ordered allowed_hosts must still verify");
     }
 }

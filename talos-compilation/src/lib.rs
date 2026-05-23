@@ -922,21 +922,62 @@ impl CompilationService {
         // silently warned through (N-7 from the talos-compilation
         // review — dev fail-open).
         //
-        // `cargo generate-lockfile` only does dependency resolution.
-        // It doesn't run build scripts or proc-macros, so it's safe to
-        // run un-sandboxed on the host. `--offline` forces resolution
-        // against the local registry cache only — no network. If a
-        // dep isn't cached locally the lockfile generation fails and
-        // the audit step that follows surfaces the missing-lockfile
-        // condition through its existing fail-closed branch.
-        let lockfile_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            Command::new("cargo")
-                .args(["generate-lockfile", "--offline", "--quiet"])
-                .current_dir(workspace)
-                .output(),
-        )
-        .await;
+        // Wasm-security review 2026-05-23 (H-6): lockfile generation
+        // now runs INSIDE the same `--network=none --read-only` build
+        // container as the compile + audit steps. Pre-fix it ran
+        // directly on the controller host (where vault tokens, master
+        // DEK, and LLM keys are mounted) — the doc-comment justified
+        // this with "cargo generate-lockfile only does dependency
+        // resolution," which is true today but doesn't make it safe to
+        // run user-controlled `Cargo.toml` parsing on the controller
+        // host. If a future cargo TOML-parsing or resolver CVE lands,
+        // an attacker would land code execution on the credential-
+        // bearing host. The fix mirrors the audit-command pattern:
+        // build the sandboxed Command via `container::build_command`,
+        // then append the `generate-lockfile --offline --quiet` args.
+        // `--offline` still forces local-registry resolution, so the
+        // `--network=none` container doesn't break legitimate use.
+        //
+        // We compute `cargo_registry_cache` and `wit_dir` here (used
+        // by `container::build_command` to mount the registry cache
+        // RO and the WIT directory RO into the container). They were
+        // previously declared after this block; pull them up.
+        let cargo_registry_cache = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".cargo/registry");
+        let wit_dir = self
+            .wit_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let lockfile_cmd = container::build_command(workspace, &cargo_registry_cache, wit_dir);
+        let lockfile_result = match lockfile_cmd {
+            Ok(mut cmd) => {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    cmd.args(["generate-lockfile", "--offline", "--quiet"])
+                        .current_dir(workspace)
+                        .output(),
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_compilation",
+                    event_kind = "lockfile_container_unavailable",
+                    error = %e,
+                    "Container build_command unavailable for lockfile gen — \
+                     falling back to direct cargo (same as audit_command's fallback policy)"
+                );
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    Command::new("cargo")
+                        .args(["generate-lockfile", "--offline", "--quiet"])
+                        .current_dir(workspace)
+                        .output(),
+                )
+                .await
+            }
+        };
         match &lockfile_result {
             Ok(Ok(out)) if out.status.success() => {
                 tracing::debug!(
@@ -975,9 +1016,8 @@ impl CompilationService {
             Some("Performing dependency security audit...".to_string()),
             Some(0.2),
         );
-        let cargo_registry_cache = dirs_next::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join(".cargo/registry");
+        // `cargo_registry_cache` was hoisted up above (H-6) for the
+        // sandboxed lockfile-gen step; reuse it here.
         let audit_cmd = container::audit_command(workspace, &cargo_registry_cache);
         // Stable image-baked advisory DB path. Both controller/Dockerfile
         // and Dockerfile.builder stage the DB at /opt/talos-advisory-db
@@ -1104,10 +1144,8 @@ impl CompilationService {
             Some("Compiling Rust source to WASM component...".to_string()),
             Some(0.3),
         );
-        let wit_dir = self
-            .wit_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
+        // `wit_dir` was hoisted up above (H-6) for the sandboxed
+        // lockfile-gen step; reuse it here.
         let build_cmd = container::build_command(workspace, &cargo_registry_cache, wit_dir);
         let output = match build_cmd {
             Ok(mut cmd) => {

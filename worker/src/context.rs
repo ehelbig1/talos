@@ -105,7 +105,15 @@ pub struct TalosContext {
 
     /// Whether this execution has been cancelled.  Set to true when the
     /// cancellation token is detected as revoked.  Checked by host functions.
-    pub cancelled: std::sync::atomic::AtomicBool,
+    ///
+    /// Wrapped in [`Arc`] so spawned background tasks (e.g. the SSE stream
+    /// reader at `host_impl::wit_http_stream::connect`) can hold a clone
+    /// and bail out promptly when the execution is cancelled —
+    /// `AtomicBool` itself is `!Clone`, so without the `Arc` the only
+    /// way a spawned task could observe cancellation was via mpsc
+    /// receiver-drop, which doesn't fire while the task is blocked
+    /// waiting on slow upstream bytes.
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 
     /// In-memory key-value store scoped to this workflow execution.
     pub state_store: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -817,7 +825,7 @@ impl TalosContext {
             crypto_budget_us: AtomicU64::new(5_000_000), // 5 seconds default
             request_id: None,
             cancellation_token: None,
-            cancelled: std::sync::atomic::AtomicBool::new(false),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quota_usage: std::sync::Mutex::new(HashMap::new()),
             http_call_count: AtomicU64::new(0),
             http_calls_per_host: dashmap::DashMap::new(),

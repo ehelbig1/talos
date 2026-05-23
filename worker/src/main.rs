@@ -48,6 +48,7 @@ mod ssrf_resolver;
 mod trace_nats;
 mod tracing;
 mod wit_inspector;
+mod worker_identity;
 
 use crate::runtime::TalosRuntime;
 
@@ -279,6 +280,14 @@ pub(crate) enum SigstoreRegexpRejection {
     /// matching workflow filename — including a forked repo with the
     /// same filename. Pin the owner/repo literally.
     UnpinnedGithubOwnerRepo,
+    /// Pattern starts with `https://` but is missing the `^` start-of-string
+    /// anchor. Cosign uses `regex::Regex::is_match` semantics — a missing
+    /// `^` means the literal `https://...` could appear anywhere inside
+    /// the SAN URI. While GitHub Actions OIDC SANs are well-structured,
+    /// a `^` anchor is cheap defense in depth (and matches the
+    /// documented operator examples in this file's human_reason() text).
+    /// Wasm-security review 2026-05-23.
+    MissingStartAnchor,
 }
 
 impl SigstoreRegexpRejection {
@@ -312,6 +321,11 @@ impl SigstoreRegexpRejection {
                  and `.github/workflows/` — owner and repo MUST be literal so a \
                  fork with the same workflow filename can't satisfy the regex. \
                  Replace `github\\.com/.*` with `github\\.com/OWNER/REPO/`."
+            }
+            Self::MissingStartAnchor => {
+                "TALOS_SIGSTORE_IDENTITY_REGEXP starts with `https://` but is \
+                 missing the `^` start-of-string anchor. Add `^` at the front \
+                 (e.g. `^https://github\\.com/OWNER/REPO/...`)."
             }
         }
     }
@@ -354,6 +368,15 @@ pub(crate) fn validate_sigstore_identity_regexp(
     // The pattern must compile or `cosign` will reject every artifact.
     if regex::Regex::new(regexp).is_err() {
         return Err(SigstoreRegexpRejection::InvalidRegex);
+    }
+    // Wasm-security review 2026-05-23: a `https://`-prefixed pattern
+    // without a leading `^` matches the URI substring anywhere — cheap
+    // defense-in-depth to require the start-anchor that all the doc
+    // examples already use. We don't require `^` on non-URL patterns
+    // because there are legitimate non-anchored uses (e.g. SAN-email
+    // patterns).
+    if regexp.starts_with("https://") {
+        return Err(SigstoreRegexpRejection::MissingStartAnchor);
     }
     // Workflow-URL convention: if the pattern mentions
     // `.github/workflows/`, the file extension `.yml` (or `.yaml`)
@@ -476,9 +499,34 @@ pub(crate) async fn verify_oci_signature(
     // just hashed. When unpinned (tests, audit-mode without a hash
     // pin, pre-startup), fall back to PATH lookup — the operator-
     // visible warning at startup already covers that posture.
+    //
+    // M (2026-05-23, wasm-security review): in production, refuse the
+    // PATH-lookup fallback. A successful M5 hash check at startup that
+    // failed to set the OnceLock would silently degrade every
+    // subsequent verification — operator-visible warning at boot is
+    // not sufficient guarantee that the production verification path
+    // uses the hashed binary. Fail-closed here makes the binary-pin
+    // invariant hold for every call, not just the happy path.
     let mut command = match cosign_pinned_path() {
         Some(path) => tokio::process::Command::new(path),
-        None => tokio::process::Command::new("cosign"),
+        None => {
+            if talos_config::is_production() {
+                ::tracing::error!(
+                    reference = %reference,
+                    "SECURITY: cosign binary path was not pinned at startup; \
+                     refusing to fall back to PATH lookup in production. The \
+                     M5 TALOS_COSIGN_SHA256 hash check requires the same \
+                     binary across boot-time hashing and per-call execution. \
+                     Confirm cosign is on PATH at worker boot."
+                );
+                return Err("cosign_unpinned".to_string());
+            }
+            ::tracing::warn!(
+                reference = %reference,
+                "cosign path not pinned (dev mode) — falling back to PATH lookup"
+            );
+            tokio::process::Command::new("cosign")
+        }
     };
     let output = match command.args(&argv).output().await {
         Ok(o) => o,
@@ -1091,90 +1139,19 @@ pub(crate) fn pick_trusted_reply_topic(
 }
 
 /// L-11 (2026-05-22): The worker's self-reported identity, bound into
-/// every signed [`JobResult`] / [`PipelineJobResult`] via
-/// [`talos_workflow_job_protocol::JobResult::sign_with_worker_id`].
+/// every signed [`talos_workflow_job_protocol::JobResult`] /
+/// [`talos_workflow_job_protocol::PipelineJobResult`] via
+/// `sign_with_worker_id`.
 ///
-/// Resolution order:
-///   1. `TALOS_WORKER_ID` env var (operator-supplied, explicit).
-///   2. `HOSTNAME` env var (Kubernetes injects this automatically as
-///      the pod name — typically `talos-worker-<rs>-<5hex>`).
-///   3. A random 16-byte hex string generated once at startup
-///      (`fallback-<hex>`). This branch only fires in dev containers
-///      that have neither env set.
-///
-/// The result is sanitized to the
-/// [`talos_workflow_job_protocol::validate_worker_id`] charset
-/// (`[A-Za-z0-9._-]{0,128}`) and cached in a [`OnceLock`] so every
-/// `JobResult.sign()` call site reads the same value without
-/// re-parsing env each time.
-///
-/// Note: this is NOT cryptographic identity — any process holding
-/// `WORKER_SHARED_KEY` can sign as any `worker_id`. It is forensic
-/// visibility (which pod produced which result, surfaced in the
-/// controller's audit log) plus the wire-format anchor that a future
-/// per-worker HKDF subkey scheme can dispatch on.
+/// Thin wrapper around [`worker::worker_identity`] — the canonical
+/// resolver lives in the library so both the binary AND library code
+/// (e.g. `host_impl::build_signed_agent_envelope`) share the same
+/// `OnceLock`-cached value. Pre-extraction this function lived in the
+/// binary only; a library callsite would have built a SECOND cache
+/// with a possibly-different fallback id, breaking forensic
+/// attribution at signed-envelope subscribers.
 pub(crate) fn worker_identity() -> &'static str {
-    use std::sync::OnceLock;
-    static WORKER_ID: OnceLock<String> = OnceLock::new();
-
-    WORKER_ID.get_or_init(|| {
-        // Sanitize: replace any character outside the allowed charset
-        // with `-` so an OS-provided hostname (which can legitimately
-        // contain characters that fail `validate_worker_id`) still
-        // produces a valid signing-payload field. We truncate to the
-        // MAX_WORKER_ID_LEN to satisfy the same validator.
-        fn sanitize(raw: &str) -> String {
-            let mut s: String = raw
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
-            if s.len() > talos_workflow_job_protocol::MAX_WORKER_ID_LEN {
-                s.truncate(talos_workflow_job_protocol::MAX_WORKER_ID_LEN);
-            }
-            s
-        }
-
-        // 1. TALOS_WORKER_ID — explicit operator override.
-        if let Ok(v) = std::env::var("TALOS_WORKER_ID") {
-            let v = v.trim();
-            if !v.is_empty() {
-                let sanitized = sanitize(v);
-                if !sanitized.is_empty() {
-                    return sanitized;
-                }
-            }
-        }
-
-        // 2. HOSTNAME — Kubernetes pod name in cluster deployments.
-        if let Ok(v) = std::env::var("HOSTNAME") {
-            let v = v.trim();
-            if !v.is_empty() {
-                let sanitized = sanitize(v);
-                if !sanitized.is_empty() {
-                    return sanitized;
-                }
-            }
-        }
-
-        // 3. Random fallback — dev / CI containers without HOSTNAME.
-        use rand::RngCore;
-        let mut buf = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut buf);
-        let id = format!("fallback-{}", hex::encode(buf));
-        ::tracing::warn!(
-            worker_id = %id,
-            "TALOS_WORKER_ID and HOSTNAME both unset — using random fallback. \
-             Set TALOS_WORKER_ID (or rely on Kubernetes pod-name HOSTNAME) for \
-             stable forensic attribution across restarts."
-        );
-        id
-    })
+    crate::worker_identity::worker_identity()
 }
 
 #[cfg(test)]
@@ -2065,30 +2042,77 @@ async fn execute_job(
                                 // `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1`
                                 // to restore the old behaviour, at the
                                 // cost of accepting unverified bytes.
-                                if std::env::var("TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS")
-                                    .ok()
-                                    .as_deref()
-                                    == Some("1")
-                                {
+                                //
+                                // H-5 (2026-05-23, wasm-security review):
+                                // the env var was a single-knob bypass
+                                // of the entire layer-digest gate. Even
+                                // with `TALOS_SIGSTORE_REQUIRED=required`
+                                // and `is_production() == true`, an
+                                // operator who toggled this on rendered
+                                // the integrity contract void with no
+                                // safety net. Defense-in-depth fix: the
+                                // env override is now refused whenever
+                                // Sigstore is `Required` OR the process
+                                // is in production. Operators on legacy
+                                // registries must downgrade Sigstore
+                                // policy AND/OR move out of production
+                                // mode to use it — making the trade-off
+                                // explicit rather than hiding it behind
+                                // one toggle.
+                                let accept_env =
+                                    std::env::var("TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS")
+                                        .ok()
+                                        .as_deref()
+                                        == Some("1");
+                                let prod = talos_config::is_production();
+                                let sigstore_required = matches!(
+                                    SigstorePolicy::from_env(),
+                                    SigstorePolicy::Required
+                                );
+                                if accept_env && !prod && !sigstore_required {
                                     ::tracing::warn!(
                                         module_uri = %req.module_uri,
                                         "OCI manifest had no layer descriptor — \
                                          accepting bytes unverified \
-                                         (TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1)"
+                                         (TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1, \
+                                         dev mode, sigstore not Required)"
                                     );
                                     _span.add_event("oci_pull_success_unverified");
                                     found_bytes = Some(layer.data);
                                 } else {
-                                    let err = "oci_manifest_missing_layer_descriptor: \
-                                               registry returned a manifest with no \
-                                               layer digest — refusing to execute. Set \
-                                               TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
-                                               to allow legacy registries.";
-                                    ::tracing::error!(
-                                        module_uri = %req.module_uri,
-                                        "OCI manifest had no layer descriptor — \
-                                         refusing to execute (M2 hardening)"
-                                    );
+                                    let err = if accept_env && (prod || sigstore_required) {
+                                        // Operator tried to use the bypass in an
+                                        // environment that disallows it — call out
+                                        // the conflict explicitly so the operator
+                                        // can choose to downgrade Sigstore policy
+                                        // or move out of production mode if the
+                                        // legacy-registry path is genuinely needed.
+                                        ::tracing::error!(
+                                            module_uri = %req.module_uri,
+                                            prod, sigstore_required,
+                                            "OCI manifest had no layer descriptor AND \
+                                             TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 was \
+                                             set in a stricter context — refusing the bypass"
+                                        );
+                                        "oci_manifest_missing_layer_descriptor: \
+                                         registry returned a manifest with no \
+                                         layer digest. TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
+                                         is REFUSED in production and when sigstore \
+                                         policy is Required — fix the registry or \
+                                         relax both gates before using the bypass."
+                                    } else {
+                                        ::tracing::error!(
+                                            module_uri = %req.module_uri,
+                                            "OCI manifest had no layer descriptor — \
+                                             refusing to execute (M2 hardening)"
+                                        );
+                                        "oci_manifest_missing_layer_descriptor: \
+                                         registry returned a manifest with no \
+                                         layer digest — refusing to execute. Set \
+                                         TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
+                                         to allow legacy registries (dev only, \
+                                         sigstore not Required)."
+                                    };
                                     _span.end_error(err);
                                     return JobResult {
                                         job_id: req.job_id,
@@ -4218,6 +4242,48 @@ mod oci_layer_tests {
         assert_eq!(
             validate_sigstore_identity_regexp(pattern),
             Err(SigstoreRegexpRejection::MissingGithubWorkflowPath)
+        );
+    }
+
+    // Wasm-security review 2026-05-23: `^` start-anchor enforcement on
+    // any pattern that begins with `https://`. Without `^`, the
+    // `https://...` substring could match anywhere inside the SAN URI;
+    // all the documented operator examples in human_reason() already
+    // use the anchor, so this is purely closing a documentation/code
+    // drift hole.
+    #[test]
+    fn sigstore_regexp_unanchored_https_pattern_is_rejected() {
+        let pattern =
+            "https://github\\.com/owner/talos/\\.github/workflows/publish\\.yml@";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingStartAnchor),
+            "unanchored https:// pattern must be rejected"
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_anchored_https_pattern_is_accepted() {
+        // Confirm the canonical form still passes after the new check.
+        let pattern =
+            "^https://github\\.com/owner/talos/\\.github/workflows/publish\\.yml@";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "anchored https:// pattern must pass: {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_non_https_pattern_does_not_require_anchor() {
+        // SAN-email patterns / custom-OIDC patterns shouldn't be forced
+        // to start with `^`. Only `https://`-prefixed patterns are
+        // affected by the new rule.
+        let pattern = "ci@example\\.com$";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "non-https pattern without ^ should pass: {:?}",
+            validate_sigstore_identity_regexp(pattern)
         );
     }
 

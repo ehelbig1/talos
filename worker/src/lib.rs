@@ -15,8 +15,10 @@ pub mod sql_validator;
 pub mod ssrf_resolver;
 pub mod tracing;
 pub mod wit_inspector;
+pub mod worker_identity;
 
 pub use runtime::TalosRuntime;
 pub use wit_inspector::{
     inspect_component, validate_capability_level, CapabilityWorld, ComponentInspection,
 };
+pub use worker_identity::worker_identity;
