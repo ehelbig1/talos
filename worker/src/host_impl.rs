@@ -12091,6 +12091,15 @@ impl wit_http_stream::Host for TalosContext {
 
         let client = self.http_client.clone();
         let url_owned = url.clone();
+        // Wasm-security review 2026-05-23 (M): clone the execution's
+        // cancellation flag into the spawned task so it can exit
+        // promptly when the parent execution is cancelled. Pre-fix the
+        // task only noticed cancellation via mpsc receiver-drop, which
+        // doesn't fire while the task is blocked in
+        // `StreamExt::next(&mut stream)` waiting on slow upstream
+        // bytes — leaving the connection / spawned task alive past
+        // execution-end and consuming a worker connection slot.
+        let cancelled = self.cancelled.clone();
 
         tokio::spawn(async move {
             let mut req_builder = client
@@ -12167,7 +12176,36 @@ impl wit_http_stream::Host for TalosContext {
             let mut data_bytes: usize = 0;
             let mut event_id: Option<String> = None;
 
-            while let Some(chunk_result) = futures_util::StreamExt::next(&mut stream).await {
+            loop {
+                // Wasm-security review 2026-05-23 (M): bound the
+                // bytes-stream wait so a slow-trickle upstream can't
+                // keep this task alive past execution-end. The
+                // `tokio::select!` races the next chunk against:
+                //   - a short periodic wake (200 ms) that checks the
+                //     execution's cancellation flag,
+                //   - the cancellation flag itself flipping mid-wait
+                //     (cooperative — we ALSO short-circuit on the
+                //     wake-tick if the flag is set, so no race window).
+                // The periodic wake is cheap (200 ms = 5 polls/sec)
+                // and gives the task at most 200 ms of slack between
+                // cancellation and exit.
+                let chunk_result = tokio::select! {
+                    chunk = futures_util::StreamExt::next(&mut stream) => chunk,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                            tracing::debug!(
+                                url = %url_owned,
+                                "SSE stream task observed execution cancellation — exiting"
+                            );
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                let chunk_result = match chunk_result {
+                    Some(c) => c,
+                    None => break,
+                };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(_) => break,

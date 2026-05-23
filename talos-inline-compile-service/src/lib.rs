@@ -310,7 +310,25 @@ impl InlineCompileService {
                 let max_rank = talos_capability_world::actor_world_rank_strict(&actor_max)
                     .unwrap_or(0);
                 let req_rank = talos_capability_world::world_rank(&world_full);
-                if req_rank > max_rank {
+                // Wasm-security review 2026-05-23 (M): the linear rank
+                // check alone is unsound for the partial-order
+                // `CapabilityWorld::is_subset_of` lattice. Database
+                // and Agent both rank 6 — without the subset check, an
+                // actor with `max_capability_world=database` (rank 6)
+                // could install Agent modules (rank 6, passes), but
+                // Agent's `agent-orchestration` interface is NOT
+                // a subset of Database. Combine the two checks: rank
+                // catches the "higher tier" case; subset catches the
+                // "incomparable sibling" case. Defense in depth.
+                use std::str::FromStr;
+                let req_world =
+                    talos_capability_world::CapabilityWorld::from_str(&world_full)
+                        .unwrap_or(talos_capability_world::CapabilityWorld::Unknown);
+                let actor_world =
+                    talos_capability_world::CapabilityWorld::from_str(&actor_max)
+                        .unwrap_or(talos_capability_world::CapabilityWorld::Unknown);
+                let subset_ok = req_world.is_subset_of(&actor_world);
+                if req_rank > max_rank || !subset_ok {
                     return Err(InlineCompileError::CapabilityCeilingViolation(format!(
                         "Capability ceiling violation: inline node uses '{}' world which exceeds \
                          the actor's max_capability_world '{}'. \
