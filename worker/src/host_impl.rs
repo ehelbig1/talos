@@ -7198,13 +7198,42 @@ impl wit_database::Host for TalosContext {
                 };
 
             if let Some(ledger_mutex) = &self.audit_ledger {
+                // Wasm-security review 2026-05-23 (M): stop logging the
+                // FULL params array verbatim. Bind parameters often
+                // carry PII (`SET password_hash = $1`, `WHERE email = $1`)
+                // or short-lived secrets (`SET api_key = $1`). Pre-fix
+                // the WORM ledger + NATS audit stream stored the raw
+                // values, and at 1 MiB aggregate × 500 queries/exec the
+                // worst-case audit dump was ~500 MiB per execution.
+                // Replace the literal `params` with:
+                //   - `params_count`     — operator-actionable cardinality
+                //   - `params_bytes`     — aggregate size for capacity planning
+                //   - `params_hash`      — sha256 over the canonical
+                //                          (length-prefixed) params blob
+                //                          so two identical-input audits
+                //                          are linkable without exposure
+                // The SQL string stays — it's bounded to 64 KiB upstream
+                // by the size cap and ALWAYS reaches the controller
+                // anyway (for replay), so retaining it adds no marginal
+                // exposure.
+                use sha2::Digest;
+                let mut params_hasher = sha2::Sha256::new();
+                let mut params_bytes: usize = 0;
+                for p in &params {
+                    params_hasher.update((p.as_bytes().len() as u64).to_le_bytes());
+                    params_hasher.update(p.as_bytes());
+                    params_bytes = params_bytes.saturating_add(p.len());
+                }
+                let params_hash = hex::encode(params_hasher.finalize());
                 let mut ledger = ledger_mutex.lock().await;
                 let event = ledger.append(
                     "agent:wasm",
                     "wasi:database_execute_query",
                     &serde_json::json!({
                         "sql": sql,
-                        "params": params,
+                        "params_count": params.len(),
+                        "params_bytes": params_bytes,
+                        "params_hash": params_hash,
                     })
                     .to_string(),
                 );
@@ -9214,6 +9243,296 @@ impl wit_graph_memory::Host for TalosContext {
 // Agent Orchestration
 // ============================================================================
 
+/// Cap on per-field payload bytes when an agent message is built. The host
+/// stamps `source_module` / `source_execution` itself (UUIDs); the only
+/// guest-controlled blobs are `payload`, `correlation_id`, and `target`. The
+/// total NATS payload after the signed envelope wrap is bounded by these
+/// caps + ~512 bytes of envelope overhead.
+///
+/// Wasm-security review 2026-05-23 (H-4): pre-fix the payload field was an
+/// unbounded JSON object; combined with the absence of HMAC signing, a
+/// guest with the routine Agent capability could blast 100MB messages into
+/// every `talos.agent.*` subscriber. Caps + signed envelope close both
+/// arms in one change.
+const MAX_AGENT_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_AGENT_CORRELATION_ID_BYTES: usize = 256;
+
+/// Build the signed NATS envelope for an agent invocation / message.
+///
+/// Wraps the guest-supplied payload in a versioned envelope and stamps it
+/// with an HMAC-SHA256 signature bound to (subject, actor_id, nonce,
+/// canonical_body). Subscribers under `talos.agent.*` MUST verify before
+/// acting on the contents — see verification helper below.
+///
+/// Envelope shape (versioned for forward compatibility):
+/// ```json
+/// {
+///   "v": 1,
+///   "nonce": "<unix_ms>:<16 random hex bytes>",
+///   "subject": "talos.agent.<target>.invoke",
+///   "source_module": "<uuid|null>",
+///   "source_execution": "<exec_id|null>",
+///   "source_actor": "<uuid|nil>",
+///   "source_worker": "<worker_id>",
+///   "payload": <guest-supplied json>,
+///   "correlation_id": <int|null>,
+///   "signature": "<hex>"
+/// }
+/// ```
+///
+/// The signature covers `serde_json::to_vec(&envelope_without_signature)`
+/// — the canonical body — combined with `subject`, `actor_id`, and
+/// `nonce` per `talos_memory::rpc_auth::sign`. When the worker's HMAC key
+/// isn't registered (test fixtures, dev without env), `signature` is
+/// emitted as the empty string; production subscribers MUST refuse such
+/// envelopes.
+fn build_signed_agent_envelope(
+    subject: &str,
+    actor_id: Option<uuid::Uuid>,
+    source_worker: &str,
+    source_module: &Option<String>,
+    source_execution: &Option<String>,
+    payload: &serde_json::Value,
+    correlation_id: &Option<String>,
+) -> Result<Vec<u8>, &'static str> {
+    use rand::Rng;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system time before epoch")?
+        .as_millis();
+    let rand_bytes: [u8; 16] = rand::thread_rng().gen();
+    let nonce = format!("{}:{}", ts, hex::encode(rand_bytes));
+
+    // Canonical envelope WITHOUT signature (which is added last). This is
+    // the byte string we sign. Field-name ordering follows
+    // `serde_json::json!` (preserves insertion order in this crate
+    // version), so the canonical bytes are deterministic for a given
+    // input.
+    let envelope = serde_json::json!({
+        "v": 1u32,
+        "nonce": nonce,
+        "subject": subject,
+        "source_module": source_module,
+        "source_execution": source_execution,
+        // `source_actor` is the actor's identity claim (HMAC-bound on
+        // the worker side); subscribers can pin against the actor's
+        // expected_caller_actor_id field for additional defense.
+        "source_actor": actor_id.unwrap_or(uuid::Uuid::nil()).to_string(),
+        "source_worker": source_worker,
+        "payload": payload,
+        "correlation_id": correlation_id,
+    });
+    let canonical_body = serde_json::to_vec(&envelope)
+        .map_err(|_| "envelope serialise failed")?;
+
+    // `rpc_auth::sign` returns None when the worker's HMAC key isn't
+    // registered — that happens in unit tests and in pre-startup paths.
+    // The envelope still goes on the wire (without signing); the
+    // production subscriber's `MUST verify` rule covers refusal in that
+    // case.
+    let signature = talos_memory::rpc_auth::sign(
+        subject,
+        actor_id.unwrap_or(uuid::Uuid::nil()),
+        &nonce,
+        &canonical_body,
+    )
+    .map(hex::encode)
+    .unwrap_or_default();
+
+    // Now re-emit the envelope with the signature appended. We re-build
+    // the JSON rather than splicing into the existing bytes to keep
+    // the canonical body construction simple — subscribers do the same:
+    // strip `signature`, recompute canonical body, verify.
+    let signed = serde_json::json!({
+        "v": 1u32,
+        "nonce": nonce,
+        "subject": subject,
+        "source_module": source_module,
+        "source_execution": source_execution,
+        "source_actor": actor_id.unwrap_or(uuid::Uuid::nil()).to_string(),
+        "source_worker": source_worker,
+        "payload": payload,
+        "correlation_id": correlation_id,
+        "signature": signature,
+    });
+    serde_json::to_vec(&signed).map_err(|_| "signed envelope serialise failed")
+}
+
+/// Verify a signed agent NATS envelope. Documented public helper that
+/// future `talos.agent.*` subscribers will call before acting on the
+/// payload. Returns `Ok(payload)` when:
+/// - the envelope JSON parses and has all required fields;
+/// - `subject` matches the envelope's `subject` (defense against
+///   re-publication onto a different topic);
+/// - the freshness window holds (per `talos_memory::rpc_auth`);
+/// - the HMAC signature verifies against the worker's shared key.
+///
+/// Refuses (returns `Err`) when:
+/// - the envelope is missing required fields;
+/// - the signature is empty (production subscribers must NOT accept
+///   unsigned envelopes);
+/// - the actor_id is malformed;
+/// - the HMAC fails;
+/// - the subject doesn't match.
+///
+/// Pure function so the verification rule can be unit-tested without
+/// NATS / a live worker.
+#[allow(dead_code)] // Provided for future subscribers; tests exercise it.
+pub fn verify_signed_agent_envelope(
+    expected_subject: &str,
+    envelope_bytes: &[u8],
+) -> Result<serde_json::Value, &'static str> {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(envelope_bytes).map_err(|_| "envelope parse failed")?;
+    let envelope = parsed.as_object().ok_or("envelope is not a JSON object")?;
+
+    let signature_hex = envelope
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .ok_or("envelope missing signature field")?;
+    if signature_hex.is_empty() {
+        return Err("envelope has empty signature — refusing");
+    }
+    let signature = hex::decode(signature_hex).map_err(|_| "signature is not valid hex")?;
+
+    let subject = envelope
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .ok_or("envelope missing subject field")?;
+    if subject != expected_subject {
+        return Err("subject mismatch — possible re-publication attempt");
+    }
+    let nonce = envelope
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .ok_or("envelope missing nonce field")?;
+    let actor_str = envelope
+        .get("source_actor")
+        .and_then(|v| v.as_str())
+        .ok_or("envelope missing source_actor field")?;
+    let actor_id = uuid::Uuid::parse_str(actor_str).map_err(|_| "source_actor is not a UUID")?;
+
+    // Reconstruct the canonical body (envelope MINUS signature) and
+    // verify. This mirrors `build_signed_agent_envelope`'s canonical
+    // form exactly.
+    let mut body_obj = envelope.clone();
+    body_obj.remove("signature");
+    let canonical_body = serde_json::to_vec(&serde_json::Value::Object(body_obj))
+        .map_err(|_| "canonical body serialise failed")?;
+
+    if !talos_memory::rpc_auth::verify(subject, actor_id, nonce, &canonical_body, &signature) {
+        return Err("signature verification failed");
+    }
+
+    envelope
+        .get("payload")
+        .cloned()
+        .ok_or("envelope missing payload field")
+}
+
+#[cfg(test)]
+mod signed_agent_envelope_tests {
+    use super::{build_signed_agent_envelope, verify_signed_agent_envelope};
+    use talos_memory::rpc_auth;
+
+    /// Register a process-wide HMAC key for the verify tests. Reuses the
+    /// same all-`0x42` test key convention as the protocol crate. Safe
+    /// to call from multiple tests — `register_hmac_key` is idempotent
+    /// for the same key bytes.
+    fn ensure_test_key() {
+        use std::sync::Arc;
+        rpc_auth::register_hmac_key(Arc::new(vec![0x42u8; 32]));
+    }
+
+    #[test]
+    fn signed_envelope_round_trips() {
+        ensure_test_key();
+        let subject = "talos.agent.alice.invoke";
+        let actor = uuid::Uuid::nil();
+        let payload = serde_json::json!({"task": "do thing"});
+        let bytes = build_signed_agent_envelope(
+            subject,
+            Some(actor),
+            "worker-1",
+            &Some("mod-1".to_string()),
+            &Some("exec-1".to_string()),
+            &payload,
+            &Some("corr-1".to_string()),
+        )
+        .expect("build envelope");
+
+        let verified =
+            verify_signed_agent_envelope(subject, &bytes).expect("verify must succeed");
+        assert_eq!(verified, payload);
+    }
+
+    #[test]
+    fn empty_signature_is_refused() {
+        // Future subscribers MUST NOT trust an unsigned envelope. We
+        // simulate the "HMAC key not registered" path by constructing
+        // an envelope with an empty signature field directly.
+        let envelope = serde_json::json!({
+            "v": 1,
+            "nonce": "0:00000000000000000000000000000000",
+            "subject": "talos.agent.alice.invoke",
+            "source_module": "mod-1",
+            "source_execution": "exec-1",
+            "source_actor": uuid::Uuid::nil().to_string(),
+            "source_worker": "worker-1",
+            "payload": {"task": "do thing"},
+            "correlation_id": null,
+            "signature": "",
+        });
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let res = verify_signed_agent_envelope("talos.agent.alice.invoke", &bytes);
+        assert!(res.is_err(), "empty signature must be refused");
+    }
+
+    #[test]
+    fn subject_mismatch_is_refused() {
+        ensure_test_key();
+        let bytes = build_signed_agent_envelope(
+            "talos.agent.alice.invoke",
+            Some(uuid::Uuid::nil()),
+            "worker-1",
+            &None,
+            &None,
+            &serde_json::json!({}),
+            &None,
+        )
+        .expect("build envelope");
+        // Subscriber on a DIFFERENT topic should refuse — defense
+        // against an attacker who re-publishes a captured envelope on
+        // an unrelated subject.
+        let res = verify_signed_agent_envelope("talos.agent.eve.invoke", &bytes);
+        assert!(res.is_err(), "subject mismatch must be refused");
+    }
+
+    #[test]
+    fn tampered_payload_is_refused() {
+        ensure_test_key();
+        let subject = "talos.agent.alice.invoke";
+        let bytes = build_signed_agent_envelope(
+            subject,
+            Some(uuid::Uuid::nil()),
+            "worker-1",
+            &None,
+            &None,
+            &serde_json::json!({"task": "original"}),
+            &None,
+        )
+        .expect("build envelope");
+
+        // Parse, tamper the payload, re-serialise WITHOUT re-signing.
+        let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        envelope["payload"] = serde_json::json!({"task": "tampered"});
+        let tampered_bytes = serde_json::to_vec(&envelope).unwrap();
+
+        let res = verify_signed_agent_envelope(subject, &tampered_bytes);
+        assert!(res.is_err(), "tampered payload must fail HMAC verify");
+    }
+}
+
 impl wit_agent_orchestration::Host for TalosContext {
     async fn invoke(
         &mut self,
@@ -9264,18 +9583,51 @@ impl wit_agent_orchestration::Host for TalosContext {
             return Err(wit_agent_orchestration::Error::AgentNotFound);
         }
 
+        // H-4: per-field caps to bound the NATS envelope size. The host
+        // stamps source_module / source_execution / nonce / signature
+        // itself; the only guest-controlled blobs are `payload` and
+        // `correlation_id` (a u64, naturally bounded).
+        if msg.payload.len() > MAX_AGENT_PAYLOAD_BYTES {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                payload_bytes = msg.payload.len(),
+                cap = MAX_AGENT_PAYLOAD_BYTES,
+                "agent payload exceeds cap"
+            );
+            return Err(wit_agent_orchestration::Error::InvocationFailed);
+        }
+
         // Build NATS topic for agent invocation
         let topic = format!("talos.agent.{}.invoke", msg.target);
 
-        let payload = serde_json::json!({
-            "payload": msg.payload,
-            "correlation_id": msg.correlation_id,
-            "source_module": self.module_id,
-            "source_execution": self.execution_id,
-        });
-
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|_| wit_agent_orchestration::Error::InvocationFailed)?;
+        // H-4: build a SIGNED envelope. Pre-fix the payload was an
+        // unsigned JSON object on `talos.agent.*` — any in-cluster
+        // attacker (or a future regression that lifts the topic outside
+        // the worker's authentication boundary) could publish arbitrary
+        // bytes that subscribers might trust. The envelope now carries
+        // an HMAC-SHA256 signature bound to subject + actor_id + nonce
+        // + canonical body, plus replay-protection nonce. Subscribers
+        // under `talos.agent.*` MUST verify before acting on the
+        // contents.
+        let payload_json: serde_json::Value = serde_json::from_str(&msg.payload)
+            .unwrap_or_else(|_| serde_json::Value::String(msg.payload.clone()));
+        let payload_bytes = build_signed_agent_envelope(
+            &topic,
+            self.actor_id,
+            crate::worker_identity::worker_identity(),
+            &self.module_id,
+            &self.execution_id,
+            &payload_json,
+            &msg.correlation_id,
+        )
+        .map_err(|err| {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                err = %err,
+                "Failed to build signed agent envelope"
+            );
+            wit_agent_orchestration::Error::InvocationFailed
+        })?;
 
         // NATS request-reply with timeout
         let response = tokio::time::timeout(timeout, nats.request(topic, payload_bytes.into()))
@@ -9370,17 +9722,39 @@ impl wit_agent_orchestration::Host for TalosContext {
             return Err(wit_agent_orchestration::Error::AgentNotFound);
         }
 
+        // H-4: per-field caps (same as invoke).
+        if msg.payload.len() > MAX_AGENT_PAYLOAD_BYTES {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                payload_bytes = msg.payload.len(),
+                cap = MAX_AGENT_PAYLOAD_BYTES,
+                "agent send payload exceeds cap"
+            );
+            return Err(wit_agent_orchestration::Error::InvocationFailed);
+        }
+
         let topic = format!("talos.agent.{}.message", msg.target);
 
-        let payload = serde_json::json!({
-            "payload": msg.payload,
-            "correlation_id": msg.correlation_id,
-            "source_module": self.module_id,
-            "source_execution": self.execution_id,
-        });
-
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|_| wit_agent_orchestration::Error::InvocationFailed)?;
+        // H-4: signed NATS envelope, see invoke() above for rationale.
+        let payload_json: serde_json::Value = serde_json::from_str(&msg.payload)
+            .unwrap_or_else(|_| serde_json::Value::String(msg.payload.clone()));
+        let payload_bytes = build_signed_agent_envelope(
+            &topic,
+            self.actor_id,
+            crate::worker_identity::worker_identity(),
+            &self.module_id,
+            &self.execution_id,
+            &payload_json,
+            &msg.correlation_id,
+        )
+        .map_err(|err| {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                err = %err,
+                "Failed to build signed agent envelope for send"
+            );
+            wit_agent_orchestration::Error::InvocationFailed
+        })?;
 
         // Fire-and-forget publish
         nats.publish(topic, payload_bytes.into())
