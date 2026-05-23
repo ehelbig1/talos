@@ -141,11 +141,16 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     allowed_sql_sorted.sort_unstable();
     let allowed_sql_str = allowed_sql_sorted.join(",");
     let reply_topic_str = req.reply_topic.as_deref().unwrap_or("-");
+    // 2026-05-23 (H-3, H-7): newly-bound fields. Mirror the production
+    // impl in `JobRequest::signing_payload` — sentinel `-` for None
+    // string options, numeric / bool fields render via Display.
+    let capability_world_str = req.capability_world.as_deref().unwrap_or("-");
+    let cancellation_token_str = req.cancellation_token.as_deref().unwrap_or("-");
     fn lp(s: &str) -> String {
         format!("{}:{}", s.as_bytes().len(), s)
     }
     let payload = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         req.job_id,
         req.workflow_execution_id,
         lp(&req.module_uri),
@@ -164,6 +169,14 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
         lp(&allowed_sql_str),
         req.allow_tier2_exposure,
         lp(reply_topic_str),
+        // H-3 / H-7 wire-format extension (2026-05-23). See the
+        // corresponding `// 2026-05-23` block in
+        // `JobRequest::signing_payload` for the field order.
+        lp(capability_world_str),
+        req.dry_run,
+        req.priority,
+        req.deadline_unix_secs,
+        lp(cancellation_token_str),
     );
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());
@@ -183,10 +196,14 @@ fn job_request_json_snapshot() {
     // Updated 2026-05-21: snapshot includes the canonical signing
     // bytes after the L-9 length-prefix discipline, M-4 actor_id
     // binding, M-5 capability-grant binding, and H-1 reply_topic
-    // binding all landed. reply_topic = None is omitted from the
-    // JSON via `skip_serializing_if`, so the shape is unchanged
-    // here; only the `signature` bytes shift.
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[104,148,176,248,116,245,0,61,91,172,197,30,238,212,180,169,149,173,36,2,150,202,28,12,39,199,95,66,50,237,118,107],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","dry_run":false}"#;
+    // binding all landed.
+    // Updated 2026-05-23: H-3 + H-7 wasm-security review — the
+    // signing payload now also binds `capability_world`, `dry_run`,
+    // `priority`, `deadline_unix_secs`, and `cancellation_token`.
+    // Only the `signature` bytes change here (None options are
+    // omitted from the JSON via `skip_serializing_if`, and the
+    // numeric fields were already in the JSON shape).
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[108,221,81,114,64,235,122,86,157,6,85,137,44,226,239,251,120,12,56,194,144,134,25,218,236,69,204,68,53,242,107,87],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","dry_run":false}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted — see test docstring for resolution"
@@ -204,10 +221,14 @@ fn job_request_signature_snapshot() {
     // The signature field is the HMAC-SHA256 over the canonical
     // bytes; locking the hex digest pins the format implicitly.
     let actual_hex = hex::encode(&req.signature);
-    // Updated 2026-05-21: see `job_request_json_snapshot` comment
-    // for the protocol bump that shifted this digest. Recomputed
-    // against the current `JobRequest::signing_payload`.
-    let expected_hex = "6894b0f874f5003d5bacc51eeed4b4a995ad240296ca1c0c27c75f4232ed766b";
+    // Updated 2026-05-23: H-3 / H-7 wasm-security review extension.
+    // The signing payload now binds `capability_world`, `dry_run`,
+    // `priority`, `deadline_unix_secs`, and `cancellation_token`
+    // (all appended at the end per the wire-format stability rule).
+    // Both the JSON shape (`signature` bytes) and this hex digest
+    // shifted; the fixture uses sentinel `-` for capability_world /
+    // cancellation_token (None) and Default values for the numerics.
+    let expected_hex = "6cdd517240eb7a569d0655892ce2effb780c38c2908619daec45cc4435f26b57";
     assert_eq!(
         actual_hex, expected_hex,
         "JobRequest signing payload drifted — see test docstring for resolution"

@@ -1579,16 +1579,26 @@ mod external_llm_host_tests {
     }
 
     #[test]
-    fn case_insensitive() {
-        // Callers are expected to lowercase the host before calling,
-        // but a belt-and-suspenders test guards against case-games in
-        // test inputs and future refactors.
+    fn case_insensitive_and_trailing_dot_safe() {
+        // Wasm-security review 2026-05-23: the helper now normalises
+        // both trailing-dot AND case at the matcher entry as
+        // defense-in-depth against an upstream caller forgetting
+        // to lowercase or strip the dot. Pre-fix the contract was
+        // "callers MUST pass lowercased / dot-stripped host";
+        // post-fix the contract is "matcher hardens what you give it"
+        // — same correctness, smaller surface for upstream regressions.
         assert!(is_external_llm_host("api.anthropic.com"));
-        // Callers MUST pass lowercase — this helper is case-sensitive
-        // by design (fast path). Document via the next assertion:
         assert!(
-            !is_external_llm_host("API.ANTHROPIC.COM"),
-            "helper is case-sensitive by design — callers must lowercase first"
+            is_external_llm_host("API.ANTHROPIC.COM"),
+            "matcher now lowercases internally (defense in depth)"
+        );
+        assert!(
+            is_external_llm_host("api.anthropic.com."),
+            "matcher now strips trailing dot (defense in depth)"
+        );
+        assert!(
+            is_external_llm_host("EU.API.OPENAI.COM."),
+            "matcher handles uppercase + trailing dot together"
         );
     }
 
