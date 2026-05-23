@@ -4,6 +4,45 @@
 //! depend on, plus version-string sanitisation (no `*` / empty pinning).
 //! Lifted from `controller/src/mcp/utils.rs` so the compilation pipeline
 //! owns its own allowlist instead of reaching back into MCP.
+//!
+//! Wasm-security review 2026-05-23 (L-finding-3): **transitive deps are
+//! NOT validated by this allowlist.** When a user declares an allowlisted
+//! direct crate (e.g. `regex`), Cargo will resolve its transitive
+//! closure — `regex-syntax`, `aho-corasick`, `memchr`, etc. — none of
+//! which appear in `DEFAULT_ALLOWED_DEPENDENCIES`. The trust boundary
+//! is "direct deps must be operator-vetted"; transitive trust delegates
+//! to the upstream crate authors and to cargo-audit's RustSec database.
+//!
+//! The transitive-dep risk is bounded by three other layers and the
+//! `dependency_allowlist` MUST NOT be the single point of failure:
+//!
+//!   1. **cargo-audit (RustSec)** — runs against the resolved
+//!      `Cargo.lock` BEFORE `cargo component build`, so any KNOWN
+//!      vulnerability in the transitive closure blocks compilation
+//!      (`talos-compilation/src/lib.rs` step 1.5). Catches published
+//!      CVEs; does NOT catch a novel supply-chain compromise against
+//!      a transitive dep before it's reported to RustSec.
+//!   2. **Frozen registry cache** — the talos-builder image bakes
+//!      `~/.cargo/registry` at image-build time and mounts it
+//!      read-only into the compilation container (`container.rs`
+//!      `registry_mount`). `cargo generate-lockfile --offline`
+//!      runs INSIDE the container with `--network=none` so the
+//!      resolver cannot reach crates.io. The practical attack
+//!      window is the gap between image rebuilds, not the runtime
+//!      window of any individual compile request.
+//!   3. **Sandboxed compile** — even if a malicious proc-macro
+//!      shipped via a transitive dep does fire at compile time,
+//!      `container::build_command` runs cargo with `--network=none`,
+//!      `--read-only` root, `--cap-drop=ALL`, `no-new-privileges`,
+//!      `--user 1000:1000`, and memory/CPU caps. The blast radius
+//!      is the compilation container, not the controller host.
+//!
+//! Direct-dep audits + image rebuilds (monthly per the CLAUDE.md
+//! advisory-DB freshness rule) are how operators close the residual
+//! gap. **Do not** add transitive-resolution logic here without
+//! pulling in a proper Cargo metadata parser — the previous attempt
+//! at substring-matching `Cargo.lock` mis-flagged crates whose names
+//! contained allowlisted-crate substrings.
 
 // ============================================================================
 // SECURITY: Dependency allowlist for compile_custom_sandbox

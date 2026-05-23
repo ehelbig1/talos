@@ -85,7 +85,7 @@ fn reject_reserved_topic_prefix(topic: &str) -> bool {
 /// to over-block legitimate-but-weird queries.
 pub(crate) fn looks_like_graphql_introspection(query: &str) -> bool {
     // Strip line comments (GraphQL uses `#` for comments).
-    let stripped: String = query
+    let comment_stripped: String = query
         .lines()
         .map(|line| match line.find('#') {
             Some(idx) => &line[..idx],
@@ -94,52 +94,375 @@ pub(crate) fn looks_like_graphql_introspection(query: &str) -> bool {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Find the root `{`. If there isn't one, this isn't a
-    // selection-set query (e.g. it's a malformed query, a query
-    // operation with no body, or a non-query operation like a
-    // bare introspection-shape mutation — none of which actually
-    // introspect at GraphQL semantics).
+    // L-finding-8: also strip the contents of string literals so a
+    // `fragment Sneaky on Query { __schema }` substring embedded
+    // inside a user-supplied string argument is NOT mistaken for a
+    // real fragment definition. GraphQL has two string forms — `"..."`
+    // (with `\"` and `\\` escapes) and `"""..."""` block strings (no
+    // escapes, terminator is three quotes). Both are replaced with
+    // same-length spaces so byte offsets stay stable for downstream
+    // diagnostics.
+    let stripped = strip_graphql_string_literals(&comment_stripped);
+
+    // Pass 1 (primary): top-level introspection in the operation's
+    // root selection set. Find the root `{` and walk for `__schema`
+    // or `__type` until the first nested `{`. This is the high-
+    // confidence path that catches the canonical
+    // `{ __schema { types { name } } }` pattern.
+    let primary = top_level_root_selection_has_introspection(&stripped);
+    if primary {
+        return true;
+    }
+
+    // Pass 2 (L-finding-8, 2026-05-23): fragment-hidden introspection.
+    // Pre-fix a guest could bury `__schema` / `__type` inside a
+    // `fragment X on Query { ... }` and reference the fragment from
+    // the root selection set:
+    //     fragment Sneaky on Query { __schema { types { name } } }
+    //     query Q { ...Sneaky }
+    // Pass 1 only walked the operation body so this query slipped
+    // through with no audit event fired. We don't pull in a full
+    // GraphQL parser (the only worker-bound option,
+    // async-graphql-parser, would add ~1 ms of parse cost to the
+    // wit_graphql hot path); instead we do a shape-based scan
+    // specifically for fragment definitions and check whether each
+    // fragment's body imports an introspection meta-field.
+    //
+    // The detector intentionally over-fires on rare patterns (e.g.
+    // a fragment defined on a custom type with a user-defined field
+    // named `__schema_foo` — though `__` is reserved by GraphQL
+    // spec so that should not occur in well-formed schemas). The
+    // existing `actor_tier1 || env_block` gating in the caller
+    // means false positives are observable via WARN (allow-mode)
+    // and only HARD-BLOCK under the deliberate operator opt-in;
+    // false negatives, by contrast, leave the audit stream silent.
+    // Prefer false-positive WARN over false-negative silence.
+    fragment_body_has_introspection(&stripped)
+}
+
+/// Inner scan for the primary "top-level introspection" pattern.
+/// Returns true if the operation body's root selection set
+/// imports `__schema` or `__type` (before any nested selection
+/// opens its own brace pair).
+fn top_level_root_selection_has_introspection(stripped: &str) -> bool {
     let Some(brace_idx) = stripped.find('{') else {
         return false;
     };
     let after_brace = &stripped[brace_idx + 1..];
-
-    // Walk character-by-character looking for `__schema` or `__type`
-    // at the root selection level. Track depth via subsequent
-    // braces; a nested `{` opens a level we're not interested in
-    // anymore (the original selection has moved on past the
-    // introspection check window).
     let bytes = after_brace.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'{' {
-            // Entered a nested selection — we've already passed
-            // the root selections, give up.
+            // Entered a nested selection — primary scan ends here.
             return false;
         }
         if b == b'_' && bytes.get(i + 1).copied() == Some(b'_') {
-            // Try to match `__schema` or `__type` (followed by a
-            // non-identifier character so `__schema_extension`
-            // doesn't false-match).
-            let rest = &after_brace[i..];
-            let candidates = ["__schema", "__type"];
-            for tok in candidates {
-                if rest.len() >= tok.len() && rest.starts_with(tok) {
-                    let next = rest.as_bytes().get(tok.len()).copied();
-                    let is_word_boundary = match next {
-                        None => true,
-                        Some(c) => !(c.is_ascii_alphanumeric() || c == b'_'),
-                    };
-                    if is_word_boundary {
-                        return true;
-                    }
-                }
+            if has_introspection_token_at(after_brace, i) {
+                return true;
             }
         }
         i += 1;
     }
     false
+}
+
+/// L-finding-8: scan for `fragment <name> on <type> { ... }`
+/// blocks and return true if ANY fragment body imports a
+/// `__schema` / `__type` meta-field at its top level. The
+/// fragment's brace-balanced body is matched lexically (no full
+/// parse) — sufficient for shape-based detection.
+fn fragment_body_has_introspection(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    // Walk for the literal `fragment` keyword with word boundaries.
+    let mut i = 0;
+    while i + 8 < bytes.len() {
+        // Cheap initial filter: only attempt the full keyword match
+        // when we see `f` (saves walking byte-by-byte for the rest
+        // of the keyword on every position).
+        if bytes[i] == b'f'
+            && stripped[i..].starts_with("fragment")
+            && is_word_boundary_left(bytes, i)
+            && bytes
+                .get(i + 8)
+                .map(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                .unwrap_or(true)
+        {
+            // Find the opening brace of the fragment body. Anything
+            // between the `fragment` keyword and the next `{` is the
+            // fragment name + `on <type>` clause — we don't care
+            // about its contents, only that we find the brace that
+            // opens the body.
+            let tail = &stripped[i + 8..];
+            if let Some(brace_off) = tail.find('{') {
+                let body_start = i + 8 + brace_off + 1;
+                let body = match find_brace_balanced_body(&stripped[body_start..]) {
+                    Some(b) => b,
+                    None => {
+                        // Malformed fragment — give up on this match
+                        // and continue scanning. The whole query will
+                        // almost certainly fail downstream parse, so
+                        // we don't need a precise verdict here.
+                        i += 8;
+                        continue;
+                    }
+                };
+                if root_selection_imports_introspection(body) {
+                    return true;
+                }
+                // Skip past the body we already scanned.
+                i = body_start + body.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Returns the brace-balanced body of a block whose opening `{`
+/// has already been consumed. The returned slice ends at the
+/// matching `}` (exclusive). Returns `None` if no matching brace
+/// is found (malformed input).
+fn find_brace_balanced_body(after_open: &str) -> Option<&str> {
+    let bytes = after_open.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&after_open[..i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Same shape as `top_level_root_selection_has_introspection` but
+/// scans the body of a brace-balanced selection set (the caller
+/// has already consumed the opening `{`).
+fn root_selection_imports_introspection(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Nested selection — stop here for shape-based detection
+            // (same semantics as the primary scan; nested `__schema`
+            // on a non-Query type isn't introspection).
+            return false;
+        }
+        if bytes[i] == b'_' && bytes.get(i + 1).copied() == Some(b'_') {
+            if has_introspection_token_at(body, i) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Returns true when `slice[start..]` begins with either `__schema`
+/// or `__type` followed by a word boundary. Shared by the primary
+/// scan and the fragment-body scan.
+fn has_introspection_token_at(slice: &str, start: usize) -> bool {
+    let rest = &slice[start..];
+    let bytes = rest.as_bytes();
+    for tok in ["__schema", "__type"] {
+        if rest.len() >= tok.len() && rest.starts_with(tok) {
+            let next = bytes.get(tok.len()).copied();
+            let is_word_boundary = match next {
+                None => true,
+                Some(c) => !(c.is_ascii_alphanumeric() || c == b'_'),
+            };
+            if is_word_boundary {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// L-finding-8: word-boundary check for the LEFT side of a
+/// keyword match (the `is_word_boundary` checks elsewhere only
+/// guard the right side because the scan walks forward).
+fn is_word_boundary_left(bytes: &[u8], at: usize) -> bool {
+    if at == 0 {
+        return true;
+    }
+    let prev = bytes[at - 1];
+    !(prev.is_ascii_alphanumeric() || prev == b'_')
+}
+
+/// L-finding-8: replace the contents of GraphQL string literals
+/// (both `"..."` and `"""..."""` block strings) with spaces so
+/// the scan can't match `fragment` / `__schema` inside string
+/// arguments. Preserves the opening/closing quotes (and all byte
+/// offsets) so brace-balance accounting elsewhere stays consistent.
+///
+/// String forms (per GraphQL October 2021 spec):
+///   - Regular string: `"<chars or \uXXXX or \" or \\ or \n etc.>"`
+///   - Block string:   `"""<any chars, terminator is three quotes>"""`
+///
+/// The implementation is a small state machine over bytes; it
+/// runs in O(n) and allocates one String of the same length as
+/// input. Not a parser — only handles enough to defeat the shape-
+/// based-detection bypass cases. A malformed query that opens a
+/// string without closing it is treated as "rest of input is
+/// inside the string" which over-strips but is safe (the
+/// downstream GraphQL server will reject the malformed query
+/// anyway).
+fn strip_graphql_string_literals(input: &str) -> String {
+    enum State {
+        Normal,
+        InRegularString,
+        InBlockString,
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut state = State::Normal;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            State::Normal => {
+                // Detect `"""` first because `"` is a prefix of `"""`.
+                if b == b'"'
+                    && bytes.get(i + 1).copied() == Some(b'"')
+                    && bytes.get(i + 2).copied() == Some(b'"')
+                {
+                    out.extend_from_slice(b"\"\"\"");
+                    state = State::InBlockString;
+                    i += 3;
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b'"');
+                    state = State::InRegularString;
+                    i += 1;
+                    continue;
+                }
+                out.push(b);
+                i += 1;
+            }
+            State::InRegularString => {
+                if b == b'\\' {
+                    // Skip the backslash AND the next byte (the
+                    // escaped char). Replace BOTH with spaces so
+                    // length is preserved.
+                    out.push(b' ');
+                    if i + 1 < bytes.len() {
+                        out.push(b' ');
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b'"');
+                    state = State::Normal;
+                    i += 1;
+                    continue;
+                }
+                // Regular strings don't span newlines per spec; a raw
+                // newline inside is malformed. Preserve it as a space
+                // so line numbers in diagnostics stay consistent. The
+                // detector doesn't care either way.
+                out.push(b' ');
+                i += 1;
+            }
+            State::InBlockString => {
+                // Block-string terminator is `"""` with no escape
+                // for embedded quotes (the spec uses `\"""` to escape).
+                if b == b'\\'
+                    && bytes.get(i + 1).copied() == Some(b'"')
+                    && bytes.get(i + 2).copied() == Some(b'"')
+                    && bytes.get(i + 3).copied() == Some(b'"')
+                {
+                    // Escaped triple-quote inside a block string —
+                    // four bytes, all stripped to spaces so we don't
+                    // confuse the terminator check below.
+                    out.extend_from_slice(b"    ");
+                    i += 4;
+                    continue;
+                }
+                if b == b'"'
+                    && bytes.get(i + 1).copied() == Some(b'"')
+                    && bytes.get(i + 2).copied() == Some(b'"')
+                {
+                    out.extend_from_slice(b"\"\"\"");
+                    state = State::Normal;
+                    i += 3;
+                    continue;
+                }
+                out.push(b' ');
+                i += 1;
+            }
+        }
+    }
+    // SAFETY: we only ever pushed ASCII bytes (`"`, spaces) or
+    // copied original bytes verbatim. Since the original input was
+    // valid UTF-8 and we only mutate bytes that were themselves
+    // ASCII (string-literal contents → spaces; quotes preserved as
+    // ASCII), every emitted byte sequence is a valid UTF-8 sequence
+    // or an ASCII space, which is also valid UTF-8. The total
+    // length matches the input length so byte offsets are preserved
+    // for downstream diagnostics.
+    String::from_utf8(out).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod strip_string_literals_tests {
+    use super::strip_graphql_string_literals;
+
+    #[test]
+    fn strips_regular_string_content() {
+        let s = strip_graphql_string_literals(r#"query { f(x: "fragment X on Q { __schema }") }"#);
+        // Quotes preserved, contents replaced with spaces.
+        assert!(s.starts_with("query { f(x: \""));
+        assert!(s.ends_with("\") }"));
+        // The `fragment` keyword inside the literal MUST NOT survive.
+        assert!(!s.contains("fragment"));
+        assert!(!s.contains("__schema"));
+    }
+
+    #[test]
+    fn handles_escaped_quote_in_string() {
+        let s = strip_graphql_string_literals(r#"f(x: "a\"b") {}"#);
+        // Two quotes (open, close), no other quote characters in output
+        // because the escaped `\"` was stripped to spaces.
+        let quote_count = s.bytes().filter(|c| *c == b'"').count();
+        assert_eq!(quote_count, 2, "expected 2 quotes in {s:?}");
+    }
+
+    #[test]
+    fn strips_block_string_content() {
+        let s = strip_graphql_string_literals(
+            r#"f(desc: """fragment X on Q { __schema }""") {}"#,
+        );
+        assert!(!s.contains("fragment"));
+        assert!(!s.contains("__schema"));
+    }
+
+    #[test]
+    fn preserves_normal_query_unchanged() {
+        let q = r#"{ __schema { types { name } } }"#;
+        let s = strip_graphql_string_literals(q);
+        assert_eq!(s, q);
+    }
+
+    #[test]
+    fn length_preserved_for_offset_stability() {
+        let q = r#"f(x: "fragment Sneaky")"#;
+        let s = strip_graphql_string_literals(q);
+        assert_eq!(s.len(), q.len(), "byte length must be preserved");
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +550,118 @@ mod introspection_detector_tests {
         assert!(!looks_like_graphql_introspection(
             "{ __schemafoo { name } }"
         ));
+    }
+
+    // ─── L-finding-8: fragment-hidden introspection ───
+
+    /// The canonical bypass: introspection in a fragment definition,
+    /// referenced from the query body. Pre-L-finding-8 this returned
+    /// false because the primary scan only walked the operation body.
+    #[test]
+    fn detects_fragment_hidden_schema() {
+        let q = r#"
+            fragment Sneaky on Query { __schema { types { name } } }
+            query Q { ...Sneaky }
+        "#;
+        assert!(looks_like_graphql_introspection(q));
+    }
+
+    /// Same bypass with `__type` instead of `__schema`.
+    #[test]
+    fn detects_fragment_hidden_type() {
+        let q = r#"
+            fragment Sneaky on Query { __type(name: "User") { name } }
+            query Q { ...Sneaky }
+        "#;
+        assert!(looks_like_graphql_introspection(q));
+    }
+
+    /// Fragment-hidden introspection with the fragment defined
+    /// AFTER the query body. Detector should not depend on
+    /// declaration order.
+    #[test]
+    fn detects_fragment_hidden_schema_fragment_after_query() {
+        let q = r#"
+            query Q { ...Sneaky }
+            fragment Sneaky on Query { __schema { queryType { name } } }
+        "#;
+        assert!(looks_like_graphql_introspection(q));
+    }
+
+    /// A fragment that does NOT import an introspection meta-field
+    /// must not trigger. False-positive guard.
+    #[test]
+    fn ignores_fragment_without_introspection() {
+        let q = r#"
+            fragment Fields on User { id name email }
+            query Q { user(id: 1) { ...Fields } }
+        "#;
+        assert!(!looks_like_graphql_introspection(q));
+    }
+
+    /// A fragment defined on a non-Query type that imports `__schema`
+    /// at its root WILL be flagged — `__` prefixes are reserved by
+    /// GraphQL spec so a user-defined field with that name shouldn't
+    /// exist in well-formed schemas. Over-firing here is acceptable
+    /// (audit WARN only in allow-mode); the alternative is a silent
+    /// bypass when an operator misuses the prefix. Documents the
+    /// trade-off.
+    #[test]
+    fn flags_fragment_on_non_query_with_introspection_token() {
+        // Note: `__schema` on a user type is semantically nonsense
+        // (introspection meta-fields only exist on Query) — but
+        // detector intentionally errs toward catching it.
+        let q = r#"
+            fragment Weird on User { __schema { types { name } } }
+            query Q { user(id: 1) { ...Weird } }
+        "#;
+        assert!(looks_like_graphql_introspection(q));
+    }
+
+    /// `__schema` buried inside a NESTED selection of a fragment
+    /// (not at the fragment's root) is NOT introspection at GraphQL
+    /// semantics — same logic as the primary scan's
+    /// `ignores_introspection_buried_in_nested_selection` test.
+    /// Confirms parity between the two scan passes.
+    #[test]
+    fn ignores_introspection_nested_inside_fragment_body() {
+        let q = r#"
+            fragment Inner on User { profile { __schema { types } } }
+            query Q { user(id: 1) { ...Inner } }
+        "#;
+        assert!(!looks_like_graphql_introspection(q));
+    }
+
+    /// The word `fragment` appearing inside a string literal MUST
+    /// NOT trigger the fragment scan. (Defense-in-depth check —
+    /// the current implementation doesn't handle string literals
+    /// specifically, but the brace-balanced body extraction won't
+    /// find a matching `}` inside a string so the scan bails out
+    /// safely on malformed input.)
+    #[test]
+    fn ignores_fragment_keyword_inside_string_literal_argument() {
+        // The introspection token is in the same string literal
+        // but never appears as a top-level selection of any
+        // fragment, so neither scan should fire.
+        let q = r#"query Q { thing(label: "fragment Sneaky on Query { __schema }") { id } }"#;
+        assert!(!looks_like_graphql_introspection(q));
+    }
+
+    /// Multi-line normal query with fragments — no introspection —
+    /// remains a clean negative.
+    #[test]
+    fn complex_normal_query_with_fragments_is_negative() {
+        let q = r#"
+            query OrderDetails($id: ID!) {
+              order(id: $id) {
+                ...OrderHeader
+                items { ...LineItem }
+              }
+            }
+            fragment OrderHeader on Order { id status total }
+            fragment LineItem on Item { sku name qty }
+        "#;
+        assert!(!looks_like_graphql_introspection(q));
     }
 }
 
@@ -468,6 +903,22 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 1_048_576;
 const MAX_EVENT_METADATA_BYTES: usize = 65_536;
 /// Maximum concurrent SSE connections per execution.
 const MAX_SSE_STREAMS_PER_EXECUTION: usize = 5;
+/// L-finding-7 (2026-05-23): per-host cumulative SSE connect cap.
+///
+/// `MAX_SSE_STREAMS_PER_EXECUTION` (5) is the global ceiling on
+/// concurrent streams, but pre-fix all 5 could be opened against ONE
+/// upstream — the worker holds a long-lived connection slot per
+/// stream and amplifies inbound bandwidth from that target back into
+/// the cluster for the full execution timeout. With 5 concurrent
+/// streams, capping per-host CUMULATIVE connects at 3 forces a
+/// well-behaved workflow that wants multi-stream subscribed-many
+/// pattern to distribute across hosts, while still permitting
+/// reconnect-on-disconnect within the same host (3 attempts is
+/// generous for transient SSE drops). Tracking cumulative connects
+/// (not "currently open") matches `MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION`'s
+/// semantics and short-circuits a churn-loop abuse pattern
+/// (connect → drop → reconnect → repeat to bypass the concurrent cap).
+const MAX_SSE_CONNECTS_PER_HOST_PER_EXECUTION: u64 = 3;
 /// Maximum bytes returned by files::read (64 MiB — prevents OOM on large files).
 const MAX_FILE_READ_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum bytes returned by object-storage::get (64 MiB — prevents OOM on large objects).
@@ -4376,6 +4827,28 @@ impl wit_secrets::Host for TalosContext {
         // immediate point of use. The Zeroizing wrapper drops + wipes
         // when its scope ends. The returned String crosses the WASM
         // boundary into guest memory — Tier-2 by design, audited above.
+        //
+        // Wasm-security review 2026-05-23 (L-finding-2): the plaintext
+        // String returned here lives in WASM linear memory for the
+        // remainder of the execution. The host's `Zeroizing<String>`
+        // drops + wipes its own copy at end-of-scope, but the WIT ABI's
+        // String return semantically MOVES bytes into the guest's
+        // wasm32 address space — the host cannot reach back and zero
+        // them. The guest is responsible for narrowing the lifetime
+        // (drop after use, overwrite with zeros, or `talos_sdk`'s
+        // `ScopedSecret` helper which scrubs on Drop). At
+        // execution-end the entire wasmtime `Store` is destroyed and
+        // its linear-memory backing region is dropped by the host
+        // allocator — but heap pages may sit in physical memory until
+        // overwritten by a subsequent allocation, so a coincident host
+        // memory dump still risks recovery. Operators who can't accept
+        // that residency window MUST leave `allow_tier2_exposure`
+        // false and use Tier-1 (`vault://` header substitution or
+        // `fetch_with_header`), which never lands plaintext in guest
+        // memory at all. The per-module `allow_tier2_exposure` flag
+        // (gated above) IS the operator's acknowledgement of this
+        // residency window — keep it false unless a specific module
+        // documents why plaintext must cross the boundary.
         self.provider
             .into_auth_header(talos_secrets::SlotHandle(handle), "expose-secret")
             .map(|wrapped| (*wrapped).clone())
@@ -12049,6 +12522,37 @@ impl wit_http_stream::Host for TalosContext {
                 );
                 return Err(wit_http_stream::Error::ForbiddenHost);
             }
+        }
+
+        // L-finding-7 (2026-05-23): per-host cumulative SSE-connect cap.
+        // Sibling-parity with the HTTP per-host rate limit (M-6 in
+        // `wit_http::fetch`) — charged AFTER all upstream-target
+        // validation has admitted (SSRF, allowlist, scheme, tier-1
+        // ceiling) so a bogus URL doesn't waste budget. Host key is
+        // normalised to `host:port` lowercased to match
+        // `http_calls_per_host`'s slot semantics. Failed admission
+        // burns NO slot on the host's bookkeeping (the bump only
+        // happens on the headroom path) so a denied caller can't
+        // accidentally pump the counter against a third party.
+        let sse_host_key = match parsed.port_or_known_default() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        if !self
+            .check_sse_per_host_rate_limit(&sse_host_key, MAX_SSE_CONNECTS_PER_HOST_PER_EXECUTION)
+        {
+            self.record_capability_denied("http-stream", "per-host-rate-limit", &host)
+                .await;
+            tracing::warn!(
+                module_id = ?self.module_id,
+                host = %host,
+                limit = MAX_SSE_CONNECTS_PER_HOST_PER_EXECUTION,
+                "SSE per-host connect cap exceeded — refusing to amplify load against a single upstream"
+            );
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("sse_per_host");
+            }
+            return Err(wit_http_stream::Error::RateLimited);
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<crate::context::SseEventInternal>(1_000);

@@ -1482,8 +1482,27 @@ impl TalosRuntime {
             // Http and Network share the same linker because wasmtime_wasi::p2 doesn't
             // support granular per-interface linking. WASI socket access is instead gated
             // at the context level: allow_wasi_network=false for Http, true for Network.
-            // This is defense-in-depth: the WIT inspector rejects Http modules that import
-            // wasi:sockets, and even if they somehow linked, the context blocks connections.
+            //
+            // Wasm-security review 2026-05-23 (L-finding-5): the shared linker is sound
+            // ONLY because THREE independent layers all have to fail for an Http-world
+            // module to reach raw sockets. Removing any one layer reopens the gap:
+            //   1. **Compile-time WIT-binding gate.** `cargo-component` generates
+            //      bindings against the declared world; Http's WIT doesn't import
+            //      `wasi:sockets`, so a legitimately-compiled Http module has no
+            //      reference to the socket interface in its component imports.
+            //   2. **Post-compile inspector check.** `talos_wit_inspector` walks the
+            //      component's import list and rejects Http modules that declare a
+            //      `wasi:sockets` import (catches a hand-edited or attacker-crafted
+            //      component that bypassed step 1's cargo-component path).
+            //   3. **Runtime context flag.** Even if both above are bypassed and the
+            //      shared linker resolves the socket import at instantiation, the
+            //      context's `allow_wasi_network=false` makes the socket calls themselves
+            //      refuse to open a connection — see `TalosContext::host_resolve`
+            //      and the wasmtime_wasi socket-resolution path.
+            // Any future refactor that touches one of these MUST verify the other two
+            // remain in place. Granular per-interface linking is the long-term fix and
+            // tracked in `wasmtime_wasi::p2` upstream; until it lands, do not collapse
+            // the three layers into "the inspector covers it."
             CapabilityWorld::Http => Ok((&self.network_linker, &self.network_cache)),
             CapabilityWorld::Network => Ok((&self.network_linker, &self.network_cache)),
             CapabilityWorld::Secrets => Ok((&self.secrets_linker, &self.secrets_cache)),

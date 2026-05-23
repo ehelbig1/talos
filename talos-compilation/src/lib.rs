@@ -358,10 +358,16 @@ mod advisory_db_age_tests {
 /// `container::build_command` pattern) we fail closed in production
 /// unless the operator explicitly opts back in.
 ///
-/// `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true` re-enables the host
+/// `TALOS_COMPILATION_ALLOW_HOST_FALLBACK` re-enables the host
 /// path — same gate as the Rust host-fallback escape hatch in
 /// `container::host_fallback_allowed`. A single deployment-wide
 /// switch keeps the security model consistent across languages.
+/// Wasm-security review 2026-05-23 (L-finding-6): in production
+/// the env var requires the explicit ack token (the short-form
+/// `true`/`1`/`yes` is intentionally refused there). Delegating to
+/// `container::host_fallback_allowed` keeps the production token
+/// requirement in one place — language-specific copies of the
+/// value-check logic would drift.
 ///
 /// Outside production (dev / test) the gate is a no-op so local
 /// `cargo test` runs pass without env setup.
@@ -369,16 +375,7 @@ fn require_host_lang_toolchain_allowed(language: &str) -> Result<()> {
     if !talos_config::is_production() {
         return Ok(());
     }
-    let allowed = matches!(
-        std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("true" | "1" | "yes")
-    );
-    if allowed {
+    if container::host_fallback_allowed() {
         tracing::warn!(
             language,
             "compile_to_wasm({language}): host toolchain enabled via TALOS_COMPILATION_ALLOW_HOST_FALLBACK — \
@@ -390,7 +387,8 @@ fn require_host_lang_toolchain_allowed(language: &str) -> Result<()> {
     bail!(
         "{language} compilation is disabled in production: the {language} toolchain currently runs \
          on the host (no sandbox) which is unsafe for multi-tenant deployments. \
-         Single-tenant operators can opt in by setting TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true; \
+         Single-tenant operators can opt in by setting \
+         TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk; \
          multi-tenant deploys should wait for the containerised {language} build image."
     );
 }
@@ -478,17 +476,11 @@ impl CompilationService {
         //
         // Fires once per process at construction, not per request,
         // so log volume is bounded.
-        if talos_config::is_production()
-            && matches!(
-                std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK")
-                    .ok()
-                    .as_deref()
-                    .map(str::trim)
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("true" | "1" | "yes")
-            )
-        {
+        // L-finding-6: delegate the production-only ack-token check to
+        // `container::host_fallback_allowed` so the env-var semantics
+        // live in exactly one place. The startup advisory only fires
+        // when the gate is genuinely open in production.
+        if talos_config::is_production() && container::host_fallback_allowed() {
             tracing::warn!(
                 target: "talos_compilation::startup_advisory",
                 flag = "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
@@ -1067,14 +1059,35 @@ impl CompilationService {
         match audit_result {
             Ok(Ok(ref out)) if !out.status.success() => {
                 let summary = parse_audit_summary(&out.stdout);
-                if summary.count > 0 {
+                // L-finding-4: surface informational advisories (unmaintained
+                // / unsound / notice) in BOTH the blocking and non-blocking
+                // branches. Pre-fix only the blocking branch consumed the
+                // parsed list; an informational-only audit run (e.g. an
+                // `unmaintained` dep with no real CVEs) silently passed
+                // with no operator-visible signal.
+                if summary.informational_count > 0 {
+                    tracing::warn!(
+                        target: "talos_compilation",
+                        event_kind = "audit_informational_advisories",
+                        user_id = %user_id,
+                        job_id = %job_id,
+                        count = summary.informational_count,
+                        advisories = %summary.informational_names.join(", "),
+                        "cargo-audit surfaced {} informational advisor{} (unmaintained / unsound / notice) — \
+                         not blocking compilation, but operators should review and pin or replace the affected crate(s)",
+                        summary.informational_count,
+                        if summary.informational_count == 1 { "y" } else { "ies" },
+                    );
+                }
+                if summary.blocking_count > 0 {
                     self.send_event(
                         user_id,
                         job_id,
                         "failed",
                         Some(format!(
-                            "Audit failed: {} vulnerabilities found",
-                            summary.count
+                            "Audit failed: {} vulnerabilit{} found",
+                            summary.blocking_count,
+                            if summary.blocking_count == 1 { "y" } else { "ies" },
                         )),
                         Some(1.0),
                     );
@@ -1083,10 +1096,21 @@ impl CompilationService {
                     return Err(anyhow::anyhow!(
                         "Dependency security audit failed — {} vulnerable crate(s): {}. \
                          Remove or downgrade the affected dependency.",
-                        summary.count,
-                        summary.names.join(", "),
+                        summary.blocking_count,
+                        summary.blocking_names.join(", "),
                     ));
                 }
+                // Non-zero exit with NO blocking advisories. Two cases:
+                //  (a) tool/DB problem — production fail-closed below.
+                //  (b) informational-only run — proceed (the WARN above
+                //      already surfaced them); the non-zero exit from
+                //      cargo-audit on an informational-only result is
+                //      treated the same as case (a) in production
+                //      because we cannot distinguish "informational
+                //      advisories caused exit 1" from "tool broke and
+                //      we found nothing" without parsing cargo-audit's
+                //      stderr. Fail-closed in prod is the right call;
+                //      the WARN tells the operator what happened.
                 if talos_config::is_production() {
                     self.send_event(
                         user_id,
@@ -1133,7 +1157,50 @@ impl CompilationService {
                 }
                 tracing::warn!("cargo-audit not available or timed out — skipping CVE scan in non-production mode");
             }
-            _ => {} // Clean audit (exit 0) — proceed
+            Ok(Ok(ref out)) => {
+                // Clean audit (exit 0). Without `--deny=informational`,
+                // cargo-audit exits 0 even when informational advisories
+                // are present — surface them so operators still see the
+                // signal. Blocking advisories with exit 0 shouldn't
+                // happen under our `--no-fetch --json` invocation, but
+                // we check defensively: if any blocking entry slipped
+                // through, block compilation. L-finding-4.
+                let summary = parse_audit_summary(&out.stdout);
+                if summary.blocking_count > 0 {
+                    self.send_event(
+                        user_id,
+                        job_id,
+                        "failed",
+                        Some(format!(
+                            "Audit failed: {} vulnerabilit{} found",
+                            summary.blocking_count,
+                            if summary.blocking_count == 1 { "y" } else { "ies" },
+                        )),
+                        Some(1.0),
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Dependency security audit failed — {} vulnerable crate(s): {}. \
+                         Remove or downgrade the affected dependency.",
+                        summary.blocking_count,
+                        summary.blocking_names.join(", "),
+                    ));
+                }
+                if summary.informational_count > 0 {
+                    tracing::warn!(
+                        target: "talos_compilation",
+                        event_kind = "audit_informational_advisories",
+                        user_id = %user_id,
+                        job_id = %job_id,
+                        count = summary.informational_count,
+                        advisories = %summary.informational_names.join(", "),
+                        "cargo-audit surfaced {} informational advisor{} on the clean-exit path \
+                         (unmaintained / unsound / notice) — not blocking compilation, \
+                         but operators should review",
+                        summary.informational_count,
+                        if summary.informational_count == 1 { "y" } else { "ies" },
+                    );
+                }
+            }
         }
 
         // 2. Run cargo component build with timeout (60 seconds)
@@ -2827,20 +2894,51 @@ impl CompilationService {
 }
 
 /// Summary of `cargo audit --json` output for error reporting.
+///
+/// Wasm-security review 2026-05-23 (L-finding-4): the audit output is
+/// split into BLOCKING (real vulnerabilities + non-`informational`
+/// advisories) and INFORMATIONAL (`unmaintained`, `unsound`, `notice`,
+/// etc.). Pre-fix every advisory with `count > 0` blocked compilation
+/// — an `unmaintained` notice on a transitive dep would refuse the
+/// whole compile, which is conservative-safe but operationally
+/// friction-full for operators who routinely review the RustSec
+/// stream and accept those advisories. Now the call site blocks ONLY
+/// on `blocking_count > 0`; informational advisories surface in a
+/// WARN log so operators can audit them without losing the compile.
 struct AuditSummary {
-    count: usize,
-    names: Vec<String>,
+    /// Real vulnerabilities + non-informational advisories. Blocking.
+    blocking_count: usize,
+    /// Pretty identifiers for the blocking set, e.g. `RUSTSEC-2025-…(crate)`.
+    blocking_names: Vec<String>,
+    /// `informational`-classified advisories: unmaintained / unsound /
+    /// notice. Surfaced via WARN log; do NOT block compilation.
+    informational_count: usize,
+    /// Pretty identifiers for the informational set.
+    informational_names: Vec<String>,
 }
 
 /// Parse `cargo audit --json` stdout into a compact summary.
 ///
 /// Returns an empty summary on any parse error (fail-open for reporting
 /// only — production tool-failure detection is at the call site, which
-/// hard-bails when status != 0 + count == 0). Distinguishes "no JSON at
-/// all" from "valid JSON, no vulnerabilities key" so operators can detect
-/// schema drift in `cargo audit`'s output without the silent fail-open
-/// masking the underlying issue.
+/// hard-bails when status != 0 + blocking_count == 0). Distinguishes
+/// "no JSON at all" from "valid JSON, no vulnerabilities key" so
+/// operators can detect schema drift in `cargo audit`'s output without
+/// the silent fail-open masking the underlying issue.
+///
+/// L-finding-4: classifies each advisory by `advisory.informational`
+/// (absent / null → real vulnerability → blocking; non-empty string →
+/// informational → non-blocking). `cargo-audit`'s schema encodes
+/// `informational` as one of `"unmaintained" | "unsound" | "notice" |
+/// "other"` — all of which are operationally distinct from a CVE and
+/// should NOT halt compilation by themselves.
 fn parse_audit_summary(stdout: &[u8]) -> AuditSummary {
+    let empty = AuditSummary {
+        blocking_count: 0,
+        blocking_names: vec![],
+        informational_count: 0,
+        informational_names: vec![],
+    };
     let v = match serde_json::from_slice::<serde_json::Value>(stdout) {
         Ok(v) => v,
         Err(e) => {
@@ -2859,10 +2957,7 @@ fn parse_audit_summary(stdout: &[u8]) -> AuditSummary {
                 "cargo-audit stdout was not valid JSON — possible schema drift; \
                  vulnerability detection is fail-open for this run"
             );
-            return AuditSummary {
-                count: 0,
-                names: vec![],
-            };
+            return empty;
         }
     };
 
@@ -2881,37 +2976,244 @@ fn parse_audit_summary(stdout: &[u8]) -> AuditSummary {
             stdout_snippet = %snippet,
             "cargo-audit JSON missing /vulnerabilities key — schema drift"
         );
-        return AuditSummary {
-            count: 0,
-            names: vec![],
-        };
+        return empty;
     }
 
-    let count = v
-        .pointer("/vulnerabilities/count")
-        .and_then(|c| c.as_u64())
-        .unwrap_or(0) as usize;
+    let mut blocking_names: Vec<String> = Vec::new();
+    let mut informational_names: Vec<String> = Vec::new();
 
-    let names: Vec<String> = v
-        .pointer("/vulnerabilities/list")
-        .and_then(|l| l.as_array())
-        .map(|list| {
-            list.iter()
-                .filter_map(|entry| {
-                    let id = entry.pointer("/advisory/id").and_then(|v| v.as_str());
-                    let pkg = entry.pointer("/advisory/package").and_then(|v| v.as_str());
-                    match (id, pkg) {
-                        (Some(id), Some(pkg)) => Some(format!("{id}({pkg})")),
-                        (Some(id), None) => Some(id.to_string()),
-                        (None, Some(pkg)) => Some(pkg.to_string()),
-                        _ => None,
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    if let Some(list) = v.pointer("/vulnerabilities/list").and_then(|l| l.as_array()) {
+        for entry in list {
+            let id = entry.pointer("/advisory/id").and_then(|v| v.as_str());
+            let pkg = entry.pointer("/advisory/package").and_then(|v| v.as_str());
+            // RustSec encodes `informational` as a STRING (e.g.
+            // "unmaintained") on non-CVE notices, and as `null` /
+            // absent on real CVEs. Treat any non-null non-empty
+            // string as informational; everything else (including
+            // null and missing key) is blocking. Defense-in-depth:
+            // if an unrecognised `informational` value appears, it
+            // still routes to the informational bucket — we'd
+            // rather under-block in dev (operator sees the WARN
+            // and decides) than over-block on schema drift.
+            let informational = entry
+                .pointer("/advisory/informational")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let pretty = match (id, pkg) {
+                (Some(id), Some(pkg)) => match informational {
+                    Some(kind) => Some(format!("{id}({pkg}, {kind})")),
+                    None => Some(format!("{id}({pkg})")),
+                },
+                (Some(id), None) => Some(id.to_string()),
+                (None, Some(pkg)) => Some(pkg.to_string()),
+                _ => None,
+            };
+            if let Some(p) = pretty {
+                if informational.is_some() {
+                    informational_names.push(p);
+                } else {
+                    blocking_names.push(p);
+                }
+            }
+        }
+    }
 
-    AuditSummary { count, names }
+    // Prefer the parsed list counts (we just walked the same list) over
+    // the top-level `/vulnerabilities/count` — the latter doesn't
+    // distinguish the two buckets, so trusting our walk gives a
+    // consistent (blocking, informational) split.
+    AuditSummary {
+        blocking_count: blocking_names.len(),
+        blocking_names,
+        informational_count: informational_names.len(),
+        informational_names,
+    }
+}
+
+#[cfg(test)]
+mod parse_audit_summary_tests {
+    use super::parse_audit_summary;
+
+    /// L-finding-4: a vulnerability with `informational: null`
+    /// (real CVE) goes in the blocking bucket and forms the
+    /// compile-blocking signal.
+    #[test]
+    fn real_cve_lands_in_blocking() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0001",
+                  "package": "vulncrate",
+                  "informational": null
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 1);
+        assert_eq!(s.informational_count, 0);
+        assert!(s.blocking_names[0].contains("RUSTSEC-2024-0001"));
+        assert!(s.blocking_names[0].contains("vulncrate"));
+    }
+
+    /// L-finding-4: a vulnerability with `informational: "unmaintained"`
+    /// lands in the informational bucket — operators see the WARN
+    /// but compilation proceeds. Pre-fix the old shape would have
+    /// blocked.
+    #[test]
+    fn unmaintained_lands_in_informational_not_blocking() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2023-0042",
+                  "package": "abandonedcrate",
+                  "informational": "unmaintained"
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 1);
+        assert!(s.informational_names[0].contains("unmaintained"));
+    }
+
+    /// L-finding-4: `informational: "unsound"` is also non-blocking
+    /// — it's a soundness notice on a transitive dep, not a CVE.
+    #[test]
+    fn unsound_lands_in_informational() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0099",
+                  "package": "unsoundcrate",
+                  "informational": "unsound"
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 1);
+    }
+
+    /// L-finding-4: mixed list — one CVE, one unmaintained. Blocking
+    /// fires because the CVE is present.
+    #[test]
+    fn mixed_advisories_split_correctly() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 2,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0001",
+                  "package": "vulncrate",
+                  "informational": null
+                }
+              },
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2023-0042",
+                  "package": "abandonedcrate",
+                  "informational": "unmaintained"
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 1);
+        assert_eq!(s.informational_count, 1);
+        assert!(s.blocking_names[0].contains("vulncrate"));
+        assert!(s.informational_names[0].contains("abandonedcrate"));
+    }
+
+    /// L-finding-4: a missing `informational` key (older cargo-audit
+    /// schemas) defaults to BLOCKING — fail-closed direction.
+    #[test]
+    fn missing_informational_key_defaults_to_blocking() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0001",
+                  "package": "vulncrate"
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 1);
+        assert_eq!(s.informational_count, 0);
+    }
+
+    /// L-finding-4: empty `informational` string is treated as
+    /// "key not meaningfully set" → blocking. Defense against a
+    /// future schema oddity that emits `"informational": ""`.
+    #[test]
+    fn empty_informational_string_defaults_to_blocking() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0001",
+                  "package": "vulncrate",
+                  "informational": ""
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 1);
+        assert_eq!(s.informational_count, 0);
+    }
+
+    /// Empty vulnerabilities list → both buckets empty (clean audit).
+    #[test]
+    fn empty_list_yields_empty_summary() {
+        let json = br#"{ "vulnerabilities": { "count": 0, "list": [] } }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 0);
+    }
+
+    /// Schema drift: missing `/vulnerabilities` key → empty summary
+    /// (fail-open for reporting; the call site still fail-closes in
+    /// production on non-zero exit code).
+    #[test]
+    fn missing_vulnerabilities_key_yields_empty() {
+        let json = br#"{ "something_else": 1 }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 0);
+    }
+
+    /// Schema drift: not JSON at all → empty summary.
+    #[test]
+    fn non_json_yields_empty() {
+        let s = parse_audit_summary(b"error: not the json you were looking for");
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 0);
+    }
 }
 
 #[cfg(test)]
@@ -3111,13 +3413,27 @@ mod m13_gate_tests {
     #[test]
     fn gate_no_op_in_dev() {
         let _g = env_lock();
-        // Default test env is non-production; gate must not block.
-        // (talos_config::is_production reads RUST_ENV=production; cargo
-        // test runs without that.)
-        let _orig = std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK").ok();
+        // L-finding-6 follow-up: explicitly pin RUST_ENV=development
+        // so this test does NOT depend on test-execution order. A
+        // sibling test (e.g. `gate_opt_in_allows_with_warning`,
+        // `host_fallback_prod_*`) that sets RUST_ENV=production
+        // and then panics before cleanup would otherwise leak the
+        // setting into this test even though env_lock serialised
+        // lock acquisition.
+        let prev_env = std::env::var("RUST_ENV").ok();
+        let prev_flag = std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK").ok();
+        std::env::set_var("RUST_ENV", "development");
         std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
         assert!(require_host_lang_toolchain_allowed("python").is_ok());
         assert!(require_host_lang_toolchain_allowed("javascript").is_ok());
+        match prev_env {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
+        }
+        match prev_flag {
+            Some(v) => std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", v),
+            None => std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
+        }
     }
 
     #[test]
@@ -3163,9 +3479,47 @@ mod m13_gate_tests {
         let prev_env = std::env::var("RUST_ENV").ok();
         let prev_flag = std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK").ok();
         std::env::set_var("RUST_ENV", "production");
-        std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", "true");
+        // L-finding-6: production opt-in now requires the explicit
+        // ack token; short-form `true`/`1`/`yes` is intentionally
+        // refused. Pre-fix the test set `true` and expected Ok;
+        // post-fix the gate is delegated to
+        // `container::host_fallback_allowed`, which only accepts the
+        // full ack-token value in production.
+        std::env::set_var(
+            "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
+            "acknowledge-single-tenant-rce-risk",
+        );
 
         assert!(require_host_lang_toolchain_allowed("javascript").is_ok());
+
+        match prev_env {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
+        }
+        match prev_flag {
+            Some(v) => std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", v),
+            None => std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
+        }
+    }
+
+    /// L-finding-6: production with the short-form `true` value must
+    /// now REFUSE — sibling-parity with
+    /// `host_fallback_prod_refuses_short_form` in `container::tests`.
+    #[test]
+    fn gate_prod_refuses_short_form_truthy() {
+        let _g = env_lock();
+        let prev_env = std::env::var("RUST_ENV").ok();
+        let prev_flag = std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK").ok();
+        std::env::set_var("RUST_ENV", "production");
+        std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", "true");
+
+        let err = require_host_lang_toolchain_allowed("python")
+            .expect_err("expected gate to refuse short-form `true` in production");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("acknowledge-single-tenant-rce-risk"),
+            "error must name the ack token: {msg}"
+        );
 
         match prev_env {
             Some(v) => std::env::set_var("RUST_ENV", v),

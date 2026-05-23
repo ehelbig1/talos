@@ -240,6 +240,23 @@ pub struct TalosContext {
     pub sse_streams:
         std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<SseEventInternal>>>,
 
+    /// L-finding-7 (2026-05-23): per-host CUMULATIVE SSE connect
+    /// counter — sibling to `http_calls_per_host` (M-6). The global
+    /// `MAX_SSE_STREAMS_PER_EXECUTION` (5) caps total concurrent
+    /// streams per execution, but pre-fix all 5 could be opened
+    /// against ONE upstream, turning the worker into a small-but-real
+    /// amplification primitive (each stream stays open for the
+    /// execution timeout and the worker holds a connection slot
+    /// against the target). Tracking CUMULATIVE connects (not
+    /// "currently open") matches the existing http_calls_per_host
+    /// semantics: a guest that opens/closes/reopens a stream against
+    /// the same host still consumes the budget. The host key is
+    /// `host:port` lowercased — same normalisation as
+    /// `http_calls_per_host` so the matcher (`per_host_check_and_bump`)
+    /// stays shared. Cap value lives in `host_impl.rs` as
+    /// `MAX_SSE_CONNECTS_PER_HOST_PER_EXECUTION`.
+    pub sse_connects_per_host: dashmap::DashMap<String, u64>,
+
     /// Shared HTTP client for all outbound requests in this execution.
     ///
     /// Built once per execution with security defaults (no redirects, user-agent).
@@ -840,6 +857,7 @@ impl TalosContext {
             llm_streams: std::sync::Mutex::new(HashMap::new()),
             event_emit_count: AtomicU64::new(0),
             sse_streams: std::sync::Mutex::new(HashMap::new()),
+            sse_connects_per_host: dashmap::DashMap::new(),
             // MCP-471: tighten the SSRF-redirect fallback. The
             // `redirect(Policy::none())` above closes the redirect-
             // pivot bypass for the worker's outbound HTTP / webhook /
@@ -1369,6 +1387,16 @@ impl TalosContext {
     /// execution serialize correctly without an outer lock.
     pub fn check_per_host_rate_limit(&self, host: &str, limit: u64) -> bool {
         per_host_check_and_bump(&self.http_calls_per_host, host, limit)
+    }
+
+    /// L-finding-7: per-host CUMULATIVE SSE-connect check. Sibling to
+    /// `check_per_host_rate_limit` but routes through the separate
+    /// `sse_connects_per_host` map so the HTTP and SSE budgets do not
+    /// share a counter (a chatty webhook poller shouldn't drain the
+    /// SSE budget and vice versa). Same lower-cased `host:port` key
+    /// normalisation, same lock-free DashMap update pattern.
+    pub fn check_sse_per_host_rate_limit(&self, host: &str, limit: u64) -> bool {
+        per_host_check_and_bump(&self.sse_connects_per_host, host, limit)
     }
 
     /// Atomically deduct `microseconds` from the crypto time budget.
