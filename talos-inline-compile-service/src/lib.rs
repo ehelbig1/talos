@@ -493,10 +493,31 @@ impl InlineCompileService {
                 ));
             }
 
-            // 7b. Permission-drift guard — only fires when caller passed
-            //     at least one explicit perm key AND it differs from
-            //     stored. Callers who omit all three keep the
-            //     pre-2026-04-23 "preserve existing" semantics.
+            // 7b. Permission-drift guard — fires when caller passed at
+            //     least one explicit perm key (allowed_hosts /
+            //     allowed_secrets / allowed_methods / capability_world)
+            //     AND it differs from stored. Callers who omit all of
+            //     them keep the pre-2026-04-23 "preserve existing"
+            //     semantics.
+            //
+            //     L-finding-1 (2026-05-23): capability_world is included
+            //     in the drift comparison. The actor's
+            //     `max_capability_world` is already enforced as a hard
+            //     ceiling above (step 2); the drift check is the
+            //     additional "caller must make the world change
+            //     EXPLICIT" gate that prevents a silent capability
+            //     upgrade on name-collision (e.g. existing module is
+            //     http-node, recompile keeps the same node_id but
+            //     declares agent-node — without this check, the upsert
+            //     would silently widen the capability surface of every
+            //     graph that references this module). Because the
+            //     caller ALWAYS passes `capability_world` (the field is
+            //     `&str`, not `Option<&str>` on the input), the drift
+            //     check always runs once a collision happens. The
+            //     legacy-row case (stored value empty) is skipped
+            //     inside `compute_permission_drift` so existing modules
+            //     without a recorded world don't trip on first
+            //     touch.
             let caller_explicit = input.explicit_allowed_hosts.is_some()
                 || input.explicit_allowed_secrets.is_some()
                 || input.explicit_allowed_methods.is_some();
@@ -510,11 +531,13 @@ impl InlineCompileService {
                         allowed_hosts: existing.allowed_hosts.clone(),
                         allowed_secrets: existing.allowed_secrets.clone(),
                         allowed_methods: existing.allowed_methods.clone(),
+                        capability_world: existing.capability_world.clone(),
                     };
                     let drift_lines = talos_workflow_creation_helpers::compute_permission_drift(
                         input.explicit_allowed_hosts.as_deref(),
                         input.explicit_allowed_secrets.as_deref(),
                         input.explicit_allowed_methods.as_deref(),
+                        Some(input.capability_world),
                         &stored,
                     );
                     if !drift_lines.is_empty() {

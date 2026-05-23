@@ -1128,10 +1128,29 @@ pub fn format_shared_module_overwrite_error(
 /// Mirrors the shape `WorkflowRepository::get_module_permissions` returns
 /// without taking that crate as a dependency (this crate is the
 /// helpers crate; it stays free of repository imports by design).
+///
+/// Wasm-security review 2026-05-23 (L-finding-1): `capability_world` is
+/// included so an inline-recompile that silently widens the world
+/// (e.g. existing module is `http-node`, caller requests `agent-node`
+/// while keeping the same node_id) surfaces as drift instead of
+/// upserting a higher-capability module into a graph that was
+/// authored against the narrower one. The actor's
+/// `max_capability_world` is still the hard ceiling and is enforced
+/// pre-compile by `InlineCompileService` regardless of drift — the
+/// drift check is the additional "caller MUST make the world-change
+/// explicit" gate that prevents a silent capability upgrade on
+/// name-collision.
 pub struct StoredPermissions {
     pub allowed_hosts: Vec<String>,
     pub allowed_secrets: Vec<String>,
     pub allowed_methods: Vec<String>,
+    /// The stored module's normalised `capability_world` (e.g.
+    /// `"http-node"`). Empty string is the legacy / migration default
+    /// meaning "no recorded value"; in that case the drift check
+    /// skips the world comparison because there's no anchor to
+    /// compare against. Callers that DO know a stored value should
+    /// always pass it through.
+    pub capability_world: String,
 }
 
 /// Build the per-field drift report comparing caller-explicit
@@ -1142,10 +1161,18 @@ pub struct StoredPermissions {
 /// behaviour". Mismatches are reported one line per field. Returns
 /// an empty vec when no drift exists — caller proceeds with the
 /// inline-compile.
+///
+/// L-finding-1: `explicit_capability_world` follows the same
+/// `Option<&str>` convention. `None` = caller omitted (preserve
+/// stored); `Some("http-node")` = caller asked explicitly, drift fires
+/// if `stored.capability_world` is a different normalised world. The
+/// comparison uses the normalised `xxx-node` form so callers can pass
+/// either `"http"` or `"http-node"` interchangeably.
 pub fn compute_permission_drift(
     explicit_allowed_hosts: Option<&[String]>,
     explicit_allowed_secrets: Option<&[String]>,
     explicit_allowed_methods: Option<&[String]>,
+    explicit_capability_world: Option<&str>,
     stored: &StoredPermissions,
 ) -> Vec<String> {
     fn perm_lists_equal(a: &[String], b: &[String]) -> bool {
@@ -1166,6 +1193,22 @@ pub fn compute_permission_drift(
             "[]".to_string()
         } else {
             format!("[{}]", p.join(", "))
+        }
+    }
+
+    // L-finding-1: normalise both sides to the `xxx-node` form so a
+    // caller passing `"http"` vs the stored `"http-node"` is NOT a
+    // false-positive drift. Mirrors `normalise_world_to_node` in
+    // inline-compile-service without taking that crate as a dep.
+    fn norm_world(w: &str) -> String {
+        let trimmed = w.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if trimmed.ends_with("-node") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}-node")
         }
     }
 
@@ -1194,6 +1237,23 @@ pub fn compute_permission_drift(
                 "  - allowed_methods: stored={} vs requested={}",
                 fmt_perm_list(&stored.allowed_methods),
                 fmt_perm_list(m)
+            ));
+        }
+    }
+    // L-finding-1: capability_world drift. Stored value can be empty
+    // string for legacy rows (no recorded world) — skip the check
+    // there because there's no anchor to compare against, AND
+    // operators upgrading legacy modules need a one-time path to
+    // backfill the field without tripping drift on every existing row.
+    if let Some(w) = explicit_capability_world {
+        let stored_norm = norm_world(&stored.capability_world);
+        let requested_norm = norm_world(w);
+        if !stored_norm.is_empty() && stored_norm != requested_norm {
+            drift_lines.push(format!(
+                "  - capability_world: stored=\"{}\" vs requested=\"{}\" \
+                 (a world change is a capability-surface change — declare it explicitly \
+                 by deleting and recreating the module, or use a fresh node_id)",
+                stored.capability_world, w
             ));
         }
     }
@@ -2958,41 +3018,54 @@ mod tests {
 
     // ─── compute_permission_drift ───
 
+    /// Test helper: build a `StoredPermissions` with no recorded
+    /// capability_world (legacy / migration default). Used by tests
+    /// that don't exercise the world-drift branch so they don't
+    /// accidentally trip it.
+    fn stored_no_world(
+        allowed_hosts: Vec<String>,
+        allowed_secrets: Vec<String>,
+        allowed_methods: Vec<String>,
+    ) -> StoredPermissions {
+        StoredPermissions {
+            allowed_hosts,
+            allowed_secrets,
+            allowed_methods,
+            capability_world: String::new(),
+        }
+    }
+
     #[test]
     fn drift_empty_when_caller_omits_all() {
-        let stored = StoredPermissions {
-            allowed_hosts: vec!["api.example.com".to_string()],
-            allowed_secrets: vec!["k1".to_string()],
-            allowed_methods: vec!["GET".to_string()],
-        };
-        let drift = compute_permission_drift(None, None, None, &stored);
+        let stored = stored_no_world(
+            vec!["api.example.com".to_string()],
+            vec!["k1".to_string()],
+            vec!["GET".to_string()],
+        );
+        let drift = compute_permission_drift(None, None, None, None, &stored);
         assert!(drift.is_empty());
     }
 
     #[test]
     fn drift_empty_when_explicit_matches_stored() {
-        let stored = StoredPermissions {
-            allowed_hosts: vec!["a".to_string(), "b".to_string()],
-            allowed_secrets: vec!["x".to_string()],
-            allowed_methods: vec!["GET".to_string()],
-        };
+        let stored = stored_no_world(
+            vec!["a".to_string(), "b".to_string()],
+            vec!["x".to_string()],
+            vec!["GET".to_string()],
+        );
         let h = vec!["a".to_string(), "b".to_string()];
         let s = vec!["x".to_string()];
         let m = vec!["GET".to_string()];
-        let drift = compute_permission_drift(Some(&h), Some(&s), Some(&m), &stored);
+        let drift = compute_permission_drift(Some(&h), Some(&s), Some(&m), None, &stored);
         assert!(drift.is_empty());
     }
 
     #[test]
     fn drift_sort_order_independence() {
         // Differing iteration order must not be reported as drift.
-        let stored = StoredPermissions {
-            allowed_hosts: vec!["b".to_string(), "a".to_string()],
-            allowed_secrets: Vec::new(),
-            allowed_methods: Vec::new(),
-        };
+        let stored = stored_no_world(vec!["b".to_string(), "a".to_string()], vec![], vec![]);
         let explicit = vec!["a".to_string(), "b".to_string()];
-        let drift = compute_permission_drift(Some(&explicit), None, None, &stored);
+        let drift = compute_permission_drift(Some(&explicit), None, None, None, &stored);
         assert!(drift.is_empty());
     }
 
@@ -3000,25 +3073,17 @@ mod tests {
     fn drift_treats_duplicates_as_equivalent() {
         // Caller-listed dupes must not be reported as drift against the
         // dedup'd stored list.
-        let stored = StoredPermissions {
-            allowed_hosts: vec!["a".to_string()],
-            allowed_secrets: Vec::new(),
-            allowed_methods: Vec::new(),
-        };
+        let stored = stored_no_world(vec!["a".to_string()], vec![], vec![]);
         let explicit = vec!["a".to_string(), "a".to_string()];
-        let drift = compute_permission_drift(Some(&explicit), None, None, &stored);
+        let drift = compute_permission_drift(Some(&explicit), None, None, None, &stored);
         assert!(drift.is_empty());
     }
 
     #[test]
     fn drift_detects_hosts_mismatch() {
-        let stored = StoredPermissions {
-            allowed_hosts: vec!["old.example.com".to_string()],
-            allowed_secrets: Vec::new(),
-            allowed_methods: Vec::new(),
-        };
+        let stored = stored_no_world(vec!["old.example.com".to_string()], vec![], vec![]);
         let explicit = vec!["new.example.com".to_string()];
-        let drift = compute_permission_drift(Some(&explicit), None, None, &stored);
+        let drift = compute_permission_drift(Some(&explicit), None, None, None, &stored);
         assert_eq!(drift.len(), 1);
         assert!(drift[0].contains("allowed_hosts"));
         assert!(drift[0].contains("old.example.com"));
@@ -3027,44 +3092,160 @@ mod tests {
 
     #[test]
     fn drift_detects_secrets_mismatch_only() {
-        let stored = StoredPermissions {
-            allowed_hosts: vec!["a".to_string()],
-            allowed_secrets: vec!["k1".to_string()],
-            allowed_methods: vec!["GET".to_string()],
-        };
+        let stored = stored_no_world(
+            vec!["a".to_string()],
+            vec!["k1".to_string()],
+            vec!["GET".to_string()],
+        );
         // Hosts + methods match; only secrets differ.
         let h = vec!["a".to_string()];
         let s = vec!["k2".to_string()];
         let m = vec!["GET".to_string()];
-        let drift = compute_permission_drift(Some(&h), Some(&s), Some(&m), &stored);
+        let drift = compute_permission_drift(Some(&h), Some(&s), Some(&m), None, &stored);
         assert_eq!(drift.len(), 1);
         assert!(drift[0].contains("allowed_secrets"));
     }
 
     #[test]
     fn drift_detects_methods_length_mismatch() {
-        let stored = StoredPermissions {
-            allowed_hosts: Vec::new(),
-            allowed_secrets: Vec::new(),
-            allowed_methods: vec!["GET".to_string(), "POST".to_string()],
-        };
+        let stored = stored_no_world(
+            vec![],
+            vec![],
+            vec!["GET".to_string(), "POST".to_string()],
+        );
         let m = vec!["GET".to_string()];
-        let drift = compute_permission_drift(None, None, Some(&m), &stored);
+        let drift = compute_permission_drift(None, None, Some(&m), None, &stored);
         assert_eq!(drift.len(), 1);
         assert!(drift[0].contains("allowed_methods"));
     }
 
     #[test]
     fn drift_formats_empty_list_as_brackets() {
-        let stored = StoredPermissions {
-            allowed_hosts: vec!["a".to_string()],
-            allowed_secrets: Vec::new(),
-            allowed_methods: Vec::new(),
-        };
+        let stored = stored_no_world(vec!["a".to_string()], vec![], vec![]);
         let h: Vec<String> = Vec::new();
-        let drift = compute_permission_drift(Some(&h), None, None, &stored);
+        let drift = compute_permission_drift(Some(&h), None, None, None, &stored);
         assert_eq!(drift.len(), 1);
         assert!(drift[0].contains("requested=[]"));
+    }
+
+    // ─── L-finding-1: capability_world drift ───
+
+    /// Caller omits world → no drift, even if stored has a value.
+    /// Preserves the pre-L-finding-1 caller semantics (omit = inherit).
+    #[test]
+    fn drift_world_omitted_is_no_drift() {
+        let stored = StoredPermissions {
+            allowed_hosts: vec![],
+            allowed_secrets: vec![],
+            allowed_methods: vec![],
+            capability_world: "http-node".to_string(),
+        };
+        let drift = compute_permission_drift(None, None, None, None, &stored);
+        assert!(drift.is_empty());
+    }
+
+    /// Caller explicit matches stored → no drift.
+    #[test]
+    fn drift_world_matching_is_no_drift() {
+        let stored = StoredPermissions {
+            allowed_hosts: vec![],
+            allowed_secrets: vec![],
+            allowed_methods: vec![],
+            capability_world: "http-node".to_string(),
+        };
+        let drift = compute_permission_drift(None, None, None, Some("http-node"), &stored);
+        assert!(drift.is_empty());
+    }
+
+    /// `"http"` and `"http-node"` normalise to the same world →
+    /// no drift. Mirrors the inline-compile-service's tolerance
+    /// for both forms in caller input.
+    #[test]
+    fn drift_world_normalises_short_form() {
+        let stored = StoredPermissions {
+            allowed_hosts: vec![],
+            allowed_secrets: vec![],
+            allowed_methods: vec![],
+            capability_world: "http-node".to_string(),
+        };
+        let drift = compute_permission_drift(None, None, None, Some("http"), &stored);
+        assert!(drift.is_empty(), "got drift: {drift:?}");
+    }
+
+    /// Caller asks for a different world → drift. The capability-
+    /// upgrade case (http-node stored, agent-node requested) — the
+    /// exact silent-escalation gap this fix closes.
+    #[test]
+    fn drift_world_upgrade_detected() {
+        let stored = StoredPermissions {
+            allowed_hosts: vec![],
+            allowed_secrets: vec![],
+            allowed_methods: vec![],
+            capability_world: "http-node".to_string(),
+        };
+        let drift = compute_permission_drift(None, None, None, Some("agent-node"), &stored);
+        assert_eq!(drift.len(), 1);
+        assert!(drift[0].contains("capability_world"));
+        assert!(drift[0].contains("http-node"));
+        assert!(drift[0].contains("agent-node"));
+    }
+
+    /// Caller asks for a NARROWER world → also drift. Capability
+    /// CHANGE in either direction should surface, not just upgrades.
+    /// A narrower world might fail to import host functions the
+    /// existing graph expects.
+    #[test]
+    fn drift_world_downgrade_also_detected() {
+        let stored = StoredPermissions {
+            allowed_hosts: vec![],
+            allowed_secrets: vec![],
+            allowed_methods: vec![],
+            capability_world: "agent-node".to_string(),
+        };
+        let drift = compute_permission_drift(None, None, None, Some("http-node"), &stored);
+        assert_eq!(drift.len(), 1);
+        assert!(drift[0].contains("capability_world"));
+    }
+
+    /// Legacy row with empty `capability_world` → caller-explicit
+    /// world does NOT trigger drift (no anchor to compare). This
+    /// preserves the migration path for existing modules without
+    /// forcing a "drift" message on every existing row.
+    #[test]
+    fn drift_world_empty_stored_skips_check() {
+        let stored = StoredPermissions {
+            allowed_hosts: vec![],
+            allowed_secrets: vec![],
+            allowed_methods: vec![],
+            capability_world: String::new(),
+        };
+        let drift = compute_permission_drift(None, None, None, Some("agent-node"), &stored);
+        assert!(drift.is_empty());
+    }
+
+    /// Mixed drift: world AND hosts mismatch produce two lines.
+    /// Confirms world drift composes with the other fields rather
+    /// than short-circuiting them.
+    #[test]
+    fn drift_world_and_hosts_both_reported() {
+        let stored = StoredPermissions {
+            allowed_hosts: vec!["api.old.com".to_string()],
+            allowed_secrets: vec![],
+            allowed_methods: vec![],
+            capability_world: "http-node".to_string(),
+        };
+        let h = vec!["api.new.com".to_string()];
+        let drift = compute_permission_drift(
+            Some(&h),
+            None,
+            None,
+            Some("agent-node"),
+            &stored,
+        );
+        assert_eq!(drift.len(), 2);
+        let joined = drift.join("\n");
+        assert!(joined.contains("allowed_hosts"));
+        assert!(joined.contains("capability_world"));
     }
 
     // ─── format_permission_drift_error ───

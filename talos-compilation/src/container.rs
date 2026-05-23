@@ -78,15 +78,61 @@ fn container_enabled() -> bool {
 /// degraded-sandbox behaviour. Multi-tenant deploys MUST leave it unset
 /// — running user-supplied `build.rs` / proc-macros on the host is a
 /// trivial RCE escalation path.
+///
+/// Wasm-security review 2026-05-23 (L-finding-6): the prior gate
+/// accepted `true`/`1`/`yes` in production with only a startup-time
+/// WARN. That's the same value an operator might set in a dev
+/// `.env` file and accidentally inherit into a production rollout —
+/// the WARN is easy to miss in log-volume environments and there's
+/// no second-factor on the gate. In production we now require a
+/// deliberate acknowledgement token that names the risk, so the
+/// flag cannot be enabled by reflex / copy-paste from a dev config:
+///
+///   prod: `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk`
+///   dev:  `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true` (or 1 / yes / the ack token)
+///
+/// Existing single-tenant production operators who had `=true` will
+/// see a clear startup error pointing them at the new value — they
+/// keep the same opt-in capability, the muscle-memory just costs
+/// one extra step. The ack token is also accepted in dev so an
+/// operator can mirror prod config locally for validation.
+const HOST_FALLBACK_PROD_ACK: &str = "acknowledge-single-tenant-rce-risk";
+
 pub fn host_fallback_allowed() -> bool {
+    let raw = match std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    // Production: ONLY the explicit ack token counts. true/1/yes are
+    // ignored (with a loud WARN) so an operator who carried a dev value
+    // into prod sees the safer "compilation refused" outcome rather than
+    // silently running unsandboxed.
+    if talos_config::is_production() {
+        if normalized == HOST_FALLBACK_PROD_ACK {
+            return true;
+        }
+        if matches!(normalized.as_str(), "true" | "1" | "yes") {
+            tracing::warn!(
+                target: "talos_compilation",
+                event_kind = "host_fallback_prod_short_form_rejected",
+                value = %normalized,
+                expected = HOST_FALLBACK_PROD_ACK,
+                "TALOS_COMPILATION_ALLOW_HOST_FALLBACK is set to a short-form truthy value \
+                 in production; this is ignored. To enable the unsandboxed fallback in \
+                 production set the value to the explicit ack token (see \
+                 host_fallback_allowed doc-comment). The short-form values remain accepted \
+                 in dev/CI for ergonomic mirroring."
+            );
+        }
+        return false;
+    }
+    // Dev/CI: short-form values keep working so existing test fixtures
+    // and local `.env` files don't break. The ack token also works so
+    // operators can mirror prod config locally.
     matches!(
-        std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("true" | "1" | "yes")
+        normalized.as_str(),
+        "true" | "1" | "yes" | HOST_FALLBACK_PROD_ACK
     )
 }
 
@@ -160,8 +206,12 @@ pub fn build_command(
                      runtime in the controller pod to restore sandboxing. \
                      Single-tenant operators who accept the trust model (operator \
                      authors all modules — user-supplied proc-macros run on the \
-                     controller host) can set TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true \
-                     to permit the legacy unsandboxed fallback."
+                     controller host) can set \
+                     TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk \
+                     to permit the legacy unsandboxed fallback. The short-form values \
+                     (`true`/`1`/`yes`) accepted in dev are intentionally REFUSED in \
+                     production to prevent accidental dev-config inheritance — see \
+                     `host_fallback_allowed` in talos-compilation/src/container.rs."
                 );
             }
             if talos_config::is_production() {
@@ -307,8 +357,11 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Co
                     "Container compilation is required in production but neither \
                      podman nor docker was found in PATH. Install a container \
                      runtime in the controller pod, or set \
-                     TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true if you accept the \
-                     unsandboxed fallback (single-tenant only)."
+                     TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk \
+                     if you accept the unsandboxed fallback (single-tenant only). \
+                     The short-form values (`true`/`1`/`yes`) accepted in dev are \
+                     intentionally REFUSED in production to prevent accidental \
+                     dev-config inheritance."
                 );
             }
             if talos_config::is_production() {
@@ -492,9 +545,96 @@ mod tests {
             std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
             assert!(
                 !host_fallback_allowed(),
-                "TALOS_COMPILATION_ALLOW_HOST_FALLBACK={val:?} must NOT enable fallback (only explicit true/1/yes)"
+                "TALOS_COMPILATION_ALLOW_HOST_FALLBACK={val:?} must NOT enable fallback"
             );
         }
         std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+    }
+
+    /// L-finding-6: in production the short-form truthy values must be
+    /// REFUSED — only the explicit ack token enables fallback. Guards
+    /// against an operator carrying a dev `.env` value into a prod
+    /// rollout and silently running unsandboxed.
+    #[test]
+    fn host_fallback_prod_refuses_short_form() {
+        let _g = env_lock();
+        std::env::set_var("RUST_ENV", "production");
+        for val in ["true", "TRUE", "1", "yes", "Yes"] {
+            std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
+            assert!(
+                !host_fallback_allowed(),
+                "production: short-form value {val:?} MUST NOT enable fallback (ack token required)"
+            );
+        }
+        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+        std::env::remove_var("RUST_ENV");
+    }
+
+    /// L-finding-6: in production ONLY the explicit ack token enables
+    /// the fallback. Case-insensitive match on the token; surrounding
+    /// whitespace is trimmed.
+    #[test]
+    fn host_fallback_prod_accepts_ack_token() {
+        let _g = env_lock();
+        std::env::set_var("RUST_ENV", "production");
+        for val in [
+            "acknowledge-single-tenant-rce-risk",
+            "ACKNOWLEDGE-SINGLE-TENANT-RCE-RISK",
+            "  acknowledge-single-tenant-rce-risk  ",
+        ] {
+            std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
+            assert!(
+                host_fallback_allowed(),
+                "production: ack token {val:?} MUST enable fallback"
+            );
+        }
+        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+        std::env::remove_var("RUST_ENV");
+    }
+
+    /// L-finding-6: the ack token also works in dev so operators can
+    /// mirror prod config locally for validation without having to flip
+    /// between values.
+    #[test]
+    fn host_fallback_dev_accepts_ack_token() {
+        let _g = env_lock();
+        std::env::set_var("RUST_ENV", "development");
+        std::env::set_var(
+            "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
+            "acknowledge-single-tenant-rce-risk",
+        );
+        assert!(
+            host_fallback_allowed(),
+            "dev: ack token must also enable fallback"
+        );
+        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+        std::env::remove_var("RUST_ENV");
+    }
+
+    /// L-finding-6: production rejects unrelated values just like dev.
+    /// Defends against e.g. `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=yes-ish`
+    /// pattern-matching the prefix of the ack token by accident.
+    #[test]
+    fn host_fallback_prod_rejects_other_values() {
+        let _g = env_lock();
+        std::env::set_var("RUST_ENV", "production");
+        for val in [
+            "false",
+            "0",
+            "no",
+            "",
+            "maybe",
+            "acknowledge",
+            "acknowledge-single",
+            "single-tenant-rce-risk",
+        ] {
+            std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
+            assert!(
+                !host_fallback_allowed(),
+                "production: {val:?} must NOT enable fallback (only the full ack token)"
+            );
+        }
+        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+        std::env::remove_var("RUST_ENV");
     }
 }
