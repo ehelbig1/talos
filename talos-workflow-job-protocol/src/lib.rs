@@ -381,10 +381,27 @@ pub const EXTERNAL_LLM_HOSTS: &[&str] = &[
 /// True iff `host` (already lowercased) matches one of the reserved
 /// external LLM hostnames. Uses exact + suffix match so region
 /// subdomains (`eu.api.openai.com`) also trigger.
+///
+/// **Trailing-dot normalisation.** `url::Url::parse("https://api.anthropic.com./...")`
+/// returns `"api.anthropic.com."` (the FQDN trailing dot is preserved per
+/// RFC 1738 / RFC 3986). DNS resolution treats the trailing dot as
+/// equivalent to the dotless form — the same A/AAAA record is returned —
+/// so leaving the deny-list strict would let a guest reach
+/// `api.anthropic.com.` while the matcher silently passed. We strip the
+/// trailing dot defensively at the matcher entry so every one of the five
+/// worker enforcement surfaces (`fetch`, `fetch_all`, `graphql::execute`,
+/// `webhook::send`, `http_stream::connect`) inherits the fix from one
+/// place. Repeating the strip at every call site would be brittle.
 pub fn is_external_llm_host(host_lower: &str) -> bool {
+    // Defense in depth — callers are documented to pass an already-lowercased
+    // host but we normalise here too: an upstream regression that forwards a
+    // mixed-case or trailing-dot value shouldn't silently bypass the gate.
+    let normalised = host_lower
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     EXTERNAL_LLM_HOSTS
         .iter()
-        .any(|reserved| *reserved == host_lower || host_lower.ends_with(&format!(".{reserved}")))
+        .any(|reserved| *reserved == normalised || normalised.ends_with(&format!(".{reserved}")))
 }
 
 /// True iff `vault_path` references a Tier-2 LLM provider's credentials.
@@ -632,6 +649,80 @@ mod llm_provider_path_tests {
         assert!(!is_controller_internal_vault_path(""));
         assert!(!is_controller_internal_vault_path("github/pat"));
         assert!(!is_controller_internal_vault_path("custom/secret"));
+    }
+}
+
+// ============================================================================
+// Wasm-security review 2026-05-23: is_external_llm_host normalisation tests
+// ============================================================================
+//
+// Threat model. The five worker call sites that gate Tier-1 LLM egress —
+// `wit_http::fetch` / `fetch_all`, `wit_graphql::execute`,
+// `wit_webhook::send`, `wit_http_stream::connect` — feed `host_str()` from a
+// `url::Url` into `is_external_llm_host`. `url::Url::parse` preserves the
+// trailing dot on an FQDN, so a Tier-1 actor could write
+// `https://api.anthropic.com./v1/messages` and the strict equality check
+// would silently pass: DNS resolves the trailing-dot form to the same
+// record. These tests pin the defensive normalisation at the matcher entry.
+#[cfg(test)]
+mod external_llm_host_normalisation_tests {
+    use super::is_external_llm_host;
+
+    #[test]
+    fn bare_host_matches() {
+        assert!(is_external_llm_host("api.anthropic.com"));
+        assert!(is_external_llm_host("api.openai.com"));
+        assert!(is_external_llm_host("generativelanguage.googleapis.com"));
+    }
+
+    #[test]
+    fn trailing_dot_does_not_bypass() {
+        // The exploit shape: `https://api.anthropic.com./v1/messages` —
+        // `url::Url::host_str()` returns the trailing-dot form. Pre-fix the
+        // matcher returned false; post-fix the strip normalises before
+        // compare.
+        assert!(is_external_llm_host("api.anthropic.com."));
+        assert!(is_external_llm_host("api.openai.com."));
+        assert!(is_external_llm_host("generativelanguage.googleapis.com."));
+    }
+
+    #[test]
+    fn trailing_dot_on_subdomain_does_not_bypass() {
+        // Suffix-match limb must also normalise — region subdomains are
+        // the documented suffix-match motivator.
+        assert!(is_external_llm_host("eu.api.openai.com."));
+        assert!(is_external_llm_host("us-east-1.api.anthropic.com."));
+    }
+
+    #[test]
+    fn mixed_case_does_not_bypass() {
+        // Documented as caller-responsibility, but defense-in-depth at the
+        // matcher entry guards against an upstream regression that forgets
+        // to lowercase. The normalisation must apply BOTH lowercasing AND
+        // trailing-dot strip — neither alone is sufficient.
+        assert!(is_external_llm_host("API.ANTHROPIC.COM"));
+        assert!(is_external_llm_host("API.ANTHROPIC.COM."));
+        assert!(is_external_llm_host("Eu.Api.OpenAI.com."));
+    }
+
+    #[test]
+    fn unrelated_hosts_still_do_not_match() {
+        // Negative path — the strip must not be so aggressive that it
+        // matches dot-suffixed lookalikes.
+        assert!(!is_external_llm_host("example.com"));
+        assert!(!is_external_llm_host("example.com."));
+        assert!(!is_external_llm_host("anthropic.com")); // bare apex is NOT in deny list
+        assert!(!is_external_llm_host("badanthropic.com."));
+        assert!(!is_external_llm_host("api.anthropic.com.attacker.example"));
+    }
+
+    #[test]
+    fn empty_and_dot_only_do_not_match() {
+        // Edge cases that the trim could theoretically corrupt — confirm
+        // they remain non-matches.
+        assert!(!is_external_llm_host(""));
+        assert!(!is_external_llm_host("."));
+        assert!(!is_external_llm_host(".."));
     }
 }
 

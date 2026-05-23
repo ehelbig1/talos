@@ -785,12 +785,21 @@ pub(crate) fn host_allowlist_match(allowed: &[String], host: &str) -> bool {
     if allowed.is_empty() {
         return false;
     }
-    let host_lower = host.to_ascii_lowercase();
+    // Strip the FQDN trailing dot before compare. `url::Url::parse` preserves
+    // it (RFC 3986); DNS resolves both forms to the same record. Without the
+    // strip, a host `example.com.` would silently fail to match an operator
+    // grant of `example.com`. We also strip the dot from the pattern side so
+    // an operator who pastes a copy of the FQDN-with-dot still matches the
+    // dotless form a client sends.
+    let host_lower = host.trim_end_matches('.').to_ascii_lowercase();
     allowed.iter().any(|pattern| {
         if pattern == "*" {
             return true;
         }
-        let pattern_lower = pattern.to_ascii_lowercase();
+        // Patterns starting with `.` are suffix patterns by design — preserve
+        // that leading dot, only strip the TRAILING one. `.example.com.` and
+        // `.example.com` should both match `api.example.com`.
+        let pattern_lower = pattern.trim_end_matches('.').to_ascii_lowercase();
         if pattern_lower.starts_with('.') {
             host_lower.ends_with(pattern_lower.as_str())
         } else {
@@ -862,6 +871,38 @@ mod host_allowlist_match_tests {
         let allowed = vec!["api.example.com".to_string()];
         assert!(!host_allowlist_match(&allowed, "evil.example.com"));
         assert!(!host_allowlist_match(&allowed, "example.com"));
+    }
+
+    // Wasm-security review 2026-05-23: trailing-dot normalisation. Same
+    // class as `is_external_llm_host` — `url::Url::parse` preserves the
+    // FQDN trailing dot and the strict equality check would otherwise let
+    // an attacker bypass a tightly-scoped operator grant.
+    #[test]
+    fn trailing_dot_on_host_does_not_bypass() {
+        let allowed = vec!["api.example.com".to_string()];
+        assert!(host_allowlist_match(&allowed, "api.example.com."));
+        assert!(host_allowlist_match(&allowed, "API.EXAMPLE.COM."));
+    }
+
+    #[test]
+    fn trailing_dot_on_pattern_still_matches() {
+        // Operator who copy-pastes an FQDN with the trailing dot should not
+        // have their pattern silently break against a dotless host (which
+        // is what `host_str()` returns when the URL has no trailing dot).
+        let allowed = vec!["api.example.com.".to_string()];
+        assert!(host_allowlist_match(&allowed, "api.example.com"));
+        assert!(host_allowlist_match(&allowed, "api.example.com."));
+    }
+
+    #[test]
+    fn trailing_dot_suffix_pattern_still_matches() {
+        let allowed = vec![".example.com".to_string()];
+        assert!(host_allowlist_match(&allowed, "api.example.com."));
+        assert!(host_allowlist_match(&allowed, "foo.bar.example.com."));
+        // Leading-dot suffix pattern must still NOT match the bare apex
+        // even with trailing-dot — the suffix-match invariant from the
+        // existing test cases must hold.
+        assert!(!host_allowlist_match(&allowed, "example.com."));
     }
 }
 
@@ -4077,6 +4118,29 @@ impl wit_secrets::Host for TalosContext {
         handle: u64,
         reason: String,
     ) -> Result<String, wit_secrets::Error> {
+        // Wasm-security review 2026-05-23: the audit-row `reason` field is
+        // operator-supplied free text that flows verbatim into the WORM
+        // ledger AND NATS audit stream. The WIT-side handle bounds the
+        // call but does NOT bound the string length: a guest with
+        // `allow_tier2_exposure: true` and the per-execution call budget
+        // (MAX_EXPOSE_CALLS_PER_EXECUTION = 10) could send 100 MB strings
+        // 10× per execution — a gigabyte of audit data per call site, with
+        // the same NATS subscriber fanout multiplying the storage cost
+        // downstream. 1 KiB matches the operator-recognised pattern of
+        // "free text long enough for forensic context, short enough that
+        // no caller has a legitimate reason to need more." Truncate at
+        // char boundary so the redacted form doesn't split a UTF-8
+        // sequence and break downstream JSON parsing.
+        const MAX_EXPOSE_REASON_BYTES: usize = 1024;
+        let reason = if reason.len() > MAX_EXPOSE_REASON_BYTES {
+            let mut s =
+                talos_text_util::truncate_at_char_boundary(&reason, MAX_EXPOSE_REASON_BYTES)
+                    .to_string();
+            s.push_str("...[TRUNCATED]");
+            s
+        } else {
+            reason
+        };
         // MCP-673: per-method capability gate. expose_secret is the
         // single grep-able Tier-2 plaintext exit point (line below),
         // so the per-method gate is highest-stakes here. The existing
@@ -4980,13 +5044,107 @@ impl wit_crypto::Host for TalosContext {
 // ============================================================================
 
 /// Build a namespace-prefixed cache key to isolate WASM module cache entries.
-/// Format: `wasm_cache:{user_id}:{module_id}:{key}`
-/// This prevents one module from reading/writing another module's cache keys.
-fn namespaced_cache_key(_ctx: &TalosContext, key: &str) -> String {
-    // Global namespace so Redis keys are visible across workflows AND between
-    // workflow nodes and direct MCP tool calls. Users who need isolation can
-    // include a workflow-specific prefix in their key names.
-    format!("talos_cache:{}", key)
+///
+/// Format: `talos_cache:u={user_id}:{key}` (or `talos_cache:u=system:{key}`
+/// when no user context is attached — system executions only).
+///
+/// **Cross-tenant isolation (2026-05-23, security review).** Pre-fix the
+/// namespace was a single `talos_cache:{key}` shared across every tenant on
+/// the cluster: any module holding the `Cache` capability — a routine grant
+/// — could `get` / `set` / `delete` / `mget` / `exists` / `increment` any
+/// other tenant's cache entries by name. PII, embeddings, OAuth-state
+/// nonces, dedupe markers, computed weights — all of it was a `mget` of a
+/// guessable key away from a hostile module. The doc-comment even called
+/// this out as intentional. It is not — opt-out, not opt-in, is the
+/// security-safe default for any tenant-aware platform.
+///
+/// **Why prefix per-user, not per-actor or per-module.** Cache values today
+/// are scoped to the user (HTTP responses, computed embeddings, OAuth
+/// state). Per-actor would over-isolate workflows-within-a-user that
+/// genuinely share state; per-module would over-isolate two nodes in the
+/// same workflow that compose a pipeline. Per-user matches the engine's
+/// existing trust boundary (DEK lineage, integration-state) and keeps the
+/// human-mental-model of "my data is mine, others can't see it" intact.
+///
+/// **Backward compatibility.** Existing `talos_cache:{key}` entries become
+/// orphaned at deploy; the 24h Redis TTL on cache writes (`OCI_CACHE_TTL_SECS`
+/// pattern) means they age out within a day. Any module relying on
+/// cross-tenant cache reads was an unintended exploit path — losing those
+/// reads is the fix, not a regression.
+fn namespaced_cache_key(ctx: &TalosContext, key: &str) -> String {
+    build_namespaced_cache_key(ctx.user_id, key)
+}
+
+/// Pure helper used by [`namespaced_cache_key`] so the namespacing rule can
+/// be unit-tested without constructing a full [`TalosContext`].
+///
+/// The format is `talos_cache:u={user_id}:{key}` for user-scoped executions
+/// and `talos_cache:u=system:{key}` for system executions. UUIDs render as
+/// hex with hyphens — there is no representable user_id that collides with
+/// the reserved `system` token, so the two namespaces are disjoint.
+pub(crate) fn build_namespaced_cache_key(user_id: Option<uuid::Uuid>, key: &str) -> String {
+    match user_id {
+        Some(uid) => format!("talos_cache:u={}:{}", uid, key),
+        None => format!("talos_cache:u=system:{}", key),
+    }
+}
+
+#[cfg(test)]
+mod namespaced_cache_key_tests {
+    use super::build_namespaced_cache_key;
+    use uuid::Uuid;
+
+    #[test]
+    fn user_scoped_key_has_user_id_prefix() {
+        let uid = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let got = build_namespaced_cache_key(Some(uid), "foo");
+        assert_eq!(got, "talos_cache:u=00000000-0000-4000-8000-000000000001:foo");
+    }
+
+    #[test]
+    fn no_user_id_routes_to_system_bucket() {
+        // System executions (scheduler, internal) get their own bucket so
+        // a malicious guest can never probe internal cache entries by
+        // omitting their own user_id.
+        assert_eq!(
+            build_namespaced_cache_key(None, "foo"),
+            "talos_cache:u=system:foo",
+        );
+    }
+
+    #[test]
+    fn distinct_users_get_distinct_namespaces() {
+        // Cross-tenant isolation invariant: two users with the same key
+        // string must produce different Redis keys.
+        let a = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let b = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        assert_ne!(
+            build_namespaced_cache_key(Some(a), "shared-key"),
+            build_namespaced_cache_key(Some(b), "shared-key"),
+        );
+    }
+
+    #[test]
+    fn user_id_cannot_collide_with_system_token() {
+        // UUIDs always contain hyphens; the literal `system` token does not
+        // parse as a Uuid. No user_id can collide with the system bucket.
+        assert!(Uuid::parse_str("system").is_err());
+    }
+
+    #[test]
+    fn keys_containing_namespace_separator_do_not_break_isolation() {
+        // A guest who tries to escape its own namespace by embedding
+        // `:u=` in the key cannot probe another user's bucket — the
+        // prefix is BEFORE the key, so the resulting Redis key still
+        // starts with the right user namespace.
+        let uid = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let injected = "extra:u=00000000-0000-4000-8000-000000000002:victim";
+        let got = build_namespaced_cache_key(Some(uid), injected);
+        assert!(got.starts_with("talos_cache:u=00000000-0000-4000-8000-000000000001:"));
+        // The injected suffix is present but inert — Redis treats the
+        // whole string as one opaque key.
+        assert!(got.ends_with(injected));
+    }
 }
 
 /// MCP-754 (2026-05-13): per-key length cap shared across every
