@@ -134,6 +134,9 @@ All responses include:
 
 ## Vulnerability Disclosure
 
-Report security issues to: security@talos.dev
+Please report security vulnerabilities privately using [GitHub's private vulnerability
+reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)
+on this repository (Security tab → "Report a vulnerability").
 
-PGP Key: [TODO: Add PGP key]
+Please do not disclose security issues publicly until they have been investigated and
+addressed. We aim to acknowledge reports within 72 hours.

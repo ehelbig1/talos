@@ -14,7 +14,7 @@ import hashlib
 # Test configuration
 WEBHOOK_URL = "http://localhost:8000/api/google-calendar/webhook"
 CHANNEL_ID = "c224bca0-4ead-4417-9afc-4d628a6d31f0"
-CALENDAR_ID = "helbig.evan@gmail.com"
+CALENDAR_ID = "test-user@example.com"
 
 # Get verification token from database
 def get_verification_token():
@@ -366,7 +366,7 @@ def main():
     if passed == total:
         print("\n🎉 All tests passed! System is fully operational.")
         print("\n📝 Next Steps:")
-        print("1. Create a test event in Google Calendar (helbig.evan@gmail.com)")
+        print("1. Create a test event in Google Calendar (replace CALENDAR_ID with your account)")
         print("2. Monitor logs in real-time:")
         print("   docker-compose logs controller -f | grep -E 'Synced|Dedup|Filter|processed'")
         print("3. Verify deduplication by updating the same event")

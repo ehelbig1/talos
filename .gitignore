@@ -48,8 +48,7 @@ sdks/typescript/node_modules/
 
 # Claude and other AI assistants
 .codex/
-.claude/worktrees/
-.claude/scheduled_tasks.lock
+.claude/
 
 # Temporary build/debug output
 controller/check_output*.txt
