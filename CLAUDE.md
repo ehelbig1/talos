@@ -235,9 +235,9 @@ tier-1 ceiling to tier-2 without invalidating the signature.
 
 ## Architectural Mandate (CRITICAL)
 
-**Workspace topology after the May-2026 spike.** The controller bin is now ~5,800 LoC (down from ~95k); 92 `talos-*` workspace crates own the implementation. The bin is bootstrap (main.rs ~4.8k, lib.rs + ~80 re-export shims). Every former top-level module in `controller/src/*` is now a 1-9 LoC re-export shim pointing at its canonical home crate; do not write new logic in those shims. When a path like `crate::foo::bar` appears in remaining controller code, treat it as syntactic sugar for `talos_foo::bar` — the dep tree, lints, and ownership belong to the underlying crate.
+**Workspace topology after the May-2026 spike.** The controller bin is now ~7.3k LoC (down from ~95k); 104 `talos-*` workspace crates own the implementation. The bin is bootstrap (main.rs ~6.4k, lib.rs + ~59 re-export shims under 10 LoC each). Every former top-level module in `controller/src/*` is now a small re-export shim pointing at its canonical home crate; do not write new logic in those shims. When a path like `crate::foo::bar` appears in remaining controller code, treat it as syntactic sugar for `talos_foo::bar` — the dep tree, lints, and ownership belong to the underlying crate.
 
-The MCP handler tree lives in `talos-mcp-handlers` (56k LoC, 27 files). The GraphQL surface lives in `talos-api`. Both keep `pub mod` re-export shims at `controller/src/mcp/mod.rs` and `controller/src/api/mod.rs` so existing import paths keep resolving. **When the priority-extraction list below references `mcp/foo.rs`, the actual file is now `talos-mcp-handlers/src/foo.rs` — the work is the same, the path moved.**
+The MCP handler tree lives in `talos-mcp-handlers` (~65k LoC, 27 source files: 21 handler-domain modules + lib/types/utils/schemas/tests support). The GraphQL surface lives in `talos-api`. Both keep `pub mod` re-export shims at `controller/src/mcp/mod.rs` and `controller/src/api/mod.rs` so existing import paths keep resolving. **When the priority-extraction list below references `mcp/foo.rs`, the actual file is now `talos-mcp-handlers/src/foo.rs` — the work is the same, the path moved.**
 
 **Incremental clean architecture extraction.** MCP handlers must be thin wrappers (~30–50 lines):
 1. Parse args → validate → call service → format response.
@@ -296,7 +296,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
 - `ReplayService` (r303, May-2026) — pulled out of two ~340 LoC handlers in `sandbox.rs` (`handle_replay_module_regression` and `handle_replay_workflow_mode`). Both paths share one private `run_replays()` kernel — load-with-template-fallback, secret prefetch, governance/unknown world rejection, and per-row execute-and-diff loop run from one place. Pure-helper `plan_workflow_replay` walks the graph for fan-in detection; testable without runtime. `sandbox.rs` 3822 → 3354 LoC. 18 unit tests cover the fan-in path, capability-world rejection, error code stability, internal-error message redaction, and counter aggregation. Output shape preserved byte-for-byte.
 - `InlineCompileService` (r304, May-2026) — pulled out of `handle_add_node_to_workflow`'s `rust_code` branch (~340 LoC of capability check + lint + compile + shared-module guard + permission-drift guard + persistence). Handler 766 → 516 LoC. Pre-compile actor capability check inside the service (saves 30–60 s of compile budget on a doomed request); post-compile defense-in-depth check stays in the handler since it covers BOTH the inline-Rust path AND the `module_id` path. Every operator-recognised error string copied verbatim from the pre-extraction handler — `"Compiled successfully but no WASM bytes were generated"` and friends are locked in by unit tests. 12 unit tests; cross-protocol-ready.
 
-**May-2026 workspace decomposition** (controller bin ~95k → ~6.8k LoC). New crates that own former controller modules whole-cloth:
+**May-2026 workspace decomposition** (controller bin ~95k → ~7.3k LoC). New crates that own former controller modules whole-cloth:
 - `talos-templates`, `talos-llm`, `talos-atlassian`, `talos-slack`, `talos-compilation`, `talos-wit-inspector` — leaf services.
 - `talos-integration-helpers` — shared `RenewalFailure` + `looks_like_oauth_failure` for push-notification integrations (breaks the gmail↔gcal coupling).
 - `talos-google-calendar`, `talos-gmail` — push-notification stacks per `docs/integration-pattern.md`.
@@ -305,7 +305,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
 - `talos-api` — entire GraphQL surface (QueryRoot/MutationRoot/SubscriptionRoot, 40 handler files, dataloaders, validation, `TalosSchema` alias).
 - `talos-api-docs` — GraphQL Playground + REST docs.
 - `talos-ws-auth` — GraphQL-over-WebSocket handshake + auth.
-- `talos-mcp-handlers` — entire MCP handler tree (27 files, 56k LoC, 280+ tool handlers, McpState).
+- `talos-mcp-handlers` — entire MCP handler tree (27 source files, ~65k LoC, ~280 tool handlers across 21 handler-domain modules, McpState).
 
 **Good examples to follow:** `ModuleExecutionService`, `AuthService`, `SecretsManager`, `CompilationService`, `SubworkflowContractService`, `ParallelWorkflowEngine`, `ActorRepository::get_actor_full_summary` (LATERAL join pattern), `graph.rs::fetch_graph_json` (helper delegation pattern).
 **Anti-pattern to avoid:** Raw `sqlx::query(...)` calls directly inside MCP handler functions. **Down to 0** in `talos-mcp-handlers/src/*.rs` as of 2026-05-04 and held at 0 through r303/r304 (down from 371 → 276 → 0). The lint-equivalent invariant is now: any new handler PR adding raw `sqlx::query` to a `talos-mcp-handlers` file is a regression — push the SQL into the relevant repository crate first. `encrypted_secrets: Default::default()` in any dispatch path is the other regression class.
@@ -316,12 +316,32 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
 - **Tests that hit async code** need `#[tokio::test]`, not `#[test]`. `sqlx::PgPoolOptions::connect_lazy` panics outside a Tokio runtime.
 
 ## Pre-deploy validation
-- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. Seven checks today: (1) raw `actor_memory` writes + legacy `value`-column projections outside `talos-memory/`, (2) bidirectional `controller/src/main.rs` route ↔ `deploy/helm/talos/templates/frontend/configmap.yaml` location alignment with `// no-nginx-route` and `# no-controller-route` opt-outs, (3) legacy `__agent_context__` key regressions (canonical is `__actor_context__`; opt-out `// allow-agent-context-key`), (4) per-call `SecretsManager::new(...)` outside canonical wiring (opt-out `// allow-secrets-manager-new`), (5) `helm template` clean-render with defaults AND with every `enabled: false` toggled on, (6) raw `sqlx::query*` inside `talos-mcp-handlers/` (opt-out `// allow-mcp-sqlx`), (7) `cargo clippy --workspace --no-deps -- -D warnings` matching the CI invocation (gated behind `TALOS_LINT_CLIPPY=1` because clippy is a 60-90s build; opt in locally for parity at PR time). Each check is tied to a specific prod incident; catches at PR-time the regression class that survives `cargo check` cleanly but breaks at CI or request time.
+- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 20 checks today, each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
+  1. raw `actor_memory` writes + legacy `value`-column projections outside `talos-memory/`
+  2. bidirectional `controller/src/main.rs` route ↔ `deploy/helm/talos/templates/frontend/configmap.yaml` location alignment (opt-outs: `// no-nginx-route`, `# no-controller-route`)
+  3. legacy `__agent_context__` key regressions (canonical is `__actor_context__`; opt-out `// allow-agent-context-key`)
+  4. per-call `SecretsManager::new(...)` outside canonical wiring (opt-out `// allow-secrets-manager-new`)
+  5. `helm template` clean-render with defaults AND with every `enabled: false` toggled on
+  6. raw `sqlx::query*` inside `talos-mcp-handlers/` (opt-out `// allow-mcp-sqlx`)
+  7. `cargo clippy --workspace --no-deps -- -D warnings` matching CI (gated behind `TALOS_LINT_CLIPPY=1` because clippy is a 60-90s build; opt in locally for parity at PR time)
+  8. `trigger_type` column references against `workflow_executions` schema
+  9. boolean-column drift against `workflow_schedules` / `webhook_triggers`
+  10. `let _ = sqlx::query(...).await` silent-swallow outside tests
+  11. misleading-success Err-only outbound webhook fires
+  12. caller-supplied limit clamp drift (the `.unwrap_or().min()` shape)
+  13. chart-wide labels under NetworkPolicy `from:` / `to:` selectors
+  14. `talos-api` `Err(async_graphql::Error::new)` missing `.extend_safe()`
+  15. `graph_json` writes via canonical chokepoint (MCP-1226/1227/1228/1229)
+  16. `wit/talos.wit` ↔ `module-templates/wit/talos.wit` drift
+  17. `encrypted_secrets: Default::default()` outside tests
+  18. `JobResult.sign()` in worker must use `sign_with_worker_id`
+  19. worker must single-publish each `JobResult` (no dual NATS publish)
+  20. every wasmtime WASM proposal must be explicitly opted in/out
 - **`scripts/smoke.sh` end-to-end probe.** Runs every public path against a deployed cluster (`/health`, `/auth/csrf` cookie seeding, `/graphql` with full CSRF round-trip, `/ws` handshake, `/mcp`); optional Phase-B encryption write→read round-trip with `SMOKE_AGENT_TOKEN` + `SMOKE_ACTOR_ID`. `deploy/k3s/install.sh` invokes it as §9.1 at the tail of every deploy — a failed smoke warns but doesn't abort install. Run manually any time with `make smoke BASE_URL=https://…`.
 - **When introducing a new top-level path on the controller**: add a matching `location` block to the chart's nginx ConfigMap, OR mark the route `// no-nginx-route: <reason>` (kubelet probes, in-cluster scrape, etc.). The lint check 2 catches drift either way; the smoke test fails fast in production if the path is supposed to be public but nginx routes it to the SPA.
 
 ## Image publishing
-- **Local-build path is canonical** (May-2026): the operator is not on a paid GitHub Actions plan, so all four workflow files (`ci.yml`, `release.yml`, `main-publish.yml`, `template-publish.yml`) have their auto-triggers gated to `workflow_dispatch:` only. The workflow YAML is preserved as reference (and for the eventual GHA re-enable) — the `push:` / `pull_request:` / `tags:` blocks are commented out, not deleted.
+- **Local-build path is canonical** (May-2026): auto-triggers on all four workflow files (`ci.yml`, `release.yml`, `main-publish.yml`, `template-publish.yml`) are gated to `workflow_dispatch:` only. The workflow YAML is preserved as reference (and for future GHA re-enable) — the `push:` / `pull_request:` / `tags:` blocks are commented out, not deleted.
 - **`scripts/publish-images.sh`** is the canonical build path. Mirrors `main-publish.yml`'s contract: builds via `docker compose build controller worker` plus a separate `docker build -f frontend/Dockerfile` (the compose file points the frontend at `Dockerfile.dev` for local-dev), pushes `:main-<sha>` (+ `:main-latest`) to `ghcr.io/<owner>/talos-*`, captures digests via `docker inspect`. Flags: `--no-push`, `--sign` (default off — see below), `--service NAME`, `--platform linux/amd64` (default, mandatory on Apple Silicon → x86_64 deploys), `--update-env PATH`. Emits a copy-pasteable `TALOS_*_DIGEST=…` block for `/etc/talos/install.env`.
 - **Signing is OPT-IN** (default OFF). The chart's Sigstore enforcement is opt-in too (`TALOS_SIGSTORE_REQUIRED`), so signing is dead weight for the typical operator and costs one Sigstore OAuth roundtrip per publish. Production deploys with enforcement enabled should run `bash scripts/publish-images.sh --sign` or set `TALOS_PUBLISH_SIGN=1`. When enabled, the script BATCHES all images into a single `cosign sign --yes` invocation — one browser tab, one OAuth token, three Fulcio cert issues. Fallback to per-image loop only if the batched call fails (old cosign versions, etc.).
 - **Signing identity binding**: locally-signed images carry the operator's GitHub OAuth identity (via Fulcio), NOT a workflow URI. Production clusters with Sigstore enforcement enabled (`TALOS_SIGSTORE_REQUIRED=true`) need their `TALOS_SIGSTORE_IDENTITY_REGEXP` widened to match the operator's email pattern. The chart-level signing contract is otherwise identical (cosign + Fulcio + Rekor public-log entry).
