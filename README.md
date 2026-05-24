@@ -6,7 +6,7 @@ Talos is a Rust runtime for executing AI agent code inside WebAssembly sandboxes
 
 It's also a complete reference implementation: a workflow engine, visual editor, and ~60 module templates are built on top of the runtime as one consumer. They are not the product. The runtime is.
 
-> **Status: pre-1.0.** Wire formats and APIs are still stabilizing. The codebase has 2,700+ unit tests, a structural-lint script, and incident-driven CHANGELOG entries — but it has not yet been deployed in anger against an SLA, and you should treat it as such.
+> **Status: pre-1.0.** Wire formats and APIs are still stabilizing. The codebase has ~2,900 unit + integration tests, a 20-check structural-lint script, and incident-driven CHANGELOG entries — but it has not yet been deployed in anger against an SLA, and you should treat it as such.
 
 ---
 
@@ -44,9 +44,9 @@ The interesting code is in a few specific files. If you're reading the repo to u
 - `wit/talos.wit` — the WebAssembly Interface Types that define what each capability world exposes.
 
 ### Per-actor LLM tier ceiling
-- `talos-actor-types/` — the `MaxLlmTier` enum and its binding into the actor model.
-- `worker/src/host_impl.rs` — five enforcement surfaces (`get_llm_api_key`, `resolve_vault_header`, `wit_http::fetch`, `wit_graphql::execute`, `wit_webhook::send`). All branch on `self.max_llm_tier == Tier1`.
-- `controller/src/secrets/` — `build_encrypted_secrets_for` skips the `resolve_llm_keys` prefetch entirely when `Tier1`, so tier-1 jobs never have an external-provider key on the wire (encrypted or otherwise).
+- `talos-actor-types/src/llm_tier.rs` — the `LlmTier` enum (`Tier1` blocks external LLM providers; `Tier2` allows them). The column is `actors.max_llm_tier`; the enum carries the value through the system.
+- `worker/src/host_impl.rs` — multiple enforcement surfaces all branching on `self.max_llm_tier == Tier1`: `get_llm_api_key` and `get_llm_api_key_by_name` (refuse external-provider vault keys), `resolve_vault_header` (refuse `vault://anthropic|openai|gemini/*` header substitution), `wit_http::fetch` / `fetch_all` (refuse hosts in `EXTERNAL_LLM_HOSTS`), `wit_graphql::execute` and `wit_webhook::send` / `wit_http_stream` (same host deny-list).
+- `talos-workflow-engine/src/secrets_pipeline.rs` — `build_encrypted_secrets_for` skips the LLM-provider key pre-fetch entirely when the job's `max_llm_tier == Tier1`, so tier-1 jobs never have an external-provider key on the wire (encrypted or otherwise). Defense in depth on top of the worker-side gates.
 
 ### Sigstore-verified module supply chain
 - `talos-registry/src/` — OCI module pulls with mandatory `cosign verify` against pinned certificate-identity + OIDC issuer regexps. Two-layer attestation: the `_index:latest` artifact is signature-verified before its config blob is parsed; each template entry is verified again at fetch time.
@@ -58,11 +58,11 @@ The interesting code is in a few specific files. If you're reading the repo to u
 
 The repo ships a complete reference stack so you can see the runtime in production conditions:
 
-- **Workflow engine** (`talos-workflow-engine/`) — graph-based DAG executor with 15 system-node kinds: parallel/sequential, loop / while-loop / repeat-loop, fan-in / collect / synthesize, wait / verify / error-handler, plus AI primitives (judge, ensemble, reflective-retry, llm-dispatch, agent-loop, react-loop, confidence-gate).
+- **Workflow engine** (`talos-workflow-engine/`) — graph-based DAG executor with 20 system-node kinds: control flow (wait, while-loop, repeat-loop, loop, error-handler, verify, fan-in, collect, synthesize, sub-workflow), and AI primitives gated behind the `llm-primitives` feature (judge, inline-judge, ensemble, confidence-gate, agent-loop, react-loop, reflective-retry, llm-dispatch, dynamic-dispatch, capability-dispatch).
 - **Visual editor** (`frontend/`) — React Flow drag-and-drop graph editor with real-time execution monitoring, per-node timing visualization, and approval-gate UI for human-in-the-loop steps.
 - **Module SDKs** — `#[talos_module(world = "http-node")]` proc macro for Rust, `@talos_module(world="http-node")` decorator for Python (via componentize-py), `talosModule({ world: "http-node" })` wrapper for TypeScript (via ComponentizeJS).
 - **~60 module templates** (`module-templates/`) — RAG pipeline, multi-agent router, human-review gate, PII scrubber, OAuth-aware Gmail / Google Calendar / Slack / Atlassian integrations, data validators, HTTP retry, and more. Compiled, signed, and OCI-distributed.
-- **MCP surface** (`talos-mcp-handlers/`) — 300+ tools across 27 handler modules so the entire platform is drivable from an MCP client.
+- **MCP surface** (`talos-mcp-handlers/`) — ~280 tools across 21 handler-domain modules (actor, advanced, alerts, analytics, auth, capability-worlds, configuration, executions, graph, knowledge-graph, modules, ollama, platform, resources, sandbox, schedules, search, secrets, versions, webhooks, workflows) so the entire platform is drivable from an MCP client.
 
 These are useful examples, not the differentiator. The runtime primitives are what make running them safely interesting.
 
@@ -95,7 +95,7 @@ Trust levels: controller (most), NATS-in-flight (encrypted + signed), worker (le
 |-------|-----------|
 | Backend | Rust (Axum, SQLx, async-graphql, wasmtime) |
 | Frontend | React 19, TypeScript, Vite, ReactFlow, Zustand |
-| Database | PostgreSQL 17 + pgvector |
+| Database | PostgreSQL 16 (dev) / 17 (production helm chart), pgvector extension |
 | WASM runtime | Wasmtime (Component Model, wasip2) |
 | Messaging | NATS JetStream (signed, HMAC + nonce cache) |
 | Cache | Redis (TLS enforced in production) |
@@ -168,10 +168,10 @@ make up-dev                # Start all services
 make lint                  # Lint Rust + frontend + structural lint
 make coverage              # Tests with coverage
 cargo check --workspace    # Quick Rust compile check
-cargo test --workspace     # Full test suite (2,700+ tests)
+cargo test --workspace     # Full test suite (~2,900 tests)
 ```
 
-The `make lint` step runs `scripts/lint-structural.sh`, which enforces seven architectural invariants tied to specific past regressions (raw `actor_memory` SQL outside `talos-memory/`, controller route ↔ nginx ConfigMap drift, the legacy `__agent_context__` key, per-call `SecretsManager::new(...)` outside canonical wiring, helm chart clean-render with toggles, raw sqlx in MCP handlers, optional clippy parity).
+The `make lint` step runs `scripts/lint-structural.sh`, which enforces 20 architectural invariants tied to specific past regressions — raw `actor_memory` SQL outside `talos-memory/`, controller route ↔ nginx ConfigMap drift, the legacy `__agent_context__` key, per-call `SecretsManager::new(...)` outside canonical wiring, helm chart clean-render with toggles, raw sqlx in MCP handlers, clippy parity, `trigger_type` / boolean column drift against schema, silent `let _ = sqlx::query(...).await` swallows outside tests, misleading-success Err-only webhook fires, caller-supplied limit clamp drift, chart-wide labels under NetworkPolicy selectors, async-graphql `Error::new` missing `.extend_safe()`, graph-JSON writes via canonical chokepoint, WIT-file drift between `wit/` and `module-templates/wit/`, `encrypted_secrets: Default::default()` outside tests, JobResult `.sign()` not using `sign_with_worker_id`, worker dual-publishing of JobResult, and wasmtime WASM proposal opt-in/out drift.
 
 ---
 
