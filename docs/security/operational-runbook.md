@@ -481,7 +481,7 @@ A passing run prints `✅ ... passed all SLSA L2 verification checks`.
 - **"signature verification FAILED"** — the image was either
   (a) built outside our CI (someone else pushed to the same tag),
   (b) tampered with after push, or (c) signed during a workflow run
-  that doesn't match `^https://github.com/ehelbig1/talos-v0/.github/workflows/release.yml@refs/tags/v.*`.
+  that doesn't match `^https://github.com/ehelbig1/talos/.github/workflows/release.yml@refs/tags/v.*`.
   DO NOT DEPLOY. Investigate the GHCR push history + GitHub Actions run
   log for the affected tag.
 - **"SBOM attestation FAILED"** — the image is signed but the SBOM
@@ -494,7 +494,7 @@ A passing run prints `✅ ... passed all SLSA L2 verification checks`.
 **Identity rotation (if the GitHub repo moves or is forked):**
 
 The `EXPECTED_IDENTITY_REGEXP` in `scripts/verify-image.sh` hardcodes
-`ehelbig1/talos-v0` as the trusted builder. If you fork the repo and
+`ehelbig1/talos` as the trusted builder. If you fork the repo and
 publish your own images, update both the regexp and any deployed
 verification configs in lockstep — leaving the old regexp would let
 the original repo's images pass verification on your fork's deploys.

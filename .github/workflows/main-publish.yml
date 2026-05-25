@@ -15,7 +15,7 @@ name: Main Publish
 #
 # Verification (example):
 #   cosign verify \
-#     --certificate-identity-regexp "^https://github\\.com/ehelbig1/talos-v0/\\.github/workflows/main-publish\\.yml@refs/heads/main$" \
+#     --certificate-identity-regexp "^https://github\\.com/ehelbig1/talos/\\.github/workflows/main-publish\\.yml@refs/heads/main$" \
 #     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
 #     ghcr.io/ehelbig1/talos-controller@sha256:<digest>
 #

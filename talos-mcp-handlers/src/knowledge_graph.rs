@@ -34,12 +34,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "graph_entity_context",
-            "description": "Get the full context for a specific entity — all its relationships, connected entities, and the memory keys it was extracted from. Use this for deep-dive into a specific person, ticket, or project.\n\nExample: graph_entity_context(actor_id=..., entity_name='Evan Helbig') returns all tickets Evan is assigned to, emails discussed, meetings attended, etc.",
+            "description": "Get the full context for a specific entity — all its relationships, connected entities, and the memory keys it was extracted from. Use this for deep-dive into a specific person, ticket, or project.\n\nExample: graph_entity_context(actor_id=..., entity_name='Jane Smith') returns all tickets Jane is assigned to, emails discussed, meetings attended, etc.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "actor_id": { "type": "string", "description": "UUID of the actor." },
-                    "entity_name": { "type": "string", "description": "Name of the entity to look up (e.g. 'SECP-11266', 'Evan Helbig', 'Prisma Cloud')." }
+                    "entity_name": { "type": "string", "description": "Name of the entity to look up (e.g. 'SECP-11266', 'Jane Smith', 'Prisma Cloud')." }
                 },
                 "required": ["actor_id", "entity_name"]
             }

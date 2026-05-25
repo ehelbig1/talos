@@ -4,7 +4,7 @@ name: Release
 # Produces signed Docker images + SBOMs + SLSA provenance for every tag.
 #
 # SLSA Level 2 contract (what a verifier can assert after this workflow runs):
-#   • Image was built by GitHub Actions on `ehelbig1/talos-v0` (hosted CI).
+#   • Image was built by GitHub Actions on `ehelbig1/talos` (hosted CI).
 #   • Source commit + tag + workflow invocation are baked into a signed
 #     in-toto provenance attestation verifiable via Sigstore.
 #   • Dependencies at build time are listed in a signed SBOM attestation.
@@ -13,7 +13,7 @@ name: Release
 #
 # Verification (example):
 #   cosign verify \
-#     --certificate-identity-regexp "^https://github.com/ehelbig1/talos-v0/\\.github/workflows/release\\.yml@refs/tags/v.*" \
+#     --certificate-identity-regexp "^https://github.com/ehelbig1/talos/\\.github/workflows/release\\.yml@refs/tags/v.*" \
 #     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
 #     ghcr.io/ehelbig1/talos-controller:1.2.3
 #
