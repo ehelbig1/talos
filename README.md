@@ -211,6 +211,6 @@ Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE), at your
 
 ## About
 
-Built by Evan Helbig as a personal portfolio project exploring what a security-first agent execution runtime would look like if designed from the ground up. Talos is unaffiliated with any employer and uses no proprietary or employer-derived code.
+Built by Evan Helbig as a personal portfolio project exploring what a security-first agent execution runtime would look like if designed from the ground up.
 
 If you're working on agent runtime security, AI sandboxing, or AppSec for agentic systems and the architecture here is relevant to what you're building, I'd be glad to hear from you — open a GitHub Discussion or reach out via the contact links on my profile.
