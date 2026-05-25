@@ -998,11 +998,11 @@ impl EncryptedSecrets {
     ///
     /// L-1 (2026-05-22): backwards-compatible no-AAD wrapper. New
     /// call sites should prefer [`Self::encrypt_with_aad`] passing
-    /// `job_id.as_bytes()` as the AAD — that ties the AES-GCM
-    /// authentication tag to the specific job and makes a transposed
-    /// ciphertext (lifted from one JobRequest into another with the
-    /// same shared key) fail to decrypt rather than relying solely
-    /// on the wider JobRequest HMAC to catch the tamper.
+    /// `workflow_execution_id.as_bytes()` as the AAD — that ties the
+    /// AES-GCM authentication tag to the specific execution and makes
+    /// a transposed ciphertext (lifted from one execution into another
+    /// with the same shared key) fail to decrypt rather than relying
+    /// solely on the wider JobRequest HMAC to catch the tamper.
     pub fn encrypt(secrets: &HashMap<String, String>, key: &[u8]) -> Result<Self, String> {
         Self::encrypt_with_aad(secrets, key, &[])
     }
@@ -1010,9 +1010,10 @@ impl EncryptedSecrets {
     /// L-1: Encrypt a secrets map with `aad` bound into the AES-GCM
     /// authentication tag.
     ///
-    /// The recommended `aad` is the job identifier (e.g.
-    /// `job_id.as_bytes()`) — that produces an in-protocol binding
-    /// between the ciphertext and the JobRequest it travels in.
+    /// The `aad` is the dispatching workflow execution id (e.g.
+    /// `workflow_execution_id.as_bytes()`) — that produces an
+    /// in-protocol binding between the ciphertext and the execution
+    /// it travels in.
     /// Decryption MUST be done with the same `aad` via
     /// [`Self::decrypt_with_aad`]; otherwise the tag will not
     /// validate and decryption will fail closed.

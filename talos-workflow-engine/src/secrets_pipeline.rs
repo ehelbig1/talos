@@ -55,11 +55,12 @@ pub(crate) async fn build_encrypted_secrets_for(
     // if a future bypass slips through.
     max_llm_tier: talos_workflow_engine_core::LlmTier,
     // L-1 (2026-05-22): AEAD additional-authenticated-data binding.
-    // The recommended value is the dispatching JobRequest's
-    // `job_id.as_bytes()` — that ties the AES-GCM tag to the specific
-    // job this ciphertext is meant for, so a ciphertext transposed
-    // into a different JobRequest (under the same shared key) fails
-    // tag validation at the worker.
+    // Callers pass the dispatching workflow execution id
+    // (`workflow_execution_id.as_bytes()`) — that ties the AES-GCM tag
+    // to the specific execution this ciphertext is meant for, so a
+    // ciphertext transposed into a different execution (even under the
+    // same shared key) fails tag validation at the worker, which
+    // unseals with the same AAD from `JobRequest.workflow_execution_id`.
     aad: &[u8],
 ) -> talos_workflow_job_protocol::EncryptedSecrets {
     // 1. Module-grant secrets.
