@@ -10,6 +10,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,28 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// HKDF-SHA256 `info` label for the secret-envelope AES-256-GCM subkey.
+///
+/// The 32-byte `WORKER_SHARED_KEY` is the *root*; the envelope cipher
+/// uses a subkey expanded from it under this label, so the encryption
+/// key is domain-separated from the HMAC signing key — historically the
+/// two were the same raw bytes. Both the controller (seal) and the
+/// worker (open) derive the identical subkey, so the round-trip is
+/// consistent by construction. Bumping the `v1` suffix forces a clean
+/// fleet-wide re-key (restart controller + workers together, same as
+/// rotating `WORKER_SHARED_KEY` itself).
+const ENVELOPE_AEAD_KEY_LABEL: &[u8] = b"talos/worker-shared-key/envelope-aead/v1";
+
+/// Expand the root `WORKER_SHARED_KEY` into the 32-byte AES-256-GCM
+/// subkey used for secret envelopes. Pure and deterministic.
+fn derive_envelope_aead_key(root: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, root);
+    let mut subkey = [0u8; 32];
+    hk.expand(ENVELOPE_AEAD_KEY_LABEL, &mut subkey)
+        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
+    subkey
+}
 
 /// Maximum future-skew tolerance for nonce timestamps (seconds).
 ///
@@ -1010,6 +1033,12 @@ impl EncryptedSecrets {
     /// L-1: Encrypt a secrets map with `aad` bound into the AES-GCM
     /// authentication tag.
     ///
+    /// `key` is the 32-byte root `WORKER_SHARED_KEY`. It is **not** used
+    /// as the AES-GCM key directly: the cipher key is HKDF-SHA256-expanded
+    /// from it (see [`ENVELOPE_AEAD_KEY_LABEL`]) so the encryption key is
+    /// domain-separated from the HMAC signing key. [`Self::decrypt_with_aad`]
+    /// performs the identical derivation.
+    ///
     /// The `aad` is the dispatching workflow execution id (e.g.
     /// `workflow_execution_id.as_bytes()`) — that produces an
     /// in-protocol binding between the ciphertext and the execution
@@ -1037,7 +1066,12 @@ impl EncryptedSecrets {
         let plaintext =
             serde_json::to_vec(secrets).map_err(|e| format!("serialize secrets: {e}"))?;
 
-        let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("create cipher: {e}"))?;
+        // The AES-GCM key is an HKDF subkey of the root, never the raw
+        // root (which is also the HMAC signing key). Encrypt and decrypt
+        // derive it identically, so the round-trip stays symmetric.
+        let aead_key = derive_envelope_aead_key(key);
+        let cipher =
+            Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
 
         // OsRng (CSPRNG via getrandom) for nonce parity with the rest of
         // the Talos signing surface — see talos-memory/src/rpc_auth.rs's
@@ -1095,7 +1129,12 @@ impl EncryptedSecrets {
             return Err("invalid nonce length".to_string());
         }
 
-        let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("create cipher: {e}"))?;
+        // The AES-GCM key is an HKDF subkey of the root, never the raw
+        // root (which is also the HMAC signing key). Encrypt and decrypt
+        // derive it identically, so the round-trip stays symmetric.
+        let aead_key = derive_envelope_aead_key(key);
+        let cipher =
+            Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
 
         let nonce = Nonce::from_slice(&self.nonce);
 
@@ -2668,6 +2707,62 @@ mod tests {
         assert!(
             msg.contains("decryption failed"),
             "expected GCM tag error, got: {msg}"
+        );
+    }
+
+    /// The envelope cipher key is an HKDF subkey of the root, not the
+    /// root itself — so it is distinct from the HMAC signing key, which
+    /// uses the root bytes directly. Derivation is deterministic so the
+    /// controller (seal) and worker (open) compute the same subkey.
+    #[test]
+    fn envelope_subkey_is_domain_separated_and_deterministic() {
+        let root = [7u8; 32];
+        let subkey = derive_envelope_aead_key(&root);
+        assert_ne!(
+            &subkey[..],
+            &root[..],
+            "envelope subkey must differ from the root (== the signing key)"
+        );
+        assert_eq!(
+            subkey,
+            derive_envelope_aead_key(&root),
+            "derivation must be deterministic across processes"
+        );
+    }
+
+    /// The strongest proof the slice does what Part 2 claims: a sealed
+    /// envelope must NOT open under the raw root key (which is also the
+    /// HMAC signing key), only under the derived subkey that
+    /// `decrypt_with_aad` reconstructs.
+    #[test]
+    fn envelope_does_not_open_under_the_raw_signing_key() {
+        use aes_gcm::{
+            aead::{Aead, KeyInit, Payload},
+            Aes256Gcm, Nonce,
+        };
+        let root = [9u8; 32];
+        let mut secrets = HashMap::new();
+        secrets.insert("api_key".to_string(), "sk-xyz".to_string());
+        let aad = b"exec-123";
+
+        let env = EncryptedSecrets::encrypt_with_aad(&secrets, &root, aad).unwrap();
+
+        // Opens via the normal path (which derives the subkey).
+        assert_eq!(env.decrypt_with_aad(&root, aad).unwrap(), secrets);
+
+        // Must NOT open if you treat the raw root as the AES-GCM key.
+        let raw_cipher = Aes256Gcm::new_from_slice(&root).unwrap();
+        let nonce = Nonce::from_slice(&env.nonce);
+        let opened_raw = raw_cipher.decrypt(
+            nonce,
+            Payload {
+                msg: env.ciphertext.as_ref(),
+                aad,
+            },
+        );
+        assert!(
+            opened_raw.is_err(),
+            "ciphertext must not open under the raw signing key"
         );
     }
 

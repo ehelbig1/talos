@@ -24,6 +24,7 @@ rand = { version = "0.8", default-features = true, features = ["std"] }
 hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
+hkdf = "0.12"
 
 [features]
 default = []
