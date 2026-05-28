@@ -5,7 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::schema::{types::*, IsTwoFactorVerified, SafeErrorExtensions};
-// use crate::schema::{require_scope, user_accessible_org_ids}; // unused
+// use crate::schema::user_accessible_org_ids; // unused
 // use talos_compilation::CompilationService; // unused
 // use talos_registry::ModuleRegistry; // unused
 // use talos_workflow_versions::WorkflowVersionService; // unused
@@ -108,6 +108,16 @@ impl AuthQueries {
     }
 
     async fn linked_oauth_accounts(&self, ctx: &Context<'_>) -> Result<Vec<OAuthAccount>> {
+        // MCP-757 sibling: paired mutation `disconnect_service_integration`
+        // is `require_2fa` + Admin-scoped; this read surface had no scope
+        // gate, so a non-Admin API key (Memory-only / Webhooks-only) could
+        // enumerate the user's full OAuth-linked-identity set (provider,
+        // email, name, picture, timestamps) — recon useful for targeted
+        // phishing. Admin scope here matches the write surface; session-
+        // authenticated callers (dashboard) pass through `require_scope`
+        // unchanged.
+        crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+
         let oauth_service = ctx.data::<Arc<talos_oauth::OAuthService>>()?;
 
         // Get authenticated user_id from context

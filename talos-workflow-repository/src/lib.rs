@@ -229,7 +229,7 @@ mod execution_output_encryption_tests {
         let repo = lazy_repo();
         let payload = serde_json::json!({"k": "v"});
         let out = repo
-            .maybe_encrypt_execution_output(&payload)
+            .maybe_encrypt_execution_output(Uuid::nil(), &payload)
             .await
             .expect("ok branch");
         assert!(out.is_none());
@@ -355,16 +355,25 @@ impl WorkflowRepository {
     /// Returns `Ok(None)` when no SecretsManager is wired (the caller
     /// then falls back to the plaintext branch). Centralised so the
     /// encrypt-or-plaintext decision lives in one place.
+    ///
+    /// MCP-S2: every caller binds AAD = exec_id so a swap of
+    /// output_data_enc across rows is detected on read. Returns
+    /// (key_id, ciphertext, format_version) so the caller can persist
+    /// all three in lockstep — without the format column write, the
+    /// read path would dispatch via v0 and fail to decrypt.
     async fn maybe_encrypt_execution_output(
         &self,
+        exec_id: Uuid,
         output: &serde_json::Value,
-    ) -> Result<Option<(Uuid, Vec<u8>)>> {
+    ) -> Result<Option<(Uuid, Vec<u8>, i16)>> {
         let Some(sm) = self.secrets_manager.as_ref() else {
             return Ok(None);
         };
         let json_str = serde_json::to_string(output)?;
-        let (key_id, enc_bytes) = sm.encrypt_value(&json_str).await?;
-        Ok(Some((key_id, enc_bytes)))
+        let (key_id, enc_bytes, version) = sm
+            .encrypt_value_aad_v1(&json_str, exec_id.as_bytes())
+            .await?;
+        Ok(Some((key_id, enc_bytes, version)))
     }
 }
 
@@ -1373,15 +1382,20 @@ impl WorkflowRepository {
         // sentinel JSON object describing the truncation.
         let bounded = bound_execution_payload(output);
         let output = &*bounded;
-        if let Some((key_id, enc_bytes)) = self.maybe_encrypt_execution_output(output).await? {
+        if let Some((key_id, enc_bytes, format_version)) = self
+            .maybe_encrypt_execution_output(execution_id, output)
+            .await?
+        {
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'completed', output_data = NULL, \
-                     output_data_enc = $1, output_enc_key_id = $2, completed_at = NOW() \
-                 WHERE id = $3 AND status = 'running'",
+                     output_data_enc = $1, output_enc_key_id = $2, \
+                     output_data_format = $3, completed_at = NOW() \
+                 WHERE id = $4 AND status = 'running'",
             )
             .bind(&enc_bytes)
             .bind(key_id)
+            .bind(format_version)
             .bind(execution_id)
             .execute(&self.db_pool)
             .await?;
@@ -1428,15 +1442,20 @@ impl WorkflowRepository {
         // upstream services, so the same multi-MB risk applies.
         let bounded = bound_execution_payload(output);
         let output = &*bounded;
-        if let Some((key_id, enc_bytes)) = self.maybe_encrypt_execution_output(output).await? {
+        if let Some((key_id, enc_bytes, format_version)) = self
+            .maybe_encrypt_execution_output(execution_id, output)
+            .await?
+        {
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'waiting', output_data = NULL, \
-                     output_data_enc = $1, output_enc_key_id = $2 \
-                 WHERE id = $3 AND status = 'running'",
+                     output_data_enc = $1, output_enc_key_id = $2, \
+                     output_data_format = $3 \
+                 WHERE id = $4 AND status = 'running'",
             )
             .bind(&enc_bytes)
             .bind(key_id)
+            .bind(format_version)
             .bind(execution_id)
             .execute(&self.db_pool)
             .await?;
@@ -1513,26 +1532,36 @@ impl WorkflowRepository {
             bounded_output.as_ref().map(|c| c.as_ref());
         // Optional encryption: only encrypt if SM is wired AND we have output.
         let encrypted = match (self.secrets_manager.as_ref(), output) {
-            (Some(_), Some(out)) => self.maybe_encrypt_execution_output(out).await?,
+            (Some(_), Some(out)) => {
+                self.maybe_encrypt_execution_output(execution_id, out).await?
+            }
             _ => None,
         };
         if self.secrets_manager.is_some() {
             // Encrypted-aware branch: writes ciphertext when present,
             // NULLs plaintext column unconditionally so a stale value
-            // can't survive a fail-rewrite.
-            let (enc_bytes, enc_key_id) = match encrypted {
-                Some((kid, bytes)) => (Some(bytes), Some(kid)),
-                None => (None, None),
+            // can't survive a fail-rewrite. MCP-S2: format_version is
+            // always written (v1 when encrypting, v1 sentinel when not)
+            // so the column invariant holds.
+            let (enc_bytes, enc_key_id, enc_format) = match encrypted {
+                Some((kid, bytes, version)) => (Some(bytes), Some(kid), version),
+                None => (
+                    None,
+                    None,
+                    talos_secrets_manager::SecretsManager::AAD_FORMAT_V1,
+                ),
             };
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'failed', error_message = $1, output_data = NULL, \
-                     output_data_enc = $2, output_enc_key_id = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status = 'running'",
+                     output_data_enc = $2, output_enc_key_id = $3, \
+                     output_data_format = $4, completed_at = NOW() \
+                 WHERE id = $5 AND status = 'running'",
             )
             .bind(&redacted_error)
             .bind(enc_bytes.as_deref())
             .bind(enc_key_id)
+            .bind(enc_format)
             .bind(execution_id)
             .execute(&self.db_pool)
             .await?;
@@ -1621,24 +1650,32 @@ impl WorkflowRepository {
         let output: Option<&serde_json::Value> =
             bounded_output.as_ref().map(|c| c.as_ref());
         let encrypted = match (self.secrets_manager.as_ref(), output) {
-            (Some(_), Some(out)) => self.maybe_encrypt_execution_output(out).await?,
+            (Some(_), Some(out)) => {
+                self.maybe_encrypt_execution_output(execution_id, out).await?
+            }
             _ => None,
         };
         if self.secrets_manager.is_some() {
-            let (enc_bytes, enc_key_id) = match encrypted {
-                Some((kid, bytes)) => (Some(bytes), Some(kid)),
-                None => (None, None),
+            let (enc_bytes, enc_key_id, enc_format) = match encrypted {
+                Some((kid, bytes, version)) => (Some(bytes), Some(kid), version),
+                None => (
+                    None,
+                    None,
+                    talos_secrets_manager::SecretsManager::AAD_FORMAT_V1,
+                ),
             };
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = $1, output_data = NULL, \
                      output_data_enc = $2, output_enc_key_id = $3, \
-                     error_message = $4, completed_at = NOW() \
-                 WHERE id = $5 AND status = 'running'",
+                     output_data_format = $4, \
+                     error_message = $5, completed_at = NOW() \
+                 WHERE id = $6 AND status = 'running'",
             )
             .bind(status)
             .bind(enc_bytes.as_deref())
             .bind(enc_key_id)
+            .bind(enc_format)
             .bind(redacted_error.as_deref())
             .bind(execution_id)
             .execute(&self.db_pool)
@@ -3907,24 +3944,35 @@ impl WorkflowRepository {
         user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let raw: Vec<(Option<serde_json::Value>, Option<Vec<u8>>, Option<Uuid>)> =
-            sqlx::query_as(
-                "SELECT output_data, output_data_enc, output_enc_key_id \
-                 FROM workflow_executions \
-                 WHERE workflow_id = $1 AND user_id = $2 AND status = 'completed' \
-                   AND (output_data IS NOT NULL OR output_data_enc IS NOT NULL) \
-                 ORDER BY started_at DESC LIMIT $3",
-            )
-            .bind(workflow_id)
-            .bind(user_id)
-            .bind(limit)
-            .fetch_all(&self.db_pool)
-            .await?;
+        // MCP-S2: SELECT `id` + `output_data_format` so the decrypt
+        // dispatcher can route v1 rows through the AAD path. Legacy v0
+        // rows naturally fall through to the empty-AAD path.
+        let raw: Vec<(
+            Uuid,
+            Option<serde_json::Value>,
+            Option<Vec<u8>>,
+            Option<Uuid>,
+            i16,
+        )> = sqlx::query_as(
+            "SELECT id, output_data, output_data_enc, output_enc_key_id, output_data_format \
+             FROM workflow_executions \
+             WHERE workflow_id = $1 AND user_id = $2 AND status = 'completed' \
+               AND (output_data IS NOT NULL OR output_data_enc IS NOT NULL) \
+             ORDER BY started_at DESC LIMIT $3",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
         let mut out = Vec::with_capacity(raw.len());
-        for (plaintext, enc_bytes, key_id) in raw {
+        for (exec_id, plaintext, enc_bytes, key_id, format_version) in raw {
             let value = match (&self.secrets_manager, enc_bytes, key_id) {
                 (Some(sm), Some(bytes), Some(kid)) => {
-                    match sm.decrypt_value_by_key(kid, &bytes).await {
+                    match sm
+                        .decrypt_versioned(kid, &bytes, exec_id.as_bytes(), format_version)
+                        .await
+                    {
                         Ok(s) => serde_json::from_str(&s)
                             .unwrap_or_else(|_| serde_json::json!({})),
                         Err(e) => {

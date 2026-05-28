@@ -4912,6 +4912,22 @@ fn require_state_capability(
     }
 }
 
+/// Maximum caller-supplied key length for wit_state operations, in
+/// bytes. `set` has enforced this since MCP-712; the parity sweep
+/// (this audit) extends the same cap to get / delete / exists so a
+/// guest can't drive the host into per-call `format!("{module_id}:{key}")`
+/// heap-alloc work with megabyte keys. Matches `state_rpc`'s
+/// `MAX_STATE_KEY_LEN` on the controller side.
+pub(crate) const MAX_STATE_KEY_LEN: usize = 1024;
+
+fn require_state_key_in_range(key: &str) -> Result<(), wit_state::Error> {
+    if key.is_empty() || key.len() > MAX_STATE_KEY_LEN {
+        Err(wit_state::Error::Invalidkey)
+    } else {
+        Ok(())
+    }
+}
+
 impl wit_state::Host for TalosContext {
     async fn get(&mut self, key: String) -> Result<String, wit_state::Error> {
         // MCP-712 (2026-05-13): audit-ledger emission for capability-
@@ -4928,6 +4944,11 @@ impl wit_state::Host for TalosContext {
                 .await;
             return Err(wit_state::Error::Storagefailed);
         }
+        // Parity with `set` (which enforced this since MCP-712). Without
+        // the cap here, a guest can drive per-call
+        // `format!("{module_id}:{key}")` heap-alloc work with megabyte
+        // keys via repeated get/delete/exists calls.
+        require_state_key_in_range(&key)?;
         let scoped = self.scoped_state_key(&key);
         let store = self
             .state_store
@@ -4950,9 +4971,7 @@ impl wit_state::Host for TalosContext {
                 .await;
             return Err(wit_state::Error::Storagefailed);
         }
-        if key.is_empty() || key.len() > 1024 {
-            return Err(wit_state::Error::Invalidkey);
-        }
+        require_state_key_in_range(&key)?;
         if value.len() > 1024 * 1024 {
             // 1MB limit
             tracing::warn!("State value exceeds 1MB limit");
@@ -5009,6 +5028,8 @@ impl wit_state::Host for TalosContext {
                 .await;
             return Err(wit_state::Error::Storagefailed);
         }
+        // Key-length parity with set; see the sibling cap on get().
+        require_state_key_in_range(&key)?;
         let scoped = self.scoped_state_key(&key);
         let mut store = self
             .state_store
@@ -5042,6 +5063,13 @@ impl wit_state::Host for TalosContext {
             // Minimal-world module enumerating namespace keys.
             self.record_capability_denied("state-exists", "capability-world", &key)
                 .await;
+            return false;
+        }
+        // Key-length parity with set; oversized keys collapse to
+        // false (this is an infallible WIT method — no Err variant
+        // to surface). The cap prevents per-call
+        // `format!("{module_id}:{key}")` allocation on megabyte input.
+        if key.is_empty() || key.len() > MAX_STATE_KEY_LEN {
             return false;
         }
         let scoped = self.scoped_state_key(&key);
@@ -5088,6 +5116,44 @@ impl wit_state::Host for TalosContext {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod wit_state_key_range_tests {
+    use super::{require_state_key_in_range, MAX_STATE_KEY_LEN};
+
+    #[test]
+    fn empty_key_rejected() {
+        assert!(require_state_key_in_range("").is_err());
+    }
+
+    #[test]
+    fn single_char_key_accepted() {
+        assert!(require_state_key_in_range("k").is_ok());
+    }
+
+    #[test]
+    fn key_at_limit_accepted() {
+        let k: String = "a".repeat(MAX_STATE_KEY_LEN);
+        assert!(require_state_key_in_range(&k).is_ok());
+    }
+
+    #[test]
+    fn key_just_over_limit_rejected() {
+        let k: String = "a".repeat(MAX_STATE_KEY_LEN + 1);
+        assert!(require_state_key_in_range(&k).is_err());
+    }
+
+    #[test]
+    fn megabyte_key_rejected_get_delete_exists_parity() {
+        // The cap previously lived only inside `set`; sweep parity
+        // (this PR) ensures get/delete/exists/set all share the same
+        // gate so a guest cannot drive per-call
+        // `format!("{module_id}:{key}")` heap-alloc work via the
+        // unbounded siblings.
+        let k: String = "x".repeat(1024 * 1024);
+        assert!(require_state_key_in_range(&k).is_err());
     }
 }
 
@@ -6308,6 +6374,22 @@ impl wit_messaging::Host for TalosContext {
 
         let mut headers = async_nats::HeaderMap::new();
         if let Some(hdr_list) = msg.headers {
+            // MCP-1105 sibling: cap header count BEFORE the per-header
+            // vault-resolve loop. `resolve_vault_header` is a DB call
+            // (cache hit common but not guaranteed); unbounded iteration
+            // is the exact amplification `MAX_OUTBOUND_HEADERS = 64`
+            // bounds on `wit_http::fetch`, `wit_webhook::send`, and
+            // `wit_graphql::execute`. publish_with_headers was the
+            // holdout.
+            if hdr_list.len() > MAX_OUTBOUND_HEADERS {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    header_count = hdr_list.len(),
+                    limit = MAX_OUTBOUND_HEADERS,
+                    "wit_messaging::publish_with_headers rejected: header count exceeds cap"
+                );
+                return Err(wit_messaging::Error::Publishfailed);
+            }
             for (k, v) in &hdr_list {
                 let resolved = self
                     .resolve_vault_header(k.as_str(), v.as_str())
@@ -6851,14 +6933,31 @@ impl TalosContext {
                         }
                         bytes.extend_from_slice(&chunk);
                     }
-                    let resp_json: serde_json::Value = serde_json::from_slice(&bytes)
+                    // MCP-H7: parse via a typed struct with
+                    // `Box<RawValue>` fields so the `data` and `errors`
+                    // payloads pass through as borrowed JSON text
+                    // without materialising a full
+                    // `HashMap<String, Value>` tree. Pre-fix the
+                    // `serde_json::Value` materialisation then
+                    // `.to_string()` reserialisation paid 3-10x WASM
+                    // fuel cost vs typed parsing on the 10 MB cap.
+                    // See CLAUDE.md WASM rules ("never use top-level
+                    // Value for upstream payloads") + the 2026-05-28
+                    // perf audit.
+                    #[derive(serde::Deserialize)]
+                    struct GqlResp<'a> {
+                        #[serde(borrow, default)]
+                        data: Option<&'a serde_json::value::RawValue>,
+                        #[serde(borrow, default)]
+                        errors: Option<Vec<&'a serde_json::value::RawValue>>,
+                    }
+                    let resp_parsed: GqlResp<'_> = serde_json::from_slice(&bytes)
                         .map_err(|_| wit_graphql::Error::Parseerror)?;
 
-                    let data = resp_json.get("data").map(|d| d.to_string());
-                    let errors = resp_json
-                        .get("errors")
-                        .and_then(|e| e.as_array())
-                        .map(|arr| arr.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+                    let data = resp_parsed.data.map(|d| d.get().to_string());
+                    let errors = resp_parsed
+                        .errors
+                        .map(|arr| arr.into_iter().map(|e| e.get().to_string()).collect());
 
                     return Ok(wit_graphql::Response { data, errors });
                 }
@@ -7331,6 +7430,34 @@ impl wit_email::Host for TalosContext {
                 total = total_recipients,
                 cap = MAX_EMAIL_RECIPIENTS_PER_MESSAGE,
                 "Email recipient count (to + cc + bcc) exceeds limit"
+            );
+            return Err(wit_email::Error::Sendfailed);
+        }
+
+        // MCP-1014 sibling: cap caller-supplied subject + body + html
+        // byte size. Pre-fix `msg.body`, `msg.html`, `msg.subject` were
+        // unbounded — a guest with the Email capability could pack
+        // 10 MB-each strings into a single send, materialise them into
+        // a `serde_json::Value`, then reqwest. With
+        // MAX_EMAIL_SENDS_PER_EXECUTION=50, worst-case in-flight host
+        // memory is ~500 MB per execution. The wit_http /
+        // wit_webhook / wit_messaging / wit_data_transform paths all
+        // cap at MAX_OUTBOUND_HTTP_BODY_BYTES (10 MB); email was the
+        // holdout. Run AFTER the validation/recipient gates so a
+        // malformed-recipient probe doesn't burn the body-size check
+        // budget either way.
+        const MAX_EMAIL_CONTENT_BYTES: usize = MAX_OUTBOUND_HTTP_BODY_BYTES;
+        let html_len = msg.html.as_ref().map(|h| h.len()).unwrap_or(0);
+        let body_bytes = msg.subject.len() + msg.body.len() + html_len;
+        if body_bytes > MAX_EMAIL_CONTENT_BYTES {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                subject_len = msg.subject.len(),
+                body_len = msg.body.len(),
+                html_len = html_len,
+                total = body_bytes,
+                cap = MAX_EMAIL_CONTENT_BYTES,
+                "wit_email::send rejected: subject+body+html exceeds cap"
             );
             return Err(wit_email::Error::Sendfailed);
         }

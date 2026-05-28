@@ -1269,15 +1269,24 @@ impl ActorRepository {
     ) -> Result<()> {
         if let Some(sm) = &self.secrets_manager {
             let json_str = serde_json::to_string(output_data)?;
-            let (key_id, enc_bytes) = sm.encrypt_value(&json_str).await?;
+            // MCP-S2: bind the output ciphertext to exec_id so an
+            // attacker with DB write capability can't swap user B's
+            // execution output onto user A's row to leak it through
+            // the GraphQL read path. Same v1 AAD format constant as the
+            // secrets table; per-row format column dispatches.
+            let (key_id, enc_bytes, format_version) = sm
+                .encrypt_value_aad_v1(&json_str, exec_id.as_bytes())
+                .await?;
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'completed', output_data = NULL, \
-                     output_data_enc = $1, output_enc_key_id = $2, completed_at = NOW() \
-                 WHERE id = $3 AND status = 'running'",
+                     output_data_enc = $1, output_enc_key_id = $2, \
+                     output_data_format = $3, completed_at = NOW() \
+                 WHERE id = $4 AND status = 'running'",
             )
             .bind(&enc_bytes)
             .bind(key_id)
+            .bind(format_version)
             .bind(exec_id)
             .execute(&self.db_pool)
             .await?;

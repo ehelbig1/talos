@@ -590,6 +590,16 @@ impl SecurityMutations {
             }
             if !headers.is_empty() {
                 let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
+                // NOTE: not migrated to encrypt_value_aad_v1 as part of
+                // MCP-S2 because the matching decrypt path in
+                // `talos-audit-ledger` uses TALOS_MASTER_KEY directly
+                // (NOT SecretsManager DEKs) — a pre-existing key-chain
+                // inconsistency. Adding AAD on the encrypt side here
+                // wouldn't reach the read path; both sides need to be
+                // realigned onto SecretsManager first. Tracked as a
+                // separate follow-up; the swap-attack surface here is
+                // smaller than TOTP / webhook signing because the read
+                // path can't decode the current ciphertext anyway.
                 let (_key_id, encrypted) = secrets_manager.encrypt_value(&headers).await?;
                 headers_nonce = Some(encrypted[..12].to_vec());
                 encrypted_headers = Some(encrypted[12..].to_vec());

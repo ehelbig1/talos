@@ -76,9 +76,14 @@ fn run(input: String) -> Result<String, String> {
                 };
                 let value = &value;
 
+                // MCP-962 sibling: saturating u64→u32 conversion.
+                // Pre-fix `v as u32` for a misconfigured ttl > 2^32
+                // (~136 years) silently wrapped. Saturate to u32::MAX
+                // so the dashboard renders an operator-recognisably
+                // absurd value rather than a plausible truncation.
                 let ttl = config.get("ttl")
                     .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
 
                 cache::set(key, value, ttl)
                     .map_err(|e| format!("Cache set failed: {:?}", e))?;

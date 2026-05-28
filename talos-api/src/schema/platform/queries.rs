@@ -48,6 +48,11 @@ pub struct PlatformQueries;
 
 #[async_graphql::Object]
 impl PlatformQueries {
+    // allow-public-query: self-scoped per-user read of the caller's own
+    // capability ceiling. WHERE user_id = $1 binds to the authenticated
+    // caller — no cross-tenant disclosure surface, so the
+    // grant/revoke_capability_ceiling Admin scope on the WRITE side
+    // doesn't apply to this self-read.
     async fn my_capability_ceiling(&self, ctx: &Context<'_>) -> Result<String> {
         let user_id = ctx
             .data_opt::<Uuid>()
@@ -67,6 +72,8 @@ impl PlatformQueries {
     }
 
     /// Get detailed capability ceiling info for the current user.
+    // allow-public-query: self-scoped per-user read; see my_capability_ceiling
+    // above for the same rationale.
     async fn capability_ceiling_detail(
         &self,
         ctx: &Context<'_>,
@@ -215,6 +222,14 @@ impl PlatformQueries {
     }
 
     async fn resource_quotas(&self, ctx: &Context<'_>) -> Result<ResourceQuota> {
+        // MCP-757 sibling: paired mutation `update_resource_quotas` is
+        // `require_2fa` + Admin-scoped; this read surface had no scope
+        // gate, so a non-Admin API key could discover the org's capacity
+        // policy (cpu_cores, memory_gb, storage_gb, concurrent_executions).
+        // Admin scope here matches the write surface; session-authenticated
+        // callers (dashboard) pass through `require_scope` unchanged.
+        crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()
@@ -278,6 +293,14 @@ impl PlatformQueries {
     }
 
     async fn service_integrations(&self, ctx: &Context<'_>) -> Result<Vec<ServiceIntegration>> {
+        // MCP-757 sibling: paired mutation `disconnect_service_integration`
+        // is `require_2fa` + Admin-scoped; this read surface had no scope
+        // gate, so a non-Admin API key could enumerate every connected
+        // provider for the user (id, account_identifier, connected_at).
+        // Admin scope here matches the write surface; session-authenticated
+        // callers (dashboard) pass through `require_scope` unchanged.
+        crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+
         let user_id = ctx
             .data_opt::<Uuid>()
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
@@ -338,7 +338,16 @@ impl GoogleCalendarService {
         expires_in: i64,
         scope: String,
     ) -> Result<GoogleCalendarIntegration> {
-        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        // MCP-960..962 sibling + chrono panic defense: route through
+        // the canonical helper so a caller passing a negative or
+        // huge i64 (provider misbehavior, manual override) doesn't
+        // produce expires_at in the past (immediate-expiry +
+        // refresh-storm) or trip `chrono::Duration::seconds`'
+        // internal i64-ms overflow panic. Clamp negatives to None
+        // (helper defaults to 3600s) and saturate excess to u64.
+        let expires_at = talos_oauth::oauth_expires_at(
+            u64::try_from(expires_in).ok(),
+        );
 
         // The google_calendar_integrations table was migrated to encrypted
         // token storage (access_token_enc / refresh_token_enc bytea columns).

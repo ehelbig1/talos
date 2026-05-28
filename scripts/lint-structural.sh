@@ -1449,6 +1449,392 @@ else
 fi
 echo
 
+# ── 21. Saturating integer-cast discipline at trust boundaries ────────
+bold "▶ check 21: integer-cast wraparound (.as_u64().*as u32 / map(|i| i as i32))"
+
+# MCP-960..962 + MCP-1007/1008 + 2026-05-28 audit established the
+# saturating-cast rule for caller-controlled numeric fields crossing
+# a width boundary:
+#
+#   MCP-960: `(t - t0).num_milliseconds() as i32` wrapped for durations
+#            >= 24.8 days. Saturate via `try_from + unwrap_or(i32::MAX)`.
+#   MCP-961: i32 -> u32 wrap via `row.iteration_index.map(|i| i as u32)`.
+#            Use `.max(0) as u32` at the read boundary.
+#   MCP-962: u64 -> u32 wrap via `v.as_u64().map(|v| v as u32)`.
+#            Saturate via `u32::try_from(v).unwrap_or(u32::MAX)`.
+#   MCP-1008: u64 -> u32 sibling in worker LLM token-count parsing.
+#   2026-05-28: caught two unchecked siblings — `talos-workflow-engine/
+#               src/graph_parser.rs::read_node_retry_policy` and
+#               `talos-yaml-workflows::lib.rs` both did
+#               `.as_u64()...as u32` on workflow `retry_count`.
+#
+# The lint flags two specific dangerous shapes that survived past
+# audits because `cargo check` passes them cleanly:
+#
+#   1. `\.as_u64\(\)`-then-`as u(8|16|32)` — direct u64→smaller wrap.
+#      Defense: `u<N>::try_from(v).unwrap_or(u<N>::MAX)`.
+#
+#   2. `\.map\(\|[a-z_]+\| [a-z_]+ as i32\)` — u32→i32 cast applied
+#      to engine-event field types via `Option::map`. Plausibly safe
+#      today (engine emits non-pathological counters) but defense-in-
+#      depth at the write boundary mirrors the read-boundary
+#      saturate. Defense: a helper like `saturating_u32_to_i32` that
+#      uses `i32::try_from(v).unwrap_or(i32::MAX)`.
+#
+# Opt-out: `// allow-as-u32-cast: <reason>` within 4 lines above a
+# call site that's provably safe (e.g. bounded by an upstream `min()`
+# clamp, or sourced from a typed `u8` literal). The presence of an
+# opt-out comment skips the line.
+
+CAST_VIOLATIONS=0
+
+# Pattern 1: `.as_u64()` followed by `as u32` / `as u16` / `as u8`
+# within ~3 lines (covering both inline and multi-line chains).
+# `grep -P` for multiline lookaround — but BSD grep on macOS lacks
+# -P, so fall back to a two-pass: find files containing as_u64(),
+# then ripgrep with -A 3 for the cast.
+TARGET_DIRS=(
+    "talos-api"
+    "talos-mcp-handlers"
+    "talos-workflow-engine"
+    "talos-yaml-workflows"
+    "talos-engine"
+    "worker"
+    "controller"
+    "talos-webhooks"
+    "talos-oauth"
+    "talos-atlassian"
+    "talos-gmail"
+    "talos-google-calendar"
+    "talos-slack"
+)
+
+# rg is available on the developer workstation per Makefile; fall
+# back to grep -rn if not. The compound rg expression catches:
+#   .as_u64().unwrap_or(N) as u32
+#   .as_u64()...).map(|v| v as u32)
+#   .and_then(|x| x.as_u64()).unwrap_or(...) as u32
+# but excludes:
+#   u32::try_from(v).unwrap_or(u32::MAX)  ← the canonical safe shape
+#   u8/u16/u32::MAX                       ← const refs
+RG_BIN=""
+if command -v rg >/dev/null 2>&1; then
+    RG_BIN="rg"
+fi
+
+for dir in "${TARGET_DIRS[@]}"; do
+    [ -d "$dir" ] || continue
+    # Match the specific dangerous shape: `as u8/u16/u32` on the SAME
+    # line as a method-chain ending the cast. The earlier permissive
+    # pattern over-flagged safely-clamped chains; tightening to the
+    # *terminal* line catches the bug shape and lets `.min(N) as u32`
+    # / `.clamp(...) as u32` pass cleanly.
+    if [ -n "$RG_BIN" ]; then
+        matches=$("$RG_BIN" -n --no-heading \
+            -g '*.rs' \
+            -g '!**/tests/**' \
+            -g '!**/*_tests.rs' \
+            'as u(8|16|32)\b' \
+            "$dir" 2>/dev/null || true)
+    else
+        matches=$(grep -rn --include='*.rs' \
+            -E 'as u(8|16|32)\b' \
+            "$dir" 2>/dev/null || true)
+    fi
+    if [ -z "$matches" ]; then
+        continue
+    fi
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+
+        # Pre-filters on the matched line itself:
+        # 1. Skip comments / docstrings (the cast appears in prose).
+        case "$body" in
+            *'//'*"as u"*) [[ "$body" =~ ^[[:space:]]*// ]] && continue ;;
+        esac
+        if [[ "$body" =~ ^[[:space:]]*// ]] || [[ "$body" =~ ^[[:space:]]*/\*\* ]] || [[ "$body" =~ ^[[:space:]]*\* ]]; then
+            continue
+        fi
+        # 2. Skip the canonical safe shape and known-safe siblings.
+        if echo "$body" | grep -qE 'try_from|saturating_|::MAX\b|::MIN\b'; then
+            continue
+        fi
+        # 3. Skip lines where the cast is from a u8 literal / typed
+        #    constant (e.g. `255 as u32`, `MAX_X as u32`) — these are
+        #    widening (smaller→larger) which is always safe.
+        if echo "$body" | grep -qE '\b[0-9]+\s+as u(16|32|64)\b'; then
+            continue
+        fi
+
+        # Look 3 lines above for opt-out + upper-bound clamp markers.
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 3 ? lineno - 3 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            # Explicit opt-out marker.
+            if echo "$ctx" | grep -q "// allow-as-u32-cast:"; then
+                continue
+            fi
+            # Upper-bound clamps in the chain make the cast safe:
+            #   .min(N) — caps to N (must be < target type MAX)
+            #   .clamp(L, H) — both bounds
+            #   contains(&n) — range-contains guard upstream
+            #   u32::from / i32::from — already-narrow source widening
+            # Limit the cast-justification scan to a couple lines above
+            # so distant `.min()` calls in unrelated code don't grant
+            # false safety.
+            if echo "$ctx" | grep -qE '\.min\(|\.clamp\(|\.contains\(&|u32::from\(|i32::from\(|u16::from\(|u8::from\('; then
+                continue
+            fi
+        fi
+
+        # Only flag if there's actually an upstream `.as_u64()` /
+        # `.as_i64()` / `.as_f64()` / `.num_milliseconds()` / similar
+        # *unbounded* numeric source within the prior few lines —
+        # those are the call sites where wrap is actually possible.
+        # Without this filter, every `n as u32` literal-conversion in
+        # the codebase trips the lint.
+        unbounded_src=""
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 3 ? lineno - 3 : 1))
+            ctx2=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx2" | grep -qE '\.as_u64\(|\.as_i64\(|\.num_milliseconds\(|\.as_secs\('; then
+                unbounded_src="yes"
+            fi
+        fi
+        # Also check the matched line itself.
+        if echo "$body" | grep -qE '\.as_u64\(|\.as_i64\(|\.num_milliseconds\(|\.as_secs\('; then
+            unbounded_src="yes"
+        fi
+        if [ -z "$unbounded_src" ]; then
+            continue
+        fi
+
+        printf '  %s\n' "$line"
+        CAST_VIOLATIONS=$((CAST_VIOLATIONS + 1))
+    done <<< "$matches"
+done
+
+# Pattern 2: `.map(|x| x as i32)` on engine-event field types.
+# Specifically scoped to talos-api workflow event-persistence sites;
+# this shape elsewhere is usually fine (typed-source converter).
+# Recent fix landed a helper `saturating_u32_to_i32` for the canonical
+# safe shape.
+WRITE_BOUNDARY_FILES=(
+    "talos-api/src/schema/workflows/mutations.rs"
+)
+for f in "${WRITE_BOUNDARY_FILES[@]}"; do
+    [ -f "$f" ] || continue
+    matches=$(grep -nE '\.map\(\|[a-z_]+\| [a-z_]+ as i32\)' "$f" 2>/dev/null || true)
+    if [ -z "$matches" ]; then
+        continue
+    fi
+    while IFS= read -r line; do
+        lineno=$(echo "$line" | cut -d: -f1)
+        body=$(echo "$line" | cut -d: -f2-)
+        # Skip comments / docstrings — the cast appears in prose
+        # (the regression-class test docstrings reference the bug
+        # shape verbatim, which trips Pattern 2 without this guard).
+        if [[ "$body" =~ ^[[:space:]]*// ]] || [[ "$body" =~ ^[[:space:]]*/\*\* ]] || [[ "$body" =~ ^[[:space:]]*\* ]]; then
+            continue
+        fi
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$f" 2>/dev/null || true)
+            if echo "$ctx" | grep -q "// allow-as-u32-cast:"; then
+                continue
+            fi
+        fi
+        printf '  %s:%s\n' "$f" "$line"
+        CAST_VIOLATIONS=$((CAST_VIOLATIONS + 1))
+    done <<< "$matches"
+done
+
+if [ "$CAST_VIOLATIONS" -gt 0 ]; then
+    red "✗ $CAST_VIOLATIONS integer-cast violation(s) found"
+    yellow "  → use saturating conversion at trust boundaries:"
+    yellow "    • u64→u32: u32::try_from(v).unwrap_or(u32::MAX)"
+    yellow "    • u32→i32: i32::try_from(v).unwrap_or(i32::MAX)"
+    yellow "    • i32→u32: v.max(0) as u32  (read boundary only)"
+    yellow "    Opt out with: // allow-as-u32-cast: <reason>"
+    yellow "    See MCP-960..962, MCP-1007/1008 for the audit class."
+    EXIT_CODE=1
+else
+    green "✓ integer-cast discipline (MCP-960..962 / MCP-1007/1008) holds"
+fi
+echo
+
+# ── 22. GraphQL per-domain query/mutation scope-parity ─────────────────
+bold "▶ check 22: GraphQL queries with sibling mutations must have a scope gate"
+
+# MCP-757 / 2026-05-28 audit established the rule: any read surface
+# whose paired write surface (in the same domain dir) calls
+# require_scope(...) — usually Admin — also needs a scope gate.
+# Otherwise a non-Admin API key can enumerate sensitive recon data
+# (linked OAuth accounts, service integrations, resource quotas,
+# capability grants...). Three live gaps were found in the 2026-05-28
+# sweep: linked_oauth_accounts, service_integrations, resource_quotas.
+#
+# The lint scans each `talos-api/src/schema/<domain>/` dir for:
+#   * mutations.rs files containing `require_scope(...)` calls
+#   * queries.rs files in the same dir whose top-level `async fn`
+#     resolvers don't call `require_scope`.
+# Flags resolvers that look like they need a gate. Heuristic — not
+# perfect; opt out with `// allow-public-query: <reason>` within 4
+# lines above the fn signature for legitimate pre-auth surfaces
+# (e.g., oauth_login_url, health checks).
+
+PARITY_VIOLATIONS=0
+
+for domain_dir in talos-api/src/schema/*/; do
+    [ -d "$domain_dir" ] || continue
+    mutations="${domain_dir}mutations.rs"
+    queries="${domain_dir}queries.rs"
+    [ -f "$mutations" ] || continue
+    [ -f "$queries" ] || continue
+
+    # Does mutations.rs use require_scope at all?
+    if ! grep -q "require_scope(" "$mutations" 2>/dev/null; then
+        continue
+    fi
+
+    # Find each async fn resolver in queries.rs. The pattern is
+    # `    async fn <name>(...)` at exactly 4-space indent (inside
+    # an `#[Object] impl Foo` block). Capture the line number.
+    while IFS=: read -r lineno _; do
+        # Inspect the next ~60 lines after the fn signature for a
+        # require_scope call OR an opt-out marker in the prior 8 lines
+        # (wider window than other checks because the opt-out
+        # rationale comment frequently runs 4-6 lines above the fn
+        # signature when documenting why the public read is safe).
+        start_above=$((lineno > 8 ? lineno - 8 : 1))
+        ctx_above=$(sed -n "${start_above},${lineno}p" "$queries" 2>/dev/null || true)
+        if echo "$ctx_above" | grep -q "// allow-public-query:"; then
+            continue
+        fi
+        # Look 60 lines below for require_scope or require_2fa.
+        end=$((lineno + 60))
+        body=$(sed -n "${lineno},${end}p" "$queries" 2>/dev/null || true)
+        if echo "$body" | grep -q "require_scope("; then
+            continue
+        fi
+        # Pre-auth surface heuristics — exempt resolvers whose name
+        # implies they're meant to be reachable without authentication
+        # (login URL builders, health checks). Use the matched line
+        # itself for the name.
+        signature=$(sed -n "${lineno}p" "$queries" 2>/dev/null || true)
+        if echo "$signature" | grep -qE 'oauth_login_url|health|liveness|readiness|version_info|server_capabilities'; then
+            continue
+        fi
+        printf '  %s:%s — `%s` has no require_scope but a sibling mutation does\n' \
+            "$queries" "$lineno" "$(echo "$signature" | sed 's/^[[:space:]]*//' | head -c 80)"
+        PARITY_VIOLATIONS=$((PARITY_VIOLATIONS + 1))
+    done < <(grep -nE '^    async fn ' "$queries" 2>/dev/null || true)
+done
+
+if [ "$PARITY_VIOLATIONS" -gt 0 ]; then
+    red "✗ $PARITY_VIOLATIONS GraphQL query/mutation scope-parity violation(s)"
+    yellow '  → add crate::schema::require_scope(ctx, ApiKeyScope::Admin)? (or appropriate scope)'
+    yellow '    at the top of the resolver. Session-authenticated callers pass through unchanged.'
+    yellow "  → legitimate pre-auth queries opt out with: // allow-public-query: <reason>"
+    yellow "  → See MCP-757 + 2026-05-28 audit (linked_oauth_accounts / service_integrations /"
+    yellow "    resource_quotas / capability_grants)."
+    EXIT_CODE=1
+else
+    green "✓ GraphQL query/mutation scope-parity holds (MCP-757 sweep)"
+fi
+echo
+
+# ── 23. AEAD AAD-binding discipline on SecretsManager::encrypt_value ──
+bold "▶ check 23: encrypt_value() without AAD outside the secrets table"
+
+# MCP-S2 (2026-05-28): every persistence boundary that stores AES-GCM
+# ciphertext via SecretsManager MUST use the AAD-bound variant
+# (`encrypt_value_with_aad` / `encrypt_value_aad_v1`) so an attacker
+# with DB write capability can't swap ciphertexts between rows that
+# share an `encryption_key_id`. The full migration landed for TOTP,
+# webhook signing secret, workflow_executions.output, module_executions
+# payloads, and actor_memory. Future writers must follow the same
+# pattern.
+#
+# This check flags any call to `secrets_manager.encrypt_value(...)` /
+# `sm.encrypt_value(...)` outside:
+#   * The SecretsManager impl itself (talos-secrets-manager/)
+#   * The `secrets` table writers (talos-api/src/schema/secrets/)
+#     — they're already AAD-bound via the v0/v1 dispatcher
+#   * Test files
+#   * The audit_settings encrypt path (intentionally NOT migrated —
+#     see MCP-S2 follow-up note in security/mutations.rs)
+# Opt out elsewhere with `// allow-encrypt-value-no-aad: <reason>`
+# within 4 lines above.
+
+ENCRYPT_VIOLATIONS=0
+
+# Use rg if available, fallback to grep.
+if [ -n "$RG_BIN" ]; then
+    matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' \
+        -g '!talos-secrets-manager/**' \
+        -g '!talos-api/src/schema/secrets/**' \
+        -g '!**/tests/**' \
+        -g '!**/*_tests.rs' \
+        -e '\.encrypt_value\(' \
+        . 2>/dev/null || true)
+else
+    matches=$(grep -rn --include='*.rs' \
+        --exclude-dir=tests \
+        --exclude='*_tests.rs' \
+        -E '\.encrypt_value\(' \
+        --include='*.rs' \
+        talos-* worker controller 2>/dev/null \
+        | grep -v 'talos-secrets-manager/' \
+        | grep -v 'talos-api/src/schema/secrets/' || true)
+fi
+
+if [ -n "$matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+
+        # Skip helper definitions / docstring references / commented-out lines.
+        if echo "$body" | grep -qE 'pub (async )?fn encrypt_value|// |/\*|encrypt_value_with_aad|encrypt_value_aad_v1|encrypt_value_by_key'; then
+            continue
+        fi
+        # Skip the audit-ledger / audit-settings deferral site (see
+        # MCP-S2 follow-up note in security/mutations.rs).
+        if echo "$file" | grep -q 'security/mutations.rs'; then
+            continue
+        fi
+
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-encrypt-value-no-aad:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        ENCRYPT_VIOLATIONS=$((ENCRYPT_VIOLATIONS + 1))
+    done <<< "$matches"
+fi
+
+if [ "$ENCRYPT_VIOLATIONS" -gt 0 ]; then
+    red "✗ $ENCRYPT_VIOLATIONS encrypt_value() call(s) without AAD found"
+    yellow "  → use SecretsManager::encrypt_value_aad_v1(value, row_id.as_bytes()) and persist"
+    yellow "    the returned format_version to a per-row column. Reads dispatch via"
+    yellow "    SecretsManager::decrypt_versioned."
+    yellow "  → Opt out (legacy/migration-only) with: // allow-encrypt-value-no-aad: <reason>"
+    yellow "  → See MCP-S2 (2026-05-28) for the full migration pattern."
+    EXIT_CODE=1
+else
+    green "✓ AEAD AAD-binding discipline holds (MCP-S2 sweep)"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"

@@ -352,23 +352,40 @@ impl ExecutionRepository {
                 .unwrap_or(true)
     }
 
-    /// Encrypt a JSON value for storage. Returns (key_id, encrypted_bytes).
-    async fn encrypt_output(&self, output: &serde_json::Value) -> Result<(Uuid, Vec<u8>)> {
+    /// Encrypt a JSON value for storage. Returns (key_id, encrypted_bytes,
+    /// format_version). MCP-S2: `exec_id` is bound as AAD so an attacker
+    /// with DB write capability can't swap user B's output_data_enc onto
+    /// user A's execution row to leak it through the read path.
+    async fn encrypt_output(
+        &self,
+        exec_id: Uuid,
+        output: &serde_json::Value,
+    ) -> Result<(Uuid, Vec<u8>, i16)> {
         let sm = self
             .secrets_manager
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SecretsManager not available for output encryption"))?;
         let json_str = serde_json::to_string(output)?;
-        sm.encrypt_value(&json_str).await
+        sm.encrypt_value_aad_v1(&json_str, exec_id.as_bytes()).await
     }
 
-    /// Decrypt encrypted output bytes back to JSON.
-    async fn decrypt_output(&self, key_id: Uuid, encrypted: &[u8]) -> Result<serde_json::Value> {
+    /// Decrypt encrypted output bytes back to JSON. Dispatches on the
+    /// per-row `output_data_format` column (0 = legacy no-AAD, 1 =
+    /// AAD-bound to exec_id).
+    async fn decrypt_output(
+        &self,
+        exec_id: Uuid,
+        key_id: Uuid,
+        encrypted: &[u8],
+        format_version: i16,
+    ) -> Result<serde_json::Value> {
         let sm = self
             .secrets_manager
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SecretsManager not available for output decryption"))?;
-        let json_str = sm.decrypt_value_by_key(key_id, encrypted).await?;
+        let json_str = sm
+            .decrypt_versioned(key_id, encrypted, exec_id.as_bytes(), format_version)
+            .await?;
         serde_json::from_str(&json_str).map_err(Into::into)
     }
 
@@ -377,13 +394,25 @@ impl ExecutionRepository {
     /// `output_data_enc` is NULL). If encrypted data exists but decryption fails,
     /// returns None rather than falling back to plaintext — this prevents returning
     /// ciphertext if the plaintext column somehow contains the encrypted bytes.
+    ///
+    /// MCP-S2: the row's `id` is read alongside the ciphertext so the
+    /// decrypt path can dispatch on `output_data_format` and supply the
+    /// correct AAD bytes. Callers MUST SELECT `id` + `output_data_format`
+    /// in their query — without them, decryption falls back to v0.
     async fn read_output_from_row(&self, row: &sqlx::postgres::PgRow) -> Option<serde_json::Value> {
         let enc_bytes: Option<Vec<u8>> = row.try_get("output_data_enc").unwrap_or(None);
         let enc_key_id: Option<Uuid> = row.try_get("output_enc_key_id").unwrap_or(None);
+        // try_get for the AAD format column: if the SELECT didn't
+        // include it (legacy caller), default to v0. Same for `id`.
+        let format_version: i16 = row.try_get("output_data_format").unwrap_or(0);
+        let exec_id: Uuid = row.try_get("id").unwrap_or(Uuid::nil());
 
         if let (Some(bytes), Some(key_id)) = (enc_bytes, enc_key_id) {
             // Encrypted row — decrypt or fail. Do NOT fall back to plaintext.
-            match self.decrypt_output(key_id, &bytes).await {
+            match self
+                .decrypt_output(exec_id, key_id, &bytes, format_version)
+                .await
+            {
                 Ok(val) => return Some(val),
                 Err(e) => {
                     tracing::error!(
@@ -563,7 +592,7 @@ impl ExecutionRepository {
         }
         let rows = sqlx::query(
             "SELECT id, workflow_id, status, started_at, completed_at, output_data, \
-                    output_data_enc, output_enc_key_id, \
+                    output_data_enc, output_enc_key_id, output_data_format, \
                     error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
                     workflow_version_id, priority, is_test_execution, provenance, \
                     acknowledged_at, acknowledgement_reason \
@@ -609,7 +638,7 @@ impl ExecutionRepository {
     ) -> Result<Option<ExecutionRow>> {
         let row = sqlx::query(
             "SELECT id, workflow_id, status, started_at, completed_at, output_data, \
-                    output_data_enc, output_enc_key_id, \
+                    output_data_enc, output_enc_key_id, output_data_format, \
                     error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
                     workflow_version_id, priority, is_test_execution, provenance, \
                     acknowledged_at, acknowledgement_reason \
@@ -708,7 +737,7 @@ impl ExecutionRepository {
     ) -> Result<Option<ExecutionRow>> {
         let row = sqlx::query(
             "SELECT id, workflow_id, status, started_at, completed_at, output_data, \
-                    output_data_enc, output_enc_key_id, \
+                    output_data_enc, output_enc_key_id, output_data_format, \
                     error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
                     workflow_version_id, priority, is_test_execution, provenance \
              FROM workflow_executions \
@@ -1247,15 +1276,20 @@ impl ExecutionRepository {
         output: &serde_json::Value,
     ) -> Result<()> {
         if self.output_encryption_enabled() {
-            let (key_id, enc_bytes) = self.encrypt_output(output).await?;
+            // MCP-S2: encrypt_output binds AAD = exec_id so a swap of
+            // output_data_enc across rows is detected on read.
+            let (key_id, enc_bytes, format_version) =
+                self.encrypt_output(exec_id, output).await?;
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'waiting', output_data = NULL, \
-                     output_data_enc = $1, output_enc_key_id = $2 \
-                 WHERE id = $3",
+                     output_data_enc = $1, output_enc_key_id = $2, \
+                     output_data_format = $3 \
+                 WHERE id = $4",
             )
             .bind(&enc_bytes)
             .bind(key_id)
+            .bind(format_version)
             .bind(exec_id)
             .execute(&self.db_pool)
             .await?;
@@ -1283,15 +1317,18 @@ impl ExecutionRepository {
         output: &serde_json::Value,
     ) -> Result<()> {
         let result = if self.output_encryption_enabled() {
-            let (key_id, enc_bytes) = self.encrypt_output(output).await?;
+            let (key_id, enc_bytes, format_version) =
+                self.encrypt_output(exec_id, output).await?;
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'completed', output_data = NULL, \
-                     output_data_enc = $1, output_enc_key_id = $2, completed_at = NOW() \
-                 WHERE id = $3 AND status = 'running'",
+                     output_data_enc = $1, output_enc_key_id = $2, \
+                     output_data_format = $3, completed_at = NOW() \
+                 WHERE id = $4 AND status = 'running'",
             )
             .bind(&enc_bytes)
             .bind(key_id)
+            .bind(format_version)
             .bind(exec_id)
             .execute(&self.db_pool)
             .await?
@@ -1366,22 +1403,31 @@ impl ExecutionRepository {
         };
         let redacted_error = talos_dlp_provider::redact_str(truncated);
         let result = if self.output_encryption_enabled() {
-            // Encrypt optional output if present
-            let (enc_bytes, enc_key_id) = if let Some(out) = output {
-                let (kid, bytes) = self.encrypt_output(out).await?;
-                (Some(bytes), Some(kid))
+            // Encrypt optional output if present. MCP-S2: AAD = exec_id
+            // when there's something to encrypt; format_version = v1
+            // regardless so the column invariant ("post-fix writes
+            // always write v1") holds even on no-output failure paths.
+            let (enc_bytes, enc_key_id, enc_format) = if let Some(out) = output {
+                let (kid, bytes, version) = self.encrypt_output(exec_id, out).await?;
+                (Some(bytes), Some(kid), version)
             } else {
-                (None, None)
+                (
+                    None,
+                    None,
+                    talos_secrets_manager::SecretsManager::AAD_FORMAT_V1,
+                )
             };
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'failed', error_message = $1, output_data = NULL, \
-                     output_data_enc = $2, output_enc_key_id = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status = 'running'",
+                     output_data_enc = $2, output_enc_key_id = $3, \
+                     output_data_format = $4, completed_at = NOW() \
+                 WHERE id = $5 AND status = 'running'",
             )
             .bind(&redacted_error)
             .bind(enc_bytes.as_deref())
             .bind(enc_key_id)
+            .bind(enc_format)
             .bind(exec_id)
             .execute(&self.db_pool)
             .await?
@@ -1729,7 +1775,7 @@ impl ExecutionRepository {
     ) -> Result<Vec<ExecutionRow>> {
         let rows = sqlx::query(
             "SELECT id, workflow_id, status, started_at, completed_at, output_data, \
-                    output_data_enc, output_enc_key_id, \
+                    output_data_enc, output_enc_key_id, output_data_format, \
                     error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
                     workflow_version_id, priority, is_test_execution, provenance \
              FROM workflow_executions \

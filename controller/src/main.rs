@@ -122,6 +122,40 @@ use secrets::SecretsManager;
 use talos_workflow_job_protocol;
 use webhooks::WebhookRouter;
 
+/// Maximum characters of WASM-emitted log content broadcast on the
+/// `execution_updates` GraphQL subscription. Mirrors the persistence
+/// path's per-row cap (`MAX_MSG_LEN` in
+/// `talos_execution_repository::add_workflow_log`); kept in lockstep
+/// so the live channel can't carry more than the persisted row.
+const MAX_BROADCAST_LOG_CHARS: usize = 8 * 1024;
+
+/// Sanitise a WASM-emitted log message for live broadcast on
+/// `execution_updates`. Mirrors the pipeline `add_workflow_log` runs
+/// before persisting to `workflow_execution_logs.message`:
+///   1. char-count truncate to `MAX_BROADCAST_LOG_CHARS`
+///   2. strip control chars except newline/tab/carriage return
+///   3. DLP redact (`talos_dlp_provider::redact_str`)
+///
+/// Extracted as a free function so the discipline is unit-testable
+/// (the inline call site is otherwise too deep in the NATS subscriber
+/// loop to cover without bringing up a NATS test harness).
+/// Same MCP-481 / MCP-1011 class — every operator-visible WASM-log
+/// surface needs identical scrubbing.
+fn scrub_wasm_log_for_broadcast(message: &str) -> String {
+    let truncated: String = if message.chars().count() > MAX_BROADCAST_LOG_CHARS {
+        let mut s: String = message.chars().take(MAX_BROADCAST_LOG_CHARS).collect();
+        s.push_str("... (truncated)");
+        s
+    } else {
+        message.to_string()
+    };
+    let sanitized: String = truncated
+        .chars()
+        .filter(|c| !c.is_control() || matches!(*c, '\n' | '\t' | '\r'))
+        .collect();
+    talos_dlp_provider::redact_str(&sanitized)
+}
+
 /// Type alias for the full GraphQL schema.
 
 #[tokio::main]
@@ -2862,6 +2896,22 @@ async fn main() -> anyhow::Result<()> {
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
+                            // MCP-1011 sibling: scrub the broadcast `message`
+                            // the same way `add_workflow_log` scrubs before
+                            // persisting. Pre-fix the persistence path
+                            // (`workflow_execution_logs.message`) applied
+                            // MCP-481 truncation + control-char strip +
+                            // `redact_str`, but the parallel `tx_for_wasm_logs`
+                            // broadcast used the raw `message` — a WASM module
+                            // emitting a Bearer / sk- / ghp_ token leaked it
+                            // to live `execution_updates` GraphQL subscribers
+                            // even though the persisted row was clean. See
+                            // `scrub_wasm_log_for_broadcast` (above) for the
+                            // canonical pipeline — kept in lockstep with the
+                            // persistence path so the live channel can't
+                            // carry more than the persisted row.
+                            let scrubbed_for_broadcast = scrub_wasm_log_for_broadcast(&message);
+
                             // Broadcast the live log to all connected GraphQL clients!
                             let _ = tx_for_wasm_logs.send(ExecutionEvent {
                                 execution_id: exec_id,
@@ -2872,7 +2922,7 @@ async fn main() -> anyhow::Result<()> {
                                 log_message: Some(format!(
                                     "[{}] {}",
                                     level_str.to_uppercase(),
-                                    message
+                                    scrubbed_for_broadcast
                                 )),
                                 iteration_index: None,
                                 iteration_total: None,
@@ -6374,3 +6424,75 @@ async fn oauth_callback_handler(
 
 mod secrets_rotation;
 mod tenancy;
+
+#[cfg(test)]
+mod scrub_wasm_log_for_broadcast_tests {
+    use super::{scrub_wasm_log_for_broadcast, MAX_BROADCAST_LOG_CHARS};
+
+    #[test]
+    fn redacts_anthropic_secret() {
+        // MCP-1011 sibling: a WASM module emitting `sk-ant-...` must
+        // have it redacted BEFORE the broadcast lands on the live
+        // `execution_updates` channel. The persistence path
+        // (`add_workflow_log`) applied this; the broadcast didn't.
+        let raw = "thinking response sk-ant-abcdefghijklmnopqrstuvwxyz0123456789 returned";
+        let out = scrub_wasm_log_for_broadcast(raw);
+        assert!(
+            !out.contains("sk-ant-abcdefghijklmnopqrstuvwxyz0123456789"),
+            "DLP scrubber must remove the secret. Got: {out}"
+        );
+    }
+
+    #[test]
+    fn redacts_bearer_token() {
+        let raw = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig";
+        let out = scrub_wasm_log_for_broadcast(raw);
+        assert!(
+            !out.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig"),
+            "Bearer JWT must be redacted. Got: {out}"
+        );
+    }
+
+    #[test]
+    fn redacts_github_token() {
+        let raw = "git push uses ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let out = scrub_wasm_log_for_broadcast(raw);
+        assert!(
+            !out.contains("ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "GitHub PAT must be redacted. Got: {out}"
+        );
+    }
+
+    #[test]
+    fn strips_control_chars_except_whitespace() {
+        // ANSI escape sequences and other control chars must not
+        // reach operator dashboards (terminal-render attacks). \n,
+        // \t, \r preserved so multi-line logs format correctly.
+        let raw = "before\x1b[31mafter\nnext\ttabbed\rret\x07bell";
+        let out = scrub_wasm_log_for_broadcast(raw);
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\x07'));
+        assert!(out.contains('\n'));
+        assert!(out.contains('\t'));
+        assert!(out.contains('\r'));
+    }
+
+    #[test]
+    fn truncates_oversize_input() {
+        // Char-based truncation must respect the 8 KiB cap so the
+        // broadcast can't carry more than `add_workflow_log` persists.
+        let raw: String = "a".repeat(MAX_BROADCAST_LOG_CHARS + 1000);
+        let out = scrub_wasm_log_for_broadcast(&raw);
+        assert!(out.contains("... (truncated)"));
+        // After truncation the prefix is exactly MAX chars, then the
+        // marker; total chars <= cap + marker length.
+        assert!(out.chars().count() <= MAX_BROADCAST_LOG_CHARS + "... (truncated)".chars().count());
+    }
+
+    #[test]
+    fn small_input_passes_through_clean() {
+        let raw = "user logged in successfully";
+        let out = scrub_wasm_log_for_broadcast(raw);
+        assert_eq!(out, raw);
+    }
+}

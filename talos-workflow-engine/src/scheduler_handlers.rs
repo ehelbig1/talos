@@ -1600,6 +1600,41 @@ impl ParallelWorkflowEngine {
                     .cloned()
             });
 
+        // MCP-H6: hoist the per-iteration DB-read costs out of the
+        // loop body. Pre-fix every iteration re-ran:
+        //   1. `fetch_module(body_uuid)` — 1 SELECT against `modules`
+        //      (no in-process cache).
+        //   2. `build_encrypted_secrets(body_module_id, exec, key)` —
+        //      1 SELECT against `secrets` + per-row AES decrypt +
+        //      LLM-keys resolve + AES encrypt of the result.
+        // For a 100-iteration loop that's ~300 extra DB round-trips
+        // per execution (3 SELECTs × 100 iterations). Module bytes
+        // and module-grant secrets are invariant across iterations —
+        // resolve them once at loop entry and reuse. If the loop
+        // exits without dispatching the body (condition false on
+        // entry), we eat the prefetch cost but the cache is one
+        // SELECT, not 100.
+        let cached_wasm_module = match self
+            .fetch_module(body_uuid)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+        {
+            Ok(m) => Some(m),
+            Err(e) => {
+                // Defer the error report to the first iteration so the
+                // shape of the engine output is identical to pre-fix.
+                tracing::warn!(
+                    body_uuid = %body_uuid,
+                    err = %e,
+                    "loop body module fetch failed at prefetch"
+                );
+                None
+            }
+        };
+        let cached_encrypted_secrets = self
+            .build_encrypted_secrets(body_module_id, execution_id, worker_shared_key)
+            .await;
+
         while iteration < max_iters {
             // Evaluate condition against current output + loop metadata.
             // `iteration_count` is injected so conditions like
@@ -1629,16 +1664,13 @@ impl ParallelWorkflowEngine {
             // Log iteration event via the engine's shared emit helper.
             self.emit_loop_iteration_event(execution_id, node_id, iteration, max_iters);
 
-            // Dispatch the body node's module.
-            let fetch_result = self
-                .fetch_module(body_uuid)
-                .await
-                .map_err(|e| anyhow::anyhow!(e));
-
-            let wasm_module = match fetch_result {
-                Ok(m) => m,
-                Err(e) => {
-                    let msg = format!("Module fetch failed: {e}");
+            // MCP-H6: reuse the prefetched module bytes. If the
+            // prefetch failed, surface it now (same shape as pre-fix
+            // failure).
+            let wasm_module = match cached_wasm_module.as_ref() {
+                Some(m) => m.clone(),
+                None => {
+                    let msg = "Module fetch failed at loop-body prefetch".to_string();
                     last_output = serde_json::json!({
                         "__error": true,
                         "error_message": msg.clone(),
@@ -1683,9 +1715,12 @@ impl ParallelWorkflowEngine {
             let job_input = serde_json::Value::Object(merged_input);
 
             let body_timeout_secs = self.node_timeout_for(body_uuid).unwrap_or(30);
-            let encrypted_secrets = self
-                .build_encrypted_secrets(body_module_id, execution_id, worker_shared_key)
-                .await;
+            // MCP-H6: reuse the prefetched encrypted_secrets. The DEK,
+            // module-grant secrets, and LLM keys are invariant across
+            // loop iterations, so re-resolving + re-encrypting per
+            // iteration is wasted work. Clone is cheap (it's an
+            // EncryptedSecrets containing a small Vec<u8> + nonce).
+            let encrypted_secrets = cached_encrypted_secrets.clone();
             let body_job = DispatchJob {
                 execution_id,
                 node_id: body_uuid,

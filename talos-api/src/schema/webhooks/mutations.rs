@@ -230,36 +230,54 @@ impl WebhooksMutations {
             hex::encode(random_bytes)
         });
 
+        // MCP-S2: pre-generate the trigger id so we can bind it as AAD
+        // into the AES-GCM tag at encrypt time. Without this binding,
+        // an attacker with DB write access can swap another row's
+        // `signing_secret_enc` onto this trigger and forge HMAC-signed
+        // payloads. The pre-generated UUID is then bound INSERT-time
+        // so the encrypt-time AAD and the persisted row id are
+        // guaranteed identical.
+        let trigger_id = Uuid::new_v4();
+
         // Encrypt signing secret at rest using envelope encryption (AES-256-GCM).
         // The plaintext signing_secret column is set to NULL; only the encrypted
         // column is populated for new triggers.
         let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
-        let (signing_secret_enc, signing_key_id) = if let Some(ref secret) = input.signing_secret {
-            let (key_id, encrypted) = secrets_manager.encrypt_value(secret).await.map_err(|e| {
-                tracing::error!("Failed to encrypt webhook signing_secret: {}", e);
-                async_graphql::Error::new("Failed to secure signing secret").extend_safe()
-            })?;
-            (Some(encrypted), Some(key_id))
-        } else {
-            (None, None)
-        };
+        let (signing_secret_enc, signing_key_id, signing_secret_format) =
+            if let Some(ref secret) = input.signing_secret {
+                let (key_id, encrypted, version) = secrets_manager
+                    .encrypt_value_aad_v1(secret, trigger_id.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("Failed to encrypt webhook signing_secret: {}", e);
+                        async_graphql::Error::new("Failed to secure signing secret").extend_safe()
+                    })?;
+                (Some(encrypted), Some(key_id), version)
+            } else {
+                // No signing secret → no ciphertext to version, but we
+                // persist v1 anyway so the column's invariant ("v1 means
+                // the row was written by post-MCP-S2 code") is uniform.
+                (None, None, talos_secrets_manager::SecretsManager::AAD_FORMAT_V1)
+            };
 
         let listener_id = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO webhook_triggers (
-                name, module_id, verification_token,
-                signing_secret_enc, signing_key_id,
+                id, name, module_id, verification_token,
+                signing_secret_enc, signing_key_id, signing_secret_format,
                 max_requests_per_minute, enabled, allowed_ips, user_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id
             "#,
         )
+        .bind(trigger_id)
         .bind(&name)
         .bind(input.module_id)
         .bind(&verification_token)
         .bind(signing_secret_enc.as_deref())
         .bind(signing_key_id)
+        .bind(signing_secret_format)
         .bind(rpm_resolved)
         .bind(enabled)
         .bind(allowed_ips)

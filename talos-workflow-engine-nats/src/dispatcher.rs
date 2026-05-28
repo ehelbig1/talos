@@ -475,7 +475,11 @@ pub(crate) async fn execute_job_with_retry(
                     // …) and in `log_message` for human readers.
                     // `retries_attempted` in get_execution_trace counts
                     // `node_retrying` rows, not `node_started` rows.
-                    let retry_num = attempts as i32; // 1-based: attempts was just incremented
+                    // MCP-961 sibling: saturating u32→i32 conversion.
+                    // `attempts` is bounded by the retry-policy
+                    // max_retries (typically <= 10) but defense-in-depth
+                    // against future producers passing unbounded values.
+                    let retry_num = i32::try_from(attempts).unwrap_or(i32::MAX);
                     emit_event_spawn(
                         &event_sink,
                         NodeEventWrite {

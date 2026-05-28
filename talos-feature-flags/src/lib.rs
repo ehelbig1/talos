@@ -52,16 +52,18 @@ pub struct FeatureFlag {
 /// Feature flag service
 pub struct FeatureFlagService {
     db_pool: Pool<Postgres>,
-    cache: Arc<RwLock<HashMap<String, FeatureFlag>>>,
+    // 2026-05-28 audit cleanup: the `cache` field was dead — `load_flag`
+    // is a placeholder returning `Ok(None)` and no reader populated the
+    // map. The misleading scaffolding invited callers to assume caching
+    // was wired up when it wasn't. When the real DB-backed `load_flag`
+    // lands, re-introduce a bounded cache (size cap + TTL sweep)
+    // matching the SecretsManager LLM-keys pattern.
 }
 
 impl FeatureFlagService {
     /// Create new service
     pub fn new(db_pool: Pool<Postgres>) -> Self {
-        Self {
-            db_pool,
-            cache: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self { db_pool }
     }
 
     /// Check if flag is enabled for user/tenant

@@ -205,19 +205,37 @@ pub fn register_graph_hook(hook: Arc<dyn GraphHook>) {
 /// legacy plaintext `value` column — the dual-write window is what
 /// keeps existing tests passing without crypto wiring.
 pub trait MemoryCryptoHook: Send + Sync + 'static {
-    /// Encrypt a JSON-serialized memory value. Returns (key_id, ciphertext).
-    fn encrypt(&self, plaintext: String) -> EncryptFuture;
+    /// Encrypt a JSON-serialized memory value with the supplied AAD
+    /// (Additional Authenticated Data). Returns (key_id, ciphertext,
+    /// format_version). MCP-S2: callers pass the stable composite
+    /// `(actor_id || key.as_bytes())` so an attacker with DB write
+    /// capability can't swap `value_enc` between two rows that share
+    /// `value_key_id` (silent cross-actor / cross-key data leak).
+    /// The format_version is persisted to `actor_memory.value_format`
+    /// alongside the ciphertext.
+    fn encrypt(&self, plaintext: String, aad: Vec<u8>) -> EncryptFuture;
 
-    /// Decrypt ciphertext using the DEK referenced by `key_id`.
-    /// Returns the plaintext wrapped in [`zeroize::Zeroizing<String>`]
-    /// so the heap allocation backing the decrypted bytes is wiped on
-    /// drop. Callers reach a `&str` via `Deref` transparently.
-    fn decrypt(&self, key_id: Uuid, ciphertext: Vec<u8>) -> DecryptFuture;
+    /// Decrypt ciphertext using the DEK referenced by `key_id`,
+    /// dispatching on the per-row `value_format` column (0 = legacy
+    /// no-AAD, 1 = AAD-bound). Returns the plaintext wrapped in
+    /// [`zeroize::Zeroizing<String>`] so the heap allocation backing
+    /// the decrypted bytes is wiped on drop. Callers reach a `&str`
+    /// via `Deref` transparently.
+    fn decrypt(
+        &self,
+        key_id: Uuid,
+        ciphertext: Vec<u8>,
+        aad: Vec<u8>,
+        format_version: i16,
+    ) -> DecryptFuture;
 }
 
-/// Future returned by [`MemoryCryptoHook::encrypt`].
-pub type EncryptFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Uuid, Vec<u8>)>> + Send>>;
+/// Future returned by [`MemoryCryptoHook::encrypt`]. Carries the
+/// AAD format version alongside (key_id, ciphertext) so the per-row
+/// version column can be persisted in lockstep.
+pub type EncryptFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<(Uuid, Vec<u8>, i16)>> + Send>,
+>;
 
 /// Future returned by [`MemoryCryptoHook::decrypt`].
 pub type DecryptFuture = std::pin::Pin<
@@ -225,6 +243,21 @@ pub type DecryptFuture = std::pin::Pin<
         dyn std::future::Future<Output = anyhow::Result<zeroize::Zeroizing<String>>> + Send,
     >,
 >;
+
+/// Build the stable AAD bytes for an `actor_memory` row from its
+/// composite primary key `(actor_id, key)`. Used by writers at
+/// encrypt time and readers at decrypt time — both sites MUST produce
+/// identical bytes or AES-GCM tag verification fails. The format
+/// `actor_id_bytes || 0x00 || key.as_bytes()` includes a separator byte
+/// so a malicious choice of `key` can't manufacture a collision with
+/// another row's AAD (e.g., key="<other-actor-uuid-bytes>...").
+pub fn build_memory_aad(actor_id: Uuid, key: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(16 + 1 + key.len());
+    aad.extend_from_slice(actor_id.as_bytes());
+    aad.push(0x00);
+    aad.extend_from_slice(key.as_bytes());
+    aad
+}
 
 static MEMORY_CRYPTO_HOOK: OnceLock<Arc<dyn MemoryCryptoHook>> = OnceLock::new();
 
@@ -239,37 +272,50 @@ pub fn memory_crypto_enabled() -> bool {
 }
 
 /// Encrypt a memory value if crypto is registered. Returns
-/// `Some((key_id, ciphertext))` when crypto is active, `None` when
-/// the legacy plaintext path should be used. Errors on crypto failure
-/// (caller decides whether to fall back or fail the write — current
-/// policy is to fail the write rather than silently downgrade).
+/// `Some((key_id, ciphertext, format_version))` when crypto is active,
+/// `None` when the legacy plaintext path should be used. Errors on
+/// crypto failure (caller decides whether to fall back or fail the
+/// write — current policy is to fail the write rather than silently
+/// downgrade).
+///
+/// MCP-S2: `aad` MUST be `build_memory_aad(actor_id, key)` so the
+/// ciphertext is bound to the composite primary key. Caller is
+/// responsible for passing the same bytes at decrypt time.
 ///
 /// Persist paths serialize the value ONCE at the top (for the size cap
 /// check + embedding text input) and pass the same string through here
 /// to avoid redundant `serde_json::to_string` round-trips per write.
 pub(crate) async fn maybe_encrypt_value_serialized(
     plaintext: String,
-) -> anyhow::Result<Option<(Uuid, Vec<u8>)>> {
+    aad: Vec<u8>,
+) -> anyhow::Result<Option<(Uuid, Vec<u8>, i16)>> {
     let Some(hook) = MEMORY_CRYPTO_HOOK.get().cloned() else {
         return Ok(None);
     };
-    let (key_id, ciphertext) = hook.encrypt(plaintext).await?;
-    Ok(Some((key_id, ciphertext)))
+    let (key_id, ciphertext, version) = hook.encrypt(plaintext, aad).await?;
+    Ok(Some((key_id, ciphertext, version)))
 }
 
 /// Resolve a stored memory value: prefer ciphertext (`value_enc` +
 /// `value_key_id`) when both are present and crypto is registered;
 /// otherwise return the plaintext fallback. Returns `null` JSON when
 /// neither is present (corrupt row — caller should treat as "missing").
+///
+/// MCP-S2: `aad` is the row's `build_memory_aad(actor_id, key)`
+/// bytes and `format_version` is the per-row `value_format` column.
+/// Together they drive the AAD-binding dispatch — v0 rows accept
+/// empty AAD, v1 rows require exactly the bytes used at encrypt time.
 pub async fn resolve_stored_value(
     value_plain: Option<serde_json::Value>,
     value_enc: Option<Vec<u8>>,
     value_key_id: Option<Uuid>,
+    aad: Vec<u8>,
+    format_version: i16,
 ) -> anyhow::Result<serde_json::Value> {
     if let (Some(enc), Some(key_id)) = (value_enc, value_key_id) {
         if let Some(hook) = MEMORY_CRYPTO_HOOK.get().cloned() {
             let plaintext = hook
-                .decrypt(key_id, enc)
+                .decrypt(key_id, enc, aad, format_version)
                 .await
                 .context("memory value decryption")?;
             return serde_json::from_str(&plaintext)
@@ -287,20 +333,25 @@ pub async fn resolve_stored_value(
     Ok(value_plain.unwrap_or(serde_json::Value::Null))
 }
 
-/// Decrypt the value column from a `PgRow` that includes `value`,
-/// `value_enc`, and `value_key_id`. Sites that build raw `sqlx::query`
-/// SELECTs (i.e. don't go through the canonical `recall_*` helpers)
-/// should use this to stay encryption-aware.
+/// Decrypt the value column from a `PgRow` that includes `actor_id`,
+/// `key`, `value`, `value_enc`, `value_key_id`, and `value_format`.
+/// Sites that build raw `sqlx::query` SELECTs (i.e. don't go through
+/// the canonical `recall_*` helpers) should use this to stay
+/// encryption-aware.
 ///
 /// Phase B note: once the legacy `value` column is dropped, the
 /// `value_plain` fallback becomes unreachable in production but the
 /// helper remains valid because `try_get("value")` simply returns `None`.
 pub async fn decrypt_row_value(row: &sqlx::postgres::PgRow) -> anyhow::Result<serde_json::Value> {
     use sqlx::Row as _;
+    let actor_id: Uuid = row.try_get("actor_id").unwrap_or(Uuid::nil());
+    let key: String = row.try_get("key").unwrap_or_default();
     let value_plain: Option<serde_json::Value> = row.try_get("value").ok();
     let value_enc: Option<Vec<u8>> = row.try_get("value_enc").ok();
     let value_key_id: Option<Uuid> = row.try_get("value_key_id").ok();
-    resolve_stored_value(value_plain, value_enc, value_key_id).await
+    let value_format: i16 = row.try_get("value_format").unwrap_or(0);
+    let aad = build_memory_aad(actor_id, &key);
+    resolve_stored_value(value_plain, value_enc, value_key_id, aad, value_format).await
 }
 
 /// Public helper — spawn graph-RAG entity extraction for a memory
@@ -499,7 +550,13 @@ pub async fn persist_memory_with_metadata(
     // Phase B of at-rest encryption: writes always go through the crypto
     // hook. The hook MUST be registered before any actor-memory write —
     // unregistered hook = panic-loud bail (no plaintext fallback path).
-    let (key_id, ciphertext) = maybe_encrypt_value_serialized(serialized)
+    //
+    // MCP-S2: AAD = build_memory_aad(actor_id, key) binds the
+    // ciphertext to its composite primary key. An attacker with DB
+    // write capability who swaps `value_enc` onto a different
+    // (actor_id, key) row will fail AES-GCM tag verification on read.
+    let aad = build_memory_aad(actor_id, key);
+    let (key_id, ciphertext, value_format) = maybe_encrypt_value_serialized(serialized, aad)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -510,11 +567,12 @@ pub async fn persist_memory_with_metadata(
 
     sqlx::query(
         "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, memory_type, expires_at, embedding, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (actor_id, key) DO UPDATE SET \
              value_enc     = EXCLUDED.value_enc, \
              value_key_id  = EXCLUDED.value_key_id, \
+             value_format  = EXCLUDED.value_format, \
              memory_type   = EXCLUDED.memory_type, \
              expires_at    = EXCLUDED.expires_at, \
              embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
@@ -525,6 +583,7 @@ pub async fn persist_memory_with_metadata(
     .bind(key)
     .bind(ciphertext.as_slice())
     .bind(key_id)
+    .bind(value_format)
     .bind(canonical_type)
     .bind(expires_at)
     .bind(embedding)
@@ -629,7 +688,10 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     let embedded = embedding.is_some();
 
     // Same Phase-B always-encrypt path as persist_memory.
-    let (key_id, ciphertext) = maybe_encrypt_value_serialized(serialized)
+    // MCP-S2: AAD binding to composite (actor_id, key) — see
+    // persist_memory above for the rationale.
+    let aad = build_memory_aad(actor_id, key);
+    let (key_id, ciphertext, value_format) = maybe_encrypt_value_serialized(serialized, aad)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -640,11 +702,12 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
 
     sqlx::query(
         "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, memory_type, expires_at, embedding, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (actor_id, key) DO UPDATE SET \
              value_enc     = EXCLUDED.value_enc, \
              value_key_id  = EXCLUDED.value_key_id, \
+             value_format  = EXCLUDED.value_format, \
              memory_type   = EXCLUDED.memory_type, \
              expires_at    = EXCLUDED.expires_at, \
              embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
@@ -655,6 +718,7 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     .bind(key)
     .bind(ciphertext.as_slice())
     .bind(key_id)
+    .bind(value_format)
     .bind(canonical_type)
     .bind(expires_at)
     .bind(embedding)
@@ -684,8 +748,10 @@ pub async fn recall_exact(
     key: &str,
 ) -> Result<Option<MemoryRow>> {
     // Phase B: every row carries ciphertext; decrypt via the registered hook.
+    // MCP-S2: SELECT value_format so the AAD-dispatch resolver picks
+    // v0 vs v1.
     let row = sqlx::query(
-        "SELECT key, value_enc, value_key_id, memory_type, expires_at, updated_at \
+        "SELECT key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at \
          FROM actor_memory \
          WHERE actor_id = $1 AND key = $2 \
            AND (expires_at IS NULL OR expires_at > now())",
@@ -697,12 +763,15 @@ pub async fn recall_exact(
     .context("recall_exact")?;
 
     let Some(r) = row else { return Ok(None) };
+    let row_key: String = r.get("key");
     let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
     let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
-    let value = resolve_stored_value(None, value_enc, value_key_id).await?;
+    let value_format: i16 = r.try_get("value_format").unwrap_or(0);
+    let aad = build_memory_aad(actor_id, &row_key);
+    let value = resolve_stored_value(None, value_enc, value_key_id, aad, value_format).await?;
 
     Ok(Some(MemoryRow {
-        key: r.get("key"),
+        key: row_key,
         value,
         memory_type: r.get("memory_type"),
         expires_at: r.get("expires_at"),
@@ -1013,7 +1082,7 @@ pub async fn recall_semantic_filtered(
         // Using `!= ALL(...)` over `NOT IN (...)` is safer with NULLs:
         // `NULL NOT IN (...)` evaluates to UNKNOWN and would drop rows.
         let sql =
-            "SELECT key, value_enc, value_key_id, memory_type, expires_at, updated_at, metadata, \
+            "SELECT key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata, \
                           (1.0 - (embedding <=> $2)) AS score \
                    FROM actor_memory \
                    WHERE actor_id = $1 \
@@ -1041,14 +1110,20 @@ pub async fn recall_semantic_filtered(
         if !rows.is_empty() {
             // Decrypt each row's value (Phase A) — score column is per-row,
             // can't use the positional helper. Build hits inline so we can
-            // preserve the cosine-derived score.
+            // preserve the cosine-derived score. MCP-S2: AAD-dispatch on
+            // per-row value_format using build_memory_aad(actor_id, key).
             let mut hits = Vec::with_capacity(rows.len());
             for r in rows {
+                let row_key: String = r.get("key");
                 let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
                 let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
-                let value = resolve_stored_value(None, value_enc, value_key_id).await?;
+                let value_format: i16 = r.try_get("value_format").unwrap_or(0);
+                let aad = build_memory_aad(actor_id, &row_key);
+                let value =
+                    resolve_stored_value(None, value_enc, value_key_id, aad, value_format)
+                        .await?;
                 hits.push(MemoryHit {
-                    key: r.get("key"),
+                    key: row_key,
                     value,
                     memory_type: r.get("memory_type"),
                     expires_at: r.get("expires_at"),
@@ -1160,7 +1235,7 @@ async fn recall_keyword_inner(
         // search surface; this fallback only fires when embeddings are
         // unavailable (queue stall, model down).
         let rows = sqlx::query(
-            "SELECT key, value_enc, value_key_id, memory_type, expires_at, updated_at, metadata \
+            "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata \
              FROM actor_memory \
              WHERE actor_id = $1 \
                AND (expires_at IS NULL OR expires_at > now()) \
@@ -1286,11 +1361,20 @@ fn is_stopword(t: &str) -> bool {
 async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<MemoryHit>> {
     let mut hits = Vec::with_capacity(rows.len());
     for (i, r) in rows.into_iter().enumerate() {
+        // MCP-S2: SELECT actor_id + value_format alongside the existing
+        // columns so the AAD-dispatch resolver picks the right path.
+        // Callers' SQL must include `actor_id` and `value_format` in
+        // the projection.
+        let actor_id: Uuid = r.try_get("actor_id").unwrap_or(Uuid::nil());
+        let row_key: String = r.get("key");
         let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
         let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
-        let value = resolve_stored_value(None, value_enc, value_key_id).await?;
+        let value_format: i16 = r.try_get("value_format").unwrap_or(0);
+        let aad = build_memory_aad(actor_id, &row_key);
+        let value = resolve_stored_value(None, value_enc, value_key_id, aad, value_format)
+            .await?;
         hits.push(MemoryHit {
-            key: r.get("key"),
+            key: row_key,
             value,
             memory_type: r.get("memory_type"),
             expires_at: r.get("expires_at"),
@@ -1470,10 +1554,27 @@ pub async fn clone_memories(
     source_actor_id: Uuid,
     target_actor_id: Uuid,
 ) -> Result<i64> {
-    let count: i64 = sqlx::query_scalar(
+    // MCP-S2: v1 ciphertexts bind AAD = build_memory_aad(actor_id, key)
+    // so a raw SQL ciphertext-passthrough across actors would produce
+    // rows whose AAD bytes don't match their new actor_id, breaking
+    // decryption. Three paths:
+    //   1. v0 rows (no AAD) — safe to bulk-copy ciphertext directly.
+    //   2. v1 rows — must be DECRYPTED with the source AAD, then
+    //      RE-ENCRYPTED with the target AAD, then written.
+    //   3. Rows without a crypto hook (test/standalone) — copy plaintext
+    //      legacy column unchanged (current legacy behaviour).
+    //
+    // The per-row decrypt+re-encrypt cost is meaningful (one extra
+    // AES-GCM round per row + DEK lookup) but clone_memories is a
+    // relatively rare admin operation; correctness > throughput here.
+
+    // First handle v0 rows via the existing bulk-SQL passthrough.
+    // value_format = 0 means no AAD was bound, so the ciphertext is
+    // decryption-equivalent under any actor_id.
+    let v0_count: i64 = sqlx::query_scalar(
         "WITH inserted AS ( \
-             INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, memory_type, expires_at, metadata, updated_at) \
-             SELECT $1, key, value_enc, value_key_id, memory_type, \
+             INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, updated_at) \
+             SELECT $1, key, value_enc, value_key_id, value_format, memory_type, \
                     CASE WHEN memory_type = 'semantic' THEN NULL \
                          WHEN memory_type = 'episodic' THEN now() + INTERVAL '7 days' \
                     END, \
@@ -1481,11 +1582,13 @@ pub async fn clone_memories(
                     now() \
              FROM actor_memory \
              WHERE actor_id = $2 \
+               AND value_format = 0 \
                AND memory_type IN ('semantic', 'episodic') \
                AND (expires_at IS NULL OR expires_at > NOW()) \
              ON CONFLICT (actor_id, key) DO UPDATE \
                SET value_enc = EXCLUDED.value_enc, \
                    value_key_id = EXCLUDED.value_key_id, \
+                   value_format = EXCLUDED.value_format, \
                    memory_type = EXCLUDED.memory_type, \
                    expires_at = EXCLUDED.expires_at, \
                    metadata = EXCLUDED.metadata, \
@@ -1497,8 +1600,86 @@ pub async fn clone_memories(
     .bind(source_actor_id)
     .fetch_one(pool)
     .await
-    .context("clone_memories: bulk copy semantic + episodic rows")?;
-    Ok(count)
+    .context("clone_memories: bulk copy v0 (legacy no-AAD) rows")?;
+
+    // Then handle v1 rows via per-row decrypt-and-re-encrypt. The hook
+    // MUST be registered for this branch since v1 always has ciphertext.
+    let v1_rows = sqlx::query(
+        "SELECT key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata \
+         FROM actor_memory \
+         WHERE actor_id = $1 \
+           AND value_format = 1 \
+           AND memory_type IN ('semantic', 'episodic') \
+           AND (expires_at IS NULL OR expires_at > NOW())",
+    )
+    .bind(source_actor_id)
+    .fetch_all(pool)
+    .await
+    .context("clone_memories: select v1 source rows")?;
+
+    let mut v1_count: i64 = 0;
+    if !v1_rows.is_empty() {
+        let hook = MEMORY_CRYPTO_HOOK.get().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "clone_memories: v1 rows present but no MemoryCryptoHook registered — \
+                 register_memory_crypto_hook() must run before any v1 clone"
+            )
+        })?;
+        for r in v1_rows {
+            let key: String = r.get("key");
+            let value_enc: Vec<u8> = r.get("value_enc");
+            let value_key_id: Uuid = r.get("value_key_id");
+            let memory_type: String = r.get("memory_type");
+            let metadata: Option<serde_json::Value> = r.try_get("metadata").ok();
+            // Decrypt under SOURCE AAD.
+            let source_aad = build_memory_aad(source_actor_id, &key);
+            let plaintext = hook
+                .decrypt(value_key_id, value_enc, source_aad, 1)
+                .await
+                .with_context(|| {
+                    format!("clone_memories: decrypt v1 source row key={key}")
+                })?;
+            // Re-encrypt under TARGET AAD.
+            let target_aad = build_memory_aad(target_actor_id, &key);
+            let (new_key_id, new_ciphertext, new_format) = hook
+                .encrypt(plaintext.to_string(), target_aad)
+                .await
+                .with_context(|| {
+                    format!("clone_memories: re-encrypt v1 row key={key}")
+                })?;
+            let new_expires_at: Option<chrono::DateTime<chrono::Utc>> = match memory_type.as_str() {
+                "semantic" => None,
+                "episodic" => Some(chrono::Utc::now() + chrono::Duration::days(7)),
+                _ => continue,
+            };
+            sqlx::query(
+                "INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \
+                 ON CONFLICT (actor_id, key) DO UPDATE \
+                   SET value_enc = EXCLUDED.value_enc, \
+                       value_key_id = EXCLUDED.value_key_id, \
+                       value_format = EXCLUDED.value_format, \
+                       memory_type = EXCLUDED.memory_type, \
+                       expires_at = EXCLUDED.expires_at, \
+                       metadata = EXCLUDED.metadata, \
+                       updated_at = NOW()",
+            )
+            .bind(target_actor_id)
+            .bind(&key)
+            .bind(new_ciphertext.as_slice())
+            .bind(new_key_id)
+            .bind(new_format)
+            .bind(&memory_type)
+            .bind(new_expires_at)
+            .bind(metadata)
+            .execute(pool)
+            .await
+            .with_context(|| format!("clone_memories: insert v1 target row key={key}"))?;
+            v1_count += 1;
+        }
+    }
+
+    Ok(v0_count + v1_count)
 }
 
 pub async fn forget_prefix(pool: &Pool<Postgres>, actor_id: Uuid, prefix: &str) -> Result<u64> {
@@ -1676,6 +1857,76 @@ pub async fn sweep_expired(pool: &Pool<Postgres>, grace_hours: i64) -> Result<u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ────────────────────────────────────────────────────────────────
+    // MCP-S2: build_memory_aad invariants
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_memory_aad_encodes_actor_id_then_separator_then_key() {
+        let actor =
+            Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("valid uuid");
+        let aad = build_memory_aad(actor, "my-key");
+        // 16 actor_id bytes
+        assert_eq!(&aad[..16], actor.as_bytes());
+        // 1 separator byte
+        assert_eq!(aad[16], 0x00);
+        // remaining bytes = key
+        assert_eq!(&aad[17..], b"my-key");
+    }
+
+    #[test]
+    fn build_memory_aad_changes_when_actor_changes() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert_ne!(build_memory_aad(a, "k"), build_memory_aad(b, "k"));
+    }
+
+    #[test]
+    fn build_memory_aad_changes_when_key_changes() {
+        let a = Uuid::new_v4();
+        assert_ne!(build_memory_aad(a, "k1"), build_memory_aad(a, "k2"));
+    }
+
+    #[test]
+    fn build_memory_aad_separator_blocks_actor_id_collision_attack() {
+        // Without the 0x00 separator, an attacker could pick a `key`
+        // that starts with another actor's UUID bytes and produce the
+        // same AAD as that other actor's legitimate row. The separator
+        // forces the AAD's first 17 bytes to encode (actor_id, 0x00),
+        // and no value of `key` can manufacture that prefix for a
+        // different actor_id.
+        let actor_a = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let actor_b = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        // Construct a malicious key that contains actor_b's bytes.
+        let mut malicious_key = String::new();
+        for b in actor_b.as_bytes() {
+            malicious_key.push(*b as char);
+        }
+        // AAD for (actor_a, malicious_key) has actor_a prefix +
+        // separator + actor_b bytes as the "key" portion.
+        let aad_a = build_memory_aad(actor_a, &malicious_key);
+        let aad_b = build_memory_aad(actor_b, "");
+        assert_ne!(
+            aad_a, aad_b,
+            "0x00 separator must prevent collision under malicious key choice"
+        );
+        // Specifically, aad_a starts with actor_a; aad_b starts with actor_b.
+        assert_eq!(&aad_a[..16], actor_a.as_bytes());
+        assert_eq!(&aad_b[..16], actor_b.as_bytes());
+    }
+
+    #[test]
+    fn build_memory_aad_empty_key_still_includes_separator() {
+        // Empty `key` is unusual but legitimate (e.g., the "default"
+        // memory slot for an actor). The separator MUST still appear
+        // so the AAD length signals "key is empty" vs "key was elided".
+        let a = Uuid::new_v4();
+        let aad = build_memory_aad(a, "");
+        assert_eq!(aad.len(), 17);
+        assert_eq!(&aad[..16], a.as_bytes());
+        assert_eq!(aad[16], 0x00);
+    }
 
     #[test]
     fn default_ttl_by_type() {

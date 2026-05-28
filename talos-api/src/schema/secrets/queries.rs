@@ -72,6 +72,13 @@ impl SecretsQueries {
     async fn secret(&self, ctx: &Context<'_>, key_path: String) -> Result<Secret> {
         crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::SecretsRead)?;
 
+        // MCP-1003 sibling: the secret(key_path) READ surface must apply
+        // the same canonical validation the create/update/delete mutations
+        // enforce, or callers can probe rows with uppercase / `//` /
+        // control-char / path-traversal-shaped key_paths that are
+        // unreachable via the documented vault_path_permitted matcher.
+        crate::validation::validate_vault_key_path(&key_path)?;
+
         let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
 
         // Get authenticated user_id from context

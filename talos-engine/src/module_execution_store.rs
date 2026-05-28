@@ -85,8 +85,12 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // input_data_enc holds the ciphertext, and payload_enc_key_id
         // points at the DEK. Without the wiring, we fall through to the
         // legacy plaintext write path.
+        // MCP-S2: AAD = module_execution_id binds the ciphertext to
+        // this row so an attacker with DB write capability can't swap
+        // payload columns across executions.
         let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
             self.secrets_manager.as_ref(),
+            id,
             Some(input),
             None,
             None,
@@ -114,6 +118,8 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         };
         let pt_input = redacted_pt_input.as_ref();
 
+        // MCP-S2: persist the AAD format version alongside the bundle.
+        let payload_format = bundle.format_version;
         let result = if race_safe_status {
             // module_executions has a real top-level trigger_type column
             // (migration 012_node_executions.sql then renamed via
@@ -124,14 +130,14 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
             sqlx::query(
                 "INSERT INTO module_executions \
                  (id, module_id, user_id, status, \
-                  input_data, input_data_enc, payload_enc_key_id, \
+                  input_data, input_data_enc, payload_enc_key_id, payload_format, \
                   workflow_execution_id, trigger_type, started_at) \
                  SELECT $1, $2, $3, \
                      CASE WHEN EXISTS( \
                          SELECT 1 FROM workflow_executions \
-                         WHERE id = $7 AND status IN ('failed', 'cancelled') \
+                         WHERE id = $8 AND status IN ('failed', 'cancelled') \
                      ) THEN 'cancelled' ELSE 'running' END, \
-                     $4, $5, $6, $7, $8, NOW() \
+                     $4, $5, $6, $7, $8, $9, NOW() \
                  ON CONFLICT DO NOTHING",
             )
             .bind(id)
@@ -140,6 +146,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
             .bind(pt_input)
             .bind(bundle.input_enc.as_deref())
             .bind(bundle.key_id)
+            .bind(payload_format)
             .bind(workflow_execution_id)
             .bind(trigger_type)
             .execute(&self.pool)
@@ -150,9 +157,9 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
             sqlx::query(
                 "INSERT INTO module_executions \
                  (id, module_id, user_id, status, \
-                  input_data, input_data_enc, payload_enc_key_id, \
+                  input_data, input_data_enc, payload_enc_key_id, payload_format, \
                   workflow_execution_id, trigger_type, started_at) \
-                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, NOW()) \
+                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, $9, NOW()) \
                  ON CONFLICT DO NOTHING",
             )
             .bind(id)
@@ -161,6 +168,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
             .bind(pt_input)
             .bind(bundle.input_enc.as_deref())
             .bind(bundle.key_id)
+            .bind(payload_format)
             .bind(workflow_execution_id)
             .bind(trigger_type)
             .execute(&self.pool)
@@ -181,8 +189,12 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // on payload_enc_key_id preserves the key set during record_started
         // (same DEK across the row) and only sets it on first write if
         // record_started ran without encryption (legacy migration window).
+        //
+        // MCP-S2: AAD = the same module_execution_id used in
+        // record_started, so the v1 ciphertext stays decryptable.
         let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
             self.secrets_manager.as_ref(),
+            id,
             None,
             Some(output),
             None,
@@ -228,17 +240,22 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
             talos_dlp_provider::redact_str(truncated)
         });
 
+        // MCP-S2: persist payload_format alongside the ciphertext so
+        // the read dispatcher routes v1 rows through the AAD path.
+        let payload_format = bundle.format_version;
         sqlx::query(
             "UPDATE module_executions \
              SET status = $1, output_data = $2, output_data_enc = $3, \
                  payload_enc_key_id = COALESCE(payload_enc_key_id, $4), \
-                 duration_ms = $5, error_message = $6, completed_at = NOW() \
-             WHERE id = $7",
+                 payload_format = $5, \
+                 duration_ms = $6, error_message = $7, completed_at = NOW() \
+             WHERE id = $8",
         )
         .bind(status)
         .bind(pt_output)
         .bind(bundle.output_enc.as_deref())
         .bind(bundle.key_id)
+        .bind(payload_format)
         .bind(duration_ms)
         .bind(redacted_error.as_deref())
         .bind(id)

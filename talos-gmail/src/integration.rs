@@ -354,8 +354,12 @@ impl GmailIntegrationService {
 
         let access_token = token_data.access_token;
         let refresh_token = token_data.refresh_token;
-        let token_expires_at =
-            Some(Utc::now() + Duration::seconds(token_data.expires_in.unwrap_or(3600) as i64));
+        // MCP-960..962 sibling + chrono panic defense: route through
+        // the canonical helper so a misbehaving provider returning a
+        // u64 expires_in > i64::MAX doesn't wrap to a negative i64
+        // (immediate-expiry + refresh-storm) or trip
+        // `chrono::Duration::seconds`' internal i64-ms overflow panic.
+        let token_expires_at = Some(talos_oauth::oauth_expires_at(token_data.expires_in));
 
         // Get user's email address
         // MCP-533: GET with `bearer_auth(access_token)` — same Mode-B

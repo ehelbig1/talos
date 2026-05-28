@@ -2452,92 +2452,106 @@ async fn handle_list_module_catalog(
         .await
         .unwrap_or_default();
 
-    // Collect entries from disk if available; fall back to a minimal hardcoded list.
+    // MCP-H8: the catalog walk is heavy sync I/O — opendir, per-dir
+    // metadata read + template.rs read. Pre-fix this ran inline on
+    // the tokio async runtime thread, stalling every other handler
+    // on that worker thread for the duration of the walk. Hoist into
+    // `spawn_blocking` so the sync work runs on the blocking-thread
+    // pool. The handler is operator-facing (catalog dashboard) so
+    // throughput here is bounded by call frequency, but a stuck
+    // disk would otherwise block kubelet probes via the same worker
+    // thread.
+    let catalog_dir_owned = catalog_dir.to_path_buf();
     let entries: Vec<serde_json::Value> = if catalog_dir.is_dir() {
-        let mut items: Vec<serde_json::Value> = Vec::new();
-        if let Ok(read_dir) = std::fs::read_dir(catalog_dir) {
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let dir_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if dir_name.is_empty() {
-                    continue;
-                }
-
-                // Modules must have template.rs to be installable.
-                let template_path = path.join("template.rs");
-                if !template_path.exists() {
-                    continue;
-                }
-
-                // talos.json is required for catalog entries. Directories that
-                // only contain template.rs (e.g. example-node dev placeholders)
-                // are intentionally excluded: without metadata they would appear
-                // as null entries and inflate the catalog count inconsistently
-                // with the node_templates DB count.
-                let meta_path = path.join("talos.json");
-                let meta_bytes = match std::fs::read(&meta_path) {
-                    Ok(b) => b,
-                    Err(_) => continue, // Skip dirs without talos.json
-                };
-                let mut item = serde_json::from_slice::<serde_json::Value>(&meta_bytes)
-                    .unwrap_or(serde_json::json!({}));
-
-                // Ensure the `name` field matches the directory (source of truth).
-                if item.get("name").and_then(|v| v.as_str()).is_none() {
-                    if let Some(obj) = item.as_object_mut() {
-                        obj.insert("name".to_string(), serde_json::json!(dir_name));
+        tokio::task::spawn_blocking(move || {
+            let mut items: Vec<serde_json::Value> = Vec::new();
+            if let Ok(read_dir) = std::fs::read_dir(&catalog_dir_owned) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
                     }
-                }
+                    let dir_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if dir_name.is_empty() {
+                        continue;
+                    }
 
-                // If capability_world is missing from talos.json, read it from template.rs.
-                if item.get("capability_world").is_none() {
-                    if let Ok(src) = std::fs::read_to_string(&template_path) {
-                        if let Some(world) = extract_world_from_source(&src) {
-                            if let Some(obj) = item.as_object_mut() {
-                                obj.insert(
-                                    "capability_world".to_string(),
-                                    serde_json::json!(world),
-                                );
-                            }
-                            // Also derive allowed_hosts if not set.
-                            if item.get("allowed_hosts").is_none() {
-                                let hosts = default_allowed_hosts_for_world(&world);
+                    // Modules must have template.rs to be installable.
+                    let template_path = path.join("template.rs");
+                    if !template_path.exists() {
+                        continue;
+                    }
+
+                    // talos.json is required for catalog entries. Directories that
+                    // only contain template.rs (e.g. example-node dev placeholders)
+                    // are intentionally excluded: without metadata they would appear
+                    // as null entries and inflate the catalog count inconsistently
+                    // with the node_templates DB count.
+                    let meta_path = path.join("talos.json");
+                    let meta_bytes = match std::fs::read(&meta_path) {
+                        Ok(b) => b,
+                        Err(_) => continue, // Skip dirs without talos.json
+                    };
+                    let mut item =
+                        serde_json::from_slice::<serde_json::Value>(&meta_bytes)
+                            .unwrap_or(serde_json::json!({}));
+
+                    // Ensure the `name` field matches the directory (source of truth).
+                    if item.get("name").and_then(|v| v.as_str()).is_none() {
+                        if let Some(obj) = item.as_object_mut() {
+                            obj.insert("name".to_string(), serde_json::json!(dir_name));
+                        }
+                    }
+
+                    // If capability_world is missing from talos.json, read it from template.rs.
+                    if item.get("capability_world").is_none() {
+                        if let Ok(src) = std::fs::read_to_string(&template_path) {
+                            if let Some(world) = extract_world_from_source(&src) {
                                 if let Some(obj) = item.as_object_mut() {
                                     obj.insert(
-                                        "allowed_hosts".to_string(),
-                                        serde_json::json!(hosts),
+                                        "capability_world".to_string(),
+                                        serde_json::json!(world),
                                     );
+                                }
+                                // Also derive allowed_hosts if not set.
+                                if item.get("allowed_hosts").is_none() {
+                                    let hosts = default_allowed_hosts_for_world(&world);
+                                    if let Some(obj) = item.as_object_mut() {
+                                        obj.insert(
+                                            "allowed_hosts".to_string(),
+                                            serde_json::json!(hosts),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                items.push(item);
+                    items.push(item);
+                }
             }
-        }
-        // Sort by category then name for stable output
-        items.sort_by(|a, b| {
-            let cat_a = a
-                .get("category")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Uncategorized");
-            let cat_b = b
-                .get("category")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Uncategorized");
-            let name_a = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let name_b = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            cat_a.cmp(cat_b).then(name_a.cmp(name_b))
-        });
-        items
+            // Sort by category then name for stable output
+            items.sort_by(|a, b| {
+                let cat_a = a
+                    .get("category")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Uncategorized");
+                let cat_b = b
+                    .get("category")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Uncategorized");
+                let name_a = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let name_b = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                cat_a.cmp(cat_b).then(name_a.cmp(name_b))
+            });
+            items
+        })
+        .await
+        .unwrap_or_default()
     } else {
         // Test/dev environment: return a minimal representative list
         vec![
@@ -3383,39 +3397,51 @@ async fn handle_find_module_alternatives(
     // Build a map of display_name → catalog_slug from disk for install hints.
     // This resolves the impedance mismatch: node_templates.name = display_name,
     // but install_module_from_catalog takes the directory slug.
-    let mut display_to_slug: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let catalog_dir = std::path::Path::new("/app/module-templates");
-    if catalog_dir.is_dir() {
-        if let Ok(read_dir) = std::fs::read_dir(catalog_dir) {
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let slug = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                let meta_path = path.join("talos.json");
-                if let Ok(bytes) = std::fs::read(&meta_path) {
-                    if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        // Seeder uses display_name preferentially as node_templates.name
-                        let dn = meta
-                            .get("display_name")
-                            .or_else(|| meta.get("name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !dn.is_empty() && !slug.is_empty() {
-                            display_to_slug.insert(dn, slug);
+    // MCP-H8: sibling sync-fs catalog walk — hoist into
+    // `spawn_blocking` to keep the tokio runtime worker thread
+    // unblocked. Same rationale as the list_module_catalog walk above.
+    let catalog_dir = std::path::Path::new("/app/module-templates").to_path_buf();
+    let display_to_slug: std::collections::HashMap<String, String> = if catalog_dir.is_dir() {
+        tokio::task::spawn_blocking(move || {
+            let mut map: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            if let Ok(read_dir) = std::fs::read_dir(&catalog_dir) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let slug = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let meta_path = path.join("talos.json");
+                    if let Ok(bytes) = std::fs::read(&meta_path) {
+                        if let Ok(meta) =
+                            serde_json::from_slice::<serde_json::Value>(&bytes)
+                        {
+                            // Seeder uses display_name preferentially as node_templates.name
+                            let dn = meta
+                                .get("display_name")
+                                .or_else(|| meta.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !dn.is_empty() && !slug.is_empty() {
+                                map.insert(dn, slug);
+                            }
                         }
                     }
                 }
             }
-        }
-    }
+            map
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Helper: enrich a TemplateAlternativeRow into a result object
     let enrich = |r: &talos_module_repository::TemplateAlternativeRow,

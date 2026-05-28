@@ -485,16 +485,29 @@ impl TotpService {
     }
 
     /// Encrypt a TOTP secret using the SecretsManager's envelope encryption (AES-256-GCM).
-    /// Returns a base64-encoded string containing the key ID, nonce, and ciphertext.
-    async fn encrypt_totp_secret(&self, secret: &str) -> Result<String> {
+    /// Returns the encoded ciphertext string AND the AAD format version
+    /// that must be persisted to `users.totp_secret_format` alongside it.
+    ///
+    /// MCP-S2: writes always use v1 with AAD bound to `users.id` so an
+    /// attacker with DB write access can't swap one user's TOTP
+    /// ciphertext onto another row (the pre-fix swap was a silent
+    /// 2FA bypass). v0 reads are preserved (see `decrypt_totp_secret`)
+    /// for backward compatibility on existing rows that haven't been
+    /// re-encrypted yet.
+    async fn encrypt_totp_secret(&self, secret: &str, user_id: Uuid) -> Result<(String, i16)> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let (key_id, encrypted_bytes) = self.secrets_manager.encrypt_value(secret).await?;
+        let (key_id, encrypted_bytes, version) = self
+            .secrets_manager
+            .encrypt_value_aad_v1(secret, user_id.as_bytes())
+            .await?;
         // Encode as: key_id_hex:base64(nonce||ciphertext)
         let encoded = format!("{}:{}", key_id, STANDARD.encode(&encrypted_bytes));
-        Ok(encoded)
+        Ok((encoded, version))
     }
 
     /// Decrypt a TOTP secret that was encrypted with `encrypt_totp_secret`.
+    /// Dispatches on the per-row `totp_secret_format` column (0 = legacy
+    /// no-AAD, 1 = AAD-bound to `user_id` bytes).
     ///
     /// Returns the plaintext wrapped in [`zeroize::Zeroizing<String>`]
     /// so the heap allocation backing the TOTP shared-secret bytes is
@@ -503,6 +516,8 @@ impl TotpService {
     async fn decrypt_totp_secret(
         &self,
         encrypted: &str,
+        user_id: Uuid,
+        format_version: i16,
     ) -> Result<zeroize::Zeroizing<String>> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let parts: Vec<&str> = encrypted.splitn(2, ':').collect();
@@ -516,7 +531,7 @@ impl TotpService {
             .decode(parts[1])
             .map_err(|_| anyhow!("Invalid base64 in encrypted TOTP secret"))?;
         self.secrets_manager
-            .decrypt_value_by_key(key_id, &encrypted_bytes)
+            .decrypt_versioned(key_id, &encrypted_bytes, user_id.as_bytes(), format_version)
             .await
     }
 
@@ -557,8 +572,13 @@ impl TotpService {
             hashed_codes.push(hash);
         }
 
-        // Encrypt the TOTP secret before storing
-        let encrypted_secret = self.encrypt_totp_secret(secret).await?;
+        // MCP-S2: encrypt the TOTP secret with AAD = user_id so an
+        // attacker with DB write capability can't swap victim's
+        // totp_secret onto attacker's row (silent 2FA bypass pre-fix).
+        // The encrypt helper returns the wire-format string and the
+        // AAD version constant (1); both must be persisted together.
+        let (encrypted_secret, format_version) =
+            self.encrypt_totp_secret(secret, user_id).await?;
 
         // Atomic enable — `WHERE totp_enabled IS NOT TRUE` rejects the
         // overwrite if 2FA is already on. `rows_affected() == 0` means
@@ -573,10 +593,11 @@ impl TotpService {
         // similar atomic UPDATE in `login`.
         let result = sqlx::query(
             "UPDATE users
-             SET totp_secret = $1, totp_enabled = true, backup_codes = $2
-             WHERE id = $3 AND totp_enabled IS NOT TRUE",
+             SET totp_secret = $1, totp_secret_format = $2, totp_enabled = true, backup_codes = $3
+             WHERE id = $4 AND totp_enabled IS NOT TRUE",
         )
         .bind(&encrypted_secret)
+        .bind(format_version)
         .bind(&hashed_codes[..])
         .bind(user_id)
         .execute(&self.db_pool)
@@ -667,13 +688,25 @@ impl TotpService {
 
         // Fetch user data outside a transaction — TOTP verification doesn't
         // modify DB state so we don't need a lock for that path.
-        // NOTE: query text must match the cached sqlx offline entry exactly.
-        let user = sqlx::query!(
-            "SELECT totp_secret, totp_enabled, backup_codes
+        // MCP-S2: `totp_secret_format` is the AEAD AAD version for
+        // `totp_secret`; the dispatcher routes v0 rows (legacy, no AAD)
+        // through the empty-AAD decrypt and v1 rows through the
+        // AAD=user_id decrypt. sqlx::query (dynamic) avoids the offline
+        // cache regeneration churn that adding a column to the
+        // `query!`-macro version would trigger.
+        #[derive(sqlx::FromRow)]
+        struct TotpUserRow {
+            totp_secret: Option<String>,
+            totp_enabled: bool,
+            backup_codes: Option<Vec<String>>,
+            totp_secret_format: i16,
+        }
+        let user = sqlx::query_as::<_, TotpUserRow>(
+            "SELECT totp_secret, totp_enabled, backup_codes, totp_secret_format
              FROM users
              WHERE id = $1",
-            user_id
         )
+        .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?
         .ok_or_else(|| anyhow!("User not found"))?;
@@ -686,8 +719,13 @@ impl TotpService {
             .totp_secret
             .ok_or_else(|| anyhow!("TOTP secret not found"))?;
 
-        // Decrypt the TOTP secret before use
-        let secret = self.decrypt_totp_secret(&encrypted_secret).await?;
+        // Decrypt the TOTP secret before use. The version column +
+        // user_id bytes together drive the AAD-binding dispatch (MCP-S2);
+        // a swapped ciphertext (different `user_id` on the v1 row) fails
+        // AES-GCM tag verification and propagates as Err.
+        let secret = self
+            .decrypt_totp_secret(&encrypted_secret, user_id, user.totp_secret_format)
+            .await?;
 
         // Try TOTP code first.
         if self.verify_code(&secret, email, code)? {
