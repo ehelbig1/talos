@@ -270,22 +270,12 @@ impl HotUpdateService {
                         workflow_name, workflow_id, actor_id
                     )));
                 };
-                let actor_rank =
-                    talos_capability_world::actor_world_rank_strict(&actor_max).unwrap_or(0);
-                // Wasm-security review 2026-05-23 (M): pair the linear
-                // rank check with the partial-order subset check. See
-                // the matching block in
-                // `talos-inline-compile-service/src/lib.rs` for the
-                // Database-vs-Agent class this closes.
-                use std::str::FromStr;
-                let req_world =
-                    talos_capability_world::CapabilityWorld::from_str(&effective_world)
-                        .unwrap_or(talos_capability_world::CapabilityWorld::Unknown);
-                let actor_world =
-                    talos_capability_world::CapabilityWorld::from_str(&actor_max)
-                        .unwrap_or(talos_capability_world::CapabilityWorld::Unknown);
-                let subset_ok = req_world.is_subset_of(&actor_world);
-                if new_rank > actor_rank || !subset_ok {
+                // Wasm-security review 2026-05-28 (HIGH): single canonical
+                // partial-order ceiling gate (replaces the inline rank+subset
+                // pair from the 2026-05-23 review). `ceiling_permits` fully
+                // subsumes the linear-rank check and fail-closes on unknown
+                // actor / module worlds.
+                if !talos_capability_world::ceiling_permits(&actor_max, &effective_world) {
                     return Err(HotUpdateError::CapabilityCeilingViolation(format!(
                         "Capability ceiling violation: hot-update would recompile module '{}' to \
                          world '{}', but workflow '{}' ({}) binds actor {} whose \

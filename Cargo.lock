@@ -7426,6 +7426,7 @@ dependencies = [
  "talos-webhooks",
  "talos-workflow-authorization",
  "talos-workflow-creation",
+ "talos-workflow-creation-helpers",
  "talos-workflow-engine",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
@@ -7831,6 +7832,7 @@ dependencies = [
  "sqlx",
  "talos-dlp-provider",
  "talos-engine-events",
+ "talos-module-payload-encryption",
  "talos-secrets-manager",
  "talos-text-util",
  "tokio",
@@ -8288,6 +8290,7 @@ dependencies = [
  "serde_json",
  "talos-secrets-manager",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -291,9 +291,10 @@ impl ActorsMutations {
                 _ => "http-node".to_string(),
             }
         };
-        if talos_capability_world::world_rank(&max_world)
-            > talos_capability_world::world_rank(&user_ceiling)
-        {
+        // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate
+        // (mirrors the MCP `handle_create_actor` fix) — the `world_rank`
+        // comparison wrongly admitted lattice-incomparable siblings.
+        if !talos_capability_world::ceiling_permits(&user_ceiling, &max_world) {
             return Err(async_graphql::Error::new(format!(
                 "Your capability ceiling is '{}'. Creating an actor with '{}' \
                  requires a higher grant — request elevation from a platform admin.",
@@ -606,9 +607,8 @@ impl ActorsMutations {
                     _ => "http-node".to_string(),
                 }
             };
-            if talos_capability_world::world_rank(w.as_str())
-                > talos_capability_world::world_rank(&user_ceiling)
-            {
+            // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate.
+            if !talos_capability_world::ceiling_permits(&user_ceiling, w.as_str()) {
                 return Err(async_graphql::Error::new(format!(
                     "Your capability ceiling is '{}'. Updating an actor to '{}' \
                      requires a higher grant — request elevation from a platform admin.",

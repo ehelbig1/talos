@@ -1199,6 +1199,90 @@ pub(crate) fn classify_private_ip(ip: std::net::IpAddr) -> Option<&'static str> 
     }
 }
 
+/// Tier-1 (local-Ollama-only) data-egress deny-check on a URL host.
+///
+/// Returns `Some(policy)` — the `record_capability_denied` reason — when a
+/// Tier-1 actor must be refused this destination, `None` when allowed.
+///
+/// Two cases:
+/// 1. A known external LLM provider hostname (`is_external_llm_host`).
+/// 2. A **globally-routable IP literal**. The hostname deny-list (case 1) is
+///    name-based, so a guest with `allowed_hosts: ["*"]` could otherwise reach
+///    a provider by raw IP (`https://<ip>/v1/messages`) and slip the ceiling —
+///    the IP-literal bypass found in the 2026-05-28 review. A public IP literal
+///    is "data leaving the host" and has no legitimate Tier-1 use (local Ollama
+///    is reached via hostname/localhost/private IP). Private, loopback,
+///    link-local, CGNAT, and unspecified literals are governed by the SSRF
+///    classifier and remain allowed here (so `127.0.0.1:11434` Ollama works).
+///
+/// `host_lower` MUST already be lowercased by the caller (matches the existing
+/// call sites). IPv6 literals are accepted with or without surrounding
+/// brackets.
+fn tier1_egress_deny_reason(host_lower: &str) -> Option<&'static str> {
+    if talos_workflow_job_protocol::is_external_llm_host(host_lower) {
+        return Some("tier1-llm-egress");
+    }
+    let bare = host_lower
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host_lower);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        // Public/routable IP literal (SSRF classifier returns None) → deny.
+        if classify_private_ip(ip).is_none() {
+            return Some("tier1-public-ip-egress");
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tier1_egress_tests {
+    use super::tier1_egress_deny_reason;
+
+    #[test]
+    fn denies_known_provider_hostname() {
+        assert_eq!(
+            tier1_egress_deny_reason("api.anthropic.com"),
+            Some("tier1-llm-egress")
+        );
+    }
+
+    #[test]
+    fn denies_public_ip_literal() {
+        // Public IPv4 / IPv6 literals — the bypass class.
+        assert_eq!(
+            tier1_egress_deny_reason("160.79.104.10"),
+            Some("tier1-public-ip-egress")
+        );
+        assert_eq!(
+            tier1_egress_deny_reason("8.8.8.8"),
+            Some("tier1-public-ip-egress")
+        );
+        assert_eq!(
+            tier1_egress_deny_reason("[2606:4700:4700::1111]"),
+            Some("tier1-public-ip-egress")
+        );
+    }
+
+    #[test]
+    fn allows_local_ip_literals_for_ollama() {
+        // Local Ollama at loopback / private IP must still work for Tier-1.
+        assert_eq!(tier1_egress_deny_reason("127.0.0.1"), None);
+        assert_eq!(tier1_egress_deny_reason("192.168.1.50"), None);
+        assert_eq!(tier1_egress_deny_reason("10.0.0.3"), None);
+        assert_eq!(tier1_egress_deny_reason("[::1]"), None);
+        assert_eq!(tier1_egress_deny_reason("0.0.0.0"), None);
+    }
+
+    #[test]
+    fn allows_non_provider_hostnames() {
+        // A DNS hostname that isn't a provider is governed by allowed_hosts,
+        // not by this Tier-1 deny-check.
+        assert_eq!(tier1_egress_deny_reason("ollama.internal"), None);
+        assert_eq!(tier1_egress_deny_reason("example.com"), None);
+    }
+}
+
 /// Match a host against the per-module `allowed_hosts` patterns.
 ///
 /// Patterns can be:
@@ -3133,13 +3217,14 @@ impl wit_http::Host for TalosContext {
             talos_workflow_job_protocol::LlmTier::Tier1
         ) {
             let host_lower = host.to_ascii_lowercase();
-            if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                self.record_capability_denied("http-fetch", "tier1-llm-egress", host)
+            if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                self.record_capability_denied("http-fetch", policy, host)
                     .await;
                 tracing::warn!(
                     host,
                     actor_id = ?self.actor_id,
-                    "tier-1 actor attempted HTTP to external LLM host; refused"
+                    policy,
+                    "tier-1 actor egress refused (external LLM host or public IP literal)"
                 );
                 return Err(wit_http::Error::Forbiddenhost);
             }
@@ -3683,13 +3768,14 @@ impl wit_http::Host for TalosContext {
                 talos_workflow_job_protocol::LlmTier::Tier1
             ) {
                 let host_lower = host.to_ascii_lowercase();
-                if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                    self.record_capability_denied("http-fetch-all", "tier1-llm-egress", &host)
+                if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                    self.record_capability_denied("http-fetch-all", policy, &host)
                         .await;
                     tracing::warn!(
                         host = %host,
                         actor_id = ?self.actor_id,
-                        "tier-1 actor attempted fetch_all HTTP to external LLM host; refused"
+                        policy,
+                        "tier-1 actor fetch_all egress refused (external LLM host or public IP literal)"
                     );
                     validated.push(Err(wit_http::Error::Forbiddenhost));
                     continue;
@@ -6857,13 +6943,14 @@ impl TalosContext {
                 talos_workflow_job_protocol::LlmTier::Tier1
             ) {
                 let host_lower = host.to_ascii_lowercase();
-                if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                    self.record_capability_denied("graphql", "tier1-llm-egress", &host)
+                if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                    self.record_capability_denied("graphql", policy, &host)
                         .await;
                     tracing::warn!(
                         host = %host,
                         actor_id = ?self.actor_id,
-                        "tier-1 actor attempted GraphQL to external LLM host; refused"
+                        policy,
+                        "tier-1 actor GraphQL egress refused (external LLM host or public IP literal)"
                     );
                     return Err(wit_graphql::Error::Networkerror);
                 }
@@ -7230,13 +7317,14 @@ impl wit_webhook::Host for TalosContext {
             talos_workflow_job_protocol::LlmTier::Tier1
         ) {
             let host_lower = host.to_ascii_lowercase();
-            if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                self.record_capability_denied("webhook", "tier1-llm-egress", &host)
+            if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                self.record_capability_denied("webhook", policy, &host)
                     .await;
                 tracing::warn!(
                     host = %host,
                     actor_id = ?self.actor_id,
-                    "tier-1 actor attempted webhook to external LLM host; refused"
+                    policy,
+                    "tier-1 actor webhook egress refused (external LLM host or public IP literal)"
                 );
                 return Err(wit_webhook::Error::Sendfailed);
             }
@@ -12804,13 +12892,14 @@ impl wit_http_stream::Host for TalosContext {
             talos_workflow_job_protocol::LlmTier::Tier1
         ) {
             let host_lower = host.to_ascii_lowercase();
-            if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                self.record_capability_denied("http-stream", "tier1-llm-egress", &host)
+            if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                self.record_capability_denied("http-stream", policy, &host)
                     .await;
                 tracing::warn!(
                     host = %host,
                     actor_id = ?self.actor_id,
-                    "tier-1 actor attempted HTTP stream to external LLM host; refused"
+                    policy,
+                    "tier-1 actor HTTP stream egress refused (external LLM host or public IP literal)"
                 );
                 return Err(wit_http_stream::Error::ForbiddenHost);
             }

@@ -1439,6 +1439,18 @@ impl SecretsManager {
     /// number — there is no per-table v1/v2 divergence today.
     pub const AAD_FORMAT_V1: i16 = 1;
 
+    /// AAD format version 2. Currently used ONLY by `module_executions`
+    /// payload bundles (`talos_module_payload_encryption`), where v2 binds a
+    /// per-slot discriminator (input/output/trigger) into the AAD on top of
+    /// the row id — closing the within-row ciphertext-swap gap a DB-write
+    /// attacker could otherwise use (v1 bound only the row id, so all three
+    /// slots authenticated under identical AAD). At the crypto layer v2 is
+    /// decrypted identically to v1 (AES-GCM with the caller-supplied AAD); the
+    /// version number only tells the *reader* which AAD bytes to reconstruct.
+    /// Other tables continue to write v1 — there is no v2 row outside module
+    /// payloads.
+    pub const AAD_FORMAT_V2: i16 = 2;
+
     /// Decrypt a `secrets.encrypted_value` blob, dispatching on the
     /// row's `encryption_format_version`. Centralises the v0/v1 fork
     /// so every read path uses the same logic.
@@ -1506,13 +1518,18 @@ impl SecretsManager {
         // dispatch time, not as a mysterious decrypt failure.
         match format_version {
             0 => self.decrypt_value_by_key(key_id, encrypted).await,
-            v if v == Self::AAD_FORMAT_V1 => {
+            // v1 and v2 are decrypted identically at the crypto layer — both
+            // pass the caller-supplied AAD into AES-GCM. The version only
+            // signals to the *caller* how to reconstruct that AAD (v2 module
+            // payloads fold a per-slot tag in; see `talos_module_payload_encryption`).
+            v if v == Self::AAD_FORMAT_V1 || v == Self::AAD_FORMAT_V2 => {
                 self.decrypt_value_by_key_with_aad(key_id, encrypted, aad)
                     .await
             }
             other => Err(anyhow!(
-                "unknown encryption_format_version {other}; this build only knows 0 (legacy no-AAD) and {} (v1 AAD-bound). Caller may be reading rows written by a newer code version.",
-                Self::AAD_FORMAT_V1
+                "unknown encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), and {} (v2 slot-bound AAD). Caller may be reading rows written by a newer code version.",
+                Self::AAD_FORMAT_V1,
+                Self::AAD_FORMAT_V2
             )),
         }
     }

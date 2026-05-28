@@ -127,7 +127,14 @@ pub fn check_capability_ceiling(
     };
     for (mid, world) in module_worlds {
         let req_rank = talos_capability_world::world_rank(world);
-        if req_rank > max_rank {
+        // Wasm-security review 2026-05-28 (HIGH): gate on the partial-order
+        // lattice, not the linear rank. `req_rank > max_rank` wrongly admitted
+        // lattice-INCOMPARABLE siblings (e.g. a `cache-node` ceiling admitting a
+        // `secrets-node` module — `Secrets ⊄ Cache`). `ceiling_permits` is the
+        // canonical gate; `req_rank`/`max_rank` are retained only for the
+        // operator-facing diagnostic. The lattice strictly subsumes the rank
+        // check (every subset edge has rank(sub) <= rank(super)).
+        if !talos_capability_world::ceiling_permits(max_world, world) {
             return Err(CreatorAuthError::CapabilityCeilingViolation {
                 module_id: *mid,
                 module_world: world.clone(),

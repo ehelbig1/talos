@@ -377,6 +377,69 @@ pub fn world_rank(world: &str) -> u8 {
 }
 
 // ============================================================================
+// Capability-ceiling gate (partial-order lattice — the CORRECT semantics)
+// ============================================================================
+
+/// Map a capability-world string to its position in the [`CapabilityWorld`]
+/// lattice for ceiling comparison. Accepts both the short (`"secrets"`) and
+/// `-node`-suffixed (`"secrets-node"`) forms.
+///
+/// `llm-node` is an actor-ceiling-only privilege tier with **no distinct WIT
+/// world** — its capabilities are `http` + native LLM bindings (vault access
+/// is gated separately by `max_llm_tier`, never by the capability world). For
+/// lattice comparison it therefore maps to [`CapabilityWorld::Http`]: an
+/// `llm-node` ceiling permits exactly the modules an `http-node` ceiling does
+/// (it does NOT grant raw sockets / `network`, secrets, files, cache, etc.).
+///
+/// Returns `None` for any unrecognised string (including `Unknown`) so callers
+/// fail closed.
+fn lattice_world(world: &str) -> Option<CapabilityWorld> {
+    if world_short(world) == "llm" {
+        return Some(CapabilityWorld::Http);
+    }
+    // `FromStr` accepts both the short and `-node` forms for every world
+    // EXCEPT the `automation`/`trusted` alias group, where bare `automation`
+    // is not recognised (only `automation-node` / `trusted` / `trusted-node`).
+    // Try the string as given, then its `-node` form, so every spelling
+    // (`secrets`, `secrets-node`, `automation`, `automation-node`) resolves.
+    let parse = |s: &str| match s.parse::<CapabilityWorld>() {
+        Ok(CapabilityWorld::Unknown) | Err(_) => None,
+        Ok(w) => Some(w),
+    };
+    parse(world).or_else(|| parse(&format!("{}-node", world_short(world))))
+}
+
+/// Returns `true` iff a principal or module requiring `requested` capabilities
+/// is permitted to run under a `ceiling` capability world, using the
+/// **partial-order lattice** ([`CapabilityWorld::is_subset_of`]) rather than a
+/// linear rank.
+///
+/// This is the canonical actor/user capability-ceiling gate. It replaces the
+/// legacy `world_rank(requested) <= world_rank(ceiling)` comparison, which was
+/// unsound for lattice-INCOMPARABLE siblings: e.g. a `cache-node` ceiling
+/// (rank 5) wrongly admitted a `secrets-node` module (rank 3) even though
+/// `Secrets ⊄ Cache`, letting a vault-denied actor resolve real secrets at
+/// runtime (the worker enforces only the *module's* own world, never the
+/// actor's ceiling, so the ceiling gate is the only barrier).
+///
+/// `is_subset_of` strictly subsumes the old rank gate: every subset edge in
+/// the lattice has `world_rank(sub) <= world_rank(super)`, so `req_rank >
+/// max_rank` implies `!is_subset_of` — the lattice check rejects a superset of
+/// what the rank check rejected, and never loses a legitimate escalation path
+/// (`Minimal`/`Http`/`Network` → anything, `Secrets` → `Database`/`Agent`/
+/// `Trusted`, `Governance` → `Agent`/`Trusted`).
+///
+/// Fail-closed: if either side is unrecognised (malformed / legacy actor row,
+/// typo'd module world), returns `false`.
+#[must_use]
+pub fn ceiling_permits(ceiling: &str, requested: &str) -> bool {
+    match (lattice_world(ceiling), lattice_world(requested)) {
+        (Some(c), Some(r)) => r.is_subset_of(&c),
+        _ => false,
+    }
+}
+
+// ============================================================================
 // Capability-world enumeration helpers (extracted from
 // controller/src/mcp/capability_worlds.rs)
 // ============================================================================
@@ -563,5 +626,113 @@ mod ceiling_tests {
     fn denies_secrets_for_unknown_world() {
         assert!(!world_allows_secrets("custom-node"));
         assert!(!world_allows_secrets(""));
+    }
+
+    // -- ceiling_permits (partial-order lattice gate) --
+
+    #[test]
+    fn ceiling_permits_rejects_incomparable_tier3_siblings() {
+        // The exact bypass class the 2026-05-28 review found: a ceiling
+        // intended to DENY vault access must reject a secrets module even
+        // though world_rank(secrets)=3 < world_rank(cache)=5.
+        for ceiling in ["cache-node", "messaging-node", "filesystem-node", "governance-node"] {
+            assert!(
+                !ceiling_permits(ceiling, "secrets-node"),
+                "{ceiling} must NOT permit a secrets-node module (Secrets ⊄ {ceiling})"
+            );
+        }
+        // Symmetric: a secrets ceiling must not permit cache/messaging/filesystem.
+        for requested in ["cache-node", "messaging-node", "filesystem-node"] {
+            assert!(
+                !ceiling_permits("secrets-node", requested),
+                "secrets-node must NOT permit a {requested} module"
+            );
+        }
+        // tier-4 incomparable siblings: database ⊉ agent and agent ⊉ database.
+        assert!(!ceiling_permits("database-node", "agent-node"));
+        assert!(!ceiling_permits("agent-node", "database-node"));
+        // agent does NOT include cache/messaging/filesystem/database.
+        for requested in ["cache-node", "messaging-node", "filesystem-node", "database-node"] {
+            assert!(!ceiling_permits("agent-node", requested));
+        }
+    }
+
+    #[test]
+    fn ceiling_permits_allows_legitimate_escalation_paths() {
+        // Identity.
+        for w in ACTOR_CEILING_WORLDS {
+            if *w == "llm-node" {
+                continue; // llm has no module-world form; covered separately.
+            }
+            assert!(ceiling_permits(w, w), "{w} must permit itself");
+        }
+        // Minimal/Http/Network are subsets of higher worlds.
+        assert!(ceiling_permits("secrets-node", "minimal-node"));
+        assert!(ceiling_permits("secrets-node", "http-node"));
+        assert!(ceiling_permits("secrets-node", "network-node"));
+        // Secrets escalates to Database/Agent/Trusted.
+        assert!(ceiling_permits("database-node", "secrets-node"));
+        assert!(ceiling_permits("agent-node", "secrets-node"));
+        assert!(ceiling_permits("automation-node", "secrets-node"));
+        // Governance escalates to Agent/Trusted.
+        assert!(ceiling_permits("agent-node", "governance-node"));
+        assert!(ceiling_permits("automation-node", "governance-node"));
+        // Trusted/automation permits everything compilable.
+        for w in compilable_worlds() {
+            assert!(
+                ceiling_permits("automation-node", w),
+                "automation-node must permit every compilable world ({w})"
+            );
+        }
+    }
+
+    #[test]
+    fn ceiling_permits_handles_llm_node_ceiling() {
+        // llm-node ⇒ Http for lattice purposes: permits minimal/http, denies
+        // network (sockets), secrets, and everything above http.
+        assert!(ceiling_permits("llm-node", "minimal-node"));
+        assert!(ceiling_permits("llm-node", "http-node"));
+        assert!(ceiling_permits("llm-node", "llm-node"));
+        assert!(!ceiling_permits("llm-node", "network-node"));
+        assert!(!ceiling_permits("llm-node", "secrets-node"));
+        assert!(!ceiling_permits("llm-node", "automation-node"));
+    }
+
+    #[test]
+    fn ceiling_permits_fails_closed_on_unknown() {
+        // Unknown / legacy / malformed ceiling rejects every module.
+        assert!(!ceiling_permits("bogus-node", "minimal-node"));
+        assert!(!ceiling_permits("", "minimal-node"));
+        assert!(!ceiling_permits("tier1", "minimal-node"));
+        // Unknown module world rejected even under the highest ceiling.
+        assert!(!ceiling_permits("automation-node", "bogus-node"));
+        assert!(!ceiling_permits("automation-node", ""));
+    }
+
+    #[test]
+    fn ceiling_permits_accepts_short_and_node_forms() {
+        assert!(ceiling_permits("database", "secrets"));
+        assert!(ceiling_permits("database-node", "secrets-node"));
+        assert!(ceiling_permits("database", "secrets-node"));
+        assert!(ceiling_permits("database-node", "secrets"));
+    }
+
+    #[test]
+    fn ceiling_permits_subsumes_world_rank_gate() {
+        // Property: every subset edge has rank(sub) <= rank(super), so the
+        // lattice gate is strictly stricter than the linear rank gate. Verify
+        // there is NO (ceiling, requested) pair the rank gate rejected that
+        // the lattice gate now ALLOWS (that would be a regression).
+        let worlds = compilable_worlds();
+        for &c in worlds {
+            for &r in worlds {
+                let rank_allows = world_rank(r) <= world_rank(c);
+                let lattice_allows = ceiling_permits(c, r);
+                assert!(
+                    !(lattice_allows && !rank_allows),
+                    "lattice allows ({c} ⊇ {r}) but rank rejected it — rank/lattice inconsistency"
+                );
+            }
+        }
     }
 }

@@ -209,18 +209,32 @@ impl ModuleExecutionService {
     /// MCP-S2: `module_execution_id` + `format_version` together drive
     /// the AAD-binding dispatch. v0 rows route through empty-AAD;
     /// v1 rows require AAD = module_execution_id bytes.
+    ///
+    /// 2026-05-28 review (low): `slot` selects the per-column AAD so v2 rows
+    /// are decrypted with their slot-bound AAD. The shared
+    /// `talos_module_payload_encryption::decrypt_payload_slot` builds the AAD
+    /// for both writer and reader — keeping the two in lockstep across the
+    /// v1→v2 change. v0/v1 rows still decrypt (the helper returns row-id-only
+    /// AAD below v2).
     async fn read_payload(
         &self,
         module_execution_id: Uuid,
+        slot: talos_module_payload_encryption::PayloadSlot,
         plaintext: Option<JsonValue>,
         enc_bytes: Option<Vec<u8>>,
         key_id: Option<Uuid>,
         format_version: i16,
     ) -> Result<Option<JsonValue>> {
         if let (Some(sm), Some(bytes), Some(kid)) = (&self.secrets_manager, &enc_bytes, key_id) {
-            let s = sm
-                .decrypt_versioned(kid, bytes, module_execution_id.as_bytes(), format_version)
-                .await?;
+            let s = talos_module_payload_encryption::decrypt_payload_slot(
+                sm,
+                kid,
+                bytes,
+                module_execution_id,
+                slot,
+                format_version,
+            )
+            .await?;
             let v: JsonValue = serde_json::from_str(&s)?;
             return Ok(Some(v));
         }
@@ -746,14 +760,15 @@ impl ModuleExecutionService {
         let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
         let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
         let payload_format: i16 = r.try_get("payload_format").unwrap_or(0);
+        use talos_module_payload_encryption::PayloadSlot;
         let trigger_metadata = self
-            .read_payload(execution_id, pt_trigger, enc_trigger, key_id, payload_format)
+            .read_payload(execution_id, PayloadSlot::Trigger, pt_trigger, enc_trigger, key_id, payload_format)
             .await?;
         let input_data = self
-            .read_payload(execution_id, pt_input, enc_input, key_id, payload_format)
+            .read_payload(execution_id, PayloadSlot::Input, pt_input, enc_input, key_id, payload_format)
             .await?;
         let output_data = self
-            .read_payload(execution_id, pt_output, enc_output, key_id, payload_format)
+            .read_payload(execution_id, PayloadSlot::Output, pt_output, enc_output, key_id, payload_format)
             .await?;
         Ok(Some(ModuleExecution {
             id: r.get("id"),
@@ -825,14 +840,15 @@ impl ModuleExecutionService {
             let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
             let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
             let payload_format: i16 = r.try_get("payload_format").unwrap_or(0);
+            use talos_module_payload_encryption::PayloadSlot;
             let trigger_metadata = self
-                .read_payload(exec_id, pt_trigger, enc_trigger, key_id, payload_format)
+                .read_payload(exec_id, PayloadSlot::Trigger, pt_trigger, enc_trigger, key_id, payload_format)
                 .await?;
             let input_data = self
-                .read_payload(exec_id, pt_input, enc_input, key_id, payload_format)
+                .read_payload(exec_id, PayloadSlot::Input, pt_input, enc_input, key_id, payload_format)
                 .await?;
             let output_data = self
-                .read_payload(exec_id, pt_output, enc_output, key_id, payload_format)
+                .read_payload(exec_id, PayloadSlot::Output, pt_output, enc_output, key_id, payload_format)
                 .await?;
             out.push(ModuleExecution {
                 id: r.get("id"),

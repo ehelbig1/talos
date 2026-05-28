@@ -2170,9 +2170,18 @@ impl ExecutionRepository {
         };
         let output_data = match (&self.secrets_manager, enc_bytes, key_id) {
             (Some(sm), Some(bytes), Some(kid)) => {
-                match sm
-                    .decrypt_versioned(kid, &bytes, id.as_bytes(), payload_format)
-                    .await
+                // 2026-05-28 review (low): route through the shared slot-AAD
+                // helper (Output slot). v2 rows are slot-bound; v0/v1 rows still
+                // decrypt (helper returns row-id-only AAD below v2).
+                match talos_module_payload_encryption::decrypt_payload_slot(
+                    sm,
+                    kid,
+                    &bytes,
+                    id,
+                    talos_module_payload_encryption::PayloadSlot::Output,
+                    payload_format,
+                )
+                .await
                 {
                     Ok(s) => serde_json::from_str(&s).ok(),
                     Err(e) => {

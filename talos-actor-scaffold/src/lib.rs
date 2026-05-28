@@ -286,10 +286,11 @@ pub async fn scaffold_actor(
     }
 
     // RBAC: user can only create actors at or below their own ceiling.
+    // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate via
+    // the canonical `ceiling_permits` helper — the `world_rank` comparison
+    // wrongly admitted lattice-incomparable siblings.
     let user_ceiling = user_max_world_str(&deps.db_pool, user_id).await;
-    if talos_capability_world::world_rank(&req.max_capability_world)
-        > talos_capability_world::world_rank(user_ceiling)
-    {
+    if !talos_capability_world::ceiling_permits(user_ceiling, &req.max_capability_world) {
         return Err(ScaffoldError::CapabilityCeilingExceeded {
             user_ceiling: user_ceiling.to_string(),
             requested: req.max_capability_world.clone(),

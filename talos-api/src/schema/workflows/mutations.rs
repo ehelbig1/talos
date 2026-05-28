@@ -1385,6 +1385,16 @@ impl WorkflowsMutations {
         // from a runaway dispatch loop) or 0 / negative (admit_count
         // helper collapses non-positive to 0 → self-DoS).
         validate_max_concurrent_executions(input.max_concurrent_executions)?;
+        // 2026-05-28 review (low): validate `intent` through the canonical
+        // `validate_intent` helper — the same one the MCP `set_workflow_intent`
+        // path uses — so the GraphQL surface enforces unknown-field rejection,
+        // the ≤500-char/field cap, null-byte/control-char rejection, and the
+        // 10K serialized cap. Pre-fix `intent` was bound raw into the JSONB
+        // column with no per-field validation (cross-protocol parity drift).
+        if let Some(ref intent) = input.intent {
+            talos_workflow_creation_helpers::validate_intent(intent)
+                .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
+        }
         let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
 
         // Get authenticated user_id from context
@@ -1510,6 +1520,13 @@ impl WorkflowsMutations {
         // PATCH max_concurrent_executions to i32::MAX or -1 to
         // bypass / DoS the per-workflow throttle.
         validate_max_concurrent_executions(input.max_concurrent_executions)?;
+        // 2026-05-28 review (low): mirror create_workflow's intent validation
+        // (canonical `validate_intent`) so a clean workflow can't be PATCHed to
+        // an oversized / unknown-field / null-byte-bearing intent.
+        if let Some(ref intent) = input.intent {
+            talos_workflow_creation_helpers::validate_intent(intent)
+                .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
+        }
 
         let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
 
