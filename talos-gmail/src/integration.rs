@@ -7,6 +7,27 @@ use oauth2::{
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
+use std::sync::LazyLock;
+
+/// Shared reqwest client for Gmail OAuth token exchange + userinfo
+/// fetch. Mirrors the per-crate shared-client pattern that MCP-1110 /
+/// MCP-1111 / the 2026-05-28 audit landed for talos-memory,
+/// talos-search-service, and talos-atlassian. Pre-fix the token-
+/// exchange + userinfo paths each built a fresh `reqwest::Client`
+/// per call — TLS context init + connection-pool reset per OAuth
+/// callback, defeating keep-alive against oauth2.googleapis.com /
+/// googleapis.com.
+///
+/// Hardening contract preserved: timeout(15s) + connect_timeout(5s) +
+/// redirect::Policy::none(). MCP-533 hardening invariants preserved.
+static OAUTH_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Gmail OAuth: failed to build hardened reqwest client")
+});
 use uuid::Uuid;
 
 use talos_oauth::OAuthCredentialService;
@@ -290,12 +311,11 @@ impl GmailIntegrationService {
         // `.expect()` instead of `unwrap_or_else(Client::new)` so a
         // TLS-init failure surfaces immediately rather than silently
         // re-enabling default redirects.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Gmail token exchange: failed to build hardened reqwest client");
+        //
+        // 2026-05-28 audit Perf#9: route through the per-crate
+        // `OAUTH_HTTP_CLIENT` so TLS context + connection pool stay
+        // shared across token exchange + userinfo + (any future)
+        // refresh path. Mirrors the talos-atlassian fix.
 
         // Build the token exchange form. Include the PKCE code_verifier
         // when present — this completes the S256 challenge/verifier handshake
@@ -311,7 +331,7 @@ impl GmailIntegrationService {
             token_body["code_verifier"] = serde_json::Value::String(verifier);
         }
 
-        let token_resp = http
+        let token_resp = OAUTH_HTTP_CLIENT
             .post("https://oauth2.googleapis.com/token")
             .json(&token_body)
             .send()
@@ -364,13 +384,9 @@ impl GmailIntegrationService {
         // Get user's email address
         // MCP-533: GET with `bearer_auth(access_token)` — same Mode-B
         // hardening as the token-exchange POST above.
+        // Perf#9: route through the shared OAUTH_HTTP_CLIENT.
         let user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo";
-        let user_info: serde_json::Value = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Gmail userinfo: failed to build hardened reqwest client")
+        let user_info: serde_json::Value = OAUTH_HTTP_CLIENT
             .get(user_info_url)
             .bearer_auth(&access_token)
             .send()

@@ -7,6 +7,37 @@
 //! does this URL match a capability scope?) lives in the worker's
 //! sandbox.
 
+use std::sync::LazyLock;
+
+use dashmap::DashMap;
+
+/// Memoized compile cache for `validate_config_patterns`. Keyed by
+/// the exact `pattern` string (operator-authored, capped at
+/// MAX_PATTERN_LEN bytes via the gate inside `validate_config_patterns`).
+///
+/// 2026-05-28 audit Perf#5: pre-fix every graph load + every dispatch
+/// re-compiled every property's regex. A workflow with N nodes × M
+/// keyed patterns × P graph loads pays O(N × M × P) regex compiles.
+/// Pattern strings are operator-authored and bounded (≤1024 bytes),
+/// so the cache size is well-bounded by the workflow set.
+///
+/// Stores `Result<Regex, String>` so a malformed pattern's error
+/// is cached too — second-load doesn't re-pay the parse cost just to
+/// produce the same error.
+static PATTERN_CACHE: LazyLock<DashMap<String, Result<regex::Regex, String>>> =
+    LazyLock::new(DashMap::new);
+
+/// Compile a regex via the memoizing cache. Returns the compiled
+/// regex on success, or a clone of the cached error string on failure.
+fn cached_regex(pattern: &str) -> Result<regex::Regex, String> {
+    if let Some(entry) = PATTERN_CACHE.get(pattern) {
+        return entry.clone();
+    }
+    let result = regex::Regex::new(pattern).map_err(|e| e.to_string());
+    PATTERN_CACHE.insert(pattern.to_string(), result.clone());
+    result
+}
+
 /// Validate config values against `pattern` constraints in the
 /// `config_schema`.
 ///
@@ -58,11 +89,12 @@ pub fn validate_config_patterns(
                 // schema author intended a strict match. Surface the
                 // error so the operator notices on graph load /
                 // dispatch and fixes the schema.
-                let re = regex::Regex::new(pattern).map_err(|e| {
-                    format!(
-                        "Config key '{}' pattern is not a valid regex: {}",
-                        key, e
-                    )
+                // Perf#5 follow-up: route through the memoizing cache
+                // so repeated graph loads of the same workflow don't
+                // re-pay the O(pattern_size) compile cost per-key
+                // per-dispatch.
+                let re = cached_regex(pattern).map_err(|e| {
+                    format!("Config key '{}' pattern is not a valid regex: {}", key, e)
                 })?;
                 if !re.is_match(value) {
                     return Err(format!(

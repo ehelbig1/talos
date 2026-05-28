@@ -1806,9 +1806,13 @@ async fn handle_get_archive_policy(
     let env_default: i32 =
         talos_config::positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30);
 
+    // MCP-961 sibling: saturating i64→i32 conversion. The value
+    // originates from the `system_config` DB row's `value` column
+    // (JSON), an operator-supplied integer. A manual SQL UPDATE
+    // setting value > i32::MAX would silently wrap pre-fix.
     let db_days_raw: Option<i32> = db_value.as_ref().and_then(|v| {
         v.as_i64()
-            .map(|n| n as i32)
+            .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
             .or_else(|| v.as_str().and_then(|s| s.trim_matches('"').parse().ok()))
     });
 

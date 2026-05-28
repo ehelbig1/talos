@@ -1524,21 +1524,24 @@ fi
 
 for dir in "${TARGET_DIRS[@]}"; do
     [ -d "$dir" ] || continue
-    # Match the specific dangerous shape: `as u8/u16/u32` on the SAME
-    # line as a method-chain ending the cast. The earlier permissive
-    # pattern over-flagged safely-clamped chains; tightening to the
-    # *terminal* line catches the bug shape and lets `.min(N) as u32`
-    # / `.clamp(...) as u32` pass cleanly.
+    # Match the specific dangerous shape: `as u8/u16/u32` OR `as i8/i16/i32`
+    # on the SAME line as a method-chain ending the cast. The earlier
+    # permissive pattern over-flagged safely-clamped chains; tightening
+    # to the *terminal* line catches the bug shape and lets `.min(N)
+    # as u32` / `.clamp(...) as u32` pass cleanly.
+    #
+    # 2026-05-28 re-audit Perf#3: widened to also catch `as i32` (e.g.,
+    # `elapsed().as_millis() as i32` wraps after 24.8 days).
     if [ -n "$RG_BIN" ]; then
         matches=$("$RG_BIN" -n --no-heading \
             -g '*.rs' \
             -g '!**/tests/**' \
             -g '!**/*_tests.rs' \
-            'as u(8|16|32)\b' \
+            'as (u|i)(8|16|32)\b' \
             "$dir" 2>/dev/null || true)
     else
         matches=$(grep -rn --include='*.rs' \
-            -E 'as u(8|16|32)\b' \
+            -E 'as (u|i)(8|16|32)\b' \
             "$dir" 2>/dev/null || true)
     fi
     if [ -z "$matches" ]; then
@@ -1565,12 +1568,15 @@ for dir in "${TARGET_DIRS[@]}"; do
         # 3. Skip lines where the cast is from a u8 literal / typed
         #    constant (e.g. `255 as u32`, `MAX_X as u32`) — these are
         #    widening (smaller→larger) which is always safe.
-        if echo "$body" | grep -qE '\b[0-9]+\s+as u(16|32|64)\b'; then
+        if echo "$body" | grep -qE '\b[0-9]+\s+as (u|i)(16|32|64)\b'; then
             continue
         fi
 
         # Look 3 lines above for opt-out + upper-bound clamp markers.
-        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+        # Guard against malformed match lines (e.g., multi-line rg
+        # output) producing non-numeric `$lineno` — without the regex
+        # check bash emits "integer expression expected" warnings.
+        if [[ "$lineno" =~ ^[0-9]+$ ]] && [ "$lineno" -gt 1 ]; then
             start=$((lineno > 3 ? lineno - 3 : 1))
             ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
             # Explicit opt-out marker.
@@ -1596,16 +1602,35 @@ for dir in "${TARGET_DIRS[@]}"; do
         # those are the call sites where wrap is actually possible.
         # Without this filter, every `n as u32` literal-conversion in
         # the codebase trips the lint.
+        # 2026-05-28 re-audit Perf#10: widen the trigger source list.
+        # Pre-fix only `.as_u64()` / `.as_i64()` / `.num_milliseconds()` /
+        # `.as_secs()` were recognised. Missing siblings let real wrap
+        # sites slip past (e.g., `talos-webhooks/src/lib.rs:1282,1310`
+        # used `elapsed().as_millis() as i32`). Widen to cover every
+        # unbounded numeric source that can produce a value > target
+        # type MAX. Also widen the context window to 6 lines for
+        # multi-line builder-style chains.
         unbounded_src=""
-        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
-            start=$((lineno > 3 ? lineno - 3 : 1))
+        # Pattern: any of the unbounded sources that can return a value
+        # wider than the target integer cast. Includes:
+        #   .as_u64() / .as_i64() / .as_f64()         — serde_json
+        #   .num_milliseconds() / .num_seconds() /
+        #   .num_minutes() / .num_hours() / .num_days() — chrono::Duration
+        #   .as_secs() / .as_millis() / .as_micros() /
+        #   .as_nanos()                                — std::time::Duration
+        #   .parse::<u64>() / .parse::<i64>() / .parse() — strings
+        #   u64::from_le_bytes / from_be_bytes / from_ne_bytes — buffers
+        #   chrono::Duration::seconds / ::milliseconds   — int → Duration
+        UNBOUNDED_SRC_RE='\.as_u64\(|\.as_i64\(|\.as_f64\(|\.num_milliseconds\(|\.num_seconds\(|\.num_minutes\(|\.num_hours\(|\.num_days\(|\.as_secs\(|\.as_millis\(|\.as_micros\(|\.as_nanos\(|\.parse::<(u|i)(16|32|64|128|size)>\(|from_(le|be|ne)_bytes\(|chrono::Duration::(seconds|milliseconds|microseconds|nanoseconds)\('
+        if [[ "$lineno" =~ ^[0-9]+$ ]] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 6 ? lineno - 6 : 1))
             ctx2=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
-            if echo "$ctx2" | grep -qE '\.as_u64\(|\.as_i64\(|\.num_milliseconds\(|\.as_secs\('; then
+            if echo "$ctx2" | grep -qE "$UNBOUNDED_SRC_RE"; then
                 unbounded_src="yes"
             fi
         fi
         # Also check the matched line itself.
-        if echo "$body" | grep -qE '\.as_u64\(|\.as_i64\(|\.num_milliseconds\(|\.as_secs\('; then
+        if echo "$body" | grep -qE "$UNBOUNDED_SRC_RE"; then
             unbounded_src="yes"
         fi
         if [ -z "$unbounded_src" ]; then

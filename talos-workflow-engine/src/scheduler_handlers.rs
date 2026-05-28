@@ -1614,6 +1614,18 @@ impl ParallelWorkflowEngine {
         // exits without dispatching the body (condition false on
         // entry), we eat the prefetch cost but the cache is one
         // SELECT, not 100.
+        //
+        // 2026-05-28 audit Perf#6 semantic note: the cached
+        // `encrypted_secrets` captures vault values AT LOOP ENTRY.
+        // SecretsManager's LLM-keys cache has a 60s TTL so rotations
+        // normally propagate within a minute; a long-running loop
+        // (e.g. 100 iters × 10s/iter = ~17 min) holds the snapshot
+        // for the loop's full lifetime. This matches the workflow
+        // execution-consistency model (one execution = one secret
+        // snapshot) — an operator who rotates a vault key mid-run
+        // sees the new value on the NEXT execution, not the
+        // in-flight one. Document the semantic so future readers
+        // don't mistake it for a cache-invalidation bug.
         let cached_wasm_module = match self
             .fetch_module(body_uuid)
             .await
@@ -1741,6 +1753,24 @@ impl ParallelWorkflowEngine {
                 // `wasm:{id}` mismatch that broke loop iteration > 0.
                 // Matches the single-node dispatch pattern in
                 // `engine_dispatch_single.rs`.
+                //
+                // 2026-05-28 audit Perf#7 follow-up (tracked, NOT
+                // shipped in the post-7879f4b sweep): each loop
+                // iteration clones the full WASM blob into a fresh
+                // `DispatchJob`. For a 5 MB module × 100 iters that
+                // is ~500 MB of controller-side allocator churn.
+                // Fix is wire-compatible (`Arc<Vec<u8>>` on both
+                // `DispatchJob.wasm_bytes` and
+                // `JobRequest.wasm_bytes` — `serde::Serialize` for
+                // `Arc<T>` delegates to `T`, so on-wire bytes are
+                // identical). Deferred: blast radius spans ~30-50
+                // construction / read sites across the dispatcher
+                // impls, and the savings only matter for long-loop /
+                // large-module workloads. Treat as its own focused
+                // PR (`perf(protocol): Arc inline wasm_bytes`) so a
+                // subtle serde/Tokio interaction can be isolated
+                // and reverted if needed without entangling other
+                // changes.
                 wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
                     None
                 } else {

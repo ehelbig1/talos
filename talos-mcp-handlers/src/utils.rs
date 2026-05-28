@@ -1000,6 +1000,9 @@ pub fn require_int_range_i32(
                 -32602,
                 &format!("Invalid '{field}' value {n}: must be in [{min}, {max}]"),
             )),
+            // allow-as-u32-cast: range-checked by the guard arm above
+            // (`contains(&n)`); reaching this branch means `min ≤ n ≤ max`
+            // and both bounds fit i32.
             Some(n) => Ok(n as i32),
             None => Err(mcp_error(
                 req_id.clone(),
@@ -2385,6 +2388,8 @@ mod auth_error_response_tests {
 
     fn body(resp: &talos_mcp::JsonRpcResponse) -> (i32, String) {
         let result = resp.result.as_ref().expect("result populated");
+        // allow-as-u32-cast: test helper; error codes are i16-fitting
+        // RPC constants — never approach i32::MAX.
         let code = result["errorCode"].as_i64().unwrap() as i32;
         let text = result["content"][0]["text"].as_str().unwrap().to_string();
         assert_eq!(result["isError"], serde_json::Value::Bool(true));

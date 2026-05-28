@@ -1563,11 +1563,57 @@ impl JobRequest {
         Ok(())
     }
 
-    /// Verify the HMAC signature and nonce freshness.
+    /// Verify the HMAC signature and nonce freshness, *and* record the
+    /// nonce in the process-local replay cache. Subsequent `verify()`
+    /// calls against the same nonce within the freshness window will
+    /// fail with `"job_nonce already seen"`.
+    ///
+    /// Use this at the **primary action point** for the request — the
+    /// place where the message is converted into a worker dispatch.
+    /// There must be EXACTLY ONE primary verifier per `JobRequest`
+    /// per worker process. Passive observers (metrics, audit
+    /// subscribers) MUST call [`verify_no_replay`](Self::verify_no_replay)
+    /// instead — calling `verify()` from two consumers of the same
+    /// signed request causes the second one to fail with a spurious
+    /// replay error. See CLAUDE.md "Verify-once rule for signed NATS
+    /// messages" for the architectural mandate.
     ///
     /// Returns `Err` if the signature is invalid or the nonce is older than
     /// `max_age_secs` (default recommendation: 300 s / 5 minutes).
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
+        let ts = self.verify_no_replay(key, max_age_secs)?;
+        // Replay protection: refuse a nonce we have seen before
+        // within the freshness window. HMAC alone catches forgery;
+        // without this check, anyone with NATS-publish access can
+        // capture a signed JobRequest and re-fire it any number of
+        // times until ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "job_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify HMAC signature and nonce freshness **without** recording
+    /// the nonce in the replay cache. Returns the parsed timestamp on
+    /// success.
+    ///
+    /// 2026-05-28 audit F5: per CLAUDE.md "Verify-once rule for signed
+    /// NATS messages — Adding a new signed message type? Add both
+    /// verify() and verify_no_replay() together up front; the
+    /// prophylactic split is cheap, the regression is total (every
+    /// job fails)." Pre-fix `JobRequest` had only `verify()`; today
+    /// only one consumer verifies so no dual-cache bug, but the
+    /// architectural mandate is to add the split BEFORE the second
+    /// consumer lands, not after.
+    ///
+    /// Use at passive observers (metrics/audit subscribers downstream
+    /// of a primary `verify()` caller). HMAC continues to gate
+    /// forgery and the freshness window continues to gate stale-replay;
+    /// replay protection is the responsibility of the primary verifier.
+    pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         // 1. Verify nonce freshness to prevent replay attacks.
         let parts: Vec<&str> = self.job_nonce.splitn(2, ':').collect();
         if parts.len() != 2 {
@@ -1605,18 +1651,7 @@ impl JobRequest {
         mac.verify_slice(&self.signature)
             .map_err(|_| "HMAC signature verification failed".to_string())?;
 
-        // 3. Replay protection: refuse a nonce we have seen before
-        // within the freshness window. HMAC alone catches forgery;
-        // without this check, anyone with NATS-publish access can
-        // capture a signed JobRequest and re-fire it any number of
-        // times until ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "job_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        Ok(ts)
     }
 }
 
@@ -2188,8 +2223,32 @@ impl PipelineJobRequest {
         Ok(())
     }
 
-    /// Verify the HMAC signature and nonce freshness.
+    /// Verify the HMAC signature and nonce freshness, *and* record the
+    /// nonce in the process-local replay cache. See `JobRequest::verify`
+    /// for the architectural-mandate rationale (CLAUDE.md "Verify-once
+    /// rule"). Pair with [`verify_no_replay`](Self::verify_no_replay)
+    /// for passive observers.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
+        let ts = self.verify_no_replay(key, max_age_secs)?;
+        // 3. Replay protection: refuse a nonce we have seen before
+        // within the freshness window. HMAC alone catches forgery;
+        // without this check, anyone with NATS-publish access can
+        // capture a signed PipelineJobRequest and re-fire it any
+        // number of times until ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "job_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify HMAC + freshness WITHOUT touching the replay cache.
+    /// 2026-05-28 audit F5 sibling of `JobRequest::verify_no_replay` —
+    /// passive observers (metrics, audit subscribers) MUST use this
+    /// to avoid dual-cache-insert deadlocks.
+    pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         let parts: Vec<&str> = self.job_nonce.splitn(2, ':').collect();
         if parts.len() != 2 {
             return Err("malformed job_nonce".to_string());
@@ -2225,18 +2284,7 @@ impl PipelineJobRequest {
         mac.verify_slice(&self.signature)
             .map_err(|_| "HMAC signature verification failed".to_string())?;
 
-        // 3. Replay protection: refuse a nonce we have seen before
-        // within the freshness window. HMAC alone catches forgery;
-        // without this check, anyone with NATS-publish access can
-        // capture a signed JobRequest and re-fire it any number of
-        // times until ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "job_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        Ok(ts)
     }
 }
 
@@ -2526,8 +2574,30 @@ impl WorkerHeartbeat {
         Ok(())
     }
 
-    /// Verify the HMAC signature and nonce freshness.
+    /// Verify the HMAC signature and nonce freshness, *and* record
+    /// the nonce in the process-local replay cache. See
+    /// `JobRequest::verify` for the architectural-mandate rationale
+    /// (CLAUDE.md "Verify-once rule"). Pair with
+    /// [`verify_no_replay`](Self::verify_no_replay) for passive observers.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
+        let ts = self.verify_no_replay(key, max_age_secs)?;
+        // 3. Replay protection: refuse a nonce we have seen before
+        // within the freshness window. HMAC alone catches forgery;
+        // without this check, anyone with NATS-publish access can
+        // capture a signed WorkerHeartbeat and re-fire it any number
+        // of times until ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.heartbeat_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "heartbeat_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify HMAC + freshness WITHOUT touching the replay cache.
+    /// 2026-05-28 audit F5 sibling of `JobRequest::verify_no_replay`.
+    pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         let parts: Vec<&str> = self.heartbeat_nonce.splitn(2, ':').collect();
         if parts.len() != 2 {
             return Err("malformed heartbeat_nonce".to_string());
@@ -2563,18 +2633,7 @@ impl WorkerHeartbeat {
         mac.verify_slice(&self.signature)
             .map_err(|_| "HMAC signature verification failed".to_string())?;
 
-        // 3. Replay protection: refuse a nonce we have seen before
-        // within the freshness window. HMAC alone catches forgery;
-        // without this check, anyone with NATS-publish access can
-        // capture a signed JobRequest and re-fire it any number of
-        // times until ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.heartbeat_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "heartbeat_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        Ok(ts)
     }
 }
 
@@ -3791,5 +3850,147 @@ mod tests {
         req.steps[0].allowed_hosts = vec!["a.com".to_string(), "b.com".to_string()];
         req.verify(&key, 300)
             .expect("re-ordered allowed_hosts must still verify");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 2026-05-28 audit F5: verify_no_replay parity tests
+    //
+    // CLAUDE.md "Verify-once rule for signed NATS messages": every
+    // signed message type MUST have BOTH `verify()` (records to nonce
+    // cache) AND `verify_no_replay()` (HMAC + freshness only). Pre-fix
+    // JobRequest, PipelineJobRequest, WorkerHeartbeat had only
+    // `verify()` — today only one consumer per type so no dual-cache
+    // bug, but adding the split BEFORE the second consumer lands is
+    // the architectural mandate. Tests pin the split's three core
+    // properties:
+    //   1. verify_no_replay accepts a valid signed message.
+    //   2. verify_no_replay does NOT poison the cache (subsequent
+    //      `verify()` on the same nonce still succeeds).
+    //   3. verify_no_replay rejects forgery / freshness violations.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn job_request_verify_no_replay_accepts_valid_signature() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+        let ts = req
+            .verify_no_replay(&key, 300)
+            .expect("verify_no_replay must accept a valid signature");
+        assert!(ts > 0, "parsed timestamp should be > 0");
+    }
+
+    #[test]
+    fn job_request_verify_no_replay_does_not_poison_cache() {
+        // The key invariant: an observer's verify_no_replay must NOT
+        // record the nonce. Otherwise the primary verify() on the
+        // same message would fail with "already seen" — the dual-
+        // consumer regression the architectural mandate exists to
+        // prevent.
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+        req.verify_no_replay(&key, 300)
+            .expect("observer call succeeds");
+        // Primary consumer's verify must STILL succeed.
+        req.verify(&key, 300)
+            .expect("primary verify must not collide with observer's verify_no_replay");
+        // And THIS verify() should have recorded the nonce, so the
+        // next verify() on the same signature must fail.
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "second verify() on the same nonce must fail (replay protection)"
+        );
+    }
+
+    #[test]
+    fn job_request_verify_no_replay_rejects_forgery() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+        // Tamper with the signature.
+        req.signature[0] ^= 0xff;
+        assert!(
+            req.verify_no_replay(&key, 300).is_err(),
+            "tampered signature must fail in verify_no_replay too"
+        );
+    }
+
+    #[test]
+    fn job_request_verify_no_replay_rejects_stale_nonce() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+        // Rewrite the nonce timestamp to be 1 hour in the past so the
+        // freshness window check trips deterministically (same-second
+        // sign+verify would otherwise pass with `max_age_secs=0`).
+        // The signature will no longer match (we replaced part of the
+        // signing input) but verify_no_replay must reject on the
+        // freshness check BEFORE reaching HMAC — that's the contract.
+        let stale_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let parts: Vec<&str> = req.job_nonce.splitn(2, ':').collect();
+        req.job_nonce = format!("{}:{}", stale_ts, parts[1]);
+        let err = req.verify_no_replay(&key, 300).unwrap_err();
+        assert!(
+            err.contains("too old"),
+            "verify_no_replay must reject stale nonce before HMAC; got: {err}"
+        );
+    }
+
+    #[test]
+    fn pipeline_job_request_verify_no_replay_does_not_poison_cache() {
+        let key = test_key();
+        let step = make_test_pipeline_step();
+        let mut req = make_test_pipeline(vec![step]);
+        req.sign(&key).unwrap();
+        req.verify_no_replay(&key, 300)
+            .expect("observer call succeeds");
+        req.verify(&key, 300)
+            .expect("primary verify must not collide with observer");
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "second primary verify on the same nonce must fail (replay protection)"
+        );
+    }
+
+    fn make_test_heartbeat() -> WorkerHeartbeat {
+        WorkerHeartbeat {
+            worker_id: Uuid::new_v4(),
+            capabilities: vec!["wasm".to_string()],
+            cpu_usage_pct: 25.0,
+            heartbeat_nonce: String::new(),
+            signature: vec![],
+        }
+    }
+
+    #[test]
+    fn worker_heartbeat_verify_no_replay_does_not_poison_cache() {
+        let key = test_key();
+        let mut hb = make_test_heartbeat();
+        hb.sign(&key).unwrap();
+        hb.verify_no_replay(&key, 300)
+            .expect("observer call succeeds");
+        hb.verify(&key, 300)
+            .expect("primary verify must not collide with observer");
+        assert!(
+            hb.verify(&key, 300).is_err(),
+            "second primary verify on the same nonce must fail (replay protection)"
+        );
+    }
+
+    #[test]
+    fn worker_heartbeat_verify_no_replay_rejects_forgery() {
+        let key = test_key();
+        let mut hb = make_test_heartbeat();
+        hb.sign(&key).unwrap();
+        hb.signature[0] ^= 0xff;
+        assert!(
+            hb.verify_no_replay(&key, 300).is_err(),
+            "tampered heartbeat signature must fail in verify_no_replay"
+        );
     }
 }

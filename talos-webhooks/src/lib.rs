@@ -1279,7 +1279,13 @@ impl WebhookRouter {
             })
             .await;
 
-            let wasm_duration_ms = wasm_start.elapsed().as_millis() as i32;
+            // MCP-961 sibling: saturating u128→i32 conversion. Pre-fix
+            // `as i32` wrapped for durations > i32::MAX ms (~24.8 days).
+            // The webhook timeout bounds practical exposure, but the
+            // column type is i32 — saturating keeps the column
+            // monotonic under any future timeout policy change.
+            let wasm_duration_ms = i32::try_from(wasm_start.elapsed().as_millis())
+                .unwrap_or(i32::MAX);
 
             let (response_body, success, error_msg) = match result {
                 Ok(Ok(output)) => {
@@ -1307,7 +1313,11 @@ impl WebhookRouter {
                 }
             };
 
-            let total_duration_ms = start_time.elapsed().as_millis() as i32;
+            // MCP-961 sibling: see wasm_duration_ms above — saturating
+            // u128→i32 conversion bounds the column under any future
+            // timeout policy change.
+            let total_duration_ms = i32::try_from(start_time.elapsed().as_millis())
+                .unwrap_or(i32::MAX);
 
             // Decoupled Write Path: Async Logging & State Updates
             let status_code = if success {

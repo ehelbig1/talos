@@ -453,6 +453,15 @@ impl ModuleExecutionService {
         } else {
             output_data.as_ref()
         };
+        // MCP-S2 follow-up: only update `payload_format` when we wrote
+        // a new ciphertext on this UPDATE. The empty-bundle short-
+        // circuit in `encrypt_payload_bundle` returns `format_version
+        // = 0` for the no-output case, which would otherwise overwrite
+        // the row's v1 stamp from `create_execution` and break
+        // subsequent reads of input_data_enc / trigger_metadata_enc on
+        // the SAME row. Preserve the prior format unless we're
+        // actually writing new ciphertext.
+        let format_arg: Option<i16> = if encrypting { Some(payload_format) } else { None };
         let result = sqlx::query(
             r#"
             UPDATE module_executions
@@ -462,7 +471,7 @@ impl ModuleExecutionService {
                 output_data = $2,
                 output_data_enc = $3,
                 payload_enc_key_id = COALESCE(payload_enc_key_id, $4),
-                payload_format = $5,
+                payload_format = COALESCE($5, payload_format),
                 fuel_consumed = $6,
                 memory_used_mb = $7
             WHERE id = $8 AND user_id = $9
@@ -472,7 +481,7 @@ impl ModuleExecutionService {
         .bind(pt_output)
         .bind(output_enc.as_deref())
         .bind(key_id)
-        .bind(payload_format)
+        .bind(format_arg)
         .bind(fuel_consumed)
         .bind(memory_used_mb)
         .bind(execution_id)

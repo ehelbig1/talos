@@ -153,7 +153,13 @@ fn scrub_wasm_log_for_broadcast(message: &str) -> String {
         .chars()
         .filter(|c| !c.is_control() || matches!(*c, '\n' | '\t' | '\r'))
         .collect();
-    talos_dlp_provider::redact_str(&sanitized)
+    // 2026-05-28 audit F3 perf follow-up: per-log-line broadcast is a
+    // hot path that runs the DLP scrubber per message × per subscriber.
+    // The trait-method `redact_str` allocates a fresh String for every
+    // pattern even when nothing matches (~14 patterns × `String::from_owned`
+    // per call). Switching to the Cow variant keeps the legitimate-log
+    // common case allocation-free.
+    talos_dlp_provider::redact_str_cow(&sanitized).into_owned()
 }
 
 /// Type alias for the full GraphQL schema.
@@ -1636,6 +1642,9 @@ async fn main() -> anyhow::Result<()> {
             // surface is cheap. Warn on the misconfiguration so an
             // operator who deliberately wrote 0/negative gets a clear
             // signal that the value was ignored.
+            // MCP-961 sibling: saturating i64→i32 conversion. Sibling
+            // of the advanced.rs fix — operator-supplied DB value
+            // could exceed i32::MAX and silently wrap pre-fix.
             let db_days: Option<i32> = sqlx::query_scalar::<_, serde_json::Value>(
                 "SELECT value FROM system_settings WHERE key = 'archive_after_days'",
             )
@@ -1644,7 +1653,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(None)
             .and_then(|v| {
                 v.as_i64()
-                    .map(|n| n as i32)
+                    .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             });
             let env_days = talos_config::positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30);

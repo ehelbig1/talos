@@ -470,9 +470,16 @@ impl ExecutionRepository {
         &self,
         user_id: Uuid,
     ) -> Result<Vec<LoopCappedWorkflowRow>> {
+        // MCP-S2 follow-up: project `we.id` + `we.output_data_format`
+        // so `read_output_from_row` can dispatch v1 (AAD-bound)
+        // ciphertexts via decrypt_versioned. Pre-fix omitted both;
+        // every v1 row's decrypt fell back to v0 path with empty AAD,
+        // AES-GCM tag check failed, row silently skipped → the
+        // dashboard hid all loop-capped workflows in the last 24 h.
         let rows = sqlx::query(
-            "SELECT we.workflow_id, w.name, we.completed_at, \
-                    we.output_data, we.output_data_enc, we.output_enc_key_id \
+            "SELECT we.id, we.workflow_id, w.name, we.completed_at, \
+                    we.output_data, we.output_data_enc, we.output_enc_key_id, \
+                    we.output_data_format \
              FROM workflow_executions we \
              JOIN workflows w ON w.id = we.workflow_id \
              WHERE w.user_id = $1 \
@@ -2123,6 +2130,12 @@ impl ExecutionRepository {
         execution_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<ModuleExecutionDetailRow>> {
+        // MCP-S2 follow-up: project `payload_format` so the decrypt
+        // dispatcher can route v1 (AAD-bound) rows correctly. Pre-fix
+        // this site used `decrypt_value_by_key` (no AAD) against
+        // ciphertexts that post-MCP-S2 writers stamp with AAD =
+        // execution_id, silently failing decrypt for every v1 row and
+        // surfacing `output_data: null` in the operator UI.
         let row: Option<(
             Uuid,
             Uuid,
@@ -2131,9 +2144,10 @@ impl ExecutionRepository {
             Option<serde_json::Value>,
             Option<Vec<u8>>,
             Option<Uuid>,
+            i16,
         )> = sqlx::query_as(
             "SELECT id, module_id, status, error_message, \
-                    output_data, output_data_enc, payload_enc_key_id \
+                    output_data, output_data_enc, payload_enc_key_id, payload_format \
              FROM module_executions \
              WHERE id = $1 AND user_id = $2",
         )
@@ -2141,14 +2155,25 @@ impl ExecutionRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        let Some((id, module_id, status, error_message, plaintext, enc_bytes, key_id)) =
-            row
+        let Some((
+            id,
+            module_id,
+            status,
+            error_message,
+            plaintext,
+            enc_bytes,
+            key_id,
+            payload_format,
+        )) = row
         else {
             return Ok(None);
         };
         let output_data = match (&self.secrets_manager, enc_bytes, key_id) {
             (Some(sm), Some(bytes), Some(kid)) => {
-                match sm.decrypt_value_by_key(kid, &bytes).await {
+                match sm
+                    .decrypt_versioned(kid, &bytes, id.as_bytes(), payload_format)
+                    .await
+                {
                     Ok(s) => serde_json::from_str(&s).ok(),
                     Err(e) => {
                         tracing::warn!(

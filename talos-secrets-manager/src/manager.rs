@@ -1453,11 +1453,21 @@ impl SecretsManager {
         encrypted: &[u8],
         format_version: i16,
     ) -> Result<Zeroizing<String>> {
-        if format_version >= Self::SECRETS_AAD_FORMAT_V1 {
-            self.decrypt_value_by_key_with_aad(key_id, encrypted, secret_id.as_bytes())
-                .await
-        } else {
-            self.decrypt_value_by_key(key_id, encrypted).await
+        // 2026-05-28 audit S2#9 follow-up: explicit-version match
+        // (sibling of `decrypt_versioned` below). `>=` invited a
+        // forward-compat trap; tighten to `==` and fail-closed on
+        // unknown values so a v1-reader against a v2-writer surfaces
+        // loudly at dispatch instead of mis-decrypting silently.
+        match format_version {
+            0 => self.decrypt_value_by_key(key_id, encrypted).await,
+            v if v == Self::SECRETS_AAD_FORMAT_V1 => {
+                self.decrypt_value_by_key_with_aad(key_id, encrypted, secret_id.as_bytes())
+                    .await
+            }
+            other => Err(anyhow!(
+                "unknown secrets encryption_format_version {other}; this build only knows 0 (legacy no-AAD) and {} (v1 AAD-bound). Row may have been written by a newer code version.",
+                Self::SECRETS_AAD_FORMAT_V1
+            )),
         }
     }
 
@@ -1483,11 +1493,27 @@ impl SecretsManager {
         aad: &[u8],
         format_version: i16,
     ) -> Result<Zeroizing<String>> {
-        if format_version >= Self::AAD_FORMAT_V1 {
-            self.decrypt_value_by_key_with_aad(key_id, encrypted, aad)
-                .await
-        } else {
-            self.decrypt_value_by_key(key_id, encrypted).await
+        // 2026-05-28 audit S2#9 follow-up: explicit-version match.
+        // Pre-fix `>= AAD_FORMAT_V1` meant a future v2 ciphertext with
+        // a NEW AAD shape (e.g. different separator, different bound
+        // fields) would silently route through the v1 AAD-binding
+        // path with the caller-supplied v1-AAD bytes — likely
+        // succeeding (random-looking AAD bytes accepted, tag check
+        // passes against an undocumented format) OR silently failing
+        // with a generic decryption error that masks the real cause.
+        // Tighten to `==` and fail-closed on unknown formats so a
+        // v1-reader against a v2-writer surfaces loudly at
+        // dispatch time, not as a mysterious decrypt failure.
+        match format_version {
+            0 => self.decrypt_value_by_key(key_id, encrypted).await,
+            v if v == Self::AAD_FORMAT_V1 => {
+                self.decrypt_value_by_key_with_aad(key_id, encrypted, aad)
+                    .await
+            }
+            other => Err(anyhow!(
+                "unknown encryption_format_version {other}; this build only knows 0 (legacy no-AAD) and {} (v1 AAD-bound). Caller may be reading rows written by a newer code version.",
+                Self::AAD_FORMAT_V1
+            )),
         }
     }
 
@@ -4616,6 +4642,55 @@ mod aad_binding_tests {
         // separator) starts at index 17.
         assert_eq!(aad_a[16], 0x00);
         assert_eq!(&aad_a[17..], b"key1");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 2026-05-28 audit S2#9: explicit-version dispatch in
+    // `decrypt_versioned` / `decrypt_secret_record`.
+    //
+    // The match arms now fail-closed on unknown format_version values.
+    // These tests pin that contract — a v1-reader against a v2-writer
+    // (post-future-migration) surfaces a clear error at dispatch
+    // instead of mis-decrypting silently.
+    // ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn decrypt_versioned_rejects_unknown_format_with_clear_error() {
+        let sm = super::SecretsManager::test_stub_for_cache();
+        let bogus_key_id = Uuid::nil();
+        let bogus_encrypted = vec![0u8; 28]; // 12-nonce + 16-tag minimum
+        let bogus_aad = b"any aad";
+        let err = sm
+            .decrypt_versioned(bogus_key_id, &bogus_encrypted, bogus_aad, 99)
+            .await
+            .expect_err("unknown format_version must fail-closed at dispatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown encryption_format_version"),
+            "error must name the unknown version class; got: {msg}"
+        );
+        assert!(
+            msg.contains("99"),
+            "error must include the offending version number; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypt_versioned_rejects_negative_format_version() {
+        // A buggy SELECT could return -1 (e.g. via misuse of NULLABLE
+        // coalesce). Same dispatch path should reject as "unknown".
+        let sm = super::SecretsManager::test_stub_for_cache();
+        let bogus_key_id = Uuid::nil();
+        let bogus_encrypted = vec![0u8; 28];
+        let bogus_aad = b"any aad";
+        let err = sm
+            .decrypt_versioned(bogus_key_id, &bogus_encrypted, bogus_aad, -1)
+            .await
+            .expect_err("negative format_version must fail-closed at dispatch");
+        assert!(
+            err.to_string().contains("unknown encryption_format_version"),
+            "got: {err}"
+        );
     }
 }
 

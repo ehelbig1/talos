@@ -2,7 +2,19 @@ use super::types::JsonRpcResponse;
 use super::utils::{mcp_error, mcp_text};
 use super::{auth, McpState};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
+
+/// Process-wide cache for the module-catalog directory walk.
+/// 2026-05-28 audit Perf#4: pre-fix every `list_module_catalog` call
+/// re-walked `/app/module-templates/` — ~60 read_dir entries × 2 file
+/// reads each = ~180 syscalls per dashboard load. The templates are
+/// baked into the controller image at build time and the only
+/// legitimate refresh trigger is a pod restart, so a process-lifetime
+/// cache is the right shape. `tokio::sync::OnceCell` over `std::sync::
+/// OnceLock` because the initializer is async (the spawn_blocking
+/// catalog walk must run on the blocking pool — MCP-H8).
+static CATALOG_CACHE: OnceCell<Vec<serde_json::Value>> = OnceCell::const_new();
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
@@ -2457,13 +2469,19 @@ async fn handle_list_module_catalog(
     // the tokio async runtime thread, stalling every other handler
     // on that worker thread for the duration of the walk. Hoist into
     // `spawn_blocking` so the sync work runs on the blocking-thread
-    // pool. The handler is operator-facing (catalog dashboard) so
-    // throughput here is bounded by call frequency, but a stuck
-    // disk would otherwise block kubelet probes via the same worker
-    // thread.
+    // pool.
+    //
+    // 2026-05-28 audit Perf#4: cache the walk across calls via
+    // CATALOG_CACHE (process-wide OnceCell). The templates are baked
+    // into the controller image at build time; the only legitimate
+    // refresh is a pod restart. Pre-cache the walk ran on every call
+    // (~180 syscalls per dashboard load); post-cache only the FIRST
+    // call pays the I/O cost.
     let catalog_dir_owned = catalog_dir.to_path_buf();
     let entries: Vec<serde_json::Value> = if catalog_dir.is_dir() {
-        tokio::task::spawn_blocking(move || {
+        CATALOG_CACHE
+            .get_or_init(|| async move {
+                tokio::task::spawn_blocking(move || {
             let mut items: Vec<serde_json::Value> = Vec::new();
             if let Ok(read_dir) = std::fs::read_dir(&catalog_dir_owned) {
                 for entry in read_dir.flatten() {
@@ -2552,6 +2570,9 @@ async fn handle_list_module_catalog(
         })
         .await
         .unwrap_or_default()
+            })
+            .await
+            .clone()
     } else {
         // Test/dev environment: return a minimal representative list
         vec![

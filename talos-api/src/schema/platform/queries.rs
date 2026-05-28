@@ -306,14 +306,6 @@ impl PlatformQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        // Generic row type for all provider queries.
-        #[derive(sqlx::FromRow)]
-        struct IntegrationRow {
-            id: Uuid,
-            identifier: String,
-            created_at: chrono::DateTime<chrono::Utc>,
-        }
-
         // Helper: map a provider's graphql_enum string to the IntegrationService enum.
         fn resolve_service(graphql_enum: &str) -> IntegrationService {
             match graphql_enum {
@@ -329,45 +321,74 @@ impl PlatformQueries {
             }
         }
 
-        // Build and execute one query per registered provider.
-        // NOTE: Table/column names come from the static PROVIDERS registry (compile-time
-        // constants, not user input). The only user-supplied value is user_id, bound as $1.
-        let mut integrations = Vec::new();
-        for provider in talos_integrations::provider_config::PROVIDERS {
-            let table_alias = if provider.account_identifier_join.is_some() {
-                "g"
-            } else {
-                "t"
-            };
-            let join_clause = provider.account_identifier_join.unwrap_or("");
-            let sql = format!(
-                "SELECT {alias}.id, {ident} as identifier, {alias}.created_at \
-                 FROM {table} {alias} {join} \
-                 WHERE {alias}.user_id = $1 {extra}",
-                alias = table_alias,
-                ident = provider.account_identifier_column,
-                table = provider.db_table,
-                join = join_clause,
-                extra = provider.extra_where,
-            );
+        // 2026-05-28 audit Perf#2: pre-fix this issued one SELECT per
+        // registered provider (4 today: GCal, Gmail, Slack, Jira;
+        // grows with each new integration). Dashboard load incurred
+        // N round-trips serially. Collapse to a single UNION ALL so
+        // every provider's rows return in one round-trip — the static
+        // PROVIDERS registry's table names and column names are
+        // compile-time constants, not user input, so the dynamic SQL
+        // builder is the same security shape as the per-provider
+        // version. Only `user_id` is bound as $1.
+        //
+        // NOTE: the UNION ALL preserves the per-provider service
+        // labeling via a literal `graphql_enum` column written into
+        // each branch — `resolve_service` runs in Rust on the unified
+        // result. The branch ordering matches PROVIDERS so the
+        // resulting Vec retains the same ordering as the pre-fix
+        // sequential loop.
+        let providers = talos_integrations::provider_config::PROVIDERS;
+        let union_branches: Vec<String> = providers
+            .iter()
+            .map(|provider| {
+                let table_alias = if provider.account_identifier_join.is_some() {
+                    "g"
+                } else {
+                    "t"
+                };
+                let join_clause = provider.account_identifier_join.unwrap_or("");
+                format!(
+                    "SELECT {alias}.id, {ident} as identifier, {alias}.created_at, '{enum_tag}' as service_tag \
+                     FROM {table} {alias} {join} \
+                     WHERE {alias}.user_id = $1 {extra}",
+                    alias = table_alias,
+                    ident = provider.account_identifier_column,
+                    table = provider.db_table,
+                    join = join_clause,
+                    extra = provider.extra_where,
+                    // PROVIDERS is a compile-time constant; the
+                    // graphql_enum strings are static literals (no
+                    // SQL injection surface).
+                    enum_tag = provider.graphql_enum,
+                )
+            })
+            .collect();
 
-            let rows = sqlx::query_as::<_, IntegrationRow>(&sql)
-                .bind(user_id)
-                .fetch_all(db_pool)
-                .await
-                .map_err(|e| e.extend_safe())?;
-
-            let service = resolve_service(provider.graphql_enum);
-            for row in rows {
-                integrations.push(ServiceIntegration {
-                    id: row.id,
-                    service,
-                    account_identifier: row.identifier,
-                    connected_at: row.created_at.to_rfc3339(),
-                    status: "active".to_string(),
-                });
-            }
+        #[derive(sqlx::FromRow)]
+        struct UnionRow {
+            id: Uuid,
+            identifier: String,
+            created_at: chrono::DateTime<chrono::Utc>,
+            service_tag: String,
         }
+
+        let sql = union_branches.join(" UNION ALL ");
+        let rows = sqlx::query_as::<_, UnionRow>(&sql)
+            .bind(user_id)
+            .fetch_all(db_pool)
+            .await
+            .map_err(|e| e.extend_safe())?;
+
+        let integrations = rows
+            .into_iter()
+            .map(|row| ServiceIntegration {
+                id: row.id,
+                service: resolve_service(&row.service_tag),
+                account_identifier: row.identifier,
+                connected_at: row.created_at.to_rfc3339(),
+                status: "active".to_string(),
+            })
+            .collect();
 
         Ok(integrations)
     }

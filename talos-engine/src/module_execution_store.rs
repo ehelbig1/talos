@@ -242,12 +242,22 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
 
         // MCP-S2: persist payload_format alongside the ciphertext so
         // the read dispatcher routes v1 rows through the AAD path.
-        let payload_format = bundle.format_version;
+        // BUT only update the column when this UPDATE writes a new
+        // ciphertext — the empty-bundle short-circuit in
+        // `encrypt_payload_bundle` returns format_version=0 which
+        // would otherwise overwrite a row's v1 stamp from
+        // record_started (sibling of the module-executions fix in
+        // talos-module-executions::complete_execution).
+        let format_arg: Option<i16> = if bundle.encrypting() {
+            Some(bundle.format_version)
+        } else {
+            None
+        };
         sqlx::query(
             "UPDATE module_executions \
              SET status = $1, output_data = $2, output_data_enc = $3, \
                  payload_enc_key_id = COALESCE(payload_enc_key_id, $4), \
-                 payload_format = $5, \
+                 payload_format = COALESCE($5, payload_format), \
                  duration_ms = $6, error_message = $7, completed_at = NOW() \
              WHERE id = $8",
         )
@@ -255,7 +265,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         .bind(pt_output)
         .bind(bundle.output_enc.as_deref())
         .bind(bundle.key_id)
-        .bind(payload_format)
+        .bind(format_arg)
         .bind(duration_ms)
         .bind(redacted_error.as_deref())
         .bind(id)

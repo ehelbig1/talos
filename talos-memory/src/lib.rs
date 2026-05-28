@@ -344,12 +344,27 @@ pub async fn resolve_stored_value(
 /// helper remains valid because `try_get("value")` simply returns `None`.
 pub async fn decrypt_row_value(row: &sqlx::postgres::PgRow) -> anyhow::Result<serde_json::Value> {
     use sqlx::Row as _;
-    let actor_id: Uuid = row.try_get("actor_id").unwrap_or(Uuid::nil());
-    let key: String = row.try_get("key").unwrap_or_default();
+    // MCP-S2 follow-up: fail LOUDLY when `actor_id` / `key` /
+    // `value_format` are missing from the SELECT projection. Pre-fix
+    // the helper silently defaulted to `Uuid::nil()` / `""` / `0`,
+    // which made SELECT-projection drift surface as "AES-GCM tag
+    // mismatch" downstream — a generic error that buried the real
+    // bug (the caller forgot to project a column). Failing closed
+    // here means CI / integration tests trip the moment a SELECT
+    // omits a required column, rather than letting the silent v1
+    // mis-dispatch reach production.
+    let actor_id: Uuid = row
+        .try_get("actor_id")
+        .context("decrypt_row_value: caller's SELECT must project `actor_id` (MCP-S2 AAD)")?;
+    let key: String = row
+        .try_get("key")
+        .context("decrypt_row_value: caller's SELECT must project `key`")?;
     let value_plain: Option<serde_json::Value> = row.try_get("value").ok();
     let value_enc: Option<Vec<u8>> = row.try_get("value_enc").ok();
     let value_key_id: Option<Uuid> = row.try_get("value_key_id").ok();
-    let value_format: i16 = row.try_get("value_format").unwrap_or(0);
+    let value_format: i16 = row.try_get("value_format").context(
+        "decrypt_row_value: caller's SELECT must project `value_format` (MCP-S2 dispatch)",
+    )?;
     let aad = build_memory_aad(actor_id, &key);
     resolve_stored_value(value_plain, value_enc, value_key_id, aad, value_format).await
 }
@@ -821,8 +836,15 @@ pub async fn recall_recent_by_types(
 ) -> Result<Vec<(String, serde_json::Value, String)>> {
     let limit = limit.clamp(1, MAX_LIST_LIMIT);
     let owned: Vec<String> = types.iter().map(|s| (*s).to_string()).collect();
+    // MCP-S2 follow-up: project `actor_id` + `value_format` so
+    // `decrypt_row_value` can dispatch v1 (AAD-bound) ciphertexts via
+    // decrypt_versioned. Pre-fix omitted both → every v1 row decrypted
+    // with empty AAD → AES-GCM tag mismatch → `?` propagated Err from
+    // the loop, breaking Layer 3 context recall entirely for any
+    // actor with at least one post-MCP-S2 row.
     let rows = sqlx::query(
-        "SELECT key, value_enc, value_key_id, memory_type FROM actor_memory \
+        "SELECT actor_id, key, value, value_enc, value_key_id, value_format, memory_type \
+         FROM actor_memory \
          WHERE actor_id = $1 \
            AND memory_type = ANY($2) \
            AND (expires_at IS NULL OR expires_at > now()) \
@@ -864,8 +886,12 @@ pub async fn recall_recent_excluding_types(
 ) -> Result<Vec<(String, serde_json::Value, String)>> {
     let limit = limit.clamp(1, MAX_LIST_LIMIT);
     let owned: Vec<String> = exclude.iter().map(|s| (*s).to_string()).collect();
+    // MCP-S2 follow-up: same SELECT-projection drift as
+    // recall_recent_by_types above — project actor_id + value +
+    // value_format so decrypt_row_value can route v1 ciphertexts.
     let rows = sqlx::query(
-        "SELECT key, value_enc, value_key_id, memory_type FROM actor_memory \
+        "SELECT actor_id, key, value, value_enc, value_key_id, value_format, memory_type \
+         FROM actor_memory \
          WHERE actor_id = $1 \
            AND NOT (memory_type = ANY($2)) \
            AND (expires_at IS NULL OR expires_at > now()) \
@@ -1274,8 +1300,14 @@ async fn recall_keyword_inner(
     // Same `metadata.kind != ALL` semantics as recall_semantic_filtered —
     // the fallback path must honor the same exclusion so synthetic output
     // doesn't leak back in when embeddings are unavailable.
+    // MCP-S2 follow-up: project `actor_id` + `value_format` so
+    // `rows_to_memory_hits` can dispatch v1 ciphertexts via the AAD-
+    // bound decrypt. Pre-fix omitted both — the whole-phrase branch
+    // above already projected them; this per-token branch was the
+    // sibling drift that broke keyword-fallback recall for any actor
+    // with at least one v1 row.
     let rows = sqlx::query(
-        "SELECT key, value_enc, value_key_id, memory_type, expires_at, updated_at, metadata \
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata \
          FROM actor_memory \
          WHERE actor_id = $1 \
            AND (expires_at IS NULL OR expires_at > now()) \
@@ -1364,12 +1396,18 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
         // MCP-S2: SELECT actor_id + value_format alongside the existing
         // columns so the AAD-dispatch resolver picks the right path.
         // Callers' SQL must include `actor_id` and `value_format` in
-        // the projection.
-        let actor_id: Uuid = r.try_get("actor_id").unwrap_or(Uuid::nil());
+        // the projection. MCP-S2 follow-up: fail loudly on missing
+        // columns (same rationale as decrypt_row_value above) so SELECT
+        // drift in callers trips CI rather than silently mis-decrypting.
+        let actor_id: Uuid = r
+            .try_get("actor_id")
+            .context("rows_to_memory_hits: caller's SELECT must project `actor_id` (MCP-S2 AAD)")?;
         let row_key: String = r.get("key");
         let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
         let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
-        let value_format: i16 = r.try_get("value_format").unwrap_or(0);
+        let value_format: i16 = r.try_get("value_format").context(
+            "rows_to_memory_hits: caller's SELECT must project `value_format` (MCP-S2 dispatch)",
+        )?;
         let aad = build_memory_aad(actor_id, &row_key);
         let value = resolve_stored_value(None, value_enc, value_key_id, aad, value_format)
             .await?;
@@ -1567,43 +1605,24 @@ pub async fn clone_memories(
     // The per-row decrypt+re-encrypt cost is meaningful (one extra
     // AES-GCM round per row + DEK lookup) but clone_memories is a
     // relatively rare admin operation; correctness > throughput here.
+    //
+    // 2026-05-28 audit S2#7 follow-up: atomicity. Pre-fix the v0 bulk
+    // INSERT committed implicitly via `fetch_one(pool)`, then each v1
+    // re-encrypt+INSERT auto-committed individually. A mid-loop decrypt
+    // / re-encrypt / INSERT failure left the target actor in a partial
+    // state (v0 rows committed, some v1 rows committed, some missing),
+    // and the caller saw only the Err — no count, no skip list.
+    //
+    // Post-fix: do crypto work outside the transaction (DEK cache is
+    // in-process so no DB hop in the common path; SecretsManager would
+    // borrow a separate pool connection in the rare miss case, which
+    // could deadlock against our held tx), then wrap BOTH the v0
+    // bulk INSERT and the v1 INSERTs in a single tx. Any failure
+    // rolls the entire clone back; the caller's Err is now
+    // semantically "no rows changed" rather than "some rows changed,
+    // some didn't."
 
-    // First handle v0 rows via the existing bulk-SQL passthrough.
-    // value_format = 0 means no AAD was bound, so the ciphertext is
-    // decryption-equivalent under any actor_id.
-    let v0_count: i64 = sqlx::query_scalar(
-        "WITH inserted AS ( \
-             INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, updated_at) \
-             SELECT $1, key, value_enc, value_key_id, value_format, memory_type, \
-                    CASE WHEN memory_type = 'semantic' THEN NULL \
-                         WHEN memory_type = 'episodic' THEN now() + INTERVAL '7 days' \
-                    END, \
-                    metadata, \
-                    now() \
-             FROM actor_memory \
-             WHERE actor_id = $2 \
-               AND value_format = 0 \
-               AND memory_type IN ('semantic', 'episodic') \
-               AND (expires_at IS NULL OR expires_at > NOW()) \
-             ON CONFLICT (actor_id, key) DO UPDATE \
-               SET value_enc = EXCLUDED.value_enc, \
-                   value_key_id = EXCLUDED.value_key_id, \
-                   value_format = EXCLUDED.value_format, \
-                   memory_type = EXCLUDED.memory_type, \
-                   expires_at = EXCLUDED.expires_at, \
-                   metadata = EXCLUDED.metadata, \
-                   updated_at = NOW() \
-             RETURNING 1 \
-         ) SELECT COUNT(*) FROM inserted",
-    )
-    .bind(target_actor_id)
-    .bind(source_actor_id)
-    .fetch_one(pool)
-    .await
-    .context("clone_memories: bulk copy v0 (legacy no-AAD) rows")?;
-
-    // Then handle v1 rows via per-row decrypt-and-re-encrypt. The hook
-    // MUST be registered for this branch since v1 always has ciphertext.
+    // ── Pre-fetch v1 source rows + do crypto work (NO tx held) ────
     let v1_rows = sqlx::query(
         "SELECT key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata \
          FROM actor_memory \
@@ -1617,7 +1636,19 @@ pub async fn clone_memories(
     .await
     .context("clone_memories: select v1 source rows")?;
 
-    let mut v1_count: i64 = 0;
+    // Buffer the decrypted+re-encrypted v1 rows in memory so the
+    // transaction below holds only DB-write work, not crypto.
+    struct ReEncryptedRow {
+        key: String,
+        new_ciphertext: Vec<u8>,
+        new_key_id: Uuid,
+        new_format: i16,
+        memory_type: String,
+        metadata: Option<serde_json::Value>,
+        new_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    let mut v1_buffered: Vec<ReEncryptedRow> = Vec::with_capacity(v1_rows.len());
     if !v1_rows.is_empty() {
         let hook = MEMORY_CRYPTO_HOOK.get().cloned().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1652,32 +1683,87 @@ pub async fn clone_memories(
                 "episodic" => Some(chrono::Utc::now() + chrono::Duration::days(7)),
                 _ => continue,
             };
-            sqlx::query(
-                "INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \
-                 ON CONFLICT (actor_id, key) DO UPDATE \
-                   SET value_enc = EXCLUDED.value_enc, \
-                       value_key_id = EXCLUDED.value_key_id, \
-                       value_format = EXCLUDED.value_format, \
-                       memory_type = EXCLUDED.memory_type, \
-                       expires_at = EXCLUDED.expires_at, \
-                       metadata = EXCLUDED.metadata, \
-                       updated_at = NOW()",
-            )
-            .bind(target_actor_id)
-            .bind(&key)
-            .bind(new_ciphertext.as_slice())
-            .bind(new_key_id)
-            .bind(new_format)
-            .bind(&memory_type)
-            .bind(new_expires_at)
-            .bind(metadata)
-            .execute(pool)
-            .await
-            .with_context(|| format!("clone_memories: insert v1 target row key={key}"))?;
-            v1_count += 1;
+            v1_buffered.push(ReEncryptedRow {
+                key,
+                new_ciphertext,
+                new_key_id,
+                new_format,
+                memory_type,
+                metadata,
+                new_expires_at,
+            });
         }
     }
+
+    // ── Single transaction: v0 bulk INSERT + each buffered v1 INSERT ──
+    // On Err from any step, the tx Drop's rollback discards EVERYTHING.
+    let mut tx = pool
+        .begin()
+        .await
+        .context("clone_memories: begin transaction")?;
+
+    let v0_count: i64 = sqlx::query_scalar(
+        "WITH inserted AS ( \
+             INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, updated_at) \
+             SELECT $1, key, value_enc, value_key_id, value_format, memory_type, \
+                    CASE WHEN memory_type = 'semantic' THEN NULL \
+                         WHEN memory_type = 'episodic' THEN now() + INTERVAL '7 days' \
+                    END, \
+                    metadata, \
+                    now() \
+             FROM actor_memory \
+             WHERE actor_id = $2 \
+               AND value_format = 0 \
+               AND memory_type IN ('semantic', 'episodic') \
+               AND (expires_at IS NULL OR expires_at > NOW()) \
+             ON CONFLICT (actor_id, key) DO UPDATE \
+               SET value_enc = EXCLUDED.value_enc, \
+                   value_key_id = EXCLUDED.value_key_id, \
+                   value_format = EXCLUDED.value_format, \
+                   memory_type = EXCLUDED.memory_type, \
+                   expires_at = EXCLUDED.expires_at, \
+                   metadata = EXCLUDED.metadata, \
+                   updated_at = NOW() \
+             RETURNING 1 \
+         ) SELECT COUNT(*) FROM inserted",
+    )
+    .bind(target_actor_id)
+    .bind(source_actor_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("clone_memories: bulk copy v0 (legacy no-AAD) rows")?;
+
+    let mut v1_count: i64 = 0;
+    for row in v1_buffered {
+        sqlx::query(
+            "INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \
+             ON CONFLICT (actor_id, key) DO UPDATE \
+               SET value_enc = EXCLUDED.value_enc, \
+                   value_key_id = EXCLUDED.value_key_id, \
+                   value_format = EXCLUDED.value_format, \
+                   memory_type = EXCLUDED.memory_type, \
+                   expires_at = EXCLUDED.expires_at, \
+                   metadata = EXCLUDED.metadata, \
+                   updated_at = NOW()",
+        )
+        .bind(target_actor_id)
+        .bind(&row.key)
+        .bind(row.new_ciphertext.as_slice())
+        .bind(row.new_key_id)
+        .bind(row.new_format)
+        .bind(&row.memory_type)
+        .bind(row.new_expires_at)
+        .bind(row.metadata)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("clone_memories: insert v1 target row key={}", row.key))?;
+        v1_count += 1;
+    }
+
+    tx.commit()
+        .await
+        .context("clone_memories: commit transaction")?;
 
     Ok(v0_count + v1_count)
 }
@@ -1754,9 +1840,15 @@ async fn backfill_embeddings_filtered(
     actor_filter: Option<Uuid>,
     limit: i64,
 ) -> Result<usize> {
+    // MCP-S2 follow-up: project `actor_id` + `value_format` so
+    // `decrypt_row_value` dispatches v1 ciphertexts via the AAD-bound
+    // path. Pre-fix the backfill would silently skip every v1 row
+    // (decrypt err → warn + continue), so embeddings never got
+    // generated for post-MCP-S2 actor_memory rows.
     let raw_rows = match actor_filter {
         Some(actor_id) => sqlx::query(
-            "SELECT id, key, value_enc, value_key_id FROM actor_memory \
+            "SELECT id, actor_id, key, value_enc, value_key_id, value_format \
+             FROM actor_memory \
              WHERE actor_id = $1 \
                AND embedding IS NULL \
                AND memory_type != 'scratchpad' \
@@ -1768,7 +1860,8 @@ async fn backfill_embeddings_filtered(
         .fetch_all(pool)
         .await?,
         None => sqlx::query(
-            "SELECT id, key, value_enc, value_key_id FROM actor_memory \
+            "SELECT id, actor_id, key, value_enc, value_key_id, value_format \
+             FROM actor_memory \
              WHERE embedding IS NULL AND memory_type != 'scratchpad' \
              AND (expires_at IS NULL OR expires_at > NOW()) \
              ORDER BY created_at ASC LIMIT $1",

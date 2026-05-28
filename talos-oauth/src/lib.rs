@@ -38,16 +38,25 @@ pub fn oauth_expires_at(expires_in_seconds: Option<u64>) -> chrono::DateTime<chr
     /// Minimum acceptable token TTL. A provider returning 1s would
     /// otherwise cause immediate refresh-storm; floor to 60s.
     const MIN_EXPIRES_IN_SECS: u64 = 60;
-    /// Maximum acceptable TTL — 24h. OAuth refresh-token TTLs over a
-    /// day are unusual for the providers we integrate with (Google,
-    /// Atlassian, Slack); cap defends against a buggy/hostile provider
-    /// returning u64::MAX. Also keeps `i64` headroom safe
-    /// (86_400 << i64::MAX / 1000).
-    const MAX_EXPIRES_IN_SECS: u64 = 24 * 60 * 60;
+    /// Maximum acceptable TTL — 90 days. Cap defends against a
+    /// buggy/hostile provider returning u64::MAX while accommodating
+    /// long-lived legitimate tokens: Google service-account JWTs
+    /// (≤1h typical, but signed JWTs can carry a longer `exp` claim),
+    /// Microsoft Graph service-principal tokens (24h–60d), and any
+    /// future provider whose access token TTL exceeds the prior 24h
+    /// ceiling. The proactive-refresh task fires
+    /// `REFRESH_THRESHOLD_MINUTES` (10 min) ahead of expiry regardless
+    /// of TTL, so a long-lived legitimate token is still refreshed on
+    /// the correct cadence. 90 days × 86_400 = 7_776_000 sec, well
+    /// under `i64::MAX / 1000` so chrono::Duration::seconds is safe.
+    /// 2026-05-28 audit Perf#8: raised from 24h after the audit
+    /// flagged the prior cap as a footgun for future integrations
+    /// that ship long-lived tokens.
+    const MAX_EXPIRES_IN_SECS: u64 = 90 * 24 * 60 * 60;
 
     let raw = expires_in_seconds.unwrap_or(DEFAULT_EXPIRES_IN_SECS);
     let clamped = raw.clamp(MIN_EXPIRES_IN_SECS, MAX_EXPIRES_IN_SECS);
-    // u64 → i64 safe: clamped <= 86_400 << i64::MAX.
+    // u64 → i64 safe: clamped <= 7_776_000 << i64::MAX.
     // `try_seconds` for fail-closed safety; the clamp guarantees Some,
     // but defending against future mis-use is cheap.
     let dur = chrono::Duration::try_seconds(clamped as i64)
@@ -1601,14 +1610,17 @@ mod oauth_expires_at_tests {
 
     #[test]
     fn clamps_ceiling() {
-        // 24h cap defends against a provider returning huge / u64::MAX.
+        // 90-day cap defends against a provider returning huge /
+        // u64::MAX. Pre-Perf#8 the cap was 24h, which silently
+        // truncated long-lived legitimate tokens (Microsoft Graph
+        // service principals, etc.).
         let now = Utc::now();
         let exp = oauth_expires_at(Some(u64::MAX));
         let delta = exp - now;
-        // 24 * 3600 = 86_400. Allow 5s skew.
+        // 90 days × 86_400 = 7_776_000 sec. Allow 5s skew.
         assert!(
-            (86_395..=86_405).contains(&delta.num_seconds()),
-            "ceiling cap should clamp to 24h, got {}s",
+            (7_775_995..=7_776_005).contains(&delta.num_seconds()),
+            "ceiling cap should clamp to 90 days, got {}s",
             delta.num_seconds()
         );
     }
