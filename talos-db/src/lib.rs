@@ -136,6 +136,63 @@ pub async fn begin_user_scoped(
     begin_tenant_read_scoped(pool, &TenantReadScope::new(user_id, Vec::new())).await
 }
 
+/// A **request-scoped unit of work** (RFC 0005 S3): ONE tenant-scoped
+/// transaction that every data-access call in a request shares, so the
+/// role + GUC are set **once** (not once per repository method) and all
+/// of the request's queries see a single, consistent tenant snapshot.
+///
+/// This replaces the "open a fresh `begin_tenant_read_scoped` per
+/// repository method" shape — a request making N data calls otherwise
+/// pays N `BEGIN`/`SET LOCAL`/`COMMIT` round-trips across N independent
+/// transactions.
+///
+/// **Executor-threading convention:** data-access functions should accept
+/// `&mut sqlx::PgConnection` (what [`conn`](Self::conn) yields) rather
+/// than reaching for `&self.db_pool`. The same function then composes
+/// into a unit of work *or* runs standalone on a pooled connection (a
+/// `Transaction` derefs to `PgConnection`, and so does an acquired pool
+/// connection), so the repository layer migrates incrementally without a
+/// second set of methods.
+///
+/// `SET LOCAL ROLE` + the GUCs are transaction-scoped, so they reset when
+/// the unit of work is committed **or dropped** — no pooled-connection
+/// leakage. The caller MUST call [`commit`](Self::commit); dropping rolls
+/// back (correct for read-only flows, and fail-safe for writes).
+pub struct UnitOfWork<'a> {
+    tx: Transaction<'a, Postgres>,
+}
+
+impl<'a> UnitOfWork<'a> {
+    /// Begin a unit of work carrying the membership-union read backstop
+    /// (same scoping + `SET LOCAL ROLE` semantics as
+    /// [`begin_tenant_read_scoped`]). Pass the user's accessible org ids
+    /// in the scope so org-shared rows remain visible.
+    pub async fn begin(
+        pool: &'a Pool<Postgres>,
+        scope: &TenantReadScope,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            tx: begin_tenant_read_scoped(pool, scope).await?,
+        })
+    }
+
+    /// The shared executor for data-access calls within this unit of work.
+    /// Pass it where a function/repository method takes
+    /// `&mut sqlx::PgConnection`. Each call reborrows, so successive calls
+    /// compose naturally:
+    /// `let a = foo(uow.conn()).await?; let b = bar(uow.conn()).await?;`
+    pub fn conn(&mut self) -> &mut sqlx::PgConnection {
+        // Transaction<Postgres> derefs to the underlying PgConnection.
+        &mut self.tx
+    }
+
+    /// Commit the unit of work (resets the role + GUCs).
+    pub async fn commit(self) -> anyhow::Result<()> {
+        self.tx.commit().await.context("commit unit of work")?;
+        Ok(())
+    }
+}
+
 /// Whether the connecting DB role can enforce row-level security.
 ///
 /// Postgres **silently ignores** RLS policies for roles that are

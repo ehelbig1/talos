@@ -94,8 +94,20 @@ layer (methods take `impl Executor` / `&mut Transaction` instead of using
   one transaction,
 - per-read overhead drops to ~zero beyond the one request-level tx.
 
-This is the largest piece of the project (touches every repository), and
-is the reason the hot tables aren't fail-closed yet.
+The abstraction for this ships in `talos_db::UnitOfWork`: one
+tenant-scoped transaction (role + GUC set once) whose `conn()` yields a
+`&mut sqlx::PgConnection` shared across calls. The **convention** is that
+data-access functions accept `&mut sqlx::PgConnection` rather than
+`&self.db_pool`, so the same function composes into a unit of work *or*
+runs standalone on a pooled connection — which lets the repository layer
+migrate **incrementally**, a few methods per PR, with no parallel method
+set. The pilot (`actor_executions_summary` / `actor_workflows_summary`)
+collapses an ownership check + an aggregate that were two unscoped
+bare-pool round-trips into one scoped unit of work.
+
+This is the largest piece of the project (touches every repository); it
+proceeds incrementally now that the abstraction + convention exist, and
+is the last prerequisite before the hot tables can go fail-closed.
 
 ### 3. Fail-closed RLS on every owned table
 
@@ -146,7 +158,7 @@ of the value early without the full infra cost up front.
 | **S0** | Foundation: data model, primitives, policies, boot guard, permissive-rollout proof | **Done** (RFC 0004) |
 | **S1** | Fail-closed on **narrow, request-only** tables (few readers, no cross-cutting access) | `scratch_sessions` ✓, `user_module_pins` ✓ |
 | **S2** | **Permissive backstop on the user-facing IDOR surfaces** of hot/cross-cutting tables (the actual attack vector). App-layer stays primary for internal readers. | **Done** — `workflows` GraphQL ✓, `secrets` ✓, `workflow_executions` ✓, `actors` ✓ |
-| **S3** | **Role split + unit-of-work refactor** — the deliberate infra project that unblocks fail-closed for the hot tables | **In progress** — `talos_app` role + `SET LOCAL ROLE` plumbing ✓ (flag-gated, default off); next: flip default on after deploy validation, then unit-of-work |
+| **S3** | **Role split + unit-of-work refactor** — the deliberate infra project that unblocks fail-closed for the hot tables | **In progress** — `talos_app` role + `SET LOCAL ROLE` plumbing ✓ (flag-gated); chart toggle + runbook ✓; `UnitOfWork` abstraction + pilot resolvers ✓; next: migrate repositories onto `UnitOfWork` incrementally |
 | **S4** | Flip hot tables to **fail-closed** (drop permissive clause), `talos_system` exempt | Future (after S3) |
 | **T2/T3** | Per-org KEK; physical isolation (RFC 0004 §T2/T3) | Future |
 
