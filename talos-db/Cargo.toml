@@ -14,8 +14,14 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
+talos-tenancy = { path = "../talos-tenancy" }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Live-Postgres integration test for the RLS mechanism (gated on
+# TALOS_TEST_DATABASE_URL).
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true
