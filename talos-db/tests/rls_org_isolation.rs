@@ -16,7 +16,9 @@
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, Pool, Postgres};
-use talos_db::{begin_org_scoped, begin_tenant_read_scoped, begin_user_scoped, check_rls_role};
+use talos_db::{
+    begin_org_scoped, begin_tenant_read_scoped, begin_user_scoped, check_rls_role, UnitOfWork,
+};
 
 /// Serializes the per-test role DDL (`CREATE ROLE` / `GRANT` / `DROP
 /// ROLE`). Running these tests in parallel races on the Postgres system
@@ -932,4 +934,40 @@ async fn set_role_talos_app_enforces_rls_under_superuser_connection() {
 
     let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf).execute(&su).await;
     let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_a).execute(&su).await;
+}
+
+/// RFC 0005 S3: a [`UnitOfWork`] sets the tenant scope ONCE and shares it
+/// across every call on `conn()`, and a data-access function that takes
+/// `&mut sqlx::PgConnection` composes into it (the executor-threading
+/// convention the repository layer migrates toward). Deterministic — does
+/// not depend on the SET-ROLE flag (enforcement is proven separately).
+#[tokio::test]
+async fn unit_of_work_shares_scope_across_calls() {
+    let Some(su_url) = superuser_url() else { return };
+    let pool = connect(&su_url).await;
+    let user = Uuid::new_v4();
+
+    let mut uow = UnitOfWork::begin(&pool, &TenantReadScope::new(user, Vec::new()))
+        .await
+        .expect("begin unit of work");
+
+    // The GUC is set once and visible to a query on the shared conn …
+    let g1: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('app.current_user_id', true)")
+            .fetch_one(uow.conn())
+            .await
+            .unwrap();
+    assert_eq!(g1.as_deref(), Some(user.to_string()).as_deref());
+
+    // … and to a SECOND call on the same unit of work (one tx, one scope).
+    async fn read_scoped_uid(conn: &mut sqlx::PgConnection) -> Option<String> {
+        sqlx::query_scalar("SELECT current_setting('app.current_user_id', true)")
+            .fetch_one(conn)
+            .await
+            .unwrap()
+    }
+    let g2 = read_scoped_uid(uow.conn()).await;
+    assert_eq!(g2.as_deref(), Some(user.to_string()).as_deref());
+
+    uow.commit().await.expect("commit unit of work");
 }

@@ -2,7 +2,7 @@ use async_graphql::{Context, Result};
 use uuid::Uuid;
 
 use crate::schema::types::*;
-use crate::schema::{require_scope, SafeErrorExtensions};
+use crate::schema::{require_scope, user_accessible_org_ids, SafeErrorExtensions};
 
 #[derive(Default)]
 pub struct ActorsQueries;
@@ -163,11 +163,23 @@ impl ActorsQueries {
 
         use sqlx::Row;
 
+        // RFC 0005 S3: one request-scoped unit of work — the ownership
+        // check and the stats aggregate share ONE tenant-scoped tx (role +
+        // GUC set once), so they see a consistent snapshot and the
+        // actors / workflow_executions RLS policies backstop both. Real
+        // org ids keep the executions count non-regressing (a teammate's
+        // executions on the actor's org-shared workflows still count).
+        let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
         let actor_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
                 .bind(actor_id)
                 .bind(user_id)
-                .fetch_optional(db_pool)
+                .fetch_optional(uow.conn())
                 .await
                 .map_err(|e| e.extend_safe())?;
 
@@ -184,9 +196,12 @@ impl ActorsQueries {
              FROM workflow_executions WHERE actor_id = $1",
         )
         .bind(actor_id)
-        .fetch_one(db_pool)
+        .fetch_one(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(ActorExecutionsSummary {
             total_executions: stats.get("total"),
@@ -210,11 +225,19 @@ impl ActorsQueries {
 
         use sqlx::Row;
 
+        // RFC 0005 S3: shared unit of work (see actor_executions_summary).
+        // Ownership check + workflows aggregate in one tenant-scoped tx.
+        let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
         let actor_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
                 .bind(actor_id)
                 .bind(user_id)
-                .fetch_optional(db_pool)
+                .fetch_optional(uow.conn())
                 .await
                 .map_err(|e| e.extend_safe())?;
 
@@ -229,9 +252,12 @@ impl ActorsQueries {
              FROM workflows WHERE actor_id = $1",
         )
         .bind(actor_id)
-        .fetch_one(db_pool)
+        .fetch_one(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(ActorWorkflowsSummary {
             total_workflows: stats.get("total"),
