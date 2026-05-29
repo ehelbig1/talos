@@ -64,14 +64,15 @@ pub async fn begin_tenant_read_scoped<'a>(
         .begin()
         .await
         .context("begin tenant-read-scoped transaction")?;
-    sqlx::query(&scope.set_local_user_sql())
-        .execute(&mut *tx)
+    // Both SET LOCALs in ONE round-trip via the simple-query protocol
+    // (`Executor::execute(&str)`), instead of two extended-protocol
+    // queries — keeps the per-scoped-read latency to begin + this + the
+    // caller's query + commit.
+    use sqlx::Executor as _;
+    (&mut *tx)
+        .execute(scope.set_local_sql().as_str())
         .await
-        .context("set app.current_user_id")?;
-    sqlx::query(&scope.set_local_orgs_sql())
-        .execute(&mut *tx)
-        .await
-        .context("set app.current_org_ids")?;
+        .context("set app.current_user_id + app.current_org_ids")?;
     Ok(tx)
 }
 
