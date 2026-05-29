@@ -125,3 +125,79 @@ async fn scratch_sessions_rls_isolates_users_through_the_repository() {
     }
     let _ = su.execute(format!("DROP ROLE IF EXISTS {ROLE};").as_str()).await;
 }
+
+const PINS_ROLE: &str = "talos_pins_rls_app";
+
+/// RFC 0004 M4 step 2: user_module_pins RLS policy isolates per user.
+#[tokio::test]
+async fn user_module_pins_rls_isolates_per_user() {
+    let Some(su_url) = su_url() else { return };
+    let su = connect(&su_url, 2).await;
+    let user_a = Uuid::new_v4();
+    let user_b = Uuid::new_v4();
+
+    su.execute(
+        format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{PINS_ROLE}') THEN \
+               CREATE ROLE {PINS_ROLE} LOGIN PASSWORD '{PW}'; END IF; END $$;"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create pins role");
+    su.execute(format!("GRANT SELECT, INSERT, DELETE ON user_module_pins TO {PINS_ROLE};").as_str())
+        .await
+        .expect("grant");
+    for (u, label) in [(user_a, "pa"), (user_b, "pb")] {
+        sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
+            .bind(u)
+            .bind(format!("pins-{label}-{}@test.invalid", u.simple()))
+            .bind(label)
+            .execute(&su)
+            .await
+            .expect("insert user");
+    }
+
+    // Seed pins for both users as superuser (bypasses RLS for the seed).
+    for (u, m) in [(user_a, "mod-a"), (user_b, "mod-b")] {
+        sqlx::query("INSERT INTO user_module_pins (user_id, module_name) VALUES ($1,$2) ON CONFLICT DO NOTHING")
+            .bind(u)
+            .bind(m)
+            .execute(&su)
+            .await
+            .expect("seed pin");
+    }
+
+    let after_at = su_url.rsplit_once('@').map(|(_, r)| r).unwrap_or(&su_url);
+    let app = connect(&format!("postgres://{PINS_ROLE}:{PW}@{after_at}"), 4).await;
+
+    // RLS-specific: a raw no-WHERE SELECT on a scoped tx sees only the
+    // scoping user's pin.
+    let mut tx_a = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_a, vec![]))
+        .await
+        .unwrap();
+    let a_names: Vec<String> = sqlx::query_scalar("SELECT module_name FROM user_module_pins")
+        .fetch_all(&mut *tx_a)
+        .await
+        .unwrap();
+    tx_a.commit().await.unwrap();
+    assert_eq!(a_names, vec!["mod-a".to_string()], "A sees only its own pin");
+
+    let mut tx_b = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_b, vec![]))
+        .await
+        .unwrap();
+    let b_names: Vec<String> = sqlx::query_scalar("SELECT module_name FROM user_module_pins")
+        .fetch_all(&mut *tx_b)
+        .await
+        .unwrap();
+    tx_b.commit().await.unwrap();
+    assert_eq!(b_names, vec!["mod-b".to_string()], "B sees only its own pin");
+
+    let _ = su
+        .execute("DELETE FROM user_module_pins WHERE module_name IN ('mod-a','mod-b');")
+        .await;
+    for u in [user_a, user_b] {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+    }
+    let _ = su.execute(format!("DROP ROLE IF EXISTS {PINS_ROLE};").as_str()).await;
+}

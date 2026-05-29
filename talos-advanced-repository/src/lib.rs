@@ -2423,6 +2423,9 @@ impl AdvancedRepository {
         // Phase 5: modules.user_id + name is the new per-user install
         // signal. The old wasm_modules/node_templates join collapses to a
         // single lookup by (user_id, name).
+        // RFC 0004 M4: user_module_pins is RLS-enforced — run on the
+        // per-user scoped tx so the policy's user_id clause matches.
+        let mut tx = self.user_scoped_tx(user_id).await?;
         let rows = sqlx::query(
             "SELECT pm.module_name, \
                     EXISTS( \
@@ -2436,8 +2439,9 @@ impl AdvancedRepository {
         )
         .bind(user_id)
         .bind(limit)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows
             .iter()
             .map(|r| PinnedModuleInstallStatus {

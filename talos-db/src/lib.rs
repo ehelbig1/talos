@@ -75,6 +75,18 @@ pub async fn begin_tenant_read_scoped<'a>(
     Ok(tx)
 }
 
+/// Convenience over [`begin_tenant_read_scoped`] for a **personal**
+/// (per-user) table: opens a scoped tx that sets `app.current_user_id`
+/// with an empty org list, so the RLS policy's `user_id = current_user_id`
+/// clause matches. Use [`begin_tenant_read_scoped`] directly for tables
+/// shared across orgs (pass the user's accessible org ids).
+pub async fn begin_user_scoped(
+    pool: &Pool<Postgres>,
+    user_id: uuid::Uuid,
+) -> anyhow::Result<Transaction<'_, Postgres>> {
+    begin_tenant_read_scoped(pool, &TenantReadScope::new(user_id, Vec::new())).await
+}
+
 /// Whether the connecting DB role can enforce row-level security.
 ///
 /// Postgres **silently ignores** RLS policies for roles that are
