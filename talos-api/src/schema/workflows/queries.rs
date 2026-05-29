@@ -51,6 +51,17 @@ impl WorkflowsQueries {
 
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
+        // RFC 0004/0005 S2: run on a tenant-scoped tx so the
+        // workflow_executions RLS policy backstops the app-layer
+        // ownership/org filter. The scope carries the same (user,
+        // accessible orgs) the WHERE clause uses; the policy mirrors the
+        // `we.user_id = $2 OR w.org_id = ANY(...)` predicate (EXISTS on
+        // the parent workflow's org — see the migration for why we.org_id
+        // is not the tenant key here).
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let rows = sqlx::query_as::<_, Row>(
             r#"
             SELECT DISTINCT ON (we.workflow_id)
@@ -63,10 +74,11 @@ impl WorkflowsQueries {
         )
         .bind(&workflow_ids)
         .bind(user_id)
-        .bind(&org_ids)
-        .fetch_all(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(rows
             .into_iter()
@@ -148,6 +160,13 @@ impl WorkflowsQueries {
         // the field was effectively broken since the column was renamed
         // away. Project from `provenance->>'trigger_type'` and alias
         // back to `trigger_type` so the `Row` FromRow derive is unchanged.
+        // RFC 0004/0005 S2: tenant-scoped tx → workflow_executions RLS
+        // backstops the app-layer ownership/org filter (see sibling
+        // resolver above + the migration).
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let rows = sqlx::query_as::<_, Row>(
             r#"
             SELECT we.id, we.workflow_id, we.status, we.started_at, we.completed_at,
@@ -164,10 +183,11 @@ impl WorkflowsQueries {
         .bind(user_id)
         .bind(limit_val)
         .bind(offset_val)
-        .bind(&org_ids)
-        .fetch_all(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(rows
             .into_iter()
