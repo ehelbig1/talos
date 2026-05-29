@@ -596,3 +596,144 @@ async fn secrets_permissive_rls_unscoped_sees_all_scoped_enforces() {
     }
     let _ = su.execute(format!("DROP ROLE IF EXISTS {SECRETS_ROLE};").as_str()).await;
 }
+
+const EXEC_ROLE: &str = "talos_wfexec_rls_app";
+
+/// RFC 0004/0005 S2: `workflow_executions` permissive policy. The
+/// critical case is an org MEMBER (not the owner) reading a teammate's
+/// execution on an org-shared workflow — the policy must permit it via
+/// the EXISTS-on-parent-workflow clause (NOT we.org_id, which is the
+/// triggerer's personal org / NULL and would wrongly hide the row). A
+/// stranger sees nothing; an un-wired path sees all (engine writes
+/// non-breaking).
+#[tokio::test]
+async fn workflow_executions_permissive_rls_member_sees_shared_stranger_blocked() {
+    let Some(su_url) = superuser_url() else { return };
+    let su = connect(&su_url).await;
+    let owner = Uuid::new_v4();
+    let teammate = Uuid::new_v4();
+    let stranger = Uuid::new_v4();
+    let team_org = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    let exec_owner = Uuid::new_v4();
+    let exec_mate = Uuid::new_v4();
+
+    su.execute(
+        format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{EXEC_ROLE}') THEN \
+               CREATE ROLE {EXEC_ROLE} LOGIN PASSWORD '{APP_PW}'; END IF; END $$;"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create exec role");
+    // The policy's EXISTS clause reads `workflows`, so the role needs
+    // SELECT on both (workflows is itself RLS-enabled — the subquery
+    // composes with its policy under the same GUC).
+    su.execute(format!("GRANT SELECT ON workflow_executions TO {EXEC_ROLE};").as_str())
+        .await
+        .expect("grant exec");
+    su.execute(format!("GRANT SELECT ON workflows TO {EXEC_ROLE};").as_str())
+        .await
+        .expect("grant wf");
+
+    for (u, label) in [(owner, "wo"), (teammate, "wm"), (stranger, "ws")] {
+        sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
+            .bind(u)
+            .bind(format!("{label}-{}@test.invalid", u.simple()))
+            .bind(label)
+            .execute(&su)
+            .await
+            .expect("insert user");
+    }
+    sqlx::query("INSERT INTO organizations (id, name, slug, owner_id) VALUES ($1,$2,$3,$4)")
+        .bind(team_org)
+        .bind("team")
+        .bind(format!("team-{}", team_org.simple()))
+        .bind(owner)
+        .execute(&su)
+        .await
+        .expect("insert org");
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json) \
+         VALUES ($1, $2, $3, 'shared-wf', 'mod://x', '{}'::jsonb)",
+    )
+    .bind(wf)
+    .bind(owner)
+    .bind(team_org)
+    .execute(&su)
+    .await
+    .expect("insert workflow");
+    for (eid, u) in [(exec_owner, owner), (exec_mate, teammate)] {
+        sqlx::query(
+            "INSERT INTO workflow_executions (id, workflow_id, user_id, status) \
+             VALUES ($1, $2, $3, 'completed')",
+        )
+        .bind(eid)
+        .bind(wf)
+        .bind(u)
+        .execute(&su)
+        .await
+        .expect("insert execution");
+    }
+
+    let after_at = su_url.rsplit_once('@').map(|(_, r)| r).unwrap_or(&su_url);
+    let app = connect(&format!("postgres://{EXEC_ROLE}:{APP_PW}@{after_at}")).await;
+
+    // Un-wired (no GUC) → permissive → both (engine writes non-breaking).
+    let unscoped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflow_executions WHERE id IN ($1,$2)")
+            .bind(exec_owner)
+            .bind(exec_mate)
+            .fetch_one(&app)
+            .await
+            .unwrap();
+    assert_eq!(unscoped, 2, "un-wired execution read must be permissive");
+
+    // Scoped as the TEAMMATE (member of team_org, NOT the owner). Must
+    // see BOTH: exec_mate via user_id, exec_owner via the EXISTS clause
+    // (workflow shared to team_org). This is the regression the
+    // we.org_id-keyed shape would have caused.
+    let mut tx = begin_tenant_read_scoped(&app, &TenantReadScope::new(teammate, vec![team_org]))
+        .await
+        .unwrap();
+    let mate_sees: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflow_executions WHERE id IN ($1,$2)")
+            .bind(exec_owner)
+            .bind(exec_mate)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        mate_sees, 2,
+        "org member must see a teammate's execution on an org-shared workflow (EXISTS clause)"
+    );
+
+    // Scoped as a STRANGER (no membership in team_org) → sees NEITHER.
+    let lonely_org = Uuid::new_v4();
+    let mut tx = begin_tenant_read_scoped(&app, &TenantReadScope::new(stranger, vec![lonely_org]))
+        .await
+        .unwrap();
+    let stranger_sees: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflow_executions WHERE id IN ($1,$2)")
+            .bind(exec_owner)
+            .bind(exec_mate)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(stranger_sees, 0, "stranger must see no executions (IDOR backstop)");
+
+    let _ = sqlx::query("DELETE FROM workflow_executions WHERE id IN ($1,$2)")
+        .bind(exec_owner)
+        .bind(exec_mate)
+        .execute(&su)
+        .await;
+    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf).execute(&su).await;
+    let _ = sqlx::query("DELETE FROM organizations WHERE id = $1").bind(team_org).execute(&su).await;
+    for u in [owner, teammate, stranger] {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+    }
+    let _ = su.execute(format!("DROP ROLE IF EXISTS {EXEC_ROLE};").as_str()).await;
+}
