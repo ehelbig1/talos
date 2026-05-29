@@ -85,8 +85,12 @@ async fn main() -> Result<()> {
             let input: Option<serde_json::Value> = row.try_get("input_data").ok();
             let output: Option<serde_json::Value> = row.try_get("output_data").ok();
             let trigger: Option<serde_json::Value> = row.try_get("trigger_metadata").ok();
+            // MCP-S2: backfill writes v1 with AAD = id, matching the
+            // production write path. Resulting rows are decrypt-safe
+            // under the AAD-bound read dispatcher.
             let bundle = encrypt_payload_bundle(
                 Some(&secrets),
+                id,
                 input.as_ref(),
                 output.as_ref(),
                 trigger.as_ref(),
@@ -98,13 +102,14 @@ async fn main() -> Result<()> {
                 "UPDATE module_executions \
                  SET input_data = NULL, output_data = NULL, trigger_metadata = NULL, \
                      input_data_enc = $1, output_data_enc = $2, trigger_metadata_enc = $3, \
-                     payload_enc_key_id = $4 \
-                 WHERE id = $5 AND payload_enc_key_id IS NULL",
+                     payload_enc_key_id = $4, payload_format = $5 \
+                 WHERE id = $6 AND payload_enc_key_id IS NULL",
             )
             .bind(bundle.input_enc.as_deref())
             .bind(bundle.output_enc.as_deref())
             .bind(bundle.trigger_enc.as_deref())
             .bind(bundle.key_id)
+            .bind(bundle.format_version)
             .bind(id)
             .execute(&mut *tx)
             .await?;

@@ -324,6 +324,11 @@ pub struct WebhookTrigger {
     /// The legacy plaintext `signing_secret` column has been removed.
     pub signing_secret_enc: Option<Vec<u8>>,
     pub signing_key_id: Option<Uuid>,
+    /// MCP-S2: AEAD AAD format version for `signing_secret_enc`.
+    /// 0 = legacy no-AAD, 1 = AAD-bound to `id`. Decrypt dispatches via
+    /// `SecretsManager::decrypt_versioned`.
+    #[sqlx(default)]
+    pub signing_secret_format: i16,
     pub allowed_ips: Option<Vec<String>>,
     pub enabled: bool,
     pub auto_respond: bool,
@@ -707,7 +712,23 @@ impl WebhookRouter {
             trigger.signing_key_id,
         ) {
             (Some(enc), Some(key_id)) => {
-                match self.secrets_manager.decrypt_value_by_key(key_id, enc).await {
+                // MCP-S2: dispatch on the per-row format version. v0 rows
+                // (existing pre-fix) decrypt with empty AAD; v1 rows
+                // decrypt with AAD = trigger.id bytes. A swapped
+                // ciphertext (attacker DB-write) fails AES-GCM tag
+                // verification on v1 rows and is logged as a decryption
+                // failure — the webhook then falls back to
+                // verification_token (or rejects, depending on policy).
+                match self
+                    .secrets_manager
+                    .decrypt_versioned(
+                        key_id,
+                        enc,
+                        trigger.id.as_bytes(),
+                        trigger.signing_secret_format,
+                    )
+                    .await
+                {
                     Ok(s) => Some(s),
                     Err(e) => {
                         tracing::error!(
@@ -1041,8 +1062,11 @@ impl WebhookRouter {
             // bundle's `encrypting()` flag should always be true here —
             // the conditional write keeps the codepath robust to future
             // configurations where SecretsManager might be optional.
+            // MCP-S2: AAD = job_id binds the webhook payload ciphertext
+            // to its module_executions row.
             let payload_bundle = match talos_module_payload_encryption::encrypt_payload_bundle(
                 Some(&self.secrets_manager),
+                job_id,
                 Some(&payload_value),
                 None,
                 None,
@@ -1078,9 +1102,9 @@ impl WebhookRouter {
             };
             if let Err(e) = sqlx::query(
                 "INSERT INTO module_executions (id, module_id, user_id, status, \
-                  input_data, input_data_enc, payload_enc_key_id, \
+                  input_data, input_data_enc, payload_enc_key_id, payload_format, \
                   workflow_execution_id, trigger_type, started_at)
-                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, 'webhook', NOW())
+                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, 'webhook', NOW())
                  ON CONFLICT DO NOTHING",
             )
             .bind(job_id)
@@ -1089,6 +1113,7 @@ impl WebhookRouter {
             .bind(redacted_pt_payload.as_ref())
             .bind(payload_bundle.input_enc.as_deref())
             .bind(payload_bundle.key_id)
+            .bind(payload_bundle.format_version)
             .bind(None::<Uuid>)
             .execute(&self.db_pool)
             .await
@@ -1254,7 +1279,13 @@ impl WebhookRouter {
             })
             .await;
 
-            let wasm_duration_ms = wasm_start.elapsed().as_millis() as i32;
+            // MCP-961 sibling: saturating u128→i32 conversion. Pre-fix
+            // `as i32` wrapped for durations > i32::MAX ms (~24.8 days).
+            // The webhook timeout bounds practical exposure, but the
+            // column type is i32 — saturating keeps the column
+            // monotonic under any future timeout policy change.
+            let wasm_duration_ms = i32::try_from(wasm_start.elapsed().as_millis())
+                .unwrap_or(i32::MAX);
 
             let (response_body, success, error_msg) = match result {
                 Ok(Ok(output)) => {
@@ -1282,7 +1313,11 @@ impl WebhookRouter {
                 }
             };
 
-            let total_duration_ms = start_time.elapsed().as_millis() as i32;
+            // MCP-961 sibling: see wasm_duration_ms above — saturating
+            // u128→i32 conversion bounds the column under any future
+            // timeout policy change.
+            let total_duration_ms = i32::try_from(start_time.elapsed().as_millis())
+                .unwrap_or(i32::MAX);
 
             // Decoupled Write Path: Async Logging & State Updates
             let status_code = if success {
@@ -1935,7 +1970,7 @@ impl WebhookRouter {
             r#"
             SELECT id, user_id, name, module_id, workflow_id,
                    verification_token,
-                   signing_secret_enc, signing_key_id,
+                   signing_secret_enc, signing_key_id, signing_secret_format,
                    allowed_ips, enabled, auto_respond, queue_events, max_requests_per_minute,
                    COALESCE(sync_response, false) as sync_response,
                    COALESCE(sync_timeout_secs, 30) as sync_timeout_secs
@@ -2957,6 +2992,14 @@ pub async fn approval_gate_handler(
     }
 
     // Look up the gate — we compare status and expiry atomically in the UPDATE
+    // 2026-05-28 audit follow-up (low confidence): the WHERE token = $1
+    // lookup uses Postgres byte-level comparator, not the canonical
+    // workspace `subtle::ConstantTimeEq` discipline used elsewhere
+    // (csrf, api-keys, totp, registry signature, webhook HMAC). The
+    // 64-char hex pre-filter at line 2976 bounds attack surface in
+    // practice. A proper hardening would (1) add `token_hash` column
+    // (SHA-256 prefix index), (2) lookup by hash, (3) ct_eq the full
+    // token after fetch. Deferred — schema change with backfill cost.
     let row: Option<(
         uuid::Uuid,
         String,

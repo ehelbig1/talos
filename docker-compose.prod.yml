@@ -244,8 +244,16 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: talos-frontend-prod
+    # 2026-05-28 review (low): bind to loopback only — like the controller
+    # (whose host `ports:` block is intentionally commented out) and the data
+    # services, the frontend must NOT be published on 0.0.0.0. The frontend
+    # nginx reverse-proxies /graphql + /ws to the controller and serves the SPA
+    # over plain HTTP; exposing it on all host interfaces lets clients reach the
+    # API/app shell in cleartext, bypassing the TLS-terminating reverse proxy
+    # this deployment assumes (HSTS is inert over HTTP). The co-located proxy
+    # reaches it via 127.0.0.1:3002 or the internal talos-network.
     ports:
-      - "3002:8080"
+      - "127.0.0.1:3002:8080"
     security_opt:
       - "no-new-privileges:true"
     depends_on:

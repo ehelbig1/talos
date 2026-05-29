@@ -1199,6 +1199,90 @@ pub(crate) fn classify_private_ip(ip: std::net::IpAddr) -> Option<&'static str> 
     }
 }
 
+/// Tier-1 (local-Ollama-only) data-egress deny-check on a URL host.
+///
+/// Returns `Some(policy)` — the `record_capability_denied` reason — when a
+/// Tier-1 actor must be refused this destination, `None` when allowed.
+///
+/// Two cases:
+/// 1. A known external LLM provider hostname (`is_external_llm_host`).
+/// 2. A **globally-routable IP literal**. The hostname deny-list (case 1) is
+///    name-based, so a guest with `allowed_hosts: ["*"]` could otherwise reach
+///    a provider by raw IP (`https://<ip>/v1/messages`) and slip the ceiling —
+///    the IP-literal bypass found in the 2026-05-28 review. A public IP literal
+///    is "data leaving the host" and has no legitimate Tier-1 use (local Ollama
+///    is reached via hostname/localhost/private IP). Private, loopback,
+///    link-local, CGNAT, and unspecified literals are governed by the SSRF
+///    classifier and remain allowed here (so `127.0.0.1:11434` Ollama works).
+///
+/// `host_lower` MUST already be lowercased by the caller (matches the existing
+/// call sites). IPv6 literals are accepted with or without surrounding
+/// brackets.
+fn tier1_egress_deny_reason(host_lower: &str) -> Option<&'static str> {
+    if talos_workflow_job_protocol::is_external_llm_host(host_lower) {
+        return Some("tier1-llm-egress");
+    }
+    let bare = host_lower
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host_lower);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        // Public/routable IP literal (SSRF classifier returns None) → deny.
+        if classify_private_ip(ip).is_none() {
+            return Some("tier1-public-ip-egress");
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tier1_egress_tests {
+    use super::tier1_egress_deny_reason;
+
+    #[test]
+    fn denies_known_provider_hostname() {
+        assert_eq!(
+            tier1_egress_deny_reason("api.anthropic.com"),
+            Some("tier1-llm-egress")
+        );
+    }
+
+    #[test]
+    fn denies_public_ip_literal() {
+        // Public IPv4 / IPv6 literals — the bypass class.
+        assert_eq!(
+            tier1_egress_deny_reason("160.79.104.10"),
+            Some("tier1-public-ip-egress")
+        );
+        assert_eq!(
+            tier1_egress_deny_reason("8.8.8.8"),
+            Some("tier1-public-ip-egress")
+        );
+        assert_eq!(
+            tier1_egress_deny_reason("[2606:4700:4700::1111]"),
+            Some("tier1-public-ip-egress")
+        );
+    }
+
+    #[test]
+    fn allows_local_ip_literals_for_ollama() {
+        // Local Ollama at loopback / private IP must still work for Tier-1.
+        assert_eq!(tier1_egress_deny_reason("127.0.0.1"), None);
+        assert_eq!(tier1_egress_deny_reason("192.168.1.50"), None);
+        assert_eq!(tier1_egress_deny_reason("10.0.0.3"), None);
+        assert_eq!(tier1_egress_deny_reason("[::1]"), None);
+        assert_eq!(tier1_egress_deny_reason("0.0.0.0"), None);
+    }
+
+    #[test]
+    fn allows_non_provider_hostnames() {
+        // A DNS hostname that isn't a provider is governed by allowed_hosts,
+        // not by this Tier-1 deny-check.
+        assert_eq!(tier1_egress_deny_reason("ollama.internal"), None);
+        assert_eq!(tier1_egress_deny_reason("example.com"), None);
+    }
+}
+
 /// Match a host against the per-module `allowed_hosts` patterns.
 ///
 /// Patterns can be:
@@ -1395,14 +1479,22 @@ pub(crate) fn classify_url_scheme(scheme: &str, insecure_opt_in: bool) -> UrlSch
     if scheme == "https" {
         return UrlSchemeVerdict::Https;
     }
-    if insecure_opt_in {
-        UrlSchemeVerdict::InsecureAllowedByOptIn {
+    // 2026-05-28 audit F4: the `WASM_ALLOW_INSECURE_HTTP` env var is
+    // documented as "permit plaintext HTTP". Pre-fix the implementation
+    // greenlit ANY non-`https` scheme under the opt-in, including
+    // `file://`, `ftp://`, `data:`, and any future scheme. Reqwest
+    // refuses these today so the practical hole is closed, but a
+    // future HTTP-client swap (curl, ureq, hyper-multiplex) would
+    // inherit the gap. Whitelist `http` explicitly so the opt-in's
+    // scope matches its name and any other scheme falls through to
+    // `InsecureRefused` regardless of opt-in state.
+    if scheme == "http" && insecure_opt_in {
+        return UrlSchemeVerdict::InsecureAllowedByOptIn {
             scheme: scheme.to_string(),
-        }
-    } else {
-        UrlSchemeVerdict::InsecureRefused {
-            scheme: scheme.to_string(),
-        }
+        };
+    }
+    UrlSchemeVerdict::InsecureRefused {
+        scheme: scheme.to_string(),
     }
 }
 
@@ -1456,6 +1548,26 @@ mod url_scheme_policy_tests {
             classify_url_scheme("ftp", false),
             UrlSchemeVerdict::InsecureRefused { .. }
         ));
+    }
+
+    #[test]
+    fn opt_in_does_not_extend_to_non_http_schemes() {
+        // 2026-05-28 audit F4: the `WASM_ALLOW_INSECURE_HTTP` opt-in
+        // is documented as "permit plaintext HTTP". Pre-fix it greenlit
+        // ANY non-https scheme. Reqwest refuses these today but a
+        // future client swap would inherit the hole. Pin the
+        // post-fix behaviour: only `http` is widened by the opt-in;
+        // every other scheme stays Refused even when opt-in is on.
+        for s in ["file", "ftp", "data", "ws", "wss", "javascript", "ldap"] {
+            assert!(
+                matches!(
+                    classify_url_scheme(s, true),
+                    UrlSchemeVerdict::InsecureRefused { .. }
+                ),
+                "scheme {s} must stay Refused under opt-in; got {:?}",
+                classify_url_scheme(s, true)
+            );
+        }
     }
 }
 
@@ -3105,13 +3217,14 @@ impl wit_http::Host for TalosContext {
             talos_workflow_job_protocol::LlmTier::Tier1
         ) {
             let host_lower = host.to_ascii_lowercase();
-            if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                self.record_capability_denied("http-fetch", "tier1-llm-egress", host)
+            if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                self.record_capability_denied("http-fetch", policy, host)
                     .await;
                 tracing::warn!(
                     host,
                     actor_id = ?self.actor_id,
-                    "tier-1 actor attempted HTTP to external LLM host; refused"
+                    policy,
+                    "tier-1 actor egress refused (external LLM host or public IP literal)"
                 );
                 return Err(wit_http::Error::Forbiddenhost);
             }
@@ -3655,13 +3768,14 @@ impl wit_http::Host for TalosContext {
                 talos_workflow_job_protocol::LlmTier::Tier1
             ) {
                 let host_lower = host.to_ascii_lowercase();
-                if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                    self.record_capability_denied("http-fetch-all", "tier1-llm-egress", &host)
+                if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                    self.record_capability_denied("http-fetch-all", policy, &host)
                         .await;
                     tracing::warn!(
                         host = %host,
                         actor_id = ?self.actor_id,
-                        "tier-1 actor attempted fetch_all HTTP to external LLM host; refused"
+                        policy,
+                        "tier-1 actor fetch_all egress refused (external LLM host or public IP literal)"
                     );
                     validated.push(Err(wit_http::Error::Forbiddenhost));
                     continue;
@@ -4912,6 +5026,22 @@ fn require_state_capability(
     }
 }
 
+/// Maximum caller-supplied key length for wit_state operations, in
+/// bytes. `set` has enforced this since MCP-712; the parity sweep
+/// (this audit) extends the same cap to get / delete / exists so a
+/// guest can't drive the host into per-call `format!("{module_id}:{key}")`
+/// heap-alloc work with megabyte keys. Matches `state_rpc`'s
+/// `MAX_STATE_KEY_LEN` on the controller side.
+pub(crate) const MAX_STATE_KEY_LEN: usize = 1024;
+
+fn require_state_key_in_range(key: &str) -> Result<(), wit_state::Error> {
+    if key.is_empty() || key.len() > MAX_STATE_KEY_LEN {
+        Err(wit_state::Error::Invalidkey)
+    } else {
+        Ok(())
+    }
+}
+
 impl wit_state::Host for TalosContext {
     async fn get(&mut self, key: String) -> Result<String, wit_state::Error> {
         // MCP-712 (2026-05-13): audit-ledger emission for capability-
@@ -4928,6 +5058,11 @@ impl wit_state::Host for TalosContext {
                 .await;
             return Err(wit_state::Error::Storagefailed);
         }
+        // Parity with `set` (which enforced this since MCP-712). Without
+        // the cap here, a guest can drive per-call
+        // `format!("{module_id}:{key}")` heap-alloc work with megabyte
+        // keys via repeated get/delete/exists calls.
+        require_state_key_in_range(&key)?;
         let scoped = self.scoped_state_key(&key);
         let store = self
             .state_store
@@ -4950,9 +5085,7 @@ impl wit_state::Host for TalosContext {
                 .await;
             return Err(wit_state::Error::Storagefailed);
         }
-        if key.is_empty() || key.len() > 1024 {
-            return Err(wit_state::Error::Invalidkey);
-        }
+        require_state_key_in_range(&key)?;
         if value.len() > 1024 * 1024 {
             // 1MB limit
             tracing::warn!("State value exceeds 1MB limit");
@@ -5009,6 +5142,8 @@ impl wit_state::Host for TalosContext {
                 .await;
             return Err(wit_state::Error::Storagefailed);
         }
+        // Key-length parity with set; see the sibling cap on get().
+        require_state_key_in_range(&key)?;
         let scoped = self.scoped_state_key(&key);
         let mut store = self
             .state_store
@@ -5042,6 +5177,13 @@ impl wit_state::Host for TalosContext {
             // Minimal-world module enumerating namespace keys.
             self.record_capability_denied("state-exists", "capability-world", &key)
                 .await;
+            return false;
+        }
+        // Key-length parity with set; oversized keys collapse to
+        // false (this is an infallible WIT method — no Err variant
+        // to surface). The cap prevents per-call
+        // `format!("{module_id}:{key}")` allocation on megabyte input.
+        if key.is_empty() || key.len() > MAX_STATE_KEY_LEN {
             return false;
         }
         let scoped = self.scoped_state_key(&key);
@@ -5088,6 +5230,44 @@ impl wit_state::Host for TalosContext {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod wit_state_key_range_tests {
+    use super::{require_state_key_in_range, MAX_STATE_KEY_LEN};
+
+    #[test]
+    fn empty_key_rejected() {
+        assert!(require_state_key_in_range("").is_err());
+    }
+
+    #[test]
+    fn single_char_key_accepted() {
+        assert!(require_state_key_in_range("k").is_ok());
+    }
+
+    #[test]
+    fn key_at_limit_accepted() {
+        let k: String = "a".repeat(MAX_STATE_KEY_LEN);
+        assert!(require_state_key_in_range(&k).is_ok());
+    }
+
+    #[test]
+    fn key_just_over_limit_rejected() {
+        let k: String = "a".repeat(MAX_STATE_KEY_LEN + 1);
+        assert!(require_state_key_in_range(&k).is_err());
+    }
+
+    #[test]
+    fn megabyte_key_rejected_get_delete_exists_parity() {
+        // The cap previously lived only inside `set`; sweep parity
+        // (this PR) ensures get/delete/exists/set all share the same
+        // gate so a guest cannot drive per-call
+        // `format!("{module_id}:{key}")` heap-alloc work via the
+        // unbounded siblings.
+        let k: String = "x".repeat(1024 * 1024);
+        assert!(require_state_key_in_range(&k).is_err());
     }
 }
 
@@ -6308,6 +6488,22 @@ impl wit_messaging::Host for TalosContext {
 
         let mut headers = async_nats::HeaderMap::new();
         if let Some(hdr_list) = msg.headers {
+            // MCP-1105 sibling: cap header count BEFORE the per-header
+            // vault-resolve loop. `resolve_vault_header` is a DB call
+            // (cache hit common but not guaranteed); unbounded iteration
+            // is the exact amplification `MAX_OUTBOUND_HEADERS = 64`
+            // bounds on `wit_http::fetch`, `wit_webhook::send`, and
+            // `wit_graphql::execute`. publish_with_headers was the
+            // holdout.
+            if hdr_list.len() > MAX_OUTBOUND_HEADERS {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    header_count = hdr_list.len(),
+                    limit = MAX_OUTBOUND_HEADERS,
+                    "wit_messaging::publish_with_headers rejected: header count exceeds cap"
+                );
+                return Err(wit_messaging::Error::Publishfailed);
+            }
             for (k, v) in &hdr_list {
                 let resolved = self
                     .resolve_vault_header(k.as_str(), v.as_str())
@@ -6747,13 +6943,14 @@ impl TalosContext {
                 talos_workflow_job_protocol::LlmTier::Tier1
             ) {
                 let host_lower = host.to_ascii_lowercase();
-                if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                    self.record_capability_denied("graphql", "tier1-llm-egress", &host)
+                if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                    self.record_capability_denied("graphql", policy, &host)
                         .await;
                     tracing::warn!(
                         host = %host,
                         actor_id = ?self.actor_id,
-                        "tier-1 actor attempted GraphQL to external LLM host; refused"
+                        policy,
+                        "tier-1 actor GraphQL egress refused (external LLM host or public IP literal)"
                     );
                     return Err(wit_graphql::Error::Networkerror);
                 }
@@ -6851,14 +7048,31 @@ impl TalosContext {
                         }
                         bytes.extend_from_slice(&chunk);
                     }
-                    let resp_json: serde_json::Value = serde_json::from_slice(&bytes)
+                    // MCP-H7: parse via a typed struct with
+                    // `Box<RawValue>` fields so the `data` and `errors`
+                    // payloads pass through as borrowed JSON text
+                    // without materialising a full
+                    // `HashMap<String, Value>` tree. Pre-fix the
+                    // `serde_json::Value` materialisation then
+                    // `.to_string()` reserialisation paid 3-10x WASM
+                    // fuel cost vs typed parsing on the 10 MB cap.
+                    // See CLAUDE.md WASM rules ("never use top-level
+                    // Value for upstream payloads") + the 2026-05-28
+                    // perf audit.
+                    #[derive(serde::Deserialize)]
+                    struct GqlResp<'a> {
+                        #[serde(borrow, default)]
+                        data: Option<&'a serde_json::value::RawValue>,
+                        #[serde(borrow, default)]
+                        errors: Option<Vec<&'a serde_json::value::RawValue>>,
+                    }
+                    let resp_parsed: GqlResp<'_> = serde_json::from_slice(&bytes)
                         .map_err(|_| wit_graphql::Error::Parseerror)?;
 
-                    let data = resp_json.get("data").map(|d| d.to_string());
-                    let errors = resp_json
-                        .get("errors")
-                        .and_then(|e| e.as_array())
-                        .map(|arr| arr.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+                    let data = resp_parsed.data.map(|d| d.get().to_string());
+                    let errors = resp_parsed
+                        .errors
+                        .map(|arr| arr.into_iter().map(|e| e.get().to_string()).collect());
 
                     return Ok(wit_graphql::Response { data, errors });
                 }
@@ -7103,13 +7317,14 @@ impl wit_webhook::Host for TalosContext {
             talos_workflow_job_protocol::LlmTier::Tier1
         ) {
             let host_lower = host.to_ascii_lowercase();
-            if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                self.record_capability_denied("webhook", "tier1-llm-egress", &host)
+            if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                self.record_capability_denied("webhook", policy, &host)
                     .await;
                 tracing::warn!(
                     host = %host,
                     actor_id = ?self.actor_id,
-                    "tier-1 actor attempted webhook to external LLM host; refused"
+                    policy,
+                    "tier-1 actor webhook egress refused (external LLM host or public IP literal)"
                 );
                 return Err(wit_webhook::Error::Sendfailed);
             }
@@ -7331,6 +7546,62 @@ impl wit_email::Host for TalosContext {
                 total = total_recipients,
                 cap = MAX_EMAIL_RECIPIENTS_PER_MESSAGE,
                 "Email recipient count (to + cc + bcc) exceeds limit"
+            );
+            return Err(wit_email::Error::Sendfailed);
+        }
+
+        // MCP-1014 sibling: cap caller-supplied subject + body + html +
+        // attachments byte size. Pre-fix `msg.body`, `msg.html`,
+        // `msg.subject` were unbounded — a guest with the Email
+        // capability could pack 10 MB-each strings into a single send,
+        // materialise them into a `serde_json::Value`, then reqwest.
+        // The post-MCP-1014 audit (2026-05-28 F1) caught that
+        // `msg.attachments: Option<list<attachment>>` (per-attachment
+        // `data: list<u8>`) was NOT counted toward the cap, so the
+        // wit_email path still permitted megabyte-scale outbound
+        // content via attachment data. The cap now sums all
+        // recipient-billed content. With
+        // MAX_EMAIL_SENDS_PER_EXECUTION=50, worst-case in-flight host
+        // memory is bounded to ~500 MB per execution. Run AFTER the
+        // validation/recipient gates so a malformed-recipient probe
+        // doesn't burn the body-size check budget either way.
+        const MAX_EMAIL_CONTENT_BYTES: usize = MAX_OUTBOUND_HTTP_BODY_BYTES;
+        let html_len = msg.html.as_ref().map(|h| h.len()).unwrap_or(0);
+        let attachments_count = msg.attachments.as_ref().map(|a| a.len()).unwrap_or(0);
+        let attachments_bytes: usize = msg
+            .attachments
+            .as_ref()
+            .map(|atts| {
+                atts.iter()
+                    .map(|a| a.filename.len() + a.content_type.len() + a.data.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        let body_bytes = msg.subject.len() + msg.body.len() + html_len + attachments_bytes;
+        if body_bytes > MAX_EMAIL_CONTENT_BYTES {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                subject_len = msg.subject.len(),
+                body_len = msg.body.len(),
+                html_len = html_len,
+                attachments_count,
+                attachments_bytes,
+                total = body_bytes,
+                cap = MAX_EMAIL_CONTENT_BYTES,
+                "wit_email::send rejected: subject+body+html+attachments exceeds cap"
+            );
+            return Err(wit_email::Error::Sendfailed);
+        }
+        // Bound the attachment COUNT independently so a guest can't
+        // ship 100k 1-byte attachments to exhaust SendGrid's per-call
+        // limits (typical providers cap at 10 MB total / ~10 files).
+        const MAX_EMAIL_ATTACHMENTS: usize = 32;
+        if attachments_count > MAX_EMAIL_ATTACHMENTS {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                attachments_count,
+                cap = MAX_EMAIL_ATTACHMENTS,
+                "wit_email::send rejected: attachment count exceeds cap"
             );
             return Err(wit_email::Error::Sendfailed);
         }
@@ -8421,6 +8692,20 @@ impl wit_data_transform::Host for TalosContext {
         let value: serde_json::Value =
             serde_json::from_str(&json).map_err(|_| wit_data_transform::Error::Parseerror)?;
         let xml = json_value_to_xml(&value, &root_element);
+        // 2026-05-28 audit F2: input cap doesn't bound the OUTPUT —
+        // wrapper-tag-per-node amplification can 2-4× the byte count
+        // on deeply nested JSON. With a 10 MB input cap, worst-case
+        // host materialisation is ~40 MB. Add an output-side cap so
+        // the host doesn't return a string larger than the input
+        // ceiling regardless of nesting structure.
+        if xml.len() > MAX_XML_BYTES {
+            tracing::warn!(
+                "json_to_xml output exceeded {} bytes (post-inflation: {})",
+                MAX_XML_BYTES,
+                xml.len()
+            );
+            return Err(wit_data_transform::Error::Parseerror);
+        }
         Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{}", xml))
     }
 }
@@ -8807,6 +9092,76 @@ impl governance::Host for TalosContext {
 // LLM
 // ============================================================================
 
+/// 2026-05-28 audit Perf#1 (H7 sibling): typed projection of an LLM
+/// provider response. Deserializing into one of these instead of
+/// `serde_json::Value` saves the per-field `HashMap<String, Value>`
+/// allocation tree. The two variants match the only two formats the
+/// callers branch on (`is_openai_format`).
+///
+/// Lives at module scope so the structs participate in `#[derive]` —
+/// `serde::Deserialize` traits can't be derived inside a function body.
+enum LlmResponse {
+    OpenAi(OpenAiResponse),
+    Anthropic(AnthropicResponse),
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiResponse {
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiChoice {
+    #[serde(default)]
+    message: Option<OpenAiMessage>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiMessage {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct AnthropicResponse {
+    #[serde(default)]
+    content: Vec<AnthropicBlock>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AnthropicBlock {
+    /// Renamed because `type` is a Rust keyword.
+    #[serde(rename = "type", default)]
+    block_type: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+}
+
 impl wit_llm::Host for TalosContext {
     async fn complete(
         &mut self,
@@ -8976,7 +9331,7 @@ impl wit_llm::Host for TalosContext {
         if matches!(provider, wit_llm::Provider::Anthropic) {
             http_req = http_req.header("anthropic-version", "2023-06-01");
         }
-        let resp_body: serde_json::Value = tokio::time::timeout(
+        let resp_body: LlmResponse = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             async move {
                 let response = http_req
@@ -9033,67 +9388,92 @@ impl wit_llm::Host for TalosContext {
                         MAX_LLM_BODY_BYTES
                     ))
                 })?;
-                serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|e| {
-                    wit_llm::Error::ApiError(format!("Failed to parse response JSON: {e}"))
-                })
+                // 2026-05-28 audit Perf#1: H7 sibling. Pre-fix this
+                // materialised the full `serde_json::Value` tree only
+                // to pluck 3-5 fields per branch. Now we deserialize
+                // into format-specific typed structs — serde only
+                // allocates the strings we actually use, skipping the
+                // `HashMap<String, Value>` tree for every other field
+                // in the provider response. The two structs match the
+                // exact shape consumed below.
+                //
+                // OpenAI/Ollama:
+                //   { choices: [{ message: { content: "..." },
+                //                 finish_reason: "..." }],
+                //     usage: { prompt_tokens, completion_tokens } }
+                // Anthropic/Gemini:
+                //   { content: [{ type: "text", text: "..." }, ...],
+                //     usage: { input_tokens, output_tokens },
+                //     stop_reason: "..." }
+                //
+                // The format-divergent shapes return as enum variants
+                // so the extraction logic below stays
+                // strongly-typed instead of `get("...").and_then(...)`
+                // chains over `Value`.
+                if is_openai_format {
+                    serde_json::from_slice::<OpenAiResponse>(&body_bytes)
+                        .map(LlmResponse::OpenAi)
+                        .map_err(|e| {
+                            wit_llm::Error::ApiError(format!(
+                                "Failed to parse OpenAI-format response: {e}"
+                            ))
+                        })
+                } else {
+                    serde_json::from_slice::<AnthropicResponse>(&body_bytes)
+                        .map(LlmResponse::Anthropic)
+                        .map_err(|e| {
+                            wit_llm::Error::ApiError(format!(
+                                "Failed to parse Anthropic-format response: {e}"
+                            ))
+                        })
+                }
             },
         )
         .await
         .map_err(|_| wit_llm::Error::Timeout)??;
 
-        // Parse text and usage from the response — format differs by provider.
-        // Anthropic: { content: [{type:"text", text:"..."}], usage: {input_tokens, output_tokens} }
-        // OpenAI/Ollama: { choices: [{message:{content:"..."}}], usage: {prompt_tokens, completion_tokens} }
-        let (text, usage, stop_reason) = if is_openai_format {
-            let text = resp_body
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let usage = resp_body.get("usage").map(|u| wit_llm::TokenUsage {
-                // MCP-1008: saturate-on-overflow to surface malicious /
-                // corrupted provider responses as visible spikes.
-                input_tokens: json_token_count_as_u32(u.get("prompt_tokens"), 0),
-                output_tokens: json_token_count_as_u32(u.get("completion_tokens"), 0),
-            });
-            let stop_reason = resp_body
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("finish_reason"))
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            (text, usage, stop_reason)
-        } else {
-            // Anthropic / Gemini format
-            let text = resp_body
-                .get("content")
-                .and_then(|c| c.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|block| {
-                            if block.get("type")?.as_str()? == "text" {
-                                block.get("text")?.as_str().map(String::from)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            let usage = resp_body.get("usage").map(|u| wit_llm::TokenUsage {
-                // MCP-1008: saturate-on-overflow (see helper docs).
-                input_tokens: json_token_count_as_u32(u.get("input_tokens"), 0),
-                output_tokens: json_token_count_as_u32(u.get("output_tokens"), 0),
-            });
-            let stop_reason = resp_body
-                .get("stop_reason")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            (text, usage, stop_reason)
+        // Extract text + usage + stop_reason from the typed response.
+        let (text, usage, stop_reason) = match resp_body {
+            LlmResponse::OpenAi(r) => {
+                let text = r
+                    .choices
+                    .first()
+                    .and_then(|c| c.message.as_ref())
+                    .and_then(|m| m.content.clone())
+                    .unwrap_or_default();
+                let usage = r.usage.map(|u| wit_llm::TokenUsage {
+                    // MCP-1008: saturate-on-overflow to surface
+                    // malicious / corrupted provider responses as
+                    // visible spikes.
+                    input_tokens: u32::try_from(u.prompt_tokens.unwrap_or(0))
+                        .unwrap_or(u32::MAX),
+                    output_tokens: u32::try_from(u.completion_tokens.unwrap_or(0))
+                        .unwrap_or(u32::MAX),
+                });
+                let stop_reason = r
+                    .choices
+                    .into_iter()
+                    .next()
+                    .and_then(|c| c.finish_reason);
+                (text, usage, stop_reason)
+            }
+            LlmResponse::Anthropic(r) => {
+                let text = r
+                    .content
+                    .iter()
+                    .filter(|b| b.block_type.as_deref() == Some("text"))
+                    .filter_map(|b| b.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("");
+                let usage = r.usage.map(|u| wit_llm::TokenUsage {
+                    // MCP-1008: saturate-on-overflow.
+                    input_tokens: u32::try_from(u.input_tokens.unwrap_or(0))
+                        .unwrap_or(u32::MAX),
+                    output_tokens: u32::try_from(u.output_tokens.unwrap_or(0))
+                        .unwrap_or(u32::MAX),
+                });
+                (text, usage, r.stop_reason)
+            }
         };
         if let Some(ref m) = self.metrics {
             let duration_ms = llm_start.elapsed().as_millis() as f64;
@@ -12512,13 +12892,14 @@ impl wit_http_stream::Host for TalosContext {
             talos_workflow_job_protocol::LlmTier::Tier1
         ) {
             let host_lower = host.to_ascii_lowercase();
-            if talos_workflow_job_protocol::is_external_llm_host(&host_lower) {
-                self.record_capability_denied("http-stream", "tier1-llm-egress", &host)
+            if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                self.record_capability_denied("http-stream", policy, &host)
                     .await;
                 tracing::warn!(
                     host = %host,
                     actor_id = ?self.actor_id,
-                    "tier-1 actor attempted HTTP stream to external LLM host; refused"
+                    policy,
+                    "tier-1 actor HTTP stream egress refused (external LLM host or public IP literal)"
                 );
                 return Err(wit_http_stream::Error::ForbiddenHost);
             }
@@ -13336,5 +13717,182 @@ mod integration_state_helper_tests {
                 std::mem::discriminant(&expected)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod llm_response_parse_tests {
+    //! 2026-05-28 audit Perf#1: typed-deserialize parser tests.
+    //!
+    //! Pre-fix the LLM response materialised into `serde_json::Value`
+    //! and the consumers did `get("...").and_then(...)` chains over
+    //! it. Post-fix the response goes through `OpenAiResponse` /
+    //! `AnthropicResponse` typed structs. These tests pin the field-
+    //! extraction contract end-to-end so a future refactor can't
+    //! regress the field plucking that the LLM hot path depends on.
+
+    use super::{AnthropicResponse, OpenAiResponse};
+
+    #[test]
+    fn openai_response_pulls_content_and_usage() {
+        let body = br#"{
+            "id": "chat-1",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "hello world"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 25,
+                "total_tokens": 37
+            }
+        }"#;
+        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
+        let choice = &r.choices[0];
+        assert_eq!(
+            choice.message.as_ref().unwrap().content.as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+        let u = r.usage.unwrap();
+        assert_eq!(u.prompt_tokens, Some(12));
+        assert_eq!(u.completion_tokens, Some(25));
+    }
+
+    #[test]
+    fn openai_response_handles_missing_usage() {
+        // Providers sometimes omit `usage` on streaming or error
+        // responses. Parser must accept this without panicking.
+        let body = br#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        }"#;
+        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
+        assert!(r.usage.is_none());
+        assert_eq!(
+            r.choices[0].message.as_ref().unwrap().content.as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn openai_response_handles_empty_choices() {
+        // Some Ollama wrappers return `{"choices": []}` on rate limit
+        // or model-not-found. Parser must accept; downstream code
+        // surfaces empty text.
+        let body = br#"{"choices": []}"#;
+        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
+        assert!(r.choices.is_empty());
+        assert!(r.usage.is_none());
+    }
+
+    #[test]
+    fn openai_response_ignores_unknown_fields() {
+        // Providers add fields over time (e.g., `system_fingerprint`).
+        // Parser must not break on unknown keys.
+        let body = br#"{
+            "choices": [{"message": {"content": "x"}}],
+            "system_fingerprint": "fp_abc",
+            "logprobs": null,
+            "x_some_future_field": {"nested": "value"}
+        }"#;
+        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
+        assert_eq!(
+            r.choices[0].message.as_ref().unwrap().content.as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn anthropic_response_pulls_text_blocks() {
+        let body = br#"{
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 7, "output_tokens": 3}
+        }"#;
+        let r: AnthropicResponse = serde_json::from_slice(body).expect("parse");
+        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
+        let u = r.usage.unwrap();
+        assert_eq!(u.input_tokens, Some(7));
+        assert_eq!(u.output_tokens, Some(3));
+        // Match the post-fix join: filter for `type == "text"` then
+        // concatenate `.text`.
+        let joined: String = r
+            .content
+            .iter()
+            .filter(|b| b.block_type.as_deref() == Some("text"))
+            .filter_map(|b| b.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(joined, "hello world");
+    }
+
+    #[test]
+    fn anthropic_response_ignores_non_text_blocks() {
+        // Future Anthropic responses may include `tool_use`,
+        // `image`, etc. blocks. Parser must skip them when
+        // extracting text — matches the post-fix filter.
+        let body = br#"{
+            "content": [
+                {"type": "tool_use", "name": "calculator", "input": {}},
+                {"type": "text", "text": "the answer is 42"}
+            ]
+        }"#;
+        let r: AnthropicResponse = serde_json::from_slice(body).expect("parse");
+        let joined: String = r
+            .content
+            .iter()
+            .filter(|b| b.block_type.as_deref() == Some("text"))
+            .filter_map(|b| b.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(joined, "the answer is 42");
+    }
+
+    #[test]
+    fn anthropic_response_handles_missing_optional_fields() {
+        // Minimal valid response.
+        let body = br#"{"content": []}"#;
+        let r: AnthropicResponse = serde_json::from_slice(body).expect("parse");
+        assert!(r.content.is_empty());
+        assert!(r.usage.is_none());
+        assert!(r.stop_reason.is_none());
+    }
+
+    #[test]
+    fn token_count_saturates_on_overflow() {
+        // Direct integer larger than u32::MAX should deserialize
+        // into u64 cleanly. The post-fix saturating cast to u32 in
+        // the host_impl extraction is tested at the call site; here
+        // we just confirm the typed field accepts the full u64.
+        let body = br#"{"usage": {"prompt_tokens": 5000000000, "completion_tokens": 1}}"#;
+        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
+        let u = r.usage.unwrap();
+        assert_eq!(u.prompt_tokens, Some(5_000_000_000));
+        // The saturating-cast logic lives in the call site:
+        let saturated = u32::try_from(u.prompt_tokens.unwrap_or(0)).unwrap_or(u32::MAX);
+        assert_eq!(saturated, u32::MAX);
+    }
+
+    #[test]
+    fn token_count_handles_missing_with_default() {
+        // Older Ollama versions omit `usage` entirely; the
+        // call-site `.unwrap_or(0)` then `u32::try_from` produces 0.
+        let body = br#"{"usage": {}}"#;
+        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
+        let u = r.usage.unwrap();
+        assert_eq!(u.prompt_tokens, None);
+        assert_eq!(u.completion_tokens, None);
     }
 }

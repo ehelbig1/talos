@@ -1554,13 +1554,20 @@ async fn handle_tail_worker_logs(
         }
     };
 
+    // 2026-05-28 review (low): apply the same __actor_context__ redaction the
+    // sibling readers (get_execution_logs, get_node_io) use — blank the
+    // plaintext `value` fields of any injected actor-memory so this read
+    // surface honours the MCP-41 privacy invariant uniformly. The write-path
+    // DLP only strips token-shaped secrets, not arbitrary actor-memory content,
+    // so a module that logs its own input would otherwise leak it here in the
+    // clear while every other read path redacts the identical bytes.
     let entries: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
             let mut obj = serde_json::json!({
                 "ts": r.created_at.to_rfc3339(),
                 "level": r.level,
-                "message": r.message,
+                "message": redact_actor_context_in_log(&r.message),
             });
             if let Some(nid) = r.node_id {
                 if let Some(m) = obj.as_object_mut() {
@@ -1569,7 +1576,9 @@ async fn handle_tail_worker_logs(
             }
             if let Some(ref md) = r.metadata {
                 if let Some(m) = obj.as_object_mut() {
-                    m.insert("metadata".to_string(), md.clone());
+                    let mut md = md.clone();
+                    redact_actor_context_in_place(&mut md);
+                    m.insert("metadata".to_string(), md);
                 }
             }
             obj

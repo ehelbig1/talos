@@ -1600,6 +1600,53 @@ impl ParallelWorkflowEngine {
                     .cloned()
             });
 
+        // MCP-H6: hoist the per-iteration DB-read costs out of the
+        // loop body. Pre-fix every iteration re-ran:
+        //   1. `fetch_module(body_uuid)` — 1 SELECT against `modules`
+        //      (no in-process cache).
+        //   2. `build_encrypted_secrets(body_module_id, exec, key)` —
+        //      1 SELECT against `secrets` + per-row AES decrypt +
+        //      LLM-keys resolve + AES encrypt of the result.
+        // For a 100-iteration loop that's ~300 extra DB round-trips
+        // per execution (3 SELECTs × 100 iterations). Module bytes
+        // and module-grant secrets are invariant across iterations —
+        // resolve them once at loop entry and reuse. If the loop
+        // exits without dispatching the body (condition false on
+        // entry), we eat the prefetch cost but the cache is one
+        // SELECT, not 100.
+        //
+        // 2026-05-28 audit Perf#6 semantic note: the cached
+        // `encrypted_secrets` captures vault values AT LOOP ENTRY.
+        // SecretsManager's LLM-keys cache has a 60s TTL so rotations
+        // normally propagate within a minute; a long-running loop
+        // (e.g. 100 iters × 10s/iter = ~17 min) holds the snapshot
+        // for the loop's full lifetime. This matches the workflow
+        // execution-consistency model (one execution = one secret
+        // snapshot) — an operator who rotates a vault key mid-run
+        // sees the new value on the NEXT execution, not the
+        // in-flight one. Document the semantic so future readers
+        // don't mistake it for a cache-invalidation bug.
+        let cached_wasm_module = match self
+            .fetch_module(body_uuid)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+        {
+            Ok(m) => Some(m),
+            Err(e) => {
+                // Defer the error report to the first iteration so the
+                // shape of the engine output is identical to pre-fix.
+                tracing::warn!(
+                    body_uuid = %body_uuid,
+                    err = %e,
+                    "loop body module fetch failed at prefetch"
+                );
+                None
+            }
+        };
+        let cached_encrypted_secrets = self
+            .build_encrypted_secrets(body_module_id, execution_id, worker_shared_key)
+            .await;
+
         while iteration < max_iters {
             // Evaluate condition against current output + loop metadata.
             // `iteration_count` is injected so conditions like
@@ -1629,16 +1676,13 @@ impl ParallelWorkflowEngine {
             // Log iteration event via the engine's shared emit helper.
             self.emit_loop_iteration_event(execution_id, node_id, iteration, max_iters);
 
-            // Dispatch the body node's module.
-            let fetch_result = self
-                .fetch_module(body_uuid)
-                .await
-                .map_err(|e| anyhow::anyhow!(e));
-
-            let wasm_module = match fetch_result {
-                Ok(m) => m,
-                Err(e) => {
-                    let msg = format!("Module fetch failed: {e}");
+            // MCP-H6: reuse the prefetched module bytes. If the
+            // prefetch failed, surface it now (same shape as pre-fix
+            // failure).
+            let wasm_module = match cached_wasm_module.as_ref() {
+                Some(m) => m.clone(),
+                None => {
+                    let msg = "Module fetch failed at loop-body prefetch".to_string();
                     last_output = serde_json::json!({
                         "__error": true,
                         "error_message": msg.clone(),
@@ -1683,9 +1727,12 @@ impl ParallelWorkflowEngine {
             let job_input = serde_json::Value::Object(merged_input);
 
             let body_timeout_secs = self.node_timeout_for(body_uuid).unwrap_or(30);
-            let encrypted_secrets = self
-                .build_encrypted_secrets(body_module_id, execution_id, worker_shared_key)
-                .await;
+            // MCP-H6: reuse the prefetched encrypted_secrets. The DEK,
+            // module-grant secrets, and LLM keys are invariant across
+            // loop iterations, so re-resolving + re-encrypting per
+            // iteration is wasted work. Clone is cheap (it's an
+            // EncryptedSecrets containing a small Vec<u8> + nonce).
+            let encrypted_secrets = cached_encrypted_secrets.clone();
             let body_job = DispatchJob {
                 execution_id,
                 node_id: body_uuid,
@@ -1706,6 +1753,24 @@ impl ParallelWorkflowEngine {
                 // `wasm:{id}` mismatch that broke loop iteration > 0.
                 // Matches the single-node dispatch pattern in
                 // `engine_dispatch_single.rs`.
+                //
+                // 2026-05-28 audit Perf#7 follow-up (tracked, NOT
+                // shipped in the post-7879f4b sweep): each loop
+                // iteration clones the full WASM blob into a fresh
+                // `DispatchJob`. For a 5 MB module × 100 iters that
+                // is ~500 MB of controller-side allocator churn.
+                // Fix is wire-compatible (`Arc<Vec<u8>>` on both
+                // `DispatchJob.wasm_bytes` and
+                // `JobRequest.wasm_bytes` — `serde::Serialize` for
+                // `Arc<T>` delegates to `T`, so on-wire bytes are
+                // identical). Deferred: blast radius spans ~30-50
+                // construction / read sites across the dispatcher
+                // impls, and the savings only matter for long-loop /
+                // large-module workloads. Treat as its own focused
+                // PR (`perf(protocol): Arc inline wasm_bytes`) so a
+                // subtle serde/Tokio interaction can be isolated
+                // and reverted if needed without entangling other
+                // changes.
                 wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
                     None
                 } else {

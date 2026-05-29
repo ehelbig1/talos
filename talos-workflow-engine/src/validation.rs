@@ -7,6 +7,37 @@
 //! does this URL match a capability scope?) lives in the worker's
 //! sandbox.
 
+use std::sync::LazyLock;
+
+use dashmap::DashMap;
+
+/// Memoized compile cache for `validate_config_patterns`. Keyed by
+/// the exact `pattern` string (operator-authored, capped at
+/// MAX_PATTERN_LEN bytes via the gate inside `validate_config_patterns`).
+///
+/// 2026-05-28 audit Perf#5: pre-fix every graph load + every dispatch
+/// re-compiled every property's regex. A workflow with N nodes × M
+/// keyed patterns × P graph loads pays O(N × M × P) regex compiles.
+/// Pattern strings are operator-authored and bounded (≤1024 bytes),
+/// so the cache size is well-bounded by the workflow set.
+///
+/// Stores `Result<Regex, String>` so a malformed pattern's error
+/// is cached too — second-load doesn't re-pay the parse cost just to
+/// produce the same error.
+static PATTERN_CACHE: LazyLock<DashMap<String, Result<regex::Regex, String>>> =
+    LazyLock::new(DashMap::new);
+
+/// Compile a regex via the memoizing cache. Returns the compiled
+/// regex on success, or a clone of the cached error string on failure.
+fn cached_regex(pattern: &str) -> Result<regex::Regex, String> {
+    if let Some(entry) = PATTERN_CACHE.get(pattern) {
+        return entry.clone();
+    }
+    let result = regex::Regex::new(pattern).map_err(|e| e.to_string());
+    PATTERN_CACHE.insert(pattern.to_string(), result.clone());
+    result
+}
+
 /// Validate config values against `pattern` constraints in the
 /// `config_schema`.
 ///
@@ -34,25 +65,42 @@ pub fn validate_config_patterns(
         None => return Ok(()),
     };
 
+    // MCP-H2: cap operator-authored `pattern` length BEFORE attempting
+    // to compile. Rust's regex crate is linear-time (no ReDoS in the
+    // exponential sense) but compile cost is O(pattern_size), so a
+    // 1 MB literal pattern loaded from a workflow's `config_schema`
+    // burns CPU on every graph load. 1 KiB matches the workspace
+    // ceiling for operator-supplied regex literals (logger filters,
+    // host allowlists, etc.).
+    const MAX_PATTERN_LEN: usize = 1024;
     for (key, prop_schema) in properties {
         if let Some(pattern) = prop_schema.get("pattern").and_then(|p| p.as_str()) {
+            if pattern.len() > MAX_PATTERN_LEN {
+                return Err(format!(
+                    "Config key '{}' pattern exceeds {} byte limit",
+                    key, MAX_PATTERN_LEN
+                ));
+            }
             if let Some(value) = config_obj.get(key).and_then(|v| v.as_str()) {
-                match regex::Regex::new(pattern) {
-                    Ok(re) => {
-                        if !re.is_match(value) {
-                            return Err(format!(
-                                "Config key '{}' value does not match required pattern '{}'",
-                                key, pattern
-                            ));
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            key,
-                            pattern,
-                            "Invalid regex pattern in config_schema — skipping validation"
-                        );
-                    }
+                // MCP-H2: fail CLOSED on regex compile error. Pre-fix
+                // a malformed pattern logged a warn and `continue`d,
+                // making schema regex bugs invisible to validation
+                // callers — every config value would pass even if the
+                // schema author intended a strict match. Surface the
+                // error so the operator notices on graph load /
+                // dispatch and fixes the schema.
+                // Perf#5 follow-up: route through the memoizing cache
+                // so repeated graph loads of the same workflow don't
+                // re-pay the O(pattern_size) compile cost per-key
+                // per-dispatch.
+                let re = cached_regex(pattern).map_err(|e| {
+                    format!("Config key '{}' pattern is not a valid regex: {}", key, e)
+                })?;
+                if !re.is_match(value) {
+                    return Err(format!(
+                        "Config key '{}' value does not match required pattern '{}'",
+                        key, pattern
+                    ));
                 }
             }
         }

@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
 import { SectionHeader } from "@/components/ui/SectionHeader";
@@ -21,6 +21,7 @@ import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { gql, graphqlRequest } from "@/lib/graphqlClient";
+import { validateOAuthUrl, loadOAuthHosts } from "@/lib/oauthUtils";
 import {
   useListLinkedAccountsQuery,
   useUnlinkOAuthMutation,
@@ -94,6 +95,13 @@ export default function OAuthManager() {
   const { data, isLoading } = useListLinkedAccountsQuery();
   const accounts = data?.linkedOauthAccounts;
 
+  // 2026-05-28 review (low): populate the dynamic OAuth-host allowlist so
+  // validateOAuthUrl below accepts operator-configured providers (it falls
+  // back to the static ALLOWED_OAUTH_HOSTS if this hasn't resolved yet).
+  useEffect(() => {
+    loadOAuthHosts();
+  }, []);
+
   const unlinkMutation = useUnlinkOAuthMutation({
     onSuccess: () => {
       toast.success("Account unlinked successfully");
@@ -121,6 +129,15 @@ export default function OAuthManager() {
         { provider: providerId },
       );
       if (urlData?.oauthLoginUrl?.authUrl) {
+        // 2026-05-28 review (low): gate the top-level navigation through the
+        // same open-redirect guard the sibling redirect sites use
+        // (IntegrationsManager, SlackAppSelector). Defends against a
+        // backend-minted authUrl ever pointing off-allowlist.
+        if (!validateOAuthUrl(urlData.oauthLoginUrl.authUrl)) {
+          toast.error("Invalid OAuth authorization URL received from server");
+          setLinkingProvider(null);
+          return;
+        }
         window.location.href = urlData.oauthLoginUrl.authUrl;
       }
     } catch (err: unknown) {

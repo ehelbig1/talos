@@ -142,7 +142,16 @@ pub fn from_graph_json(
                         .and_then(|d| d.get("systemNodeKind"))
                         .and_then(|s| s.as_str())
                         .map(String::from),
-                    retry_count: n.get("retry_count").and_then(|r| r.as_u64()).unwrap_or(0) as u32,
+                    // MCP-962 sibling: saturating u64→u32 conversion on
+                    // the YAML import path; mirrors the graph_parser fix
+                    // for the React-Flow JSON path. Pre-fix `as u32`
+                    // silently wrapped a misconfigured `retry_count:
+                    // 5_000_000_000` into ~705M retries.
+                    retry_count: n
+                        .get("retry_count")
+                        .and_then(|r| r.as_u64())
+                        .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+                        .unwrap_or(0),
                     continue_on_error: n
                         .get("continue_on_error")
                         .and_then(|c| c.as_bool())

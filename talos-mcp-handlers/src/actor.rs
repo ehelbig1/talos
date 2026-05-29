@@ -1504,9 +1504,12 @@ async fn handle_create_actor(
         );
     }
 
-    // Human RBAC: enforce the requesting user's capability ceiling
+    // Human RBAC: enforce the requesting user's capability ceiling.
+    // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate — a
+    // user may only create an actor whose ceiling is a SUBSET of their own.
+    // `world_rank` comparison wrongly admitted incomparable siblings.
     let user_ceiling = user_max_world(&state.db_pool, user_id).await;
-    if world_rank(max_world) > world_rank(&user_ceiling) {
+    if !talos_capability_world::ceiling_permits(&user_ceiling, max_world) {
         return mcp_error(
             req_id, -32603,
             &format!(
@@ -5566,9 +5569,12 @@ async fn handle_grant_capability_ceiling(
         None => None,
     };
 
-    // Granter's ceiling must be >= world being granted
+    // Granter's ceiling must be a superset of the world being granted.
+    // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate — a
+    // `cache-node` granter could previously grant `secrets-node`/`governance-node`
+    // (lower rank, but lattice-incomparable) to another user.
     let granter_ceiling = user_max_world(&state.db_pool, granter_id).await;
-    if world_rank(grant_world) > world_rank(&granter_ceiling) {
+    if !talos_capability_world::ceiling_permits(&granter_ceiling, grant_world) {
         return mcp_error(
             req_id,
             -32603,
@@ -6091,9 +6097,12 @@ async fn handle_clone_actor(
     };
     let new_description = override_description.or(source_description);
 
-    // Human RBAC: enforce the requesting user's capability ceiling
+    // Human RBAC: enforce the requesting user's capability ceiling.
+    // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate — a
+    // user could previously clone an actor whose ceiling is a lattice-incomparable
+    // sibling of (not a subset of) their own.
     let user_ceiling = user_max_world(&state.db_pool, user_id).await;
-    if world_rank(&source_max_world) > world_rank(&user_ceiling) {
+    if !talos_capability_world::ceiling_permits(&user_ceiling, &source_max_world) {
         return mcp_error(
             req_id,
             -32603,

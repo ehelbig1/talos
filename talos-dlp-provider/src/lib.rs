@@ -54,6 +54,17 @@ pub trait DlpProvider: Send + Sync {
     /// Redact PII from a plain string.
     fn redact_str(&self, input: &str) -> String;
 
+    /// Allocation-light variant of `redact_str` — returns
+    /// `Cow::Borrowed` when no PII is detected so callers on hot
+    /// paths avoid the per-pattern allocation cycle. The default
+    /// implementation falls back to `redact_str` and always allocates;
+    /// builtin providers override with a fast-path match-then-allocate
+    /// pattern. Used by the WASM-log broadcast scrubber and other
+    /// per-message-volume call sites.
+    fn redact_str_cow<'a>(&self, input: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Owned(self.redact_str(input))
+    }
+
     /// Recursively redact string leaves in a JSON value tree.
     ///
     /// The default implementation walks the tree and calls `redact_str` on
@@ -413,18 +424,16 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
 /// Regex-based PII redaction — the default provider.
 pub struct BuiltinDlpProvider;
 
-// MCP-949 (2026-05-15): the `redact_str_optimized` helper below
-// returns `Cow::Borrowed` when no PII pattern matches, avoiding the
-// allocation that `redact_str` (the trait method) always pays. It has
-// no callers — wired only in an unmerged optimization path. Kept
-// for future wiring (the consumer site would be the hot DLP path
-// in `node_hook` / `audit_ledger`); narrow-scope the allow to this
-// impl block so the rest of the file still warns.
-#[allow(dead_code)]
 impl BuiltinDlpProvider {
     /// Optimized redaction that minimizes allocations for common cases.
-    /// Returns Cow::Borrowed if no redaction needed, avoiding allocation entirely.
-    fn redact_str_optimized<'a>(&self, input: &'a str) -> std::borrow::Cow<'a, str> {
+    /// Returns `Cow::Borrowed` if no redaction needed, avoiding the
+    /// ~14-allocation per-pattern walk that `redact_str` (the trait
+    /// method) pays unconditionally. Wired through the public
+    /// `redact_str_cow` free function and used on hot paths like the
+    /// WASM log broadcast scrubber (`controller::scrub_wasm_log_for_broadcast`)
+    /// where the typical message has zero matches and the trait method
+    /// burns CPU on dead allocations.
+    pub fn redact_str_optimized<'a>(&self, input: &'a str) -> std::borrow::Cow<'a, str> {
         // Fast path: check if any pattern matches before allocating
         let card_pattern = &*CARD_PATTERN;
         let needs_redaction =
@@ -450,6 +459,10 @@ impl DlpProvider for BuiltinDlpProvider {
         }
         result
     }
+
+    fn redact_str_cow<'a>(&self, input: &'a str) -> std::borrow::Cow<'a, str> {
+        self.redact_str_optimized(input)
+    }
 }
 
 // ============================================================================
@@ -462,6 +475,10 @@ pub struct PassthroughDlpProvider;
 impl DlpProvider for PassthroughDlpProvider {
     fn redact_str(&self, input: &str) -> String {
         input.to_owned()
+    }
+
+    fn redact_str_cow<'a>(&self, input: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Borrowed(input)
     }
 
     fn redact_json(&self, value: &Value) -> Value {
@@ -657,6 +674,10 @@ impl DlpService {
         self.0.redact_str(s)
     }
 
+    pub fn redact_str_cow<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        self.0.redact_str_cow(s)
+    }
+
     pub fn redact_json(&self, v: &Value) -> Value {
         self.0.redact_json(v)
     }
@@ -678,6 +699,22 @@ static GLOBAL_DLP: LazyLock<DlpService> = LazyLock::new(DlpService::from_env);
 /// unchanged if an internal error occurs (infallible).
 pub fn redact_str(s: &str) -> String {
     GLOBAL_DLP.redact_str(s)
+}
+
+/// Allocation-light variant of [`redact_str`]. Returns `Cow::Borrowed`
+/// when the input contains no PII patterns, avoiding the per-pattern
+/// allocation cycle that `redact_str` pays unconditionally.
+///
+/// Use this on hot paths where most inputs are expected to be
+/// pattern-free (per-log-line WASM broadcast, per-event subscriber
+/// fan-out). The trait method is still appropriate on persistence-
+/// boundary writes where a single allocation per row is acceptable.
+///
+/// Dispatches via the `DlpProvider::redact_str_cow` trait method;
+/// builtin + passthrough providers override with zero-alloc fast
+/// paths, external provider falls back to the alloc-once shape.
+pub fn redact_str_cow(s: &str) -> std::borrow::Cow<'_, str> {
+    GLOBAL_DLP.redact_str_cow(s)
 }
 
 /// Recursively redact string leaves in a JSON value tree.

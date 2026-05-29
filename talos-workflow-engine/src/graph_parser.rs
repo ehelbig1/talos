@@ -22,11 +22,21 @@ use uuid::Uuid;
 /// type. Returns `None` when the node has no retry config at all; the
 /// engine treats that as "use the workflow-level default."
 pub(crate) fn read_node_retry_policy(node: &JsonValue) -> Option<RetryPolicy> {
+    // MCP-962 sibling: saturating u64→u32 conversion. Pre-fix `as u32`
+    // silently wrapped a caller-supplied `retry_count: 5_000_000_000`
+    // (5B) into ~705M retries in `RetryPolicy::max_retries`. The
+    // actor-budget clamp in `read_node_retry_policy_with_actor_cap`
+    // only kicks in when `actor_id.is_none()`, so actor-owned
+    // executions took the unbounded value straight into the engine
+    // retry loop. Saturate to u32::MAX so the dashboard renders an
+    // operator-recognisably absurd value (~4.3B) that triggers
+    // investigation, vs. silently truncating to a plausible-looking
+    // 705M.
     let retry_count = node
         .get("retry_count")
         .or_else(|| node.get("data").and_then(|d| d.get("retry_count")))
         .and_then(JsonValue::as_u64)
-        .map(|v| v as u32);
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
     let retry_backoff = node
         .get("retry_backoff_ms")
         .or_else(|| node.get("data").and_then(|d| d.get("retry_backoff_ms")))
@@ -461,4 +471,60 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
 #[cfg(not(feature = "llm-primitives"))]
 fn parse_llm_system_node_kind(_k: &str, _node: &JsonValue) -> Option<SystemNodeKind> {
     None
+}
+
+#[cfg(test)]
+mod read_node_retry_policy_tests {
+    use super::read_node_retry_policy;
+    use serde_json::json;
+
+    #[test]
+    fn retry_count_within_u32_passes_through() {
+        let node = json!({ "retry_count": 5 });
+        let p = read_node_retry_policy(&node).unwrap();
+        assert_eq!(p.max_retries, 5);
+    }
+
+    #[test]
+    fn retry_count_above_u32_saturates_to_max() {
+        // MCP-962 sibling: pre-fix `v as u32` for v = 5_000_000_000
+        // silently wrapped to ~705_032_704. Saturating cast surfaces
+        // an operator-recognisably absurd value (~4.3B) instead.
+        let node = json!({ "retry_count": 5_000_000_000_u64 });
+        let p = read_node_retry_policy(&node).unwrap();
+        assert_eq!(p.max_retries, u32::MAX);
+    }
+
+    #[test]
+    fn retry_count_u64_max_saturates_to_u32_max() {
+        let node = json!({ "retry_count": u64::MAX });
+        let p = read_node_retry_policy(&node).unwrap();
+        assert_eq!(p.max_retries, u32::MAX);
+    }
+
+    #[test]
+    fn retry_count_at_u32_max_passes_through() {
+        let node = json!({ "retry_count": u32::MAX as u64 });
+        let p = read_node_retry_policy(&node).unwrap();
+        assert_eq!(p.max_retries, u32::MAX);
+    }
+
+    #[test]
+    fn retry_count_just_over_u32_max_saturates() {
+        // Pre-fix `v as u32` for v = u32::MAX as u64 + 1 wrapped to 0
+        // — silently disabling all retries.
+        let node = json!({ "retry_count": (u32::MAX as u64) + 1 });
+        let p = read_node_retry_policy(&node).unwrap();
+        assert_eq!(p.max_retries, u32::MAX);
+    }
+
+    #[test]
+    fn nested_data_retry_count_also_saturates() {
+        // The parser accepts both top-level and `data.*` shapes.
+        let node = json!({
+            "data": { "retry_count": 10_000_000_000_u64 }
+        });
+        let p = read_node_retry_policy(&node).unwrap();
+        assert_eq!(p.max_retries, u32::MAX);
+    }
 }

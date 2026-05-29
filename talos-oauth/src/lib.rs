@@ -4,6 +4,66 @@ pub mod resolver;
 pub use credentials::OAuthCredentialService;
 pub use resolver::ControllerSecretsResolver;
 
+/// Compute an OAuth token's `expires_at` from a provider-supplied
+/// `expires_in` (seconds, optional). Safe under three failure modes
+/// that the canonical `Utc::now() + Duration::seconds(expires_in as i64)`
+/// idiom hit silently:
+///
+/// 1. **Negative cast wrap.** `Option<u64>::unwrap_or(3600) as i64`
+///    wraps for `expires_in > i64::MAX` (~9.2e18 sec). Result: a
+///    negative duration → `expires_at` in the past → token treated as
+///    immediately-expired on every read → refresh-loop hammers the
+///    provider.
+///
+/// 2. **`chrono::Duration::seconds` panic.** Chrono represents
+///    durations internally as i64 milliseconds. For
+///    `seconds > i64::MAX / 1_000` (~9.2e15), the constructor
+///    overflows and **panics**, killing the refresh task entirely
+///    with no graceful fallback.
+///
+/// 3. **None / zero / negative `expires_in`.** Providers occasionally
+///    return `expires_in: 0` (or omit the field); the canonical
+///    idiom defaulted to 3600s.
+///
+/// Defense matches MCP-997 (caller-supplied destructive interval
+/// clamp at function entry) and the MCP-960..962 integer-cast sweep.
+/// Clamps to 24h max (an OAuth refresh-token TTL longer than a day
+/// is unusual; capping defends against a misbehaving provider).
+/// Minimum 60s so a `expires_in: 1` doesn't immediately invalidate.
+pub fn oauth_expires_at(expires_in_seconds: Option<u64>) -> chrono::DateTime<chrono::Utc> {
+    /// Provider-suggested default when `expires_in` is missing. Matches
+    /// the canonical OAuth2 RFC 6749 §4.2.2 default and what every
+    /// pre-fix call site used.
+    const DEFAULT_EXPIRES_IN_SECS: u64 = 3600;
+    /// Minimum acceptable token TTL. A provider returning 1s would
+    /// otherwise cause immediate refresh-storm; floor to 60s.
+    const MIN_EXPIRES_IN_SECS: u64 = 60;
+    /// Maximum acceptable TTL — 90 days. Cap defends against a
+    /// buggy/hostile provider returning u64::MAX while accommodating
+    /// long-lived legitimate tokens: Google service-account JWTs
+    /// (≤1h typical, but signed JWTs can carry a longer `exp` claim),
+    /// Microsoft Graph service-principal tokens (24h–60d), and any
+    /// future provider whose access token TTL exceeds the prior 24h
+    /// ceiling. The proactive-refresh task fires
+    /// `REFRESH_THRESHOLD_MINUTES` (10 min) ahead of expiry regardless
+    /// of TTL, so a long-lived legitimate token is still refreshed on
+    /// the correct cadence. 90 days × 86_400 = 7_776_000 sec, well
+    /// under `i64::MAX / 1000` so chrono::Duration::seconds is safe.
+    /// 2026-05-28 audit Perf#8: raised from 24h after the audit
+    /// flagged the prior cap as a footgun for future integrations
+    /// that ship long-lived tokens.
+    const MAX_EXPIRES_IN_SECS: u64 = 90 * 24 * 60 * 60;
+
+    let raw = expires_in_seconds.unwrap_or(DEFAULT_EXPIRES_IN_SECS);
+    let clamped = raw.clamp(MIN_EXPIRES_IN_SECS, MAX_EXPIRES_IN_SECS);
+    // u64 → i64 safe: clamped <= 7_776_000 << i64::MAX.
+    // `try_seconds` for fail-closed safety; the clamp guarantees Some,
+    // but defending against future mis-use is cheap.
+    let dur = chrono::Duration::try_seconds(clamped as i64)
+        .unwrap_or_else(|| chrono::Duration::seconds(DEFAULT_EXPIRES_IN_SECS as i64));
+    chrono::Utc::now() + dur
+}
+
 /// How far ahead of token expiry we start refreshing (minutes).
 ///
 /// INVARIANT: the proactive refresh task's SQL query window (`refresh_task.rs`)
@@ -1513,5 +1573,87 @@ mod okta_domain_validation_tests {
         assert!(!is_valid_okta_domain("acme.\nokta.com"));
         assert!(!is_valid_okta_domain("acme.\tokta.com"));
         assert!(!is_valid_okta_domain("acme.okta.com\0"));
+    }
+}
+
+#[cfg(test)]
+mod oauth_expires_at_tests {
+    use super::oauth_expires_at;
+    use chrono::Utc;
+
+    #[test]
+    fn default_for_none() {
+        let now = Utc::now();
+        let exp = oauth_expires_at(None);
+        let delta = exp - now;
+        // 3600s default, allow 5s skew for test execution.
+        assert!(
+            (3595..=3605).contains(&delta.num_seconds()),
+            "expected ~3600s delta, got {}",
+            delta.num_seconds()
+        );
+    }
+
+    #[test]
+    fn clamps_floor() {
+        // expires_in=1 would invalidate the token within a tick;
+        // floor to 60s so the refresh loop doesn't storm the provider.
+        let now = Utc::now();
+        let exp = oauth_expires_at(Some(1));
+        let delta = exp - now;
+        assert!(
+            delta.num_seconds() >= 55,
+            "floor should kick in: got {}s",
+            delta.num_seconds()
+        );
+    }
+
+    #[test]
+    fn clamps_ceiling() {
+        // 90-day cap defends against a provider returning huge /
+        // u64::MAX. Pre-Perf#8 the cap was 24h, which silently
+        // truncated long-lived legitimate tokens (Microsoft Graph
+        // service principals, etc.).
+        let now = Utc::now();
+        let exp = oauth_expires_at(Some(u64::MAX));
+        let delta = exp - now;
+        // 90 days × 86_400 = 7_776_000 sec. Allow 5s skew.
+        assert!(
+            (7_775_995..=7_776_005).contains(&delta.num_seconds()),
+            "ceiling cap should clamp to 90 days, got {}s",
+            delta.num_seconds()
+        );
+    }
+
+    #[test]
+    fn does_not_panic_on_i64_overflow_inputs() {
+        // Pre-fix: `chrono::Duration::seconds(u64::MAX as i64)` —
+        // u64::MAX as i64 wraps to -1, the resulting "Duration of -1s"
+        // produced expires_at in the past → immediate refresh storm.
+        // For sufficiently large multiples (>i64::MAX/1000)
+        // Duration::seconds panics internally. With the clamp, both
+        // paths are safe.
+        for v in [
+            i64::MAX as u64 + 1,
+            (i64::MAX / 1000) as u64 + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let exp = oauth_expires_at(Some(v));
+            // Result must be in the FUTURE, not the past.
+            assert!(
+                exp > Utc::now() - chrono::Duration::seconds(5),
+                "expires_at must be in the future for input {v}, got {exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_when_zero() {
+        // expires_in=0 floors to 60s.
+        let now = Utc::now();
+        let exp = oauth_expires_at(Some(0));
+        let delta = exp - now;
+        assert!(delta.num_seconds() >= 55);
     }
 }

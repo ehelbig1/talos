@@ -81,14 +81,20 @@ async fn main() -> Result<()> {
             let id: Uuid = row.try_get("id")?;
             let value: serde_json::Value = row.try_get("output_data")?;
             let plaintext = serde_json::to_string(&value)?;
-            let (key_id, ciphertext) = secrets.encrypt_value(&plaintext).await?;
+            // MCP-S2: backfill writes v1 with AAD = exec_id so the
+            // resulting rows match the production write path's
+            // ciphertext shape.
+            let (key_id, ciphertext, format_version) =
+                secrets.encrypt_value_aad_v1(&plaintext, id.as_bytes()).await?;
             sqlx::query(
                 "UPDATE workflow_executions \
-                 SET output_data = NULL, output_data_enc = $1, output_enc_key_id = $2 \
-                 WHERE id = $3 AND output_data_enc IS NULL",
+                 SET output_data = NULL, output_data_enc = $1, output_enc_key_id = $2, \
+                     output_data_format = $3 \
+                 WHERE id = $4 AND output_data_enc IS NULL",
             )
             .bind(&ciphertext)
             .bind(key_id)
+            .bind(format_version)
             .bind(id)
             .execute(&mut *tx)
             .await?;

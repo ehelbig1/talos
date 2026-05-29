@@ -84,22 +84,34 @@ impl WebhookRepository {
         secrets_manager: &talos_secrets_manager::SecretsManager,
         cap: i64,
     ) -> Result<Option<i64>> {
-        // Envelope-encrypt the optional signing secret. Failure here MUST
+        // MCP-S2: envelope-encrypt the optional signing secret with AAD
+        // bound to the pre-generated webhook_id, so an attacker with DB
+        // write capability can't swap another row's signing_secret_enc
+        // onto this trigger and forge HMAC payloads. Failure here MUST
         // surface — silently dropping the secret would leave the caller
         // thinking HMAC is enabled when it isn't. Done BEFORE the
         // transaction so the advisory lock is held for milliseconds, not
         // seconds.
-        let (signing_secret_enc, signing_key_id): (Option<Vec<u8>>, Option<Uuid>) =
-            match signing_secret {
-                Some(s) if !s.is_empty() => {
-                    let (key_id, ciphertext) =
-                        secrets_manager.encrypt_value(s).await.map_err(|e| {
-                            anyhow::anyhow!("Failed to encrypt webhook signing_secret: {}", e)
-                        })?;
-                    (Some(ciphertext), Some(key_id))
-                }
-                _ => (None, None),
-            };
+        let (signing_secret_enc, signing_key_id, signing_secret_format): (
+            Option<Vec<u8>>,
+            Option<Uuid>,
+            i16,
+        ) = match signing_secret {
+            Some(s) if !s.is_empty() => {
+                let (key_id, ciphertext, version) = secrets_manager
+                    .encrypt_value_aad_v1(s, webhook_id.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to encrypt webhook signing_secret: {}", e)
+                    })?;
+                (Some(ciphertext), Some(key_id), version)
+            }
+            _ => (
+                None,
+                None,
+                talos_secrets_manager::SecretsManager::AAD_FORMAT_V1,
+            ),
+        };
 
         let mut tx = self
             .db_pool
@@ -132,8 +144,8 @@ impl WebhookRepository {
             "INSERT INTO webhook_triggers \
              (id, user_id, name, module_id, workflow_id, verification_token, \
               max_requests_per_minute, auto_respond, sync_response, sync_timeout_secs, \
-              signing_secret_enc, signing_key_id, enabled, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, true, NOW())",
+              signing_secret_enc, signing_key_id, signing_secret_format, enabled, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true, NOW())",
         )
         .bind(webhook_id)
         .bind(user_id)
@@ -149,6 +161,7 @@ impl WebhookRepository {
         .bind(sync_timeout_secs)
         .bind(signing_secret_enc.as_deref())
         .bind(signing_key_id)
+        .bind(signing_secret_format)
         .execute(&mut *tx)
         .await
         .context("Failed to insert webhook under cap lock")?;

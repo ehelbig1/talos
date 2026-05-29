@@ -2164,7 +2164,10 @@ impl ParallelWorkflowEngine {
             .and_then(|n| n.as_array())
             .unwrap_or(&empty_vec);
 
-        let mut module_ids = Vec::new();
+        // Preallocate to nodes.len() — most nodes have a module_id,
+        // so the eventual length is close to nodes.len(). Avoids the
+        // repeated 2x reallocation cycle in graphs > 8 nodes.
+        let mut module_ids = Vec::with_capacity(nodes.len());
         for node in nodes {
             let module_id_str = node
                 .get("type")

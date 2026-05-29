@@ -22,6 +22,20 @@ use talos_workflow_engine_core::WorkerSharedKey;
 use talos_workflow_versions::WorkflowVersionService;
 use worker::runtime::TalosRuntime;
 
+/// Saturating u32→i32 conversion for `execution_events.iteration_index`
+/// / `iteration_total` columns (Postgres `int4`). Defense in depth on
+/// the WRITE boundary — the read boundary already saturates with
+/// `.max(0) as u32` (MCP-961). Source is `Option<u32>` from
+/// `talos_engine_events::NodeEventWrite`; the engine is internal and
+/// emits non-pathological counters today, but a future producer (or a
+/// manual row-write) exceeding `i32::MAX` (~2.1B) would silently land
+/// as a negative iteration index. Saturate to MAX so the dashboard
+/// renders an operator-recognisably absurd value rather than a
+/// nonsensical negative counter.
+fn saturating_u32_to_i32(v: u32) -> i32 {
+    i32::try_from(v).unwrap_or(i32::MAX)
+}
+
 #[derive(Default)]
 pub struct WorkflowsMutations;
 
@@ -404,8 +418,8 @@ impl WorkflowsMutations {
                     .bind(event.node_id)
                     .bind(format!("{:?}", event.status))
                     .bind(&redacted_log_message)
-                    .bind(event.iteration_index.map(|i| i as i32))
-                    .bind(event.iteration_total.map(|i| i as i32))
+                    .bind(event.iteration_index.map(saturating_u32_to_i32))
+                    .bind(event.iteration_total.map(saturating_u32_to_i32))
                     .execute(&db_pool)
                     .await {
                         tracing::error!("Failed to persist execution event: {}", db_err);
@@ -1043,8 +1057,8 @@ impl WorkflowsMutations {
                     .bind(event.node_id)
                     .bind(format!("{:?}", event.status))
                     .bind(&redacted_log_message)
-                    .bind(event.iteration_index.map(|i| i as i32))
-                    .bind(event.iteration_total.map(|i| i as i32))
+                    .bind(event.iteration_index.map(saturating_u32_to_i32))
+                    .bind(event.iteration_total.map(saturating_u32_to_i32))
                     .execute(&db_pool)
                     .await {
                         tracing::error!("Failed to persist execution event: {}", db_err);
@@ -1371,6 +1385,16 @@ impl WorkflowsMutations {
         // from a runaway dispatch loop) or 0 / negative (admit_count
         // helper collapses non-positive to 0 → self-DoS).
         validate_max_concurrent_executions(input.max_concurrent_executions)?;
+        // 2026-05-28 review (low): validate `intent` through the canonical
+        // `validate_intent` helper — the same one the MCP `set_workflow_intent`
+        // path uses — so the GraphQL surface enforces unknown-field rejection,
+        // the ≤500-char/field cap, null-byte/control-char rejection, and the
+        // 10K serialized cap. Pre-fix `intent` was bound raw into the JSONB
+        // column with no per-field validation (cross-protocol parity drift).
+        if let Some(ref intent) = input.intent {
+            talos_workflow_creation_helpers::validate_intent(intent)
+                .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
+        }
         let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
 
         // Get authenticated user_id from context
@@ -1496,6 +1520,13 @@ impl WorkflowsMutations {
         // PATCH max_concurrent_executions to i32::MAX or -1 to
         // bypass / DoS the per-workflow throttle.
         validate_max_concurrent_executions(input.max_concurrent_executions)?;
+        // 2026-05-28 review (low): mirror create_workflow's intent validation
+        // (canonical `validate_intent`) so a clean workflow can't be PATCHed to
+        // an oversized / unknown-field / null-byte-bearing intent.
+        if let Some(ref intent) = input.intent {
+            talos_workflow_creation_helpers::validate_intent(intent)
+                .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
+        }
 
         let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
 
@@ -2704,5 +2735,46 @@ mod create_outcome_projection_tests {
         });
         assert_eq!(r.error_class.as_deref(), Some("no_matched_modules"));
         assert!(r.error_message.unwrap().contains("17 templates"));
+    }
+}
+
+#[cfg(test)]
+mod saturating_u32_to_i32_tests {
+    //! MCP-961 sibling: defend the `execution_events.iteration_index` /
+    //! `iteration_total` write boundary against u32→i32 wraparound.
+    //! Pre-fix `event.iteration_index.map(|i| i as i32)` silently
+    //! wrapped any u32 > i32::MAX (~2.1B) to a negative iteration
+    //! index. The read boundary already saturates with `.max(0) as u32`
+    //! (MCP-961); the write boundary is defense-in-depth.
+    use super::saturating_u32_to_i32;
+
+    #[test]
+    fn passes_through_when_in_range() {
+        assert_eq!(saturating_u32_to_i32(0), 0);
+        assert_eq!(saturating_u32_to_i32(1_000_000), 1_000_000);
+        assert_eq!(saturating_u32_to_i32(i32::MAX as u32), i32::MAX);
+    }
+
+    #[test]
+    fn saturates_at_i32_max_for_excess_u32() {
+        // u32::MAX = 4_294_967_295; i32::MAX = 2_147_483_647. The
+        // pre-fix `as i32` would wrap negative; saturation surfaces a
+        // positive operator-recognisably-absurd ceiling.
+        assert_eq!(saturating_u32_to_i32(u32::MAX), i32::MAX);
+        assert_eq!(saturating_u32_to_i32(3_000_000_000), i32::MAX);
+        assert_eq!(saturating_u32_to_i32(i32::MAX as u32 + 1), i32::MAX);
+    }
+
+    #[test]
+    fn never_returns_negative() {
+        // Crisp invariant: an iteration index/total is a non-negative
+        // counter; saturate-to-MAX preserves that semantic.
+        for v in [0u32, 1, u32::MAX / 2, u32::MAX - 1, u32::MAX] {
+            assert!(
+                saturating_u32_to_i32(v) >= 0,
+                "iteration counter must be non-negative; got {} for {v}",
+                saturating_u32_to_i32(v)
+            );
+        }
     }
 }

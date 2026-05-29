@@ -1761,10 +1761,15 @@ async fn handle_create_workflow(
         return crate::utils::creator_auth_error_to_response(e, req_id);
     }
 
+    // MCP-962 sibling: caller-controlled MCP tool arg. Pre-fix
+    // `v as i32` for 5_000_000_000 wrapped to ~705M, persisting an
+    // absurd execution_timeout_secs to workflows. Clamp to a sane
+    // upper bound (1 day) and saturate the cast.
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+        .map(|v| v.clamp(1, 86_400))
+        .map(|v| i32::try_from(v).unwrap_or(i32::MAX));
     // Description validation — length cap, NUL/control-char filter,
     // tool-call-XML-leak detector. See `validate_workflow_description`
     // for the security rationale; the prod incident that drove the

@@ -777,8 +777,13 @@ impl OAuthCredentialService {
             .json()
             .await
             .context("Failed to parse refresh response")?;
-        let new_expires = chrono::Utc::now()
-            + chrono::Duration::seconds(token_data.expires_in.unwrap_or(3600) as i64);
+        // MCP-960..962 sibling + chrono panic defense: clamp the
+        // provider-supplied expires_in (u64) through the canonical
+        // `oauth_expires_at` helper so a misbehaving provider returning
+        // u64::MAX cannot wrap to a negative i64 (immediate-expiry +
+        // refresh-storm) or trip chrono::Duration::seconds' internal
+        // i64-millisecond overflow panic.
+        let new_expires = crate::oauth_expires_at(token_data.expires_in);
 
         // Preserve the previously-persisted scope if the refresh response omits
         // it, otherwise overwrite with what the provider actually granted. This

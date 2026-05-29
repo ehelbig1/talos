@@ -168,8 +168,13 @@ impl ModuleExecutionService {
     /// `module_payload_encryption::encrypt_payload_bundle` so all writer
     /// paths (this service, engine store, webhooks) produce identical
     /// wire format under the same DEK.
+    ///
+    /// MCP-S2: `module_execution_id` is bound as AAD across all three
+    /// slots so an attacker with DB write capability can't swap one
+    /// row's payload columns onto another row of the same key_id.
     async fn encrypt_payload_bundle(
         &self,
+        module_execution_id: Uuid,
         input: Option<&JsonValue>,
         output: Option<&JsonValue>,
         trigger: Option<&JsonValue>,
@@ -178,9 +183,11 @@ impl ModuleExecutionService {
         Option<Vec<u8>>,
         Option<Vec<u8>>,
         Option<Vec<u8>>,
+        i16,
     )> {
         let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
             self.secrets_manager.as_ref(),
+            module_execution_id,
             input,
             output,
             trigger,
@@ -191,20 +198,43 @@ impl ModuleExecutionService {
             bundle.input_enc,
             bundle.output_enc,
             bundle.trigger_enc,
+            bundle.format_version,
         ))
     }
 
     /// Decrypt a payload column read from a row. Prefers ciphertext when
     /// SecretsManager is wired and `enc_bytes` is Some; falls back to
     /// the plaintext column for legacy rows.
+    ///
+    /// MCP-S2: `module_execution_id` + `format_version` together drive
+    /// the AAD-binding dispatch. v0 rows route through empty-AAD;
+    /// v1 rows require AAD = module_execution_id bytes.
+    ///
+    /// 2026-05-28 review (low): `slot` selects the per-column AAD so v2 rows
+    /// are decrypted with their slot-bound AAD. The shared
+    /// `talos_module_payload_encryption::decrypt_payload_slot` builds the AAD
+    /// for both writer and reader — keeping the two in lockstep across the
+    /// v1→v2 change. v0/v1 rows still decrypt (the helper returns row-id-only
+    /// AAD below v2).
     async fn read_payload(
         &self,
+        module_execution_id: Uuid,
+        slot: talos_module_payload_encryption::PayloadSlot,
         plaintext: Option<JsonValue>,
         enc_bytes: Option<Vec<u8>>,
         key_id: Option<Uuid>,
+        format_version: i16,
     ) -> Result<Option<JsonValue>> {
         if let (Some(sm), Some(bytes), Some(kid)) = (&self.secrets_manager, &enc_bytes, key_id) {
-            let s = sm.decrypt_value_by_key(kid, bytes).await?;
+            let s = talos_module_payload_encryption::decrypt_payload_slot(
+                sm,
+                kid,
+                bytes,
+                module_execution_id,
+                slot,
+                format_version,
+            )
+            .await?;
             let v: JsonValue = serde_json::from_str(&s)?;
             return Ok(Some(v));
         }
@@ -314,8 +344,15 @@ impl ModuleExecutionService {
         // as NULL, the *_enc columns hold the ciphertext, and the
         // partial-index `idx_module_executions_needs_payload_encryption`
         // does NOT match (so backfill skips this row).
-        let (key_id, input_enc, _output_enc, trigger_enc) = self
-            .encrypt_payload_bundle(input_data.as_ref(), None, trigger_metadata.as_ref())
+        //
+        // MCP-S2: AAD = execution_id binds each ciphertext to its row.
+        let (key_id, input_enc, _output_enc, trigger_enc, payload_format) = self
+            .encrypt_payload_bundle(
+                execution_id,
+                input_data.as_ref(),
+                None,
+                trigger_metadata.as_ref(),
+            )
             .await?;
         let encrypting = key_id.is_some();
 
@@ -325,9 +362,10 @@ impl ModuleExecutionService {
                 id, module_id, user_id, status, trigger_type,
                 trigger_metadata, input_data,
                 trigger_metadata_enc, input_data_enc, payload_enc_key_id,
+                payload_format,
                 workflow_execution_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
         )
         .bind(execution_id)
@@ -349,6 +387,7 @@ impl ModuleExecutionService {
         .bind(trigger_enc.as_deref())
         .bind(input_enc.as_deref())
         .bind(key_id)
+        .bind(payload_format)
         .bind(workflow_execution_id)
         .execute(&self.db_pool)
         .await
@@ -412,12 +451,32 @@ impl ModuleExecutionService {
         // existing payload_enc_key_id from create_execution stays valid
         // (same DEK), so a successful encrypt here just stores another
         // ciphertext under the same key.
-        let (key_id, _input_enc, output_enc, _trigger_enc) = self
-            .encrypt_payload_bundle(None, output_data.as_ref(), None)
+        //
+        // MCP-S2: AAD = execution_id, matching the row that
+        // create_execution populated.
+        let (key_id, _input_enc, output_enc, _trigger_enc, payload_format) = self
+            .encrypt_payload_bundle(execution_id, None, output_data.as_ref(), None)
             .await?;
         let encrypting = key_id.is_some();
 
-        let result = sqlx::query!(
+        // MCP-S2: use dynamic `sqlx::query` (not `query!` macro) since
+        // the new `payload_format` column isn't in the offline cache
+        // yet. Same approach as the TOTP migration's `query_as` site.
+        let pt_output = if encrypting {
+            None
+        } else {
+            output_data.as_ref()
+        };
+        // MCP-S2 follow-up: only update `payload_format` when we wrote
+        // a new ciphertext on this UPDATE. The empty-bundle short-
+        // circuit in `encrypt_payload_bundle` returns `format_version
+        // = 0` for the no-output case, which would otherwise overwrite
+        // the row's v1 stamp from `create_execution` and break
+        // subsequent reads of input_data_enc / trigger_metadata_enc on
+        // the SAME row. Preserve the prior format unless we're
+        // actually writing new ciphertext.
+        let format_arg: Option<i16> = if encrypting { Some(payload_format) } else { None };
+        let result = sqlx::query(
             r#"
             UPDATE module_executions
             SET
@@ -426,23 +485,21 @@ impl ModuleExecutionService {
                 output_data = $2,
                 output_data_enc = $3,
                 payload_enc_key_id = COALESCE(payload_enc_key_id, $4),
-                fuel_consumed = $5,
-                memory_used_mb = $6
-            WHERE id = $7 AND user_id = $8
+                payload_format = COALESCE($5, payload_format),
+                fuel_consumed = $6,
+                memory_used_mb = $7
+            WHERE id = $8 AND user_id = $9
             "#,
-            ExecutionStatus::Completed.to_string(),
-            if encrypting {
-                None
-            } else {
-                output_data.as_ref()
-            } as Option<&JsonValue>,
-            output_enc.as_deref(),
-            key_id,
-            fuel_consumed,
-            memory_used_mb,
-            execution_id,
-            user_id
         )
+        .bind(ExecutionStatus::Completed.to_string())
+        .bind(pt_output)
+        .bind(output_enc.as_deref())
+        .bind(key_id)
+        .bind(format_arg)
+        .bind(fuel_consumed)
+        .bind(memory_used_mb)
+        .bind(execution_id)
+        .bind(user_id)
         .execute(&self.db_pool)
         .await
         .context("Failed to complete execution")?;
@@ -679,6 +736,7 @@ impl ModuleExecutionService {
                 id, module_id, user_id, status, trigger_type,
                 trigger_metadata, input_data, output_data,
                 trigger_metadata_enc, input_data_enc, output_data_enc, payload_enc_key_id,
+                payload_format,
                 started_at, completed_at, duration_ms,
                 error_message, error_type,
                 fuel_consumed, memory_used_mb,
@@ -701,9 +759,17 @@ impl ModuleExecutionService {
         let enc_input: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
         let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
         let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
-        let trigger_metadata = self.read_payload(pt_trigger, enc_trigger, key_id).await?;
-        let input_data = self.read_payload(pt_input, enc_input, key_id).await?;
-        let output_data = self.read_payload(pt_output, enc_output, key_id).await?;
+        let payload_format: i16 = r.try_get("payload_format").unwrap_or(0);
+        use talos_module_payload_encryption::PayloadSlot;
+        let trigger_metadata = self
+            .read_payload(execution_id, PayloadSlot::Trigger, pt_trigger, enc_trigger, key_id, payload_format)
+            .await?;
+        let input_data = self
+            .read_payload(execution_id, PayloadSlot::Input, pt_input, enc_input, key_id, payload_format)
+            .await?;
+        let output_data = self
+            .read_payload(execution_id, PayloadSlot::Output, pt_output, enc_output, key_id, payload_format)
+            .await?;
         Ok(Some(ModuleExecution {
             id: r.get("id"),
             module_id: r.get("module_id"),
@@ -745,6 +811,7 @@ impl ModuleExecutionService {
                 id, module_id, user_id, status, trigger_type,
                 trigger_metadata, input_data, output_data,
                 trigger_metadata_enc, input_data_enc, output_data_enc, payload_enc_key_id,
+                payload_format,
                 started_at, completed_at, duration_ms,
                 error_message, error_type,
                 fuel_consumed, memory_used_mb,
@@ -763,6 +830,7 @@ impl ModuleExecutionService {
         .context("Failed to fetch module executions")?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
+            let exec_id: Uuid = r.get("id");
             let pt_trigger: Option<JsonValue> = r.try_get("trigger_metadata").ok().flatten();
             let pt_input: Option<JsonValue> = r.try_get("input_data").ok().flatten();
             let pt_output: Option<JsonValue> = r.try_get("output_data").ok().flatten();
@@ -771,9 +839,17 @@ impl ModuleExecutionService {
             let enc_input: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
             let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
             let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
-            let trigger_metadata = self.read_payload(pt_trigger, enc_trigger, key_id).await?;
-            let input_data = self.read_payload(pt_input, enc_input, key_id).await?;
-            let output_data = self.read_payload(pt_output, enc_output, key_id).await?;
+            let payload_format: i16 = r.try_get("payload_format").unwrap_or(0);
+            use talos_module_payload_encryption::PayloadSlot;
+            let trigger_metadata = self
+                .read_payload(exec_id, PayloadSlot::Trigger, pt_trigger, enc_trigger, key_id, payload_format)
+                .await?;
+            let input_data = self
+                .read_payload(exec_id, PayloadSlot::Input, pt_input, enc_input, key_id, payload_format)
+                .await?;
+            let output_data = self
+                .read_payload(exec_id, PayloadSlot::Output, pt_output, enc_output, key_id, payload_format)
+                .await?;
             out.push(ModuleExecution {
                 id: r.get("id"),
                 module_id: r.get("module_id"),

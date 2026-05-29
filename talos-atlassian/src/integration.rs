@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use oauth2::{
     basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
     Scope, TokenUrl,
@@ -7,6 +7,30 @@ use oauth2::{
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
+use std::sync::LazyLock;
+
+/// Shared reqwest client for Atlassian OAuth (token exchange +
+/// refresh). Mirrors the per-crate shared-client pattern that
+/// MCP-1110 / MCP-1111 landed for talos-memory + talos-search-service,
+/// and the 2026-05-28 Perf#9 sweep extended to gmail + slack. Pre-fix
+/// the refresh path built a fresh `reqwest::Client` per call — TLS
+/// context init + connection pool reset per refresh, defeating
+/// keep-alive against auth.atlassian.com. Now serves both token
+/// exchange (callback path) and refresh.
+///
+/// Same hardening contract as the inline builder it replaces:
+/// timeout(15s) + connect_timeout(5s) + redirect::Policy::none().
+/// Build-failure fall-back panics via .expect() so a misconfigured
+/// rustls/TLS stack surfaces loudly at startup rather than
+/// indefinitely-retrying refresh tasks.
+static REFRESH_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Atlassian OAuth: failed to build hardened reqwest client")
+});
 use uuid::Uuid;
 
 use talos_oauth::OAuthCredentialService;
@@ -210,12 +234,8 @@ impl AtlassianIntegrationService {
         // Default redirect policy + `unwrap_or_else(|_| Client::new())`
         // would silently re-enable redirects on TLS-init failure,
         // forwarding the secret-bearing form body to redirect targets.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Atlassian token exchange: failed to build hardened reqwest client");
+        // Perf#9: route through the shared REFRESH_HTTP_CLIENT — the
+        // module-level static carries identical hardening.
 
         let mut token_body = serde_json::json!({
             "grant_type": "authorization_code",
@@ -229,7 +249,7 @@ impl AtlassianIntegrationService {
             token_body["code_verifier"] = serde_json::Value::String(verifier);
         }
 
-        let token_resp = http
+        let token_resp = REFRESH_HTTP_CLIENT
             .post("https://auth.atlassian.com/oauth/token")
             .json(&token_body)
             .send()
@@ -267,8 +287,12 @@ impl AtlassianIntegrationService {
 
         let access_token = token_data.access_token;
         let refresh_token = token_data.refresh_token;
-        let token_expires_at =
-            Utc::now() + Duration::seconds(token_data.expires_in.unwrap_or(3600) as i64);
+        // MCP-960..962 sibling + chrono panic defense: route through
+        // the canonical helper so a misbehaving provider returning a
+        // u64 expires_in > i64::MAX doesn't wrap to a negative i64
+        // (immediate-expiry + refresh-storm) or trip
+        // `chrono::Duration::seconds`' internal i64-ms overflow panic.
+        let token_expires_at = talos_oauth::oauth_expires_at(token_data.expires_in);
         // Persist the granted scope string verbatim so operators can diagnose
         // "Unauthorized; scope does not match" errors by comparing what was
         // requested (in get_authorization_url) against what was granted. If
@@ -284,14 +308,8 @@ impl AtlassianIntegrationService {
         // 3. Discover accessible Atlassian Cloud sites.
         // MCP-533: this GET carries `Bearer access_token` — same
         // credential-leak hardening as the token-exchange POST above.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Atlassian accessible-resources: failed to build hardened reqwest client");
-
-        let resources_resp = http
+        // Perf#9: route through the shared REFRESH_HTTP_CLIENT.
+        let resources_resp = REFRESH_HTTP_CLIENT
             .get("https://api.atlassian.com/oauth/token/accessible-resources")
             .bearer_auth(&access_token)
             .send()
@@ -314,7 +332,7 @@ impl AtlassianIntegrationService {
 
         // Fetch the user's Jira account ID for JQL queries
         let account_id: Option<String> = {
-            let myself_resp = http
+            let myself_resp = REFRESH_HTTP_CLIENT
                 .get(format!(
                     "https://api.atlassian.com/ex/jira/{}/rest/api/3/myself",
                     site.id
@@ -516,14 +534,10 @@ impl AtlassianIntegrationService {
         // MCP-533: same Mode-B credential-leak hardening as the token-
         // exchange path above. Refresh body carries `client_secret` +
         // `refresh_token` — both must not ride a stray redirect.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Atlassian token refresh: failed to build hardened reqwest client");
-
-        let resp = http
+        // MCP-1110/1111 sibling: route through the per-crate
+        // `REFRESH_HTTP_CLIENT` so TLS context + connection pool stay
+        // shared across all refreshes.
+        let resp = REFRESH_HTTP_CLIENT
             .post("https://auth.atlassian.com/oauth/token")
             .json(&serde_json::json!({
                 "grant_type": "refresh_token",
@@ -568,8 +582,9 @@ impl AtlassianIntegrationService {
             .await
             .context("Failed to parse Atlassian refresh response")?;
 
-        let new_expires_at =
-            Utc::now() + Duration::seconds(token_resp.expires_in.unwrap_or(3600) as i64);
+        // MCP-960..962 sibling + chrono panic defense: see token-exchange
+        // call site above.
+        let new_expires_at = talos_oauth::oauth_expires_at(token_resp.expires_in);
 
         // MCP-468: prefer the refresh response's scope, fall back to the
         // existing DB value, only resort to the requested-superset list

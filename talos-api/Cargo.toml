@@ -60,6 +60,7 @@ talos-totp-2fa = { path = "../talos-totp-2fa" }
 talos-webhooks = { path = "../talos-webhooks" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-creation = { path = "../talos-workflow-creation" }
+talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-types = { path = "../talos-workflow-types" }

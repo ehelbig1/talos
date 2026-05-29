@@ -972,7 +972,11 @@ async fn handle_compile_custom_sandbox(
             let max_rank = talos_capability_world::actor_world_rank_strict(&max_world)
                 .unwrap_or(0);
             let req_rank = crate::actor::world_rank(capability_world);
-            if req_rank > max_rank {
+            // Wasm-security review 2026-05-28 (HIGH): gate on the partial-order
+            // lattice via the canonical `ceiling_permits` helper, not the linear
+            // rank — `req_rank > max_rank` admitted incomparable siblings (e.g. a
+            // `cache-node` ceiling compiling a `secrets-node` module).
+            if !talos_capability_world::ceiling_permits(&max_world, capability_world) {
                 return mcp_error(req_id, -32003, &format!(
                     "Actor capability ceiling exceeded: actor's max world is '{}' (rank {}), \
                      but '{}' (rank {}) was requested. Request operator elevation to increase the ceiling.",
@@ -1473,7 +1477,9 @@ async fn handle_run_sandbox(
             let max_rank = talos_capability_world::actor_world_rank_strict(&max_world)
                 .unwrap_or(0);
             let req_rank = crate::actor::world_rank(capability_world);
-            if req_rank > max_rank {
+            // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate
+            // (see `handle_compile_custom_sandbox` above).
+            if !talos_capability_world::ceiling_permits(&max_world, capability_world) {
                 return mcp_error(
                     req_id,
                     -32003,

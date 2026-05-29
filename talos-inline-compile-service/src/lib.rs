@@ -307,28 +307,14 @@ impl InlineCompileService {
             if let Some(actor_max) =
                 talos_actor_repository::get_actor_max_world(&self.db_pool, actor_id).await
             {
-                let max_rank = talos_capability_world::actor_world_rank_strict(&actor_max)
-                    .unwrap_or(0);
-                let req_rank = talos_capability_world::world_rank(&world_full);
-                // Wasm-security review 2026-05-23 (M): the linear rank
-                // check alone is unsound for the partial-order
-                // `CapabilityWorld::is_subset_of` lattice. Database
-                // and Agent both rank 6 — without the subset check, an
-                // actor with `max_capability_world=database` (rank 6)
-                // could install Agent modules (rank 6, passes), but
-                // Agent's `agent-orchestration` interface is NOT
-                // a subset of Database. Combine the two checks: rank
-                // catches the "higher tier" case; subset catches the
-                // "incomparable sibling" case. Defense in depth.
-                use std::str::FromStr;
-                let req_world =
-                    talos_capability_world::CapabilityWorld::from_str(&world_full)
-                        .unwrap_or(talos_capability_world::CapabilityWorld::Unknown);
-                let actor_world =
-                    talos_capability_world::CapabilityWorld::from_str(&actor_max)
-                        .unwrap_or(talos_capability_world::CapabilityWorld::Unknown);
-                let subset_ok = req_world.is_subset_of(&actor_world);
-                if req_rank > max_rank || !subset_ok {
+                // Wasm-security review 2026-05-28 (HIGH): single canonical
+                // partial-order ceiling gate (replaces the inline rank+subset
+                // pair from the 2026-05-23 review). The lattice catches both the
+                // "higher tier" and the "incomparable sibling" case (e.g. an
+                // actor with `max_capability_world=database` may NOT install an
+                // Agent module — `Agent ⊄ Database`), and fail-closes on unknown
+                // worlds; `ceiling_permits` fully subsumes the linear-rank check.
+                if !talos_capability_world::ceiling_permits(&actor_max, &world_full) {
                     return Err(InlineCompileError::CapabilityCeilingViolation(format!(
                         "Capability ceiling violation: inline node uses '{}' world which exceeds \
                          the actor's max_capability_world '{}'. \

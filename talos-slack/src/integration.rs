@@ -7,6 +7,24 @@ use oauth2::{
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
+use std::sync::LazyLock;
+
+/// Shared reqwest client for Slack OAuth callback (oauth.v2.access).
+/// Mirrors the per-crate shared-client pattern (MCP-1110/1111 +
+/// 2026-05-28 Perf#9 audit). Pre-fix the callback built a fresh
+/// `reqwest::Client` per OAuth completion — TLS init + pool reset
+/// per call, defeating keep-alive against slack.com. Hardening
+/// contract preserved: timeout(15s) + connect_timeout(5s) +
+/// redirect::Policy::none() (form bodies aren't stripped on
+/// same-origin redirects).
+static OAUTH_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Slack OAuth: failed to build hardened reqwest client")
+});
 use uuid::Uuid;
 
 /// Slack workspace integration metadata.
@@ -271,12 +289,11 @@ impl SlackIntegrationService {
         //    chat.postMessage etc.) was fixed in MCP-471; this OAuth
         //    callback path was missed because it builds a one-shot
         //    client inline instead of going through the shared client.
-        let oauth_response: serde_json::Value = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Slack OAuth callback: failed to build hardened reqwest client")
+        // Perf#9: route through the shared OAUTH_HTTP_CLIENT defined
+        // at module scope — TLS context + connection pool stay shared
+        // across all OAuth callbacks. See the module-level static for
+        // the security-rationale doc-comment.
+        let oauth_response: serde_json::Value = OAUTH_HTTP_CLIENT
             .post("https://slack.com/api/oauth.v2.access")
             .form(&token_params)
             .send()
