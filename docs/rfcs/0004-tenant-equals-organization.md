@@ -63,73 +63,97 @@ the org infrastructure already in place.
   RBAC dimension, exactly as RFC 0001 §T1.4 intended (`org_id` is the
   isolation boundary; `user_id` is the within-tenant scope).
 
-### Access & RLS
+### Access & RLS — membership-union model
 
-- A request operates with an **active org** (`app.current_org_id`),
-  selected from the orgs the caller is a member of; defaults to the
-  caller's personal org. The data-isolation backstop is one RLS policy
-  per owned table:
+**Decided 2026-05-29**, reconciling with the org-access model already
+live in `talos-api/src/schema/mod.rs` (`user_accessible_org_ids`,
+`user_writable_org_ids`, `check_resource_access`, org-scoped API keys).
+That model is **multi-org union** — a caller sees a row if they **own**
+it OR it's in **any org they belong to** (`WHERE user_id = $1 OR org_id =
+ANY($accessible_orgs)`), with writes gated to Member+ roles. We keep that
+flexible model as the **primary** authorization, and add RLS as a
+**defense-in-depth backstop with the same union semantics** — *not* a
+single-active-org policy (which would have broken the existing
+cross-org reads). The earlier single-active-org sketch is superseded.
 
-  ```sql
-  CREATE POLICY <t>_org_isolation ON <t>
-    USING (org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid);
-  ```
+The per-owned-table backstop policy:
 
-  Two non-obvious details, both **proven against a live DB** by
-  `talos-db/tests/rls_org_isolation.rs` before any table got a policy:
+```sql
+CREATE POLICY <t>_tenant_isolation ON <t> USING (
+  user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid          -- owned rows
+  OR org_id = ANY(
+       string_to_array(NULLIF(current_setting('app.current_org_ids', true), ''), ',')::uuid[]
+     )                                                                              -- member-org rows
+);
+```
 
-  1. **`NULLIF(current_setting(..., true), '')` — not the bare cast.** A
-     *custom* GUC (`app.current_org_id`) resets to the **empty string**,
-     not NULL, on a pooled connection after a prior `SET LOCAL` commits.
-     `''::uuid` raises `22P02`, so the naive
-     `current_setting('app.current_org_id')::uuid` would turn a
-     non-scoped query into an *error* on a recycled connection instead of
-     fail-closed-empty. `NULLIF(..., '')` makes both never-set and
-     reset-to-empty resolve to NULL → matches nothing → **fail-closed,
-     no error**.
-  2. **The controller's DB role must NOT be a superuser or have
-     `BYPASSRLS`.** Postgres silently ignores RLS policies for those
-     roles, which would make the whole scheme a no-op. The app connects
-     as a plain role; sensitive tables also use `FORCE ROW LEVEL
-     SECURITY` so the policy applies even to the table owner. (An
-     operator/ops role with `BYPASSRLS` is the intended cross-tenant
-     escape hatch, never reachable from a user request path.)
+(Tables without a `user_id` column use only the `org_id = ANY(...)`
+clause.) The accessible-org-id list is the **same set** the app layer
+already computes via `user_accessible_org_ids`, resolved server-side
+from `organization_members` — never client-supplied, so not forgeable.
+`ANY(array)` is a scalar-array op evaluated against an array computed
+once per statement (the `current_setting` is STABLE) — no per-row
+subquery, so it's performant.
 
-  Access goes through `talos_db::begin_org_scoped(pool, &OrgScope)` — the
-  canonical primitive that opens a tx and stamps `SET LOCAL
-  app.current_org_id`. `SET LOCAL` is tx-scoped, so there is no
-  cross-request GUC leakage through the pool.
+Three details, all **proven against a live DB** by
+`talos-db/tests/rls_org_isolation.rs` (under a real non-superuser role)
+before any table got a policy:
 
-  Because the superuser/`BYPASSRLS` footgun is silent, the controller
-  runs `talos_db::warn_if_rls_will_be_bypassed` at boot (one `pg_roles`
-  lookup) and logs a prominent WARN if its role would bypass RLS. Today
-  it only informs (RLS isn't enabled until M4); when M4 lands this
-  escalates to a hard refusal-to-serve so a misconfigured role can't
-  silently disable tenant isolation in production.
+1. **`NULLIF(current_setting(..., true), '')` — not the bare cast.** A
+   *custom* GUC resets to the **empty string**, not NULL, on a pooled
+   connection after a prior `SET LOCAL` commits. `''::uuid` raises
+   `22P02`, so the naive cast would turn a non-scoped query into an
+   *error* on a recycled connection instead of fail-closing. `NULLIF`
+   makes both never-set and reset-to-empty resolve to NULL → matches
+   nothing → **fail-closed, no error**. A caller in zero orgs gets an
+   empty CSV → no org rows, but still sees their owned rows.
+2. **The controller's DB role must NOT be a superuser or have
+   `BYPASSRLS`.** Postgres silently ignores RLS policies for those roles
+   → the whole scheme becomes a no-op. The app connects as a plain role;
+   sensitive tables also use `FORCE ROW LEVEL SECURITY`. The boot guard
+   `talos_db::warn_if_rls_will_be_bypassed` (one `pg_roles` lookup) WARNs
+   today and escalates to refuse-to-serve when M4 enables RLS — so a
+   misconfigured role can't silently disable isolation in production. An
+   operator/ops role with `BYPASSRLS` is the intended cross-tenant
+   escape hatch, never reachable from a user request path.
+3. **Union, not single-org** (validated): a caller who is a member of
+   orgs {A, B} sees rows in A, B, and rows they own — never a row in a
+   non-member org C that they don't own.
 
-- **Membership / role checks stay app-enforced** (can this user switch
-  into this org? can they write here? — the existing org RBAC). RLS is
-  the belt-and-braces that catches a missed `WHERE org_id = $1`, not the
-  primary authz.
-- **Cross-org views** ("all my workflows across every org I'm in") are an
-  explicit app feature — iterate the caller's orgs and union — *never* an
-  RLS bypass. The only RLS bypass is the platform-operator role
-  (`BYPASSRLS`), never reachable from a user request path.
+Reads route through `talos_db::begin_tenant_read_scoped(pool,
+&TenantReadScope { user_id, accessible_org_ids })`, which stamps
+`app.current_user_id` + `app.current_org_ids`. A **single-org** context
+(org-scoped API key, or the creation context — which org a new resource
+lands in) uses `talos_db::begin_org_scoped(pool, &OrgScope)` with the
+single `app.current_org_id` GUC. `SET LOCAL` is tx-scoped → no
+cross-request GUC leakage through the pool.
+
+- **Membership / role checks stay app-enforced** (`check_resource_access`,
+  `user_writable_org_ids`) — RLS is the belt-and-braces that catches a
+  missed `WHERE`, not the primary authz.
+- The only RLS bypass is the platform-operator role (`BYPASSRLS`), never
+  reachable from a user request path.
 
 ### Propagation path (no thread-locals)
 
 ```
-JWT { sub: user_id, org: active_org_id }
-  → AuthService::verify_token → { user_id, active_org_id }
-  → handler builds OrgScope { active_org_id, user_id }
-  → tx start: SET LOCAL app.current_org_id = $active_org_id
-  → repository: WHERE org_id = $1 [AND user_id = $2]   (RLS backstops)
+JWT { sub: user_id, org: <optional active org override> }
+  → AuthService::verify_token → { user_id, org claim }
+  → request layer resolves accessible_org_ids (user_accessible_org_ids,
+    request-cached) and the creation-context active org
+    (OrganizationService::resolve_active_org, membership-checked)
+  → reads:  begin_tenant_read_scoped → SET LOCAL current_user_id + current_org_ids
+    writes: created rows stamped with the active org (OrgScope)
+  → repository: existing app-layer WHERE (user_id / org_id = ANY) ; RLS backstops
 ```
 
-`OrgScope { active_org_id, user_id }` (in `talos-tenancy`) replaces the
-bare `user_id: Uuid` on repository methods, so the compiler forces every
-call site to supply both — the same compiler-enforced discipline RFC
-0001 §T1.3 specified, with org as the boundary.
+`OrgScope { active_org_id, user_id }` (in `talos-tenancy`) is the
+single-org creation/API-key context; `TenantReadScope { user_id,
+accessible_org_ids }` is the union read backstop. The repository sweep
+(M3) routes org-scoped data access through these primitives and stamps
+`org_id` on writes; the existing app-layer `user_accessible_org_ids` /
+`check_resource_access` predicates remain the primary gate, with the RLS
+policy above as the compiler-can't-forget backstop.
 
 ## Owned tables
 
@@ -207,15 +231,26 @@ moment the policy turns on. So RLS lands in the *same* deploy as the
   to each org-scoped table; backfill from the owning user's personal org;
   composite `(org_id, user_id)` indexes. No `NOT NULL`, no RLS — the app
   still runs on `user_id`. Reversible (`DROP COLUMN`).
-- **M3 — enforcement (app + DB together).** JWT `org` claim; AuthService
-  threads `active_org_id`; repositories migrate `user_id` → `OrgScope`;
-  every tx opens with `SET LOCAL app.current_org_id`; writes supply
-  `org_id`; then `ALTER COLUMN org_id SET NOT NULL`. (Touches `sqlx::query!`
-  macro sites → requires `cargo sqlx prepare` against a migrated DB.)
-- **M4 — RLS.** `ENABLE ROW LEVEL SECURITY` + the per-table policy,
-  shipped in the M3 deploy so the GUC is always set first. `secrets` is
-  RLS-primary (per RFC 0001 §T1.5 — the table where a missed WHERE is
-  unbounded).
+- **M3 — enforcement (app + DB together).**
+  - *Step 1 (done, PR #6):* JWT `org` claim + `resolve_active_org`
+    (membership-checked, personal-org fallback).
+  - *Step 2 (done, PR #7):* `begin_org_scoped` + the RLS mechanism proof.
+  - *Step 3 (done, PR #8):* boot-time RLS-bypass role guard.
+  - *Step 4 (done, this PR):* `TenantReadScope` + `begin_tenant_read_scoped`
+    (membership-union) + the validated union policy.
+  - *Remaining sweep:* per request, resolve `accessible_org_ids`
+    (`user_accessible_org_ids`, request-cached) and stamp them via
+    `begin_tenant_read_scoped` on read paths; stamp `org_id` (= active
+    org) on write paths; then `ALTER COLUMN org_id SET NOT NULL`.
+    Repositories with `query!` macro sites need `cargo sqlx prepare`
+    against a migrated DB (note: `WorkflowRepository` is all-runtime, no
+    prepare needed).
+- **M4 — RLS.** `ENABLE ROW LEVEL SECURITY` + the membership-union policy
+  above + `FORCE ROW LEVEL SECURITY` on sensitive tables, shipped in the
+  M3 deploy so the GUCs are always set first, and only after the
+  controller's DB role is confirmed non-superuser (the boot guard
+  escalates to refuse-to-serve here). `secrets` first (per RFC 0001
+  §T1.5 — the table where a missed WHERE is unbounded).
 - **T2 (later) — per-org KEK.** RFC 0001 §T2 with tenant → org: each org
   gets a KEK wrapping its DEKs; offboarding an org = deleting its KEK.
 - **T3 (later) — physical.** Schema-per-org only if a compliance auditor
@@ -223,12 +258,15 @@ moment the policy turns on. So RLS lands in the *same* deploy as the
 
 ## Testing
 
-- `tests/org_isolation.rs`: two orgs, two users each, resources in each;
-  assert org A cannot read ANY of org B's rows through any endpoint
-  (MCP / GraphQL / REST) with the wrong `app.current_org_id`. The
-  concrete answer to a pentester's isolation question.
-- Per-repository: a query with the wrong `org_id` returns empty (not
-  error) — correct RLS/app behaviour.
+- `talos-db/tests/rls_org_isolation.rs` (live DB, non-superuser role,
+  **done**): proves both the single-org policy and the membership-union
+  policy isolate correctly — a member of orgs {A,B} sees rows in A, B,
+  and owned rows, never a non-member org's row; and the role guard
+  classifies superuser-vs-app roles.
+- End-to-end (remaining): two users in disjoint orgs, resources in each;
+  assert one cannot read the other's rows through any endpoint
+  (MCP / GraphQL / REST). The concrete answer to a pentester's isolation
+  question.
 - M1: every user has exactly one personal org post-backfill; signup
   creates one; backfill is idempotent.
 
