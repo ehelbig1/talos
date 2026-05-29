@@ -15,7 +15,7 @@
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
-use talos_organizations::OrganizationService;
+use talos_organizations::{OrgRole, OrganizationService};
 use uuid::Uuid;
 
 async fn pool_or_skip() -> Option<Pool<Postgres>> {
@@ -145,4 +145,63 @@ async fn resolve_active_org_honours_membership_else_falls_back_to_personal() {
         .execute(&pool)
         .await;
     cleanup(&pool, &[alice, bob]).await;
+}
+
+/// The writable-member gate that org-aware `create_workflow` relies on:
+/// only Member+ (not Viewer) may create resources in a shared org.
+#[tokio::test]
+async fn org_write_access_excludes_viewers() {
+    let Some(pool) = pool_or_skip().await else { return };
+    let owner = make_user(&pool, "owner").await;
+    let member = make_user(&pool, "member").await;
+    let viewer = make_user(&pool, "viewer").await;
+
+    let org = OrganizationService::create_org(&pool, "Team", "team-write-gate-test", owner)
+        .await
+        .unwrap();
+    OrganizationService::add_member(&pool, org.id, member, OrgRole::Member, owner)
+        .await
+        .unwrap();
+    OrganizationService::add_member(&pool, org.id, viewer, OrgRole::Viewer, owner)
+        .await
+        .unwrap();
+
+    // Member+ gate (the exact check the create path applies before
+    // stamping org_id on a workflow):
+    assert!(
+        OrganizationService::check_org_access(&pool, org.id, owner, OrgRole::Member)
+            .await
+            .is_ok(),
+        "owner may create in the org"
+    );
+    assert!(
+        OrganizationService::check_org_access(&pool, org.id, member, OrgRole::Member)
+            .await
+            .is_ok(),
+        "member may create in the org"
+    );
+    assert!(
+        OrganizationService::check_org_access(&pool, org.id, viewer, OrgRole::Member)
+            .await
+            .is_err(),
+        "VIEWER must NOT be able to create resources in the org"
+    );
+    // A complete non-member is likewise refused.
+    let outsider = make_user(&pool, "outsider").await;
+    assert!(
+        OrganizationService::check_org_access(&pool, org.id, outsider, OrgRole::Member)
+            .await
+            .is_err(),
+        "non-member must be refused"
+    );
+
+    let _ = sqlx::query("DELETE FROM organization_members WHERE org_id = $1")
+        .bind(org.id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org.id)
+        .execute(&pool)
+        .await;
+    cleanup(&pool, &[owner, member, viewer, outsider]).await;
 }
