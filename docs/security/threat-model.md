@@ -15,7 +15,7 @@ Talos is a workflow automation platform built on:
 - **Worker** -- Rust WASM runtime (wasmtime-based, executes user-authored modules in sandboxed guests)
 - **PostgreSQL** -- primary data store (workflows, secrets, audit logs, execution state)
 - **Redis** -- session cache, TOTP replay prevention, distributed rate limiting, approval gate pub/sub
-- **NATS JetStream** -- job queue between controller and worker, audit event streaming
+- **NATS** -- job dispatch between controller and worker is core-NATS signed request/reply (queue-group load balancing + controller-side retry on timeout, not a durable JetStream queue); JetStream backs the tamper-evident audit-event ledger. Optional per-node checkpointing (RFC 0003) makes interrupted runs resumable.
 - **Browser/CLI** -- untrusted client (React SPA, MCP clients such as Claude Desktop)
 
 ---
@@ -51,7 +51,7 @@ Talos is a workflow automation platform built on:
 | B1 | Internet edge | Browser/CLI | Controller | HTTPS (TLS 1.2+) |
 | B2 | Controller-to-DB | Controller | PostgreSQL | TCP (TLS in prod) |
 | B3 | Controller-to-Redis | Controller | Redis | `rediss://` enforced in prod |
-| B4 | Controller-to-NATS | Controller | NATS JetStream | TLS (when configured) |
+| B4 | Controller-to-NATS | Controller | NATS (core for jobs; JetStream for audit ledger) | TLS (when configured) |
 | B5 | NATS-to-Worker | NATS | Worker | TLS + HMAC-SHA256 job signing |
 | B6 | Worker-to-WASM | Worker host | WASM guest | wasmtime sandbox (capability worlds) |
 | B7 | Webhook ingress | External service | Controller `/webhooks/*` | HTTPS + HMAC signature |

@@ -355,7 +355,7 @@ in-cluster StatefulSets disabled (the default for Postgres):
 | **Neo4j** | Single StatefulSet replica | Managed Neo4j (AuraDB) or a causal cluster. Graph-RAG degrades (semantic recall still works) if Neo4j is down; the platform stays up. |
 | **Vault** | Single StatefulSet replica | Vault in HA mode (3-replica Raft) or a managed KMS for the transit/KEK backend. A sealed/down Vault blocks DEK unwrap → controller CrashLoops. Back up `bootstrap.json` (unseal material) off-cluster. |
 | **MinIO** | Single StatefulSet replica | Managed S3 or distributed MinIO (4+ nodes). Holds the WORM audit sink. |
-| **NATS** | 3-replica StatefulSet, `minAvailable: 2` PDB | Already HA. Keep ≥3 replicas; JetStream stream replication ≥2 for at-least-once job delivery. |
+| **NATS** | 3-replica StatefulSet, `minAvailable: 2` PDB | Already HA. Keep ≥3 replicas; set JetStream stream replication ≥2 for the audit-event ledger. (Job dispatch is core-NATS request/reply with controller-side retry — see RFC 0003 — so it doesn't rely on JetStream durability.) |
 
 **Availability alerts.** `deploy/observability/alerts.yaml` ships
 `TalosSingleReplicaInfraDown` (any in-cluster stateful SPOF at 0 ready
