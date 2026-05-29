@@ -140,6 +140,25 @@ call site to supply both — the same compiler-enforced discipline RFC
 The exact per-table decision is finalised in M2's migration review; this
 list is the working set.
 
+**M2 outcome (2026-05-29), against the live post-migration schema:**
+- Several tables in the original working set **don't exist** (terminology
+  refactor / never created): `agents`/`agent_*` (→ `actors`/`actor_*`),
+  `node_executions`, `node_execution_logs`, `node_templates`,
+  `wasm_modules`, `webhook_listeners`. Dropped from the sweep.
+- `workflows`, `secrets`, `modules`, `api_keys` **already had** `org_id`
+  (prior org work); M2 backfills their NULLs + adds the composite index.
+- **Deferred to M2b** (carry tenant data but link via `trigger_id` to a
+  webhook trigger, not a user): `webhook_request_log`,
+  `webhook_processed_events`. They get `org_id` via the trigger's owner in
+  a focused follow-up.
+- Confirmed global carve-outs: `compilation_cache`, `node_result_cache`
+  (content-addressed shared caches — note: cross-tenant cache *sharing*
+  by content hash is a latent isolation question to review separately),
+  `secrets_rotation_log` (platform crypto-ops log).
+- Net: M2 added `org_id` to 39 tables; 43 now carry it. Backfill verified
+  end-to-end (direct `user_id`→personal-org and parent-join lineages) on
+  a real `pgvector` DB.
+
 ## Migration sequence
 
 Each phase ships independently and backward-compatibly. **RLS never goes
