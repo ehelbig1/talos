@@ -8379,6 +8379,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-auth-types",
+ "tokio",
  "tracing",
  "uuid",
 ]

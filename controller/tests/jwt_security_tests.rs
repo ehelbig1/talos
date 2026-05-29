@@ -53,6 +53,7 @@ async fn expired_token_is_rejected() {
         is_2fa_verified: false,
         iss: "talos".to_string(),
         aud: Some("talos".to_string()),
+        org: String::new(),
     };
 
     let token = encode(
@@ -197,6 +198,7 @@ async fn alg_none_token_is_rejected() {
         is_2fa_verified: false,
         iss: "talos".to_string(),
         aud: Some("talos".to_string()),
+        org: String::new(),
     };
     let payload = serde_json::to_string(&claims).unwrap();
 

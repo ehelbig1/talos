@@ -20,6 +20,17 @@ pub struct Claims {
     pub iss: String,
     #[serde(default)]
     pub aud: Option<String>,
+    /// Active organization (the tenant, per RFC 0004) this token operates
+    /// under — a UUID string, set to the user's personal org by default
+    /// or to a shared org the user has switched into. The controller
+    /// stamps `SET LOCAL app.current_org_id` from this for RLS.
+    ///
+    /// `#[serde(default)]` keeps it backward-compatible: tokens minted
+    /// before this field existed deserialize with `org == ""`, and the
+    /// resolution path falls back to the user's personal org. So a
+    /// rollout never invalidates in-flight tokens.
+    #[serde(default)]
+    pub org: String,
 }
 
 #[cfg(test)]
@@ -31,5 +42,14 @@ mod tests {
         let json = r#"{"sub":"u","email":"e","exp":1,"iat":1,"is_2fa_verified":false,"iss":""}"#;
         let claims: Claims = serde_json::from_str(json).unwrap();
         assert!(claims.aud.is_none());
+    }
+
+    #[test]
+    fn org_is_optional_for_back_compat() {
+        // A token minted before the `org` claim existed must still
+        // deserialize (RFC 0004 rollout safety) — `org` defaults to "".
+        let json = r#"{"sub":"u","email":"e","exp":1,"iat":1,"is_2fa_verified":false,"iss":""}"#;
+        let claims: Claims = serde_json::from_str(json).unwrap();
+        assert!(claims.org.is_empty());
     }
 }

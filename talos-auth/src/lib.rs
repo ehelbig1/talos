@@ -929,6 +929,14 @@ impl AuthService {
             is_2fa_verified,
             iss: "talos".to_string(),
             aud: Some("talos".to_string()),
+            // RFC 0004: left empty here (this minting path is sync / has
+            // no DB handle to look up the active org). The controller
+            // resolves the active org per request via
+            // `OrganizationService::resolve_active_org`, defaulting to the
+            // user's personal org when `org` is empty. The claim is
+            // populated only once org-switching is wired (a later step),
+            // at which point it carries the user's selected org.
+            org: String::new(),
         };
 
         let token = encode(
