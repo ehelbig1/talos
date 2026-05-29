@@ -389,3 +389,92 @@ async fn permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set() {
         .execute(format!("DROP ROLE IF EXISTS {PERM_ROLE};").as_str())
         .await;
 }
+
+const WF_ROLE: &str = "talos_wf_rls_app";
+
+/// RFC 0004 M4 workflows step 2: the PERMISSIVE policy on the real
+/// `workflows` table — an un-wired path (no GUC) sees all (non-breaking,
+/// e.g. the engine's graph-load), while a wired/scoped read enforces the
+/// union. Validated on the actual table+migration under a non-superuser
+/// role.
+#[tokio::test]
+async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
+    let Some(su_url) = superuser_url() else { return };
+    let su = connect(&su_url).await;
+    let user_a = Uuid::new_v4();
+    let user_b = Uuid::new_v4();
+    // Unique names so the assertions ignore any seeded workflows.
+    let name_a = format!("wfa-{}", user_a.simple());
+    let name_b = format!("wfb-{}", user_b.simple());
+
+    su.execute(
+        format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{WF_ROLE}') THEN \
+               CREATE ROLE {WF_ROLE} LOGIN PASSWORD '{APP_PW}'; END IF; END $$;"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create wf role");
+    su.execute(format!("GRANT SELECT, INSERT ON workflows TO {WF_ROLE};").as_str())
+        .await
+        .expect("grant");
+    for (u, label) in [(user_a, "wa"), (user_b, "wb")] {
+        sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
+            .bind(u)
+            .bind(format!("{label}-{}@test.invalid", u.simple()))
+            .bind(label)
+            .execute(&su)
+            .await
+            .expect("insert user");
+    }
+    // org_id NULL → the user_id clause carries (sufficient for this test).
+    for (u, n) in [(user_a, &name_a), (user_b, &name_b)] {
+        sqlx::query(
+            "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
+             VALUES (gen_random_uuid(), $1, $2, '', '{}')",
+        )
+        .bind(u)
+        .bind(n)
+        .execute(&su)
+        .await
+        .expect("insert workflow");
+    }
+
+    let after_at = su_url.rsplit_once('@').map(|(_, r)| r).unwrap_or(&su_url);
+    let app = connect(&format!("postgres://{WF_ROLE}:{APP_PW}@{after_at}")).await;
+
+    // Un-wired path (no GUC) → permissive → sees BOTH (non-breaking).
+    let unscoped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflows WHERE name IN ($1, $2)")
+            .bind(&name_a)
+            .bind(&name_b)
+            .fetch_one(&app)
+            .await
+            .unwrap();
+    assert_eq!(unscoped, 2, "un-wired path must be permissive (engine/scheduler don't break)");
+
+    // Wired/scoped to user A → enforced → sees only A's.
+    let mut tx = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_a, vec![]))
+        .await
+        .unwrap();
+    let scoped: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM workflows WHERE name IN ($1, $2)")
+            .bind(&name_a)
+            .bind(&name_b)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(scoped, vec![name_a.clone()], "scoped read must enforce — only A's workflow");
+
+    let _ = sqlx::query("DELETE FROM workflows WHERE name IN ($1,$2)")
+        .bind(&name_a)
+        .bind(&name_b)
+        .execute(&su)
+        .await;
+    for u in [user_a, user_b] {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+    }
+    let _ = su.execute(format!("DROP ROLE IF EXISTS {WF_ROLE};").as_str()).await;
+}

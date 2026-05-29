@@ -238,7 +238,14 @@ impl WorkflowsQueries {
             actor_id: Option<Uuid>,
         }
 
-        let workflow = sqlx::query_as::<_, Row>(
+        // RFC 0004 M4: run on a tenant-scoped tx so the workflows RLS
+        // policy backstops the app-layer ownership/org filter. The scope
+        // carries the same (user, accessible orgs) the WHERE clause uses.
+        let scope = talos_tenancy::TenantReadScope::new(*user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+        let found = sqlx::query_as::<_, Row>(
             r#"
             SELECT id, name, graph_json, user_id, org_id, max_concurrent_executions, intent, actor_id
             FROM workflows
@@ -247,11 +254,14 @@ impl WorkflowsQueries {
         )
         .bind(id)
         .bind(user_id)
-        .bind(&org_ids)
-        .fetch_optional(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?
-        .ok_or_else(|| {
+        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let workflow = found.ok_or_else(|| {
             async_graphql::Error::new("Workflow not found or access denied").extend_safe()
         })?;
 
@@ -304,15 +314,22 @@ impl WorkflowsQueries {
 
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
+        // RFC 0004 M4: scoped tx so the workflows RLS policy backstops the
+        // app-layer union filter.
+        let scope = talos_tenancy::TenantReadScope::new(*user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let workflows = sqlx::query_as::<_, WorkflowRow>(
             "SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) ORDER BY created_at DESC LIMIT $2 OFFSET $3"
         )
         .bind(user_id)
         .bind(limit_val)
         .bind(offset_val)
-        .bind(&org_ids)
-        .fetch_all(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(workflows
             .into_iter()
