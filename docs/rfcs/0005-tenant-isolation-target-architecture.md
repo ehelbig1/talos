@@ -104,6 +104,36 @@ membership-union policy (drop the permissive `IS NULL` clause), and
 `talos_system` is the single explicit, audited escape hatch for the
 cross-cutting readers.
 
+## Enabling enforcement (operator runbook)
+
+Pillar 1 ships **flag-gated, default off** — the `talos_app` role and the
+`SET LOCAL ROLE` plumbing exist, but the policies stay a no-op backstop
+until an operator opts in. To turn enforcement on:
+
+1. **Apply migrations** through `20260529220000_talos_app_role.sql` (the
+   chart's pre-install/upgrade migrations Job does this). This creates
+   `talos_app` and grants it the request-path DML on all tables +
+   defaults for future tables.
+2. **Set the flag** — uncomment `controller.env.TALOS_RLS_SET_ROLE: "true"`
+   in the chart values (or set `TALOS_RLS_SET_ROLE=1` in the controller
+   env) and `helm upgrade` / restart the controller.
+3. **Confirm at boot** — the controller logs `RLS SET-ROLE mode active`
+   (INFO). If instead it logs an ERROR about `talos_app` missing or
+   being a superuser / `BYPASSRLS`, step 1 didn't take — fix before
+   trusting enforcement.
+4. **Validate** — run `make smoke` and exercise a few read/write
+   workflows in staging. Every request-path tx now runs as `talos_app`,
+   so a write that violated its table's RLS `WITH CHECK` would surface
+   here (not in prod).
+
+**Rollback is instant and data-safe**: set the flag to `"false"` (or
+remove it) and restart. Enforcement is per-transaction `SET LOCAL ROLE`,
+so there is no schema or data change to undo.
+
+The default does not flip to on until enforcement is proven across the
+representative deploy modes (in-cluster superuser + managed non-superuser)
+— a small follow-up once operators have run with it enabled.
+
 ## Staged roadmap
 
 RLS is **defense-in-depth** — the app layer is and stays the *primary*

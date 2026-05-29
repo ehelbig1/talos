@@ -149,6 +149,27 @@ controller:
     KEK_PROVIDER: "vault"
     VAULT_TRANSIT_KEY_NAME: "talos-kek"
     TALOS_DISABLE_POOLING: "true"
+    # RFC 0005 S3 — tenant-isolation RLS enforcement via SET LOCAL ROLE.
+    # When "true", every request-path transaction (begin_tenant_read_scoped
+    # / begin_org_scoped) runs as the non-superuser `talos_app` role via a
+    # per-transaction SET LOCAL ROLE (auto-resets on commit/rollback), so
+    # the RFC 0004 row-level-security policies ENFORCE even when the
+    # controller's DB connection is a superuser — the in-cluster Postgres
+    # default, where RLS is otherwise silently bypassed. Default OFF: the
+    # policies are a no-op backstop until you opt in (the app-layer
+    # ownership checks remain primary either way).
+    #
+    # PREREQUISITES before flipping to "true":
+    #   1. Migrations applied through
+    #      20260529220000_talos_app_role.sql (creates `talos_app` + the
+    #      request-path grants). The controller boot guard logs an ERROR if
+    #      the role is missing or mis-attributed while this is on.
+    #   2. Validate in staging first: after enabling, confirm the
+    #      controller logs "RLS SET-ROLE mode active" (INFO) at boot and
+    #      run `make smoke`. Exercise a few read/write workflows.
+    # Rollback is instant and data-safe: set "false" (or remove) and
+    # restart — enforcement is per-transaction, no migration to undo.
+    # TALOS_RLS_SET_ROLE: "true"
     # JWT audience-claim enforcement (MCP-857). Once every live token
     # in your cluster carries `aud=talos`, set this to "true" to fail
     # closed on tokens missing the claim (defense vs. cross-audience
