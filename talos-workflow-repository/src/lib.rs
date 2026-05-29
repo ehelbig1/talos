@@ -764,11 +764,16 @@ impl WorkflowRepository {
     ) -> Result<Uuid> {
         let wf_id = Uuid::new_v4();
         sqlx::query(
+            // RFC 0004: stamp org_id = the creator's personal org (this
+            // path has no org-context selector). NULL-tolerant: if the
+            // personal org is somehow absent, org_id stays NULL and the
+            // owner still sees the row via the user_id union clause.
             "INSERT INTO workflows \
              (id, user_id, name, module_uri, graph_json, description, tags, capabilities, \
               intent, max_concurrent_executions, timeout_seconds, actor_id, readiness_score, \
-              created_at, updated_at) \
-             VALUES ($1, $2, $3, '', $4, $5, $6, $7, $8, $9, $10, $11, 0, NOW(), NOW())",
+              created_at, updated_at, org_id) \
+             VALUES ($1, $2, $3, '', $4, $5, $6, $7, $8, $9, $10, $11, 0, NOW(), NOW(), \
+              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
         )
         .bind(wf_id)
         .bind(user_id)
@@ -3428,8 +3433,10 @@ impl WorkflowRepository {
         graph_json: &str,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO workflows (id, user_id, actor_id, name, description, graph_json, status, workflow_type) \
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'published', 'internal')",
+            // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
+            "INSERT INTO workflows (id, user_id, actor_id, name, description, graph_json, status, workflow_type, org_id) \
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'published', 'internal', \
+              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
         )
         .bind(workflow_id)
         .bind(user_id)
@@ -3457,8 +3464,10 @@ impl WorkflowRepository {
         module_uri: &str,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO workflows (id, user_id, name, description, graph_json, is_enabled, capabilities, module_uri) \
-             VALUES ($1, $2, $3, $4, $5, true, $6, $7)",
+            // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
+            "INSERT INTO workflows (id, user_id, name, description, graph_json, is_enabled, capabilities, module_uri, org_id) \
+             VALUES ($1, $2, $3, $4, $5, true, $6, $7, \
+              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
         )
         .bind(workflow_id)
         .bind(user_id)
@@ -3744,8 +3753,10 @@ impl WorkflowRepository {
         tags: &[String],
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO workflows (id, user_id, name, module_uri, graph_json, tags, created_at, updated_at) \
-             VALUES ($1, $2, $3, '', $4, $5, NOW(), NOW())",
+            // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
+            "INSERT INTO workflows (id, user_id, name, module_uri, graph_json, tags, created_at, updated_at, org_id) \
+             VALUES ($1, $2, $3, '', $4, $5, NOW(), NOW(), \
+              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
         )
         .bind(new_id)
         .bind(user_id)
@@ -4713,8 +4724,10 @@ impl WorkflowRepository {
             .ok_or_else(|| anyhow::anyhow!("Workflow not found or not owned by caller"))?
         } else {
             sqlx::query_scalar(
-                "INSERT INTO workflows (user_id, name, module_uri, graph_json, created_at, updated_at) \
-                 VALUES ($1, $2, '', $3, NOW(), NOW()) \
+                // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
+                "INSERT INTO workflows (user_id, name, module_uri, graph_json, created_at, updated_at, org_id) \
+                 VALUES ($1, $2, '', $3, NOW(), NOW(), \
+                  (SELECT id FROM organizations WHERE owner_id = $1 AND is_personal)) \
                  RETURNING id",
             )
             .bind(user_id)
