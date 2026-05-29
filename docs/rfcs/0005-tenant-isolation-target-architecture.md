@@ -142,6 +142,22 @@ until an operator opts in. To turn enforcement on:
 remove it) and restart. Enforcement is per-transaction `SET LOCAL ROLE`,
 so there is no schema or data change to undo.
 
+**Writes are gated too, not just reads.** The permissive policies declare
+only `USING` (no explicit `WITH CHECK`); per Postgres, an `ALL`-command
+policy with `WITH CHECK` omitted applies its `USING` predicate as the
+check on new/updated rows. So under enforcement a request-path
+`INSERT`/`UPDATE` must produce a row that satisfies the membership-union
+predicate (`user_id = current_user_id` OR `org_id ∈ current_org_ids`) —
+a write that would create a row for another tenant is rejected with
+SQLSTATE `42501`. This is the main thing to validate when flipping on:
+every write that runs through a scoped `UnitOfWork` / `begin_org_scoped`
+must stamp the row's `user_id`/`org_id` to the acting tenant (the app
+layer already does, but a mismatch surfaces as `42501` here rather than
+silently writing a cross-tenant row). The behavior is locked by
+`talos-db/tests/rls_org_isolation.rs::set_role_with_check_gates_cross_tenant_writes`.
+Writes that deliberately run cross-tenant (none today) would use the
+non-`SET ROLE` system path.
+
 The default does not flip to on until enforcement is proven across the
 representative deploy modes (in-cluster superuser + managed non-superuser)
 — a small follow-up once operators have run with it enabled.
