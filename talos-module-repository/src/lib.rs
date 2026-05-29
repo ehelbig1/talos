@@ -1257,14 +1257,18 @@ impl ModuleRepository {
 
     /// Pin a module for a user (idempotent — ON CONFLICT DO NOTHING).
     pub async fn pin_user_module(&self, user_id: Uuid, module_name: &str) -> Result<()> {
+        // RFC 0004 M4: user_module_pins is RLS-enforced — run on a
+        // per-user scoped tx so the policy's user_id clause matches.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         sqlx::query(
             "INSERT INTO user_module_pins (user_id, module_name) VALUES ($1, $2) \
              ON CONFLICT DO NOTHING",
         )
         .bind(user_id)
         .bind(module_name)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1274,6 +1278,7 @@ impl ModuleRepository {
     /// `wasm_bytes IS NOT NULL AND length > 0`. Used by
     /// `restore_pinned_modules` to decide which entries need a recompile.
     pub async fn list_user_pinned_modules(&self, user_id: Uuid) -> Result<Vec<PinnedModuleStatus>> {
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT pm.module_name, \
                     (m.wasm_bytes IS NOT NULL AND octet_length(m.wasm_bytes) > 0) AS has_wasm \
@@ -1283,8 +1288,9 @@ impl ModuleRepository {
              ORDER BY pm.pinned_at ASC",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows
             .iter()
             .map(|r| PinnedModuleStatus {

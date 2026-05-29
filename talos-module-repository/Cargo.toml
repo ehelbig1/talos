@@ -12,6 +12,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-db = { path = "../talos-db" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 tracing.workspace = true
 uuid.workspace = true
