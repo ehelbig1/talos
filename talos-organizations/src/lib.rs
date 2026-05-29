@@ -97,6 +97,78 @@ impl OrganizationService {
         Ok(org)
     }
 
+    /// Create (or return the existing) **personal organization** for a
+    /// user — the org-as-tenant home for that user's non-team resources
+    /// (RFC 0004). Idempotent: if the user already has a personal org it
+    /// is returned unchanged, so this is safe to call on every signup
+    /// and as a backfill repair.
+    ///
+    /// The slug is derived from the user id (`user-<32-hex>`) so it is
+    /// globally unique and satisfies the 3–100 lowercase-alnum-hyphen
+    /// slug rule without a collision-retry loop.
+    pub async fn create_personal_org(
+        db: &Pool<Postgres>,
+        user_id: Uuid,
+        display_name: Option<&str>,
+    ) -> Result<Organization> {
+        // Idempotent fast-path: return the existing personal org.
+        if let Some(existing) = sqlx::query_as::<_, Organization>(
+            r#"
+            SELECT id, name, slug, owner_id, created_at, updated_at
+            FROM organizations
+            WHERE owner_id = $1 AND is_personal
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .context("Failed to look up existing personal org")?
+        {
+            return Ok(existing);
+        }
+
+        let slug = format!("user-{}", user_id.simple());
+        let name: String = display_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Personal")
+            .chars()
+            .take(255)
+            .collect();
+
+        let mut tx = db.begin().await.context("Failed to begin transaction")?;
+        let org = sqlx::query_as::<_, Organization>(
+            r#"
+            INSERT INTO organizations (name, slug, owner_id, is_personal)
+            VALUES ($1, $2, $3, true)
+            RETURNING id, name, slug, owner_id, created_at, updated_at
+            "#,
+        )
+        .bind(&name)
+        .bind(&slug)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("Failed to create personal organization")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO organization_members (org_id, user_id, role, invited_by)
+            VALUES ($1, $2, 'owner', NULL)
+            ON CONFLICT (org_id, user_id) DO NOTHING
+            "#,
+        )
+        .bind(org.id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to add owner member to personal org")?;
+
+        tx.commit().await.context("Failed to commit transaction")?;
+        Ok(org)
+    }
+
     /// Get an organization by ID.
     pub async fn get_org(db: &Pool<Postgres>, org_id: Uuid) -> Result<Organization> {
         sqlx::query_as::<_, Organization>(

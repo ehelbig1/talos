@@ -22,6 +22,55 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+/// Postgres GUC carrying the request's **active organization** for
+/// row-level security. The controller sets it per transaction
+/// (`SET LOCAL app.current_org_id = '<uuid>'`); each owned table's RLS
+/// policy reads it via `current_setting(...)`. One canonical name so the
+/// tx-open path and the policy definitions never drift. See RFC 0004.
+pub const ACTIVE_ORG_GUC: &str = "app.current_org_id";
+
+/// Request-scoped tenancy scope (RFC 0004: tenant = organization).
+///
+/// Carries the **active organization** — the isolation boundary every
+/// owned query must filter on — plus the **acting user** (the
+/// within-org RBAC dimension, e.g. who created a workflow). This type
+/// replaces a bare `user_id: Uuid` on repository methods so the compiler
+/// forces every call site to supply both, the same compiler-enforced
+/// discipline RFC 0001 §T1.3 specified, with org as the boundary.
+///
+/// `active_org_id` is chosen by the request layer from the orgs the
+/// caller is a member of (defaulting to their personal org); membership
+/// is validated in the app layer, RLS is the data backstop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrgScope {
+    /// The organization whose data this request may touch (RLS boundary).
+    pub active_org_id: Uuid,
+    /// The user acting within that organization.
+    pub user_id: Uuid,
+}
+
+impl OrgScope {
+    /// Build a scope from an active org and the acting user.
+    #[must_use]
+    pub fn new(active_org_id: Uuid, user_id: Uuid) -> Self {
+        Self {
+            active_org_id,
+            user_id,
+        }
+    }
+
+    /// The `SET LOCAL app.current_org_id = '<uuid>'` statement that opens
+    /// a tenant-scoped transaction. `SET LOCAL` cannot take bind
+    /// parameters, so the UUID is interpolated — safe because
+    /// `active_org_id` is a `Uuid` (no caller-controlled text, no
+    /// injection surface). Centralised here so every tx uses the same
+    /// GUC spelling as the RLS policies.
+    #[must_use]
+    pub fn set_local_org_sql(&self) -> String {
+        format!("SET LOCAL {ACTIVE_ORG_GUC} = '{}'", self.active_org_id)
+    }
+}
+
 /// Tenant resource limits
 #[derive(Debug, Clone)]
 pub struct TenantLimits {
@@ -106,5 +155,23 @@ impl TenantIsolation {
 impl Default for TenantIsolation {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn org_scope_emits_canonical_set_local() {
+        let org = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let user = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let scope = OrgScope::new(org, user);
+        assert_eq!(
+            scope.set_local_org_sql(),
+            "SET LOCAL app.current_org_id = '11111111-1111-1111-1111-111111111111'"
+        );
+        // GUC spelling is shared with the RLS policy definitions.
+        assert!(scope.set_local_org_sql().contains(ACTIVE_ORG_GUC));
     }
 }

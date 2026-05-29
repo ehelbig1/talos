@@ -52,6 +52,24 @@ impl AuthMutations {
             async_graphql::Error::new("Failed to get user").extend_safe()
         })?;
 
+        // RFC 0004: every user gets a personal organization (their
+        // org-as-tenant home). Best-effort — the user is already
+        // committed, and `create_personal_org` is idempotent (the M1
+        // backfill / a later call repairs a miss), so a transient failure
+        // here must not fail an otherwise-successful signup. Once org_id
+        // becomes required (M3) this moves into the same transaction.
+        if let Ok(db_pool) = ctx.data::<sqlx::PgPool>() {
+            if let Err(e) = talos_organizations::OrganizationService::create_personal_org(
+                db_pool,
+                user_id,
+                user.name.as_deref(),
+            )
+            .await
+            {
+                tracing::error!(user_id = %user_id, "Failed to create personal org at signup (will be repaired): {e}");
+            }
+        }
+
         // Generate access token (short-lived: 15 minutes)
         // New users don't have 2FA enabled yet, so they are verified
         let access_token = auth_service
