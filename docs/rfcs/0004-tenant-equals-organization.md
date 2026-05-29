@@ -100,6 +100,13 @@ the org infrastructure already in place.
   app.current_org_id`. `SET LOCAL` is tx-scoped, so there is no
   cross-request GUC leakage through the pool.
 
+  Because the superuser/`BYPASSRLS` footgun is silent, the controller
+  runs `talos_db::warn_if_rls_will_be_bypassed` at boot (one `pg_roles`
+  lookup) and logs a prominent WARN if its role would bypass RLS. Today
+  it only informs (RLS isn't enabled until M4); when M4 lands this
+  escalates to a hard refusal-to-serve so a misconfigured role can't
+  silently disable tenant isolation in production.
+
 - **Membership / role checks stay app-enforced** (can this user switch
   into this org? can they write here? — the existing org RBAC). RLS is
   the belt-and-braces that catches a missed `WHERE org_id = $1`, not the

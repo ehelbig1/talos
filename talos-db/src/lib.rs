@@ -46,6 +46,78 @@ pub async fn begin_org_scoped<'a>(
     Ok(tx)
 }
 
+/// Whether the connecting DB role can enforce row-level security.
+///
+/// Postgres **silently ignores** RLS policies for roles that are
+/// superusers or have `BYPASSRLS` — so if the controller connects as
+/// such a role, the RFC 0004 org-isolation policies become a no-op and
+/// tenants would see each other's data with no error. This is the single
+/// highest-impact RLS footgun; [`check_rls_role`] surfaces it at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RlsRoleStatus {
+    /// The role is a superuser (bypasses RLS unconditionally).
+    pub is_superuser: bool,
+    /// The role has the `BYPASSRLS` attribute.
+    pub bypass_rls: bool,
+}
+
+impl RlsRoleStatus {
+    /// True when RLS policies will actually apply to this role's queries.
+    #[must_use]
+    pub fn rls_enforced(&self) -> bool {
+        !self.is_superuser && !self.bypass_rls
+    }
+}
+
+/// Inspect the connecting role's superuser / `BYPASSRLS` attributes.
+///
+/// Call at startup and `warn!`/refuse if `!rls_enforced()` *when RLS is
+/// expected* (RFC 0004 M4). Cheap — one catalog lookup against
+/// `pg_roles` for `current_user`.
+pub async fn check_rls_role(pool: &Pool<Postgres>) -> anyhow::Result<RlsRoleStatus> {
+    let row: (bool, bool) = sqlx::query_as(
+        "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await
+    .context("query current_user RLS attributes")?;
+    Ok(RlsRoleStatus {
+        is_superuser: row.0,
+        bypass_rls: row.1,
+    })
+}
+
+/// Boot-time guard: log a prominent warning when the controller's DB role
+/// would silently bypass the RFC 0004 org-isolation RLS policies. Safe to
+/// call before RLS is enabled (it only informs); returns the status so a
+/// caller can escalate to a hard refusal once RLS is mandatory.
+pub async fn warn_if_rls_will_be_bypassed(pool: &Pool<Postgres>) -> RlsRoleStatus {
+    match check_rls_role(pool).await {
+        Ok(status) if !status.rls_enforced() => {
+            tracing::warn!(
+                is_superuser = status.is_superuser,
+                bypass_rls = status.bypass_rls,
+                "DB role bypasses row-level security — RFC 0004 tenant-isolation \
+                 policies will be a NO-OP for this connection. Connect as a \
+                 non-superuser role WITHOUT BYPASSRLS before enabling RLS (M4)."
+            );
+            status
+        }
+        Ok(status) => {
+            tracing::debug!("DB role enforces RLS (not superuser, no BYPASSRLS)");
+            status
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not determine DB role RLS status");
+            // Unknown → assume the worst for visibility, but don't block boot.
+            RlsRoleStatus {
+                is_superuser: true,
+                bypass_rls: true,
+            }
+        }
+    }
+}
+
 /// Initialize database connection pool
 pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
     let _ = dotenvy::dotenv();
