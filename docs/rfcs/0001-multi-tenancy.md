@@ -1,8 +1,17 @@
 # RFC 001 — Multi-tenancy implementation
 
-**Status:** Draft
+**Status:** Superseded (data model) by
+[RFC 0004 — Tenant = Organization](./0004-tenant-equals-organization.md)
 **Author:** Platform
 **Date:** 2026-04-24
+
+> **Superseded note (2026-05-29):** this RFC's proposed *separate
+> `tenants` table* and *"a user belongs to exactly one tenant"* rule were
+> written without reconciling the pre-existing `organizations` model
+> (which already backs `tenant_quotas` and `workflows.org_id`). RFC 0004
+> resolves that: **the organization IS the tenant.** The phasing here
+> (logical → cryptographic → physical) and the T2/T3 shapes still hold,
+> re-expressed with tenant ≡ org. Read RFC 0004 for the live plan.
 **Supersedes:** §"Tenant Isolation Architecture" in
 [`docs/architecture/managed-cloud.md`](../architecture/managed-cloud.md)
 (that document made the high-level decision; this one is the concrete

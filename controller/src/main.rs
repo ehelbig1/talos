@@ -6326,6 +6326,23 @@ async fn oauth_callback_handler(
         .await
         .map_err(|_e| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // RFC 0004: give brand-new OAuth users a personal organization (their
+    // org-as-tenant home), mirroring the GraphQL signup path. Best-effort
+    // + idempotent — `create_personal_org` repairs a miss, and existing
+    // users already have one via the M1 backfill, so this never blocks
+    // login.
+    if is_new_user {
+        if let Err(e) = talos_organizations::OrganizationService::create_personal_org(
+            &google_calendar_service.db_pool,
+            user_id,
+            user_info_clone.name.as_deref(),
+        )
+        .await
+        {
+            tracing::error!(user_id = %user_id, "Failed to create personal org for new OAuth user (will be repaired): {e}");
+        }
+    }
+
     // Check if this is a Google OAuth callback with Calendar scopes
     if provider_enum == OAuthProvider::Google {
         let is_calendar_integration = user_info_clone
