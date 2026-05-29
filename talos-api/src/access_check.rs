@@ -41,6 +41,21 @@ pub(crate) async fn workflow_accessible_for_user(
     user_id: Uuid,
     org_ids: &[Uuid],
 ) -> Result<bool, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    workflow_accessible_for_user_on_conn(&mut conn, workflow_id, user_id, org_ids).await
+}
+
+/// `workflow_accessible_for_user` against a caller-supplied connection —
+/// RFC 0005 S3 executor-threading convention. Lets the ownership check
+/// share a request-scoped `talos_db::UnitOfWork` with the data read that
+/// follows it (one tenant-scoped tx, one snapshot) instead of taking its
+/// own pooled connection. The `&PgPool` method delegates here.
+pub(crate) async fn workflow_accessible_for_user_on_conn(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+    user_id: Uuid,
+    org_ids: &[Uuid],
+) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM workflows \
          WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3)))",
@@ -48,7 +63,7 @@ pub(crate) async fn workflow_accessible_for_user(
     .bind(workflow_id)
     .bind(user_id)
     .bind(org_ids)
-    .fetch_one(pool)
+    .fetch_one(conn)
     .await
 }
 

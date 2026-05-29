@@ -476,13 +476,21 @@ impl WorkflowsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        // Verify user owns the workflow or has org access
+        // RFC 0005 S3: the ownership check + the versions read share ONE
+        // request-scoped unit of work (one tenant-scoped tx + snapshot,
+        // role/GUC set once, RLS backstop on both). `user_accessible_org_ids`
+        // sources the scope so it necessarily precedes the tx.
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
-        let owns = crate::access_check::workflow_accessible_for_user(
-            db_pool,
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
+        let owns = crate::access_check::workflow_accessible_for_user_on_conn(
+            uow.conn(),
             workflow_id,
             user_id,
-            &org_ids,
+            &scope.accessible_org_ids,
         )
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -496,13 +504,20 @@ impl WorkflowsQueries {
         let limit_val = limit.unwrap_or(50).clamp(1, 1000) as i64;
         let offset_val = offset.unwrap_or(0).max(0) as i64;
 
-        let versions =
-            WorkflowVersionService::list_versions(db_pool, workflow_id, limit_val, offset_val)
-                .await
-                .map_err(|e: anyhow::Error| {
-                    tracing::error!("Failed to list workflow versions: {}", e);
-                    async_graphql::Error::new("Failed to list workflow versions").extend_safe()
-                })?;
+        let versions = WorkflowVersionService::list_versions_on_conn(
+            uow.conn(),
+            workflow_id,
+            limit_val,
+            offset_val,
+        )
+        .await
+        .map_err(|e: anyhow::Error| {
+            tracing::error!("Failed to list workflow versions: {}", e);
+            async_graphql::Error::new("Failed to list workflow versions").extend_safe()
+        })?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(versions.into_iter().map(Into::into).collect())
     }
@@ -551,13 +566,19 @@ impl WorkflowsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        // Verify user owns the workflow or has org access
+        // RFC 0005 S3: ownership check + active-version read in ONE
+        // request-scoped unit of work (see workflow_versions above).
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
-        let owns = crate::access_check::workflow_accessible_for_user(
-            db_pool,
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
+        let owns = crate::access_check::workflow_accessible_for_user_on_conn(
+            uow.conn(),
             workflow_id,
             user_id,
-            &org_ids,
+            &scope.accessible_org_ids,
         )
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -569,12 +590,15 @@ impl WorkflowsQueries {
         }
 
         let version: Option<talos_workflow_versions::WorkflowVersion> =
-            WorkflowVersionService::get_active_version(db_pool, workflow_id)
+            WorkflowVersionService::get_active_version_on_conn(uow.conn(), workflow_id)
                 .await
                 .map_err(|e: anyhow::Error| {
                     tracing::error!("Failed to get active workflow version: {}", e);
                     async_graphql::Error::new("Failed to get active workflow version").extend_safe()
                 })?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(version.map(Into::into))
     }
