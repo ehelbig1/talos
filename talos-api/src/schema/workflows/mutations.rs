@@ -1921,15 +1921,27 @@ impl WorkflowsMutations {
         talos_scheduler::validate_timezone(&tz)
             .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
 
-        // Verify user owns the workflow or has org write access (creating
-        // schedules is a write — Viewer must not create schedules on
-        // org-shared workflows).
+        // Calculate next trigger time (pure — compute before opening the
+        // tx so the unit of work stays scoped to the two DB ops).
+        let next_trigger = talos_scheduler::calculate_next_trigger(&cron_expression, &tz)
+            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
+
+        // RFC 0005 S3: the org-WRITE-access check + the upsert share ONE
+        // request-scoped unit of work — the ownership read gets the
+        // workflows RLS backstop, and both run in one transaction.
+        // user_writable_org_ids (Viewer must not create schedules on
+        // org-shared workflows) sources the scope, so it precedes the tx.
         let org_ids: Vec<uuid::Uuid> = crate::schema::user_writable_org_ids(ctx).await?;
-        let workflow_exists = crate::access_check::workflow_accessible_for_user(
-            db_pool,
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
+        let workflow_exists = crate::access_check::workflow_accessible_for_user_on_conn(
+            uow.conn(),
             workflow_id,
             user_id,
-            &org_ids,
+            &scope.accessible_org_ids,
         )
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -1939,10 +1951,6 @@ impl WorkflowsMutations {
                 async_graphql::Error::new("Workflow not found or access denied").extend_safe(),
             );
         }
-
-        // Calculate next trigger time
-        let next_trigger = talos_scheduler::calculate_next_trigger(&cron_expression, &tz)
-            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
 
         // Upsert: insert or update on conflict (workflow_id is UNIQUE)
         let row = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
@@ -1964,9 +1972,12 @@ impl WorkflowsMutations {
         .bind(&cron_expression)
         .bind(&tz)
         .bind(next_trigger)
-        .fetch_one(db_pool)
+        .fetch_one(uow.conn())
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?; // Added type annotation
+        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(WorkflowScheduleObj {
             id: row.id,
@@ -1998,14 +2009,25 @@ impl WorkflowsMutations {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        // update_schedule is a write — Viewer must not be able to change
-        // the cron of an org-shared workflow.
+        // RFC 0005 S3: ownership check + read-merge-write all in ONE
+        // request-scoped unit of work. Beyond the snapshot/RLS-backstop
+        // win, the shared tx lets the existing-row SELECT take a
+        // `FOR UPDATE` row lock so the read→merge→update is atomic —
+        // closing the lost-update window where two concurrent updates each
+        // merging different fields off a stale snapshot would clobber each
+        // other. update_schedule is a write, so the scope uses the
+        // WRITABLE org set (Viewer must not change an org-shared schedule).
         let org_ids: Vec<uuid::Uuid> = crate::schema::user_writable_org_ids(ctx).await?;
-        let workflow_exists = crate::access_check::workflow_accessible_for_user(
-            db_pool,
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
+        let workflow_exists = crate::access_check::workflow_accessible_for_user_on_conn(
+            uow.conn(),
             workflow_id,
             user_id,
-            &org_ids,
+            &scope.accessible_org_ids,
         )
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -2016,7 +2038,10 @@ impl WorkflowsMutations {
             );
         }
 
-        // Fetch existing schedule
+        // Fetch existing schedule, locking the row (`FOR UPDATE OF ws`) so
+        // the merge-then-update below is serialized against concurrent
+        // updaters. `OF ws` locks only the schedule row, not the joined
+        // workflows row.
         let existing = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
             r#"
             SELECT ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
@@ -2024,14 +2049,15 @@ impl WorkflowsMutations {
             FROM workflow_schedules ws
             LEFT JOIN workflows w ON w.id = ws.workflow_id
             WHERE ws.workflow_id = $1 AND (ws.user_id = $2 OR w.org_id = ANY($3))
+            FOR UPDATE OF ws
             "#,
         )
         .bind(workflow_id)
         .bind(user_id)
-        .bind(&org_ids)
-        .fetch_optional(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_optional(uow.conn())
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())? // Added type annotation
+        .map_err(|e: sqlx::Error| e.extend_safe())?
         .ok_or_else(|| async_graphql::Error::new("Schedule not found").extend_safe())?;
 
         let new_cron = cron_expression.unwrap_or(existing.cron_expression);
@@ -2112,10 +2138,13 @@ impl WorkflowsMutations {
         .bind(&new_tz)
         .bind(new_enabled)
         .bind(next_trigger)
-        .bind(&org_ids)
-        .fetch_one(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_one(uow.conn())
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?; // Added type annotation
+        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(WorkflowScheduleObj {
             id: row.id,
