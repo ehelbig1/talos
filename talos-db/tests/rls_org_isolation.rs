@@ -16,7 +16,7 @@
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, Pool, Postgres};
-use talos_db::begin_org_scoped;
+use talos_db::{begin_org_scoped, check_rls_role};
 use talos_tenancy::OrgScope;
 use uuid::Uuid;
 
@@ -142,6 +142,19 @@ async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
         .await
         .expect("unscoped count");
     assert_eq!(unscoped, 0, "without the GUC, RLS must hide every row (fail-closed)");
+
+    // The RLS-role guard correctly classifies both roles: the superuser
+    // setup connection bypasses RLS; the plain app role enforces it.
+    let su_status = check_rls_role(&su).await.expect("su role status");
+    assert!(
+        !su_status.rls_enforced(),
+        "the superuser test connection must be flagged as RLS-bypassing"
+    );
+    let app_status = check_rls_role(&app).await.expect("app role status");
+    assert!(
+        app_status.rls_enforced(),
+        "the non-superuser app role must be RLS-enforcing"
+    );
 
     // ── Cleanup ────────────────────────────────────────────────────────
     let _ = su.execute("DROP TABLE IF EXISTS rls_probe;").await;

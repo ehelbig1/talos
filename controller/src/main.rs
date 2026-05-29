@@ -287,6 +287,13 @@ async fn main() -> anyhow::Result<()> {
     // foot-gun where new tables silently went missing on rebuild.
     let db_pool: sqlx::Pool<sqlx::Postgres> = init_pool().await?;
 
+    // RFC 0004 readiness check: warn loudly if the controller's DB role
+    // would silently bypass row-level security (superuser / BYPASSRLS).
+    // Informational today (RLS isn't enabled until M4); surfaces the
+    // misconfiguration before it can turn the tenant-isolation policies
+    // into a no-op. One catalog lookup, non-blocking.
+    let _rls_role_status = talos_db::warn_if_rls_will_be_bypassed(&db_pool).await;
+
     {
         let migrate_start = std::time::Instant::now();
         match sqlx::migrate!("../migrations").run(&db_pool).await {
