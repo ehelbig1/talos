@@ -94,6 +94,8 @@ The production overlay:
 | `WASM_CACHE_MAX_MODULES` | `1000` | Max cached WASM modules |
 | `WASM_CACHE_MAX_SIZE_MB` | `500` | Max WASM cache size in MB |
 | `STUCK_EXECUTION_TIMEOUT_MINS` | `30` | Minutes before marking stuck executions |
+| `EXECUTION_CHECKPOINTING_ENABLED` | `false` | Persist per-node checkpoints so an interrupted run resumes from the last node instead of restarting (see RFC 0003). Requires `WORKER_SHARED_KEY`. |
+| `CHECKPOINT_EVERY_N_NODES` | `1` | Checkpoint cadence when enabled — save every Nth node completion. Raise on large graphs to cut re-encryption cost (resume then re-runs up to N trailing nodes). |
 | `GRAPHQL_MAX_DEPTH` | `10` | Max GraphQL query nesting depth |
 | `GRAPHQL_MAX_COMPLEXITY` | `5000` | Max GraphQL query complexity score |
 | `TRUSTED_IPS` | (none) | IPs that bypass rate limiting |

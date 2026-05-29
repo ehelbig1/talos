@@ -118,9 +118,62 @@ pub(super) fn build_controller_engine(
         Arc::new(ControllerSecretsResolver::new(secrets_manager.clone()));
     let mut engine = build_controller_engine_with_resolver(registry, secrets_resolver, user_id);
     engine.set_module_execution_store(Arc::new(
-        PostgresModuleExecutionStore::new(pool).with_encryption(secrets_manager),
+        PostgresModuleExecutionStore::new(pool.clone()).with_encryption(secrets_manager.clone()),
     ));
+    maybe_enable_checkpointing(&mut engine, pool, secrets_manager);
     engine
+}
+
+/// Phase C (2026-05-28): opt-in per-node execution checkpointing.
+///
+/// Off unless `EXECUTION_CHECKPOINTING_ENABLED` is truthy. When on, the
+/// TOP-LEVEL engine persists a snapshot of completed-node outputs every
+/// `CHECKPOINT_EVERY_N_NODES` (default 1) node completions, so a
+/// controller crash / rolling deploy can resume the run from the last
+/// checkpoint instead of restarting it. This generalises the existing
+/// `Wait`/approval suspend-and-resume to *unplanned* interruptions and is
+/// the first step of the durable-execution direction (see
+/// docs/rfcs/0003-durable-execution.md).
+///
+/// Wired ONLY here, in the canonical top-level builder — sub-workflow
+/// engines hydrate via `adapter_set().into_engine()`, which deliberately
+/// does not carry the store, so children never checkpoint under the
+/// parent's `execution_id`.
+///
+/// Reuses the same `WORKER_SHARED_KEY`-derived AES-256-GCM as the
+/// scheduler's completion-time checkpoint, plus the `SecretsManager` for
+/// the DEK-column load fallback. If the key is absent the store no-ops on
+/// save (logged) — never a hard failure.
+fn maybe_enable_checkpointing(
+    engine: &mut ParallelWorkflowEngine,
+    pool: sqlx::PgPool,
+    secrets_manager: Arc<SecretsManager>,
+) {
+    if !talos_config::bool_env_or_default("EXECUTION_CHECKPOINTING_ENABLED", false) {
+        return;
+    }
+    let every_n = talos_config::get_env("CHECKPOINT_EVERY_N_NODES", "1")
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    let wsk = talos_workflow_job_protocol::load_worker_shared_key()
+        .ok()
+        .map(|k| k.as_bytes().to_vec());
+    if wsk.is_none() {
+        tracing::warn!(
+            "EXECUTION_CHECKPOINTING_ENABLED is set but WORKER_SHARED_KEY is unavailable — \
+             per-node checkpoint saves will no-op; resume falls back to completion-time \
+             checkpoints only"
+        );
+    }
+    let store = crate::checkpoint_store::ControllerCheckpointStore::new(pool, wsk)
+        .with_secrets_manager(secrets_manager);
+    engine.set_checkpoint_store(Arc::new(store), every_n);
+    tracing::info!(
+        every_n,
+        "per-node execution checkpointing enabled (EXECUTION_CHECKPOINTING_ENABLED)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

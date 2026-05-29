@@ -7762,6 +7762,7 @@ dependencies = [
  "talos-workflow-engine",
  "talos-workflow-engine-core",
  "talos-workflow-engine-nats",
+ "talos-workflow-job-protocol",
  "talos-workflow-repository",
  "thiserror 2.0.18",
  "tokio",

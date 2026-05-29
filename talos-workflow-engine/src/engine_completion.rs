@@ -272,6 +272,38 @@ impl ParallelWorkflowEngine {
             );
         }
 
+        // Phase C (opt-in): best-effort per-node checkpoint. Disabled
+        // unless the controller wired a CheckpointStore onto the top-level
+        // engine (sub-workflow engines never carry one — see
+        // `CheckpointConfig`). `results` already includes the node that
+        // just finished (inserted above), so the snapshot is complete
+        // through this node. Debounced by `every_n` to bound re-encryption
+        // cost; spawned so a slow store never stalls dispatch; failures are
+        // logged, not propagated (resume just falls back to the last good
+        // checkpoint, re-running at most the trailing `every_n` nodes).
+        if let Some(cp) = self.checkpoint.as_ref() {
+            let n = cp.dirty.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % cp.every_n == 0 {
+                let snapshot = serde_json::Value::Object(
+                    results
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.clone()))
+                        .collect(),
+                );
+                let store = cp.store.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = store.save(execution_id, &snapshot).await {
+                        tracing::warn!(
+                            %execution_id,
+                            error = %e,
+                            "per-node checkpoint save failed (best-effort; resume \
+                             falls back to the last good checkpoint)"
+                        );
+                    }
+                });
+            }
+        }
+
         // Chain execution: clear `pending` for interior chain nodes so
         // their would-be successors (already run inside the pipeline)
         // don't wait on them. Primary scheduler only — seeded path
