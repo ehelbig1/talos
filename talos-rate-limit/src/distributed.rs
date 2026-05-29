@@ -68,6 +68,8 @@ pub struct RateLimitResult {
 pub struct DistributedRateLimiter {
     redis: Arc<redis::Client>,
     default_config: RateLimitConfig,
+    /// M4 (2026-05-28 review): cached, auto-reconnecting multiplexed connection.
+    conn_mgr: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
 }
 
 impl DistributedRateLimiter {
@@ -76,7 +78,28 @@ impl DistributedRateLimiter {
         Self {
             redis,
             default_config: config,
+            conn_mgr: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// M4: hand out a clone of ONE cached, auto-reconnecting multiplexed
+    /// connection instead of opening a fresh connection (TCP + TLS + AUTH) on
+    /// every call. The rate limiter runs on EVERY inbound request, so the old
+    /// `get_multiplexed_async_connection()`-per-op pattern was the hottest
+    /// instance of the workspace-wide churn: a multiplexed connection that
+    /// lived for exactly one operation defeats the point of multiplexing.
+    /// `ConnectionManager` keeps one socket open, pipelines over it, and
+    /// reconnects transparently; it is cheaply `Clone` (clones share the
+    /// socket). `get_or_try_init` does NOT cache an init failure, so a Redis
+    /// outage at first use is retried on the next call.
+    async fn conn(&self) -> Result<redis::aio::ConnectionManager> {
+        let mgr = self
+            .conn_mgr
+            .get_or_try_init(|| async {
+                redis::aio::ConnectionManager::new((*self.redis).clone()).await
+            })
+            .await?;
+        Ok(mgr.clone())
     }
 
     /// Check rate limit for a key
@@ -90,7 +113,7 @@ impl DistributedRateLimiter {
 
         let window_start = now - (config.window_secs * 1000);
 
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn().await?;
 
         // MCP-475: per-request unique member for ZADD. Pre-fix the script
         // used `now` as BOTH the sorted-set score AND the member. Sorted
@@ -157,7 +180,7 @@ impl DistributedRateLimiter {
 
     /// Get current count for key
     pub async fn get_count(&self, key: &str) -> Result<u32> {
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn().await?;
 
         let count: i64 = redis::cmd("ZCARD").arg(key).query_async(&mut conn).await?;
 
@@ -166,7 +189,7 @@ impl DistributedRateLimiter {
 
     /// Reset rate limit for key
     pub async fn reset(&self, key: &str) -> Result<()> {
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn().await?;
 
         let _: () = conn.del(key).await?;
         Ok(())

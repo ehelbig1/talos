@@ -217,7 +217,21 @@ pub struct SchedulerService {
     module_execution_service: Arc<ModuleExecutionService>,
     worker_shared_key: Option<WorkerSharedKey>,
     nats_client: Arc<async_nats::Client>,
+    /// M6 (2026-05-28 review): bounds the number of scheduled executions
+    /// running concurrently. After controller downtime or a clock catch-up a
+    /// large batch of schedules comes due at once; pre-fix each was
+    /// `tokio::spawn`ed with no ceiling, so the whole backlog thundered the
+    /// engine / worker fleet / NATS simultaneously. Each spawned task now
+    /// acquires a permit before running, so the backlog drains at a controlled
+    /// rate. Sized from `SCHEDULER_MAX_CONCURRENT_EXECUTIONS` (default
+    /// [`DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS`]).
+    spawn_semaphore: Arc<tokio::sync::Semaphore>,
 }
+
+/// Default ceiling on concurrently-running scheduled executions (see
+/// [`SchedulerService::spawn_semaphore`]). Override via
+/// `SCHEDULER_MAX_CONCURRENT_EXECUTIONS`.
+pub const DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS: usize = 16;
 
 impl SchedulerService {
     pub fn new(
@@ -230,6 +244,13 @@ impl SchedulerService {
         worker_shared_key: Option<WorkerSharedKey>,
         nats_client: Arc<async_nats::Client>,
     ) -> Self {
+        // Resolved here (not a `new` param) so existing call sites are
+        // unchanged. `positive_env_or_default` guards the `=0` footgun: a
+        // zero-permit semaphore would park every scheduled execution forever.
+        let max_concurrent: usize = talos_config::positive_env_or_default(
+            "SCHEDULER_MAX_CONCURRENT_EXECUTIONS",
+            DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS,
+        );
         Self {
             db_pool,
             event_sender,
@@ -239,6 +260,7 @@ impl SchedulerService {
             module_execution_service,
             worker_shared_key,
             nats_client,
+            spawn_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         }
     }
 
@@ -564,8 +586,26 @@ impl SchedulerService {
         let module_execution_service = self.module_execution_service.clone();
         let worker_shared_key = self.worker_shared_key.clone();
         let nats_client = self.nats_client.clone();
+        let spawn_semaphore = self.spawn_semaphore.clone();
 
         tokio::spawn(async move {
+            // M6: bound concurrent scheduled executions. Acquire INSIDE the
+            // spawned task (so the spawn itself stays non-blocking) — a
+            // post-downtime backlog spawns many cheap parked tasks but only
+            // `SCHEDULER_MAX_CONCURRENT_EXECUTIONS` run the execution at once,
+            // draining at a controlled rate rather than stampeding the worker
+            // fleet. The permit is held for the execution's lifetime and
+            // released on drop. `acquire_owned` only errors if the semaphore is
+            // closed, which never happens (the Arc lives as long as the
+            // service); on the impossible error we skip rather than run
+            // unbounded.
+            let _permit = match spawn_semaphore.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::error!("Scheduler spawn semaphore closed — skipping execution");
+                    return;
+                }
+            };
             let execution_id = Uuid::new_v4();
 
             tracing::info!(

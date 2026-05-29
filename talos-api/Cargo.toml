@@ -29,6 +29,7 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-api-keys = { path = "../talos-api-keys" }
+talos-audit-ledger = { path = "../talos-audit-ledger" }
 talos-auth = { path = "../talos-auth" }
 talos-auth-types = { path = "../talos-auth-types" }
 talos-capability-world = { path = "../talos-capability-world" }

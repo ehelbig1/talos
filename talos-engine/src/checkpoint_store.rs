@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use std::fmt;
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use async_trait::async_trait;
+use hkdf::Hkdf;
 use rand::RngCore;
 use serde_json::Value as JsonValue;
+use sha2::Sha256;
 use sqlx::{Pool, Postgres};
 use talos_workflow_engine_core::{BoxError, CheckpointStore};
 use uuid::Uuid;
@@ -24,6 +26,39 @@ const AES_KEY_LEN: usize = 32;
 
 /// AES-GCM nonce length used by the `aes_gcm` crate's default.
 const NONCE_LEN: usize = 12;
+
+/// HKDF-SHA256 domain-separation label for the checkpoint AEAD subkey.
+///
+/// `WORKER_SHARED_KEY` is the root for several primitives (rpc_auth /
+/// JobRequest / JobResult HMAC signing, and the secret-envelope AES-GCM
+/// subkey in `talos-workflow-job-protocol`). Encrypting checkpoints with
+/// the RAW root reused it as an AEAD key across primitives. We instead
+/// derive a dedicated 32-byte subkey via HKDF with this UNIQUE label —
+/// distinct from the envelope label (`.../envelope-aead/v1`) so the two
+/// subkeys never collide. Bumping the `v1` suffix forces a clean
+/// fleet-wide re-key (same operational cost as rotating the root).
+///
+/// NOTE (migration): this change moves checkpoints off the raw root and
+/// adds `execution_id` AAD binding. Checkpoints written under the OLD
+/// scheme (raw key, no AAD) will NO LONGER decrypt and fail closed with
+/// a clear error — the same constraint the envelope HKDF change (5eedad8)
+/// accepted. Checkpoints are transient execution-resume state, so a fleet
+/// restart that re-runs in-flight waiting workflows from scratch is an
+/// acceptable one-time cost.
+const CHECKPOINT_AEAD_KEY_LABEL: &[u8] = b"talos/worker-shared-key/checkpoint-aead/v1";
+
+/// Expand the root `WORKER_SHARED_KEY` into the 32-byte AES-256-GCM
+/// subkey used for execution checkpoints. Pure and deterministic; encrypt
+/// and decrypt derive it identically so the round-trip stays symmetric.
+/// Mirrors `derive_envelope_aead_key` in `talos-workflow-job-protocol`
+/// but with a distinct domain-separation label.
+fn derive_checkpoint_aead_key(root: &[u8]) -> [u8; AES_KEY_LEN] {
+    let hk = Hkdf::<Sha256>::new(None, root);
+    let mut subkey = [0u8; AES_KEY_LEN];
+    hk.expand(CHECKPOINT_AEAD_KEY_LABEL, &mut subkey)
+        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
+    subkey
+}
 
 /// Postgres-backed checkpoint store.
 ///
@@ -156,8 +191,12 @@ impl CheckpointStore for ControllerCheckpointStore {
         let Some(key) = self.worker_shared_key.as_deref() else {
             return Ok(());
         };
+        // AAD binds the ciphertext to this execution_id so a DB-write
+        // attacker can't transpose a checkpoint blob from one execution
+        // into another and have it decrypt cleanly.
         let (ciphertext, nonce) =
-            encrypt_checkpoint(snapshot, key).map_err(|e| -> BoxError { e.into() })?;
+            encrypt_checkpoint(snapshot, key, execution_id.as_bytes())
+                .map_err(|e| -> BoxError { e.into() })?;
         sqlx::query(
             "UPDATE workflow_executions \
              SET checkpoint_encrypted = $1, checkpoint_nonce = $2 \
@@ -203,7 +242,7 @@ impl CheckpointStore for ControllerCheckpointStore {
             .await?;
 
             if let Some((ciphertext, nonce)) = enc_row {
-                let decrypted = decrypt_checkpoint(&ciphertext, &nonce, key)
+                let decrypted = decrypt_checkpoint(&ciphertext, &nonce, key, execution_id.as_bytes())
                     .map_err(|e| -> BoxError { e.into() })?;
                 return Ok(decrypted
                     .as_object()
@@ -280,12 +319,25 @@ fn uuid_keyed_map(obj: &serde_json::Map<String, JsonValue>) -> HashMap<Uuid, Jso
 /// Returns `(ciphertext, nonce)`. Private; callers go through the
 /// [`CheckpointStore::save`] trait method, which owns the SQL write.
 ///
+/// The AES-GCM key is an HKDF subkey of `key` (the root
+/// `WORKER_SHARED_KEY`), NEVER the raw root — the root is also the HMAC
+/// signing key for rpc_auth / JobRequest / JobResult, so reusing it as an
+/// AEAD key crosses primitive boundaries. `derive_checkpoint_aead_key`
+/// uses a domain-separation label distinct from the secret-envelope label.
+///
+/// `aad` (the execution_id bytes) is bound into the GCM tag so a blob
+/// transposed to a different execution fails the tag check on decrypt.
+///
 /// M-11: requires the key to be exactly [`AES_KEY_LEN`] bytes. The previous
 /// `key.len() < AES_KEY_LEN` check accepted longer keys and silently
 /// truncated to the first 32 bytes, which masked operator-error key
 /// configurations (hex-encoded keys interpreted as raw bytes,
 /// prepend-rotation accidentally using stale material).
-fn encrypt_checkpoint(data: &JsonValue, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn encrypt_checkpoint(
+    data: &JsonValue,
+    key: &[u8],
+    aad: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     if key.len() != AES_KEY_LEN {
         return Err(format!(
             "Encryption key must be exactly {AES_KEY_LEN} bytes; got {}",
@@ -294,23 +346,42 @@ fn encrypt_checkpoint(data: &JsonValue, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)
     }
     let plaintext =
         serde_json::to_vec(data).map_err(|e| format!("Failed to serialize checkpoint: {e}"))?;
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {e}"))?;
+    let aead_key = derive_checkpoint_aead_key(key);
+    let cipher = Aes256Gcm::new_from_slice(&aead_key)
+        .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_ref())
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext.as_ref(),
+                aad,
+            },
+        )
         .map_err(|e| format!("Encryption failed: {e}"))?;
     Ok((ciphertext, nonce_bytes.to_vec()))
 }
 
 /// Decrypt an AES-256-GCM checkpoint. Returns an opaque error string on
-/// any failure (wrong key, corrupted ciphertext, malformed JSON).
+/// any failure (wrong key, corrupted ciphertext, malformed JSON, or AAD
+/// mismatch). Like `encrypt_checkpoint`, derives the AEAD key via HKDF
+/// from the root and binds `aad` (the execution_id bytes) into the tag.
+///
+/// Fails closed on any mismatch. Checkpoints written under the pre-HKDF
+/// scheme (raw root key, no AAD) will NOT decrypt here and surface the
+/// standard "wrong key or corrupted data" error — accepted migration cost
+/// (transient resume state; see [`CHECKPOINT_AEAD_KEY_LABEL`]).
 ///
 /// M-11: requires the key to be exactly [`AES_KEY_LEN`] bytes (mirrors
 /// `encrypt_checkpoint`).
-fn decrypt_checkpoint(ciphertext: &[u8], nonce: &[u8], key: &[u8]) -> Result<JsonValue, String> {
+fn decrypt_checkpoint(
+    ciphertext: &[u8],
+    nonce: &[u8],
+    key: &[u8],
+    aad: &[u8],
+) -> Result<JsonValue, String> {
     if key.len() != AES_KEY_LEN {
         return Err(format!(
             "Decryption key must be exactly {AES_KEY_LEN} bytes; got {}",
@@ -323,11 +394,18 @@ fn decrypt_checkpoint(ciphertext: &[u8], nonce: &[u8], key: &[u8]) -> Result<Jso
             nonce.len()
         ));
     }
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {e}"))?;
+    let aead_key = derive_checkpoint_aead_key(key);
+    let cipher = Aes256Gcm::new_from_slice(&aead_key)
+        .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let nonce = Nonce::from_slice(nonce);
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| "Checkpoint decryption failed — wrong key or corrupted data".to_string())?;
     serde_json::from_slice(&plaintext).map_err(|e| format!("Failed to deserialize checkpoint: {e}"))
 }
@@ -343,7 +421,7 @@ mod m11_key_length_tests {
     #[test]
     fn encrypt_rejects_short_key() {
         let v = serde_json::json!({});
-        let err = encrypt_checkpoint(&v, &k(31)).unwrap_err();
+        let err = encrypt_checkpoint(&v, &k(31), b"exec").unwrap_err();
         assert!(err.contains("exactly 32 bytes"), "got {err}");
     }
 
@@ -351,25 +429,78 @@ mod m11_key_length_tests {
     fn encrypt_rejects_long_key() {
         // M-11: previously accepted; silently truncated to first 32 bytes.
         let v = serde_json::json!({});
-        let err = encrypt_checkpoint(&v, &k(33)).unwrap_err();
+        let err = encrypt_checkpoint(&v, &k(33), b"exec").unwrap_err();
         assert!(err.contains("exactly 32 bytes"), "got {err}");
     }
 
     #[test]
     fn encrypt_accepts_exact_key() {
         let v = serde_json::json!({"x": 1});
-        assert!(encrypt_checkpoint(&v, &k(32)).is_ok());
+        assert!(encrypt_checkpoint(&v, &k(32), b"exec").is_ok());
     }
 
     #[test]
     fn decrypt_rejects_long_key() {
-        let err = decrypt_checkpoint(&[], &[0u8; NONCE_LEN], &k(64)).unwrap_err();
+        let err = decrypt_checkpoint(&[], &[0u8; NONCE_LEN], &k(64), b"exec").unwrap_err();
         assert!(err.contains("exactly 32 bytes"), "got {err}");
     }
 
     #[test]
     fn decrypt_rejects_wrong_nonce_length() {
-        let err = decrypt_checkpoint(&[], &[0u8; 11], &k(32)).unwrap_err();
+        let err = decrypt_checkpoint(&[], &[0u8; 11], &k(32), b"exec").unwrap_err();
         assert!(err.contains("Nonce must be exactly"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_aead_tests {
+    use super::*;
+
+    fn k(n: usize) -> Vec<u8> {
+        vec![0x42u8; n]
+    }
+
+    #[test]
+    fn round_trip_with_matching_execution_id_succeeds() {
+        let key = k(AES_KEY_LEN);
+        let exec = Uuid::new_v4();
+        let snapshot = serde_json::json!({"node": "a", "value": 42});
+
+        let (ct, nonce) = encrypt_checkpoint(&snapshot, &key, exec.as_bytes()).unwrap();
+        let decrypted = decrypt_checkpoint(&ct, &nonce, &key, exec.as_bytes()).unwrap();
+
+        assert_eq!(decrypted, snapshot);
+    }
+
+    #[test]
+    fn decrypt_with_different_execution_id_fails_aad_mismatch() {
+        let key = k(AES_KEY_LEN);
+        let exec = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert_ne!(exec, other);
+        let snapshot = serde_json::json!({"node": "a"});
+
+        let (ct, nonce) = encrypt_checkpoint(&snapshot, &key, exec.as_bytes()).unwrap();
+        // Transposing the blob to a different execution_id must fail closed.
+        let err = decrypt_checkpoint(&ct, &nonce, &key, other.as_bytes()).unwrap_err();
+        assert!(
+            err.contains("wrong key or corrupted data"),
+            "expected fail-closed AAD mismatch, got {err}"
+        );
+    }
+
+    #[test]
+    fn derived_subkey_differs_from_raw_input_key() {
+        // The AEAD key must be the HKDF subkey, never the raw root (which
+        // is also the HMAC signing key for rpc_auth / JobRequest / JobResult).
+        let root = k(AES_KEY_LEN);
+        let subkey = derive_checkpoint_aead_key(&root);
+        assert_ne!(
+            &subkey[..],
+            &root[..],
+            "derived checkpoint AEAD subkey must differ from the raw root key"
+        );
+        // Deterministic across calls.
+        assert_eq!(subkey, derive_checkpoint_aead_key(&root));
     }
 }

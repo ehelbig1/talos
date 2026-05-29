@@ -343,6 +343,26 @@ pub struct WebhookTrigger {
     pub sync_timeout_secs: i32,
 }
 
+/// Auth-downgrade guard predicate (MEDIUM finding).
+///
+/// Returns `true` when the webhook MUST fail closed because an HMAC
+/// signing secret was CONFIGURED on the trigger (`signing_secret_enc`
+/// present) but could not be RESOLVED (decryption failed, so the
+/// decrypted secret is `None`). In that state the handler must NOT fall
+/// through to the static `verification_token` branch — doing so would be
+/// a silent HMAC -> static-token auth downgrade, re-enabling a long-lived
+/// UUID token the operator was told is permanently off once a signing
+/// secret is set.
+///
+/// Pure function so the security-critical predicate is unit-tested without
+/// a DB pool / SecretsManager / NATS (`handle_webhook` is not isolatable).
+pub(crate) fn webhook_must_fail_closed_on_hmac(
+    hmac_configured: bool,
+    hmac_secret_resolved: bool,
+) -> bool {
+    hmac_configured && !hmac_secret_resolved
+}
+
 impl WebhookRouter {
     /// MCP-1131 (2026-05-16): signal the DLQ batch processor to flush
     /// its in-memory batch and exit before tokio aborts the task.
@@ -707,6 +727,21 @@ impl WebhookRouter {
         // Zeroizing<String> so the HMAC signing secret is wiped from
         // the heap on drop. The HMAC verifier takes `&str`; the deref
         // path works transparently.
+        //
+        // MEDIUM (auth downgrade): distinguish "HMAC was CONFIGURED" from
+        // "HMAC secret RESOLVED". The presence of a stored encrypted
+        // signing secret (`signing_secret_enc`) is the operator's intent
+        // to require HMAC; the operator-facing create_webhook contract
+        // guarantees the static-token fallback is PERMANENTLY off once a
+        // signing secret is set. `decrypted_signing_secret` becomes None
+        // not only when no secret is configured, but ALSO when decryption
+        // FAILS (key rotation, DEK/KMS outage, corrupted ciphertext,
+        // AAD/format mismatch). Without tracking the configured-flag
+        // separately, a transient decrypt failure would silently fall
+        // through to the verification_token branch below — re-enabling a
+        // long-lived static UUID token the operator believes is off. We
+        // fail closed instead: configured-but-unresolved => 401.
+        let hmac_configured = trigger.signing_secret_enc.is_some();
         let decrypted_signing_secret: Option<zeroize::Zeroizing<String>> = match (
             &trigger.signing_secret_enc,
             trigger.signing_key_id,
@@ -731,9 +766,17 @@ impl WebhookRouter {
                 {
                     Ok(s) => Some(s),
                     Err(e) => {
-                        tracing::error!(
+                        // Do NOT leak the internal error detail (or any
+                        // secret/ciphertext) to the response — log it at
+                        // WARN with only the trigger id so operators can
+                        // correlate to a DEK/rotation/KMS outage. The
+                        // caller gets a generic 401 from the fail-closed
+                        // branch below (hmac_configured && None).
+                        tracing::warn!(
                             trigger_id = %trigger_id,
-                            "Failed to decrypt webhook signing secret — treating as unconfigured: {}",
+                            "Failed to decrypt webhook signing secret — HMAC is configured but the \
+                             secret could not be resolved (DEK/KMS outage, key rotation, corrupted \
+                             ciphertext, or AAD/format mismatch); failing closed: {}",
                             e
                         );
                         None
@@ -814,6 +857,44 @@ impl WebhookRouter {
                 .await;
                 return Ok((StatusCode::UNAUTHORIZED, "Invalid signature").into_response());
             }
+        } else if webhook_must_fail_closed_on_hmac(
+            hmac_configured,
+            decrypted_signing_secret.is_some(),
+        ) {
+            // FAIL CLOSED: HMAC was configured on this trigger
+            // (`signing_secret_enc` is present) but the secret could not
+            // be decrypted (see the WARN logged at the decrypt site).
+            // Falling through to the static-token branch here would be a
+            // silent HMAC -> static-token auth DOWNGRADE: the
+            // verification_token is a long-lived UUID the operator was
+            // told is permanently disabled once a signing secret is set.
+            // A transient DEK/KMS/rotation outage must NEVER re-enable it.
+            // Mirror the GitHub-format `dedup.is_none()` fail-closed shape
+            // above — generic 401, no internal detail in the response.
+            tracing::warn!(
+                trigger_id = %trigger_id,
+                "Webhook has an HMAC signing secret configured but it could not be resolved — \
+                 refusing to fall back to the static verification token (auth-downgrade guard). \
+                 Check for a DEK/KMS outage or in-progress key rotation."
+            );
+            if let Some(ip) = source_ip {
+                self.circuit_breaker
+                    .record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
+            }
+            self.log_request(
+                trigger_id,
+                headers,
+                &body,
+                source_ip,
+                StatusCode::UNAUTHORIZED.as_u16() as i32,
+                None,
+                0,
+                0,
+                false,
+                Some("Invalid signature"),
+            )
+            .await;
+            return Ok((StatusCode::UNAUTHORIZED, "Invalid signature").into_response());
         } else if let Some(expected_token) = &trigger.verification_token {
             // Static token fallback — used when the caller cannot compute HMAC
             // (e.g. simple webhook forwarders).  The caller must supply the token
@@ -3350,4 +3431,33 @@ pub async fn suspension_callback_handler(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod auth_downgrade_tests {
+    use super::webhook_must_fail_closed_on_hmac;
+
+    // MEDIUM (auth downgrade): the predicate must fail closed ONLY when an
+    // HMAC signing secret was configured but could not be resolved.
+    #[test]
+    fn configured_but_unresolved_fails_closed() {
+        // signing_secret_enc present, decryption failed -> 401, no fallback.
+        assert!(webhook_must_fail_closed_on_hmac(true, false));
+    }
+
+    #[test]
+    fn configured_and_resolved_does_not_fail_closed() {
+        // Normal HMAC path — verification proceeds against the secret.
+        assert!(!webhook_must_fail_closed_on_hmac(true, true));
+    }
+
+    #[test]
+    fn not_configured_allows_static_token_fallback() {
+        // No signing secret configured -> static verification_token branch
+        // is legitimately reachable; the guard must NOT fire.
+        assert!(!webhook_must_fail_closed_on_hmac(false, false));
+        // Degenerate (resolved-but-not-configured) is impossible in practice
+        // but must also not fail closed.
+        assert!(!webhook_must_fail_closed_on_hmac(false, true));
+    }
 }

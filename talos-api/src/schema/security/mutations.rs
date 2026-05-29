@@ -589,20 +589,27 @@ impl SecurityMutations {
                 );
             }
             if !headers.is_empty() {
-                let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
-                // NOTE: not migrated to encrypt_value_aad_v1 as part of
-                // MCP-S2 because the matching decrypt path in
-                // `talos-audit-ledger` uses TALOS_MASTER_KEY directly
-                // (NOT SecretsManager DEKs) — a pre-existing key-chain
-                // inconsistency. Adding AAD on the encrypt side here
-                // wouldn't reach the read path; both sides need to be
-                // realigned onto SecretsManager first. Tracked as a
-                // separate follow-up; the swap-attack surface here is
-                // smaller than TOTP / webhook signing because the read
-                // path can't decode the current ciphertext anyway.
-                let (_key_id, encrypted) = secrets_manager.encrypt_value(&headers).await?;
-                headers_nonce = Some(encrypted[..12].to_vec());
-                encrypted_headers = Some(encrypted[12..].to_vec());
+                // L3 (2026-05-28 review): encrypt with the canonical
+                // `talos_audit_ledger` helper — an HKDF subkey of
+                // TALOS_MASTER_KEY bound to this `user_id` via AAD — which is
+                // the EXACT primitive the audit-ledger read path decrypts with.
+                // Pre-L3 this used a SecretsManager DEK envelope while the read
+                // path decrypted with the raw TALOS_MASTER_KEY, so the round
+                // trip ALWAYS failed and the (silently-swallowed) result was
+                // that authenticated audit streaming never worked. Both ends now
+                // share one helper so they cannot drift.
+                let (ciphertext, nonce) =
+                    talos_audit_ledger::encrypt_otlp_auth_headers(&headers, *user_id).map_err(
+                        |_| {
+                            // Opaque message — never leak crypto/internal detail.
+                            async_graphql::Error::new(
+                                "Failed to encrypt audit auth headers (is TALOS_MASTER_KEY configured?)",
+                            )
+                            .extend_safe()
+                        },
+                    )?;
+                encrypted_headers = Some(ciphertext);
+                headers_nonce = Some(nonce);
             }
         }
 

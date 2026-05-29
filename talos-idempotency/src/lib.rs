@@ -28,6 +28,10 @@ pub struct IdempotencyRecord {
 pub struct IdempotencyService {
     redis: Arc<redis::Client>,
     default_ttl: Duration,
+    /// M4 (2026-05-28 review): cached, auto-reconnecting multiplexed connection
+    /// (see `conn`). Replaces a fresh TCP+TLS+AUTH connection per idempotent
+    /// mutation.
+    conn_mgr: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
 }
 
 impl IdempotencyService {
@@ -36,7 +40,21 @@ impl IdempotencyService {
         Self {
             redis,
             default_ttl: ttl,
+            conn_mgr: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// M4: hand out a clone of ONE cached, auto-reconnecting multiplexed
+    /// connection instead of opening a fresh one per call. `get_or_try_init`
+    /// does not cache an init failure, so a Redis outage at first use is retried.
+    async fn conn(&self) -> Result<redis::aio::ConnectionManager> {
+        let mgr = self
+            .conn_mgr
+            .get_or_try_init(|| async {
+                redis::aio::ConnectionManager::new((*self.redis).clone()).await
+            })
+            .await?;
+        Ok(mgr.clone())
     }
 
     /// Check if request is duplicate and return cached response.
@@ -59,7 +77,7 @@ impl IdempotencyService {
     /// the conversion ambiguity entirely — the wire format is a single
     /// bulk string parsed by serde on the Rust side.
     pub async fn check(&self, key: &str, request_hash: &str) -> Result<Option<IdempotencyRecord>> {
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn().await?;
 
         let redis_key = format!("idempotency:{}", key);
 
@@ -171,7 +189,7 @@ impl IdempotencyService {
         status_code: i32,
         response_body: Option<&str>,
     ) -> Result<bool> {
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn().await?;
 
         let redis_key = format!("idempotency:{}", key);
 
@@ -236,16 +254,33 @@ enum CheckOutcome {
 pub struct WebhookDeduplication {
     redis: Arc<redis::Client>,
     window: Duration,
+    /// M4 (2026-05-28 review): cached, auto-reconnecting multiplexed connection.
+    conn_mgr: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
 }
 
 impl WebhookDeduplication {
     pub fn new(redis: Arc<redis::Client>, window: Duration) -> Self {
-        Self { redis, window }
+        Self {
+            redis,
+            window,
+            conn_mgr: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// M4: clone of one cached, auto-reconnecting multiplexed connection.
+    async fn conn(&self) -> Result<redis::aio::ConnectionManager> {
+        let mgr = self
+            .conn_mgr
+            .get_or_try_init(|| async {
+                redis::aio::ConnectionManager::new((*self.redis).clone()).await
+            })
+            .await?;
+        Ok(mgr.clone())
     }
 
     /// Check if webhook was already processed
     pub async fn is_duplicate(&self, trigger_id: Uuid, event_id: &str) -> Result<bool> {
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn().await?;
 
         let key = format!("webhook:processed:{}:{}", trigger_id, event_id);
 

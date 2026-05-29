@@ -168,6 +168,7 @@ pub mod schedules;
 pub mod schemas;
 pub mod search;
 pub mod secrets;
+pub mod ssrf_resolver;
 pub mod types;
 pub mod utils;
 pub mod versions;

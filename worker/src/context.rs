@@ -1084,12 +1084,17 @@ impl wasmtime_wasi_http::p2::WasiHttpView for TalosContext {
         wasmtime_wasi_http::p2::WasiHttpCtxView {
             ctx: &mut self.http_ctx,
             table: &mut self.table,
-            // SECURITY: Use default_hooks() which delegates HTTP to the built-in
-            // send_request implementation.  Talos WASM nodes should use
-            // talos:core/http for controlled HTTP (host allowlist, rate limits,
-            // SSRF protection).  The WIT world definitions only include
-            // wasi:http/types for type compatibility — outgoing-handler is
-            // intentionally not wired into any world except trusted/automation.
+            // SECURITY (H2): default_hooks() is the UNFILTERED built-in
+            // send_request (raw hyper/tokio, no SSRF/allowlist/tier-1 gate). It
+            // is only ever reachable from a world that links
+            // wasi:http/outgoing-handler, and as of the 2026-05-28 review that
+            // is EXCLUSIVELY the trusted/automation linker (build_trusted_linker)
+            // — non-trusted worlds (minimal/network/governance/secrets/cache/…)
+            // register wasi:http/types ONLY via add_wasi_http_types_only, so the
+            // handler is unavailable there (a component importing it fails to
+            // link). Talos WASM nodes use talos:core/http for controlled HTTP
+            // (host allowlist, rate limits, SSRF protection); trusted modules are
+            // operator-authored and allowed unrestricted egress by design.
             hooks: wasmtime_wasi_http::p2::default_hooks(),
         }
     }

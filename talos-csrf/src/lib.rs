@@ -15,6 +15,20 @@ const CSRF_COOKIE_NAME: &str = "talos_csrf_token";
 const CSRF_HEADER_NAME: &str = "X-CSRF-Token";
 const GRACE_PERIOD_SECONDS: u64 = 15;
 
+/// Maximum GraphQL request body size (bytes). SINGLE SOURCE OF TRUTH for both
+/// the `/graphql` route's `DefaultBodyLimit::max(..)` AND the dev-only body
+/// buffering in [`csrf_protection_graphql`] (L5, 2026-05-28 review).
+///
+/// Pre-L5 the CSRF middleware buffered the body with a hard-coded 1 MiB cap
+/// while the route allowed 5 MiB, so a legitimate 1–5 MiB mutation was rejected
+/// with a misleading "Failed to read request body" 400 — the effective limit
+/// was silently 1 MiB. Both sites now reference this const so they can never
+/// drift again. (In production the CSRF middleware no longer reads the body at
+/// all — see `csrf_protection_graphql` — so this cap applies only to the
+/// dev-introspection inspection path; the route's `DefaultBodyLimit` is the
+/// real production ceiling.)
+pub const GRAPHQL_MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
+
 /// MCP-1145 (2026-05-16): defense-in-depth max-entries cap on the
 /// rotation grace cache. Sibling pattern to MCP-1093/1132/1137
 /// (workspace-wide audit rule: every TTL-bounded in-memory cache needs
@@ -280,63 +294,65 @@ pub async fn csrf_protection_graphql(
     let is_production = talos_config::is_production();
     let allow_dev_bypass = !is_production && talos_config::dev_csrf_bypass_enabled();
 
-    // Get request body bytes to check if it's an introspection query
-    let (parts, body) = request.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!("Failed to read request body for CSRF check: {}", e);
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Failed to read request body".to_string(),
-            ));
+    // L5 (2026-05-28 review): only BUFFER the request body when we actually
+    // need to inspect it. The CSRF token check below uses headers + cookies
+    // ONLY — never the body — so the sole reason to read the body is the
+    // dev-only introspection bypass (and the explicit dev unsafe bypass), both
+    // of which require `!is_production`. In production we therefore pass the
+    // request through UNTOUCHED: no buffering of up to GRAPHQL_MAX_BODY_BYTES
+    // per mutation, and — critically — no body-size cap that can diverge from
+    // the route's `DefaultBodyLimit`. (Pre-L5 the body was always buffered with
+    // a hard-coded 1 MiB `to_bytes` cap while the route allowed 5 MiB, so any
+    // legitimate 1–5 MiB mutation was rejected with a misleading 400; the
+    // effective limit was silently 1 MiB.) Both the dev cap here and the route
+    // limit now reference the shared `GRAPHQL_MAX_BODY_BYTES` const.
+    //
+    // This also subsumes MCP-1106 (production short-circuit of the introspection
+    // parse): production never even reads the body now, which is strictly
+    // cheaper than the prior lazy-evaluation short-circuit.
+    let request = if is_production {
+        request
+    } else {
+        let (parts, body) = request.into_parts();
+        let body_bytes = match axum::body::to_bytes(body, GRAPHQL_MAX_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("Failed to read request body for CSRF check: {}", e);
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read request body".to_string(),
+                ));
+            }
+        };
+
+        // L-16: identify introspection by parsing the GraphQL document, not
+        // by substring sniffing the raw body. Substring sniff produced false
+        // positives (a mutation containing the literal string "__schema"
+        // inside a string argument was misclassified as introspection and
+        // CSRF-bypassed in dev), so we now parse the JSON envelope and
+        // walk the operation/selection tree.
+        //
+        // Defense-in-depth: introspection bypass only applies in dev anyway.
+        // Even with a false-positive sniff, production stayed safe (production
+        // doesn't reach this branch at all) — this fix tightens dev so the
+        // CSRF gate isn't accidentally weakened by misleading payloads.
+        if allow_dev_bypass || is_pure_introspection_request(&String::from_utf8_lossy(&body_bytes)) {
+            if allow_dev_bypass {
+                tracing::warn!(
+                    "⚠️ DANGER: Skipping CSRF for GraphQL request due to ALLOW_DEV_UNSAFE_CSRF_BYPASS=true"
+                );
+            } else {
+                tracing::info!("Allowing GraphQL introspection query without CSRF in development");
+            }
+
+            let request = Request::from_parts(parts, Body::from(body_bytes));
+            let response = next.run(request).await;
+            return Ok(response);
         }
+
+        // Reconstruct request with body for subsequent middleware.
+        Request::from_parts(parts, Body::from(body_bytes))
     };
-
-    // L-16: identify introspection by parsing the GraphQL document, not
-    // by substring sniffing the raw body. Substring sniff produced false
-    // positives (a mutation containing the literal string "__schema"
-    // inside a string argument was misclassified as introspection and
-    // CSRF-bypassed in dev), so we now parse the JSON envelope and
-    // walk the operation/selection tree.
-    //
-    // Defense-in-depth: introspection bypass only applies in dev anyway
-    // (see `is_introspection && !is_production` below). Even with a
-    // false-positive sniff, production stayed safe — this fix tightens
-    // dev so the CSRF gate isn't accidentally weakened by misleading
-    // payloads.
-    //
-    // MCP-1106 (2026-05-16): short-circuit the introspection parse in
-    // production. Pre-fix `is_pure_introspection_request` ran
-    // unconditionally — including in production where its result is
-    // immediately discarded (the bypass branch requires `!is_production`).
-    // For each GraphQL POST that fits the 1 MB body cap, the parse cost
-    // includes a `String::from_utf8_lossy(&body_bytes)` allocation +
-    // `serde_json::from_str` + `strip_graphql_string_literals` byte
-    // walk + two substring `.contains` scans. At 1 MB bodies × any
-    // realistic GraphQL traffic rate, that's measurable CPU spent on a
-    // value the rest of the function ignores. Short-circuit the call
-    // entirely in production via lazy evaluation. Same dead-work-on-
-    // hot-path class as MCP-1009 (Slack mention regex per-call compile)
-    // and MCP-1010 (validate_email size-check-after-regex).
-    if allow_dev_bypass
-        || (!is_production && is_pure_introspection_request(&String::from_utf8_lossy(&body_bytes)))
-    {
-        if allow_dev_bypass {
-            tracing::warn!(
-                "⚠️ DANGER: Skipping CSRF for GraphQL request due to ALLOW_DEV_UNSAFE_CSRF_BYPASS=true"
-            );
-        } else {
-            tracing::info!("Allowing GraphQL introspection query without CSRF in development");
-        }
-
-        let request = Request::from_parts(parts, Body::from(body_bytes));
-        let response = next.run(request).await;
-        return Ok(response);
-    }
-
-    // Reconstruct request with body for subsequent middleware
-    let request = Request::from_parts(parts, Body::from(body_bytes));
 
     // For production or non-introspection queries, enforce CSRF
     let cookie_token = cookies.get(CSRF_COOKIE_NAME).map(|c| c.value().to_string());

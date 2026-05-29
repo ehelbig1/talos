@@ -20,6 +20,8 @@ aws-sdk-s3 = "1.30"
 chrono.workspace = true
 futures = "0.3"
 hex = "0.4"
+hkdf = "0.12"
+rand = { version = "0.8", default-features = true, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
