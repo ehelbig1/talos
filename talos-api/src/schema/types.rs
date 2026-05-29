@@ -240,6 +240,12 @@ pub struct CreateWorkflowInput {
     pub graph_json: String,
     pub max_concurrent_executions: Option<i32>,
     pub intent: Option<serde_json::Value>,
+    /// Organization that owns this workflow (RFC 0004 tenant = org).
+    /// Omit to create it in your **personal org** (the default). When set
+    /// to a shared org, the caller must have Member+ role there
+    /// (validated against `user_writable_org_ids`); teammates then see
+    /// the workflow via the org-union read path.
+    pub organization_id: Option<Uuid>,
 }
 
 /// Input for `createWorkflowFromDescription`. Mirrors the MCP

@@ -1402,11 +1402,43 @@ impl WorkflowsMutations {
             .data_opt::<Uuid>()
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
 
+        // RFC 0004: resolve the OWNING ORG. An explicit org must be one
+        // the caller can write to (Member+, via user_writable_org_ids —
+        // a Viewer can't create resources in an org); omitting it
+        // defaults to the caller's personal org, so every workflow has a
+        // non-null owning org going forward (sets up the eventual
+        // `org_id SET NOT NULL`). Stamping org_id is what makes the
+        // org-union read path actually surface team-shared workflows —
+        // previously org_id was never written, so sharing was read-ready
+        // but write-incomplete.
+        let org_id: Uuid = match input.organization_id {
+            Some(org) => {
+                let writable = crate::schema::user_writable_org_ids(ctx).await?;
+                if !writable.contains(&org) {
+                    return Err(async_graphql::Error::new(
+                        "You do not have write access to that organization",
+                    )
+                    .extend_safe());
+                }
+                org
+            }
+            None => {
+                talos_organizations::OrganizationService::create_personal_org(db_pool, *user_id, None)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(user_id = %user_id, "create_workflow: resolve personal org failed: {e}");
+                        async_graphql::Error::new("Failed to resolve your personal organization")
+                            .extend_safe()
+                    })?
+                    .id
+            }
+        };
+
         // Insert or update workflow
         let workflow_id = sqlx::query_scalar::<_, Uuid>(
             r#"
-            INSERT INTO workflows (name, module_uri, graph_json, user_id, max_concurrent_executions, intent)
-            VALUES ($1, '', $2, $3, $4, $5)
+            INSERT INTO workflows (name, module_uri, graph_json, user_id, max_concurrent_executions, intent, org_id)
+            VALUES ($1, '', $2, $3, $4, $5, $6)
             RETURNING id
             "#,
         )
@@ -1415,6 +1447,7 @@ impl WorkflowsMutations {
         .bind(user_id)
         .bind(input.max_concurrent_executions)
         .bind(&input.intent)
+        .bind(org_id)
         .fetch_one(db_pool)
         .await?;
 
