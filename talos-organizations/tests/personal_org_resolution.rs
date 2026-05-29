@@ -147,6 +147,57 @@ async fn resolve_active_org_honours_membership_else_falls_back_to_personal() {
     cleanup(&pool, &[alice, bob]).await;
 }
 
+/// RFC 0004 org_id auto-stamp trigger: an insert into a triggered
+/// definition table (actors) without org_id is stamped with the owner's
+/// personal org, and an explicit org_id is preserved.
+#[tokio::test]
+async fn org_id_autostamp_trigger_on_actors() {
+    let Some(pool) = pool_or_skip().await else { return };
+    let user = make_user(&pool, "trig").await;
+    let personal = OrganizationService::create_personal_org(&pool, user, None)
+        .await
+        .unwrap();
+
+    // (1) no org_id supplied → trigger stamps the personal org.
+    let a1 = Uuid::new_v4();
+    sqlx::query("INSERT INTO actors (id, user_id, name, max_capability_world) VALUES ($1,$2,'a1','minimal-node')")
+        .bind(a1)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .expect("insert actor without org_id");
+    let stamped: Option<Uuid> = sqlx::query_scalar("SELECT org_id FROM actors WHERE id = $1")
+        .bind(a1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stamped, Some(personal.id), "trigger must stamp the personal org");
+
+    // (2) explicit org_id → preserved (trigger is a no-op).
+    let team = OrganizationService::create_org(&pool, "Team", "team-autostamp-test", user)
+        .await
+        .unwrap();
+    let a2 = Uuid::new_v4();
+    sqlx::query("INSERT INTO actors (id, user_id, name, max_capability_world, org_id) VALUES ($1,$2,'a2','minimal-node',$3)")
+        .bind(a2)
+        .bind(user)
+        .bind(team.id)
+        .execute(&pool)
+        .await
+        .expect("insert actor with explicit org_id");
+    let preserved: Option<Uuid> = sqlx::query_scalar("SELECT org_id FROM actors WHERE id = $1")
+        .bind(a2)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(preserved, Some(team.id), "explicit org_id must be preserved");
+
+    let _ = sqlx::query("DELETE FROM actors WHERE user_id = $1").bind(user).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM organization_members WHERE org_id = $1").bind(team.id).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM organizations WHERE id = $1").bind(team.id).execute(&pool).await;
+    cleanup(&pool, &[user]).await;
+}
+
 /// The writable-member gate that org-aware `create_workflow` relies on:
 /// only Member+ (not Viewer) may create resources in a shared org.
 #[tokio::test]
