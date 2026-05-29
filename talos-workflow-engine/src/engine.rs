@@ -313,9 +313,38 @@ pub const DEFAULT_MAX_SUBFLOW_DEPTH: usize = 16;
 
 use crate::emit_event_spawn;
 use talos_workflow_engine_core::{
-    EdgeLogic, EventSink, JoinMode, ModuleFetcher, NodeEventWrite, NodeLifecycleHook,
-    SecretsResolver, SystemNodeKind, WorkflowContext, WorkflowGraphStore,
+    CheckpointStore, EdgeLogic, EventSink, JoinMode, ModuleFetcher, NodeEventWrite,
+    NodeLifecycleHook, SecretsResolver, SystemNodeKind, WorkflowContext, WorkflowGraphStore,
 };
+
+/// Opt-in per-node checkpointing config (Phase C, 2026-05-28). When the
+/// controller wires a [`CheckpointStore`] onto the TOP-LEVEL engine, each
+/// node completion debounce-persists a snapshot of all completed-node
+/// outputs so an interrupted run (controller crash / rolling deploy) can
+/// resume from the last persisted node instead of restarting from scratch
+/// — generalising the existing `Wait`/approval suspend-and-resume to
+/// cover *unplanned* interruptions.
+///
+/// Reliability of the "top-level only" boundary comes from construction,
+/// not a depth check: [`AdapterSet`] (the sole engine→sub-workflow
+/// propagation path, see [`ParallelWorkflowEngine::adapter_set`]) does NOT
+/// carry this field, and sub-engines build from [`ParallelWorkflowEngine::new`]
+/// (where it is `None`). So a child engine can never inherit a parent's
+/// store, and sub-workflow runs never write checkpoints under the parent's
+/// `execution_id`.
+pub(crate) struct CheckpointConfig {
+    /// Consumer-provided store; owns encryption + persistence. The engine
+    /// only hands it plaintext `JsonValue` snapshots.
+    pub(crate) store: Arc<dyn CheckpointStore>,
+    /// Persist on every `every_n`-th node completion. `0` disables (treated
+    /// as "no checkpointing" even if a store is present). Larger values
+    /// trade resume granularity (more nodes re-run after a crash) for less
+    /// re-encryption work on big graphs.
+    pub(crate) every_n: usize,
+    /// Node-completion counter (interior mutability — the completion
+    /// handler is `&self`). Fresh per engine instance.
+    pub(crate) dirty: std::sync::atomic::AtomicUsize,
+}
 
 // Checkpoint encryption + persistence is the responsibility of the
 // consumer's `CheckpointStore` impl (see
@@ -556,6 +585,12 @@ pub struct ParallelWorkflowEngine {
     /// `__memory_write__` actor-memory protocol; tests can plug in a
     /// capture hook to assert per-node outputs.
     pub(crate) node_hook: Option<Arc<dyn NodeLifecycleHook>>,
+    /// Opt-in per-node checkpointing (Phase C). `None` (the default, and
+    /// the value on every sub-workflow engine) = exactly today's
+    /// behaviour. Set only on the top-level engine by the controller when
+    /// `EXECUTION_CHECKPOINTING_ENABLED` is on. Deliberately NOT carried by
+    /// [`AdapterSet`], so sub-engines never inherit it.
+    pub(crate) checkpoint: Option<CheckpointConfig>,
     /// Pluggable read-only access to workflow graph definitions — used
     /// when the engine hits a sub-workflow-ish system node (sub-workflow,
     /// judge, ensemble child, agent-loop body, reflective-retry child,
@@ -889,6 +924,7 @@ impl ParallelWorkflowEngine {
             module_fetcher: None,
             event_sink: None,
             node_hook: None,
+            checkpoint: None,
             graph_store: None,
             sub_actor_context_resolver: None,
             secrets_resolver: None,
@@ -1316,6 +1352,27 @@ impl ParallelWorkflowEngine {
     /// actor-memory persistence.
     pub fn set_node_hook(&mut self, hook: Arc<dyn NodeLifecycleHook>) {
         self.node_hook = Some(hook);
+    }
+
+    /// Enable opt-in per-node checkpointing on THIS (top-level) engine.
+    ///
+    /// After every `every_n`-th node completion, a snapshot of all
+    /// completed-node outputs is best-effort persisted via `store` so an
+    /// interrupted run can resume from the last checkpoint. `every_n == 0`
+    /// is a no-op (leaves checkpointing disabled). Call only on the
+    /// top-level engine — sub-workflow engines never inherit this (see
+    /// [`CheckpointConfig`]). Safe to leave unset: the default is exactly
+    /// today's no-checkpoint behaviour.
+    pub fn set_checkpoint_store(&mut self, store: Arc<dyn CheckpointStore>, every_n: usize) {
+        if every_n == 0 {
+            self.checkpoint = None;
+            return;
+        }
+        self.checkpoint = Some(CheckpointConfig {
+            store,
+            every_n,
+            dirty: std::sync::atomic::AtomicUsize::new(0),
+        });
     }
 
     /// Snapshot of this engine's policy adapters + user/actor context.

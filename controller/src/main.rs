@@ -1163,6 +1163,41 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Background task: Postgres connection-pool saturation gauges. Runs
+    // every 15s and exports size / idle / in-use / max so the alert
+    // `TalosDBPoolSaturated` (deploy/observability/alerts.yaml) can fire
+    // before acquisitions start blocking on the 10s acquire timeout.
+    // Pool state was previously un-instrumented — a saturated pool
+    // surfaced only as climbing request latency with no direct signal.
+    // The pool is process-local, so every controller replica samples its
+    // own; the sum across replicas must stay below the backend's
+    // server-side connection ceiling (see the per-subject RPC semaphore
+    // note in docs/architecture/managed-cloud.md).
+    {
+        let pool = db_pool.clone();
+        let max_connections: i64 = std::env::var("DB_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(30);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                ticker.tick().await;
+                if let Some(m) = metrics::global() {
+                    // `size()` is total connections (idle + in-use);
+                    // `num_idle()` is the currently-available subset.
+                    let size = i64::from(pool.size());
+                    let idle = i64::try_from(pool.num_idle()).unwrap_or(i64::MAX);
+                    m.db_pool_connections.set(size);
+                    m.db_pool_idle_connections.set(idle);
+                    m.db_pool_in_use_connections.set((size - idle).max(0));
+                    m.db_pool_max_connections.set(max_connections);
+                }
+            }
+        });
+    }
+
     // Seed templates on first run
     seed_templates(&registry, compiler.clone()).await?;
     seed_marketplace(&db_pool).await;

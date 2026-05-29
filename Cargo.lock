@@ -7424,6 +7424,7 @@ dependencies = [
  "talos-secrets-manager",
  "talos-text-util",
  "talos-totp-2fa",
+ "talos-validation",
  "talos-webhooks",
  "talos-workflow-authorization",
  "talos-workflow-creation",
@@ -7761,6 +7762,7 @@ dependencies = [
  "talos-workflow-engine",
  "talos-workflow-engine-core",
  "talos-workflow-engine-nats",
+ "talos-workflow-job-protocol",
  "talos-workflow-repository",
  "thiserror 2.0.18",
  "tokio",
@@ -8197,6 +8199,7 @@ dependencies = [
  "talos-subworkflow-contract",
  "talos-system-repo",
  "talos-text-util",
+ "talos-validation",
  "talos-webhook-repository",
  "talos-webhooks",
  "talos-workflow-authorization",
@@ -8745,6 +8748,13 @@ dependencies = [
  "opentelemetry",
  "tracing",
  "tracing-opentelemetry",
+]
+
+[[package]]
+name = "talos-validation"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]

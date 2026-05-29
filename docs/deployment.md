@@ -94,6 +94,8 @@ The production overlay:
 | `WASM_CACHE_MAX_MODULES` | `1000` | Max cached WASM modules |
 | `WASM_CACHE_MAX_SIZE_MB` | `500` | Max WASM cache size in MB |
 | `STUCK_EXECUTION_TIMEOUT_MINS` | `30` | Minutes before marking stuck executions |
+| `EXECUTION_CHECKPOINTING_ENABLED` | `false` | Persist per-node checkpoints so an interrupted run resumes from the last node instead of restarting (see RFC 0003). Requires `WORKER_SHARED_KEY`. |
+| `CHECKPOINT_EVERY_N_NODES` | `1` | Checkpoint cadence when enabled — save every Nth node completion. Raise on large graphs to cut re-encryption cost (resume then re-runs up to N trailing nodes). |
 | `GRAPHQL_MAX_DEPTH` | `10` | Max GraphQL query nesting depth |
 | `GRAPHQL_MAX_COMPLEXITY` | `5000` | Max GraphQL query complexity score |
 | `TRUSTED_IPS` | (none) | IPs that bypass rate limiting |
@@ -281,6 +283,20 @@ Available metrics include:
 | `talos_wasm_cache_misses_total` | Counter | WASM module cache misses |
 | `talos_active_jobs` | Gauge | Currently executing jobs |
 
+The **controller** exposes metrics on its main port at `/metrics/prometheus`
+(bearer `PROMETHEUS_SCRAPE_TOKEN`). Beyond the crypto-invariant gauges, it
+samples its Postgres connection pool every 15s:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `talos_db_pool_connections` | Gauge | Total pooled connections (idle + in-use) |
+| `talos_db_pool_idle_connections` | Gauge | Idle connections available to hand out |
+| `talos_db_pool_in_use_connections` | Gauge | Connections currently checked out |
+| `talos_db_pool_max_connections` | Gauge | Configured pool ceiling (`DB_MAX_CONNECTIONS`) |
+
+Alert on saturation with `in_use / max > 0.9` (shipped as `TalosDBPoolSaturated`
+in `deploy/observability/alerts.yaml`).
+
 Example Prometheus scrape configuration:
 
 ```yaml
@@ -318,8 +334,40 @@ When not configured, the `email` WIT interface returns an `unauthorized` error. 
 
 ## Scaling
 
-- **Controller**: Stateless (except in-memory caches). Can run multiple instances behind a load balancer. Use sticky sessions for WebSocket connections.
-- **Worker**: Stateless. Scale horizontally. Each worker registers with the controller via NATS heartbeats.
+- **Controller**: Stateless (background sweeps coordinate through Postgres — e.g. the scheduler uses `FOR UPDATE SKIP LOCKED` so N replicas don't double-fire). Can run multiple instances behind a load balancer. Use sticky sessions for WebSocket connections. **Connection-pool note:** each controller replica holds its own `DB_MAX_CONNECTIONS`-sized pool; the *sum* across replicas must stay below the backend's server-side connection ceiling. The `talos_db_pool_*` gauges (see Prometheus Metrics) and the `TalosDBPoolSaturated` alert exist to catch this.
+- **Worker**: Stateless. Scale horizontally — NATS queue-group load balancing distributes jobs across the fleet. Each worker registers with the controller via NATS heartbeats. CPU-based HPA is wired by default; queue-depth-based KEDA autoscaling lands with the JetStream durable consumer (see High Availability below).
 - **PostgreSQL**: Single primary. Use connection pooling (sqlx pool size configurable).
 - **Redis**: Single instance sufficient for most deployments. Used for caching, not primary storage.
 - **NATS**: Can be clustered for HA. Used for job dispatch and event streaming.
+
+## High Availability & Single Points of Failure
+
+**Recommended production topology: external-managed datastores.** The Helm
+chart's in-cluster datastore mode (`postgres.enabled: true`, in-cluster
+Neo4j/Vault/MinIO) is single-replica and intended for homelab / single-region
+/ evaluation use. For production, point Talos at managed services and leave the
+in-cluster StatefulSets disabled (the default for Postgres):
+
+| Component | In-cluster default | Production recommendation |
+|-----------|--------------------|---------------------------|
+| **PostgreSQL** | Single StatefulSet replica, daily `pg_dump`, no PITR | Managed Postgres with replication + PITR (Neon, RDS, Cloud SQL). Set `DATABASE_URL`; keep `postgres.enabled: false`. |
+| **Redis** | External only (no in-cluster option) | Managed Redis with Multi-AZ failover (ElastiCache, Upstash). |
+| **Neo4j** | Single StatefulSet replica | Managed Neo4j (AuraDB) or a causal cluster. Graph-RAG degrades (semantic recall still works) if Neo4j is down; the platform stays up. |
+| **Vault** | Single StatefulSet replica | Vault in HA mode (3-replica Raft) or a managed KMS for the transit/KEK backend. A sealed/down Vault blocks DEK unwrap → controller CrashLoops. Back up `bootstrap.json` (unseal material) off-cluster. |
+| **MinIO** | Single StatefulSet replica | Managed S3 or distributed MinIO (4+ nodes). Holds the WORM audit sink. |
+| **NATS** | 3-replica StatefulSet, `minAvailable: 2` PDB | Already HA. Keep ≥3 replicas; set JetStream stream replication ≥2 for the audit-event ledger. (Job dispatch is core-NATS request/reply with controller-side retry — see RFC 0003 — so it doesn't rely on JetStream durability.) |
+
+**Availability alerts.** `deploy/observability/alerts.yaml` ships
+`TalosSingleReplicaInfraDown` (any in-cluster stateful SPOF at 0 ready
+replicas), `TalosNatsBelowQuorum`, `TalosPodCrashLooping`,
+`TalosControllerDown`/`TalosWorkerDown`, and the pool-saturation alerts. Deploy
+them with the chart via `monitoring.prometheusRule.enabled: true` (requires
+kube-prometheus-stack), or apply the file directly.
+
+**Worker queue-depth autoscaling.** CPU-based HPA lags the real backlog (CPU
+only spikes once a job is *running*, but the fuel budget of an in-flight job
+means CPU underreports a deep queue). True queue-depth autoscaling via KEDA's
+NATS JetStream scaler depends on the JetStream durable consumer (at-least-once
+job delivery); see the engine durability work. Until then, size
+`worker.autoscaling.maxReplicas` for peak concurrency rather than relying on
+CPU to track backlog.

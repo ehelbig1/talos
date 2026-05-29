@@ -86,6 +86,21 @@ pub struct TalosMetrics {
     pub module_execution_orphaned_rows: IntGauge,
     pub workflow_execution_orphaned_rows: IntGauge,
     pub dek_cache_size: IntGauge,
+    /// Total connections currently held by the controller's sqlx
+    /// Postgres pool (idle + in-use). Sampled periodically by a
+    /// controller sweep task. Bounded above by `DB_MAX_CONNECTIONS`.
+    pub db_pool_connections: IntGauge,
+    /// Connections in the pool that are idle (available to hand out).
+    pub db_pool_idle_connections: IntGauge,
+    /// Connections currently checked out and in use
+    /// (`connections - idle`). When this sits at `DB_MAX_CONNECTIONS`,
+    /// new acquisitions block on the 10 s acquire timeout — the pool is
+    /// saturated and request latency climbs across the whole process.
+    pub db_pool_in_use_connections: IntGauge,
+    /// The configured max pool size (`DB_MAX_CONNECTIONS`), exported as
+    /// a gauge so alerts can compute a saturation RATIO
+    /// (`in_use / max`) without hardcoding the limit in PromQL.
+    pub db_pool_max_connections: IntGauge,
 }
 
 impl TalosMetrics {
@@ -322,6 +337,31 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(dek_cache_size.clone()))?;
 
+        let db_pool_connections = IntGauge::new(
+            "talos_db_pool_connections",
+            "Total connections held by the controller's Postgres pool (idle + in-use).",
+        )?;
+        registry.register(Box::new(db_pool_connections.clone()))?;
+
+        let db_pool_idle_connections = IntGauge::new(
+            "talos_db_pool_idle_connections",
+            "Idle connections in the controller's Postgres pool (available to hand out).",
+        )?;
+        registry.register(Box::new(db_pool_idle_connections.clone()))?;
+
+        let db_pool_in_use_connections = IntGauge::new(
+            "talos_db_pool_in_use_connections",
+            "Connections currently checked out of the controller's Postgres pool. \
+             At DB_MAX_CONNECTIONS the pool is saturated and acquisitions block.",
+        )?;
+        registry.register(Box::new(db_pool_in_use_connections.clone()))?;
+
+        let db_pool_max_connections = IntGauge::new(
+            "talos_db_pool_max_connections",
+            "Configured maximum size of the controller's Postgres pool (DB_MAX_CONNECTIONS).",
+        )?;
+        registry.register(Box::new(db_pool_max_connections.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
             webhook_requests_total,
@@ -351,6 +391,10 @@ impl TalosMetrics {
             module_execution_orphaned_rows,
             workflow_execution_orphaned_rows,
             dek_cache_size,
+            db_pool_connections,
+            db_pool_idle_connections,
+            db_pool_in_use_connections,
+            db_pool_max_connections,
         }))
     }
 

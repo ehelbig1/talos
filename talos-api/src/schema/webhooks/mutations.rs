@@ -176,16 +176,12 @@ impl WebhooksMutations {
                 )
                 .extend_safe());
             }
-            if token.contains('\0')
-                || token
-                    .chars()
-                    .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
-            {
-                return Err(async_graphql::Error::new(
-                    "Webhook verification_token cannot contain control characters or null bytes",
-                )
-                .extend_safe());
-            }
+            talos_validation::reject_control_chars(
+                "Webhook verification_token",
+                token,
+                talos_validation::LineMode::MultiLine,
+            )
+            .map_err(|e| async_graphql::Error::new(e.message).extend_safe())?;
         }
 
         // MCP-812 (2026-05-14): validate caller-supplied

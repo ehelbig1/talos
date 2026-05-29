@@ -17,7 +17,7 @@ Talos is a workflow automation platform with user-submitted WASM module executio
 | Worker | Rust WASM runtime (wasmtime, sandboxed execution) | `worker/` |
 | PostgreSQL | Primary data store (workflows, secrets, audit, executions) | `migrations/` |
 | Redis | Session cache, rate limiting, TOTP replay prevention, approval pub/sub | Controller connects via `REDIS_URL` |
-| NATS JetStream | Job queue (controller-to-worker), audit event streaming | `talos-workflow-job-protocol` (sibling repo `../talos-workflow-engine/talos-workflow-job-protocol/`) |
+| NATS | Job dispatch is **core-NATS signed request/reply** (controller pre-allocates a reply inbox; queue-group workers reply; the controller retries on timeout — controller-driven redelivery, NOT a durable JetStream work queue). **JetStream** backs the tamper-evident audit-event ledger. | `talos-workflow-job-protocol` (in-workspace) |
 | Frontend | React/TypeScript visual workflow editor (untrusted client) | `frontend/` |
 
 ---
@@ -169,7 +169,7 @@ This is the highest-risk attack surface. Users submit arbitrary Rust source code
 ### Spoofing
 - **Threat:** Attacker with NATS access injects forged job requests.
 - **Mitigation:** Every `JobRequest` signed with HMAC-SHA256 using pre-shared `WORKER_SHARED_KEY`. Worker verifies signature before execution. Nonce freshness validation (timestamp + random hex).
-- **File:** `talos-workflow-job-protocol/src/lib.rs` (sibling repo)
+- **File:** `talos-workflow-job-protocol/src/lib.rs`
 
 ### Tampering
 - **Threat:** Job payload modified in transit to alter execution behavior.
@@ -250,7 +250,7 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 | Control | Implementation | File Path |
 |---------|---------------|-----------|
 | WASM sandboxing | Fuel limits, memory caps, capability worlds, wall-clock timeout | `worker/src/runtime.rs` |
-| Job signing | HMAC-SHA256 + AES-256-GCM + nonce per job | `talos-workflow-job-protocol/src/lib.rs` (sibling repo) |
+| Job signing | HMAC-SHA256 + AES-256-GCM + nonce per job | `talos-workflow-job-protocol/src/lib.rs` |
 | Audit ledger | HMAC-signed events, hash chains, immutability triggers | `worker/src/audit.rs`, `controller/src/audit_ledger.rs` |
 | SQL validation | AST-parsed via sqlparser, parameterized queries only | `worker/src/sql_validator.rs` |
 | DLP | PII redaction (SSN, CC, email, phone, JWT), Luhn validation | `controller/src/dlp.rs` |
@@ -269,7 +269,7 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 | Risk | Severity | Likelihood | Rationale |
 |------|----------|------------|-----------|
 | No formal verification of WASM component model adapter | Critical | Very Low | wasmtime is memory-safe Rust with active security team. Mitigated by capability worlds limiting blast radius. See `docs/wasmtime-version-tracking.md` for upgrade cadence. |
-| Single-region deployment | High | Low | Multi-region scaffolded but not proven. Mitigated by database replication and job queue durability. |
+| Single-region deployment | High | Low | Multi-region scaffolded but not proven. Mitigated by database replication; worker-crash is covered by controller-side dispatch retry, and interrupted runs are resumable via opt-in per-node checkpointing (RFC 0003). |
 | DLP patterns are regex-based (no ML-based PII detection) | Medium | Medium | Known PII formats covered. Novel PII patterns may pass through. Mitigated by ExternalDlpProvider hook for enterprise ML systems. |
 | Master key in environment variable | Critical | Low | Standard practice but not HSM-backed. Recommend migration to AWS KMS / GCP Cloud KMS for production. |
 | DNS rebinding bypasses SSRF check | High | Low | URL validated at config time, not at request time. **Closed (M4, 2026-05-22)**: `SsrfFilteringResolver` reapplies the private-IP filter at the reqwest resolve point, closing the TOCTOU window. See `worker/src/ssrf_resolver.rs`. |

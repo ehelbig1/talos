@@ -70,6 +70,8 @@ talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-subworkflow-contract = { path = "../talos-subworkflow-contract" }
 talos-system-repo = { path = "../talos-system-repo" }
 talos-text-util = { path = "../talos-text-util" }
+# Canonical cross-protocol field validators shared with talos-api.
+talos-validation = { path = "../talos-validation" }
 talos-webhook-repository = { path = "../talos-webhook-repository" }
 talos-webhooks = { path = "../talos-webhooks" }
 talos-execution-orchestration = { path = "../talos-execution-orchestration" }

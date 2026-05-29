@@ -595,17 +595,11 @@ pub fn validate_name_no_control_chars(
     value: &str,
     req_id: Option<serde_json::Value>,
 ) -> Result<(), JsonRpcResponse> {
-    if value.contains('\0') || value.chars().any(|c| c.is_control() && c != '\t') {
-        return Err(mcp_error(
-            req_id,
-            -32602,
-            &format!(
-                "{} cannot contain control characters or null bytes",
-                field_label
-            ),
-        ));
-    }
-    Ok(())
+    // Canonical single-line control-char rule lives in `talos-validation`
+    // (shared with the GraphQL surface). allow-validation-predicate: thin
+    // wrapper mapping the shared error into the MCP -32602 shape.
+    talos_validation::reject_control_chars(field_label, value, talos_validation::LineMode::SingleLine)
+        .map_err(|e| mcp_error(req_id, -32602, &e.message))
 }
 
 /// MCP-429 (2026-05-11): canonical validator for multi-line
@@ -646,37 +640,14 @@ pub fn validate_multiline_description(
     if d.is_empty() {
         return Ok(None);
     }
-    if d.trim().is_empty() {
-        let msg = if omit_hint.is_empty() {
-            format!(
-                "{field_label} must be non-empty and non-whitespace when provided. \
-                 Omit the field to leave it blank."
-            )
-        } else {
-            format!(
-                "{field_label} must be non-empty and non-whitespace when provided. {omit_hint}"
-            )
-        };
-        return Err(mcp_error(req_id, -32602, &msg));
+    // Canonical trim/empty/length/control-char rule lives in
+    // `talos-validation` (shared with the GraphQL surface). This wrapper
+    // owns only the MCP-specific Option/empty→None mapping and the
+    // owned-String return. allow-validation-predicate: thin wrapper.
+    match talos_validation::validate_multiline_description(field_label, d, max_len, omit_hint) {
+        Ok(trimmed) => Ok(Some(trimmed.to_string())),
+        Err(e) => Err(mcp_error(req_id, -32602, &e.message)),
     }
-    if d.trim().len() > max_len {
-        return Err(mcp_error(
-            req_id,
-            -32602,
-            &format!("{field_label} must be ≤ {max_len} characters"),
-        ));
-    }
-    if d.contains('\0')
-        || d.chars()
-            .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
-    {
-        return Err(mcp_error(
-            req_id,
-            -32602,
-            &format!("{field_label} cannot contain control characters or null bytes"),
-        ));
-    }
-    Ok(Some(d.trim().to_string()))
 }
 
 /// Validate a byte-bounded blob against an explicit byte cap.

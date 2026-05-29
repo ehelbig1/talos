@@ -111,16 +111,12 @@ impl SecurityMutations {
                 "API key name must be 1–255 characters",
             ).extend_safe());
         }
-        if input.name.contains('\0')
-            || input
-                .name
-                .chars()
-                .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
-        {
-            return Err(async_graphql::Error::new(
-                "API key name cannot contain control characters or null bytes",
-            ).extend_safe());
-        }
+        talos_validation::reject_control_chars(
+            "API key name",
+            &input.name,
+            talos_validation::LineMode::MultiLine,
+        )
+        .map_err(|e| async_graphql::Error::new(e.message).extend_safe())?;
         let name_owned = trimmed_name.to_string();
 
         // MCP-1187 (2026-05-17): bound expires_in_days at the

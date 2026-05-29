@@ -54,15 +54,12 @@ impl ActorsMutations {
                 "Agent name must be 1-100 characters",
             ).extend_safe());
         }
-        if name.contains('\0')
-            || name
-                .chars()
-                .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
-        {
-            return Err(async_graphql::Error::new(
-                "Agent name cannot contain control characters or null bytes",
-            ).extend_safe());
-        }
+        talos_validation::reject_control_chars(
+            "Agent name",
+            &name,
+            talos_validation::LineMode::MultiLine,
+        )
+        .map_err(|e| async_graphql::Error::new(e.message).extend_safe())?;
         let name = trimmed_name.to_string();
 
         // Look up the role

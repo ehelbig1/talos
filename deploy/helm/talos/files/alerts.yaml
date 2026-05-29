@@ -1,0 +1,374 @@
+# Talos — crypto-invariant alert rules.
+#
+# Designed for Prometheus / Alertmanager. Alerts in this file MUST page
+# operator attention — every one of them means either:
+#   (a) encrypted-at-rest data is currently unreadable, or
+#   (b) encrypted-at-rest data will be unreadable on the next restart.
+#
+# Series come from:
+#   - talos-controller /metrics/prometheus (bearer PROMETHEUS_SCRAPE_TOKEN)
+#   - vault /v1/sys/metrics?format=prometheus
+#
+# Apply to Prometheus via:
+#   prometheus --config.file=... --rules.file=alerts.yaml
+# or (kube-prometheus-stack):
+#   kubectl -n monitoring create configmap talos-alerts --from-file=alerts.yaml
+#   then reference it from a PrometheusRule CRD.
+groups:
+  # ────────────────────────────────────────────────────────────────────
+  - name: talos.crypto.invariants
+    interval: 30s
+    rules:
+
+      # ── DEK orphan gauges — value > 0 means data loss already occurred.
+      # These gauges are computed by a 60s background loop in controller
+      # main.rs (SELECT COUNT(*) with NOT EXISTS) so we scrape the DB
+      # only indirectly. Paging threshold: ANY non-zero value for 5m.
+      - alert: TalosActorMemoryDEKOrphaned
+        expr: talos_actor_memory_orphaned_rows > 0
+        for: 5m
+        labels:
+          severity: critical
+          category: data-loss
+          runbook: https://github.com/OWNER/talos/blob/main/docs/security/operational-runbook.md#dek-orphan
+        annotations:
+          summary: "{{ $value }} actor_memory row(s) reference a missing DEK"
+          description: |
+            actor_memory.value_key_id points at an encryption_keys row that
+            no longer exists. This should be structurally impossible under
+            the ON DELETE RESTRICT FK — investigate for:
+              - partial DB restore (pg_restore without encryption_keys)
+              - manual DEK deletion with FK triggers disabled
+              - Vault master-key rotation without DEK rewrap
+            Affected rows are UNRECOVERABLE. Do not delete them without
+            a decision to abandon their payloads.
+          action: |
+            1. kubectl -n talos exec deploy/talos-controller -- \
+                 psql $DATABASE_URL -c "SELECT id, actor_id, key, created_at \
+                   FROM actor_memory am \
+                   WHERE NOT EXISTS ( \
+                     SELECT 1 FROM encryption_keys ek WHERE ek.id = am.value_key_id \
+                   );"
+            2. Decide: delete orphans, or hold for forensic dump before delete.
+            3. Follow docs/security/operational-runbook.md § DEK orphan.
+
+      - alert: TalosModuleExecutionPayloadOrphaned
+        expr: talos_module_execution_orphaned_rows > 0
+        for: 5m
+        labels:
+          severity: critical
+          category: data-loss
+        annotations:
+          summary: "{{ $value }} module_executions row(s) reference a missing DEK"
+          description: |
+            module_executions.payload_enc_key_id FK broken. Execution
+            metadata survives; input/output/trigger_metadata_enc are
+            unrecoverable. NULL the _enc columns once a decision is
+            made — see 2026-04-24 cleanup precedent.
+
+      - alert: TalosWorkflowOutputPayloadOrphaned
+        expr: talos_workflow_execution_orphaned_rows > 0
+        for: 5m
+        labels:
+          severity: critical
+          category: data-loss
+        annotations:
+          summary: "{{ $value }} workflow_executions row(s) reference a missing DEK"
+          description: |
+            workflow_executions.output_enc_key_id FK broken. Output data
+            unrecoverable.
+
+      # ── KEK decrypt failures — rate > 0 means current write path is
+      # broken. "both" label (active+legacy both failed) is hard-fail.
+      - alert: TalosKEKDecryptFailuresBoth
+        expr: rate(talos_kek_decrypt_failures_total{provider="both"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          category: crypto-broken
+        annotations:
+          summary: "KEK decrypt failing on BOTH active and legacy providers"
+          description: |
+            Neither the active KEK provider (Vault transit or env) nor
+            the legacy fallback could unwrap a DEK. Encrypted-at-rest
+            reads are currently failing. Most common cause: Vault's
+            transit key was rotated/deleted without rewrapping DEKs,
+            and the env KEK master key doesn't match either.
+          action: |
+            1. Check Vault transit key version: `vault read transit/keys/talos-kek`
+            2. Check controller KEK_PROVIDER env: matches Vault or env?
+            3. Review `docs/security/kek-to-kms-plan.md` § recovery.
+            4. If Vault is unreachable, failing over to KEK_PROVIDER=env
+               works iff TALOS_MASTER_KEY is the key the DEKs were
+               originally wrapped with.
+
+      - alert: TalosKEKDecryptFailuresActive
+        expr: rate(talos_kek_decrypt_failures_total{provider="active"}[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          category: crypto-degraded
+        annotations:
+          summary: "KEK active-provider decrypt failing (legacy fallback active)"
+          description: |
+            active provider ({{ $labels.provider }}) is failing decryption;
+            legacy fallback is carrying the load. This is survivable in the
+            short term but will become critical if legacy becomes unavailable.
+            Often means a misconfigured Vault token or network partition.
+
+      # ── memory-write failures — node outputs are being lost.
+      - alert: TalosMemoryWriteFailuresCrypto
+        expr: rate(talos_memory_write_failures_total{reason="crypto"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          category: crypto-broken
+        annotations:
+          summary: "__memory_write__ persist failing due to crypto errors"
+          description: |
+            Node outputs returning `__memory_write__` are being silently
+            dropped because the encryption path is broken. Every dropped
+            write loses actor state. Historically this fires when the
+            Vault KEK can't be reached — see the 2026-04-24 `-dev` mode
+            persistence bug for the canonical pattern.
+
+      - alert: TalosMemoryWriteFailuresDB
+        expr: rate(talos_memory_write_failures_total{reason="db"}[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          category: persistence-degraded
+        annotations:
+          summary: "__memory_write__ DB errors sustained"
+          description: |
+            Memory writes failing at the DB layer at {{ $value }} per second.
+            Common causes: pool saturation, statement timeout, migration
+            lock. Check controller DB pool metrics and Postgres load.
+
+      # ── Module-execution payload encryption failures.
+      - alert: TalosModulePayloadEncryptionFailures
+        expr: rate(talos_module_payload_encryption_failures_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          category: crypto-broken
+        annotations:
+          summary: "module_executions payload encryption/decryption failing"
+          description: |
+            op={{ $labels.op }} stage={{ $labels.stage }} rate={{ $value }}/s.
+            Input/output/trigger_metadata payloads are either not being
+            encrypted on write or not being decrypted on read.
+
+  # ────────────────────────────────────────────────────────────────────
+  - name: talos.vault
+    interval: 30s
+    rules:
+
+      # Vault's own metric: 1 = sealed, 0 = unsealed. Paging on sealed.
+      - alert: VaultSealed
+        expr: vault_core_unsealed == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: crypto-broken
+        annotations:
+          summary: "Vault is SEALED — all encrypted-at-rest ops will fail"
+          description: |
+            The Talos KEK backend is sealed. Every DEK wrap/unwrap will
+            error until unseal completes. The vault-init Job unseals on
+            pod restart — if it's not running, run:
+              kubectl -n talos create job --from=cronjob/vault-init vault-init-manual
+            Otherwise: `kubectl -n talos exec statefulset/talos-vault-0 -- \
+              vault operator unseal <key-from-bootstrap.json>`.
+
+      - alert: VaultHighLatency
+        expr: histogram_quantile(0.99, rate(vault_core_handle_request_bucket[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Vault p99 request latency > 500ms for 10m"
+          description: |
+            Vault is slow. Every DEK decrypt goes through Vault transit,
+            so controller-side DB reads will show elevated p99 too.
+            Common causes: Vault PVC disk pressure, Vault CPU throttling.
+
+  # ────────────────────────────────────────────────────────────────────
+  - name: talos.controller.health
+    interval: 30s
+    rules:
+      - alert: TalosControllerDown
+        expr: up{job="talos-controller"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "Talos controller is not responding to Prometheus scrapes"
+          description: |
+            All N controller replicas have failed scrapes for 2m. Platform
+            is down. Check: `kubectl -n talos get pods -l app.kubernetes.io/component=controller`.
+
+      - alert: TalosControllerHighErrorRate
+        expr: |
+          sum(rate(talos_auth_failures_total[5m]))
+          / sum(rate(talos_auth_attempts_total[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          category: abuse-or-broken
+        annotations:
+          summary: "Auth failure rate > 20% for 10m"
+          description: |
+            Either credential stuffing in progress, or an auth bug.
+            Check: `kubectl -n talos logs -l app.kubernetes.io/component=controller | grep auth_failure`.
+
+      # DEK cache unbounded growth (leak).
+      - alert: TalosDEKCacheOverflow
+        expr: talos_dek_cache_size > 10000
+        for: 15m
+        labels:
+          severity: warning
+          category: leak
+        annotations:
+          summary: "DEK cache has > 10k entries for 15m"
+          description: |
+            TTL eviction and write-path invalidation should bound this.
+            Unbounded growth = a cache-invalidation bug or many distinct
+            DEKs in flight (shouldn't normally happen).
+
+  # ────────────────────────────────────────────────────────────────────
+  - name: talos.backups
+    interval: 1m
+    rules:
+      # Scraped from the drill script's metric output (see
+      # deploy/observability/drill-textfile-exporter.md).
+      - alert: TalosBackupRestoreDrillFailed
+        expr: talos_backup_drill_last_success_timestamp_seconds < (time() - 14*86400)
+        labels:
+          severity: warning
+          category: ops-hygiene
+        annotations:
+          summary: "No successful backup→restore drill in 14+ days"
+          description: |
+            scripts/drills/backup-restore.sh has either not run or is
+            failing. A backup you have not restored is a hypothesis —
+            run the drill now.
+
+  # ────────────────────────────────────────────────────────────────────
+  # Capacity / saturation. Series come from talos-controller
+  # /metrics/prometheus — the DB-pool gauges are sampled every 15s by a
+  # background task in controller main.rs. These fire BEFORE the failure
+  # is user-visible (pool saturation → acquire-timeout → 503s), which the
+  # crypto-invariant alerts above do not cover.
+  - name: talos.capacity
+    interval: 30s
+    rules:
+      # Postgres pool saturation. Each controller replica samples its own
+      # process-local pool; the alert is per-replica (no aggregation) so a
+      # single saturated replica pages even when others are healthy.
+      - alert: TalosDBPoolSaturated
+        expr: |
+          talos_db_pool_in_use_connections
+          / clamp_min(talos_db_pool_max_connections, 1) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          category: saturation
+        annotations:
+          summary: "Postgres pool > 90% in-use on {{ $labels.instance }} for 5m"
+          description: |
+            In-use connections have exceeded 90% of DB_MAX_CONNECTIONS for
+            5m. New acquisitions queue on the 10s acquire timeout, so this
+            precedes a latency cliff / 503 cascade. Either raise
+            DB_MAX_CONNECTIONS (and the backend's server-side limit), scale
+            down controller replicas (the sum of per-replica pools must
+            stay under the backend ceiling), or find the query holding
+            connections (pg_stat_activity, state='active').
+
+      - alert: TalosDBPoolExhausted
+        expr: |
+          talos_db_pool_in_use_connections
+          >= clamp_min(talos_db_pool_max_connections, 1)
+        for: 1m
+        labels:
+          severity: critical
+          category: saturation
+        annotations:
+          summary: "Postgres pool fully exhausted on {{ $labels.instance }}"
+          description: |
+            Every pooled connection is checked out — new work blocks on the
+            acquire timeout and requests are failing. See the runbook's
+            pool-exhaustion section.
+
+      - alert: TalosWorkerDown
+        expr: up{job="talos-worker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "A Talos worker is not responding to Prometheus scrapes"
+          description: |
+            Worker scrape failing for 2m — WASM execution capacity reduced
+            or zero. Check: `kubectl -n talos get pods -l app.kubernetes.io/component=worker`.
+
+  # ────────────────────────────────────────────────────────────────────
+  # Infrastructure availability. These series come from kube-state-metrics
+  # (bundled with kube-prometheus-stack — the same operator the
+  # ServiceMonitors assume). If you don't run kube-state-metrics, these
+  # alerts simply never fire; they are not a hard dependency. Tune the
+  # `namespace` / `statefulset` matchers to your release name.
+  - name: talos.infra.availability
+    interval: 30s
+    rules:
+      # The four single-replica stateful components are SPOFs in the
+      # in-cluster topology (postgres/neo4j/vault/minio). "0 ready" = down.
+      # Production should prefer external-managed Postgres/Redis (see
+      # docs/deployment.md) — these alerts cover the homelab/single-region
+      # in-cluster path.
+      - alert: TalosSingleReplicaInfraDown
+        expr: |
+          kube_statefulset_status_replicas_ready{statefulset=~".*(postgres|neo4j|vault|minio).*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "Stateful component {{ $labels.statefulset }} has 0 ready replicas"
+          description: |
+            A single-replica in-cluster datastore is down. For postgres
+            this stops the platform; neo4j degrades graph-RAG only; vault
+            blocks DEK unwrap (controller CrashLoops); minio blocks the
+            WORM audit sink. Restore the pod, then check its PVC.
+
+      # NATS is the only HA stateful component (3-replica quorum). Below
+      # quorum (<2 ready) JetStream loses write availability.
+      - alert: TalosNatsBelowQuorum
+        expr: |
+          kube_statefulset_status_replicas_ready{statefulset=~".*nats.*"} < 2
+        for: 2m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "NATS cluster below quorum ({{ $value }} ready)"
+          description: |
+            Fewer than 2 of 3 NATS replicas are ready — the job queue and
+            signed-RPC transport lose write availability. Check the NATS
+            StatefulSet and PVCs.
+
+      # Crash-looping pods anywhere in the release.
+      - alert: TalosPodCrashLooping
+        expr: |
+          increase(kube_pod_container_status_restarts_total{namespace=~".*talos.*"}[1h]) > 5
+        for: 10m
+        labels:
+          severity: warning
+          category: availability
+        annotations:
+          summary: "Pod {{ $labels.pod }} restarted > 5x in the last hour"
+          description: |
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is
+            crash-looping. Check logs and recent config/secret changes.

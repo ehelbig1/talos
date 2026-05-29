@@ -95,6 +95,7 @@ members = [
     "talos-gmail",
     "talos-continuation-trigger",
     "talos-webhooks",
+    "talos-validation",
     "talos-api",
     "talos-mcp-handlers",
     "talos-api-docs",

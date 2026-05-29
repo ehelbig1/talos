@@ -1137,7 +1137,17 @@ fn validate_actor_name(name: &str) -> Result<(), &'static str> {
     if name.len() > 100 {
         return Err("Actor name must be 1–100 characters");
     }
-    if name.contains('\0') || name.chars().any(|c| c.is_control() && c != '\t') {
+    // Predicate sourced from the canonical `talos-validation` crate
+    // (single source of truth shared with the GraphQL surface). The
+    // message stays a `&'static str` literal so this helper's error type
+    // is unchanged for its three callers.
+    if talos_validation::reject_control_chars(
+        "Actor name",
+        name,
+        talos_validation::LineMode::SingleLine,
+    )
+    .is_err()
+    {
         return Err("Actor name cannot contain control characters or null bytes");
     }
     Ok(())
