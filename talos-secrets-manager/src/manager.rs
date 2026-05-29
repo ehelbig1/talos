@@ -2068,7 +2068,13 @@ impl SecretsManager {
         accessible_org_ids: &[Uuid],
     ) -> Result<Vec<Secret>> {
         let rows = if let Some(user_id) = owner_user_id {
-            sqlx::query(
+            // RFC 0004/0005 S2: user-facing read → run on a tenant-scoped
+            // tx so the secrets RLS policy backstops the app-layer
+            // ownership/org filter. (The None branch below is the
+            // internal/admin all-rows path and stays permissive.)
+            let scope = talos_tenancy::TenantReadScope::new(user_id, accessible_org_ids.to_vec());
+            let mut tx = talos_db::begin_tenant_read_scoped(&self.db_pool, &scope).await?;
+            let rows = sqlx::query(
                 r#"
                 SELECT id, name, key_path, description, created_by,
                        created_at, updated_at, expires_at,
@@ -2084,8 +2090,10 @@ impl SecretsManager {
             .bind(accessible_org_ids)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.db_pool)
-            .await?
+            .fetch_all(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            rows
         } else {
             sqlx::query(
                 r#"
@@ -2125,6 +2133,13 @@ impl SecretsManager {
         requestor_user_id: Uuid,
         accessible_org_ids: &[Uuid],
     ) -> Result<Secret> {
+        // RFC 0004/0005 S2: user-facing read → tenant-scoped tx so the
+        // secrets RLS policy backstops this app-layer ownership/org
+        // filter. Scope carries (requestor, accessible orgs); the policy
+        // matches owner_user_id/created_by = current_user_id OR
+        // org_id = ANY(current_org_ids).
+        let scope = talos_tenancy::TenantReadScope::new(requestor_user_id, accessible_org_ids.to_vec());
+        let mut tx = talos_db::begin_tenant_read_scoped(&self.db_pool, &scope).await?;
         let row = sqlx::query(
             r#"
             SELECT id, name, key_path, description, created_by,
@@ -2139,9 +2154,10 @@ impl SecretsManager {
         .bind(key_path)
         .bind(requestor_user_id)
         .bind(accessible_org_ids)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
         .context("Secret not found")?;
+        tx.commit().await?;
 
         Ok(Self::row_to_secret(row))
     }
