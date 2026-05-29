@@ -207,10 +207,20 @@ list is the working set.
   webhook trigger, not a user): `webhook_request_log`,
   `webhook_processed_events`. They get `org_id` via the trigger's owner in
   a focused follow-up.
-- Confirmed global carve-outs: `compilation_cache`, `node_result_cache`
-  (content-addressed shared caches — note: cross-tenant cache *sharing*
-  by content hash is a latent isolation question to review separately),
+- Confirmed global carve-outs: `compilation_cache`, `node_result_cache`,
   `secrets_rotation_log` (platform crypto-ops log).
+  - **Cache cross-tenant question — RESOLVED (investigated 2026-05-29).**
+    The content-addressed caches are tenant-isolated by design:
+    `node_result_cache` (`talos-node-cache`) is gated to `minimal`/
+    `minimal-node` worlds (pure, no I/O — output is a function of
+    `(module, input)` only, so sharing is correct); `semantic_execution_cache`
+    keys on `workflow_id`; and the **active** worker result cache
+    (`worker/src/runtime.rs`) keys on `workflow_id + module_id` (a
+    workflow belongs to one tenant). Hardened the one latent gap: the
+    worker now **refuses to cache when `execution_context` is `None`**
+    (no workflow scoping → the key would collapse to `module+input` and
+    could leak a non-pure module's output cross-tenant). Locked in by a
+    unit test on `result_cache_key`.
 - Net: M2 added `org_id` to 39 tables; 43 now carry it. Backfill verified
   end-to-end (direct `user_id`→personal-org and parent-join lineages) on
   a real `pgvector` DB.
