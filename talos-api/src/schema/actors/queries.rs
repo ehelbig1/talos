@@ -20,6 +20,19 @@ impl ActorsQueries {
 
         use sqlx::Row;
 
+        // RFC 0004/0005 S2: run on a tenant-scoped tx so the actors RLS
+        // policy backstops the app-layer `user_id` filter. Actors are
+        // personal (the policy only ever matches the owner clause), but
+        // we pass the user's real accessible orgs so the workflow /
+        // workflow_executions COUNT subqueries — both RLS-enabled — stay
+        // permissive enough to count a teammate's executions on this
+        // actor's org-shared workflows (preserving the pre-RLS counts; an
+        // empty org list would undercount them).
+        let org_ids: Vec<uuid::Uuid> = crate::schema::user_accessible_org_ids(ctx).await?;
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let rows = sqlx::query(
             r#"SELECT
                 a.id, a.name, a.description, a.status, a.max_capability_world,
@@ -33,9 +46,10 @@ impl ActorsQueries {
              ORDER BY a.created_at DESC"#,
         )
         .bind(user_id)
-        .fetch_all(db_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         let actors = rows
             .into_iter()
@@ -74,6 +88,14 @@ impl ActorsQueries {
 
         use sqlx::Row;
 
+        // RFC 0004/0005 S2: tenant-scoped tx → actors RLS backstops the
+        // app-layer `user_id` filter; real org_ids keep the RLS-enabled
+        // COUNT subqueries non-regressing (see sibling list resolver).
+        let org_ids: Vec<uuid::Uuid> = crate::schema::user_accessible_org_ids(ctx).await?;
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let row = sqlx::query(
             r#"SELECT
                 a.id, a.name, a.description, a.status, a.max_capability_world, a.metadata,
@@ -88,9 +110,10 @@ impl ActorsQueries {
         )
         .bind(id)
         .bind(user_id)
-        .fetch_optional(db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(row.map(|r| {
             let metadata: Option<String> = r

@@ -16,7 +16,16 @@
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, Pool, Postgres};
-use talos_db::{begin_org_scoped, begin_tenant_read_scoped, check_rls_role};
+use talos_db::{begin_org_scoped, begin_tenant_read_scoped, begin_user_scoped, check_rls_role};
+
+/// Serializes the per-test role DDL (`CREATE ROLE` / `GRANT` / `DROP
+/// ROLE`). Running these tests in parallel races on the Postgres system
+/// catalog (`pg_authid` / `pg_class`), which surfaces as a transient
+/// `XX000 tuple concurrently updated` on a concurrent GRANT. Each test
+/// holds this lock for its duration so the suite is deterministic
+/// without requiring `--test-threads=1`.
+static DDL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 use talos_tenancy::{OrgScope, TenantReadScope};
 use uuid::Uuid;
 
@@ -55,6 +64,7 @@ async fn connect(url: &str) -> Pool<Postgres> {
 #[tokio::test]
 async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
     let Some(su_url) = superuser_url() else { return };
+    let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
 
     let org_a = Uuid::new_v4();
@@ -176,6 +186,7 @@ fn union_app_url(superuser: &str) -> String {
 #[tokio::test]
 async fn membership_union_rls_shows_owned_and_member_orgs_only() {
     let Some(su_url) = superuser_url() else { return };
+    let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
 
     let user = Uuid::new_v4();
@@ -282,6 +293,7 @@ const PERM_ROLE: &str = "talos_rls_perm_app";
 #[tokio::test]
 async fn permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set() {
     let Some(su_url) = superuser_url() else { return };
+    let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let user = Uuid::new_v4();
     let org_a = Uuid::new_v4();
@@ -400,6 +412,7 @@ const WF_ROLE: &str = "talos_wf_rls_app";
 #[tokio::test]
 async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
     let Some(su_url) = superuser_url() else { return };
+    let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let user_a = Uuid::new_v4();
     let user_b = Uuid::new_v4();
@@ -510,6 +523,7 @@ const SECRETS_ROLE: &str = "talos_secrets_rls_app";
 #[tokio::test]
 async fn secrets_permissive_rls_unscoped_sees_all_scoped_enforces() {
     let Some(su_url) = superuser_url() else { return };
+    let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let user_a = Uuid::new_v4();
     let user_b = Uuid::new_v4();
@@ -609,6 +623,7 @@ const EXEC_ROLE: &str = "talos_wfexec_rls_app";
 #[tokio::test]
 async fn workflow_executions_permissive_rls_member_sees_shared_stranger_blocked() {
     let Some(su_url) = superuser_url() else { return };
+    let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let owner = Uuid::new_v4();
     let teammate = Uuid::new_v4();
@@ -736,4 +751,84 @@ async fn workflow_executions_permissive_rls_member_sees_shared_stranger_blocked(
         let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
     }
     let _ = su.execute(format!("DROP ROLE IF EXISTS {EXEC_ROLE};").as_str()).await;
+}
+
+const ACTORS_ROLE: &str = "talos_actors_rls_app";
+
+/// RFC 0004/0005 S2: `actors` permissive policy. Actors are personal —
+/// an un-wired internal reader (engine apply_actor_to_engine, scheduler)
+/// sees all (non-breaking), while a wired/scoped read enforces the owner
+/// match so one user never sees another's actor.
+#[tokio::test]
+async fn actors_permissive_rls_unscoped_sees_all_scoped_enforces() {
+    let Some(su_url) = superuser_url() else { return };
+    let _ddl_guard = DDL_LOCK.lock().await;
+    let su = connect(&su_url).await;
+    let user_a = Uuid::new_v4();
+    let user_b = Uuid::new_v4();
+    let actor_a = Uuid::new_v4();
+    let actor_b = Uuid::new_v4();
+
+    su.execute(
+        format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{ACTORS_ROLE}') THEN \
+               CREATE ROLE {ACTORS_ROLE} LOGIN PASSWORD '{APP_PW}'; END IF; END $$;"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create actors role");
+    su.execute(format!("GRANT SELECT ON actors TO {ACTORS_ROLE};").as_str())
+        .await
+        .expect("grant");
+    for (u, label) in [(user_a, "aa"), (user_b, "ab")] {
+        sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
+            .bind(u)
+            .bind(format!("{label}-{}@test.invalid", u.simple()))
+            .bind(label)
+            .execute(&su)
+            .await
+            .expect("insert user");
+    }
+    for (aid, u) in [(actor_a, user_a), (actor_b, user_b)] {
+        sqlx::query("INSERT INTO actors (id, user_id, name) VALUES ($1, $2, 'a')")
+            .bind(aid)
+            .bind(u)
+            .execute(&su)
+            .await
+            .expect("insert actor");
+    }
+
+    let after_at = su_url.rsplit_once('@').map(|(_, r)| r).unwrap_or(&su_url);
+    let app = connect(&format!("postgres://{ACTORS_ROLE}:{APP_PW}@{after_at}")).await;
+
+    // Un-wired (no GUC) → permissive → both (engine reader non-breaking).
+    let unscoped: i64 = sqlx::query_scalar("SELECT count(*) FROM actors WHERE id IN ($1,$2)")
+        .bind(actor_a)
+        .bind(actor_b)
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    assert_eq!(unscoped, 2, "un-wired actors read must be permissive");
+
+    // Wired/scoped to user A → only A's actor (owner clause).
+    let mut tx = begin_user_scoped(&app, user_a).await.unwrap();
+    let scoped: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM actors WHERE id IN ($1,$2)")
+        .bind(actor_a)
+        .bind(actor_b)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(scoped, vec![actor_a], "scoped actors read must enforce — only A's");
+
+    let _ = sqlx::query("DELETE FROM actors WHERE id IN ($1,$2)")
+        .bind(actor_a)
+        .bind(actor_b)
+        .execute(&su)
+        .await;
+    for u in [user_a, user_b] {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+    }
+    let _ = su.execute(format!("DROP ROLE IF EXISTS {ACTORS_ROLE};").as_str()).await;
 }

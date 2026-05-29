@@ -95,7 +95,7 @@ of the value early without the full infra cost up front.
 |---|---|---|
 | **S0** | Foundation: data model, primitives, policies, boot guard, permissive-rollout proof | **Done** (RFC 0004) |
 | **S1** | Fail-closed on **narrow, request-only** tables (few readers, no cross-cutting access) | `scratch_sessions` ✓, `user_module_pins` ✓ |
-| **S2** | **Permissive backstop on the user-facing IDOR surfaces** of hot/cross-cutting tables (the actual attack vector). App-layer stays primary for internal readers. | `workflows` GraphQL ✓, `secrets` ✓, `workflow_executions` ✓; **`actors` next** |
+| **S2** | **Permissive backstop on the user-facing IDOR surfaces** of hot/cross-cutting tables (the actual attack vector). App-layer stays primary for internal readers. | **Done** — `workflows` GraphQL ✓, `secrets` ✓, `workflow_executions` ✓, `actors` ✓ |
 | **S3** | **Dual-role + unit-of-work refactor** — the deliberate infra project that unblocks fail-closed for the hot tables | Future |
 | **S4** | Flip hot tables to **fail-closed** (drop permissive clause), `talos_system` exempt | Future (after S3) |
 | **T2/T3** | Per-org KEK; physical isolation (RFC 0004 §T2/T3) | Future |
