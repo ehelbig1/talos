@@ -169,6 +169,38 @@ impl OrganizationService {
         Ok(org)
     }
 
+    /// Resolve the validated **active organization** for a request
+    /// (RFC 0004) — the org the controller stamps into
+    /// `SET LOCAL app.current_org_id` for RLS.
+    ///
+    /// `requested` is the (optional) JWT `org` claim. It is honoured ONLY
+    /// when the user is *currently* a member of that org — defense in
+    /// depth: the token is signed (so the claim isn't forgeable), but
+    /// membership can be revoked after a token is minted, and we must not
+    /// keep granting access in that window. On a rejected or absent
+    /// request we fall back to the user's **personal org** (created on
+    /// the fly if somehow missing — idempotent repair).
+    ///
+    /// Falling back rather than erroring is deliberate: a stale org claim
+    /// should degrade to the user's own data, never 500 a request.
+    pub async fn resolve_active_org(
+        db: &Pool<Postgres>,
+        user_id: Uuid,
+        requested: Option<Uuid>,
+    ) -> Result<Uuid> {
+        if let Some(org) = requested {
+            if Self::get_member_role(db, org, user_id).await?.is_some() {
+                return Ok(org);
+            }
+            tracing::warn!(
+                %user_id,
+                requested_org = %org,
+                "active-org claim rejected (user is not a member) — falling back to personal org"
+            );
+        }
+        Ok(Self::create_personal_org(db, user_id, None).await?.id)
+    }
+
     /// Get an organization by ID.
     pub async fn get_org(db: &Pool<Postgres>, org_id: Uuid) -> Result<Organization> {
         sqlx::query_as::<_, Organization>(

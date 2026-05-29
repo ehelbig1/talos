@@ -434,6 +434,7 @@ async fn test_jwt_wrong_audience_rejected() {
         is_2fa_verified: false,
         iss: "talos".to_string(),
         aud: Some("evil-service".to_string()),
+        org: String::new(),
     };
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(service.key_pair.algorithm()),
@@ -461,6 +462,7 @@ async fn test_jwt_missing_audience_accepted_for_migration() {
         is_2fa_verified: false,
         iss: "talos".to_string(),
         aud: None,
+        org: String::new(),
     };
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(service.key_pair.algorithm()),

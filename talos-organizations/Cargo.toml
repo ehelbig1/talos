@@ -16,5 +16,9 @@ talos-auth-types = { path = "../talos-auth-types" }
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# Live-Postgres integration tests (gated on TALOS_TEST_DATABASE_URL).
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
 [lints]
 workspace = true
