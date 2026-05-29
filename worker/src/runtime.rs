@@ -2167,6 +2167,19 @@ impl TalosRuntime {
             // Governance nodes must not be cached because they require human interaction
             result_cache_ttl_secs = None;
         }
+        // Tenant-isolation defense in depth (RFC 0004): the result-cache
+        // key derives its cross-tenant separation SOLELY from the
+        // workflow_id in execution_context (see `result_cache_key` — a
+        // workflow belongs to exactly one owner/org). With no workflow
+        // context the key would collapse to (module_hash + input), shared
+        // across every tenant — so a non-pure module's output (one that
+        // depends on the caller's secrets / fetched data) could leak
+        // between tenants on a same-input hit. Refuse to cache in that
+        // case: correctness over a cache hit. Mirrors the Governance
+        // exclusion above.
+        if execution_context.is_none() {
+            result_cache_ttl_secs = None;
+        }
 
         // PHASE 2: RESULT CACHING — check before doing any compilation work
         if result_cache_ttl_secs.is_some() {
@@ -4317,5 +4330,40 @@ mod tests {
             !report.contains("MAX_RESPONSE_BYTES"),
             "remediation hint should not fire below threshold: {report}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // result_cache_key — cross-tenant isolation (RFC 0004)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn result_cache_key_isolates_by_workflow_id() {
+        let input = serde_json::json!({"x": 1});
+        // Same module + identical input, but two different workflows
+        // (each owned by exactly one tenant) → DIFFERENT cache keys, so a
+        // non-pure module's cached output can't leak across tenants.
+        let ctx_a = ("wf-A".to_string(), "exec-1".to_string(), "mod-1".to_string());
+        let ctx_b = ("wf-B".to_string(), "exec-2".to_string(), "mod-1".to_string());
+        let key_a = TalosRuntime::result_cache_key("modhash", &input, Some(&ctx_a));
+        let key_b = TalosRuntime::result_cache_key("modhash", &input, Some(&ctx_b));
+        assert_ne!(
+            key_a, key_b,
+            "different workflow_id MUST yield a different cache key (tenant isolation)"
+        );
+
+        // execution_id is intentionally excluded → caching across runs of
+        // the SAME workflow is the whole point.
+        let ctx_a2 = ("wf-A".to_string(), "exec-999".to_string(), "mod-1".to_string());
+        let key_a2 = TalosRuntime::result_cache_key("modhash", &input, Some(&ctx_a2));
+        assert_eq!(
+            key_a, key_a2,
+            "same workflow+module+input must reuse the cache entry across runs"
+        );
+
+        // The context-less key (no workflow scoping) is distinct — and the
+        // execute path refuses to cache when execution_context is None, so
+        // this collapsed key is never actually populated cross-tenant.
+        let key_none = TalosRuntime::result_cache_key("modhash", &input, None);
+        assert_ne!(key_none, key_a);
     }
 }
