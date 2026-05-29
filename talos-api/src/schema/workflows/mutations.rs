@@ -1434,7 +1434,13 @@ impl WorkflowsMutations {
             }
         };
 
-        // Insert or update workflow
+        // RFC 0004 M4: insert on a user-scoped tx so the workflows RLS
+        // WITH CHECK is satisfied via the user_id clause (the new row is
+        // owned by the inserting user). Required so the eventual
+        // fail-closed flip doesn't reject creates.
+        let mut tx = talos_db::begin_user_scoped(db_pool, *user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let workflow_id = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO workflows (name, module_uri, graph_json, user_id, max_concurrent_executions, intent, org_id)
@@ -1448,8 +1454,9 @@ impl WorkflowsMutations {
         .bind(input.max_concurrent_executions)
         .bind(&input.intent)
         .bind(org_id)
-        .fetch_one(db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         // Maintain workflow_module_refs junction table.
         sync_workflow_module_refs(db_pool, workflow_id, &input.graph_json).await;
@@ -1572,6 +1579,12 @@ impl WorkflowsMutations {
         // Use the role-filtered helper — a Viewer must NOT be able to UPDATE
         // an org-shared workflow even though they can SELECT it.
         let org_ids: Vec<uuid::Uuid> = crate::schema::user_writable_org_ids(ctx).await?;
+        // RFC 0004 M4: scoped tx (user + writable orgs) so the workflows
+        // RLS USING matches the same rows as the app-layer WHERE.
+        let scope = talos_tenancy::TenantReadScope::new(*user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let result = sqlx::query(
             r#"
             UPDATE workflows
@@ -1585,9 +1598,10 @@ impl WorkflowsMutations {
         .bind(&input.intent)
         .bind(id)
         .bind(user_id)
-        .bind(&org_ids)
-        .execute(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         if result.rows_affected() == 0 {
             // MCP-918: .extend_safe()
@@ -1643,6 +1657,14 @@ impl WorkflowsMutations {
         // the guard at the SQL layer so the GraphQL dashboard can't
         // silently nuke running executions. Cross-protocol parity per
         // MCP-292 / MCP-647 / MCP-648.
+        // RFC 0004 M4: scoped tx (user + writable orgs) so the workflows
+        // RLS USING matches the app-layer WHERE. The workflow_executions
+        // subquery is unaffected (that table isn't RLS-enabled). Clone —
+        // org_ids is reused by the refusal-path diagnostic SELECT below.
+        let scope = talos_tenancy::TenantReadScope::new(*user_id, org_ids.clone());
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let result = sqlx::query(
             "DELETE FROM workflows \
              WHERE id = $1 \
@@ -1655,9 +1677,10 @@ impl WorkflowsMutations {
         )
         .bind(id)
         .bind(user_id)
-        .bind(&org_ids)
-        .execute(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         if result.rows_affected() == 0 {
             // Distinguish "not found / access denied" from "blocked by

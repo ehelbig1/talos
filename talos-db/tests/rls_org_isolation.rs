@@ -468,9 +468,31 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
     tx.commit().await.unwrap();
     assert_eq!(scoped, vec![name_a.clone()], "scoped read must enforce — only A's workflow");
 
-    let _ = sqlx::query("DELETE FROM workflows WHERE name IN ($1,$2)")
+    // WRITE-side (WITH CHECK): under A's scope, inserting a workflow owned
+    // by B is rejected — you can't write a row you don't own. (The wired
+    // create/update/delete mutations rely on this once fail-closed.)
+    let evil_name = format!("evil-{}", user_b.simple());
+    let mut tx_w = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_a, vec![]))
+        .await
+        .unwrap();
+    let rejected = sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
+         VALUES (gen_random_uuid(), $1, $2, '', '{}')",
+    )
+    .bind(user_b)
+    .bind(&evil_name)
+    .execute(&mut *tx_w)
+    .await;
+    assert!(
+        rejected.is_err(),
+        "RLS WITH CHECK must reject inserting a workflow owned by another user"
+    );
+    let _ = tx_w.rollback().await;
+
+    let _ = sqlx::query("DELETE FROM workflows WHERE name IN ($1,$2,$3)")
         .bind(&name_a)
         .bind(&name_b)
+        .bind(&evil_name)
         .execute(&su)
         .await;
     for u in [user_a, user_b] {
