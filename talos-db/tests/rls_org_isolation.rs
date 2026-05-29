@@ -500,3 +500,99 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
     }
     let _ = su.execute(format!("DROP ROLE IF EXISTS {WF_ROLE};").as_str()).await;
 }
+
+const SECRETS_ROLE: &str = "talos_secrets_rls_app";
+
+/// RFC 0004/0005 S2: `secrets` permissive policy — an un-wired path (no
+/// GUC, e.g. the execution-time decrypt path) sees all (non-breaking),
+/// while a wired/scoped metadata read enforces the ownership/org match.
+/// secrets is owned via owner_user_id/created_by (not a `user_id` column).
+#[tokio::test]
+async fn secrets_permissive_rls_unscoped_sees_all_scoped_enforces() {
+    let Some(su_url) = superuser_url() else { return };
+    let su = connect(&su_url).await;
+    let user_a = Uuid::new_v4();
+    let user_b = Uuid::new_v4();
+    let kp_a = format!("ka-{}", user_a.simple());
+    let kp_b = format!("kb-{}", user_b.simple());
+
+    su.execute(
+        format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{SECRETS_ROLE}') THEN \
+               CREATE ROLE {SECRETS_ROLE} LOGIN PASSWORD '{APP_PW}'; END IF; END $$;"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create secrets role");
+    su.execute(format!("GRANT SELECT ON secrets TO {SECRETS_ROLE};").as_str())
+        .await
+        .expect("grant");
+    for (u, label) in [(user_a, "sa"), (user_b, "sb")] {
+        sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
+            .bind(u)
+            .bind(format!("{label}-{}@test.invalid", u.simple()))
+            .bind(label)
+            .execute(&su)
+            .await
+            .expect("insert user");
+    }
+    let key_id: Uuid =
+        sqlx::query_scalar("INSERT INTO encryption_keys (encrypted_key) VALUES ($1) RETURNING id")
+            .bind(vec![0u8, 1, 2])
+            .fetch_one(&su)
+            .await
+            .expect("insert key");
+    for (u, kp) in [(user_a, &kp_a), (user_b, &kp_b)] {
+        sqlx::query(
+            "INSERT INTO secrets (name, key_path, encrypted_value, encryption_key_id, owner_user_id) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(kp)
+        .bind(kp)
+        .bind(vec![9u8])
+        .bind(key_id)
+        .bind(u)
+        .execute(&su)
+        .await
+        .expect("insert secret");
+    }
+
+    let after_at = su_url.rsplit_once('@').map(|(_, r)| r).unwrap_or(&su_url);
+    let app = connect(&format!("postgres://{SECRETS_ROLE}:{APP_PW}@{after_at}")).await;
+
+    // Un-wired (no GUC) → permissive → both (decrypt path doesn't break).
+    let unscoped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM secrets WHERE key_path IN ($1,$2)")
+            .bind(&kp_a)
+            .bind(&kp_b)
+            .fetch_one(&app)
+            .await
+            .unwrap();
+    assert_eq!(unscoped, 2, "un-wired secrets read must be permissive (decrypt path)");
+
+    // Wired/scoped to user A → only A's (owner_user_id clause).
+    let mut tx = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_a, vec![]))
+        .await
+        .unwrap();
+    let scoped: Vec<String> =
+        sqlx::query_scalar("SELECT key_path FROM secrets WHERE key_path IN ($1,$2)")
+            .bind(&kp_a)
+            .bind(&kp_b)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(scoped, vec![kp_a.clone()], "scoped secrets read must enforce — only A's");
+
+    let _ = sqlx::query("DELETE FROM secrets WHERE key_path IN ($1,$2)")
+        .bind(&kp_a)
+        .bind(&kp_b)
+        .execute(&su)
+        .await;
+    let _ = sqlx::query("DELETE FROM encryption_keys WHERE id = $1").bind(key_id).execute(&su).await;
+    for u in [user_a, user_b] {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+    }
+    let _ = su.execute(format!("DROP ROLE IF EXISTS {SECRETS_ROLE};").as_str()).await;
+}
