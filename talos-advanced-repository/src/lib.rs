@@ -6,7 +6,8 @@
 /// methods and format the JSON-RPC response.
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
+use talos_tenancy::TenantReadScope;
 use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,6 +241,22 @@ impl AdvancedRepository {
     }
 
     // ── Scratch sessions ──────────────────────────────────────────────────────
+    //
+    // RFC 0004 M4: `scratch_sessions` is the first table with RLS enforced
+    // (migration 20260529160000). It's request-only (no worker access) and
+    // every query lives in this file, so all paths are wired below. scratch
+    // sessions are personal, so the scope carries the user with an empty org
+    // list — the policy's `user_id = current_user_id` clause matches.
+    // Each method runs on the scoped tx so the RLS policy sees the GUC.
+
+    /// Open a per-user tenant-scoped transaction (sets app.current_user_id)
+    /// so the scratch_sessions RLS policy enforces. Caller runs its query on
+    /// the returned tx and commits.
+    async fn user_scoped_tx(&self, user_id: Uuid) -> Result<Transaction<'_, Postgres>> {
+        talos_db::begin_tenant_read_scoped(&self.db_pool, &TenantReadScope::new(user_id, Vec::new()))
+            .await
+            .map_err(|e| anyhow!("open user-scoped tx: {e}"))
+    }
 
     /// Create or update a scratch session (UPSERT by user_id + name).
     pub async fn upsert_scratch_session(
@@ -249,6 +266,7 @@ impl AdvancedRepository {
         code: &str,
         world: &str,
     ) -> Result<()> {
+        let mut tx = self.user_scoped_tx(user_id).await?;
         sqlx::query(
             "INSERT INTO scratch_sessions (user_id, name, code, world, updated_at) \
              VALUES ($1, $2, $3, $4, NOW()) \
@@ -258,14 +276,15 @@ impl AdvancedRepository {
         .bind(name)
         .bind(code)
         .bind(world)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
-        .context("upsert_scratch_session")
+        .context("upsert_scratch_session")?;
+        tx.commit().await.context("commit upsert_scratch_session")
     }
 
     /// Update only the code field of an existing scratch session.
     pub async fn update_scratch_code(&self, code: &str, user_id: Uuid, name: &str) -> Result<()> {
+        let mut tx = self.user_scoped_tx(user_id).await?;
         sqlx::query(
             "UPDATE scratch_sessions SET code = $1, updated_at = NOW() \
              WHERE user_id = $2 AND name = $3",
@@ -273,10 +292,10 @@ impl AdvancedRepository {
         .bind(code)
         .bind(user_id)
         .bind(name)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
-        .context("update_scratch_code")
+        .context("update_scratch_code")?;
+        tx.commit().await.context("commit update_scratch_code")
     }
 
     /// Fetch (code, world) for a named scratch session.
@@ -285,18 +304,22 @@ impl AdvancedRepository {
         user_id: Uuid,
         name: &str,
     ) -> Result<Option<(String, String)>> {
-        sqlx::query_as::<_, (String, String)>(
+        let mut tx = self.user_scoped_tx(user_id).await?;
+        let row = sqlx::query_as::<_, (String, String)>(
             "SELECT code, world FROM scratch_sessions WHERE user_id = $1 AND name = $2",
         )
         .bind(user_id)
         .bind(name)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await
-        .context("get_scratch_session")
+        .context("get_scratch_session")?;
+        tx.commit().await.context("commit get_scratch_session")?;
+        Ok(row)
     }
 
     /// Persist a compilation/execution error on a scratch session.
     pub async fn update_scratch_error(&self, error: &str, user_id: Uuid, name: &str) -> Result<()> {
+        let mut tx = self.user_scoped_tx(user_id).await?;
         sqlx::query(
             "UPDATE scratch_sessions SET last_error = $1, last_output = NULL, updated_at = NOW() \
              WHERE user_id = $2 AND name = $3",
@@ -304,14 +327,15 @@ impl AdvancedRepository {
         .bind(error)
         .bind(user_id)
         .bind(name)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
-        .context("update_scratch_error")
+        .context("update_scratch_error")?;
+        tx.commit().await.context("commit update_scratch_error")
     }
 
     /// Persist a compilation warning where output is NULL but no full error (no_wasm_bytes path).
     pub async fn update_scratch_no_wasm(&self, msg: &str, user_id: Uuid, name: &str) -> Result<()> {
+        let mut tx = self.user_scoped_tx(user_id).await?;
         sqlx::query(
             "UPDATE scratch_sessions SET last_error = $1, updated_at = NOW() \
              WHERE user_id = $2 AND name = $3",
@@ -319,10 +343,10 @@ impl AdvancedRepository {
         .bind(msg)
         .bind(user_id)
         .bind(name)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
-        .context("update_scratch_no_wasm")
+        .context("update_scratch_no_wasm")?;
+        tx.commit().await.context("commit update_scratch_no_wasm")
     }
 
     /// Persist the successful output of a scratch session execution.
@@ -332,6 +356,7 @@ impl AdvancedRepository {
         user_id: Uuid,
         name: &str,
     ) -> Result<()> {
+        let mut tx = self.user_scoped_tx(user_id).await?;
         sqlx::query(
             "UPDATE scratch_sessions SET last_output = $1, last_error = NULL, updated_at = NOW() \
              WHERE user_id = $2 AND name = $3",
@@ -339,22 +364,24 @@ impl AdvancedRepository {
         .bind(output)
         .bind(user_id)
         .bind(name)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
-        .context("update_scratch_output")
+        .context("update_scratch_output")?;
+        tx.commit().await.context("commit update_scratch_output")
     }
 
     /// List all scratch sessions for a user, ordered by most recently updated.
     pub async fn list_scratch_sessions(&self, user_id: Uuid) -> Result<Vec<ScratchSessionRow>> {
+        let mut tx = self.user_scoped_tx(user_id).await?;
         let rows = sqlx::query(
             "SELECT name, world, updated_at, (last_error IS NOT NULL) as has_error \
              FROM scratch_sessions WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 1000",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await
         .context("list_scratch_sessions")?;
+        tx.commit().await.context("commit list_scratch_sessions")?;
 
         Ok(rows
             .into_iter()
@@ -369,13 +396,16 @@ impl AdvancedRepository {
 
     /// Delete a named scratch session. Returns the number of rows affected.
     pub async fn delete_scratch_session(&self, user_id: Uuid, name: &str) -> Result<u64> {
-        sqlx::query("DELETE FROM scratch_sessions WHERE user_id = $1 AND name = $2")
+        let mut tx = self.user_scoped_tx(user_id).await?;
+        let affected = sqlx::query("DELETE FROM scratch_sessions WHERE user_id = $1 AND name = $2")
             .bind(user_id)
             .bind(name)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map(|r| r.rows_affected())
-            .context("delete_scratch_session")
+            .context("delete_scratch_session")?;
+        tx.commit().await.context("commit delete_scratch_session")?;
+        Ok(affected)
     }
 
     // ── Archive policy ────────────────────────────────────────────────────────
