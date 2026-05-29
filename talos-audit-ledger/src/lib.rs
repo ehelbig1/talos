@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use anyhow::Result;
@@ -17,6 +17,196 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
+
+// ── OTLP auth-header encryption (L3, 2026-05-28 review) ────────────────────────
+//
+// SINGLE SOURCE OF TRUTH for encrypting/decrypting the per-tenant OTLP
+// streaming auth headers. The GraphQL write path (`talos-api`
+// update_audit_settings) and this crate's read path (`OTLPCache::get_tracer`)
+// BOTH call these helpers, so the (algorithm, key-derivation, AAD) triple can
+// never drift again.
+//
+// Pre-L3 the two ends were mismatched: the write path encrypted with a
+// SecretsManager DEK envelope while the read path decrypted with the RAW
+// `TALOS_MASTER_KEY` as the AES key. The GCM tag check therefore ALWAYS failed
+// at read time, and the failure was silently swallowed — encrypted headers were
+// persisted but never applied, so authenticated audit-log streaming was
+// silently non-functional. (See the now-removed NOTE in update_audit_settings.)
+//
+// This realignment fixes three things at once:
+//   1. Correctness — both ends derive the SAME key identically, so the
+//      round-trip works.
+//   2. Domain separation — the master key is the KEK (it wraps DEKs); using it
+//      DIRECTLY as an AES data key (as the old read path did) reused crypto
+//      material across primitives. We instead derive a dedicated AEAD subkey via
+//      HKDF-SHA256 with a unique label (same hardening as the secret-envelope
+//      and checkpoint subkeys).
+//   3. Swap resistance — AAD binds the ciphertext to the owning `user_id`, so a
+//      DB-write attacker can't transpose one tenant's header blob into another's
+//      `user_audit_settings` row and have it decrypt.
+//
+// Old ciphertext (SecretsManager-DEK, no AAD) does not decrypt under this scheme
+// and fails closed with a logged WARN — acceptable because it never decrypted
+// under the broken read path either, so there is no working data to migrate.
+
+/// HKDF-SHA256 domain-separation label for the OTLP auth-header AEAD subkey.
+const OTLP_HEADER_AEAD_LABEL: &[u8] = b"talos/master-key/audit-otlp-header-aead/v1";
+
+/// Derive the dedicated 32-byte AES-256-GCM subkey for OTLP auth-header
+/// encryption from the raw `TALOS_MASTER_KEY`. Deterministic; encrypt and
+/// decrypt derive it identically.
+fn derive_otlp_header_key(master_key: &[u8]) -> [u8; 32] {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, master_key);
+    let mut subkey = [0u8; 32];
+    hk.expand(OTLP_HEADER_AEAD_LABEL, &mut subkey)
+        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
+    subkey
+}
+
+/// AAD = the 16 raw bytes of the owning tenant's `user_id`. Binds the ciphertext
+/// to one tenant so a row can't be transposed between users.
+fn otlp_header_aad(user_id: Uuid) -> [u8; 16] {
+    *user_id.as_bytes()
+}
+
+/// Load + hex-decode `TALOS_MASTER_KEY`. Returns `None` (caller logs) if the env
+/// var is unset or not valid hex.
+fn load_master_key_bytes() -> Option<Vec<u8>> {
+    let hex_str = std::env::var("TALOS_MASTER_KEY").ok()?;
+    hex::decode(hex_str.trim()).ok()
+}
+
+/// Encrypt OTLP auth headers (a JSON string) for storage. Returns
+/// `(ciphertext, nonce)` for the `auth_headers_encrypted` / `auth_headers_nonce`
+/// columns. Called by the GraphQL write path. Errors (opaque string — never the
+/// plaintext) if `TALOS_MASTER_KEY` is unavailable or encryption fails.
+pub fn encrypt_otlp_auth_headers(plaintext: &str, user_id: Uuid) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let master_key =
+        load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
+    encrypt_otlp_auth_headers_with_master_key(plaintext, user_id, &master_key)
+}
+
+/// Decrypt OTLP auth headers stored by [`encrypt_otlp_auth_headers`]. Returns the
+/// JSON string. Called by the read path. Fails closed (opaque error) on a wrong
+/// key, corrupted ciphertext, AAD/tenant mismatch, or bad nonce length.
+pub fn decrypt_otlp_auth_headers(
+    ciphertext: &[u8],
+    nonce: &[u8],
+    user_id: Uuid,
+) -> Result<String, String> {
+    let master_key =
+        load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
+    decrypt_otlp_auth_headers_with_master_key(ciphertext, nonce, user_id, &master_key)
+}
+
+/// Encryption core taking the master key explicitly (env-free, so the crypto
+/// round-trip is unit-testable without touching the process environment).
+fn encrypt_otlp_auth_headers_with_master_key(
+    plaintext: &str,
+    user_id: Uuid,
+    master_key: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use rand::RngCore;
+    let subkey = derive_otlp_header_key(master_key);
+    let cipher = Aes256Gcm::new_from_slice(&subkey).map_err(|e| format!("cipher init: {e}"))?;
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let aad = otlp_header_aad(user_id);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext.as_bytes(),
+                aad: &aad,
+            },
+        )
+        .map_err(|e| format!("encrypt: {e}"))?;
+    Ok((ciphertext, nonce_bytes.to_vec()))
+}
+
+/// Decryption core taking the master key explicitly (env-free; see the encrypt
+/// core).
+fn decrypt_otlp_auth_headers_with_master_key(
+    ciphertext: &[u8],
+    nonce: &[u8],
+    user_id: Uuid,
+    master_key: &[u8],
+) -> Result<String, String> {
+    if nonce.len() != 12 {
+        return Err(format!("nonce wrong length (expected 12, got {})", nonce.len()));
+    }
+    let subkey = derive_otlp_header_key(master_key);
+    let cipher = Aes256Gcm::new_from_slice(&subkey).map_err(|e| format!("cipher init: {e}"))?;
+    let aad = otlp_header_aad(user_id);
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "decrypt failed — wrong key, corrupted data, or tenant (AAD) mismatch".to_string())?;
+    String::from_utf8(plaintext).map_err(|_| "decrypted bytes are not valid UTF-8".to_string())
+}
+
+#[cfg(test)]
+mod otlp_header_crypto_tests {
+    use super::*;
+
+    fn master_key() -> Vec<u8> {
+        vec![0x11u8; 32]
+    }
+
+    #[test]
+    fn round_trip_with_matching_user_succeeds() {
+        let user = Uuid::new_v4();
+        let headers = r#"{"authorization":"Bearer abc","x-tenant":"acme"}"#;
+        let (ct, nonce) =
+            encrypt_otlp_auth_headers_with_master_key(headers, user, &master_key()).unwrap();
+        let out =
+            decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, user, &master_key()).unwrap();
+        assert_eq!(out, headers);
+    }
+
+    #[test]
+    fn decrypt_with_different_user_fails_aad_mismatch() {
+        let user = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert_ne!(user, other);
+        let (ct, nonce) =
+            encrypt_otlp_auth_headers_with_master_key("{}", user, &master_key()).unwrap();
+        // Transposing the blob to another tenant must fail closed.
+        let err = decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, other, &master_key())
+            .unwrap_err();
+        assert!(err.contains("AAD") || err.contains("mismatch"), "got {err}");
+    }
+
+    #[test]
+    fn decrypt_with_wrong_master_key_fails() {
+        let user = Uuid::new_v4();
+        let (ct, nonce) =
+            encrypt_otlp_auth_headers_with_master_key("{}", user, &master_key()).unwrap();
+        let wrong = vec![0x22u8; 32];
+        assert!(decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, user, &wrong).is_err());
+    }
+
+    #[test]
+    fn derived_subkey_differs_from_raw_master_key() {
+        let mk = master_key();
+        let subkey = derive_otlp_header_key(&mk);
+        assert_ne!(&subkey[..], &mk[..], "subkey must not equal the raw master key");
+        assert_eq!(subkey, derive_otlp_header_key(&mk), "derivation is deterministic");
+    }
+
+    #[test]
+    fn rejects_wrong_nonce_length() {
+        let user = Uuid::new_v4();
+        let err = decrypt_otlp_auth_headers_with_master_key(&[1, 2, 3], &[0u8; 11], user, &master_key())
+            .unwrap_err();
+        assert!(err.contains("nonce wrong length"), "got {err}");
+    }
+}
 
 /// S3 Object-Lock retention applied per audit batch upload when
 /// `TALOS_AUDIT_S3_OBJECT_LOCK=true`. The bucket MUST have Object Lock
@@ -237,31 +427,42 @@ impl OTLPCache {
         if let (Some(encrypted), Some(nonce)) =
             (settings.auth_headers_encrypted, settings.auth_headers_nonce)
         {
-            if let Ok(master_key_hex) = std::env::var("TALOS_MASTER_KEY") {
-                if let Ok(master_key) = hex::decode(master_key_hex.trim()) {
-                    if let Ok(cipher) = Aes256Gcm::new_from_slice(&master_key) {
-                        // AES-256-GCM requires exactly 12-byte nonces. Reject
-                        // corrupted values early instead of panicking in from_slice.
-                        if nonce.len() != 12 {
-                            tracing::error!(
-                                nonce_len = nonce.len(),
-                                "OTLP auth nonce has wrong length (expected 12 bytes) — skipping header decryption"
-                            );
-                            return None;
-                        }
-                        let nonce_obj = Nonce::from_slice(&nonce);
-                        if let Ok(plaintext) = cipher.decrypt(nonce_obj, encrypted.as_ref()) {
-                            if let Ok(json_headers) =
-                                serde_json::from_slice::<HashMap<String, String>>(&plaintext)
-                            {
-                                for (k, v) in json_headers {
-                                    if let (Ok(key), Ok(val)) = (k.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>(), v.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()) {
-                                        metadata.insert(key, val);
-                                    }
-                                }
+            // L3: decrypt via the canonical helper (HKDF subkey of
+            // TALOS_MASTER_KEY + user_id AAD) — the SAME primitive the GraphQL
+            // write path encrypts with. Do NOT silently swallow failures: a
+            // decrypt error means the exporter would stream WITHOUT auth, which
+            // operators must be able to see.
+            match decrypt_otlp_auth_headers(&encrypted, &nonce, user_id) {
+                Ok(json_str) => match serde_json::from_str::<HashMap<String, String>>(&json_str) {
+                    Ok(json_headers) => {
+                        for (k, v) in json_headers {
+                            if let (Ok(key), Ok(val)) = (
+                                k.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>(),
+                                v.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>(),
+                            ) {
+                                metadata.insert(key, val);
                             }
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "talos_audit",
+                            user_id = %user_id,
+                            "OTLP auth headers decrypted but are not a valid JSON string map: {e} \
+                             — exporter will stream WITHOUT auth headers"
+                        );
+                    }
+                },
+                Err(reason) => {
+                    tracing::warn!(
+                        target: "talos_audit",
+                        user_id = %user_id,
+                        reason = %reason,
+                        "Failed to decrypt OTLP auth headers — exporter will stream WITHOUT auth \
+                         headers. Check TALOS_MASTER_KEY, and note that header blobs saved before \
+                         the L3 key-realignment (SecretsManager-DEK ciphertext) are not readable \
+                         and must be re-saved via update_audit_settings."
+                    );
                 }
             }
         }

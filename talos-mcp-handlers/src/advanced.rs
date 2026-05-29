@@ -37,12 +37,10 @@ use uuid::Uuid;
 /// deployment-time TLS issue.
 static APPROVAL_GATE_NOTIFY_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("talos-approval-gate/1.0")
-            .build()
+        // L4: built via the shared helper so it carries the connect-time
+        // ControllerSsrfResolver (DNS-rebinding TOCTOU close) alongside the
+        // existing timeout / connect-timeout / no-redirect posture.
+        crate::ssrf_resolver::build_outbound_webhook_client("talos-approval-gate/1.0")
             .expect(
                 "talos-mcp-handlers: failed to build approval-gate notification HTTP client (TLS init)",
             )
@@ -5356,15 +5354,11 @@ async fn handle_test_sla_webhook(
         "source": "talos-platform",
     });
 
-    // Fire the HTTP POST with a strict timeout — never follow redirects (SSRF mitigation)
-    // MCP-1034: explicit connect_timeout for fast-fail on black-holed
-    // endpoint.
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("talos-sla-monitor/1.0")
-        .build()
+    // Fire the HTTP POST with a strict timeout — never follow redirects (SSRF
+    // mitigation). L4: shared builder adds the connect-time SSRF resolver that
+    // closes the DNS-rebinding TOCTOU. MCP-1034: explicit connect_timeout for
+    // fast-fail on black-holed endpoint.
+    let client = match crate::ssrf_resolver::build_outbound_webhook_client("talos-sla-monitor/1.0")
     {
         Ok(c) => c,
         Err(e) => {
@@ -5561,20 +5555,16 @@ async fn handle_test_approval_webhook(
         "note": "This is a test notification fired by test_approval_webhook. No real gate was created.",
     });
 
-    // MCP-1034: explicit connect_timeout for fast-fail.
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("talos-approval-gate/1.0")
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("test_approval_webhook: failed to build HTTP client: {}", e);
-            return mcp_error(req_id, -32000, "Failed to build HTTP client");
-        }
-    };
+    // MCP-1034: explicit connect_timeout for fast-fail. L4: shared builder adds
+    // the connect-time SSRF resolver that closes the DNS-rebinding TOCTOU.
+    let client =
+        match crate::ssrf_resolver::build_outbound_webhook_client("talos-approval-gate/1.0") {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("test_approval_webhook: failed to build HTTP client: {}", e);
+                return mcp_error(req_id, -32000, "Failed to build HTTP client");
+            }
+        };
 
     let response = client
         .post(&webhook_url)

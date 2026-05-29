@@ -106,12 +106,38 @@ pub fn verify_freshness(timestamp_ms: i64) -> bool {
 // **Two-generation rotating maps.** Eviction by full scan is O(n)
 // per insert; under sustained load the scan dominates RPC latency.
 // Instead we keep two `DashMap`s — `current` and `previous` — and
-// rotate them every `PAST_WINDOW_MS / 2`. On lookup we check both;
-// on insert we write to `current`. Every rotation drops `previous`
-// in O(1) and promotes `current` to `previous`. Each entry lives
-// between `PAST_WINDOW_MS/2` and `PAST_WINDOW_MS` before being
-// dropped — well within the freshness window the verifier already
-// rejects.
+// rotate them every `PAST_WINDOW_MS` (the full freshness window). On
+// lookup we check both; on insert we write to `current`. Every
+// rotation drops `previous` in O(1) and promotes `current` to
+// `previous`.
+//
+// **Lifetime invariant (replay-coverage).** An entry inserted at time
+// `t` is dropped only after it has been `previous` for a full rotation
+// interval. Worst case — inserted an instant before a rotation — it is
+// promoted to `previous` immediately and then survives until the NEXT
+// rotation, i.e. one full `PAST_WINDOW_MS`. Best case — inserted just
+// after a rotation — it stays in `current` for one interval, then in
+// `previous` for another, i.e. `2 * PAST_WINDOW_MS`. So every entry
+// lives between `PAST_WINDOW_MS` (60 s) and `2 * PAST_WINDOW_MS`
+// (120 s) before being dropped.
+//
+// Because the guaranteed MINIMUM lifetime (60 s) >= the freshness
+// window (`PAST_WINDOW_MS` = 60 s) that `verify_freshness` accepts, a
+// captured request can NEVER be both (a) still fresh enough to pass
+// `verify_freshness` AND (b) already evicted from both generations.
+// No replay is admitted within the freshness window. (Earlier this
+// rotated every `PAST_WINDOW_MS / 2`, which dropped pre-rotation
+// entries after only ~30 s while freshness still accepted them to
+// 60 s — leaving a ~30 s replay band. Fixed by widening residency to
+// the full window rather than shrinking the freshness window, which
+// preserves the documented 60 s no-replay invariant.)
+//
+// **Memory stays bounded.** `NONCE_CACHE_MAX_ENTRIES` caps each
+// generation regardless of the rotation interval, so the cache holds
+// at most `2 * NONCE_CACHE_MAX_ENTRIES` entries at any instant.
+// Doubling per-generation residency (30 s → 60 s) does NOT make the
+// cache unbounded — it only means a generation can fill closer to its
+// cap before being dropped; the cap itself is unchanged.
 //
 // **DashMap, not Mutex<HashMap>.** A single global `Mutex` would
 // serialize every RPC across all four subscribers. `DashMap`
@@ -191,8 +217,19 @@ impl NonceCache {
         }
     }
 
+    /// Rotation cadence. Set to the FULL [`PAST_WINDOW_MS`] (not
+    /// `PAST_WINDOW_MS / 2`) so the two-generation design guarantees a
+    /// minimum per-entry lifetime of one full window: an entry inserted
+    /// immediately before a rotation is promoted to `previous` and
+    /// survives until the next rotation, i.e. `PAST_WINDOW_MS`. That
+    /// minimum (60 s) >= the freshness window [`verify_freshness`]
+    /// accepts (60 s), so a still-fresh captured request can never have
+    /// been evicted from both generations — no replay within the
+    /// freshness window. Memory remains bounded by
+    /// [`NONCE_CACHE_MAX_ENTRIES`] per generation independent of this
+    /// interval (≤ `2 * NONCE_CACHE_MAX_ENTRIES` total).
     fn rotation_interval() -> Duration {
-        Duration::from_millis((PAST_WINDOW_MS / 2) as u64)
+        Duration::from_millis(PAST_WINDOW_MS as u64)
     }
 
     /// Check + record. Returns `true` when fresh (and inserts);
@@ -327,6 +364,20 @@ impl NonceCache {
             *g = Instant::now();
         }
     }
+
+    /// Test-only: rewind `rotated_at` so the next `check_and_record`
+    /// (which calls `rotate_if_due`) sees a full rotation interval as
+    /// elapsed and performs exactly one rotation. This lets the
+    /// lifetime/replay-coverage tests exercise the rotation math
+    /// deterministically without sleeping for `PAST_WINDOW_MS`.
+    #[cfg(test)]
+    fn force_age_one_interval(&self) {
+        if let Ok(mut g) = self.rotated_at.lock() {
+            // Subtract slightly more than one interval so the
+            // `elapsed() >= interval` check in `rotate_if_due` fires.
+            *g = Instant::now() - Self::rotation_interval() - Duration::from_millis(1);
+        }
+    }
 }
 
 static NONCE_CACHE: std::sync::LazyLock<NonceCache> = std::sync::LazyLock::new(NonceCache::new);
@@ -401,6 +452,15 @@ pub fn check_and_record_nonce(subject: &'static str, actor_id: Uuid, nonce: &str
 #[cfg(test)]
 pub(crate) fn clear_nonce_cache_for_test() {
     NONCE_CACHE.clear();
+}
+
+/// Test-only: rewind the global nonce cache's rotation clock by one
+/// full rotation interval so the next `check_and_record_nonce` triggers
+/// exactly one rotation. Used by the replay-coverage tests to age an
+/// entry past a rotation boundary without real-time sleeps.
+#[cfg(test)]
+pub(crate) fn force_age_nonce_cache_one_interval_for_test() {
+    NONCE_CACHE.force_age_one_interval();
 }
 
 /// Test-only serialization lock for the process-global nonce cache.
@@ -803,6 +863,90 @@ mod nonce_cache_concurrency_tests {
         assert_eq!(
             admitted, 100,
             "expected all 100 distinct nonces admitted; got {admitted}"
+        );
+    }
+
+    /// Replay-coverage invariant (MEDIUM replay-gap fix): an entry must
+    /// survive at least one FULL rotation cycle so a captured request
+    /// that is still within the freshness window can never have been
+    /// evicted from both generations.
+    ///
+    /// With `rotation_interval == PAST_WINDOW_MS` and two generations,
+    /// an entry inserted just before a rotation is promoted to
+    /// `previous` and survives until the next rotation — a guaranteed
+    /// minimum lifetime of one full `PAST_WINDOW_MS`. We simulate the
+    /// worst case (insert, then one rotation immediately after) by
+    /// rewinding the rotation clock so the next call rotates exactly
+    /// once, then assert the nonce is still detected as a replay.
+    #[test]
+    fn nonce_survives_one_full_rotation_cycle() {
+        let _g = nonce_test_lock();
+        clear_nonce_cache_for_test();
+        let actor = uuid::Uuid::new_v4();
+        let nonce = random_nonce();
+
+        // First sight: admitted, lands in `current`.
+        assert!(
+            check_and_record_nonce("memory_rpc", actor, &nonce),
+            "first sighting of a fresh nonce must be admitted"
+        );
+
+        // Age the cache by one full interval. The NEXT check_and_record
+        // will rotate exactly once: `current` (holding our nonce) is
+        // promoted to `previous`, a fresh empty `current` is installed.
+        // This models a request captured an instant before a rotation —
+        // the worst case for entry lifetime.
+        force_age_nonce_cache_one_interval_for_test();
+
+        // Replay of the SAME nonce: must still be rejected. It now lives
+        // in `previous`; the rotation that happened on this very call
+        // moved it there but did NOT drop it. This is the band that the
+        // old `PAST_WINDOW_MS / 2` interval failed to cover.
+        assert!(
+            !check_and_record_nonce("memory_rpc", actor, &nonce),
+            "nonce aged just under PAST_WINDOW_MS must still be a replay \
+             (survives at least one full rotation cycle)"
+        );
+
+        // A different fresh nonce on the same call path is still
+        // admitted — the surviving entry didn't block unrelated traffic
+        // and the rotation left `current` writable.
+        let other = random_nonce();
+        assert!(
+            check_and_record_nonce("memory_rpc", actor, &other),
+            "a distinct fresh nonce must still be admitted after rotation"
+        );
+    }
+
+    /// After TWO full rotation cycles, the original entry has aged out
+    /// of both generations (current → previous → dropped). This pins
+    /// the UPPER bound of the lifetime so the test for the lower bound
+    /// above isn't trivially satisfied by an entry that never expires.
+    #[test]
+    fn nonce_evicted_after_two_full_rotation_cycles() {
+        let _g = nonce_test_lock();
+        clear_nonce_cache_for_test();
+        let actor = uuid::Uuid::new_v4();
+        let nonce = random_nonce();
+
+        assert!(check_and_record_nonce("memory_rpc", actor, &nonce));
+
+        // First rotation: nonce current → previous (still tracked).
+        force_age_nonce_cache_one_interval_for_test();
+        assert!(
+            !check_and_record_nonce("memory_rpc", actor, &nonce),
+            "after one rotation the nonce is in `previous`, still a replay"
+        );
+
+        // Second rotation: nonce previous → dropped. At this point a
+        // real request would also be stale (>= 2 * PAST_WINDOW_MS old)
+        // and rejected by verify_freshness, so re-admission here is
+        // outside the security-relevant window.
+        force_age_nonce_cache_one_interval_for_test();
+        assert!(
+            check_and_record_nonce("memory_rpc", actor, &nonce),
+            "after two full rotations the nonce has aged out of both \
+             generations and is re-admitted (upper bound of lifetime)"
         );
     }
 }

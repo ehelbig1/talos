@@ -597,6 +597,11 @@ pub struct DistributedRateLimiter {
     window_secs: u64,
     prefix: String,
     policy: RateLimitFallbackPolicy,
+    /// M4 (2026-05-28 review): cached, auto-reconnecting multiplexed
+    /// connection. This limiter is on the per-request hot path; the old
+    /// `get_multiplexed_tokio_connection()`-per-check opened a fresh
+    /// connection (TCP + TLS + AUTH) on every request. See `conn_or_init`.
+    conn_mgr: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
 }
 
 impl DistributedRateLimiter {
@@ -635,7 +640,25 @@ impl DistributedRateLimiter {
             window_secs: config.per.as_secs(),
             prefix: prefix.to_string(),
             policy,
+            conn_mgr: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// M4: hand out a clone of ONE cached, auto-reconnecting multiplexed
+    /// connection instead of opening a fresh connection per request.
+    /// `ConnectionManager` keeps one socket open and reconnects transparently;
+    /// clones share it. `get_or_try_init` does not cache an init failure, so a
+    /// Redis outage at first use is retried (and meanwhile `check` applies the
+    /// configured fail-open / fail-closed fallback policy).
+    async fn conn_or_init(
+        &self,
+        client: &redis::Client,
+    ) -> Result<redis::aio::ConnectionManager, redis::RedisError> {
+        let mgr = self
+            .conn_mgr
+            .get_or_try_init(|| async { redis::aio::ConnectionManager::new(client.clone()).await })
+            .await?;
+        Ok(mgr.clone())
     }
 
     /// Create a distributed rate limiter that auto-detects the fallback policy
@@ -694,7 +717,7 @@ impl DistributedRateLimiter {
         identifier: &str,
     ) -> Result<bool, redis::RedisError> {
         let key = format!("rl:{}:{}", self.prefix, identifier);
-        let mut con = client.get_multiplexed_tokio_connection().await?;
+        let mut con = self.conn_or_init(client).await?;
         // MCP-442: INCR and EXPIRE used to be two separate commands. If
         // the EXPIRE leg failed (transient network blip, server
         // reconnect mid-flight), INCR had already created the key with

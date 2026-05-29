@@ -38,6 +38,11 @@ pub struct NodeResultCache {
     enabled: bool,
     /// Cache TTL in seconds (default: 7 days).
     ttl_secs: u64,
+    /// M4 (2026-05-28 review): cached, auto-reconnecting multiplexed
+    /// connection. The cache runs on every cacheable minimal-node execution;
+    /// the old `get_multiplexed_async_connection()`-per-get/put opened a fresh
+    /// connection (TCP + TLS + AUTH) each time. See `conn_or_init`.
+    conn_mgr: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
 }
 
 impl NodeResultCache {
@@ -79,7 +84,25 @@ impl NodeResultCache {
             db_pool,
             enabled,
             ttl_secs,
+            conn_mgr: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// M4: hand out a clone of ONE cached, auto-reconnecting multiplexed
+    /// connection instead of opening a fresh one per get/put. `ConnectionManager`
+    /// keeps one socket open and reconnects transparently; clones share it.
+    /// `get_or_try_init` does not cache an init failure, so a Redis outage at
+    /// first use is retried on the next call (and meanwhile the cache layer
+    /// simply degrades to a miss + the durable Postgres layer).
+    async fn conn_or_init(
+        &self,
+        client: &redis::Client,
+    ) -> Result<redis::aio::ConnectionManager, redis::RedisError> {
+        let mgr = self
+            .conn_mgr
+            .get_or_try_init(|| async { redis::aio::ConnectionManager::new(client.clone()).await })
+            .await?;
+        Ok(mgr.clone())
     }
 
     /// Look up a cached result. Tries Redis first, then PostgreSQL.
@@ -90,7 +113,7 @@ impl NodeResultCache {
 
         // Layer 1: Redis
         if let Some(ref client) = self.redis_client {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+            if let Ok(mut conn) = self.conn_or_init(client).await {
                 let redis_key = format!("ncache:{}", cache_key);
                 if let Ok(Some(json_str)) = redis::cmd("GET")
                     .arg(&redis_key)
@@ -126,7 +149,7 @@ impl NodeResultCache {
             tracing::debug!(cache_key = cache_key, layer = "postgres", "Node cache hit");
             // Backfill Redis for future fast lookups
             if let Some(ref client) = self.redis_client {
-                if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                if let Ok(mut conn) = self.conn_or_init(client).await {
                     let redis_key = format!("ncache:{}", cache_key);
                     let _ = redis::cmd("SETEX")
                         .arg(&redis_key)
@@ -156,7 +179,7 @@ impl NodeResultCache {
 
         // Layer 1: Redis (fire-and-forget)
         if let Some(ref client) = self.redis_client {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+            if let Ok(mut conn) = self.conn_or_init(client).await {
                 let redis_key = format!("ncache:{}", cache_key);
                 let _ = redis::cmd("SETEX")
                     .arg(&redis_key)

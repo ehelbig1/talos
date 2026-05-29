@@ -403,6 +403,110 @@ pub fn check_outbound_url_no_ssrf(url: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Classify an IPv4 address: `Some(policy)` = refuse to connect, `None` = allow.
+///
+/// Same range coverage as the worker's `classify_private_ipv4`
+/// (loopback / RFC-1918 / link-local / multicast / broadcast / the whole
+/// `0.0.0.0/8` unspecified subnet / RFC-6598 CGNAT `100.64.0.0/10`). Kept in
+/// sync with that one — both encode the SSRF deny-list this crate's URL-level
+/// `check_outbound_url_no_ssrf` already enforces.
+fn classify_private_ipv4(addr: std::net::Ipv4Addr) -> Option<&'static str> {
+    if addr.is_loopback()
+        || addr.is_private()
+        || addr.is_link_local()
+        || addr.is_multicast()
+        || addr.is_broadcast()
+    {
+        return Some("private-ip");
+    }
+    // Entire 0.0.0.0/8: on Linux connecting to 0.x routes to loopback.
+    if addr.octets()[0] == 0 {
+        return Some("private-ip-unspecified");
+    }
+    // RFC 6598 CGNAT 100.64.0.0/10 — routable internally, not on the public net.
+    let addr_u32 = u32::from(addr);
+    if (addr_u32 >> 22) == (0x6440_0000u32 >> 22) {
+        return Some("private-ip-cgnat");
+    }
+    None
+}
+
+/// Classify an IP (v4 or v6) for SSRF purposes: `Some(policy)` = refuse,
+/// `None` = allow. This is the canonical IP-level deny-list used by the
+/// connect-time DNS resolver that closes the DNS-rebinding TOCTOU on
+/// controller-side outbound clients (L4, 2026-05-28 review). IPv4-mapped IPv6
+/// (`::ffff:A.B.C.D`) is canonicalized first so the v4 rules can't be bypassed
+/// by spelling an address in IPv6.
+pub fn classify_private_ip(ip: std::net::IpAddr) -> Option<&'static str> {
+    match ip {
+        std::net::IpAddr::V4(addr) => classify_private_ipv4(addr),
+        std::net::IpAddr::V6(addr) => {
+            if let Some(mapped) = addr.to_ipv4_mapped() {
+                if let Some(reason) = classify_private_ipv4(mapped) {
+                    return Some(match reason {
+                        "private-ip-cgnat" => "private-ip-cgnat-ipv4-mapped-ipv6",
+                        _ => "private-ip-ipv4-mapped-ipv6",
+                    });
+                }
+            }
+            if addr.is_loopback() || addr.is_multicast() {
+                return Some("private-ip");
+            }
+            if addr.is_unspecified() {
+                return Some("private-ip-unspecified");
+            }
+            // IPv6 link-local (fe80::/10) and unique-local (fc00::/7).
+            let first = addr.segments()[0];
+            if (first & 0xffc0) == 0xfe80 || (first & 0xfe00) == 0xfc00 {
+                return Some("private-ip");
+            }
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod classify_private_ip_tests {
+    use super::classify_private_ip;
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    fn ip(s: &str) -> IpAddr {
+        IpAddr::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn allows_public_ipv4_and_ipv6() {
+        assert!(classify_private_ip(ip("8.8.8.8")).is_none());
+        assert!(classify_private_ip(ip("1.1.1.1")).is_none());
+        assert!(classify_private_ip(ip("2606:4700:4700::1111")).is_none());
+    }
+
+    #[test]
+    fn rejects_loopback_private_linklocal_metadata() {
+        assert!(classify_private_ip(ip("127.0.0.1")).is_some());
+        assert!(classify_private_ip(ip("10.0.0.5")).is_some());
+        assert!(classify_private_ip(ip("172.16.3.4")).is_some());
+        assert!(classify_private_ip(ip("192.168.1.1")).is_some());
+        assert!(classify_private_ip(ip("169.254.169.254")).is_some()); // cloud metadata
+        assert!(classify_private_ip(ip("0.0.0.0")).is_some());
+        assert!(classify_private_ip(ip("0.1.2.3")).is_some()); // 0.0.0.0/8
+        assert!(classify_private_ip(ip("100.64.0.1")).is_some()); // CGNAT
+    }
+
+    #[test]
+    fn rejects_ipv6_loopback_ula_linklocal_and_mapped_v4() {
+        assert!(classify_private_ip(ip("::1")).is_some());
+        assert!(classify_private_ip(ip("fe80::1")).is_some());
+        assert!(classify_private_ip(ip("fc00::1")).is_some());
+        assert!(classify_private_ip(ip("::")).is_some());
+        // ::ffff:169.254.169.254 — metadata via IPv4-mapped IPv6.
+        assert!(classify_private_ip(ip("::ffff:169.254.169.254")).is_some());
+        // ::ffff:10.0.0.1 — RFC-1918 via mapped IPv6.
+        assert!(classify_private_ip(ip("::ffff:10.0.0.1")).is_some());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::check_outbound_url_no_ssrf;

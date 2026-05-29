@@ -143,6 +143,30 @@ pub static DEFAULT_NODE_TIMEOUT_SECS: LazyLock<u64> = LazyLock::new(|| {
         .unwrap_or(60)
 });
 
+/// M5 (2026-05-28 review): maximum number of node-dispatch futures the reactor
+/// keeps in flight at once (the `executing` pool: regular module nodes +
+/// pipeline-chain heads). Without a ceiling, a wide fan-out — a diamond / many
+/// parallel branches — drained the whole `ready` queue and pushed EVERY branch's
+/// NATS job into the pool simultaneously, and recursive sub-workflows multiplied
+/// it, saturating the worker fleet / NATS in-flight cap. The reactor now stops
+/// pulling from `ready` once the pool reaches this size and resumes as futures
+/// complete (backpressure), which throttles dispatch without changing any
+/// observable result or ordering. The historical doc note said "8 is enough for
+/// typical fan-out"; that is the default. Override via `TALOS_MAX_CONCURRENT_NODES`.
+pub(crate) const DEFAULT_MAX_CONCURRENT_NODE_DISPATCH: usize = 8;
+
+/// Resolved `TALOS_MAX_CONCURRENT_NODES` (see
+/// [`DEFAULT_MAX_CONCURRENT_NODE_DISPATCH`]). Clamped to `>= 1` so a `0` /
+/// negative / unparseable value can never wedge the reactor (a cap of 0 would
+/// never dispatch anything).
+pub(crate) static MAX_CONCURRENT_NODE_DISPATCH: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("TALOS_MAX_CONCURRENT_NODES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_NODE_DISPATCH)
+});
+
 /// Maximum entries the rate-limit counter retains before eviction
 /// kicks in. Tuned to be cheap to scan (`DashMap::retain` over ≤ 1000
 /// shards-worth of entries is sub-millisecond) while still letting a
@@ -2408,23 +2432,33 @@ impl ParallelWorkflowEngine {
             inputs
         };
 
-        // 1. Run child workflow N times sequentially.
-        let mut all_results: Vec<JsonValue> = Vec::with_capacity(run_count as usize);
-        for _i in 0..run_count {
-            let out = match self
-                .execute_subworkflow_graph(
-                    child_wf_id,
-                    clean_input.clone(),
-                    dispatcher.clone(),
-                    worker_shared_key.clone(),
-                )
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => e.into_error_envelope("Ensemble child"),
-            };
-            all_results.push(out);
-        }
+        // 1. Run the child workflow N times. M6 (2026-05-28 review): the N runs
+        // are INDEPENDENT (identical input), so run them CONCURRENTLY instead of
+        // sequentially — pre-fix wall-clock was run_count × child-latency (a
+        // 5-run ensemble of a 10s child took ~50s instead of ~10s). `buffered`
+        // preserves run order so `first_pass` (picks the first non-error) and
+        // the recorded metadata stay deterministic, and bounds concurrency at
+        // MAX_CONCURRENT_NODE_DISPATCH so a large run_count (or nested
+        // ensembles) can't stampede the worker fleet. The sibling `sub_workflow`
+        // fan-out path was already parallel; ensemble had been missed.
+        let candidate_futs = (0..run_count).map(|_i| {
+            let input = clean_input.clone();
+            let dispatcher = dispatcher.clone();
+            let wsk = worker_shared_key.clone();
+            async move {
+                match self
+                    .execute_subworkflow_graph(child_wf_id, input, dispatcher, wsk)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => e.into_error_envelope("Ensemble child"),
+                }
+            }
+        });
+        let all_results: Vec<JsonValue> = futures::stream::iter(candidate_futs)
+            .buffered(*MAX_CONCURRENT_NODE_DISPATCH)
+            .collect()
+            .await;
 
         // 2. Pick a winner via the consensus strategy.
         let consensus_output: JsonValue = match consensus_strategy.as_str() {
@@ -4636,9 +4670,23 @@ impl ParallelWorkflowEngine {
         let mut node_timings: HashMap<String, u64> = HashMap::new();
         let mut node_start_times: HashMap<NodeIndex, std::time::Instant> = HashMap::new();
 
+        // M5: ceiling on concurrent node-dispatch futures (see
+        // MAX_CONCURRENT_NODE_DISPATCH). Resolved once per run.
+        let max_concurrent_nodes = *MAX_CONCURRENT_NODE_DISPATCH;
+
         // Main reactor loop.
         while !ready.is_empty() || !executing.is_empty() {
-            while let Some(node_idx) = ready.pop_front() {
+            // M5: stop pulling new work from `ready` once the in-flight pool is
+            // full; fall through to `executing.next().await` below to drain a
+            // slot first. Deadlock-safe: we only stop early while `executing` is
+            // non-empty (it's at the cap), so a completion is always pending to
+            // await. Synchronous / inline-await node kinds that don't push to
+            // the pool simply get processed on the next pass once a slot frees —
+            // correctness and ordering are unchanged, only dispatch is throttled.
+            while executing.len() < max_concurrent_nodes {
+                let Some(node_idx) = ready.pop_front() else {
+                    break;
+                };
                 // ── Pipeline dispatch (chain head, fresh runs only) ──────
                 if let Some(&chain_idx) = node_to_chain.get(&node_idx) {
                     // Only dispatch when we're at the chain head; non-
@@ -5027,17 +5075,33 @@ impl ParallelWorkflowEngine {
                     }
                     ready = keep;
 
-                    let dispatch_futs = sub_wf_batch.iter().map(|(idx, id)| {
+                    // `.copied()` yields owned `(NodeIndex, Uuid)` (both Copy) so
+                    // the dispatch closure's arg isn't a borrow of the batch —
+                    // `buffered` needs a higher-ranked closure that a
+                    // `&(NodeIndex, Uuid)` arg does not satisfy. `sub_wf_batch`
+                    // stays intact for the order-preserving zip below.
+                    let dispatch_futs = sub_wf_batch.iter().copied().map(|(idx, id)| {
                         self.try_dispatch_sub_workflow(
-                            *idx,
-                            *id,
+                            idx,
+                            id,
                             execution_id,
                             &dispatcher,
                             &worker_shared_key,
                             &results,
                         )
                     });
-                    let outputs = futures::future::join_all(dispatch_futs).await;
+                    // M5: bound the sub-workflow fan-out to the same in-flight
+                    // ceiling as the module-node pool. `join_all` ran ALL ready
+                    // sub-workflows at once (and each recursively fans out),
+                    // which could multiply into worker-fleet / NATS saturation.
+                    // `buffered` runs at most `max_concurrent_nodes` concurrently
+                    // and — crucially — yields results in INPUT ORDER, so the
+                    // `sub_wf_batch.zip(outputs)` mapping below stays correct
+                    // (unlike `buffer_unordered`).
+                    let outputs: Vec<Option<JsonValue>> = futures::stream::iter(dispatch_futs)
+                        .buffered(max_concurrent_nodes)
+                        .collect()
+                        .await;
 
                     for ((idx, id), output) in sub_wf_batch.into_iter().zip(outputs) {
                         if let Some(out) = output {

@@ -3502,9 +3502,11 @@ async fn main() -> anyhow::Result<()> {
     let graphql_routes = Router::new()
         .route("/graphql", graphql_route)
         .route("/ws", get(websocket_handler))
-        // Limit request body to 5 MB — prevents oversized GraphQL documents from
+        // Limit request body — prevents oversized GraphQL documents from
         // exhausting memory before the query depth/complexity limits fire.
-        .layer(DefaultBodyLimit::max(5 * 1024 * 1024))
+        // L5: shares `csrf::GRAPHQL_MAX_BODY_BYTES` with the CSRF middleware's
+        // dev body-buffer cap so the two limits can never silently diverge.
+        .layer(DefaultBodyLimit::max(csrf::GRAPHQL_MAX_BODY_BYTES))
         // CSRF protection (production only for mutations, lenient in dev)
         .layer(from_fn(csrf::csrf_protection_graphql))
         .layer(from_fn(rate_limit::rate_limit_middleware))

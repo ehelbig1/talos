@@ -73,17 +73,36 @@ pub(crate) async fn build_encrypted_secrets_for(
         });
 
     // 2. Statically-declared extra paths (module's `allowed_secrets` list).
+    //
+    // Tier-1 defense in depth: drop any LLM-provider vault path from the
+    // declared set before resolving. A module that declares
+    // `allowed_secrets: ["*"]` (the common wildcard default, expanded to
+    // a concrete path set upstream) or that names `anthropic/api_key`
+    // directly would otherwise resolve an external-provider key and seal
+    // it into a tier-1 job's `encrypted_secrets`. The worker's deny-list
+    // refuses to *use* it, but per the documented invariant a tier-1 job
+    // must never carry such a key on the wire (encrypted or otherwise) —
+    // we drop it here so a future worker-side bypass ends at "no key
+    // present" rather than "key present but refused". Same rationale as
+    // the step-5 LLM-prefetch skip below.
+    let extra_paths = filter_tier1_paths(extra_paths, max_llm_tier);
     if !extra_paths.is_empty() {
-        match resolver.resolve_by_paths(extra_paths, user_id).await {
+        match resolver.resolve_by_paths(&extra_paths, user_id).await {
             Ok(declared) => secrets_map.extend(declared),
             Err(e) => tracing::warn!(error = %e, "Failed to fetch module declared secrets"),
         }
     }
 
     // 3-4. OAuth refresh + dynamic vault paths.
+    //
+    // Tier-1 defense in depth (mirrors step 2): a node whose config
+    // contains `vault://anthropic/api_key` would otherwise seal that key
+    // into a tier-1 job. Filter the LLM-provider paths out of the dynamic
+    // set too, before both the OAuth refresh hook and the resolve.
+    let vault_paths = filter_tier1_paths(vault_paths, max_llm_tier);
     if !vault_paths.is_empty() {
-        resolver.refresh_vault_paths(vault_paths).await;
-        match resolver.resolve_by_paths(vault_paths, user_id).await {
+        resolver.refresh_vault_paths(&vault_paths).await;
+        match resolver.resolve_by_paths(&vault_paths, user_id).await {
             Ok(v) => secrets_map.extend(v),
             Err(e) => tracing::error!(
                 error = %e,
@@ -172,6 +191,36 @@ pub(crate) async fn build_encrypted_secrets_for(
     }
 }
 
+/// Tier-1 LLM-provider path filter (single source of truth for the
+/// step-2 and step-4 defense-in-depth drop).
+///
+/// For [`LlmTier::Tier2`] this is an identity copy — tier-2 behavior is
+/// unchanged. For [`LlmTier::Tier1`] it drops every path for which
+/// [`talos_workflow_job_protocol::is_llm_provider_vault_path`] returns
+/// true, so an external-provider key (`anthropic/api_key`,
+/// `openai/api_key`, `gemini/api_key`) declared via a module's
+/// `allowed_secrets` (including the `["*"]` wildcard expanded to a
+/// concrete path set upstream) or referenced via a `vault://…` node
+/// config entry never gets resolved into — and therefore never sealed
+/// into — a tier-1 job's `encrypted_secrets`.
+///
+/// [`LlmTier::Tier1`]: talos_workflow_engine_core::LlmTier::Tier1
+/// [`LlmTier::Tier2`]: talos_workflow_engine_core::LlmTier::Tier2
+pub(crate) fn filter_tier1_paths(
+    paths: &[String],
+    max_llm_tier: talos_workflow_engine_core::LlmTier,
+) -> Vec<String> {
+    if matches!(max_llm_tier, talos_workflow_engine_core::LlmTier::Tier1) {
+        paths
+            .iter()
+            .filter(|p| !talos_workflow_job_protocol::is_llm_provider_vault_path(p))
+            .cloned()
+            .collect()
+    } else {
+        paths.to_vec()
+    }
+}
+
 /// Extract `vault://…` paths from a node config, stripping the prefix.
 ///
 /// Thin wrapper over [`crate::vault_resolver::extract_vault_refs`] that
@@ -183,4 +232,62 @@ pub(crate) fn extract_vault_paths(config: &serde_json::Value) -> Vec<String> {
         .into_iter()
         .map(|(_key, path)| path)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_tier1_paths;
+    use talos_workflow_engine_core::LlmTier;
+
+    fn paths() -> Vec<String> {
+        vec![
+            "anthropic/api_key".to_string(),
+            "openai/api_key".to_string(),
+            "gemini/api_key".to_string(),
+            "stripe/secret_key".to_string(),
+            "github/token".to_string(),
+        ]
+    }
+
+    #[test]
+    fn tier1_drops_all_llm_provider_paths() {
+        let out = filter_tier1_paths(&paths(), LlmTier::Tier1);
+        // No LLM-provider key survives for a tier-1 job.
+        assert!(!out.iter().any(|p| p == "anthropic/api_key"));
+        assert!(!out.iter().any(|p| p == "openai/api_key"));
+        assert!(!out.iter().any(|p| p == "gemini/api_key"));
+        // Non-LLM secrets are untouched — tier-1 nodes still get their
+        // Stripe / GitHub credentials.
+        assert_eq!(
+            out,
+            vec!["stripe/secret_key".to_string(), "github/token".to_string()]
+        );
+    }
+
+    #[test]
+    fn tier2_is_an_identity_copy() {
+        let input = paths();
+        let out = filter_tier1_paths(&input, LlmTier::Tier2);
+        // Tier-2 behavior is unchanged — every path including the LLM
+        // provider keys is preserved.
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn tier1_wildcard_expansion_drops_llm_paths() {
+        // Simulates an `allowed_secrets: ["*"]` grant expanded upstream
+        // to a concrete path set that happens to include a provider key.
+        let expanded = vec![
+            "anthropic/api_key".to_string(),
+            "service/db_url".to_string(),
+        ];
+        let out = filter_tier1_paths(&expanded, LlmTier::Tier1);
+        assert_eq!(out, vec!["service/db_url".to_string()]);
+    }
+
+    #[test]
+    fn tier1_empty_input_yields_empty() {
+        let out = filter_tier1_paths(&[], LlmTier::Tier1);
+        assert!(out.is_empty());
+    }
 }

@@ -1082,12 +1082,48 @@ pub struct TalosRuntime {
 
 // ── Linker builders ──────────────────────────────────────────────────────────
 
+/// Register ONLY the `wasi:http/types` interface (the request/response data
+/// types) WITHOUT `wasi:http/outgoing-handler` (the egress channel).
+///
+/// SECURITY (H2, 2026-05-28 review): the upstream
+/// [`wasmtime_wasi_http::p2::add_only_http_to_linker_async`] registers BOTH
+/// `wasi:http/types` AND `wasi:http/outgoing-handler`. The handler's default
+/// send path ([`wasmtime_wasi_http::p2::default_hooks`]) connects with raw
+/// hyper/tokio — NO SSRF filter, NO host allowlist, NO tier-1 egress gate, NO
+/// private-IP / metadata-endpoint (169.254.169.254) check. Talos's entire
+/// outbound-network defense (allowlist, `SsrfFilteringResolver`,
+/// `classify_private_ip`, tier-1 LLM-egress deny, rate limit, circuit breaker)
+/// lives EXCLUSIVELY on the `talos:core/http` path. Linking
+/// `wasi:http/outgoing-handler` into a non-trusted world therefore created a
+/// parallel, completely unfiltered egress channel that bypassed every gate —
+/// a latent full SSRF / tier-1-egress bypass for any component that imported
+/// it (and previously it was wired even into the pure-compute `minimal` world).
+///
+/// No Talos WIT world imports `wasi:http` at all, so the types are not strictly
+/// required either; we register them (and only them) in non-trusted worlds to
+/// preserve forward type-compatibility while ensuring the egress handler is
+/// unavailable — a component importing `wasi:http/outgoing-handler` under a
+/// non-trusted world now FAILS TO LINK (fail closed). The full handler is
+/// registered ONLY by [`build_trusted_linker`], whose automation modules are
+/// operator-authored and allowed unrestricted egress by design.
+fn add_wasi_http_types_only(l: &mut Linker<TalosContext>) -> Result<()> {
+    use wasmtime_wasi_http::p2::{bindings, WasiHttp};
+    let options = bindings::LinkOptions::default();
+    bindings::http::types::add_to_linker::<_, WasiHttp>(
+        l,
+        &options.into(),
+        <TalosContext as wasmtime_wasi_http::p2::WasiHttpView>::http,
+    )?;
+    Ok(())
+}
+
 /// Build the minimal-tier linker: WASI + logging + json + datetime + crypto + env.
 fn build_minimal_linker(engine: &Engine) -> Result<Linker<TalosContext>> {
     let mut l = Linker::new(engine);
 
     wasmtime_wasi::p2::add_to_linker_async(&mut l)?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut l)?;
+    // SECURITY (H2): types only — NO outgoing-handler. See add_wasi_http_types_only.
+    add_wasi_http_types_only(&mut l)?;
     crate::bindings::talos::core::logging::add_to_linker::<TalosContext, HasSelf<TalosContext>>(
         &mut l,
         |c| c,
@@ -1117,7 +1153,10 @@ fn build_network_linker(engine: &Engine) -> Result<Linker<TalosContext>> {
     let mut l = Linker::new(engine);
 
     wasmtime_wasi::p2::add_to_linker_async(&mut l)?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut l)?;
+    // SECURITY (H2): types only — NO outgoing-handler. The talos:core/http
+    // path below is the only sanctioned egress for this tier. See
+    // add_wasi_http_types_only.
+    add_wasi_http_types_only(&mut l)?;
     // Minimal interfaces
     crate::bindings::talos::core::logging::add_to_linker::<TalosContext, HasSelf<TalosContext>>(
         &mut l,
@@ -1194,6 +1233,11 @@ fn build_trusted_linker(engine: &Engine) -> Result<Linker<TalosContext>> {
     let mut l = Linker::new(engine);
 
     wasmtime_wasi::p2::add_to_linker_async(&mut l)?;
+    // SECURITY (H2): the trusted/automation tier is the ONLY world that
+    // receives the full `wasi:http` surface including `outgoing-handler`
+    // (unfiltered egress via default_hooks). Trusted modules are
+    // operator-authored and allowed unrestricted egress by design;
+    // non-trusted worlds get types only (see add_wasi_http_types_only).
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut l)?;
     crate::bindings::AutomationNode::add_to_linker::<TalosContext, HasSelf<TalosContext>>(
         &mut l,
@@ -3949,6 +3993,63 @@ mod tests {
         assert_eq!(status.component_cache_size, 0);
         assert!(!status.has_redis);
         assert!(!status.has_nats);
+    }
+
+    /// SECURITY (H2): `wasi:http/outgoing-handler` (the UNFILTERED egress
+    /// channel — see [`add_wasi_http_types_only`]) must be registered ONLY in
+    /// the trusted/automation linker, never in any non-trusted world.
+    ///
+    /// We probe each built linker by attempting to register outgoing-handler
+    /// ourselves: if the interface is ALREADY present the re-add fails with a
+    /// duplicate-definition error (so the linker HAS it); if absent the add
+    /// succeeds (so the linker does NOT have it — a guest importing it would
+    /// fail to link, i.e. fail closed).
+    #[test]
+    fn wasi_http_outgoing_handler_only_in_trusted_linker() {
+        use wasmtime_wasi_http::p2::{bindings, WasiHttp};
+
+        fn test_engine() -> Engine {
+            let mut c = Config::new();
+            c.wasm_component_model(true);
+            Engine::new(&c).expect("engine")
+        }
+
+        // true  => the linker ALREADY has outgoing-handler (re-add errors)
+        // false => the linker does NOT have it (re-add succeeds)
+        fn has_outgoing_handler(mut l: Linker<TalosContext>) -> bool {
+            bindings::http::outgoing_handler::add_to_linker::<_, WasiHttp>(
+                &mut l,
+                <TalosContext as wasmtime_wasi_http::p2::WasiHttpView>::http,
+            )
+            .is_err()
+        }
+
+        let eng = test_engine();
+
+        // Non-trusted worlds (and the two that derive from network) must NOT
+        // expose the unfiltered egress handler.
+        assert!(
+            !has_outgoing_handler(build_minimal_linker(&eng).unwrap()),
+            "minimal linker must NOT register wasi:http/outgoing-handler"
+        );
+        assert!(
+            !has_outgoing_handler(build_network_linker(&eng).unwrap()),
+            "network linker must NOT register wasi:http/outgoing-handler"
+        );
+        assert!(
+            !has_outgoing_handler(build_governance_linker(&eng).unwrap()),
+            "governance linker (derives from network) must NOT register outgoing-handler"
+        );
+        assert!(
+            !has_outgoing_handler(build_secrets_linker(&eng).unwrap()),
+            "secrets linker (derives from network) must NOT register outgoing-handler"
+        );
+
+        // The trusted/automation tier IS allowed unrestricted egress by design.
+        assert!(
+            has_outgoing_handler(build_trusted_linker(&eng).unwrap()),
+            "trusted linker MUST register wasi:http/outgoing-handler"
+        );
     }
 
     // -----------------------------------------------------------------------
