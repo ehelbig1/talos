@@ -255,12 +255,38 @@ moment the policy turns on. So RLS lands in the *same* deploy as the
     Repositories with `query!` macro sites need `cargo sqlx prepare`
     against a migrated DB (note: `WorkflowRepository` is all-runtime, no
     prepare needed).
-- **M4 — RLS.** `ENABLE ROW LEVEL SECURITY` + the membership-union policy
-  above + `FORCE ROW LEVEL SECURITY` on sensitive tables, shipped in the
-  M3 deploy so the GUCs are always set first, and only after the
-  controller's DB role is confirmed non-superuser (the boot guard
-  escalates to refuse-to-serve here). `secrets` first (per RFC 0001
-  §T1.5 — the table where a missed WHERE is unbounded).
+- **M4 — RLS, rolled out INCREMENTALLY (no big-bang).** The earlier
+  worry was that RLS is all-or-nothing per table — enabling it before
+  *every* access path sets the GUCs would fail-close the un-wired paths.
+  That's resolved with a **permissive-when-unset** policy, so each table
+  can be enabled non-breakingly and its paths wired one at a time:
+
+  ```sql
+  CREATE POLICY <t>_tenant_isolation ON <t> USING (
+    -- transition phase: no GUC set (un-wired path) → permissive (RLS
+    -- is a no-op; the app-layer WHERE still protects). Reset-to-empty
+    -- on a recycled pooled connection ALSO lands here (NULLIF→NULL).
+    NULLIF(current_setting('app.current_user_id', true), '') IS NULL
+    -- wired path: enforce the membership union.
+    OR user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    OR org_id = ANY(string_to_array(
+         NULLIF(current_setting('app.current_org_ids', true), ''), ',')::uuid[])
+  );
+  ```
+
+  Rollout per table: (a) `ENABLE` + `FORCE ROW LEVEL SECURITY` with the
+  permissive policy — non-breaking; (b) wire each access path to open a
+  `begin_tenant_read_scoped` tx (the wired paths become enforced); (c)
+  once every path is wired, **drop the permissive `IS NULL` clause** so
+  the table is fail-closed. Only enable after the boot guard confirms a
+  non-superuser DB role (it escalates to refuse-to-serve at this point).
+  `secrets` first (RFC 0001 §T1.5 — the table where a missed WHERE is
+  unbounded).
+
+  Validated end-to-end in `talos-db/tests/rls_org_isolation.rs`
+  (`permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set`):
+  unset GUC → sees all (non-breaking); scoped → enforced union;
+  reset-to-empty on a reused connection → permissive (not deny).
 - **T2 (later) — per-org KEK.** RFC 0001 §T2 with tenant → org: each org
   gets a KEK wrapping its DEKs; offboarding an org = deleting its KEK.
 - **T3 (later) — physical.** Schema-per-org only if a compliance auditor

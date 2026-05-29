@@ -269,3 +269,123 @@ async fn membership_union_rls_shows_owned_and_member_orgs_only() {
         .execute(format!("DROP ROLE IF EXISTS {UNION_ROLE};").as_str())
         .await;
 }
+
+const PERM_ROLE: &str = "talos_rls_perm_app";
+
+/// Proves the M4 INCREMENTAL-rollout policy: permissive when the GUC is
+/// unset/empty (so enabling RLS doesn't break un-wired paths — they keep
+/// relying on the app layer), enforced when the GUC is set (wired paths
+/// get the union backstop). Crucially exercises the pooling case: after a
+/// scoped tx commits, the custom GUC resets to '' on the SAME connection,
+/// and a bare query must fall back to PERMISSIVE — not deny. Uses a
+/// 1-connection pool to force that connection reuse.
+#[tokio::test]
+async fn permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set() {
+    let Some(su_url) = superuser_url() else { return };
+    let su = connect(&su_url).await;
+    let user = Uuid::new_v4();
+    let org_a = Uuid::new_v4();
+    let org_c = Uuid::new_v4(); // a non-member org
+
+    su.execute(
+        format!(
+            "DO $$ BEGIN \
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{PERM_ROLE}') THEN \
+                 CREATE ROLE {PERM_ROLE} LOGIN PASSWORD '{APP_PW}'; \
+               END IF; \
+             END $$;"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create perm role");
+
+    // Permissive-when-unset variant of the membership-union policy.
+    su.execute(
+        "DROP TABLE IF EXISTS rls_perm_probe;
+         CREATE TABLE rls_perm_probe (id serial PRIMARY KEY, user_id uuid, org_id uuid, val text);
+         ALTER TABLE rls_perm_probe ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE rls_perm_probe FORCE ROW LEVEL SECURITY;
+         DROP POLICY IF EXISTS rls_perm_iso ON rls_perm_probe;
+         CREATE POLICY rls_perm_iso ON rls_perm_probe USING (
+            NULLIF(current_setting('app.current_user_id', true), '') IS NULL
+            OR user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+            OR org_id = ANY(
+                 string_to_array(NULLIF(current_setting('app.current_org_ids', true), ''), ',')::uuid[]
+               )
+         );",
+    )
+    .await
+    .expect("perm probe table + policy");
+    su.execute(format!("GRANT SELECT, INSERT ON rls_perm_probe TO {PERM_ROLE};").as_str())
+        .await
+        .unwrap();
+    su.execute(
+        format!("GRANT USAGE, SELECT ON SEQUENCE rls_perm_probe_id_seq TO {PERM_ROLE};").as_str(),
+    )
+    .await
+    .unwrap();
+
+    let other = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO rls_perm_probe (user_id, org_id, val) VALUES \
+         ($1,$2,'in-A'), ($3,$4,'in-C-other'), ($5,$4,'owned-in-C')",
+    )
+    .bind(other)
+    .bind(org_a)
+    .bind(other)
+    .bind(org_c)
+    .bind(user)
+    .execute(&su)
+    .await
+    .expect("seed perm rows");
+
+    // 1-connection pool so steps (1)→(3) share one physical connection,
+    // forcing the post-commit GUC-reset-to-'' case in step (3).
+    let after_at = su_url.rsplit_once('@').map(|(_, r)| r).unwrap_or(&su_url);
+    let app = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&format!("postgres://{PERM_ROLE}:{APP_PW}@{after_at}"))
+        .await
+        .expect("connect perm app role");
+
+    // (1) GUC unset → PERMISSIVE: sees ALL rows (un-wired path doesn't break).
+    let unset: i64 = sqlx::query_scalar("SELECT count(*) FROM rls_perm_probe")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    assert_eq!(unset, 3, "unset GUC must be permissive so un-wired paths don't break");
+
+    // (2) Scoped (wired path): ENFORCED union → in-A + owned-in-C, not in-C-other.
+    let scope = TenantReadScope::new(user, vec![org_a]);
+    let mut tx = begin_tenant_read_scoped(&app, &scope).await.unwrap();
+    let vals: Vec<String> = sqlx::query_scalar("SELECT val FROM rls_perm_probe ORDER BY val")
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        vals,
+        vec!["in-A".to_string(), "owned-in-C".to_string()],
+        "a wired (scoped) path must enforce the membership-union backstop"
+    );
+
+    // (3) Same connection, GUC now reset to '' post-commit. A bare query
+    // must fall back to PERMISSIVE (NULLIF('')→NULL → first clause true),
+    // NOT deny — otherwise enabling RLS would break every un-wired query
+    // sharing a recycled connection.
+    let after_reset: i64 = sqlx::query_scalar("SELECT count(*) FROM rls_perm_probe")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_reset, 3,
+        "reset-to-empty GUC must be permissive, not deny (pooling safety for incremental rollout)"
+    );
+
+    let _ = su.execute("DROP TABLE IF EXISTS rls_perm_probe;").await;
+    let _ = su
+        .execute(format!("DROP ROLE IF EXISTS {PERM_ROLE};").as_str())
+        .await;
+}
