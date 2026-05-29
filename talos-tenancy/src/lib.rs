@@ -71,6 +71,69 @@ impl OrgScope {
     }
 }
 
+/// GUC carrying the acting user id, for the RLS backstop's
+/// personally-owned-row clause (`user_id = current_user_id`).
+pub const READ_USER_GUC: &str = "app.current_user_id";
+
+/// GUC carrying the CSV of org ids the caller may read, for the RLS
+/// backstop's org-membership clause (`org_id = ANY(current_org_ids)`).
+pub const READ_ORGS_GUC: &str = "app.current_org_ids";
+
+/// Request-scoped **read** tenancy backstop (RFC 0004, membership-union
+/// model). The primary access control stays in the app layer
+/// (`talos-api`'s `user_accessible_org_ids` / `check_resource_access`);
+/// this carries the same facts into Postgres so an RLS policy can act as
+/// a defense-in-depth net that catches a missed `WHERE` clause.
+///
+/// Mirrors the existing union semantics: a row is visible if the caller
+/// **owns** it (`user_id`) OR it belongs to **any org the caller is a
+/// member of** (`accessible_org_ids`, resolved server-side from
+/// `organization_members` — never client-supplied, so not forgeable).
+///
+/// This is distinct from [`OrgScope`], which names a SINGLE active org —
+/// used for the *creation context* (which org a new resource lands in)
+/// and for org-scoped API keys, not for the read backstop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantReadScope {
+    /// The acting user (covers personally-owned rows).
+    pub user_id: Uuid,
+    /// Every org the caller may read from (membership-resolved).
+    pub accessible_org_ids: Vec<Uuid>,
+}
+
+impl TenantReadScope {
+    /// Build a read scope from the acting user and their accessible orgs.
+    #[must_use]
+    pub fn new(user_id: Uuid, accessible_org_ids: Vec<Uuid>) -> Self {
+        Self {
+            user_id,
+            accessible_org_ids,
+        }
+    }
+
+    /// `SET LOCAL app.current_user_id = '<uuid>'`. `SET LOCAL` can't bind
+    /// params; the value is a `Uuid` (no caller text → no injection).
+    #[must_use]
+    pub fn set_local_user_sql(&self) -> String {
+        format!("SET LOCAL {READ_USER_GUC} = '{}'", self.user_id)
+    }
+
+    /// `SET LOCAL app.current_org_ids = 'uuid1,uuid2,…'` (empty string
+    /// when the caller is in no orgs — the policy's `NULLIF(...,'')`
+    /// turns that into NULL → matches no org rows, fail-closed). All
+    /// values are `Uuid`s, so the CSV carries no injectable text.
+    #[must_use]
+    pub fn set_local_orgs_sql(&self) -> String {
+        let csv = self
+            .accessible_org_ids
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("SET LOCAL {READ_ORGS_GUC} = '{csv}'")
+    }
+}
+
 /// Tenant resource limits
 #[derive(Debug, Clone)]
 pub struct TenantLimits {
@@ -173,5 +236,35 @@ mod tests {
         );
         // GUC spelling is shared with the RLS policy definitions.
         assert!(scope.set_local_org_sql().contains(ACTIVE_ORG_GUC));
+    }
+
+    #[test]
+    fn read_scope_emits_user_and_csv_org_guc() {
+        let user = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let a = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let b = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        let scope = TenantReadScope::new(user, vec![a, b]);
+        assert_eq!(
+            scope.set_local_user_sql(),
+            "SET LOCAL app.current_user_id = '22222222-2222-2222-2222-222222222222'"
+        );
+        assert_eq!(
+            scope.set_local_orgs_sql(),
+            "SET LOCAL app.current_org_ids = \
+             'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'"
+        );
+    }
+
+    #[test]
+    fn read_scope_with_no_orgs_emits_empty_csv() {
+        // A user in zero orgs → empty CSV → policy NULLIF(...,'') → NULL
+        // → matches no org rows (fail-closed). Owned rows still match via
+        // the user-id clause.
+        let user = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let scope = TenantReadScope::new(user, vec![]);
+        assert_eq!(
+            scope.set_local_orgs_sql(),
+            "SET LOCAL app.current_org_ids = ''"
+        );
     }
 }

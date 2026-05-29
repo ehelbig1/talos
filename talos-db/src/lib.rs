@@ -6,7 +6,7 @@
 // `init_read_replica_pool` is still kept below for the operator hook).
 use anyhow::Context;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Transaction};
-use talos_tenancy::OrgScope;
+use talos_tenancy::{OrgScope, TenantReadScope};
 
 /// Begin a **tenant-scoped transaction** (RFC 0004): acquire a pooled
 /// connection, open a transaction, and stamp `SET LOCAL
@@ -43,6 +43,35 @@ pub async fn begin_org_scoped<'a>(
         .execute(&mut *tx)
         .await
         .context("set app.current_org_id for tenant scope")?;
+    Ok(tx)
+}
+
+/// Begin a transaction carrying the **membership-union read backstop**
+/// (RFC 0004): stamps `app.current_user_id` + `app.current_org_ids` so
+/// the RLS policy can act as defense in depth behind the app-layer
+/// `user_accessible_org_ids` checks — a row is visible if owned by the
+/// user OR in any org the user belongs to. The caller runs its queries
+/// on the returned tx and **must commit** (drop = rollback).
+///
+/// Use this for general read paths. For a single-org context (org-scoped
+/// API key, creation context) use [`begin_org_scoped`]. Same
+/// non-superuser-role prerequisite applies (see [`check_rls_role`]).
+pub async fn begin_tenant_read_scoped<'a>(
+    pool: &'a Pool<Postgres>,
+    scope: &TenantReadScope,
+) -> anyhow::Result<Transaction<'a, Postgres>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin tenant-read-scoped transaction")?;
+    sqlx::query(&scope.set_local_user_sql())
+        .execute(&mut *tx)
+        .await
+        .context("set app.current_user_id")?;
+    sqlx::query(&scope.set_local_orgs_sql())
+        .execute(&mut *tx)
+        .await
+        .context("set app.current_org_ids")?;
     Ok(tx)
 }
 

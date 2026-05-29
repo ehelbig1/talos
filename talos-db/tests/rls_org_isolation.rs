@@ -16,8 +16,8 @@
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, Pool, Postgres};
-use talos_db::{begin_org_scoped, check_rls_role};
-use talos_tenancy::OrgScope;
+use talos_db::{begin_org_scoped, begin_tenant_read_scoped, check_rls_role};
+use talos_tenancy::{OrgScope, TenantReadScope};
 use uuid::Uuid;
 
 const APP_ROLE: &str = "talos_rls_test_app";
@@ -160,5 +160,112 @@ async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
     let _ = su.execute("DROP TABLE IF EXISTS rls_probe;").await;
     let _ = su
         .execute(format!("DROP ROLE IF EXISTS {APP_ROLE};").as_str())
+        .await;
+}
+
+const UNION_ROLE: &str = "talos_rls_union_app";
+
+fn union_app_url(superuser: &str) -> String {
+    let after_at = superuser
+        .rsplit_once('@')
+        .map(|(_, rest)| rest)
+        .unwrap_or(superuser);
+    format!("postgres://{UNION_ROLE}:{APP_PW}@{after_at}")
+}
+
+#[tokio::test]
+async fn membership_union_rls_shows_owned_and_member_orgs_only() {
+    let Some(su_url) = superuser_url() else { return };
+    let su = connect(&su_url).await;
+
+    let user = Uuid::new_v4();
+    let org_a = Uuid::new_v4();
+    let org_b = Uuid::new_v4();
+    let org_c = Uuid::new_v4(); // a NON-member org
+
+    su.execute(
+        format!(
+            "DO $$ BEGIN \
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{UNION_ROLE}') THEN \
+                 CREATE ROLE {UNION_ROLE} LOGIN PASSWORD '{APP_PW}'; \
+               END IF; \
+             END $$;"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create union app role");
+
+    // Probe table mirrors an owned table's shape: user_id + org_id, with
+    // the RFC 0004 membership-union backstop policy.
+    su.execute(
+        "DROP TABLE IF EXISTS rls_union_probe;
+         CREATE TABLE rls_union_probe (id serial PRIMARY KEY, user_id uuid, org_id uuid, val text);
+         ALTER TABLE rls_union_probe ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE rls_union_probe FORCE ROW LEVEL SECURITY;
+         DROP POLICY IF EXISTS rls_union_iso ON rls_union_probe;
+         CREATE POLICY rls_union_iso ON rls_union_probe USING (
+            user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+            OR org_id = ANY(
+                 string_to_array(NULLIF(current_setting('app.current_org_ids', true), ''), ',')::uuid[]
+               )
+         );",
+    )
+    .await
+    .expect("union probe table + policy");
+
+    su.execute(format!("GRANT SELECT, INSERT ON rls_union_probe TO {UNION_ROLE};").as_str())
+        .await
+        .unwrap();
+    su.execute(
+        format!("GRANT USAGE, SELECT ON SEQUENCE rls_union_probe_id_seq TO {UNION_ROLE};").as_str(),
+    )
+    .await
+    .unwrap();
+
+    // Rows: one in each of A, B (member), C (non-member), plus one owned
+    // by the user but in non-member org C (owned clause must still show it).
+    let other_user = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO rls_union_probe (user_id, org_id, val) VALUES \
+         ($1,$2,'in-A'), ($1,$3,'in-B'), ($4,$5,'in-C-other'), ($6,$5,'owned-in-C')",
+    )
+    .bind(other_user)
+    .bind(org_a)
+    .bind(org_b)
+    .bind(other_user)
+    .bind(org_c)
+    .bind(user) // owned-in-C is owned by `user`
+    .execute(&su)
+    .await
+    .expect("seed union rows");
+
+    // Scope: user is a member of A and B only.
+    let app = connect(&union_app_url(&su_url)).await;
+    let scope = TenantReadScope::new(user, vec![org_a, org_b]);
+    let mut tx = begin_tenant_read_scoped(&app, &scope)
+        .await
+        .expect("read-scoped tx");
+    let vals: Vec<String> = sqlx::query_scalar("SELECT val FROM rls_union_probe ORDER BY val")
+        .fetch_all(&mut *tx)
+        .await
+        .expect("union select");
+    tx.commit().await.unwrap();
+
+    // Sees: in-A, in-B (member orgs) + owned-in-C (owned clause). NOT
+    // in-C-other (non-member org, not owned).
+    assert_eq!(
+        vals,
+        vec![
+            "in-A".to_string(),
+            "in-B".to_string(),
+            "owned-in-C".to_string()
+        ],
+        "union backstop must show member-org rows + owned rows, never a non-member org's other-owned row"
+    );
+
+    let _ = su.execute("DROP TABLE IF EXISTS rls_union_probe;").await;
+    let _ = su
+        .execute(format!("DROP ROLE IF EXISTS {UNION_ROLE};").as_str())
         .await;
 }
