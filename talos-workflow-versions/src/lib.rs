@@ -309,6 +309,23 @@ impl WorkflowVersionService {
         db_pool: &PgPool,
         workflow_id: Uuid,
     ) -> Result<Option<WorkflowVersion>> {
+        let mut conn = db_pool
+            .acquire()
+            .await
+            .context("acquire connection for get_active_version")?;
+        Self::get_active_version_on_conn(&mut conn, workflow_id).await
+    }
+
+    /// `get_active_version` against a caller-supplied connection — RFC 0005
+    /// S3 executor-threading convention. Lets the call compose into a
+    /// request-scoped `talos_db::UnitOfWork` (`uow.conn()`) so it shares
+    /// the request's tenant scope + transaction instead of taking its own
+    /// pooled connection. The `&PgPool` method above delegates here, so
+    /// there is one source of query logic.
+    pub async fn get_active_version_on_conn(
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+    ) -> Result<Option<WorkflowVersion>> {
         let version = sqlx::query_as::<_, WorkflowVersion>(
             r#"
             SELECT id, workflow_id, version_number, graph_json, description, published_at, published_by, is_active, created_at
@@ -317,7 +334,7 @@ impl WorkflowVersionService {
             "#,
         )
         .bind(workflow_id)
-        .fetch_optional(db_pool)
+        .fetch_optional(conn)
         .await
         .context("Failed to fetch active workflow version")?;
 
@@ -351,6 +368,22 @@ impl WorkflowVersionService {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<WorkflowVersion>> {
+        let mut conn = db_pool
+            .acquire()
+            .await
+            .context("acquire connection for list_versions")?;
+        Self::list_versions_on_conn(&mut conn, workflow_id, limit, offset).await
+    }
+
+    /// `list_versions` against a caller-supplied connection — RFC 0005 S3
+    /// executor-threading convention (composes into a `UnitOfWork`; the
+    /// `&PgPool` method delegates here, single source of query logic).
+    pub async fn list_versions_on_conn(
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowVersion>> {
         let versions = sqlx::query_as::<_, WorkflowVersion>(
             r#"
             SELECT id, workflow_id, version_number, graph_json, description, published_at, published_by, is_active, created_at
@@ -363,7 +396,7 @@ impl WorkflowVersionService {
         .bind(workflow_id)
         .bind(limit)
         .bind(offset)
-        .fetch_all(db_pool)
+        .fetch_all(conn)
         .await
         .context("Failed to list workflow versions")?;
 
