@@ -29,14 +29,16 @@ fn safe_err(msg: impl Into<String>) -> async_graphql::Error {
 }
 
 const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10MB
-/// Maximum allowed name length for workflows, modules, and templates.
-const MAX_NAME_LENGTH: usize = 255;
-/// Minimum allowed name length.
-const MIN_NAME_LENGTH: usize = 1;
-/// Characters not allowed in resource names (prevent path traversal, injection).
-const FORBIDDEN_NAME_CHARS: &[char] = &[
-    '/', '\\', '<', '>', ':', '"', '|', '?', '*', '\0', '\n', '\r',
-];
+
+/// Map a protocol-neutral [`talos_validation::ValidationError`] into the
+/// GraphQL `safe_err` shape so the canonical message survives the
+/// production scrubber (`.extend_safe()`). All three name/description
+/// validators below delegate their predicate logic to `talos-validation`
+/// — the rule + message live there once, this crate only adapts the
+/// error type. See that crate's module docs for the drift-class history.
+fn safe_validation_err(e: talos_validation::ValidationError) -> async_graphql::Error {
+    safe_err(e.message)
+}
 
 pub fn validate_payload_size(name: &str, payload: &str) -> Result<()> {
     if payload.len() > MAX_PAYLOAD_SIZE {
@@ -56,69 +58,11 @@ pub fn validate_payload_size(name: &str, payload: &str) -> Result<()> {
 /// - Cannot be empty or whitespace-only
 /// - Cannot start with a dot (hidden files)
 pub fn validate_resource_name(name: &str) -> Result<()> {
-    // Check length
-    let trimmed = name.trim();
-    if trimmed.len() < MIN_NAME_LENGTH {
-        return Err(safe_err(
-            "Name cannot be empty or whitespace-only",
-        ));
-    }
-
-    if trimmed.len() > MAX_NAME_LENGTH {
-        return Err(safe_err(format!(
-            "Name exceeds maximum length of {} characters",
-            MAX_NAME_LENGTH
-        )));
-    }
-
-    // Check for forbidden characters (path traversal, injection)
-    if let Some(forbidden) = trimmed.chars().find(|c| FORBIDDEN_NAME_CHARS.contains(c)) {
-        return Err(safe_err(format!(
-            "Name contains forbidden character: '{}'",
-            forbidden
-        )));
-    }
-
-    // MCP-751 (2026-05-13): reject all `is_control()` chars except `\t`.
-    // FORBIDDEN_NAME_CHARS above covers `\0`, `\n`, `\r` with a specific
-    // diagnostic (preserved for those three so existing test assertions
-    // matching "forbidden character" keep passing), but the long tail of
-    // ASCII control chars — `\x01` (SOH), `\x07` (BEL), `\x08` (BS),
-    // `\x0B` (VT), `\x0C` (FF), `\x0E..\x1F`, `\x7F` (DEL) — slipped
-    // through. An operator pasting from a terminal with a stray BEL or
-    // accidental control sequence would persist an invisible-char row
-    // that MCP-side tooling rejects via the stricter
-    // `validate_name_no_control_chars` (talos-mcp-handlers/src/utils.rs:534,
-    // MCP-405/MCP-410). Closes the cross-protocol asymmetry MCP-750
-    // surfaced on `create_secret` — same fix here ensures every caller
-    // of this helper inherits the tighter policy: `create_secret`,
-    // `create_workflow`, and any future caller.
-    if trimmed.chars().any(|c| c.is_control() && c != '\t') {
-        return Err(safe_err(
-            "Name cannot contain control characters",
-        ));
-    }
-
-    // Prevent hidden files (names starting with .)
-    if trimmed.starts_with('.') {
-        return Err(safe_err(
-            "Name cannot start with a dot (.)",
-        ));
-    }
-
-    // Prevent reserved Windows filenames
-    let lower = trimmed.to_lowercase();
-    let reserved = [
-        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-    ];
-    if reserved.contains(&lower.as_str()) {
-        return Err(safe_err(
-            "Name is a reserved system filename",
-        ));
-    }
-
-    Ok(())
+    // Canonical rule + messages live in `talos-validation` (shared with
+    // the MCP surface). MCP-751's control-char tightening and the
+    // forbidden-char / reserved-name / dot-prefix diagnostics are all
+    // enforced there now.
+    talos_validation::validate_resource_name(name).map_err(safe_validation_err)
 }
 
 /// Validates a display name with focused content discipline.
@@ -154,45 +98,11 @@ pub fn validate_display_name<'a>(
     name: &'a str,
     max_len: usize,
 ) -> Result<&'a str> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(safe_err(format!(
-            "{} cannot be empty or whitespace-only",
-            field_name
-        )));
-    }
-    if trimmed.len() > max_len {
-        return Err(safe_err(format!(
-            "{} must be 1–{} characters",
-            field_name, max_len
-        )));
-    }
-    // MCP-1151 (2026-05-16): reject `\n` in addition to `\0` and the
-    // other control chars. Pre-fix the `c != '\t' && c != '\n'` branch
-    // allowed embedded newlines in display names, but the MCP-side
-    // canonical `validate_name_no_control_chars` (talos-mcp-handlers/
-    // src/utils.rs:572) rejected `\n` — every MCP-side `create_actor`
-    // / `create_workflow` / `rename_*` / `set_secret` handler refused
-    // `name: "Line1\nLine2"` while the corresponding GraphQL mutation
-    // accepted it. Cross-protocol drift identical to MCP-1150 (vault
-    // key_path validator) and MCP-465 (engine evaluator lockstep) —
-    // operators see "MCP refused but dashboard accepts" and find it
-    // indistinguishable from a bug.
-    //
-    // Every call site of this helper is a SINGLE-LINE display name
-    // (organization name, actor name, module name, webhook name) —
-    // `\n` is never legitimate in those fields. Multi-line description
-    // fields go through `validate_description_content` below, which
-    // intentionally allows `\n`/`\r` for legitimate multi-line text.
-    if name.contains('\0')
-        || name.chars().any(|c| c.is_control() && c != '\t')
-    {
-        return Err(safe_err(format!(
-            "{} cannot contain control characters or null bytes",
-            field_name
-        )));
-    }
-    Ok(trimmed)
+    // Canonical single-line-name rule lives in `talos-validation`
+    // (shared with the MCP surface). MCP-1151's newline rejection is
+    // enforced there via `LineMode::SingleLine`.
+    talos_validation::validate_display_name(field_name, name, max_len)
+        .map_err(safe_validation_err)
 }
 
 /// Validates multi-line description content with focused 4-step discipline.
@@ -232,31 +142,12 @@ pub fn validate_description_content<'a>(
     desc: &'a str,
     max_len: usize,
 ) -> Result<&'a str> {
-    let trimmed = desc.trim();
-    if trimmed.is_empty() {
-        return Err(safe_err(format!(
-            "{} must be non-empty and non-whitespace when provided. \
-             Omit the field to leave it blank.",
-            field_name
-        )));
-    }
-    if trimmed.len() > max_len {
-        return Err(safe_err(format!(
-            "{} must be ≤ {} characters",
-            field_name, max_len
-        )));
-    }
-    if desc.contains('\0')
-        || desc
-            .chars()
-            .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
-    {
-        return Err(safe_err(format!(
-            "{} cannot contain control characters or null bytes",
-            field_name
-        )));
-    }
-    Ok(trimmed)
+    // Canonical multi-line-description rule lives in `talos-validation`
+    // (shared with the MCP surface). The empty-string omit-hint variant
+    // ("Omit the field to leave it blank.") is the default — GraphQL
+    // callers do their own None/empty short-circuit BEFORE calling this.
+    talos_validation::validate_multiline_description(field_name, desc, max_len, "")
+        .map_err(safe_validation_err)
 }
 
 /// Validates that a string is a safe identifier (alphanumeric + hyphens/underscores).

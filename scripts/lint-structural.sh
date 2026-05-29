@@ -1860,6 +1860,76 @@ else
 fi
 echo
 
+# ── 24. Cross-protocol field-validation predicate must use talos-validation ──
+bold "▶ check 24: inline control-char predicate in a write surface"
+
+# 2026-05-28: the recurring GraphQL↔MCP validation-drift bug class
+# (MCP-963/964/1003/1151) came from per-field validators being copied
+# between the two write surfaces instead of shared. The canonical
+# predicate + messages now live in `talos-validation`; both surfaces
+# wrap it. This check freezes that: any inline re-derivation of the
+# control-char/null-byte predicate
+#   `c.is_control() && c != '\t'`  (with or without `&& c != '\n' …`)
+# inside the two cross-protocol write surfaces (talos-api,
+# talos-mcp-handlers) is a regression — route it through
+# `talos_validation::reject_control_chars(field, value, LineMode::…)`
+# (or the higher-level `validate_display_name` / `validate_resource_name`
+# / `validate_multiline_description`) instead.
+#
+# Scope is deliberately the two protocol surfaces where the regressions
+# occurred. Leaf crates (talos-memory key rules, talos-oauth token
+# sanitisation, talos-auth user-name policy) keep their own narrow
+# validators — they are not part of the cross-protocol-parity contract.
+# Opt out with `// allow-validation-predicate: <reason>` within 4 lines
+# above (e.g. a genuinely surface-specific rule the shared helper can't
+# express).
+
+VALIDATION_PREDICATE_VIOLATIONS=0
+
+if [ -n "$RG_BIN" ]; then
+    matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' \
+        -g '!**/tests/**' \
+        -g '!**/*_tests.rs' \
+        -e "is_control\(\) && c != '\\\\t'" \
+        talos-api talos-mcp-handlers 2>/dev/null || true)
+else
+    matches=$(grep -rn --include='*.rs' \
+        --exclude-dir=tests \
+        --exclude='*_tests.rs' \
+        -E "is_control\(\) && c != '\\\\t'" \
+        talos-api talos-mcp-handlers 2>/dev/null || true)
+fi
+
+if [ -n "$matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        [ -f "$file" ] || continue
+
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-validation-predicate:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        VALIDATION_PREDICATE_VIOLATIONS=$((VALIDATION_PREDICATE_VIOLATIONS + 1))
+    done <<< "$matches"
+fi
+
+if [ "$VALIDATION_PREDICATE_VIOLATIONS" -gt 0 ]; then
+    red "✗ $VALIDATION_PREDICATE_VIOLATIONS inline control-char predicate(s) in a write surface"
+    yellow "  → route through talos_validation::reject_control_chars(field, value, LineMode::SingleLine|MultiLine)"
+    yellow "    or the higher-level validate_display_name / validate_resource_name / validate_multiline_description."
+    yellow "  → Opt out (surface-specific rule) with: // allow-validation-predicate: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ cross-protocol field validators route through talos-validation"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"

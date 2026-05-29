@@ -1,0 +1,19 @@
+[package]
+name = "talos-validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Canonical home for cross-protocol field validators (resource names,
+# display names, multi-line descriptions, control-char/null-byte
+# rejection). The GraphQL surface (`talos-api`) and the MCP surface
+# (`talos-mcp-handlers`) both wrap these pure predicates, mapping the
+# protocol-neutral `ValidationError` into their own error types. This
+# is the structural fix for the recurring GraphQL↔MCP validation-drift
+# bug class (MCP-963/964/1003/1151/…): the rule + its canonical message
+# now live in ONE place, so a fix can't land on one surface and miss
+# the other.
+[dependencies]
+thiserror.workspace = true

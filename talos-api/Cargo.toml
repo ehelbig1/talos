@@ -58,6 +58,10 @@ talos-secrets-manager = { path = "../talos-secrets-manager" }
 # MCP-1036: bounded_preview for caller-supplied reflection in validate_uuid error.
 talos-text-util = { path = "../talos-text-util" }
 talos-totp-2fa = { path = "../talos-totp-2fa" }
+# Canonical cross-protocol field validators (resource/display name,
+# multiline description, control-char rejection). Shared with
+# talos-mcp-handlers so a rule fix can't drift between surfaces.
+talos-validation = { path = "../talos-validation" }
 talos-webhooks = { path = "../talos-webhooks" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-creation = { path = "../talos-workflow-creation" }
