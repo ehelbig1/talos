@@ -775,15 +775,23 @@ impl WorkflowsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        // Verify ownership
+        // RFC 0005 S3: the ownership read (workflows.graph_json doubles as
+        // the access check) + the published-version read share ONE
+        // request-scoped unit of work — consistent snapshot, both RLS
+        // tables backstopped. user_accessible_org_ids sources the scope.
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
         let draft_json: Option<String> = sqlx::query_scalar(
             "SELECT graph_json FROM workflows WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))",
         )
         .bind(workflow_id)
         .bind(user_id)
-        .bind(&org_ids)
-        .fetch_optional(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_optional(uow.conn())
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
 
@@ -796,9 +804,12 @@ impl WorkflowsQueries {
             "SELECT graph_json::text FROM workflow_versions WHERE workflow_id = $1 AND is_active = true",
         )
         .bind(workflow_id)
-        .fetch_optional(db_pool)
+        .fetch_optional(uow.conn())
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         let published_json = match published_json {
             Some(pj) => pj,
@@ -863,13 +874,22 @@ impl WorkflowsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        // Verify ownership
+        let limit_val = limit.unwrap_or(10).clamp(1, 100) as i64;
+
+        // RFC 0005 S3: ownership check + versions read in ONE request-scoped
+        // unit of work (mirrors workflow_versions). user_accessible_org_ids
+        // sources the scope.
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
-        let owns = crate::access_check::workflow_accessible_for_user(
-            db_pool,
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
+        let owns = crate::access_check::workflow_accessible_for_user_on_conn(
+            uow.conn(),
             workflow_id,
             user_id,
-            &org_ids,
+            &scope.accessible_org_ids,
         )
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -880,16 +900,21 @@ impl WorkflowsQueries {
             );
         }
 
-        let limit_val = limit.unwrap_or(10).clamp(1, 100) as i64;
-
         // Fetch one extra version so we can diff the oldest requested version against its predecessor
-        let versions =
-            WorkflowVersionService::list_versions(db_pool, workflow_id, limit_val + 1, 0)
-                .await
-                .map_err(|e: anyhow::Error| {
-                    tracing::error!("Failed to list workflow versions: {}", e);
-                    async_graphql::Error::new("Failed to list workflow versions").extend_safe()
-                })?;
+        let versions = WorkflowVersionService::list_versions_on_conn(
+            uow.conn(),
+            workflow_id,
+            limit_val + 1,
+            0,
+        )
+        .await
+        .map_err(|e: anyhow::Error| {
+            tracing::error!("Failed to list workflow versions: {}", e);
+            async_graphql::Error::new("Failed to list workflow versions").extend_safe()
+        })?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         let mut entries = Vec::new();
         for (i, version) in versions.iter().enumerate() {
