@@ -280,19 +280,26 @@ impl ActorsQueries {
 
         use sqlx::Row;
 
+        let limit = limit.unwrap_or(50).clamp(1, 200);
+
+        // RFC 0005 S3: ownership check + action-log read in ONE per-user
+        // unit of work (actors are personal — the actor's log is the
+        // user's), so the actors ownership read gets the RLS backstop.
+        let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
         let actor_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
                 .bind(actor_id)
                 .bind(user_id)
-                .fetch_optional(db_pool)
+                .fetch_optional(uow.conn())
                 .await
                 .map_err(|e| e.extend_safe())?;
 
         if actor_exists.is_none() {
             return Err(async_graphql::Error::new("Actor not found").extend_safe());
         }
-
-        let limit = limit.unwrap_or(50).clamp(1, 200);
 
         let rows = sqlx::query(
             r#"SELECT id, action_type, summary, timestamp, workflow_id, execution_id
@@ -303,9 +310,12 @@ impl ActorsQueries {
         )
         .bind(actor_id)
         .bind(limit)
-        .fetch_all(db_pool)
+        .fetch_all(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(rows
             .into_iter()
@@ -350,22 +360,30 @@ impl ActorsQueries {
 
         use sqlx::Row;
 
+        // MCP-1189: cap at 1000 even if caller passes a larger value.
+        // Negatives / zero clamp up to 1. Canonical `unwrap_or(N)
+        // .clamp(1, MAX)` shape used throughout the workspace.
+        let limit_val: i64 = i64::from(limit.unwrap_or(1000).clamp(1, 1000));
+
+        // RFC 0005 S3: ownership check + the actor's-workflows read in ONE
+        // per-user unit of work — both `actors` and `workflows` (the read
+        // is `w.user_id = $2`, strictly the user's own) get the RLS
+        // backstop.
+        let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
         let actor_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
                 .bind(actor_id)
                 .bind(user_id)
-                .fetch_optional(db_pool)
+                .fetch_optional(uow.conn())
                 .await
                 .map_err(|e| e.extend_safe())?;
 
         if actor_exists.is_none() {
             return Err(async_graphql::Error::new("Actor not found").extend_safe());
         }
-
-        // MCP-1189: cap at 1000 even if caller passes a larger value.
-        // Negatives / zero clamp up to 1. Canonical `unwrap_or(N)
-        // .clamp(1, MAX)` shape used throughout the workspace.
-        let limit_val: i64 = i64::from(limit.unwrap_or(1000).clamp(1, 1000));
 
         let rows = sqlx::query(
             r#"SELECT
@@ -382,9 +400,12 @@ impl ActorsQueries {
         .bind(actor_id)
         .bind(user_id)
         .bind(limit_val)
-        .fetch_all(db_pool)
+        .fetch_all(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(rows
             .into_iter()
@@ -431,13 +452,29 @@ impl ActorsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
+        // MCP-1188: cap at 1000 even if caller passes a larger value.
+        // 1000 rows × 64 KiB worst-case value = ~64 MiB per request,
+        // which is bounded enough for the controller to absorb under
+        // concurrent dashboard loads. Negatives / zero clamp up to 1.
+        let limit_val: i64 = i64::from(limit.unwrap_or(1000).clamp(1, 1000));
+
+        use sqlx::Row as _;
+
+        // RFC 0005 S3: ownership check + memory read in ONE per-user unit
+        // of work (actors are personal), so the actors ownership read gets
+        // the RLS backstop. Commit before the (connection-free) per-row
+        // decrypt loop below.
+        let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
         // Verify ownership
         let owned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2)",
         )
         .bind(actor_id)
         .bind(user_id)
-        .fetch_one(db_pool)
+        .fetch_one(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
 
@@ -447,13 +484,6 @@ impl ActorsQueries {
             );
         }
 
-        // MCP-1188: cap at 1000 even if caller passes a larger value.
-        // 1000 rows × 64 KiB worst-case value = ~64 MiB per request,
-        // which is bounded enough for the controller to absorb under
-        // concurrent dashboard loads. Negatives / zero clamp up to 1.
-        let limit_val: i64 = i64::from(limit.unwrap_or(1000).clamp(1, 1000));
-
-        use sqlx::Row as _;
         // Phase B: every row carries ciphertext (value_enc + value_key_id);
         // the legacy plaintext `value` column is dropped. decrypt_row_value
         // reads value_enc + value_key_id and routes through the registered
@@ -470,9 +500,12 @@ impl ActorsQueries {
         .bind(actor_id)
         .bind(memory_type.as_deref())
         .bind(limit_val)
-        .fetch_all(db_pool)
+        .fetch_all(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
