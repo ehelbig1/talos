@@ -832,3 +832,104 @@ async fn actors_permissive_rls_unscoped_sees_all_scoped_enforces() {
     }
     let _ = su.execute(format!("DROP ROLE IF EXISTS {ACTORS_ROLE};").as_str()).await;
 }
+
+/// RFC 0005 S3 headline: `SET LOCAL ROLE talos_app` activates RLS even
+/// when the underlying connection is a SUPERUSER (the common in-cluster
+/// Postgres deploy). This is the whole point of the SET-ROLE model — RLS
+/// enforcement without provisioning separate login credentials. The test
+/// connects as the superuser test role and proves a scoped tx under
+/// `talos_app` cannot see another user's workflow, while the bare
+/// superuser connection (no SET ROLE) bypasses RLS as expected.
+#[tokio::test]
+async fn set_role_talos_app_enforces_rls_under_superuser_connection() {
+    let Some(su_url) = superuser_url() else { return };
+    let su = connect(&su_url).await;
+    use sqlx::Executor as _;
+
+    // Migration invariant: talos_app exists and is NOSUPERUSER NOBYPASSRLS.
+    let role: Option<(bool, bool)> =
+        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'talos_app'")
+            .fetch_optional(&su)
+            .await
+            .unwrap();
+    let (is_super, bypass) = role.expect("talos_app role must exist (migration 20260529220000)");
+    assert!(
+        !is_super && !bypass,
+        "talos_app must be NOSUPERUSER + NOBYPASSRLS or SET ROLE would not enforce RLS"
+    );
+
+    let user_a = Uuid::new_v4();
+    let user_b = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x','sra')")
+        .bind(user_a)
+        .bind(format!("sra-{}@test.invalid", user_a.simple()))
+        .execute(&su)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
+         VALUES ($1, $2, 'sr-wf', 'mod://x', '{}'::jsonb)",
+    )
+    .bind(wf)
+    .bind(user_a)
+    .execute(&su)
+    .await
+    .unwrap();
+
+    // Bare superuser connection (no SET ROLE) → bypasses RLS → sees the row.
+    let su_sees: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE id = $1")
+        .bind(wf)
+        .fetch_one(&su)
+        .await
+        .unwrap();
+    assert_eq!(su_sees, 1, "bare superuser must bypass RLS (control)");
+
+    // SET LOCAL ROLE talos_app + scope to user B → RLS enforces → row hidden.
+    let mut tx = su.begin().await.unwrap();
+    (&mut *tx)
+        .execute(
+            format!(
+                "SET LOCAL ROLE talos_app; \
+                 SET LOCAL app.current_user_id = '{user_b}'; \
+                 SET LOCAL app.current_org_ids = ''"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    let b_sees: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE id = $1")
+        .bind(wf)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        b_sees, 0,
+        "SET ROLE talos_app must activate RLS — B cannot see A's workflow even on a superuser connection"
+    );
+
+    // Same, scoped to the owner A → visible (positive control).
+    let mut tx = su.begin().await.unwrap();
+    (&mut *tx)
+        .execute(
+            format!(
+                "SET LOCAL ROLE talos_app; \
+                 SET LOCAL app.current_user_id = '{user_a}'; \
+                 SET LOCAL app.current_org_ids = ''"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    let a_sees: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE id = $1")
+        .bind(wf)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(a_sees, 1, "owner must see own workflow under SET ROLE talos_app");
+
+    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf).execute(&su).await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_a).execute(&su).await;
+}
