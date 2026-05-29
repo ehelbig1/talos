@@ -971,3 +971,87 @@ async fn unit_of_work_shares_scope_across_calls() {
 
     uow.commit().await.expect("commit unit of work");
 }
+
+/// RFC 0005 S3 — write-path enforcement under `SET LOCAL ROLE talos_app`.
+/// The permissive policies declare only `USING` (no explicit `WITH
+/// CHECK`), so per Postgres the `USING` predicate ALSO gates INSERT/UPDATE
+/// of new rows. This proves the consequence that gates the enforcement
+/// flip: a correctly-scoped write succeeds, and a write that would create
+/// a row for ANOTHER tenant is rejected by the policy (SQLSTATE 42501) —
+/// even though the underlying connection is a superuser.
+#[tokio::test]
+async fn set_role_with_check_gates_cross_tenant_writes() {
+    let Some(su_url) = superuser_url() else { return };
+    let su = connect(&su_url).await;
+    use sqlx::Executor as _;
+
+    let user_a = Uuid::new_v4();
+    let user_b = Uuid::new_v4();
+    let wf_ok = Uuid::new_v4();
+    let wf_bad = Uuid::new_v4();
+    for (u, label) in [(user_a, "wca"), (user_b, "wcb")] {
+        sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
+            .bind(u)
+            .bind(format!("{label}-{}@test.invalid", u.simple()))
+            .bind(label)
+            .execute(&su)
+            .await
+            .unwrap();
+    }
+
+    // Scoped to A, INSERT a workflow owned by A → satisfies USING-as-WITH-CHECK.
+    let mut tx = su.begin().await.unwrap();
+    (&mut *tx)
+        .execute(
+            format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{user_a}'; SET LOCAL app.current_org_ids = ''")
+                .as_str(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
+         VALUES ($1, $2, 'ok', 'mod://x', '{}'::jsonb)",
+    )
+    .bind(wf_ok)
+    .bind(user_a)
+    .execute(&mut *tx)
+    .await
+    .expect("a correctly-scoped write (own user_id) must satisfy the policy");
+    tx.commit().await.unwrap();
+
+    // Scoped to A, INSERT a workflow owned by B → violates the policy.
+    let mut tx = su.begin().await.unwrap();
+    (&mut *tx)
+        .execute(
+            format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{user_a}'; SET LOCAL app.current_org_ids = ''")
+                .as_str(),
+        )
+        .await
+        .unwrap();
+    let res = sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
+         VALUES ($1, $2, 'bad', 'mod://x', '{}'::jsonb)",
+    )
+    .bind(wf_bad)
+    .bind(user_b)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        res.is_err(),
+        "writing a row owned by another tenant under SET ROLE must be rejected by the policy"
+    );
+    if let Err(sqlx::Error::Database(dbe)) = &res {
+        assert_eq!(
+            dbe.code().as_deref(),
+            Some("42501"),
+            "expected a row-level-security WITH CHECK violation (42501)"
+        );
+    }
+    let _ = tx.rollback().await;
+
+    // Cleanup (wf_bad never committed).
+    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf_ok).execute(&su).await;
+    for u in [user_a, user_b] {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+    }
+}
