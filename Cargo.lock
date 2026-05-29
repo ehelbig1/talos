@@ -7352,8 +7352,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "talos-db",
  "talos-dlp-provider",
+ "talos-tenancy",
  "talos-text-util",
+ "tokio",
  "tracing",
  "uuid",
 ]
