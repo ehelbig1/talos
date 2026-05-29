@@ -72,8 +72,33 @@ the org infrastructure already in place.
 
   ```sql
   CREATE POLICY <t>_org_isolation ON <t>
-    USING (org_id = current_setting('app.current_org_id')::uuid);
+    USING (org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid);
   ```
+
+  Two non-obvious details, both **proven against a live DB** by
+  `talos-db/tests/rls_org_isolation.rs` before any table got a policy:
+
+  1. **`NULLIF(current_setting(..., true), '')` — not the bare cast.** A
+     *custom* GUC (`app.current_org_id`) resets to the **empty string**,
+     not NULL, on a pooled connection after a prior `SET LOCAL` commits.
+     `''::uuid` raises `22P02`, so the naive
+     `current_setting('app.current_org_id')::uuid` would turn a
+     non-scoped query into an *error* on a recycled connection instead of
+     fail-closed-empty. `NULLIF(..., '')` makes both never-set and
+     reset-to-empty resolve to NULL → matches nothing → **fail-closed,
+     no error**.
+  2. **The controller's DB role must NOT be a superuser or have
+     `BYPASSRLS`.** Postgres silently ignores RLS policies for those
+     roles, which would make the whole scheme a no-op. The app connects
+     as a plain role; sensitive tables also use `FORCE ROW LEVEL
+     SECURITY` so the policy applies even to the table owner. (An
+     operator/ops role with `BYPASSRLS` is the intended cross-tenant
+     escape hatch, never reachable from a user request path.)
+
+  Access goes through `talos_db::begin_org_scoped(pool, &OrgScope)` — the
+  canonical primitive that opens a tx and stamps `SET LOCAL
+  app.current_org_id`. `SET LOCAL` is tx-scoped, so there is no
+  cross-request GUC leakage through the pool.
 
 - **Membership / role checks stay app-enforced** (can this user switch
   into this org? can they write here? — the existing org RBAC). RLS is

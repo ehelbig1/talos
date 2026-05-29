@@ -5,7 +5,46 @@
 // `talos-db` helpers had no callers (the deferred read-replica wire-in
 // `init_read_replica_pool` is still kept below for the operator hook).
 use anyhow::Context;
-use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Transaction};
+use talos_tenancy::OrgScope;
+
+/// Begin a **tenant-scoped transaction** (RFC 0004): acquire a pooled
+/// connection, open a transaction, and stamp `SET LOCAL
+/// app.current_org_id` so every statement run on the returned
+/// transaction is filtered by the org-isolation RLS policies. The caller
+/// runs its queries on the returned `Transaction` and **must commit**
+/// (drop = rollback).
+///
+/// This is the canonical primitive the repository layer (M3) routes
+/// org-scoped data access through. `SET LOCAL` is transaction-scoped, so
+/// the GUC is automatically cleared on commit/rollback — there is no
+/// cross-request leakage through the connection pool (unlike a
+/// session-level `SET`).
+///
+/// # Security prerequisite
+///
+/// RLS is enforced **only if the connecting role is neither a superuser
+/// nor `BYPASSRLS`** — Postgres silently ignores policies for those
+/// roles, which would make this primitive a no-op isolation-wise. The
+/// controller MUST connect as a plain application role. (Tables may also
+/// use `FORCE ROW LEVEL SECURITY` to apply policies even to the table
+/// owner.) See RFC 0004 "Access & RLS".
+pub async fn begin_org_scoped<'a>(
+    pool: &'a Pool<Postgres>,
+    scope: &OrgScope,
+) -> anyhow::Result<Transaction<'a, Postgres>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin tenant-scoped transaction")?;
+    // SET LOCAL cannot bind parameters; `scope.set_local_org_sql()`
+    // interpolates a `Uuid` (no caller text, no injection surface).
+    sqlx::query(&scope.set_local_org_sql())
+        .execute(&mut *tx)
+        .await
+        .context("set app.current_org_id for tenant scope")?;
+    Ok(tx)
+}
 
 /// Initialize database connection pool
 pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
