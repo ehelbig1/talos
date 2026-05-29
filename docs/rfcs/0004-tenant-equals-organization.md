@@ -255,7 +255,15 @@ moment the policy turns on. So RLS lands in the *same* deploy as the
     Repositories with `query!` macro sites need `cargo sqlx prepare`
     against a migrated DB (note: `WorkflowRepository` is all-runtime, no
     prepare needed).
-- **M4 — RLS, rolled out INCREMENTALLY (no big-bang).** The earlier
+- **M4 — RLS, rolled out INCREMENTALLY (no big-bang).** The *target*
+  end-state (dual DB role + request-scoped unit-of-work + fail-closed on
+  every table) and the staged path to it are specified in
+  [RFC 0005](./0005-tenant-isolation-target-architecture.md) — the hot,
+  cross-cutting tables (`workflows`, `secrets`, …) can only be
+  fully fail-closed after the dual-role/unit-of-work investment. The
+  mechanics below are the per-table tools that roadmap uses.
+
+  The earlier
   worry was that RLS is all-or-nothing per table — enabling it before
   *every* access path sets the GUCs would fail-close the un-wired paths.
   That's resolved with a **permissive-when-unset** policy, so each table
