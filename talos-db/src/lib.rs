@@ -176,6 +176,14 @@ impl<'a> UnitOfWork<'a> {
         })
     }
 
+    /// Convenience for a **personal** (per-user) unit of work — sets
+    /// `app.current_user_id` with an empty org list, so the RLS policy's
+    /// `user_id = current_user_id` clause matches. Use [`begin`](Self::begin)
+    /// with the user's accessible orgs for org-shared reads.
+    pub async fn begin_user(pool: &'a Pool<Postgres>, user_id: uuid::Uuid) -> anyhow::Result<Self> {
+        Self::begin(pool, &TenantReadScope::new(user_id, Vec::new())).await
+    }
+
     /// The shared executor for data-access calls within this unit of work.
     /// Pass it where a function/repository method takes
     /// `&mut sqlx::PgConnection`. Each call reborrows, so successive calls
