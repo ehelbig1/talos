@@ -1080,10 +1080,12 @@ impl AdvancedRepository {
         intent: Option<&serde_json::Value>,
     ) -> Result<()> {
         sqlx::query(
+            // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
             "INSERT INTO workflows \
              (id, user_id, name, module_uri, graph_json, capabilities, intent, status, \
-              created_at, updated_at) \
-             VALUES ($1, $2, $3, '', $4, $5, $6, 'draft', NOW(), NOW())",
+              created_at, updated_at, org_id) \
+             VALUES ($1, $2, $3, '', $4, $5, $6, 'draft', NOW(), NOW(), \
+              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
         )
         .bind(wf_id)
         .bind(user_id)
