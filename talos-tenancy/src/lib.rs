@@ -132,6 +132,16 @@ impl TenantReadScope {
             .join(",");
         format!("SET LOCAL {READ_ORGS_GUC} = '{csv}'")
     }
+
+    /// Both GUCs as ONE semicolon-joined statement string, for execution
+    /// via the simple-query protocol in a SINGLE round-trip (vs. two
+    /// extended-protocol queries). Used by `begin_tenant_read_scoped` to
+    /// keep the per-scoped-read latency low. Values are `Uuid`s — no
+    /// injectable text.
+    #[must_use]
+    pub fn set_local_sql(&self) -> String {
+        format!("{}; {}", self.set_local_user_sql(), self.set_local_orgs_sql())
+    }
 }
 
 /// Tenant resource limits
@@ -252,6 +262,18 @@ mod tests {
             scope.set_local_orgs_sql(),
             "SET LOCAL app.current_org_ids = \
              'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'"
+        );
+    }
+
+    #[test]
+    fn read_scope_combined_sql_joins_both_set_locals() {
+        let user = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let a = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let scope = TenantReadScope::new(user, vec![a]);
+        assert_eq!(
+            scope.set_local_sql(),
+            "SET LOCAL app.current_user_id = '22222222-2222-2222-2222-222222222222'; \
+             SET LOCAL app.current_org_ids = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'"
         );
     }
 
