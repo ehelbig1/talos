@@ -28,34 +28,54 @@ solves.
 
 Three pillars. This is the shape mature multi-tenant systems converge on.
 
-### 1. Two DB roles with an explicit, audited trust boundary
+### 1. A request-path role reached via `SET LOCAL ROLE`
 
-- **`talos_app`** — non-superuser, **no `BYPASSRLS`**. Used by *all
-  request-handling* paths (GraphQL, MCP, REST). RLS is enforced for it.
-- **`talos_system`** — **`BYPASSRLS`**. Used by an *enumerated, small*
-  set of platform-internal subsystems whose authorization is established
-  **upstream**, not per-row at query time:
-  - the engine's workflow-graph load (the `workflow_id` was authorized
-    when the job was created),
-  - embedding generation + similarity/discovery indexing (genuine
-    all-rows internal operations),
-  - the scheduler's due-schedule poll,
-  - analytics/cost rollups.
+**Model (chosen 2026-05-29): `SET LOCAL ROLE`, not separate login roles.**
+The controller keeps its single connection (which, in the common
+in-cluster deploy, is the `POSTGRES_USER` superuser). The scoped-tx
+helpers (`begin_tenant_read_scoped` / `begin_org_scoped`) prepend
+`SET LOCAL ROLE talos_app` to the per-transaction GUC `SET LOCAL`s, so:
 
-**The discipline that makes this proper, not a backdoor:**
-1. A `talos_system` query is **either** a genuine all-rows internal
+- **`talos_app`** — non-superuser, **no `BYPASSRLS`**, `NOLOGIN` (reached
+  only via `SET ROLE`, like `talos_guest`). Every request-handling path
+  (GraphQL, MCP, REST) runs its transactions as this role, so RLS
+  enforces **regardless of the base connection's privileges** — including
+  a superuser base connection. `SET LOCAL ROLE` is transaction-scoped, so
+  it resets on commit/rollback with zero pooled-connection leakage (same
+  guarantee as the GUC `SET LOCAL`s).
+- **Cross-cutting internal readers** (engine workflow-graph load,
+  embedding/similarity indexing, the scheduler's due-poll, analytics/cost
+  rollups) simply **do not `SET ROLE`** — they run on the base
+  owner/superuser connection and bypass RLS by design. Their
+  authorization is established **upstream** (e.g. the `workflow_id` was
+  authorized when the job was created), not per-row at query time. A
+  dedicated `talos_system` `BYPASSRLS` role for an *explicit non-superuser*
+  reader is a later refinement (and avoids the managed-Postgres
+  `BYPASSRLS`-grant portability issue for now).
+
+**Why this over separate login roles:** no new k8s Secret, no second
+`SYSTEM_DATABASE_URL`/pool, no `install.sh` role-provisioning, and it
+works identically in managed (RDS/Neon) and in-cluster Postgres — at the
+cost of hard *credential* isolation (the base connection remains
+privileged, so enforcement relies on the discipline of always
+`SET ROLE`-ing on request paths, which is centralized in the two
+scoped-tx helpers). Separate login roles remain a possible S3b follow-up
+for defense-in-depth.
+
+**The discipline that makes the bypass path proper, not a backdoor:**
+1. An internal (non-`SET ROLE`) query is **either** a genuine all-rows
    operation **or** scoped by an **upstream-authorized id** — *never*
-   parameterized by a raw user-supplied row selector. (A `talos_system`
-   query that takes user input to pick rows must re-apply the app-layer
-   scope itself.)
-2. `talos_system` is reachable only from the enumerated subsystems —
-   never from a request handler.
-3. The boot guard (`talos_db::warn_if_rls_will_be_bypassed`) asserts the
-   *request* role (`talos_app`) is **not** bypass-capable, and refuses to
-   serve in production if it is. (`talos_system` being bypass-capable is
-   expected.)
-4. The role split is provisioned in the chart; `DATABASE_URL` →
-   `talos_app`, a second `SYSTEM_DATABASE_URL` → `talos_system`.
+   parameterized by a raw user-supplied row selector. (One that takes
+   user input to pick rows must re-apply the app-layer scope itself.)
+2. The bypass path is reachable only from the enumerated subsystems —
+   request handlers always go through the `SET LOCAL ROLE` helpers.
+3. The boot guard (`talos_db::warn_if_rls_will_be_bypassed`) is
+   SET-ROLE-aware: in SET-ROLE mode it verifies `talos_app` exists and is
+   non-bypass (and `error!`s if not — a misconfigured role would silently
+   defeat enforcement); in direct mode it warns if the base role bypasses.
+4. Activation is gated by `TALOS_RLS_SET_ROLE` (default **off**) so a
+   deploy turns on enforcement only after the role + grants
+   (migration `20260529220000`) are confirmed present.
 
 ### 2. Request-scoped unit-of-work (set the GUC once per request)
 
@@ -96,7 +116,7 @@ of the value early without the full infra cost up front.
 | **S0** | Foundation: data model, primitives, policies, boot guard, permissive-rollout proof | **Done** (RFC 0004) |
 | **S1** | Fail-closed on **narrow, request-only** tables (few readers, no cross-cutting access) | `scratch_sessions` ✓, `user_module_pins` ✓ |
 | **S2** | **Permissive backstop on the user-facing IDOR surfaces** of hot/cross-cutting tables (the actual attack vector). App-layer stays primary for internal readers. | **Done** — `workflows` GraphQL ✓, `secrets` ✓, `workflow_executions` ✓, `actors` ✓ |
-| **S3** | **Dual-role + unit-of-work refactor** — the deliberate infra project that unblocks fail-closed for the hot tables | Future |
+| **S3** | **Role split + unit-of-work refactor** — the deliberate infra project that unblocks fail-closed for the hot tables | **In progress** — `talos_app` role + `SET LOCAL ROLE` plumbing ✓ (flag-gated, default off); next: flip default on after deploy validation, then unit-of-work |
 | **S4** | Flip hot tables to **fail-closed** (drop permissive clause), `talos_system` exempt | Future (after S3) |
 | **T2/T3** | Per-org KEK; physical isolation (RFC 0004 §T2/T3) | Future |
 

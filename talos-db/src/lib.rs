@@ -8,6 +8,48 @@ use anyhow::Context;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Transaction};
 use talos_tenancy::{OrgScope, TenantReadScope};
 
+/// RFC 0005 S3: the non-superuser / non-`BYPASSRLS` role that request-path
+/// transactions run as (via `SET LOCAL ROLE`) so the RFC 0004 RLS
+/// policies enforce even when the controller's underlying connection is a
+/// superuser (the common in-cluster Postgres deploy). Provisioned by
+/// migration `20260529220000_talos_app_role.sql`; reached only via
+/// `SET ROLE` (the role is `NOLOGIN`), mirroring `talos_guest`.
+pub const RLS_APP_ROLE: &str = "talos_app";
+
+/// Whether the scoped-tx helpers wrap each transaction in
+/// `SET LOCAL ROLE talos_app`. Gated by `TALOS_RLS_SET_ROLE` (default
+/// OFF) so a deploy enables enforcement only after confirming the role +
+/// grants are provisioned (migration applied) in that environment.
+/// Read once — process env is immutable for the lifetime of the process.
+fn rls_set_role_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(
+            std::env::var("TALOS_RLS_SET_ROLE").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    });
+    *ENABLED
+}
+
+/// `"SET LOCAL ROLE talos_app; "` when enforcement is enabled, else `""`.
+/// Pure (testable) mapping; the role name is a fixed constant — no caller
+/// text, no injection surface.
+fn rls_role_prefix_for(enabled: bool) -> &'static str {
+    if enabled {
+        "SET LOCAL ROLE talos_app; "
+    } else {
+        ""
+    }
+}
+
+/// Prefix prepended to a scoped tx's GUC `SET LOCAL`s so the role + scope
+/// are established in ONE round-trip. `SET LOCAL ROLE` is
+/// transaction-scoped — it resets on commit/rollback, so there is no
+/// pooled-connection leakage (same guarantee as the GUC `SET LOCAL`s).
+fn rls_role_prefix() -> &'static str {
+    rls_role_prefix_for(rls_set_role_enabled())
+}
+
 /// Begin a **tenant-scoped transaction** (RFC 0004): acquire a pooled
 /// connection, open a transaction, and stamp `SET LOCAL
 /// app.current_org_id` so every statement run on the returned
@@ -38,11 +80,16 @@ pub async fn begin_org_scoped<'a>(
         .await
         .context("begin tenant-scoped transaction")?;
     // SET LOCAL cannot bind parameters; `scope.set_local_org_sql()`
-    // interpolates a `Uuid` (no caller text, no injection surface).
-    sqlx::query(&scope.set_local_org_sql())
-        .execute(&mut *tx)
+    // interpolates a `Uuid` (no caller text, no injection surface). The
+    // optional `SET LOCAL ROLE talos_app` (RFC 0005 S3) rides in the same
+    // simple-query round-trip so RLS enforces under a superuser
+    // connection without an extra hop.
+    use sqlx::Executor as _;
+    let sql = format!("{}{}", rls_role_prefix(), scope.set_local_org_sql());
+    (&mut *tx)
+        .execute(sql.as_str())
         .await
-        .context("set app.current_org_id for tenant scope")?;
+        .context("set role + app.current_org_id for tenant scope")?;
     Ok(tx)
 }
 
@@ -69,10 +116,11 @@ pub async fn begin_tenant_read_scoped<'a>(
     // queries — keeps the per-scoped-read latency to begin + this + the
     // caller's query + commit.
     use sqlx::Executor as _;
+    let sql = format!("{}{}", rls_role_prefix(), scope.set_local_sql());
     (&mut *tx)
-        .execute(scope.set_local_sql().as_str())
+        .execute(sql.as_str())
         .await
-        .context("set app.current_user_id + app.current_org_ids")?;
+        .context("set role + app.current_user_id + app.current_org_ids")?;
     Ok(tx)
 }
 
@@ -129,35 +177,99 @@ pub async fn check_rls_role(pool: &Pool<Postgres>) -> anyhow::Result<RlsRoleStat
     })
 }
 
-/// Boot-time guard: log a prominent warning when the controller's DB role
-/// would silently bypass the RFC 0004 org-isolation RLS policies. Safe to
-/// call before RLS is enabled (it only informs); returns the status so a
-/// caller can escalate to a hard refusal once RLS is mandatory.
+/// Inspect a named role's superuser / `BYPASSRLS` attributes (returns
+/// `None` if the role does not exist). Used by the boot guard to verify
+/// the SET-ROLE target (`talos_app`) is correctly configured.
+async fn named_role_status(
+    pool: &Pool<Postgres>,
+    role: &str,
+) -> anyhow::Result<Option<RlsRoleStatus>> {
+    let row: Option<(bool, bool)> =
+        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1")
+            .bind(role)
+            .fetch_optional(pool)
+            .await
+            .context("query named role RLS attributes")?;
+    Ok(row.map(|(is_superuser, bypass_rls)| RlsRoleStatus {
+        is_superuser,
+        bypass_rls,
+    }))
+}
+
+/// Boot-time guard: surface whether the RFC 0004 org-isolation RLS
+/// policies will actually enforce. Returns the **base** connection's role
+/// status; safe to call before RLS is enabled (it only informs).
+///
+/// Two modes:
+/// * **SET-ROLE mode** (`TALOS_RLS_SET_ROLE` on, RFC 0005 S3): request
+///   transactions run as [`RLS_APP_ROLE`] via `SET LOCAL ROLE`, so the
+///   base connection may be a superuser and RLS still enforces. The guard
+///   instead verifies `talos_app` exists and is non-bypass — and
+///   `error!`s if it isn't (that would silently defeat enforcement).
+/// * **Direct mode** (default): the base connection's own attributes
+///   decide enforcement — warn if it bypasses.
 pub async fn warn_if_rls_will_be_bypassed(pool: &Pool<Postgres>) -> RlsRoleStatus {
-    match check_rls_role(pool).await {
-        Ok(status) if !status.rls_enforced() => {
-            tracing::warn!(
-                is_superuser = status.is_superuser,
-                bypass_rls = status.bypass_rls,
-                "DB role bypasses row-level security — RFC 0004 tenant-isolation \
-                 policies will be a NO-OP for this connection. Connect as a \
-                 non-superuser role WITHOUT BYPASSRLS before enabling RLS (M4)."
-            );
-            status
-        }
-        Ok(status) => {
-            tracing::debug!("DB role enforces RLS (not superuser, no BYPASSRLS)");
-            status
-        }
+    let status = match check_rls_role(pool).await {
+        Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "could not determine DB role RLS status");
             // Unknown → assume the worst for visibility, but don't block boot.
-            RlsRoleStatus {
+            return RlsRoleStatus {
                 is_superuser: true,
                 bypass_rls: true,
+            };
+        }
+    };
+
+    if rls_set_role_enabled() {
+        match named_role_status(pool, RLS_APP_ROLE).await {
+            Ok(Some(app)) if app.rls_enforced() => {
+                tracing::info!(
+                    base_is_superuser = status.is_superuser,
+                    "RLS SET-ROLE mode active: request transactions run as `{}` \
+                     (non-superuser, no BYPASSRLS) — RLS enforced regardless of the \
+                     base connection's privileges.",
+                    RLS_APP_ROLE
+                );
+            }
+            Ok(Some(app)) => {
+                tracing::error!(
+                    is_superuser = app.is_superuser,
+                    bypass_rls = app.bypass_rls,
+                    "TALOS_RLS_SET_ROLE is on but role `{}` is a superuser or has \
+                     BYPASSRLS — RLS would be SILENTLY BYPASSED. Fix the role \
+                     attributes (migration 20260529220000_talos_app_role.sql).",
+                    RLS_APP_ROLE
+                );
+            }
+            Ok(None) => {
+                tracing::error!(
+                    "TALOS_RLS_SET_ROLE is on but role `{}` does not exist — scoped \
+                     transactions will FAIL. Apply migration \
+                     20260529220000_talos_app_role.sql.",
+                    RLS_APP_ROLE
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not verify `{}` role attributes", RLS_APP_ROLE);
             }
         }
+        return status;
     }
+
+    if !status.rls_enforced() {
+        tracing::warn!(
+            is_superuser = status.is_superuser,
+            bypass_rls = status.bypass_rls,
+            "DB role bypasses row-level security — RFC 0004 tenant-isolation \
+             policies will be a NO-OP for this connection. Either connect as a \
+             non-superuser role WITHOUT BYPASSRLS, or set TALOS_RLS_SET_ROLE=1 to \
+             enforce per-transaction via `SET LOCAL ROLE talos_app` (RFC 0005 S3)."
+        );
+    } else {
+        tracing::debug!("DB role enforces RLS (not superuser, no BYPASSRLS)");
+    }
+    status
 }
 
 /// Initialize database connection pool
@@ -334,3 +446,24 @@ pub async fn init_read_replica_pool() -> Option<Pool<Postgres>> {
     }
 }
 
+
+#[cfg(test)]
+mod rls_role_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn prefix_is_set_role_when_enabled() {
+        // Locks the exact SQL + role name: a drift here would silently
+        // stop RLS from being activated (enabled) or break the
+        // single-round-trip concatenation.
+        assert_eq!(rls_role_prefix_for(true), "SET LOCAL ROLE talos_app; ");
+        assert!(rls_role_prefix_for(true).ends_with("; "));
+        assert!(rls_role_prefix_for(true).contains(RLS_APP_ROLE));
+    }
+
+    #[test]
+    fn prefix_is_empty_when_disabled() {
+        // Default-OFF must be byte-identical to the pre-S3 behavior.
+        assert_eq!(rls_role_prefix_for(false), "");
+    }
+}
