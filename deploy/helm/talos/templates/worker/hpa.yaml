@@ -20,12 +20,19 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.worker.autoscaling.targetCPUUtilizationPercentage }}
-  # TODO: KEDA-based scaling on NATS queue depth is the real signal for
-  # the worker (CPU lags actual backlog by the fuel budget of an
-  # in-flight job). When KEDA is available:
+  # KEDA-based scaling on NATS queue depth is the real signal for the
+  # worker (CPU lags actual backlog by the fuel budget of an in-flight
+  # job). It depends on the JetStream DURABLE CONSUMER introduced by the
+  # execution-durability work — KEDA's `nats-jetstream` scaler reads the
+  # consumer's pending-message count, which does NOT exist while job
+  # dispatch uses core-NATS queue groups (ephemeral, no server-side
+  # backlog gauge). Once that consumer lands:
   #   - install KEDA's ScaledObject alongside (not inside) this chart,
+  #     triggering on the durable consumer's num_pending,
   #   - disable this HPA (worker.autoscaling.enabled = false),
   #   - let KEDA's generated HPA take over.
+  # Until then size maxReplicas for peak concurrency (docs/deployment.md
+  # → High Availability).
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300

@@ -911,6 +911,20 @@ monitoring:
     #       extraLabels:
     #         release: kube-prometheus-stack
     extraLabels: {}
+  # PrometheusRule: ship the alert rules (canonical source lives at
+  # files/alerts.yaml in this chart, symlinked from
+  # deploy/observability/alerts.yaml) as a PrometheusRule CRD so they
+  # deploy WITH the release instead of being applied by hand. Requires
+  # the monitoring.coreos.com/v1 CRDs (kube-prometheus-stack /
+  # prometheus-operator). Off by default so the chart still renders on
+  # clusters without those CRDs.
+  prometheusRule:
+    enabled: false
+    # kube-prometheus-stack selects PrometheusRules by a release label,
+    # same as ServiceMonitors — most operators need e.g.
+    #   extraLabels:
+    #     release: kube-prometheus-stack
+    extraLabels: {}
 
 # ----------------------------------------------------------------------------
 # Bootstrap Secret — seed values injected on first install.
