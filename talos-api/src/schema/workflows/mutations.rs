@@ -2171,12 +2171,21 @@ impl WorkflowsMutations {
 
         // delete_schedule is a write — Viewer must not be able to detach
         // a schedule from an org-shared workflow.
+        // RFC 0005 S3: ownership check + DELETE share ONE request-scoped
+        // unit of work (completes the schedule trio with create/update,
+        // PR #29). The workflows-USING join gets the RLS backstop; the
+        // scope uses the WRITABLE org set (write op).
         let org_ids: Vec<uuid::Uuid> = crate::schema::user_writable_org_ids(ctx).await?;
-        let workflow_exists = crate::access_check::workflow_accessible_for_user(
-            db_pool,
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
+        let workflow_exists = crate::access_check::workflow_accessible_for_user_on_conn(
+            uow.conn(),
             workflow_id,
             user_id,
-            &org_ids,
+            &scope.accessible_org_ids,
         )
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -2198,10 +2207,13 @@ impl WorkflowsMutations {
         )
         .bind(workflow_id)
         .bind(user_id)
-        .bind(&org_ids)
-        .execute(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .execute(uow.conn())
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?; // Added type annotation
+        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        uow.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(result.rows_affected() > 0)
     }
