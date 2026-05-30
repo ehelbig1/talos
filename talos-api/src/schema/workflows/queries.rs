@@ -743,6 +743,12 @@ impl WorkflowsQueries {
             avg_duration_secs: Option<f64>,
         }
 
+        // RFC 0005 S3: per-user tenant-scoped tx so the workflows +
+        // workflow_executions RLS policies backstop this user-only stats
+        // read (both tables are RLS-enabled; the query filters w.user_id).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let rows = sqlx::query_as::<_, StatsRow>(
             r#"
             SELECT w.id, w.name,
@@ -761,12 +767,15 @@ impl WorkflowsQueries {
         )
         .bind(user_id)
         .bind(days_val)
-        .fetch_all(db_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| {
             tracing::error!("Failed to fetch workflow stats: {}", e);
             async_graphql::Error::new("Failed to fetch workflow stats").extend_safe()
         })?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(rows
             .into_iter()
@@ -1027,6 +1036,13 @@ impl WorkflowsQueries {
         let limit_val: i64 = i64::from(limit.unwrap_or(20).clamp(1, 100));
 
         use sqlx::Row;
+        // RFC 0005 S3: per-user tenant-scoped tx so the workflows RLS
+        // policy backstops the ownership JOIN (execution_approvals has no
+        // policy of its own; the gate is `w.user_id = $1` on the joined
+        // workflow).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let rows = sqlx::query(
             r#"
             SELECT a.id, a.workflow_id, a.execution_id, a.node_id, a.required_for, a.status,
@@ -1040,9 +1056,12 @@ impl WorkflowsQueries {
         )
         .bind(user_id)
         .bind(limit_val)
-        .fetch_all(db_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         Ok(rows
             .into_iter()
