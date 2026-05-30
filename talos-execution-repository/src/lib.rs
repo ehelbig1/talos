@@ -643,6 +643,12 @@ impl ExecutionRepository {
         exec_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<ExecutionRow>> {
+        // RFC 0005 S3: self-scope on a per-user tx so the
+        // workflow_executions RLS policy backstops the read for ALL callers
+        // (the MCP execution handlers + the GraphQL module-execution
+        // resolver), with no per-caller change. The query already filters
+        // `user_id = $2`; the scope's user-clause mirrors it.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT id, workflow_id, status, started_at, completed_at, output_data, \
                     output_data_enc, output_enc_key_id, output_data_format, \
@@ -653,8 +659,9 @@ impl ExecutionRepository {
         )
         .bind(exec_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let Some(r) = row else { return Ok(None) };
         let output_data = self.read_output_from_row(&r).await;
@@ -686,13 +693,16 @@ impl ExecutionRepository {
     /// page query stays cheap; the count can be approximated server-side
     /// in a future optimisation if it becomes a hot path.
     pub async fn count_executions(&self, wf_id: Uuid, user_id: Uuid) -> Result<i64> {
+        // RFC 0005 S3: self-scope (see get_execution).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM workflow_executions WHERE workflow_id = $1 AND user_id = $2",
         )
         .bind(wf_id)
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(count)
     }
 
@@ -703,6 +713,9 @@ impl ExecutionRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<ExecutionSummary>> {
+        // RFC 0005 S3: self-scope (see get_execution). The LEFT JOIN to
+        // workflows also picks up the workflows RLS backstop.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT e.id, e.workflow_id, w.name AS workflow_name, e.status, \
                     e.started_at, e.completed_at, e.error_message, e.is_pinned, \
@@ -716,8 +729,9 @@ impl ExecutionRepository {
         .bind(user_id)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
