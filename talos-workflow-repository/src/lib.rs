@@ -387,6 +387,9 @@ impl WorkflowRepository {
         user_id: Uuid,
         tag_filter: Option<&str>,
     ) -> Result<Vec<WorkflowSummary>> {
+        // RFC 0005 S3: self-scope (see get_workflow). Both branches + the
+        // LATERAL workflow_executions join run under one per-user tx.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = if let Some(tag) = tag_filter {
             sqlx::query(
                 "SELECT w.id, w.name, w.description, w.graph_json, w.created_at, w.updated_at, \
@@ -401,7 +404,7 @@ impl WorkflowRepository {
             )
             .bind(user_id)
             .bind(tag)
-            .fetch_all(&self.db_pool)
+            .fetch_all(&mut *tx)
             .await?
         } else {
             sqlx::query(
@@ -416,9 +419,10 @@ impl WorkflowRepository {
                  ORDER BY w.updated_at DESC LIMIT 50",
             )
             .bind(user_id)
-            .fetch_all(&self.db_pool)
+            .fetch_all(&mut *tx)
             .await?
         };
+        tx.commit().await?;
 
         let summaries = rows
             .into_iter()
@@ -518,10 +522,15 @@ impl WorkflowRepository {
         }
         data_q = data_q.bind(limit).bind(offset);
 
-        let (rows, total) = tokio::try_join!(
-            data_q.fetch_all(&self.db_pool),
-            count_q.fetch_one(&self.db_pool),
-        )?;
+        // RFC 0005 S3: self-scope (see get_workflow). The data + count
+        // queries share ONE per-user tx, so they run sequentially rather
+        // than the prior concurrent try_join — a single scoped transaction
+        // can't be borrowed by two concurrent queries. Both are bounded
+        // (LIMIT / COUNT), so the latency cost is small.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let rows = data_q.fetch_all(&mut *tx).await?;
+        let total = count_q.fetch_one(&mut *tx).await?;
+        tx.commit().await?;
 
         let summaries = rows
             .into_iter()
@@ -549,6 +558,11 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<WorkflowRecord>> {
+        // RFC 0005 S3: self-scope on a per-user tx so the workflows RLS
+        // policy backstops the read for ALL callers (the MCP workflow
+        // handlers), no per-caller change. The query filters
+        // `user_id = $2`; the scope's user-clause mirrors it.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT id, name, graph_json, tags, description, max_concurrent_executions, \
                     is_enabled, capabilities, intent, readiness_score, actor_id, status, \
@@ -557,8 +571,9 @@ impl WorkflowRepository {
         )
         .bind(workflow_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(row.map(|r| WorkflowRecord {
             id: r.get("id"),
@@ -716,6 +731,8 @@ impl WorkflowRepository {
 
     /// Check whether a workflow name is already taken for a user (ignoring archived).
     pub async fn find_workflow_by_name(&self, user_id: Uuid, name: &str) -> Result<Option<Uuid>> {
+        // RFC 0005 S3: self-scope (see get_workflow).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let id: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM workflows \
              WHERE user_id = $1 AND name = $2 \
@@ -724,8 +741,9 @@ impl WorkflowRepository {
         )
         .bind(user_id)
         .bind(name)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -735,13 +753,16 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<serde_json::Value>> {
+        // RFC 0005 S3: self-scope (see get_workflow).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let schema: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT input_schema FROM workflows WHERE id = $1 AND user_id = $2")
                 .bind(workflow_id)
                 .bind(user_id)
-                .fetch_optional(&self.db_pool)
+                .fetch_optional(&mut *tx)
                 .await?
                 .flatten();
+        tx.commit().await?;
         Ok(schema)
     }
 
@@ -2079,6 +2100,8 @@ impl WorkflowRepository {
         user_id: Uuid,
         like_pattern: &str,
     ) -> Result<Vec<(Uuid, String)>> {
+        // RFC 0005 S3: self-scope (see get_workflow).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT id, name FROM workflows \
              WHERE user_id = $1 AND name LIKE $2 ESCAPE '\\' \
@@ -2087,8 +2110,9 @@ impl WorkflowRepository {
         )
         .bind(user_id)
         .bind(like_pattern)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows)
     }
 
@@ -3119,15 +3143,29 @@ impl WorkflowRepository {
     /// Out of scope for this fix; the telemetry below covers the
     /// silent-incident case.
     pub async fn workflow_exists(&self, workflow_id: Uuid, user_id: Uuid) -> bool {
+        // RFC 0005 S3: self-scope (see get_workflow). A begin failure
+        // folds into the same fail-closed `false` the query-error arm
+        // returns (callers surface it as "Workflow not found").
+        let mut tx = match talos_db::begin_user_scoped(&self.db_pool, user_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(workflow_id = %workflow_id, user_id = %user_id, error = %e,
+                    "workflow_exists: tenant-scope begin failed — returning false (fail-closed)");
+                return false;
+            }
+        };
         match sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1 AND user_id = $2)",
         )
         .bind(workflow_id)
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
         {
-            Ok(exists) => exists,
+            Ok(exists) => {
+                let _ = tx.commit().await;
+                exists
+            }
             Err(e) => {
                 tracing::warn!(
                     workflow_id = %workflow_id,
@@ -3905,12 +3943,15 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<String>> {
+        // RFC 0005 S3: self-scope (see get_workflow).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row: Option<(String,)> =
             sqlx::query_as("SELECT name FROM workflows WHERE id = $1 AND user_id = $2")
                 .bind(workflow_id)
                 .bind(user_id)
-                .fetch_optional(&self.db_pool)
+                .fetch_optional(&mut *tx)
                 .await?;
+        tx.commit().await?;
         Ok(row.map(|(n,)| n))
     }
 
