@@ -373,6 +373,9 @@ services:
       # The controller embeds its own WasmRuntime (used by run_sandbox / compile_custom_sandbox).
       # Disable pooling here too — same reason as the worker service above.
       TALOS_DISABLE_POOLING: "true"
+      # RFC 0005 S3 tenant-isolation RLS enforcement (SET LOCAL ROLE talos_app).
+      # Default off; flip via TALOS_RLS_SET_ROLE=true in .env to validate.
+      TALOS_RLS_SET_ROLE: ${TALOS_RLS_SET_ROLE:-false}
     ports:
       - "8000:8000"
     volumes:
