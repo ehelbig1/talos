@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod count_memory_write_nodes;
+pub mod crash_recovery;
 mod deep_merge;
 mod errors;
 mod failure_webhook;
@@ -36,6 +37,7 @@ mod retry;
 mod trigger;
 
 pub use count_memory_write_nodes::count_memory_write_nodes;
+pub use crash_recovery::{recover_stuck_executions, RecoveryDeps};
 pub use deep_merge::deep_merge;
 pub use errors::OrchestrationError;
 pub use input::{ReplayInput, ReplayWithInputInput, RetryInput, TriggerInput};

@@ -2051,6 +2051,74 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!("Stuck execution cleanup task started (runs every 5 minutes, timeout after 30 min by default)");
 
+    // ---------- Crash recovery: resume checkpointed executions ----------
+    // RFC 0003 (durable execution). On a controller restart, executions that
+    // were mid-flight are wedged in `running` — their in-process engine task
+    // died with the process. When EXECUTION_CHECKPOINTING_ENABLED is on, the
+    // engine persisted node-result checkpoints; this one-shot startup sweep
+    // claims those orphans (`running -> resuming`, FOR UPDATE SKIP LOCKED so
+    // it's exactly-once across replicas) and resumes each from its last
+    // checkpoint via the NATS seed path.
+    //
+    // ONE-SHOT at startup (not periodic) on purpose: at startup there are no
+    // live in-process engine tasks from THIS process, so any orphaned
+    // `running` row is genuinely dead. A periodic sweep in a single-replica
+    // deployment could claim a long-running-but-alive execution (one whose
+    // current node runs longer than the stale window without a checkpoint
+    // heartbeat) and double-dispatch it.
+    //
+    // Requires NATS (the resume dispatch goes over signed NATS-RPC) and the
+    // checkpointing flag — without checkpoints there is nothing to resume.
+    if talos_config::bool_env_or_default("EXECUTION_CHECKPOINTING_ENABLED", false) {
+        if let Some(nats_for_recovery) = nats_client.clone() {
+            // Resume orphans idle beyond this window. MUST be smaller than
+            // STUCK_EXECUTION_TIMEOUT_MINS (default 30) so a recoverable
+            // execution is resumed before any cleanup path could fail it.
+            let resume_stale_mins =
+                talos_config::positive_env_or_default::<i64>("EXECUTION_RESUME_STALE_MINS", 5);
+            let stuck_timeout_mins =
+                talos_config::positive_env_or_default::<i64>("STUCK_EXECUTION_TIMEOUT_MINS", 30);
+            if resume_stale_mins >= stuck_timeout_mins {
+                tracing::warn!(
+                    resume_stale_mins,
+                    stuck_timeout_mins,
+                    "EXECUTION_RESUME_STALE_MINS >= STUCK_EXECUTION_TIMEOUT_MINS — orphaned \
+                     executions may be failed by stuck-cleanup before crash recovery can claim them"
+                );
+            }
+            let recovery_deps = talos_execution_orchestration::RecoveryDeps {
+                db_pool: db_pool.clone(),
+                registry: registry.clone(),
+                secrets_manager: secrets_manager.clone(),
+                actor_repo: std::sync::Arc::new(actor_repository::ActorRepository::new(
+                    db_pool.clone(),
+                )),
+                execution_repo: std::sync::Arc::new(
+                    crate::execution_repository::ExecutionRepository::new(db_pool.clone()),
+                ),
+                worker_shared_key: worker_shared_key.clone(),
+                nats_client: nats_for_recovery,
+            };
+            tokio::spawn(async move {
+                talos_execution_orchestration::recover_stuck_executions(
+                    recovery_deps,
+                    resume_stale_mins,
+                )
+                .await;
+            });
+            tracing::info!(
+                "Crash-recovery startup sweep spawned (EXECUTION_CHECKPOINTING_ENABLED on); \
+                 resuming executions idle > {} min from their last checkpoint",
+                resume_stale_mins
+            );
+        } else {
+            tracing::warn!(
+                "EXECUTION_CHECKPOINTING_ENABLED is on but NATS is unavailable — \
+                 crash-recovery sweep skipped (resume dispatch needs NATS)"
+            );
+        }
+    }
+
     // ---------- Start DEK cache cleanup task ----------
     // Evicts expired DEK entries from the in-memory HashMap to prevent unbounded
     // growth in long-lived processes.  DEK rotation is rare, so the cache stays
