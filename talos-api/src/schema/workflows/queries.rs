@@ -538,6 +538,15 @@ impl WorkflowsQueries {
 
         // SECURITY: Join through workflows to enforce ownership check.
         // Without this, any authenticated user could read any workflow version by ID.
+        // RFC 0005 S3: run on a tenant-scoped tx so the workflows RLS
+        // policy backstops the join — workflow_versions has no policy of
+        // its own, so this scoping is the only RLS protection a version
+        // read gets (if RLS hides the parent workflow, the join yields
+        // nothing).
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let version = sqlx::query_as::<_, talos_workflow_versions::WorkflowVersion>(
             "SELECT wv.* FROM workflow_versions wv \
              JOIN workflows w ON wv.workflow_id = w.id \
@@ -545,10 +554,11 @@ impl WorkflowsQueries {
         )
         .bind(id)
         .bind(user_id)
-        .bind(&org_ids)
-        .fetch_optional(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(version.map(|v| v.into()))
     }
@@ -618,6 +628,14 @@ impl WorkflowsQueries {
 
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
+        // RFC 0005 S3: tenant-scoped tx so the workflows RLS policy
+        // backstops the join (workflow_schedules has no policy of its own;
+        // an org-shared schedule is reachable via the parent workflow's
+        // org, the `ws.user_id` clause covers the personal case).
+        let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+        let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let row = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
             r#"
             SELECT ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
@@ -629,10 +647,11 @@ impl WorkflowsQueries {
         )
         .bind(workflow_id)
         .bind(user_id)
-        .bind(&org_ids)
-        .fetch_optional(db_pool)
+        .bind(&scope.accessible_org_ids)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(row.map(|s| WorkflowScheduleObj {
             id: s.id,
