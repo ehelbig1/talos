@@ -13,6 +13,7 @@ chrono.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-db = { path = "../talos-db" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-engine-events = { path = "../talos-engine-events" }
 talos-graph-rag = { path = "../talos-graph-rag" }
