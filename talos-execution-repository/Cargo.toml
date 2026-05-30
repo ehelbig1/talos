@@ -22,5 +22,10 @@ tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# Live-Postgres integration test for crash-recovery claim/fail/reclaim
+# (gated on TALOS_TEST_DATABASE_URL).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
 [lints]
 workspace = true

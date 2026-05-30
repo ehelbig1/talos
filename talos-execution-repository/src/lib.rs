@@ -1618,7 +1618,7 @@ impl ExecutionRepository {
              FROM workflow_executions e \
              LEFT JOIN workflows w ON w.id = e.workflow_id \
              WHERE e.status = 'running' \
-               AND e.updated_at < NOW() - make_interval(mins => $1)",
+               AND e.updated_at < NOW() - make_interval(mins => $1::int)",
         )
         .bind(stale_after_minutes)
         .fetch_all(&self.db_pool)
@@ -1660,10 +1660,109 @@ impl ExecutionRepository {
                  error_message = CONCAT('Cleaned up: execution was stale (running for over ', $1::text, ' minutes)'), \
                  completed_at = NOW() \
              WHERE status = 'running' AND user_id = $2 \
-               AND started_at < NOW() - make_interval(mins => $1)",
+               AND started_at < NOW() - make_interval(mins => $1::int)",
         )
         .bind(timeout_minutes)
         .bind(user_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Atomically CLAIM one orphaned `running` execution for crash recovery
+    /// (RFC 0003 durable execution). Returns everything the resume needs, or
+    /// `None` when nothing is claimable.
+    ///
+    /// Exactly-once across replicas: the inner `SELECT … FOR UPDATE SKIP
+    /// LOCKED` picks a single candidate row and row-locks it, so concurrent
+    /// claimers on other replicas skip it and grab a *different* row (or
+    /// none); the status-guarded `UPDATE … WHERE status='running'` then flips
+    /// it `running → resuming`. A row in `resuming` is invisible to every
+    /// `WHERE status='running'` cleanup, so it can't be failed out from under
+    /// recovery. `graph_json` / `workflow_default_actor_id` come from
+    /// correlated subqueries (NULL if the workflow was deleted — caller
+    /// treats NULL graph as a hard skip).
+    ///
+    /// `stale_after_minutes` is the orphan threshold: a `running` row whose
+    /// `updated_at` (advanced on each checkpoint save) is older than this is
+    /// presumed orphaned. Must be positive (a non-positive value would claim
+    /// every running execution); refused with `None`.
+    pub async fn claim_stuck_execution_for_resume(
+        &self,
+        stale_after_minutes: i64,
+    ) -> Result<Option<StuckExecutionForResume>> {
+        if stale_after_minutes <= 0 {
+            tracing::warn!(
+                target: "talos_audit",
+                stale_after_minutes,
+                "crash-recovery claim refused: stale_after_minutes must be positive"
+            );
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, StuckExecutionForResume>(
+            "WITH claimed AS ( \
+                 SELECT id FROM workflow_executions \
+                 WHERE status = 'running' \
+                   AND updated_at < NOW() - make_interval(mins => $1::int) \
+                 ORDER BY updated_at ASC \
+                 LIMIT 1 \
+                 FOR UPDATE SKIP LOCKED \
+             ) \
+             UPDATE workflow_executions e \
+             SET status = 'resuming', updated_at = NOW() \
+             FROM claimed c \
+             WHERE e.id = c.id AND e.status = 'running' \
+             RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, \
+                       (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
+                           AS workflow_default_actor_id, \
+                       (SELECT w.graph_json FROM workflows w WHERE w.id = e.workflow_id) \
+                           AS graph_json",
+        )
+        .bind(stale_after_minutes)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Terminal exit for a claimed (`resuming`) execution whose resume could
+    /// not be dispatched (decrypt fail, engine build fail, NATS down, deleted
+    /// workflow). Status-guarded on `resuming` so it never clobbers a row the
+    /// engine already moved on. Returns true if it transitioned a row.
+    pub async fn fail_resuming_execution(&self, id: Uuid, error_message: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workflow_executions \
+             SET status = 'failed', error_message = $2, completed_at = NOW() \
+             WHERE id = $1 AND status = 'resuming'",
+        )
+        .bind(id)
+        .bind(error_message)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Reclaim executions wedged in `resuming` (a replica crashed *during*
+    /// recovery, before the engine took over). Older than `grace_minutes` →
+    /// `failed`, so they never get stuck. Run once at startup before the main
+    /// claim sweep. Returns the count reclaimed. Non-positive grace refused.
+    pub async fn reclaim_orphaned_resuming(&self, grace_minutes: i64) -> Result<u64> {
+        if grace_minutes <= 0 {
+            tracing::warn!(
+                target: "talos_audit",
+                grace_minutes,
+                "reclaim_orphaned_resuming refused: grace_minutes must be positive"
+            );
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "UPDATE workflow_executions \
+             SET status = 'failed', \
+                 error_message = 'resume interrupted (controller restarted during recovery)', \
+                 completed_at = NOW() \
+             WHERE status = 'resuming' \
+               AND updated_at < NOW() - make_interval(mins => $1::int)",
+        )
+        .bind(grace_minutes)
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())
