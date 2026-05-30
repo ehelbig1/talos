@@ -454,7 +454,10 @@ impl AdvancedRepository {
             );
             return Ok(0);
         }
-        sqlx::query(
+        // RFC 0005 S3: self-scope so the workflow_executions RLS policy
+        // backstops the DELETE (only the caller's rows are archived).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let n = sqlx::query(
             "WITH archived AS (
                 DELETE FROM workflow_executions
                 WHERE status IN ('completed', 'failed', 'cancelled')
@@ -480,10 +483,12 @@ impl AdvancedRepository {
         )
         .bind(days)
         .bind(user_id)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
         .map(|r| r.rows_affected())
-        .context("archive_executions")
+        .context("archive_executions")?;
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// List archived executions, optionally filtered by workflow_id.
@@ -1003,16 +1008,21 @@ impl AdvancedRepository {
 
     /// Archive a workflow (set status = 'archived'). Returns rows affected.
     pub async fn archive_workflow(&self, wf_id: Uuid, user_id: Uuid) -> Result<u64> {
-        sqlx::query(
+        // RFC 0005 S3: self-scope so the workflows RLS policy backstops the
+        // UPDATE (USING-as-WITH-CHECK; the row stays owned by the caller).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let n = sqlx::query(
             "UPDATE workflows SET status = 'archived', updated_at = NOW() \
              WHERE id = $1 AND user_id = $2 AND status != 'archived'",
         )
         .bind(wf_id)
         .bind(user_id)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
         .map(|r| r.rows_affected())
-        .context("archive_workflow")
+        .context("archive_workflow")?;
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// Fetch (name, status) for a workflow (ownership-checked).
@@ -1021,12 +1031,15 @@ impl AdvancedRepository {
         wf_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<(String, Option<String>)>> {
+        // RFC 0005 S3: self-scope (workflows RLS backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query("SELECT name, status FROM workflows WHERE id = $1 AND user_id = $2")
             .bind(wf_id)
             .bind(user_id)
-            .fetch_optional(&self.db_pool)
+            .fetch_optional(&mut *tx)
             .await
             .context("get_workflow_name_status")?;
+        tx.commit().await?;
 
         Ok(row.map(|r| {
             let name: String = r.try_get("name").unwrap_or_default();
@@ -1037,13 +1050,17 @@ impl AdvancedRepository {
 
     /// Set workflow status to 'active'.
     pub async fn activate_workflow(&self, wf_id: Uuid, user_id: Uuid) -> Result<()> {
+        // RFC 0005 S3: self-scope (workflows RLS backstop on the UPDATE).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         sqlx::query("UPDATE workflows SET status = 'active' WHERE id = $1 AND user_id = $2")
             .bind(wf_id)
             .bind(user_id)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map(|_| ())
-            .context("activate_workflow")
+            .context("activate_workflow")?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Create a workflow schedule.
@@ -1284,7 +1301,9 @@ impl AdvancedRepository {
             );
             return Ok(0);
         }
-        sqlx::query(
+        // RFC 0005 S3: self-scope (workflows RLS backstop on the UPDATE).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let n = sqlx::query(
             "UPDATE workflows SET status = 'archived', updated_at = NOW() \
              WHERE user_id = $1 \
                AND status = 'draft' \
@@ -1293,10 +1312,12 @@ impl AdvancedRepository {
         )
         .bind(user_id)
         .bind(stale_days)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
         .map(|r| r.rows_affected())
-        .context("archive_stale_drafts")
+        .context("archive_stale_drafts")?;
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// Count workflows with no capability tags.
