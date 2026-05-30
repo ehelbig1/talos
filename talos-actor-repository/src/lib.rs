@@ -301,12 +301,18 @@ impl ActorRepository {
     /// Verify that an actor exists and belongs to the given user.
     /// Returns the actor's UUID on success, or None if not found / access denied.
     pub async fn find_actor_for_user(&self, actor_id: Uuid, user_id: Uuid) -> Result<Option<Uuid>> {
+        // RFC 0005 S3: self-scope on a per-user tx so the actors RLS policy
+        // backstops this ownership gate for ALL callers (the MCP actor
+        // handlers + the GraphQL post-mutation summary), no per-caller
+        // change. The query filters `user_id = $2`; the scope mirrors it.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
                 .bind(actor_id)
                 .bind(user_id)
-                .fetch_optional(&self.db_pool)
+                .fetch_optional(&mut *tx)
                 .await?;
+        tx.commit().await?;
         Ok(exists)
     }
 
@@ -341,6 +347,10 @@ impl ActorRepository {
         status_filter: Option<&str>,
         inactive_days: Option<i64>,
     ) -> Result<Vec<ActorSummaryRow>> {
+        // RFC 0005 S3: self-scope (see find_actor_for_user). The
+        // actors/workflows/workflow_executions joins all pick up the
+        // backstop; the query already filters `a.user_id = $1`.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT a.id, a.name, a.description, a.status, a.max_capability_world, a.created_at,
                     COUNT(DISTINCT w.id)  AS workflow_count,
@@ -360,8 +370,9 @@ impl ActorRepository {
         .bind(user_id)
         .bind(status_filter)
         .bind(inactive_days)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let result = rows
             .iter()
@@ -417,6 +428,10 @@ impl ActorRepository {
         actor_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<ActorPostMutationSummary>> {
+        // RFC 0005 S3: self-scope (see find_actor_for_user). Real org
+        // visibility isn't needed — the actor + its count subqueries are
+        // all the caller's own (a.user_id = $2).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT a.id, a.name, a.description, a.status, a.max_capability_world, \
                     a.created_at, a.updated_at, \
@@ -428,8 +443,9 @@ impl ActorRepository {
         )
         .bind(actor_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(row.map(|r| ActorPostMutationSummary {
             id: r.get("id"),
@@ -520,13 +536,16 @@ impl ActorRepository {
         actor_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<String>> {
+        // RFC 0005 S3: self-scope (see find_actor_for_user).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let status: Option<String> =
             sqlx::query_scalar("SELECT status FROM actors WHERE id = $1 AND user_id = $2")
                 .bind(actor_id)
                 .bind(user_id)
-                .fetch_optional(&self.db_pool)
+                .fetch_optional(&mut *tx)
                 .await?
                 .flatten();
+        tx.commit().await?;
         Ok(status)
     }
 

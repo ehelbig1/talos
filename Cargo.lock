@@ -7301,6 +7301,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "sqlx",
+ "talos-db",
  "talos-dlp-provider",
  "talos-memory",
  "talos-secrets-manager",
