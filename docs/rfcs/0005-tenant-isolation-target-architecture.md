@@ -174,9 +174,40 @@ of the value early without the full infra cost up front.
 | **S0** | Foundation: data model, primitives, policies, boot guard, permissive-rollout proof | **Done** (RFC 0004) |
 | **S1** | Fail-closed on **narrow, request-only** tables (few readers, no cross-cutting access) | `scratch_sessions` ✓, `user_module_pins` ✓ |
 | **S2** | **Permissive backstop on the user-facing IDOR surfaces** of hot/cross-cutting tables (the actual attack vector). App-layer stays primary for internal readers. | **Done** — `workflows` GraphQL ✓, `secrets` ✓, `workflow_executions` ✓, `actors` ✓ |
-| **S3** | **Role split + unit-of-work refactor** — the deliberate infra project that unblocks fail-closed for the hot tables | **In progress** — `talos_app` role + `SET LOCAL ROLE` plumbing ✓ (flag-gated); chart toggle + runbook ✓; `UnitOfWork` abstraction + pilot resolvers ✓; next: migrate repositories onto `UnitOfWork` incrementally |
-| **S4** | Flip hot tables to **fail-closed** (drop permissive clause), `talos_system` exempt | Future (after S3) |
+| **S3** | **Role split + enforcement** — make the policies actually enforce | **Done** — `talos_app` role + `SET LOCAL ROLE` enforcement (works under a superuser base connection) ✓; chart + dev-compose toggles + runbook ✓; `UnitOfWork` abstraction ✓; **entire GraphQL surface** (reads + writes) scoped + lint-frozen (check 25) ✓; **entire MCP surface** (execution / actor / workflow / analytics / advanced repos, reads + writes) self-scoped ✓; **validated live** (cross-tenant read denied, owner preserved, `make smoke` green) ✓ |
+| **S4** | Flip hot tables to **fail-closed** (drop permissive clause), `talos_system` exempt | Future (after enforcement is **rolled out** to prod and stable — see below) |
 | **T2/T3** | Per-org KEK; physical isolation (RFC 0004 §T2/T3) | Future |
+
+### Current status (2026-05-30)
+
+**S0–S3 are functionally complete.** Every owned table has the
+membership-union RLS policy; both request protocols route their
+user-scoped reads *and* writes through `SET LOCAL ROLE talos_app`:
+
+- **GraphQL** — every resolver on an RLS table is scoped, and the
+  invariant is **lint-frozen** (`scripts/lint-structural.sh` check 25:
+  no bare-pool query on an RLS table in `talos-api/src/schema`).
+- **MCP** — the five repositories (`Execution`, `Actor`, `Workflow`,
+  `Analytics`, `Advanced`) **self-scope** their `user_id`-taking read +
+  write methods, so every handler is covered with no per-handler change.
+  The cross-cutting internal readers (`*_unchecked`, `*_by_id`,
+  `*_for_similarity`, embedding/graph-load, scheduler) deliberately stay
+  on the bare pool — the documented all-rows escape hatch.
+
+Enforcement is **flag-gated, default off** (`TALOS_RLS_SET_ROLE`) and was
+**validated live**: a real controller booted with the flag, logged
+`RLS SET-ROLE mode active` under a superuser base connection, and a
+two-user probe confirmed a cross-tenant GraphQL read is denied while the
+owner's is preserved (`make smoke` green).
+
+**The one remaining step is operational, not code:** roll
+`TALOS_RLS_SET_ROLE=true` out to real environments (per the operator
+runbook above) and let it bake. **S4** (drop the permissive `IS NULL`
+clause → fully fail-closed) is only safe *after* enforcement is on and
+stable in production — flipping fail-closed while the flag is off is a
+no-op (a superuser base connection bypasses RLS entirely), and flipping
+it before the cross-cutting-reader categorization is battle-tested risks
+breaking an internal path. So S4 waits on the rollout, by design.
 
 ### Why this staging is the right call
 
