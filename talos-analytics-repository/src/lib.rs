@@ -1045,6 +1045,9 @@ impl AnalyticsRepository {
         // ~1h phantom duration) don't distort the metric. See sibling
         // method in talos-workflow-repository for the production
         // incident rationale.
+        // RFC 0005 S3: self-scope so the workflow_executions RLS policy
+        // backstops this read for all (MCP analytics) callers.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT COUNT(*)::bigint AS total, \
                     COUNT(*) FILTER (WHERE status = 'completed')::bigint AS succeeded, \
@@ -1057,8 +1060,9 @@ impl AnalyticsRepository {
         .bind(wf_id)
         .bind(user_id)
         .bind(days)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ExecStats {
             total: row.try_get("total").unwrap_or(0),
             succeeded: row.try_get("succeeded").unwrap_or(0),
@@ -1071,6 +1075,8 @@ impl AnalyticsRepository {
     pub async fn get_exec_stats_global(&self, user_id: Uuid, days: i32) -> Result<ExecStats> {
         // See `get_exec_stats` for the status='completed' AVG-filter
         // rationale.
+        // RFC 0005 S3: self-scope (see get_exec_stats).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT COUNT(*)::bigint AS total, \
                     COUNT(*) FILTER (WHERE status = 'completed')::bigint AS succeeded, \
@@ -1082,8 +1088,9 @@ impl AnalyticsRepository {
         )
         .bind(user_id)
         .bind(days)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ExecStats {
             total: row.try_get("total").unwrap_or(0),
             succeeded: row.try_get("succeeded").unwrap_or(0),
@@ -1164,6 +1171,8 @@ impl AnalyticsRepository {
     }
 
     pub async fn list_workflows_for_user(&self, user_id: Uuid) -> Result<Vec<WorkflowBasicRow>> {
+        // RFC 0005 S3: self-scope (workflows RLS backstop for MCP callers).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT id, name, status, is_enabled, workflow_type, capabilities, \
                     readiness_score, description, created_at, updated_at \
@@ -1172,8 +1181,9 @@ impl AnalyticsRepository {
              ORDER BY updated_at DESC",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows
             .into_iter()
             .map(|r| WorkflowBasicRow {
@@ -1200,6 +1210,8 @@ impl AnalyticsRepository {
         user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<WorkflowGraphRow>> {
+        // RFC 0005 S3: self-scope (workflows RLS backstop for MCP callers).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT id, name, graph_json::text AS graph_json, status, is_enabled, \
                     workflow_type, tags, created_at, updated_at \
@@ -1210,8 +1222,9 @@ impl AnalyticsRepository {
         )
         .bind(user_id)
         .bind(limit)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows
             .into_iter()
             .map(|r| WorkflowGraphRow {
@@ -1313,6 +1326,9 @@ impl AnalyticsRepository {
         // Phase 5: `templates` count now sources from the unified `modules`
         // table (counts user-owned + catalog rows, matching the legacy
         // `node_templates.user_id = $1 OR IS NULL` predicate).
+        // RFC 0005 S3: self-scope so the workflows / workflow_executions /
+        // secrets RLS policies backstop the per-user count subqueries.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT \
                (SELECT COUNT(*)::bigint FROM workflows WHERE user_id = $1) AS workflows, \
@@ -1324,8 +1340,9 @@ impl AnalyticsRepository {
                (SELECT COUNT(*)::bigint FROM webhook_triggers WHERE user_id = $1) AS webhooks",
         )
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(SystemStatusCounts {
             workflows: row.try_get("workflows").unwrap_or(0),
             executions: row.try_get("executions").unwrap_or(0),
@@ -1355,6 +1372,8 @@ impl AnalyticsRepository {
         // state, not an "ignore this workflow" signal. Same root
         // cause as the loop_capped sibling fix (see
         // ExecutionRepository::find_loop_capped_workflows_24h).
+        // RFC 0005 S3: self-scope (workflows + workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT w.id, w.name, \
                     COUNT(*) FILTER (WHERE we.status = 'failed')::bigint AS fail_count, \
@@ -1369,8 +1388,9 @@ impl AnalyticsRepository {
         )
         .bind(user_id)
         .bind(hours)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows
             .into_iter()
             .map(|r| FailingWorkflowRow {
@@ -1385,6 +1405,8 @@ impl AnalyticsRepository {
     // -- Health dashboard -------------------------------------------------
 
     pub async fn get_long_running_executions(&self, user_id: Uuid) -> Result<Vec<LongRunningRow>> {
+        // RFC 0005 S3: self-scope (workflow_executions + workflows backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT we.id, we.workflow_id, w.name, \
                     EXTRACT(EPOCH FROM (NOW() - we.started_at))::int AS running_secs \
@@ -1395,8 +1417,9 @@ impl AnalyticsRepository {
              ORDER BY we.started_at ASC LIMIT 10",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows
             .into_iter()
             .map(|r| LongRunningRow {
@@ -1409,6 +1432,8 @@ impl AnalyticsRepository {
     }
 
     pub async fn get_health_summary_counts(&self, user_id: Uuid) -> Result<HealthSummaryCounts> {
+        // RFC 0005 S3: self-scope (workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT \
                COUNT(*) FILTER (WHERE status = 'running')::bigint AS running, \
@@ -1417,8 +1442,9 @@ impl AnalyticsRepository {
              FROM workflow_executions WHERE user_id = $1",
         )
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(HealthSummaryCounts {
             running: row.try_get("running").unwrap_or(0),
             failed_24h: row.try_get("failed_24h").unwrap_or(0),
@@ -2379,13 +2405,16 @@ impl AnalyticsRepository {
     }
 
     pub async fn count_stale_running_executions(&self, user_id: Uuid) -> Result<i64> {
+        // RFC 0005 S3: self-scope (workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM workflow_executions \
              WHERE user_id = $1 AND status = 'running' AND started_at < NOW() - interval '60 minutes'",
         )
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(count)
     }
 
@@ -2685,6 +2714,8 @@ impl AnalyticsRepository {
     }
 
     pub async fn get_recent_exec_error_rate(&self, user_id: Uuid) -> Result<(i64, i64)> {
+        // RFC 0005 S3: self-scope (workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT COUNT(*)::bigint AS total, \
                     COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed \
@@ -2692,8 +2723,9 @@ impl AnalyticsRepository {
              WHERE user_id = $1 AND started_at > NOW() - interval '1 hour'",
         )
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         let total: i64 = row.try_get("total").unwrap_or(0);
         let failed: i64 = row.try_get("failed").unwrap_or(0);
         Ok((total, failed))
@@ -2935,6 +2967,8 @@ impl AnalyticsRepository {
     // -- Daily digest -----------------------------------------------------
 
     pub async fn get_daily_exec_summary(&self, user_id: Uuid) -> Result<DailyExecSummary> {
+        // RFC 0005 S3: self-scope (workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT COUNT(*)::bigint AS total, \
                     COUNT(*) FILTER (WHERE status = 'completed')::bigint AS succeeded, \
@@ -2944,8 +2978,9 @@ impl AnalyticsRepository {
              FROM workflow_executions WHERE user_id = $1 AND started_at > NOW() - INTERVAL '24 hours'",
         )
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(DailyExecSummary {
             total: row.try_get("total").unwrap_or(0),
             succeeded: row.try_get("succeeded").unwrap_or(0),
@@ -2956,6 +2991,8 @@ impl AnalyticsRepository {
     }
 
     pub async fn get_top_active_workflows_24h(&self, user_id: Uuid) -> Result<Vec<TopWorkflowRow>> {
+        // RFC 0005 S3: self-scope (workflow_executions + workflows backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT w.id, w.name, COUNT(*)::bigint AS exec_count \
              FROM workflow_executions we \
@@ -2965,8 +3002,9 @@ impl AnalyticsRepository {
              ORDER BY exec_count DESC LIMIT 3",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows
             .into_iter()
             .map(|r| TopWorkflowRow {
