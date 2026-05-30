@@ -1700,22 +1700,36 @@ impl WorkflowsMutations {
             // of a still-running workflow. Fail closed with a
             // retry-after-DB diagnostic so the operator knows the
             // delete state is undetermined.
-            let blocked = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS ( \
-                     SELECT 1 FROM workflows w \
-                     WHERE w.id = $1 \
-                       AND (w.user_id = $2 OR w.org_id = ANY($3)) \
-                       AND EXISTS ( \
-                           SELECT 1 FROM workflow_executions \
-                           WHERE workflow_id = w.id \
-                             AND status IN ('running', 'queued', 'pending') \
-                       ) \
-                 )",
-            )
-            .bind(id)
-            .bind(user_id)
-            .bind(&org_ids)
-            .fetch_optional(db_pool)
+            // RFC 0005 S3: run the diagnostic on a tenant-scoped tx so the
+            // workflows + workflow_executions RLS policies backstop it. A
+            // begin/commit failure maps to sqlx::Error and lands in the
+            // Err arm below — which already means "delete state
+            // undetermined", the correct outcome when the scope can't even
+            // be established.
+            let blocked: Result<Option<bool>, sqlx::Error> = async {
+                let mut dtx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
+                    .await
+                    .map_err(|e| sqlx::Error::Protocol(format!("tenant scope: {e}")))?;
+                let b = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM workflows w \
+                         WHERE w.id = $1 \
+                           AND (w.user_id = $2 OR w.org_id = ANY($3)) \
+                           AND EXISTS ( \
+                               SELECT 1 FROM workflow_executions \
+                               WHERE workflow_id = w.id \
+                                 AND status IN ('running', 'queued', 'pending') \
+                           ) \
+                     )",
+                )
+                .bind(id)
+                .bind(user_id)
+                .bind(&scope.accessible_org_ids)
+                .fetch_optional(&mut *dtx)
+                .await?;
+                dtx.commit().await?;
+                Ok(b)
+            }
             .await;
             match blocked {
                 Ok(Some(true)) => {
