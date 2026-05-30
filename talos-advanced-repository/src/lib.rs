@@ -1198,15 +1198,18 @@ impl AdvancedRepository {
     /// Count total workflows and those with embeddings for a user.
     /// Returns (total, embedded).
     pub async fn get_embedding_coverage(&self, user_id: Uuid) -> Result<(i64, i64)> {
+        // RFC 0005 S3: self-scope (workflows RLS backstop for MCP callers).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row = sqlx::query(
             "SELECT COUNT(*) as total, \
                     COUNT(*) FILTER (WHERE embedding IS NOT NULL) as embedded \
              FROM workflows WHERE user_id = $1",
         )
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .context("get_embedding_coverage")?;
+        tx.commit().await?;
 
         Ok(row
             .map(|r| {
@@ -1220,19 +1223,24 @@ impl AdvancedRepository {
 
     /// Fetch UUIDs of workflows that have no embedding (limit 100).
     pub async fn get_ids_without_embedding(&self, user_id: Uuid) -> Result<Vec<Uuid>> {
+        // RFC 0005 S3: self-scope (workflows RLS backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT id FROM workflows WHERE user_id = $1 AND embedding IS NULL LIMIT 100",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await
         .context("get_ids_without_embedding")?;
+        tx.commit().await?;
 
         Ok(rows.into_iter().map(|r| r.get("id")).collect())
     }
 
     /// Fetch recent draft workflows with no executions (max 10).
     pub async fn get_draft_workflows(&self, user_id: Uuid) -> Result<Vec<DraftWorkflowRow>> {
+        // RFC 0005 S3: self-scope (workflows + workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT w.id, w.name, w.created_at, w.graph_json::text AS graph_json \
              FROM workflows w \
@@ -1242,9 +1250,10 @@ impl AdvancedRepository {
              ORDER BY w.updated_at DESC LIMIT 10",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await
         .context("get_draft_workflows")?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -1292,26 +1301,33 @@ impl AdvancedRepository {
 
     /// Count workflows with no capability tags.
     pub async fn get_uncapabilized_count(&self, user_id: Uuid) -> Result<i64> {
-        sqlx::query_scalar::<_, i64>(
+        // RFC 0005 S3: self-scope (workflows RLS backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let n = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM workflows \
              WHERE user_id = $1 AND (capabilities IS NULL OR capabilities = '{}')",
         )
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
-        .context("get_uncapabilized_count")
+        .context("get_uncapabilized_count")?;
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// Fetch UUIDs of workflows with no capability tags (limit 100).
     pub async fn get_ids_without_capabilities(&self, user_id: Uuid) -> Result<Vec<Uuid>> {
+        // RFC 0005 S3: self-scope (workflows RLS backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT id FROM workflows WHERE user_id = $1 \
              AND (capabilities IS NULL OR capabilities = '{}') LIMIT 100",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await
         .context("get_ids_without_capabilities")?;
+        tx.commit().await?;
 
         Ok(rows.into_iter().map(|r| r.get("id")).collect())
     }
@@ -1354,13 +1370,17 @@ impl AdvancedRepository {
 
     /// Count active (non-archived) workflows for a user.
     pub async fn get_active_workflow_count(&self, user_id: Uuid) -> Result<i64> {
-        sqlx::query_scalar::<_, i64>(
+        // RFC 0005 S3: self-scope (workflows RLS backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let n = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM workflows WHERE user_id = $1 AND status = 'active'",
         )
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
-        .context("get_active_workflow_count")
+        .context("get_active_workflow_count")?;
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// Count active workflow schedules for a user.
@@ -1394,7 +1414,9 @@ impl AdvancedRepository {
         // `status != 'archived'` so the metric matches the user's
         // mental model: "how many of my non-archived workflows have
         // an enabled schedule attached?"
-        sqlx::query_scalar::<_, i64>(
+        // RFC 0005 S3: self-scope (workflows RLS backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let n = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(DISTINCT w.id) \
              FROM workflows w \
              JOIN workflow_schedules s ON s.workflow_id = w.id \
@@ -1403,9 +1425,11 @@ impl AdvancedRepository {
                AND s.is_enabled = true",
         )
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
-        .context("get_active_workflows_with_schedule_count")
+        .context("get_active_workflows_with_schedule_count")?;
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// Workflows that ran ≥3 times in the last 60 days but have no active
@@ -1501,14 +1525,18 @@ impl AdvancedRepository {
 
     /// Check whether a workflow is owned by the given user.
     pub async fn check_workflow_ownership(&self, wf_id: Uuid, user_id: Uuid) -> Result<bool> {
-        sqlx::query_scalar::<_, bool>(
+        // RFC 0005 S3: self-scope (workflows RLS backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1 AND user_id = $2)",
         )
         .bind(wf_id)
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
-        .context("check_workflow_ownership")
+        .context("check_workflow_ownership")?;
+        tx.commit().await?;
+        Ok(exists)
     }
 
     /// Insert a new approval gate. Returns the new gate UUID.
@@ -1969,6 +1997,9 @@ impl AdvancedRepository {
 
     /// List all SLA thresholds for a user (with workflow name).
     pub async fn list_sla_thresholds(&self, user_id: Uuid) -> Result<Vec<SlaThresholdRow>> {
+        // RFC 0005 S3: self-scope so the workflows RLS policy backstops
+        // the ownership JOIN (workflow_sla_thresholds has no policy itself).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT t.id, t.workflow_id, w.name AS workflow_name, \
                     t.p95_latency_ms, t.success_rate_pct::float8 AS success_rate_pct, \
@@ -1979,9 +2010,10 @@ impl AdvancedRepository {
              ORDER BY t.created_at DESC",
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await
         .context("list_sla_thresholds")?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
