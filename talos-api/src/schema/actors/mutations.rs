@@ -302,6 +302,15 @@ impl ActorsMutations {
 
         let actor_id = Uuid::new_v4();
 
+        // RFC 0005 S3: INSERT on a per-user scoped tx so the actors RLS
+        // policy's WITH CHECK pins the new row to the caller — if the
+        // bound user_id ever drifted from the acting user, the insert
+        // fails closed (42501) rather than creating a cross-tenant actor.
+        // Commit before the post-insert log/summary (they reference the
+        // row).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         sqlx::query(
             "INSERT INTO actors (id, user_id, name, description, max_capability_world, status) \
              VALUES ($1, $2, $3, $4, $5, 'active')",
@@ -311,12 +320,15 @@ impl ActorsMutations {
         .bind(&name)
         .bind(&description)
         .bind(&max_world)
-        .execute(db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create actor: {}", e);
             async_graphql::Error::new("Failed to create actor").extend_safe()
         })?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         talos_actor_repository::spawn_log_action(
             db_pool.clone(),
@@ -913,6 +925,14 @@ impl ActorsMutations {
         let db_pool = ctx.data::<sqlx::PgPool>()?;
         use sqlx::Row as _;
 
+        // RFC 0005 S3: the source-actor ownership read + the clone INSERT
+        // share one per-user scoped tx — the actors RLS policy backstops
+        // both, and its WITH CHECK pins the new row to the caller. Commit
+        // before the memory copy below (it needs the new actor row).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+
         // Fetch source actor (ownership check)
         let src = sqlx::query(
             "SELECT name, description, max_capability_world FROM actors \
@@ -920,7 +940,7 @@ impl ActorsMutations {
         )
         .bind(id)
         .bind(user_id)
-        .fetch_optional(db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?
         .ok_or_else(|| {
@@ -950,12 +970,15 @@ impl ActorsMutations {
         .bind(&clone_name)
         .bind(&src_description)
         .bind(world)
-        .execute(db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("clone_actor insert failed: {}", e);
             async_graphql::Error::new("Failed to clone actor").extend_safe()
         })?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         // Copy semantic (permanent) and episodic (fresh 7-day TTL) memories
         // through the canonical talos_memory entry point — same DEK lineage
