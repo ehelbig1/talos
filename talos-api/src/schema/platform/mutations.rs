@@ -39,18 +39,27 @@ impl PlatformMutations {
             }
         }
 
+        // RFC 0005 S3: per-user scoped tx so the workflows RLS policy
+        // backstops this UPDATE (USING-as-WITH-CHECK; the row stays owned
+        // by the caller — only max_concurrent_executions changes).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let result = sqlx::query(
             "UPDATE workflows SET max_concurrent_executions = $1 WHERE id = $2 AND user_id = $3",
         )
         .bind(max_concurrent)
         .bind(workflow_id)
         .bind(user_id)
-        .execute(db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("Failed to set concurrency limit: {}", e);
             async_graphql::Error::new("Failed to set concurrency limit").extend_safe()
         })?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if result.rows_affected() == 0 {
             return Err(

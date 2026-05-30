@@ -1930,6 +1930,70 @@ else
 fi
 echo
 
+# ── 25. No bare-pool reads/writes on RLS tables in talos-api resolvers ─
+bold "▶ check 25: bare-pool queries on RLS tables in talos-api/src/schema"
+
+# RFC 0004/0005 S2/S3: the org-isolation RLS policies only ENFORCE for a
+# query that runs inside a tenant-scoped transaction (begin_tenant_read_scoped
+# / begin_org_scoped / begin_user_scoped / UnitOfWork) — that is what issues
+# the per-tx `SET LOCAL ROLE talos_app` + the app.current_user_id/org_ids
+# GUCs. A resolver that runs a query on the bare pool (`.fetch_*(db_pool)` /
+# `.execute(db_pool)`) NEVER sets the role, so even with TALOS_RLS_SET_ROLE
+# on it runs as the base role and the RLS policy is a NO-OP for that read /
+# write — a silent backstop gap that survives the enforcement flip.
+#
+# This check flags any bare-pool executor in talos-api/src/schema whose
+# enclosing `sqlx::query*` block references one of the RLS-enabled tables
+# (workflows, workflow_executions, actors, secrets, scratch_sessions,
+# user_module_pins) — including via JOIN, the dominant ownership-gate
+# shape. The ~22-PR S2/S3 conversion reduced this to ZERO; the lint freezes
+# it so new code can't silently regress.
+#
+# Opt out — for a query that MUST run unscoped (a genuine cross-tenant
+# platform-admin op, or an internal cross-cutting reader whose
+# authorization is established upstream) — with `// allow-bare-pool-rls:
+# <reason>` anywhere in the query block.
+
+RLS_TABLE_RE='workflows|workflow_executions|actors|secrets|scratch_sessions|user_module_pins'
+BARE_POOL_RLS_VIOLATIONS=0
+
+if [ -d talos-api/src/schema ]; then
+    while IFS=: read -r file lineno _; do
+        [ -f "$file" ] || continue
+        start=$((lineno > 40 ? lineno - 40 : 1))
+        # Take the text from the LAST `sqlx::query` opening up to the
+        # executor line — i.e. the actual enclosing query block.
+        qblock=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null \
+            | awk '/sqlx::query/{buf=""} {buf=buf"\n"$0} END{print buf}')
+        echo "$qblock" | grep -q "sqlx::query" || continue
+        echo "$qblock" | grep -qiE \
+            "(FROM|JOIN|INTO|UPDATE)[[:space:]]+(${RLS_TABLE_RE})([^a-zA-Z0-9_]|$)" || continue
+        echo "$qblock" | grep -q "// allow-bare-pool-rls:" && continue
+        tbl=$(echo "$qblock" | grep -oiE \
+            "(FROM|JOIN|INTO|UPDATE)[[:space:]]+(${RLS_TABLE_RE})" | head -1)
+        printf '  %s:%s — bare-pool executor on an RLS-table query [%s]\n' \
+            "$file" "$lineno" "$tbl"
+        BARE_POOL_RLS_VIOLATIONS=$((BARE_POOL_RLS_VIOLATIONS + 1))
+    done < <(grep -rnE '\.(fetch_optional|fetch_one|fetch_all|execute)\((db_pool|pool|&self\.db_pool)\)' \
+        talos-api/src/schema 2>/dev/null || true)
+fi
+
+if [ "$BARE_POOL_RLS_VIOLATIONS" -gt 0 ]; then
+    red "✗ $BARE_POOL_RLS_VIOLATIONS bare-pool quer(ies) on RLS tables in talos-api resolvers"
+    yellow '  → run the query on a tenant-scoped tx so RLS enforces under talos_app:'
+    yellow '      let mut tx = talos_db::begin_user_scoped(db_pool, user_id).await?;     // personal'
+    yellow '      let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope).await?; // org-shared'
+    yellow '      let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope).await?;       // multi-call'
+    yellow '    then .fetch_*/.execute(&mut *tx) (or uow.conn()) and tx.commit()/uow.commit().'
+    yellow '  → genuine cross-tenant / upstream-authorized reads opt out with:'
+    yellow '      // allow-bare-pool-rls: <reason>'
+    yellow '  → See RFC 0005 (SET-ROLE enforcement) + the S2/S3 conversion PRs.'
+    EXIT_CODE=1
+else
+    green "✓ no bare-pool reads/writes on RLS tables in talos-api resolvers"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
