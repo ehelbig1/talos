@@ -496,17 +496,30 @@ impl ActorsMutations {
         let mut archived_count = 0i64;
         let mut cleanup_failed = false;
         if cleanup {
-            match sqlx::query_scalar::<_, i64>(
-                "WITH updated AS (
-                    UPDATE workflows SET status = 'archived', updated_at = now()
-                    WHERE actor_id = $1 AND (status IS NULL OR status != 'archived')
-                    RETURNING 1
-                 ) SELECT COUNT(*) FROM updated",
-            )
-            .bind(id)
-            .fetch_optional(db_pool)
-            .await
-            {
+            // RFC 0005 S3: scope the best-effort workflow archive on a
+            // per-user tx so the workflows RLS policy (USING-as-WITH-CHECK)
+            // backstops it — only the caller's own workflows for this actor
+            // are archived. begin/commit failures fold into the existing
+            // cleanup_failed path (the actor is already terminated above).
+            let archive_res: Result<Option<i64>, sqlx::Error> = async {
+                let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+                    .await
+                    .map_err(|e| sqlx::Error::Protocol(format!("tenant scope: {e}")))?;
+                let n = sqlx::query_scalar::<_, i64>(
+                    "WITH updated AS (
+                        UPDATE workflows SET status = 'archived', updated_at = now()
+                        WHERE actor_id = $1 AND (status IS NULL OR status != 'archived')
+                        RETURNING 1
+                     ) SELECT COUNT(*) FROM updated",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(n)
+            }
+            .await;
+            match archive_res {
                 Ok(n) => archived_count = n.unwrap_or(0),
                 Err(e) => {
                     cleanup_failed = true;
@@ -750,15 +763,23 @@ impl ActorsMutations {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data::<sqlx::PgPool>()?;
 
-        // Validate actor ownership
+        // Validate actor ownership — RFC 0005 S3: on a per-user scoped tx
+        // so the actors RLS policy backstops the check (the memory write
+        // itself goes through talos_memory).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let owned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2 AND status != 'terminated')",
         )
         .bind(input.actor_id)
         .bind(user_id)
-        .fetch_one(db_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if !owned {
             return Err(
@@ -881,15 +902,22 @@ impl ActorsMutations {
         let trimmed_key = talos_memory::validate_memory_key(&key)
             .map_err(|msg| async_graphql::Error::new(msg).extend_safe())?;
 
-        // Verify ownership before deleting
+        // Verify ownership before deleting — RFC 0005 S3: per-user scoped
+        // tx so the actors RLS policy backstops the check.
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let owned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2)",
         )
         .bind(actor_id)
         .bind(user_id)
-        .fetch_one(db_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if !owned {
             return Err(
