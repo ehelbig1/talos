@@ -424,6 +424,11 @@ impl WebhooksMutations {
             execution_id: Uuid,
             replayed_at: Option<chrono::DateTime<chrono::Utc>>,
         }
+        // RFC 0005 S3: per-user scoped tx so the workflows RLS policy
+        // backstops the ownership JOIN (the gate is `w.user_id = $2`).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let row: DlqRow = sqlx::query_as::<_, DlqRow>(
             "SELECT d.execution_id, d.replayed_at \
              FROM dead_letter_queue d \
@@ -432,12 +437,15 @@ impl WebhooksMutations {
         )
         .bind(id)
         .bind(user_id)
-        .fetch_optional(db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?
         .ok_or_else(|| {
             async_graphql::Error::new("DLQ entry not found or access denied").extend_safe()
         })?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if row.replayed_at.is_some() {
             return Err(
