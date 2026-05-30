@@ -118,6 +118,12 @@ impl ExecutionsMutations {
             _ => None,
         };
 
+        // RFC 0005 S3: per-user scoped tx so the workflows RLS policy
+        // backstops the ownership JOIN (the gate is `w.user_id = $1` on
+        // the joined workflow; execution_approvals has no policy itself).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let result = sqlx::query!(
             "UPDATE execution_approvals \
              SET status = 'approved', decided_at = NOW(), decided_by = $1, reason = $2 \
@@ -127,9 +133,12 @@ impl ExecutionsMutations {
             reason,
             id
         )
-        .execute(db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if result.rows_affected() == 0 {
             return Err(
@@ -164,6 +173,11 @@ impl ExecutionsMutations {
             _ => None,
         };
 
+        // RFC 0005 S3: per-user scoped tx → workflows RLS backstops the
+        // ownership JOIN (see approve_execution).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let result = sqlx::query!(
             "UPDATE execution_approvals \
              SET status = 'denied', decided_at = NOW(), decided_by = $1, reason = $2 \
@@ -173,9 +187,12 @@ impl ExecutionsMutations {
             reason,
             id
         )
-        .execute(db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if result.rows_affected() == 0 {
             return Err(
