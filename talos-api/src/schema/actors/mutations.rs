@@ -368,6 +368,12 @@ impl ActorsMutations {
         // RBAC + state checks. Closing at the SQL layer makes the
         // IRREVERSIBLE contract documented on terminate_actor and
         // archive_actor unconditional.
+        // RFC 0005 S3: run the UPDATE on a per-user scoped tx so the
+        // actors RLS policy backstops it (USING doubles as WITH CHECK on
+        // the update — the row stays owned by the caller).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let result = sqlx::query(
             "UPDATE actors SET status = $1, updated_at = now() \
              WHERE id = $2 AND user_id = $3 \
@@ -376,12 +382,15 @@ impl ActorsMutations {
         .bind(&status)
         .bind(id)
         .bind(user_id)
-        .execute(db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("Failed to update actor status: {}", e);
             async_graphql::Error::new("Failed to update actor status").extend_safe()
         })?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if result.rows_affected() == 0 {
             // rows_affected = 0 collapses three cases into one
@@ -434,17 +443,25 @@ impl ActorsMutations {
         let db_pool = ctx.data::<sqlx::PgPool>()?;
         let cleanup = cleanup_workflows.unwrap_or(false);
 
+        // RFC 0005 S3: per-user scoped tx → actors RLS backstops the
+        // UPDATE (see update_actor_status).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let result = sqlx::query(
             "UPDATE actors SET status = 'terminated', updated_at = now() WHERE id = $1 AND user_id = $2",
         )
         .bind(id)
         .bind(user_id)
-        .execute(db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("Failed to terminate actor: {}", e);
             async_graphql::Error::new("Failed to terminate actor").extend_safe()
         })?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if result.rows_affected() == 0 {
             return Err(
@@ -636,6 +653,11 @@ impl ActorsMutations {
             param_count + 2,
         );
 
+        // RFC 0005 S3: per-user scoped tx → actors RLS backstops the
+        // UPDATE (see update_actor_status).
+        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let mut q = sqlx::query(&sql);
         if let Some(ref n) = name {
             q = q.bind(n.trim());
@@ -649,7 +671,7 @@ impl ActorsMutations {
         let result = q
             .bind(id)
             .bind(user_id)
-            .execute(db_pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
@@ -663,6 +685,9 @@ impl ActorsMutations {
                     async_graphql::Error::new("Failed to update actor").extend_safe()
                 }
             })?;
+        tx.commit()
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if result.rows_affected() == 0 {
             return Err(
