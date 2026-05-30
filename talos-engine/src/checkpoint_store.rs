@@ -86,6 +86,14 @@ pub struct ControllerCheckpointStore {
     /// `save()` path no-ops without a key and the `load()` path
     /// returned an empty map, so the engine resumed from scratch.
     secrets_manager: Option<std::sync::Arc<talos_secrets_manager::SecretsManager>>,
+    /// Execution statuses `load` will read a checkpoint from. Defaults to
+    /// `["waiting"]` (the suspend/approval-gate resume path). Crash recovery
+    /// sets this to `["waiting", "resuming"]` via [`with_resume_statuses`]
+    /// (`ControllerCheckpointStore::with_resume_statuses`) so a claimed
+    /// (`resuming`) orphaned execution actually hydrates its checkpoint —
+    /// without it, all three `load` branches filter `status='waiting'` and a
+    /// `resuming` row silently loads empty → re-runs from scratch.
+    load_statuses: Vec<String>,
 }
 
 impl fmt::Debug for ControllerCheckpointStore {
@@ -120,7 +128,18 @@ impl ControllerCheckpointStore {
             pool,
             worker_shared_key,
             secrets_manager: None,
+            load_statuses: vec!["waiting".to_string()],
         }
+    }
+
+    /// Crash recovery (RFC 0003): also read a checkpoint from `resuming`
+    /// rows (the claimed-orphan state), not just `waiting`. Without this the
+    /// startup resume sweep would load an empty checkpoint for every claimed
+    /// execution and re-run it from scratch.
+    #[must_use]
+    pub fn with_resume_statuses(mut self) -> Self {
+        self.load_statuses = vec!["waiting".to_string(), "resuming".to_string()];
+        self
     }
 
     /// MCP-684: attach a SecretsManager so `load` can decrypt
@@ -180,6 +199,35 @@ pub async fn load_checkpoint_for_full(
     }
 }
 
+/// Crash-recovery variant of [`load_checkpoint_for_full`] that also reads a
+/// checkpoint from `resuming` rows (the claimed-orphan state), not just
+/// `waiting`. The startup resume sweep MUST use this — `load_checkpoint_for_full`
+/// would return an empty map for a `resuming` row (all three branches filter
+/// `status='waiting'`), silently re-running the workflow from scratch.
+pub async fn load_checkpoint_for_resume(
+    pool: &Pool<Postgres>,
+    worker_shared_key: Option<&[u8]>,
+    secrets_manager: Option<std::sync::Arc<talos_secrets_manager::SecretsManager>>,
+    execution_id: Uuid,
+) -> HashMap<Uuid, JsonValue> {
+    let mut store = ControllerCheckpointStore::new(pool.clone(), worker_shared_key.map(<[u8]>::to_vec))
+        .with_resume_statuses();
+    if let Some(sm) = secrets_manager {
+        store = store.with_secrets_manager(sm);
+    }
+    match store.load(execution_id).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(
+                %execution_id,
+                error = %e,
+                "Failed to load checkpoint for resume — treating as fresh run"
+            );
+            HashMap::new()
+        }
+    }
+}
+
 #[async_trait]
 impl CheckpointStore for ControllerCheckpointStore {
     async fn save(&self, execution_id: Uuid, snapshot: &JsonValue) -> Result<(), BoxError> {
@@ -214,9 +262,10 @@ impl CheckpointStore for ControllerCheckpointStore {
         // Plain-JSON fast path: older executions and ones written with no key.
         let row: Option<(Option<JsonValue>,)> = sqlx::query_as(
             "SELECT output_data FROM workflow_executions \
-             WHERE id = $1 AND status = 'waiting'",
+             WHERE id = $1 AND status = ANY($2)",
         )
         .bind(execution_id)
+        .bind(&self.load_statuses)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -235,9 +284,10 @@ impl CheckpointStore for ControllerCheckpointStore {
         if let Some(key) = self.worker_shared_key.as_deref() {
             let enc_row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
                 "SELECT checkpoint_encrypted, checkpoint_nonce FROM workflow_executions \
-                 WHERE id = $1 AND status = 'waiting' AND checkpoint_encrypted IS NOT NULL",
+                 WHERE id = $1 AND status = ANY($2) AND checkpoint_encrypted IS NOT NULL",
             )
             .bind(execution_id)
+            .bind(&self.load_statuses)
             .fetch_optional(&self.pool)
             .await?;
 
@@ -268,9 +318,10 @@ impl CheckpointStore for ControllerCheckpointStore {
 
         let dek_row: Option<(Option<Vec<u8>>, Option<Uuid>)> = sqlx::query_as(
             "SELECT output_data_enc, output_enc_key_id FROM workflow_executions \
-             WHERE id = $1 AND status = 'waiting' AND output_data_enc IS NOT NULL",
+             WHERE id = $1 AND status = ANY($2) AND output_data_enc IS NOT NULL",
         )
         .bind(execution_id)
+        .bind(&self.load_statuses)
         .fetch_optional(&self.pool)
         .await?;
 
