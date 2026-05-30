@@ -8322,6 +8322,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-db",
+ "talos-module-payload-encryption",
  "talos-secrets-manager",
  "tracing",
  "uuid",

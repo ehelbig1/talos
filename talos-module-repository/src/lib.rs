@@ -303,17 +303,60 @@ impl ModuleRepository {
         self
     }
 
-    /// Decrypt a payload column read from a module_executions row.
-    /// Prefers ciphertext when present + SecretsManager wired; falls
-    /// back to the plaintext column for legacy rows.
-    async fn read_payload(
+    /// Decrypt one `module_executions` payload slot (input/output/trigger).
+    /// Prefers ciphertext when present + SecretsManager wired; falls back to
+    /// the plaintext column for legacy rows.
+    ///
+    /// MUST route through `decrypt_payload_slot` (version+slot-bound AAD),
+    /// mirroring the canonical reader in `talos-module-executions`. The prior
+    /// implementation called the bare `decrypt_value_by_key` (empty AAD = v0
+    /// format), which AES-GCM-tag-fails on every v1+ row the writer produces
+    /// — silently breaking replay-from-history on any encrypted deploy. The
+    /// caller MUST therefore SELECT the row `id` (the AAD root) and
+    /// `payload_format`; omitting `payload_format` (defaulting to 0) would
+    /// reintroduce the v0 mismatch.
+    async fn read_module_payload(
         &self,
+        module_execution_id: Uuid,
+        slot: talos_module_payload_encryption::PayloadSlot,
         plaintext: Option<serde_json::Value>,
         enc_bytes: Option<Vec<u8>>,
         key_id: Option<Uuid>,
+        format_version: i16,
     ) -> Result<Option<serde_json::Value>> {
         if let (Some(sm), Some(bytes), Some(kid)) = (&self.secrets_manager, &enc_bytes, key_id) {
-            let s = sm.decrypt_value_by_key(kid, bytes).await?;
+            let s = talos_module_payload_encryption::decrypt_payload_slot(
+                sm,
+                kid,
+                bytes,
+                module_execution_id,
+                slot,
+                format_version,
+            )
+            .await?;
+            let v: serde_json::Value = serde_json::from_str(&s)?;
+            return Ok(Some(v));
+        }
+        Ok(plaintext)
+    }
+
+    /// Decrypt a `workflow_executions.output_data_enc` column. Unlike module
+    /// payloads (per-slot AAD), workflow output binds only the execution `id`
+    /// as AAD — mirroring `talos_execution_repository`'s `decrypt_output` so
+    /// the two readers stay in lockstep on the wire format. The caller MUST
+    /// SELECT the row `id` and `output_data_format`.
+    async fn read_workflow_output(
+        &self,
+        execution_id: Uuid,
+        plaintext: Option<serde_json::Value>,
+        enc_bytes: Option<Vec<u8>>,
+        key_id: Option<Uuid>,
+        format_version: i16,
+    ) -> Result<Option<serde_json::Value>> {
+        if let (Some(sm), Some(bytes), Some(kid)) = (&self.secrets_manager, &enc_bytes, key_id) {
+            let s = sm
+                .decrypt_versioned(kid, bytes, execution_id.as_bytes(), format_version)
+                .await?;
             let v: serde_json::Value = serde_json::from_str(&s)?;
             return Ok(Some(v));
         }
@@ -1855,16 +1898,20 @@ impl ModuleRepository {
         module_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<(Option<serde_json::Value>, Option<serde_json::Value>)>> {
-        // Fetch both plaintext and ciphertext columns; read_payload
+        // Fetch both plaintext and ciphertext columns; read_module_payload
         // chooses the right one based on whether SecretsManager is wired.
+        // `id` + `payload_format` are required to rebuild the per-row,
+        // per-slot AAD (see read_module_payload).
         let row: Option<(
+            Uuid,
             Option<serde_json::Value>,
             Option<serde_json::Value>,
             Option<Vec<u8>>,
             Option<Vec<u8>>,
             Option<Uuid>,
+            i16,
         )> = sqlx::query_as(
-            "SELECT input_data, output_data, input_data_enc, output_data_enc, payload_enc_key_id \
+            "SELECT id, input_data, output_data, input_data_enc, output_data_enc, payload_enc_key_id, payload_format \
              FROM module_executions \
              WHERE module_id = $1 AND user_id = $2 AND status = 'completed' \
              ORDER BY completed_at DESC NULLS LAST, started_at DESC \
@@ -1874,11 +1921,16 @@ impl ModuleRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        let Some((pt_in, pt_out, enc_in, enc_out, kid)) = row else {
+        let Some((id, pt_in, pt_out, enc_in, enc_out, kid, fmt)) = row else {
             return Ok(None);
         };
-        let input = self.read_payload(pt_in, enc_in, kid).await?;
-        let output = self.read_payload(pt_out, enc_out, kid).await?;
+        use talos_module_payload_encryption::PayloadSlot;
+        let input = self
+            .read_module_payload(id, PayloadSlot::Input, pt_in, enc_in, kid, fmt)
+            .await?;
+        let output = self
+            .read_module_payload(id, PayloadSlot::Output, pt_out, enc_out, kid, fmt)
+            .await?;
         Ok(Some((input, output)))
     }
 
@@ -2715,14 +2767,16 @@ impl ModuleRepository {
         )>,
     > {
         // Same dual-column SELECT + decrypt cascade as
-        // `find_latest_completed_execution_io`.
+        // `find_latest_completed_execution_io`. `payload_format` is required
+        // to rebuild the per-row, per-slot AAD (see read_module_payload).
         let raw: Vec<(
             Uuid,
             Option<serde_json::Value>, Option<serde_json::Value>,
             Option<Vec<u8>>, Option<Vec<u8>>, Option<Uuid>,
             Option<Uuid>,
+            i16,
         )> = sqlx::query_as(
-            "SELECT id, input_data, output_data, input_data_enc, output_data_enc, payload_enc_key_id, workflow_execution_id \
+            "SELECT id, input_data, output_data, input_data_enc, output_data_enc, payload_enc_key_id, workflow_execution_id, payload_format \
              FROM module_executions \
              WHERE module_id = $1 AND user_id = $2 AND status = 'completed' \
              ORDER BY completed_at DESC NULLS LAST, started_at DESC \
@@ -2733,10 +2787,15 @@ impl ModuleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
+        use talos_module_payload_encryption::PayloadSlot;
         let mut out = Vec::with_capacity(raw.len());
-        for (id, pt_in, pt_out, enc_in, enc_out, kid, wf_id) in raw {
-            let input = self.read_payload(pt_in, enc_in, kid).await?;
-            let output = self.read_payload(pt_out, enc_out, kid).await?;
+        for (id, pt_in, pt_out, enc_in, enc_out, kid, wf_id, fmt) in raw {
+            let input = self
+                .read_module_payload(id, PayloadSlot::Input, pt_in, enc_in, kid, fmt)
+                .await?;
+            let output = self
+                .read_module_payload(id, PayloadSlot::Output, pt_out, enc_out, kid, fmt)
+                .await?;
             out.push((id, input, output, wf_id));
         }
         Ok(out)
@@ -2761,21 +2820,24 @@ impl ModuleRepository {
     ///
     /// Fix: SELECT both column families, filter `(output_data IS NOT
     /// NULL OR output_data_enc IS NOT NULL)`, return all three columns
-    /// to the caller. The caller decrypts via the standard
-    /// `read_payload` helper before use.
+    /// to the caller. Decryption routes through `read_workflow_output`
+    /// (id-bound AAD) before the value reaches the caller.
     pub async fn list_completed_workflow_executions_with_output(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<(Uuid, Option<serde_json::Value>)>> {
+        // `output_data_format` is required to rebuild the id-bound AAD for
+        // the workflow-output scheme (see read_workflow_output).
         let raw: Vec<(
             Uuid,
             Option<serde_json::Value>,
             Option<Vec<u8>>,
             Option<Uuid>,
+            i16,
         )> = sqlx::query_as(
-            "SELECT id, output_data, output_data_enc, output_enc_key_id \
+            "SELECT id, output_data, output_data_enc, output_enc_key_id, output_data_format \
              FROM workflow_executions \
              WHERE workflow_id = $1 AND user_id = $2 AND status = 'completed' \
                AND (output_data IS NOT NULL OR output_data_enc IS NOT NULL) \
@@ -2788,8 +2850,10 @@ impl ModuleRepository {
         .fetch_all(&self.db_pool)
         .await?;
         let mut out = Vec::with_capacity(raw.len());
-        for (id, plaintext, enc_bytes, key_id) in raw {
-            let output = self.read_payload(plaintext, enc_bytes, key_id).await?;
+        for (id, plaintext, enc_bytes, key_id, fmt) in raw {
+            let output = self
+                .read_workflow_output(id, plaintext, enc_bytes, key_id, fmt)
+                .await?;
             out.push((id, output));
         }
         Ok(out)
