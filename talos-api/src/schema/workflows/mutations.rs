@@ -1672,7 +1672,7 @@ impl WorkflowsMutations {
                AND NOT EXISTS ( \
                    SELECT 1 FROM workflow_executions \
                    WHERE workflow_id = workflows.id \
-                     AND status IN ('running', 'queued', 'pending') \
+                     AND status IN ('running', 'queued', 'pending', 'resuming') \
                )",
         )
         .bind(id)
@@ -1718,7 +1718,7 @@ impl WorkflowsMutations {
                            AND EXISTS ( \
                                SELECT 1 FROM workflow_executions \
                                WHERE workflow_id = w.id \
-                                 AND status IN ('running', 'queued', 'pending') \
+                                 AND status IN ('running', 'queued', 'pending', 'resuming') \
                            ) \
                      )",
                 )

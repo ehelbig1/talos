@@ -2053,6 +2053,73 @@ else
 fi
 echo
 
+# ── 26. In-flight execution-status set must include 'resuming' ──
+bold "▶ check 26: in-flight status literal must include 'resuming'"
+
+# (2026-05-31) The durable-execution crash-recovery feature (#51/#52) added a
+# transient `resuming` status to workflow_executions — an execution claimed for
+# restart-resume, semantically in-flight (it occupies an about-to-run slot).
+# Every concurrency-cap count, active-execution gate (workflow delete/disable),
+# cancel path, and stale-execution diagnostic that enumerates the in-flight set
+# `('running', 'queued', 'pending')` MUST also include `'resuming'` — otherwise a
+# resuming execution is silently uncounted: concurrency caps can be exceeded
+# during recovery, and a workflow could be deleted out from under a mid-resume
+# execution.
+#
+# There is no shared Rust constant for this set (the owning crates —
+# execution-repository, workflow-repository, talos-api, analytics-repository —
+# don't share a common dep), so this lint IS the single source of truth: any
+# `status IN ('running', 'queued', 'pending'` literal that omits `'resuming'`
+# is flagged. Opt out (a genuinely pre-resuming-semantics set) with
+# `// allow-inflight-no-resuming: <reason>` within 4 lines above.
+
+INFLIGHT_VIOLATIONS=0
+if [ -n "$RG_BIN" ]; then
+    inflight_matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' -g '!**/tests/**' -g '!**/*_tests.rs' \
+        -e "'running', 'queued', 'pending'" \
+        . 2>/dev/null || true)
+else
+    inflight_matches=$(grep -rn --include='*.rs' --exclude-dir=tests --exclude='*_tests.rs' \
+        -F "'running', 'queued', 'pending'" \
+        talos-* worker controller 2>/dev/null || true)
+fi
+
+if [ -n "$inflight_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Already includes 'resuming' on the same line → compliant.
+        if echo "$body" | grep -q "'resuming'"; then
+            continue
+        fi
+        # Opt-out marker within 4 lines above.
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-inflight-no-resuming:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        INFLIGHT_VIOLATIONS=$((INFLIGHT_VIOLATIONS + 1))
+    done <<< "$inflight_matches"
+fi
+
+if [ "$INFLIGHT_VIOLATIONS" -gt 0 ]; then
+    red "✗ $INFLIGHT_VIOLATIONS in-flight status literal(s) missing 'resuming'"
+    yellow "  → add 'resuming' to the IN (...) set: status IN ('running', 'queued', 'pending', 'resuming')"
+    yellow "  → a resuming execution is in-flight; omitting it under-counts concurrency caps and"
+    yellow "    lets a workflow be deleted mid-resume. See crash recovery (#51/#52)."
+    yellow "  → Opt out (pre-resuming-semantics set) with: // allow-inflight-no-resuming: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ in-flight status literals include 'resuming' (crash-recovery #51/#52)"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
