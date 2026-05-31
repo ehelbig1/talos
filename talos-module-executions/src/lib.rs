@@ -818,7 +818,7 @@ impl ModuleExecutionService {
                 created_at, updated_at
             FROM module_executions
             WHERE module_id = $1 AND user_id = $2
-            ORDER BY started_at DESC
+            ORDER BY started_at DESC, id DESC
             LIMIT $3 OFFSET $4",
         )
         .bind(module_id)

@@ -2082,7 +2082,7 @@ impl SecretsManager {
                        last_accessed_at, access_count
                 FROM secrets
                 WHERE owner_user_id = $1 OR created_by = $1 OR org_id = ANY($2)
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT $3 OFFSET $4
                 "#,
             )
@@ -2102,7 +2102,7 @@ impl SecretsManager {
                        owner_user_id, org_id, allowed_modules,
                        last_accessed_at, access_count
                 FROM secrets
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT $1 OFFSET $2
                 "#,
             )
@@ -2230,7 +2230,7 @@ impl SecretsManager {
             JOIN secrets s ON s.id = l.secret_id
             WHERE l.secret_id = $1 
               AND ($4::uuid IS NULL OR s.owner_user_id = $4::uuid OR s.created_by = $4::uuid)
-            ORDER BY l.timestamp DESC
+            ORDER BY l.timestamp DESC, l.id DESC
             LIMIT $2 OFFSET $3
             "#,
             secret_id,
