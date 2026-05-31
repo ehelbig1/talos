@@ -77,7 +77,7 @@ pub trait JobTransport: Send + Sync {
     /// [`request_with_reply_inbox`] call.
     ///
     /// When `Some(inbox)`, the dispatcher binds the inbox subject
-    /// into the JobRequest's signed `reply_topic` field, so the
+    /// into the `JobRequest`'s signed `reply_topic` field, so the
     /// worker can verify the wire `msg.reply` against the
     /// HMAC-protected value and refuse to publish results to an
     /// attacker-redirected subject.

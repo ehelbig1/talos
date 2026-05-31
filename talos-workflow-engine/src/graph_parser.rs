@@ -504,7 +504,7 @@ mod read_node_retry_policy_tests {
 
     #[test]
     fn retry_count_at_u32_max_passes_through() {
-        let node = json!({ "retry_count": u32::MAX as u64 });
+        let node = json!({ "retry_count": u64::from(u32::MAX) });
         let p = read_node_retry_policy(&node).unwrap();
         assert_eq!(p.max_retries, u32::MAX);
     }
@@ -513,7 +513,7 @@ mod read_node_retry_policy_tests {
     fn retry_count_just_over_u32_max_saturates() {
         // Pre-fix `v as u32` for v = u32::MAX as u64 + 1 wrapped to 0
         // — silently disabling all retries.
-        let node = json!({ "retry_count": (u32::MAX as u64) + 1 });
+        let node = json!({ "retry_count": u64::from(u32::MAX) + 1 });
         let p = read_node_retry_policy(&node).unwrap();
         assert_eq!(p.max_retries, u32::MAX);
     }

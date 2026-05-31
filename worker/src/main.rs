@@ -1506,10 +1506,8 @@ async fn execute_job(
             // leak via HTTP body / headers / error message); fail
             // closed BEFORE making the network round-trip.
             if is_metadata_service_host(reference.registry()) {
-                let err = format!(
-                    "registry_host_denied: cloud metadata service host \
-                     is never a legitimate OCI registry"
-                );
+                let err = "registry_host_denied: cloud metadata service host \
+                     is never a legitimate OCI registry".to_string();
                 ::tracing::error!(
                     module_uri = %req.module_uri,
                     registry = %reference.registry(),
@@ -1806,10 +1804,7 @@ async fn execute_job(
             // `bytes_attested_in_this_run` accordingly so the
             // downstream `expected_wasm_hash` fallback doesn't kick in
             // and re-fail for cached-but-no-hash-provided jobs.
-            let redis_key = match &expected_layer_digest {
-                Some(d) => Some(format!("oci_cache:{}", d)),
-                None => None,
-            };
+            let redis_key = expected_layer_digest.as_ref().map(|d| format!("oci_cache:{}", d));
             if let (Some(digest), Some(key)) = (&expected_layer_digest, &redis_key) {
                 if let Some(redis_client) = runtime.redis_client() {
                     if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {

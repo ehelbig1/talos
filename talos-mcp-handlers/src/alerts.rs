@@ -374,6 +374,46 @@ fn build_fingerprint_groups(
     out
 }
 
+async fn handle_cleanup_old_alerts(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    // MCP-176 (2026-05-08): replace silent-clamp with explicit range
+    // validation. Pre-fix `unwrap_or(30).max(7)` silently rewrote
+    // -1 → 7 and 3 → 7 with no warning to the caller. Operator could
+    // not tell whether the value they passed was honoured. Same
+    // pattern as MCP-160 (add_loop_node max_iterations).
+    let older_than_days =
+        match crate::utils::validate_range_i64(args, "older_than_days", 7, 365, 30, &req_id) {
+            Ok(v) => v as i32,
+            Err(resp) => return resp,
+        };
+
+    let deleted = state
+        .analytics_repo
+        .cleanup_old_alerts(user_id, older_than_days)
+        .await;
+
+    match deleted {
+        Ok(count) => {
+            let result = serde_json::json!({
+                "deleted_count": count,
+                "older_than_days": older_than_days,
+            });
+            mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        Err(e) => {
+            tracing::error!("cleanup_old_alerts query failed: {}", e);
+            mcp_error(req_id, -32000, "Failed to cleanup alerts")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_fingerprint_groups;
@@ -427,7 +467,7 @@ mod tests {
         let top = &groups[0];
         assert_eq!(top["alert_count"].as_i64().unwrap(), 2);
         assert_eq!(top["occurrence_count"].as_i64().unwrap(), 8);
-        assert_eq!(top["fully_acknowledged"].as_bool().unwrap(), false);
+        assert!(!top["fully_acknowledged"].as_bool().unwrap());
     }
 
     #[test]
@@ -438,14 +478,14 @@ mod tests {
         ];
         let groups = build_fingerprint_groups(&rows);
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0]["fully_acknowledged"].as_bool().unwrap(), false);
+        assert!(!groups[0]["fully_acknowledged"].as_bool().unwrap());
 
         let rows_all_acked = vec![
             row("alpha", "timeout after 30", 1, true, 0),
             row("alpha", "timeout after 60", 1, true, 5),
         ];
         let groups_all = build_fingerprint_groups(&rows_all_acked);
-        assert_eq!(groups_all[0]["fully_acknowledged"].as_bool().unwrap(), true);
+        assert!(groups_all[0]["fully_acknowledged"].as_bool().unwrap());
     }
 
     #[test]
@@ -485,45 +525,5 @@ mod tests {
             .map(|g| g["occurrence_count"].as_i64().unwrap())
             .collect();
         assert_eq!(counts, vec![5, 3, 1]);
-    }
-}
-
-async fn handle_cleanup_old_alerts(
-    req_id: Option<serde_json::Value>,
-    args: &serde_json::Value,
-    state: &McpState,
-    user_id: Uuid,
-) -> JsonRpcResponse {
-    // MCP-176 (2026-05-08): replace silent-clamp with explicit range
-    // validation. Pre-fix `unwrap_or(30).max(7)` silently rewrote
-    // -1 → 7 and 3 → 7 with no warning to the caller. Operator could
-    // not tell whether the value they passed was honoured. Same
-    // pattern as MCP-160 (add_loop_node max_iterations).
-    let older_than_days =
-        match crate::utils::validate_range_i64(args, "older_than_days", 7, 365, 30, &req_id) {
-            Ok(v) => v as i32,
-            Err(resp) => return resp,
-        };
-
-    let deleted = state
-        .analytics_repo
-        .cleanup_old_alerts(user_id, older_than_days)
-        .await;
-
-    match deleted {
-        Ok(count) => {
-            let result = serde_json::json!({
-                "deleted_count": count,
-                "older_than_days": older_than_days,
-            });
-            mcp_text(
-                req_id,
-                &serde_json::to_string_pretty(&result).unwrap_or_default(),
-            )
-        }
-        Err(e) => {
-            tracing::error!("cleanup_old_alerts query failed: {}", e);
-            mcp_error(req_id, -32000, "Failed to cleanup alerts")
-        }
     }
 }

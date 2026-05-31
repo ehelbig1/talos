@@ -13,7 +13,7 @@ use dashmap::DashMap;
 
 /// Memoized compile cache for `validate_config_patterns`. Keyed by
 /// the exact `pattern` string (operator-authored, capped at
-/// MAX_PATTERN_LEN bytes via the gate inside `validate_config_patterns`).
+/// `MAX_PATTERN_LEN` bytes via the gate inside `validate_config_patterns`).
 ///
 /// 2026-05-28 audit Perf#5: pre-fix every graph load + every dispatch
 /// re-compiled every property's regex. A workflow with N nodes × M

@@ -33,11 +33,7 @@ fn nats_wildcard_matches(subscription_pattern: &str, topic: &str) -> bool {
         topic.starts_with(prefix)
             && topic.len() > prefix.len()
             && topic.as_bytes()[prefix.len()] == b'.'
-    } else if subscription_pattern == topic {
-        true
-    } else {
-        false
-    }
+    } else { subscription_pattern == topic }
 }
 
 // ============================================================================

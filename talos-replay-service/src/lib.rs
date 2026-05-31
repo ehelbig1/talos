@@ -1031,7 +1031,7 @@ mod tests {
         let set = build_ignore_field_set(&extra);
         // Default ignored fields (engine metadata) are baked in. Asserting
         // any one of them is present is enough to verify the chain hooked up.
-        let from_defaults: Vec<&str> = DEFAULT_IGNORED_FIELDS.iter().copied().collect();
+        let from_defaults: Vec<&str> = DEFAULT_IGNORED_FIELDS.to_vec();
         let probe = from_defaults
             .first()
             .copied()

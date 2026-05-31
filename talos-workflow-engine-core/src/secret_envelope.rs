@@ -191,9 +191,9 @@ pub trait SecretEnvelope: Send + Sync {
     /// The recommended `aad` is the dispatching job's identifier
     /// (e.g. `job_id.as_bytes()` — the raw 16-byte UUID). Binding
     /// that into the tag makes a transposed ciphertext (lifted from
-    /// one JobRequest into another under the same shared key) fail
+    /// one `JobRequest` into another under the same shared key) fail
     /// to decrypt at the worker, providing an in-protocol integrity
-    /// gate independent of the JobRequest HMAC.
+    /// gate independent of the `JobRequest` HMAC.
     ///
     /// The default impl ignores `aad` and falls through to [`Self::seal`]
     /// — this keeps existing custom envelopes compiling without

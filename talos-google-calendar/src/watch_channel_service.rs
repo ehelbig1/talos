@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(s.calendar_id, "primary");
         assert_eq!(s.google_channel_id, uuid_ch);
         assert_eq!(s.last_message_number, 0);
-        assert_eq!(s.has_sync_token, false);
+        assert!(!s.has_sync_token);
         assert!(s.module_id.is_none());
         assert!(s.module_name.is_none());
     }
@@ -393,31 +393,27 @@ mod tests {
         let base = row(&Uuid::new_v4().to_string(), "ch", 0, None);
 
         // Field absent.
-        assert_eq!(
-            project_row(&base, &HashMap::new()).unwrap().has_sync_token,
-            false
+        assert!(
+            !project_row(&base, &HashMap::new()).unwrap().has_sync_token
         );
 
         // Field present but null.
         let mut v = base.clone();
         v["sync_token"] = JsonValue::Null;
-        assert_eq!(
-            project_row(&v, &HashMap::new()).unwrap().has_sync_token,
-            false
+        assert!(
+            !project_row(&v, &HashMap::new()).unwrap().has_sync_token
         );
 
         // Field present but empty string.
         v["sync_token"] = json!("");
-        assert_eq!(
-            project_row(&v, &HashMap::new()).unwrap().has_sync_token,
-            false
+        assert!(
+            !project_row(&v, &HashMap::new()).unwrap().has_sync_token
         );
 
         // Field present with a real token.
         v["sync_token"] = json!("CAESBA...");
-        assert_eq!(
-            project_row(&v, &HashMap::new()).unwrap().has_sync_token,
-            true
+        assert!(
+            project_row(&v, &HashMap::new()).unwrap().has_sync_token
         );
     }
 

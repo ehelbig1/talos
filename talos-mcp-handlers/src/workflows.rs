@@ -10537,7 +10537,7 @@ async fn handle_export_yaml_workflow(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
     use talos_workflow_creation_helpers::detect_tool_call_xml_leak;
 
     /// Exact prod-incident artifact from discovery-call-synthesizer (2026-04-29).

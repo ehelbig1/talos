@@ -157,11 +157,10 @@ fn top_level_root_selection_has_introspection(stripped: &str) -> bool {
             // Entered a nested selection — primary scan ends here.
             return false;
         }
-        if b == b'_' && bytes.get(i + 1).copied() == Some(b'_') {
-            if has_introspection_token_at(after_brace, i) {
+        if b == b'_' && bytes.get(i + 1).copied() == Some(b'_')
+            && has_introspection_token_at(after_brace, i) {
                 return true;
             }
-        }
         i += 1;
     }
     false
@@ -257,11 +256,10 @@ fn root_selection_imports_introspection(body: &str) -> bool {
             // on a non-Query type isn't introspection).
             return false;
         }
-        if bytes[i] == b'_' && bytes.get(i + 1).copied() == Some(b'_') {
-            if has_introspection_token_at(body, i) {
+        if bytes[i] == b'_' && bytes.get(i + 1).copied() == Some(b'_')
+            && has_introspection_token_at(body, i) {
                 return true;
             }
-        }
         i += 1;
     }
     false
@@ -7881,7 +7879,7 @@ impl wit_database::Host for TalosContext {
                 let mut params_hasher = sha2::Sha256::new();
                 let mut params_bytes: usize = 0;
                 for p in &params {
-                    params_hasher.update((p.as_bytes().len() as u64).to_le_bytes());
+                    params_hasher.update((p.len() as u64).to_le_bytes());
                     params_hasher.update(p.as_bytes());
                     params_bytes = params_bytes.saturating_add(p.len());
                 }
