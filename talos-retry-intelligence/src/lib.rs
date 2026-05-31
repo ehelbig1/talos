@@ -226,10 +226,10 @@ pub async fn diagnose_failures(
     let (total, failed): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'failed') \
          FROM workflow_executions \
-         WHERE workflow_id = $1 AND started_at > NOW() - make_interval(hours => $2)",
+         WHERE workflow_id = $1 AND started_at > NOW() - make_interval(hours => $2::int)",
     )
     .bind(workflow_id)
-    .bind(hours as f64)
+    .bind(hours)
     .fetch_one(pool)
     .await
     .unwrap_or_else(|e| {
@@ -254,12 +254,12 @@ pub async fn diagnose_failures(
          FROM module_executions \
          WHERE workflow_execution_id IN \
            (SELECT id FROM workflow_executions WHERE workflow_id = $1 \
-            AND started_at > NOW() - make_interval(hours => $2)) \
+            AND started_at > NOW() - make_interval(hours => $2::int)) \
          GROUP BY COALESCE(node_label, node_id::text) \
          ORDER BY COUNT(*) FILTER (WHERE status = 'failed') DESC",
     )
     .bind(workflow_id)
-    .bind(hours as f64)
+    .bind(hours)
     .fetch_all(pool)
     .await
     .unwrap_or_else(|e| {

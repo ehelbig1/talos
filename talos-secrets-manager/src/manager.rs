@@ -2482,7 +2482,7 @@ impl SecretsManager {
             "SELECT id, name, key_path, description, created_at, expires_at, namespace, rotation_reminder_days \
              FROM secrets \
              WHERE created_by = $1 AND expires_at IS NOT NULL \
-               AND expires_at < NOW() + make_interval(days => $2) \
+               AND expires_at < NOW() + make_interval(days => $2::int) \
              ORDER BY expires_at ASC LIMIT 100",
         )
         .bind(user_id)
@@ -3363,7 +3363,7 @@ impl SecretsManager {
              FROM secret_audit_log l \
              LEFT JOIN secrets s ON s.id = l.secret_id \
              WHERE ($1::text IS NULL OR s.key_path = $1) \
-               AND l.timestamp > NOW() - make_interval(hours => $2) \
+               AND l.timestamp > NOW() - make_interval(hours => $2::int) \
              ORDER BY l.timestamp DESC \
              LIMIT $3",
         )

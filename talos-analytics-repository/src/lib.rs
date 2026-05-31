@@ -1067,7 +1067,7 @@ impl AnalyticsRepository {
                     COUNT(*) FILTER (WHERE status = 'running')::bigint AS running, \
                     (AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) FILTER (WHERE completed_at IS NOT NULL AND status = 'completed'))::float8 AS avg_duration_secs \
              FROM workflow_executions \
-             WHERE workflow_id = $1 AND user_id = $2 AND started_at > NOW() - make_interval(days => $3)",
+             WHERE workflow_id = $1 AND user_id = $2 AND started_at > NOW() - make_interval(days => $3::int)",
         )
         .bind(wf_id)
         .bind(user_id)
@@ -1096,7 +1096,7 @@ impl AnalyticsRepository {
                     COUNT(*) FILTER (WHERE status = 'running')::bigint AS running, \
                     (AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) FILTER (WHERE completed_at IS NOT NULL AND status = 'completed'))::float8 AS avg_duration_secs \
              FROM workflow_executions \
-             WHERE user_id = $1 AND started_at > NOW() - make_interval(days => $2)",
+             WHERE user_id = $1 AND started_at > NOW() - make_interval(days => $2::int)",
         )
         .bind(user_id)
         .bind(days)
@@ -1392,7 +1392,7 @@ impl AnalyticsRepository {
                     COUNT(*)::bigint AS total_count \
              FROM workflows w \
              JOIN workflow_executions we ON we.workflow_id = w.id \
-             WHERE w.user_id = $1 AND we.started_at > NOW() - make_interval(hours => $2) \
+             WHERE w.user_id = $1 AND we.started_at > NOW() - make_interval(hours => $2::int) \
                AND (w.status IS NULL OR w.status != 'archived') \
              GROUP BY w.id, w.name \
              HAVING COUNT(*) FILTER (WHERE we.status = 'failed') > 0 \
@@ -1482,7 +1482,7 @@ impl AnalyticsRepository {
                         EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) \
              FROM workflow_executions \
              WHERE workflow_id = $1 \
-               AND started_at > NOW() - make_interval(hours => $2)",
+               AND started_at > NOW() - make_interval(hours => $2::int)",
         )
         .bind(wf_id)
         .bind(hours)
@@ -1519,7 +1519,7 @@ impl AnalyticsRepository {
              FROM workflow_executions \
              WHERE workflow_id = $1 AND user_id = $2 \
                AND status = 'completed' AND completed_at IS NOT NULL \
-               AND started_at > NOW() - make_interval(days => $3)",
+               AND started_at > NOW() - make_interval(days => $3::int)",
         )
         .bind(wf_id)
         .bind(user_id)
@@ -1787,7 +1787,7 @@ impl AnalyticsRepository {
             "SELECT error_message FROM workflow_executions \
              WHERE workflow_id = $1 AND user_id = $2 AND status = 'failed' \
                AND error_message IS NOT NULL \
-               AND started_at > NOW() - make_interval(days => $3) \
+               AND started_at > NOW() - make_interval(days => $3::int) \
              ORDER BY started_at DESC LIMIT $4",
         )
         .bind(wf_id)
@@ -1816,7 +1816,7 @@ impl AnalyticsRepository {
              WHERE workflow_id = $1 AND user_id = $2 AND status = 'failed' \
                AND error_message IS NOT NULL \
                AND started_at IS NOT NULL \
-               AND started_at > NOW() - make_interval(days => $3) \
+               AND started_at > NOW() - make_interval(days => $3::int) \
              ORDER BY started_at DESC LIMIT $4",
         )
         .bind(wf_id)
@@ -1848,7 +1848,7 @@ impl AnalyticsRepository {
              FROM execution_events ee \
              JOIN workflow_executions we ON we.id = ee.execution_id \
              WHERE we.workflow_id = $1 AND we.user_id = $2 AND ee.event_type = 'node_failed' \
-               AND we.started_at > NOW() - make_interval(days => $3) \
+               AND we.started_at > NOW() - make_interval(days => $3::int) \
              GROUP BY ee.node_id ORDER BY fail_count DESC LIMIT 20",
         )
         .bind(wf_id)
@@ -1878,7 +1878,7 @@ impl AnalyticsRepository {
              FROM execution_events ee \
              JOIN workflow_executions we ON we.id = ee.execution_id \
              WHERE we.workflow_id = $1 AND we.user_id = $2 AND ee.event_type = 'node_failed' \
-               AND we.started_at > NOW() - make_interval(days => $3) \
+               AND we.started_at > NOW() - make_interval(days => $3::int) \
              GROUP BY ee.node_id ORDER BY fail_count DESC LIMIT 50",
         )
         .bind(wf_id)
@@ -1907,7 +1907,7 @@ impl AnalyticsRepository {
             "SELECT EXTRACT(HOUR FROM started_at)::int AS hour, COUNT(*)::bigint AS fail_count \
              FROM workflow_executions \
              WHERE workflow_id = $1 AND user_id = $2 AND status = 'failed' \
-               AND started_at > NOW() - make_interval(days => $3) \
+               AND started_at > NOW() - make_interval(days => $3::int) \
              GROUP BY hour ORDER BY hour",
         )
         .bind(wf_id)
@@ -1942,7 +1942,7 @@ impl AnalyticsRepository {
                     (AVG(EXTRACT(EPOCH FROM (we.completed_at - we.started_at))) FILTER (WHERE we.completed_at IS NOT NULL AND we.status = 'completed'))::float8 AS avg_duration_secs \
              FROM workflows w \
              LEFT JOIN workflow_executions we ON we.workflow_id = w.id \
-               AND we.started_at > NOW() - make_interval(days => $2) \
+               AND we.started_at > NOW() - make_interval(days => $2::int) \
              WHERE w.user_id = $1 \
              GROUP BY w.id, w.name \
              HAVING COUNT(we.id) > 0 \
@@ -2242,7 +2242,7 @@ impl AnalyticsRepository {
                     COUNT(DISTINCT DATE(we.started_at)) AS unique_days \
              FROM workflows w \
              JOIN workflow_executions we ON we.workflow_id = w.id \
-             WHERE w.user_id = $1 AND we.started_at > NOW() - make_interval(days => $2) \
+             WHERE w.user_id = $1 AND we.started_at > NOW() - make_interval(days => $2::int) \
                AND (w.status IS NULL OR w.status != 'archived') \
              GROUP BY w.id, w.name, w.graph_json \
              ORDER BY total_invocations DESC LIMIT 20",
@@ -2296,7 +2296,7 @@ impl AnalyticsRepository {
             "SELECT we.id, we.output_data, we.output_data_enc, we.output_enc_key_id, we.output_data_format \
              FROM workflow_executions we \
              WHERE we.workflow_id = $1 AND we.user_id = $2 AND we.status = 'completed' \
-               AND we.started_at > NOW() - make_interval(days => $3) \
+               AND we.started_at > NOW() - make_interval(days => $3::int) \
                AND (we.output_data IS NOT NULL OR we.output_data_enc IS NOT NULL) \
              ORDER BY we.started_at DESC LIMIT $4",
         )
@@ -2336,7 +2336,7 @@ impl AnalyticsRepository {
             "SELECT we.id, we.output_data, we.output_data_enc, we.output_enc_key_id, we.output_data_format \
              FROM workflow_executions we \
              WHERE we.user_id = $1 AND we.status = 'completed' \
-               AND we.started_at > NOW() - make_interval(days => $2) \
+               AND we.started_at > NOW() - make_interval(days => $2::int) \
                AND (we.output_data IS NOT NULL OR we.output_data_enc IS NOT NULL) \
              ORDER BY we.started_at DESC LIMIT $3",
         )
@@ -2462,7 +2462,7 @@ impl AnalyticsRepository {
              FROM workflow_executions \
              WHERE workflow_id = $1 \
                AND status = 'failed' \
-               AND started_at > NOW() - make_interval(days => $2) \
+               AND started_at > NOW() - make_interval(days => $2::int) \
                AND (error_message ILIKE '%unauthorized%' \
                     OR error_message ILIKE '%access denied%' \
                     OR error_message ILIKE '%access-denied%')",
@@ -2676,7 +2676,7 @@ impl AnalyticsRepository {
             "SELECT w.name AS workflow_name, wa.message, wa.occurrence_count, wa.last_occurred_at, wa.acknowledged \
              FROM workflow_alerts wa \
              JOIN workflows w ON w.id = wa.workflow_id \
-             WHERE wa.user_id = $1 AND wa.created_at > NOW() - make_interval(hours => $2) \
+             WHERE wa.user_id = $1 AND wa.created_at > NOW() - make_interval(hours => $2::int) \
              ORDER BY wa.last_occurred_at DESC LIMIT 20",
         )
         .bind(user_id)
@@ -2718,7 +2718,7 @@ impl AnalyticsRepository {
             "WITH deleted AS ( \
                 DELETE FROM workflow_alerts \
                 WHERE user_id = $1 AND acknowledged = true \
-                  AND created_at < NOW() - make_interval(days => $2) \
+                  AND created_at < NOW() - make_interval(days => $2::int) \
                 RETURNING 1 \
              ) SELECT COUNT(*)::bigint FROM deleted",
         )
@@ -2843,7 +2843,7 @@ impl AnalyticsRepository {
              FROM workflow_executions \
              WHERE workflow_id = $1 AND user_id = $2 \
                AND status = 'completed' AND completed_at IS NOT NULL \
-               AND started_at > NOW() - make_interval(days => $3)",
+               AND started_at > NOW() - make_interval(days => $3::int)",
         )
         .bind(wf_id)
         .bind(user_id)
@@ -3802,7 +3802,7 @@ impl AnalyticsRepository {
              JOIN modules m ON m.id = r.module_id \
              JOIN workflows w ON w.id = r.workflow_id \
              WHERE w.user_id = $1 \
-               AND r.recorded_at > NOW() - make_interval(days => $2) \
+               AND r.recorded_at > NOW() - make_interval(days => $2::int) \
                AND r.module_id IS NOT NULL \
              GROUP BY m.id, m.name, m.kind, m.max_fuel \
              HAVING COUNT(*) >= $3 \
@@ -3892,7 +3892,7 @@ impl AnalyticsRepository {
              FROM execution_cost_rollup r \
              JOIN workflows w ON w.id = r.workflow_id \
              WHERE r.workflow_id = $1 AND w.user_id = $2 \
-               AND r.recorded_at > NOW() - make_interval(days => $3) \
+               AND r.recorded_at > NOW() - make_interval(days => $3::int) \
              GROUP BY r.node_id \
              ORDER BY AVG(r.wall_time_ms) DESC NULLS LAST",
         )
