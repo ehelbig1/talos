@@ -35,6 +35,7 @@ talos-dlp = { path = "../talos-dlp" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-secrets = { path = "../talos-secrets" }
 talos-memory = { path = "../talos-memory" }
+talos-ssrf-classify = { path = "../talos-ssrf-classify" }
 talos-capability-world = { path = "../talos-capability-world" }
 talos-wit-inspector = { path = "../talos-wit-inspector" }
 talos-trace-nats = { path = "../talos-trace-nats" }

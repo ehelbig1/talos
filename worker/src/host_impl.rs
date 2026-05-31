@@ -1100,104 +1100,20 @@ static ALLOW_PRIVATE_HOST_TARGETS: std::sync::LazyLock<bool> =
 // SSRF private-IP classification
 // ============================================================================
 //
-// Single source of truth for "is this IP one we refuse to reach". Used by
-// every place we have an IP in hand: the IP-literal arms in `fetch` /
-// `fetch_all`, and the DNS-resolved arm in `fetch`. Returns the
-// `record_capability_denied` policy string when the IP is denied so the
-// caller emits a consistent audit trail.
-//
-// Adding a new range = one edit here, not three.
+// "Is this IP one we refuse to reach?" Used by every place we have an IP in
+// hand: the IP-literal arms in `fetch` / `fetch_all`, and the DNS-resolved arm
+// in `fetch`. Returns the `record_capability_denied` policy string when the IP
+// is denied so the caller emits a consistent audit trail. The logic is shared
+// with the controller via `talos-ssrf-classify` — adding a new range is one
+// edit in that crate, for both gates.
 
-/// Classify an IPv4 address. `Some(policy)` = block.
-fn classify_private_ipv4(addr: std::net::Ipv4Addr) -> Option<&'static str> {
-    if addr.is_loopback()
-        || addr.is_private()
-        || addr.is_link_local()
-        || addr.is_multicast()
-        || addr.is_broadcast()
-    {
-        return Some("private-ip");
-    }
-    // MCP-553: include the IPv4 unspecified range (0.0.0.0/8). On Linux,
-    // connecting to 0.0.0.0:PORT routes to 127.0.0.1:PORT (any local
-    // interface listening on that port). Without this gate a guest with
-    // `allowed_hosts: ["*"]` could reach the worker's loopback services
-    // by simply spelling them as `http://0.0.0.0:8080` — the literal
-    // host_str passes the allowlist, the classifier returns None
-    // (`is_unspecified()` is NOT covered by `is_loopback`/`is_private`/
-    // `is_link_local`/`is_multicast`/`is_broadcast`), and the kernel
-    // silently substitutes loopback. Mirrors the
-    // `talos_http_utils::ssrf` deny-list, which already covers
-    // `is_unspecified()` for the IPv4-mapped-IPv6 path.
-    //
-    // MCP-1069 (2026-05-15): widen to cover the ENTIRE 0.0.0.0/8
-    // range, not just the exact `0.0.0.0` address `is_unspecified()`
-    // matches. `Ipv4Addr::is_unspecified()` is exact-zero only — the
-    // MCP-553 comment claimed /8 coverage but the code did not.
-    // Sibling of the ssrf.rs MCP-1067/1068 fix that closed the same
-    // gap on the controller-side pre-resolution path. Bringing the
-    // runtime classifier and the pre-validation guard into agreement
-    // so a host that's blocked by one is blocked by both.
-    if addr.octets()[0] == 0 {
-        return Some("private-ip-unspecified");
-    }
-    // RFC 6598 Carrier-Grade NAT (100.64.0.0/10). Carriers route this
-    // range internally; reachable from the worker's NIC but not the
-    // public internet, so an SSRF target.
-    let addr_u32 = u32::from(addr);
-    if (addr_u32 >> 22) == (0x64400000u32 >> 22) {
-        return Some("private-ip-cgnat");
-    }
-    None
-}
-
-/// Classify an IP (v4 or v6). `Some(policy)` = block; the string is the
-/// `record_capability_denied` policy field.
-///
-/// IPv4-mapped IPv6 (`::ffff:A.B.C.D`) is canonicalized first so a guest
-/// can't bypass IPv4 rules by spelling them in IPv6.
-pub(crate) fn classify_private_ip(ip: std::net::IpAddr) -> Option<&'static str> {
-    match ip {
-        std::net::IpAddr::V4(addr) => classify_private_ipv4(addr),
-        std::net::IpAddr::V6(addr) => {
-            let segs = addr.segments();
-            if segs[0] == 0
-                && segs[1] == 0
-                && segs[2] == 0
-                && segs[3] == 0
-                && segs[4] == 0
-                && segs[5] == 0xffff
-            {
-                let mapped = std::net::Ipv4Addr::new(
-                    (segs[6] >> 8) as u8,
-                    segs[6] as u8,
-                    (segs[7] >> 8) as u8,
-                    segs[7] as u8,
-                );
-                if let Some(reason) = classify_private_ipv4(mapped) {
-                    return Some(match reason {
-                        "private-ip-cgnat" => "private-ip-cgnat-ipv4-mapped-ipv6",
-                        _ => "private-ip-ipv4-mapped-ipv6",
-                    });
-                }
-            }
-            if addr.is_loopback() || addr.is_multicast() {
-                return Some("private-ip");
-            }
-            // MCP-553: IPv6 unspecified `::` is the v6 analogue of
-            // 0.0.0.0 — same kernel substitute-with-loopback behaviour.
-            if addr.is_unspecified() {
-                return Some("private-ip-unspecified");
-            }
-            // IPv6 link-local (fe80::/10) and unique-local (fc00::/7).
-            let first = segs[0];
-            if (first & 0xffc0) == 0xfe80 || (first & 0xfe00) == 0xfc00 {
-                return Some("private-ip");
-            }
-            None
-        }
-    }
-}
+// Both functions now live in `talos-ssrf-classify` (std-only), shared with the
+// controller's `talos_http_utils::ssrf` so the SSRF deny-list — including the
+// IPv6 transition-form coverage (IPv4-mapped/compatible, NAT64, 6to4) added in
+// the 2026-05-31 consolidation — is defined in exactly one place. The policy
+// strings ("private-ip", "private-ip-unspecified", "private-ip-cgnat",
+// "private-ip-ipv4-mapped-ipv6", …) are preserved for the audit trail.
+pub(crate) use talos_ssrf_classify::classify_private_ip;
 
 /// Tier-1 (local-Ollama-only) data-egress deny-check on a URL host.
 ///
@@ -1578,7 +1494,8 @@ mod classify_private_ip_tests {
     //! spelling it `http://0.0.0.0:PORT` (Linux kernel substitutes
     //! 127.0.0.1) — bypassing the SSRF gate that already covers
     //! `is_loopback`/`is_private`/`is_link_local`/CGNAT.
-    use super::{classify_private_ip, classify_private_ipv4};
+    use super::classify_private_ip;
+    use talos_ssrf_classify::classify_private_ipv4;
 
     #[test]
     fn ipv4_unspecified_is_blocked() {

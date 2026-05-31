@@ -341,54 +341,19 @@ pub fn check_outbound_url_no_ssrf(url: &str) -> Result<(), &'static str> {
     // We also reject IPv6 loopback / unspecified / link-local / ULA
     // here for cases the literal-prefix check missed (e.g.
     // `[0:0:0:0:0:0:0:1]` vs `[::1]`).
+    // IP-literal hosts skip the resolve-time SSRF gate (reqwest connects to a
+    // literal directly, no DNS), so the canonical classifier is applied here on
+    // the parsed address. This catches every IPv6 spelling of an internal
+    // target — loopback/unspecified/link-local/ULA/site-local, IPv4-mapped
+    // (`::ffff:7f00:1`), and the other IPv4-in-IPv6 transition forms
+    // (IPv4-compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) that the
+    // string-prefix checks above can't see (MCP-458/542/1068 + the 2026-05-31
+    // transition-form sweep, now in talos-ssrf-classify).
     if let Ok(v6) = std::net::Ipv6Addr::from_str(&host) {
-        if v6.is_loopback() || v6.is_unspecified() {
+        if classify_private_ip(std::net::IpAddr::V6(v6)).is_some() {
             return Err(
                 "URL points to a blocked destination (localhost, private IP, or cloud metadata endpoint)",
             );
-        }
-        // is_unicast_link_local() and is_unique_local() are stable in
-        // recent Rust. Manual bit-check is identical and avoids
-        // MSRV churn — fe80::/10 and fc00::/7.
-        let s0 = v6.segments()[0];
-        if (s0 & 0xffc0) == 0xfe80 || (s0 & 0xfe00) == 0xfc00 {
-            return Err(
-                "URL points to a blocked destination (localhost, private IP, or cloud metadata endpoint)",
-            );
-        }
-        if let Some(v4) = v6.to_ipv4_mapped() {
-            // MCP-542: std::net::Ipv4Addr::is_private() is RFC-1918
-            // ONLY — 10/8 + 172.16/12 + 192.168/16. It does NOT include
-            // CGNAT 100.64.0.0/10 (RFC 6598). Cover it manually so
-            // pure-hex IPv4-mapped IPv6 forms like `::ffff:6440:1` ↔
-            // `100.64.0.1` are rejected.
-            //
-            // MCP-1068 (2026-05-15): sibling of MCP-1067 — cover the
-            // ENTIRE 0.0.0.0/8 unspecified range, not just the exact
-            // `0.0.0.0` address that `v4.is_unspecified()` catches.
-            // Pre-fix `::ffff:0.0.0.1` (IPv4-mapped form of 0.0.0.1)
-            // passed `v4.is_unspecified()` = false and slipped
-            // through. MCP-1067 closed the direct-IPv4 string-prefix
-            // path; this closes the IPv4-mapped IPv6 sibling. Same
-            // defense-in-depth rationale: 0.x.y.z parsing varies
-            // across kernels / network libraries; bound the entire
-            // /8 to avoid any forward-compat surprises.
-            let octets = v4.octets();
-            let is_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
-            let is_unspecified_subnet = octets[0] == 0;
-            if v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || is_unspecified_subnet
-                || v4.is_broadcast()
-                || is_cgnat
-                || octets == [169, 254, 169, 254]
-            {
-                return Err(
-                    "URL points to a blocked destination (localhost, private IP, or cloud metadata endpoint)",
-                );
-            }
         }
     }
 
@@ -403,67 +368,13 @@ pub fn check_outbound_url_no_ssrf(url: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Classify an IPv4 address: `Some(policy)` = refuse to connect, `None` = allow.
-///
-/// Same range coverage as the worker's `classify_private_ipv4`
-/// (loopback / RFC-1918 / link-local / multicast / broadcast / the whole
-/// `0.0.0.0/8` unspecified subnet / RFC-6598 CGNAT `100.64.0.0/10`). Kept in
-/// sync with that one — both encode the SSRF deny-list this crate's URL-level
-/// `check_outbound_url_no_ssrf` already enforces.
-fn classify_private_ipv4(addr: std::net::Ipv4Addr) -> Option<&'static str> {
-    if addr.is_loopback()
-        || addr.is_private()
-        || addr.is_link_local()
-        || addr.is_multicast()
-        || addr.is_broadcast()
-    {
-        return Some("private-ip");
-    }
-    // Entire 0.0.0.0/8: on Linux connecting to 0.x routes to loopback.
-    if addr.octets()[0] == 0 {
-        return Some("private-ip-unspecified");
-    }
-    // RFC 6598 CGNAT 100.64.0.0/10 — routable internally, not on the public net.
-    let addr_u32 = u32::from(addr);
-    if (addr_u32 >> 22) == (0x6440_0000u32 >> 22) {
-        return Some("private-ip-cgnat");
-    }
-    None
-}
-
-/// Classify an IP (v4 or v6) for SSRF purposes: `Some(policy)` = refuse,
-/// `None` = allow. This is the canonical IP-level deny-list used by the
-/// connect-time DNS resolver that closes the DNS-rebinding TOCTOU on
-/// controller-side outbound clients (L4, 2026-05-28 review). IPv4-mapped IPv6
-/// (`::ffff:A.B.C.D`) is canonicalized first so the v4 rules can't be bypassed
-/// by spelling an address in IPv6.
-pub fn classify_private_ip(ip: std::net::IpAddr) -> Option<&'static str> {
-    match ip {
-        std::net::IpAddr::V4(addr) => classify_private_ipv4(addr),
-        std::net::IpAddr::V6(addr) => {
-            if let Some(mapped) = addr.to_ipv4_mapped() {
-                if let Some(reason) = classify_private_ipv4(mapped) {
-                    return Some(match reason {
-                        "private-ip-cgnat" => "private-ip-cgnat-ipv4-mapped-ipv6",
-                        _ => "private-ip-ipv4-mapped-ipv6",
-                    });
-                }
-            }
-            if addr.is_loopback() || addr.is_multicast() {
-                return Some("private-ip");
-            }
-            if addr.is_unspecified() {
-                return Some("private-ip-unspecified");
-            }
-            // IPv6 link-local (fe80::/10) and unique-local (fc00::/7).
-            let first = addr.segments()[0];
-            if (first & 0xffc0) == 0xfe80 || (first & 0xfe00) == 0xfc00 {
-                return Some("private-ip");
-            }
-            None
-        }
-    }
-}
+// The SSRF private-IP classifier is the single source of truth in
+// `talos-ssrf-classify` (std-only, shared with the WASM-host worker so a
+// hardening fix lands in one place for both gates). Re-exported here so the
+// existing `talos_http_utils::ssrf::classify_private_ip` import path — used by
+// this crate's connect-time DNS resolver and by talos-mcp-handlers — keeps
+// resolving.
+pub use talos_ssrf_classify::classify_private_ip;
 
 #[cfg(test)]
 mod classify_private_ip_tests {
