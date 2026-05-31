@@ -158,7 +158,7 @@ async fn test_mcp_agents_query_and_revoke() {
     sqlx::query("INSERT INTO agent_roles (id, name, allowed_capabilities) VALUES ($1, $2, $3)")
         .bind(role_id)
         .bind("Test Role")
-        .bind(&vec!["minimal"])
+        .bind(vec!["minimal"])
         .execute(&db_pool)
         .await
         .unwrap();

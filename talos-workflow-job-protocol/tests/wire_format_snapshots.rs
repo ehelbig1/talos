@@ -147,7 +147,7 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     let capability_world_str = req.capability_world.as_deref().unwrap_or("-");
     let cancellation_token_str = req.cancellation_token.as_deref().unwrap_or("-");
     fn lp(s: &str) -> String {
-        format!("{}:{}", s.as_bytes().len(), s)
+        format!("{}:{}", s.len(), s)
     }
     let payload = format!(
         "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",

@@ -1157,8 +1157,8 @@ impl ParallelWorkflowEngine {
     /// Both variants share the same field shape
     /// (`body_workflow_id`, `max_iterations`, `inject_history`,
     /// `timeout_secs`) and identical runtime semantics — the variants
-    /// differ only in authoring provenance (AgentLoop is the general
-    /// shape, ReActLoop is the explicit ReAct annotation). This one
+    /// differ only in authoring provenance (`AgentLoop` is the general
+    /// shape, `ReActLoop` is the explicit `ReAct` annotation). This one
     /// dispatcher handles both so they cannot diverge at runtime.
     ///
     /// Returns `None` when the node is neither; otherwise the loop's

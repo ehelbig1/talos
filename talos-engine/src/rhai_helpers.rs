@@ -636,7 +636,7 @@ mod looks_like_error_string_tests {
         // The '€' is 3 bytes; place a chain so one boundary lands on a
         // continuation byte.
         let prefix = "x".repeat(4094); // bytes 0..4094 ASCII
-        let mut s = String::from(prefix);
+        let mut s = prefix;
         s.push('€'); // 3 bytes: starts at 4094, ends at 4097 — boundary 4095 + 4096 are inside the char
         s.push_str(" error after"); // ASCII tail
         // Walk-back from 4096 to 4094 lands on the start of '€' — &s[..4094]

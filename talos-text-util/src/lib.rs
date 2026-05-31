@@ -486,7 +486,7 @@ mod tests {
         let cow = bounded_preview(&big, 64);
         assert!(matches!(cow, std::borrow::Cow::Owned(_)));
         assert!(cow.ends_with('…'));
-        assert!(cow.as_bytes().len() <= 64);
+        assert!(cow.len() <= 64);
     }
 
     #[test]
@@ -496,7 +496,7 @@ mod tests {
         let s = "x".repeat(200);
         let cow = bounded_preview(&s, 32);
         assert!(matches!(cow, std::borrow::Cow::Owned(_)));
-        assert!(cow.as_bytes().len() <= 32);
+        assert!(cow.len() <= 32);
         assert!(cow.ends_with('…'));
     }
 

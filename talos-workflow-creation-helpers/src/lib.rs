@@ -1617,7 +1617,7 @@ mod tests {
         assert_eq!(structural.len(), 2);
         assert_eq!(regular.len(), 3);
         assert_eq!(structural[0]["id"], "n2");
-        assert_eq!(regular.iter().any(|n| n["id"] == "n5"), true);
+        assert!(regular.iter().any(|n| n["id"] == "n5"));
     }
 
     #[test]
@@ -1646,11 +1646,11 @@ mod tests {
 
     #[test]
     fn module_id_validation_requires_uuid() {
-        let nodes = vec![json!({"id": "n1", "module_id": "550e8400-e29b-41d4-a716-446655440000"})];
+        let nodes = [json!({"id": "n1", "module_id": "550e8400-e29b-41d4-a716-446655440000"})];
         let regs: Vec<&Value> = nodes.iter().collect();
         assert!(validate_regular_module_ids(&regs).is_ok());
 
-        let bad = vec![json!({"id": "n1", "module_id": "redis-cache"})];
+        let bad = [json!({"id": "n1", "module_id": "redis-cache"})];
         let regs: Vec<&Value> = bad.iter().collect();
         let err = validate_regular_module_ids(&regs).unwrap_err();
         assert!(err.contains("Invalid module_id"));

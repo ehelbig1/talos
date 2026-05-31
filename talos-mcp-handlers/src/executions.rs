@@ -1326,89 +1326,6 @@ fn redact_actor_context_in_place(v: &mut serde_json::Value) -> bool {
     redacted
 }
 
-#[cfg(test)]
-mod redact_actor_context_tests {
-    use super::redact_actor_context_in_log;
-    use serde_json::json;
-
-    #[test]
-    fn redacts_actor_context_memory_values() {
-        let payload = json!({
-            "__actor_context__": {
-                "actor_id": "c1362f85-1a2c-4a61-8b4b-7b99b7653c03",
-                "memories": [
-                    {"key": "daily_brief/2026-05-07", "type": "episodic", "value": {"brief": "secret content here"}},
-                    {"key": "daily_brief/2026-05-06", "type": "episodic", "value": "more secret"}
-                ]
-            },
-            "MAX_TOKENS": 2048
-        });
-        let s = serde_json::to_string(&payload).unwrap();
-        let redacted = redact_actor_context_in_log(&s);
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("secret content here"));
-        assert!(!redacted.contains("more secret"));
-        // Structure preserved for debugging.
-        assert!(redacted.contains("daily_brief/2026-05-07"));
-        assert!(redacted.contains("daily_brief/2026-05-06"));
-        assert!(redacted.contains("episodic"));
-        // Other fields untouched.
-        assert!(redacted.contains("\"MAX_TOKENS\":2048"));
-    }
-
-    #[test]
-    fn no_actor_context_returns_unchanged() {
-        let payload = json!({"MAX_TOKENS": 2048, "MODEL": "claude-sonnet-4-6"});
-        let s = serde_json::to_string(&payload).unwrap();
-        let out = redact_actor_context_in_log(&s);
-        assert_eq!(out, s);
-    }
-
-    #[test]
-    fn invalid_json_passes_through() {
-        let s = "not actually json";
-        let out = redact_actor_context_in_log(s);
-        assert_eq!(out, s);
-    }
-
-    #[test]
-    fn handles_actor_context_with_no_memories() {
-        let payload = json!({"__actor_context__": {"actor_id": "x", "memories": []}});
-        let s = serde_json::to_string(&payload).unwrap();
-        let out = redact_actor_context_in_log(&s);
-        assert_eq!(out, s);
-    }
-
-    #[test]
-    fn redacts_nested_actor_context() {
-        // Some node configs nest the inject under data.config.__actor_context__
-        let payload = json!({
-            "data": {
-                "config": {
-                    "__actor_context__": {
-                        "memories": [{"key": "k", "value": "secret"}]
-                    }
-                }
-            }
-        });
-        let s = serde_json::to_string(&payload).unwrap();
-        let out = redact_actor_context_in_log(&s);
-        assert!(out.contains("[REDACTED]"));
-        assert!(!out.contains("\"secret\""));
-    }
-
-    #[test]
-    fn memory_without_value_field_is_safe() {
-        // Defensive: redactor must not panic if a memory entry has no "value" field.
-        let payload = json!({
-            "__actor_context__": {"memories": [{"key": "k", "type": "episodic"}]}
-        });
-        let s = serde_json::to_string(&payload).unwrap();
-        let out = redact_actor_context_in_log(&s);
-        assert_eq!(out, s);
-    }
-}
-
 // ── tail_worker_logs ────────────────────────────────────────────────────────
 //
 // Returns ascending-time-ordered log lines from `workflow_execution_logs`,
@@ -6576,4 +6493,87 @@ async fn handle_get_node_io(
         }))
         .unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod redact_actor_context_tests {
+    use super::redact_actor_context_in_log;
+    use serde_json::json;
+
+    #[test]
+    fn redacts_actor_context_memory_values() {
+        let payload = json!({
+            "__actor_context__": {
+                "actor_id": "c1362f85-1a2c-4a61-8b4b-7b99b7653c03",
+                "memories": [
+                    {"key": "daily_brief/2026-05-07", "type": "episodic", "value": {"brief": "secret content here"}},
+                    {"key": "daily_brief/2026-05-06", "type": "episodic", "value": "more secret"}
+                ]
+            },
+            "MAX_TOKENS": 2048
+        });
+        let s = serde_json::to_string(&payload).unwrap();
+        let redacted = redact_actor_context_in_log(&s);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("secret content here"));
+        assert!(!redacted.contains("more secret"));
+        // Structure preserved for debugging.
+        assert!(redacted.contains("daily_brief/2026-05-07"));
+        assert!(redacted.contains("daily_brief/2026-05-06"));
+        assert!(redacted.contains("episodic"));
+        // Other fields untouched.
+        assert!(redacted.contains("\"MAX_TOKENS\":2048"));
+    }
+
+    #[test]
+    fn no_actor_context_returns_unchanged() {
+        let payload = json!({"MAX_TOKENS": 2048, "MODEL": "claude-sonnet-4-6"});
+        let s = serde_json::to_string(&payload).unwrap();
+        let out = redact_actor_context_in_log(&s);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn invalid_json_passes_through() {
+        let s = "not actually json";
+        let out = redact_actor_context_in_log(s);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn handles_actor_context_with_no_memories() {
+        let payload = json!({"__actor_context__": {"actor_id": "x", "memories": []}});
+        let s = serde_json::to_string(&payload).unwrap();
+        let out = redact_actor_context_in_log(&s);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn redacts_nested_actor_context() {
+        // Some node configs nest the inject under data.config.__actor_context__
+        let payload = json!({
+            "data": {
+                "config": {
+                    "__actor_context__": {
+                        "memories": [{"key": "k", "value": "secret"}]
+                    }
+                }
+            }
+        });
+        let s = serde_json::to_string(&payload).unwrap();
+        let out = redact_actor_context_in_log(&s);
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("\"secret\""));
+    }
+
+    #[test]
+    fn memory_without_value_field_is_safe() {
+        // Defensive: redactor must not panic if a memory entry has no "value" field.
+        let payload = json!({
+            "__actor_context__": {"memories": [{"key": "k", "type": "episodic"}]}
+        });
+        let s = serde_json::to_string(&payload).unwrap();
+        let out = redact_actor_context_in_log(&s);
+        assert_eq!(out, s);
+    }
 }

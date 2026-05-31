@@ -1710,7 +1710,7 @@ impl ParallelWorkflowEngine {
     /// same AAD (from `JobRequest.workflow_execution_id`) — a
     /// ciphertext transposed between executions under the same
     /// shared key fails decryption at the worker, providing an
-    /// in-protocol integrity gate independent of the JobRequest
+    /// in-protocol integrity gate independent of the `JobRequest`
     /// HMAC. The caller passes `execution_id` because the engine
     /// itself doesn't hold one — it's a per-dispatch parameter.
     pub(crate) async fn build_encrypted_secrets(
@@ -2806,7 +2806,7 @@ impl ParallelWorkflowEngine {
         }
     }
 
-    /// One-shot dispatch of a ReflectiveRetry system node.
+    /// One-shot dispatch of a `ReflectiveRetry` system node.
     ///
     /// Runs `child_wf_id` up to `max_retries` times. After each failure,
     /// invokes `reflection_wf_id` with `{input, error, attempt}`. The
@@ -3263,9 +3263,9 @@ impl ParallelWorkflowEngine {
     ///
     /// This is the canonical sub-workflow invocation path. It encapsulates what
     /// was previously duplicated at ~10 call sites (judge, ensemble, reflective-
-    /// retry, sub_workflow, llm-dispatch) across two dispatch loops:
+    /// retry, `sub_workflow`, llm-dispatch) across two dispatch loops:
     ///
-    /// 1. Load the sub-workflow graph from the DB (via the registry's db_pool).
+    /// 1. Load the sub-workflow graph from the DB (via the registry's `db_pool`).
     /// 2. Build an engine, register a synthetic `__trigger__` node, wire it to
     ///    every root so root nodes execute instead of being pre-seeded.
     /// 3. `run_with_seed` with `trigger_input` as the trigger's output.
@@ -3903,12 +3903,12 @@ impl ParallelWorkflowEngine {
         (verify_result, passed)
     }
 
-    /// Evaluate a ConfidenceGate node against its parent output.
+    /// Evaluate a `ConfidenceGate` node against its parent output.
     ///
     /// Returns `Ok(result_json)` for pass/passthrough/error modes, or
     /// `Err(waiting_json)` when the gate is paused awaiting approval.
     /// The caller must handle the `Err` case by early-returning from the
-    /// reactor loop with a `waiting: true` WorkflowContext.
+    /// reactor loop with a `waiting: true` `WorkflowContext`.
     #[tracing::instrument(
         level = "info",
         name = "confidence_gate",

@@ -40,7 +40,7 @@ fn test_access_control_query_has_three_conditions() {
 
     // This is a contract test: we verify the expected behavior by documenting
     // the three access paths.
-    let conditions = vec!["user_id = $2", "workflow_module_refs", "graph_json"];
+    let conditions = ["user_id = $2", "workflow_module_refs", "graph_json"];
 
     // All three must be present in the implementation. If this test is updated
     // to remove one, that's a red flag.

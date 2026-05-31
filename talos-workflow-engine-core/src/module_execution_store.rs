@@ -109,7 +109,7 @@ pub trait ModuleExecutionStore: Send + Sync {
     /// Resolve a logical module identifier (e.g. a template id) to the
     /// canonical id used when recording execution rows. Impls backed
     /// by a `node_templates ↔ wasm_modules` split map the template id
-    /// to the matching wasm_modules row (most recent compile);
+    /// to the matching `wasm_modules` row (most recent compile);
     /// simpler stores return the input unchanged.
     ///
     /// When the input is already canonical, or no mapping exists, the

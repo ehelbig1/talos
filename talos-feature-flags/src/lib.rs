@@ -22,9 +22,6 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// Feature flag value types

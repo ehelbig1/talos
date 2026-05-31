@@ -226,33 +226,6 @@ async fn save_graph_json_unchecked(
     }
 }
 
-#[cfg(test)]
-mod canonicalise_rhai_tests {
-    use super::canonicalise_rhai_in_graph_json;
-
-    #[test]
-    fn decodes_retry_condition() {
-        let raw = r#"{"nodes":[{"id":"n1","retry_condition":"a &amp;&amp; b"}],"edges":[]}"#;
-        let canonical = canonicalise_rhai_in_graph_json(raw);
-        assert!(canonical.contains(r#""retry_condition":"a && b""#));
-    }
-
-    #[test]
-    fn passes_through_unchanged_when_no_entities() {
-        let raw = r#"{"nodes":[{"id":"n1","retry_condition":"a && b"}],"edges":[]}"#;
-        let canonical = canonicalise_rhai_in_graph_json(raw);
-        // Cow::Borrowed → reference equality with input
-        assert!(matches!(canonical, std::borrow::Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn invalid_json_passes_through() {
-        let raw = "not json";
-        let canonical = canonicalise_rhai_in_graph_json(raw);
-        assert_eq!(canonical.as_ref(), raw);
-    }
-}
-
 /// Shape returned by [`upsert_system_node`]. Carries the verified
 /// workflow_id + node_id plus pre-formatted wiring strings so handler
 /// bodies can splice them into their response text without re-
@@ -5058,4 +5031,31 @@ async fn handle_add_llm_dispatch_node(
         timeout_secs,
         added.wiring_in, added.wiring_out
     ))
+}
+
+#[cfg(test)]
+mod canonicalise_rhai_tests {
+    use super::canonicalise_rhai_in_graph_json;
+
+    #[test]
+    fn decodes_retry_condition() {
+        let raw = r#"{"nodes":[{"id":"n1","retry_condition":"a &amp;&amp; b"}],"edges":[]}"#;
+        let canonical = canonicalise_rhai_in_graph_json(raw);
+        assert!(canonical.contains(r#""retry_condition":"a && b""#));
+    }
+
+    #[test]
+    fn passes_through_unchanged_when_no_entities() {
+        let raw = r#"{"nodes":[{"id":"n1","retry_condition":"a && b"}],"edges":[]}"#;
+        let canonical = canonicalise_rhai_in_graph_json(raw);
+        // Cow::Borrowed → reference equality with input
+        assert!(matches!(canonical, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn invalid_json_passes_through() {
+        let raw = "not json";
+        let canonical = canonicalise_rhai_in_graph_json(raw);
+        assert_eq!(canonical.as_ref(), raw);
+    }
 }

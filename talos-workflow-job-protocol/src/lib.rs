@@ -567,9 +567,7 @@ pub fn is_disallowed_sql_function(name: &str) -> bool {
     // at parse time, but sqlparser preserves the original case so we
     // normalise here for the comparison.
     let lower = name.to_ascii_lowercase();
-    DISALLOWED_SQL_FUNCTIONS
-        .iter()
-        .any(|denied| *denied == lower.as_str())
+    DISALLOWED_SQL_FUNCTIONS.contains(&lower.as_str())
 }
 
 /// True iff `path` is consumed by a controller-internal subsystem (LLM
@@ -1462,7 +1460,7 @@ impl JobRequest {
         // new free-form string field could re-introduce the collision
         // class. The length-prefix discipline is forward-safe.
         fn lp(s: &str) -> String {
-            format!("{}:{}", s.as_bytes().len(), s)
+            format!("{}:{}", s.len(), s)
         }
 
         // H-1: reply_topic. Sentinel `-` for None so absence is
@@ -1535,7 +1533,7 @@ impl JobRequest {
             // attacker can't redirect a worker's signed JobResult to
             // an attacker-controlled subject via the unsigned
             // msg.reply NATS header.
-            lp(&reply_topic_str),
+            lp(reply_topic_str),
             // H-3 (2026-05-23): capability_world appended AT THE END.
             lp(capability_world_str),
             // H-7 (2026-05-23): dry_run appended AT THE END.
@@ -2098,9 +2096,9 @@ impl PipelineJobRequest {
                 let sql_str = sql.join(",");
                 format!(
                     "{}:{}|{}:{}|{}",
-                    secrets_str.as_bytes().len(),
+                    secrets_str.len(),
                     secrets_str,
-                    sql_str.as_bytes().len(),
+                    sql_str.len(),
                     sql_str,
                     s.allow_tier2_exposure,
                 )
@@ -2113,7 +2111,7 @@ impl PipelineJobRequest {
         // payload-collisions. Existing fixed-width fields stay
         // unchanged.
         fn lp(s: &str) -> String {
-            format!("{}:{}", s.as_bytes().len(), s)
+            format!("{}:{}", s.len(), s)
         }
         let step_hashes_joined = step_hashes.join(":");
         let step_integrations_joined = step_integrations.join(",");
@@ -2221,7 +2219,7 @@ impl PipelineJobRequest {
             // M-5 (pipeline): per-step capability grants appended AT THE END.
             lp(&step_caps_str),
             // H-1 (pipeline): reply_topic appended AT THE END.
-            lp(&reply_topic_str),
+            lp(reply_topic_str),
             // C-2 (2026-05-23): per-step policy (config, hosts, methods,
             // secrets ciphertext, fuel/mem/timeout, priority,
             // cancellation_token) appended AT THE END per the

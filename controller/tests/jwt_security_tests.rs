@@ -5,7 +5,7 @@
 
 use chrono::{Duration, Utc};
 use controller::auth::{AuthService, Claims};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{encode, EncodingKey, Header};
 use uuid::Uuid;
 
 /// Create an AuthService backed by a lazy (not connected) pool.
