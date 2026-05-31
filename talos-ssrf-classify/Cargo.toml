@@ -1,0 +1,16 @@
+[package]
+name = "talos-ssrf-classify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Intentionally dependency-free (std::net only). This is the single source of
+# truth for SSRF private-IP classification, shared by the controller
+# (talos-http-utils) and the WASM-host worker — so it must stay light enough to
+# pull into the worker without dragging in a web framework.
+[dependencies]
+
+[lints]
+workspace = true

@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+talos-ssrf-classify = { path = "../talos-ssrf-classify" }
 axum = { version = "0.8", features = ["json"] }
 regex = "1.12"
 tracing.workspace = true

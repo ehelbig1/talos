@@ -8020,6 +8020,7 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
  "regex",
+ "talos-ssrf-classify",
  "tokio",
  "tower 0.5.3",
  "tracing",
@@ -8662,6 +8663,10 @@ dependencies = [
  "urlencoding",
  "uuid",
 ]
+
+[[package]]
+name = "talos-ssrf-classify"
+version = "0.1.0"
 
 [[package]]
 name = "talos-subworkflow-contract"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "talos-dlp",
     "talos-secrets",
+    "talos-ssrf-classify",
     "talos-memory",
     "talos-mcp",
     "talos-auth-types",
