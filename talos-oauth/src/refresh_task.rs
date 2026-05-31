@@ -29,7 +29,7 @@ pub async fn proactive_token_refresh_task(cred_service: Arc<OAuthCredentialServi
             "SELECT access_token_secret_path FROM integration_credentials \
              WHERE is_active = TRUE \
                AND token_expires_at IS NOT NULL \
-               AND token_expires_at < NOW() + make_interval(mins => $1) \
+               AND token_expires_at < NOW() + make_interval(mins => $1::int) \
                AND access_token_secret_path IS NOT NULL",
         )
         .bind(threshold_mins)

@@ -461,7 +461,7 @@ impl AdvancedRepository {
             "WITH archived AS (
                 DELETE FROM workflow_executions
                 WHERE status IN ('completed', 'failed', 'cancelled')
-                AND completed_at < NOW() - make_interval(days => $1)
+                AND completed_at < NOW() - make_interval(days => $1::int)
                 AND is_pinned = false
                 AND user_id = $2
                 RETURNING *
@@ -1308,7 +1308,7 @@ impl AdvancedRepository {
              WHERE user_id = $1 \
                AND status = 'draft' \
                AND NOT EXISTS (SELECT 1 FROM workflow_executions we WHERE we.workflow_id = workflows.id) \
-               AND created_at < NOW() - make_interval(days => $2)",
+               AND created_at < NOW() - make_interval(days => $2::int)",
         )
         .bind(user_id)
         .bind(stale_days)

@@ -100,10 +100,10 @@ pub async fn get_actor_cost_report(
     let totals = sqlx::query_as::<_, (i64, i64, i64)>(
         "SELECT COALESCE(SUM(fuel_consumed), 0), COALESCE(SUM(wall_time_ms), 0), COUNT(DISTINCT execution_id) \
          FROM execution_cost_rollup \
-         WHERE actor_id = $1 AND recorded_at > NOW() - make_interval(hours => $2)",
+         WHERE actor_id = $1 AND recorded_at > NOW() - make_interval(hours => $2::int)",
     )
     .bind(actor_id)
-    .bind(hours as f64)
+    .bind(hours)
     .fetch_one(pool)
     .await
     .unwrap_or_else(|e| {
@@ -119,11 +119,11 @@ pub async fn get_actor_cost_report(
     let top_workflows = sqlx::query_as::<_, (Uuid, i64, i64)>(
         "SELECT workflow_id, SUM(fuel_consumed), COUNT(DISTINCT execution_id) \
          FROM execution_cost_rollup \
-         WHERE actor_id = $1 AND recorded_at > NOW() - make_interval(hours => $2) \
+         WHERE actor_id = $1 AND recorded_at > NOW() - make_interval(hours => $2::int) \
          GROUP BY workflow_id ORDER BY SUM(fuel_consumed) DESC LIMIT 10",
     )
     .bind(actor_id)
-    .bind(hours as f64)
+    .bind(hours)
     .fetch_all(pool)
     .await
     .unwrap_or_else(|e| {

@@ -2120,6 +2120,71 @@ else
 fi
 echo
 
+# ── 27. make_interval() integer args must be cast ::int ──
+bold "▶ check 27: make_interval(<int arg> => \$N) must cast \$N::int"
+
+# (2026-05-31) PostgreSQL's make_interval() types years/months/weeks/days/hours/
+# mins as `int` (int4) and ONLY secs as `double precision`. sqlx sends a bound
+# parameter with the OID derived from the Rust type — so binding an i64 (int8)
+# or f64 (float8) to `make_interval(hours => $N)` resolves to a non-existent
+# overload and FAILS AT REQUEST TIME on pg16/pg17:
+#   ERROR: function make_interval(hours => bigint) does not exist
+# This compiles clean and only trips when the query runs — exactly the class
+# `cargo check` can't catch. Observed real bugs: retry-intelligence +
+# cost-attribution bound `hours as f64`, list_secret_access_log took `hours: f64`,
+# and the crash-recovery claim bound `mins: i64` (#51).
+#
+# Fix: cast the parameter in SQL — `make_interval(hours => $N::int)` — which
+# coerces any numeric bind (i32/i64/f64) to int4. The `secs =>` arg is exempt
+# (it's double precision and accepts int/float natively). Opt out (a genuine
+# secs-style double arg, or a non-parameterized literal) with
+# `// allow-make-interval-no-cast: <reason>` within 4 lines above.
+
+MKINT_VIOLATIONS=0
+if [ -n "$RG_BIN" ]; then
+    mkint_matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' -g '!**/tests/**' -g '!**/*_tests.rs' \
+        -e 'make_interval\((mins|hours|days|weeks|months|years) => \$[0-9]+\)' \
+        . 2>/dev/null || true)
+else
+    mkint_matches=$(grep -rnE --include='*.rs' \
+        'make_interval\((mins|hours|days|weeks|months|years) => \$[0-9]+\)' \
+        talos-* worker controller 2>/dev/null | grep -v '/tests/' || true)
+fi
+
+if [ -n "$mkint_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Already has ::int (the regex above excludes it, but guard comments).
+        if echo "$body" | grep -qE '::int\)|^\s*//|//!'; then
+            continue
+        fi
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-make-interval-no-cast:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        MKINT_VIOLATIONS=$((MKINT_VIOLATIONS + 1))
+    done <<< "$mkint_matches"
+fi
+
+if [ "$MKINT_VIOLATIONS" -gt 0 ]; then
+    red "✗ $MKINT_VIOLATIONS make_interval(<int arg>) without ::int cast"
+    yellow "  → cast the param: make_interval(hours => \$N::int) — int8/float8 binds fail at runtime"
+    yellow "    (function make_interval(hours => bigint) does not exist) on pg16/pg17."
+    yellow "  → 'secs =>' is exempt (double precision). Opt out: // allow-make-interval-no-cast: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ make_interval integer args are ::int-cast (pg int4 overload safety)"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"

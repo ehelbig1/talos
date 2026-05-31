@@ -1031,7 +1031,7 @@ impl ModuleRepository {
              FROM modules m \
              WHERE m.user_id = $1 \
                AND m.compiled_at IS NOT NULL \
-               AND m.compiled_at < NOW() - make_interval(days => $2) \
+               AND m.compiled_at < NOW() - make_interval(days => $2::int) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM workflows w \
                    WHERE w.user_id = $1 AND w.graph_json LIKE '%' || m.id::text || '%' \

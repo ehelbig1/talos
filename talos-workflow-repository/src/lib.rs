@@ -2266,7 +2266,7 @@ impl WorkflowRepository {
                     FILTER (WHERE completed_at IS NOT NULL AND status = 'completed'))::float8 AS avg_duration_secs \
              FROM workflow_executions \
              WHERE workflow_id = $1 AND user_id = $2 \
-               AND started_at > NOW() - make_interval(days => $3)",
+               AND started_at > NOW() - make_interval(days => $3::int)",
         )
         .bind(workflow_id)
         .bind(user_id)
@@ -2315,7 +2315,7 @@ impl WorkflowRepository {
                         FILTER (WHERE completed_at IS NOT NULL AND status = 'completed'))::float8 AS avg_duration_secs \
              FROM workflow_executions \
              WHERE workflow_id = ANY($1) AND user_id = $2 \
-               AND started_at > NOW() - make_interval(days => $3) \
+               AND started_at > NOW() - make_interval(days => $3::int) \
              GROUP BY workflow_id",
         )
         .bind(workflow_ids)

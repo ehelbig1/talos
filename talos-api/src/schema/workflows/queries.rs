@@ -757,7 +757,7 @@ impl WorkflowsQueries {
                 COUNT(*) FILTER (WHERE we.status = 'failed')::bigint AS failed,
                 (AVG(EXTRACT(EPOCH FROM (we.completed_at - we.started_at))) FILTER (WHERE we.completed_at IS NOT NULL))::float8 AS avg_duration_secs
             FROM workflows w
-            LEFT JOIN workflow_executions we ON we.workflow_id = w.id AND we.started_at > NOW() - make_interval(days => $2)
+            LEFT JOIN workflow_executions we ON we.workflow_id = w.id AND we.started_at > NOW() - make_interval(days => $2::int)
             WHERE w.user_id = $1
             GROUP BY w.id, w.name
             HAVING COUNT(we.id) > 0

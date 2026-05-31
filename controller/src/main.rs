@@ -1671,7 +1671,7 @@ async fn main() -> anyhow::Result<()> {
             // override path matches the env-side hardening from MCP-643.
             // Pre-fix a `system_settings.value = 0` row took
             // db_days.unwrap_or(env_days) → 0, then bound 0 into
-            // `make_interval(days => $1)` below — "completed_at < NOW() -
+            // `make_interval(days => $1::int)` below — "completed_at < NOW() -
             // 0 days" matches every completed/failed/cancelled execution
             // ever, archiving the entire table at the next daily tick.
             // Negative DB values would have the same effect (Postgres
@@ -1721,7 +1721,7 @@ async fn main() -> anyhow::Result<()> {
                 "WITH archived AS (
                     DELETE FROM workflow_executions
                     WHERE status IN ('completed', 'failed', 'cancelled')
-                    AND completed_at < NOW() - make_interval(days => $1)
+                    AND completed_at < NOW() - make_interval(days => $1::int)
                     AND is_pinned = false
                     RETURNING *
                 )
@@ -4411,7 +4411,7 @@ async fn main() -> anyhow::Result<()> {
                         "UPDATE workflow_executions SET status = 'failed', \
                          error_message = 'Auto-cleaned: execution stale (running > configured threshold)', \
                          completed_at = NOW() \
-                         WHERE status IN ('running') AND status != 'queued' AND started_at < NOW() - make_interval(mins => $1)"
+                         WHERE status IN ('running') AND status != 'queued' AND started_at < NOW() - make_interval(mins => $1::int)"
                     ).bind(stale_minutes).execute(&cleanup_pool).await;
                     if let Ok(r) = result {
                         if r.rows_affected() > 0 {
