@@ -11322,6 +11322,7 @@ dependencies = [
  "talos-memory",
  "talos-secrets",
  "talos-shutdown",
+ "talos-ssrf-classify",
  "talos-text-util",
  "talos-trace-nats",
  "talos-wit-inspector",

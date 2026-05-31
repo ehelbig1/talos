@@ -514,12 +514,36 @@ pub const DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
     // ── Large object FS I/O (lo_import / lo_export) ─────────────────────
     "lo_import",
     "lo_export",
+    // ── adminpack filesystem write/delete ───────────────────────────────
+    // The read side (pg_read_file/…) is covered above; adminpack adds the
+    // MUTATION side, which is strictly worse. Typically not installed, but
+    // denied in the same fail-closed spirit as dblink / plperlu below.
+    "pg_file_write",
+    "pg_file_read",
+    "pg_file_unlink",
+    "pg_file_rename",
+    "pg_file_sync",
+    "pg_logfile_rotate",
+    "pg_logdir_ls",
     // ── dblink — bypass network egress controls via PG-side connection ──
     "dblink",
     "dblink_exec",
     "dblink_connect",
+    // dblink_connect_u is the UNRESTRICTED variant — it lets a non-superuser
+    // use any libpq auth method, the explicit privilege-bypass of
+    // dblink_connect. Denying dblink_connect without it left the bypass open.
+    "dblink_connect_u",
+    "dblink_disconnect",
     "dblink_send_query",
     "dblink_open",
+    "dblink_close",
+    "dblink_fetch",
+    "dblink_get_result",
+    "dblink_get_connections",
+    "dblink_cancel_query",
+    "dblink_error_message",
+    "dblink_is_busy",
+    "dblink_get_notify",
     // ── PL/perl / PL/python untrusted variants — RCE via stored proc ────
     // These are typically not installed but if they ARE installed in the
     // operator's cluster, calling them from guest SQL is RCE.
