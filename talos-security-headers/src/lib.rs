@@ -205,6 +205,7 @@ fn csp_and_reporting_headers() -> &'static (HeaderValue, Option<HeaderValue>) {
                  img-src 'self' https:; \
                  font-src 'self'; \
                  connect-src 'self' wss:; \
+                 object-src 'none'; \
                  frame-ancestors 'none'; \
                  base-uri 'self'; \
                  form-action 'self'"
@@ -216,6 +217,7 @@ fn csp_and_reporting_headers() -> &'static (HeaderValue, Option<HeaderValue>) {
                  img-src 'self' data: https:; \
                  font-src 'self' data:; \
                  connect-src 'self' ws: wss:; \
+                 object-src 'none'; \
                  frame-ancestors 'none'; \
                  base-uri 'self'; \
                  form-action 'self'"
@@ -260,8 +262,19 @@ mod tests {
 
         let headers = response.headers();
 
-        // Check CSP
+        // Check CSP — incl. explicit object-src 'none' (parity with the SPA's
+        // nginx CSP; <object>/<embed> must not fall back to default-src 'self').
         assert!(headers.contains_key(header::CONTENT_SECURITY_POLICY));
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("object-src 'none'"),
+            "CSP must explicitly deny plugin objects: {csp}"
+        );
+        assert!(csp.contains("frame-ancestors 'none'"), "CSP must deny framing: {csp}");
 
         // Check X-Frame-Options
         assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
