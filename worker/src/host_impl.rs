@@ -9557,6 +9557,11 @@ impl wit_agent_memory::Host for TalosContext {
                 .await;
             return Err(wit_agent_memory::Error::NotAvailable);
         }
+        // Fail-fast key validation (parity with set/delete + the controller's
+        // memory_rpc verify(); see set for rationale).
+        if talos_memory::validate_memory_key(&key).is_err() {
+            return Err(wit_agent_memory::Error::InvalidInput);
+        }
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let (actor_id, nats) = match mem_rpc_prereqs_owned(self) {
@@ -9601,6 +9606,14 @@ impl wit_agent_memory::Host for TalosContext {
                 .await;
             return Err(wit_agent_memory::Error::NotAvailable);
         }
+        // Fail-fast key validation via the canonical validator the controller's
+        // memory_rpc verify() also runs (trim, non-empty, ≤500 chars, no control
+        // chars/null). Parity with the per-key caps on wit_cache (MCP-754) and
+        // wit_state: rejects an over-long/invalid key here instead of HMAC-signing
+        // and shipping a doomed payload the controller would reject anyway.
+        if talos_memory::validate_memory_key(&key).is_err() {
+            return Err(wit_agent_memory::Error::InvalidInput);
+        }
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         if value.len() > talos_memory::MAX_VALUE_BYTES {
@@ -9643,6 +9656,11 @@ impl wit_agent_memory::Host for TalosContext {
             self.record_capability_denied("agent-memory-delete", "capability-world", &key)
                 .await;
             return Err(wit_agent_memory::Error::NotAvailable);
+        }
+        // Fail-fast key validation (parity with get/set + the controller's
+        // memory_rpc verify(); see set for rationale).
+        if talos_memory::validate_memory_key(&key).is_err() {
+            return Err(wit_agent_memory::Error::InvalidInput);
         }
         let (actor_id, nats) = match mem_rpc_prereqs_owned(self) {
             Some(p) => p,
