@@ -1014,20 +1014,32 @@ impl AnalyticsRepository {
 
     /// Decrypt a single output row (plaintext fallback for legacy).
     /// Returns None when both columns are NULL or decryption fails.
+    ///
+    /// MCP-S2: `output_data_enc` is AAD-bound to the execution `id`
+    /// (`encrypt_value_aad_v1`), so the read MUST dispatch on
+    /// `output_data_format` and supply the same AAD via `decrypt_versioned`.
+    /// A bare `decrypt_value_by_key` (empty AAD) tag-fails every v1 row,
+    /// re-introducing the MCP-680 output-blindness on encrypted deploys.
+    /// Callers MUST therefore SELECT `id` + `output_data_format`.
     async fn decode_output_row(
         &self,
+        exec_id: Uuid,
         plaintext: Option<serde_json::Value>,
         enc_bytes: Option<Vec<u8>>,
         key_id: Option<Uuid>,
+        format_version: i16,
     ) -> Option<serde_json::Value> {
         match (&self.secrets_manager, enc_bytes, key_id) {
             (Some(sm), Some(bytes), Some(kid)) => {
-                match sm.decrypt_value_by_key(kid, &bytes).await {
+                match sm
+                    .decrypt_versioned(kid, &bytes, exec_id.as_bytes(), format_version)
+                    .await
+                {
                     Ok(s) => serde_json::from_str(&s).ok(),
                     Err(e) => {
                         tracing::warn!(
                             err = ?e,
-                            "AnalyticsRepository: decrypt_value_by_key failed — skipping row"
+                            "AnalyticsRepository: output decrypt failed — skipping row"
                         );
                         None
                     }
@@ -2275,11 +2287,13 @@ impl AnalyticsRepository {
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
         let raw: Vec<(
+            Uuid,
             Option<serde_json::Value>,
             Option<Vec<u8>>,
             Option<Uuid>,
+            i16,
         )> = sqlx::query_as(
-            "SELECT we.output_data, we.output_data_enc, we.output_enc_key_id \
+            "SELECT we.id, we.output_data, we.output_data_enc, we.output_enc_key_id, we.output_data_format \
              FROM workflow_executions we \
              WHERE we.workflow_id = $1 AND we.user_id = $2 AND we.status = 'completed' \
                AND we.started_at > NOW() - make_interval(days => $3) \
@@ -2293,8 +2307,8 @@ impl AnalyticsRepository {
         .fetch_all(&self.db_pool)
         .await?;
         let mut out = Vec::with_capacity(raw.len());
-        for (plaintext, enc_bytes, key_id) in raw {
-            if let Some(v) = self.decode_output_row(plaintext, enc_bytes, key_id).await {
+        for (id, plaintext, enc_bytes, key_id, fmt) in raw {
+            if let Some(v) = self.decode_output_row(id, plaintext, enc_bytes, key_id, fmt).await {
                 out.push(v);
             }
         }
@@ -2313,11 +2327,13 @@ impl AnalyticsRepository {
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
         let raw: Vec<(
+            Uuid,
             Option<serde_json::Value>,
             Option<Vec<u8>>,
             Option<Uuid>,
+            i16,
         )> = sqlx::query_as(
-            "SELECT we.output_data, we.output_data_enc, we.output_enc_key_id \
+            "SELECT we.id, we.output_data, we.output_data_enc, we.output_enc_key_id, we.output_data_format \
              FROM workflow_executions we \
              WHERE we.user_id = $1 AND we.status = 'completed' \
                AND we.started_at > NOW() - make_interval(days => $2) \
@@ -2330,8 +2346,8 @@ impl AnalyticsRepository {
         .fetch_all(&self.db_pool)
         .await?;
         let mut out = Vec::with_capacity(raw.len());
-        for (plaintext, enc_bytes, key_id) in raw {
-            if let Some(v) = self.decode_output_row(plaintext, enc_bytes, key_id).await {
+        for (id, plaintext, enc_bytes, key_id, fmt) in raw {
+            if let Some(v) = self.decode_output_row(id, plaintext, enc_bytes, key_id, fmt).await {
                 out.push(v);
             }
         }

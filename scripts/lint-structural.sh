@@ -1773,7 +1773,7 @@ fi
 echo
 
 # ── 23. AEAD AAD-binding discipline on SecretsManager::encrypt_value ──
-bold "▶ check 23: encrypt_value() without AAD outside the secrets table"
+bold "▶ check 23: encrypt_value()/decrypt_value_by_key() without AAD outside the secrets table"
 
 # MCP-S2 (2026-05-28): every persistence boundary that stores AES-GCM
 # ciphertext via SecretsManager MUST use the AAD-bound variant
@@ -1847,16 +1847,75 @@ if [ -n "$matches" ]; then
     done <<< "$matches"
 fi
 
+# ── Decrypt side: the no-AAD reader must not be used on AAD-bound rows ──
+# (2026-05-30) The bare `decrypt_value_by_key(kid, bytes)` is the v0/empty-AAD
+# path. Calling it to read a column the writer AAD-bound via
+# `encrypt_value_aad_v1` (workflow_executions.output_data_enc,
+# module_executions.*_enc) AES-GCM-tag-fails on every v1 row — a SILENT
+# correctness regression on encrypted deploys (replay loses history, analytics
+# goes output-blind, crash-recovery drops its resume seed). Four readers drifted
+# this way and were swept; the canonical readers all dispatch on the per-row
+# format column via `decrypt_versioned(kid, bytes, row_id.as_bytes(), fmt)`
+# (or `talos_module_payload_encryption::decrypt_payload_slot`).
+#
+# Allowed bare callers: the SecretsManager impl + its v0 dispatch arm
+# (talos-secrets-manager/), the verification example (controller/examples/),
+# and genuinely-v0 data with `// allow-decrypt-no-aad: <reason>` within 4 lines.
+
+if [ -n "$RG_BIN" ]; then
+    dec_matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' \
+        -g '!talos-secrets-manager/**' \
+        -g '!**/examples/**' \
+        -g '!**/tests/**' \
+        -g '!**/*_tests.rs' \
+        -e '\.decrypt_value_by_key\(' \
+        . 2>/dev/null || true)
+else
+    dec_matches=$(grep -rn --include='*.rs' \
+        --exclude-dir=tests --exclude-dir=examples \
+        --exclude='*_tests.rs' \
+        -E '\.decrypt_value_by_key\(' \
+        talos-* worker controller 2>/dev/null \
+        | grep -v 'talos-secrets-manager/' || true)
+fi
+
+if [ -n "$dec_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+
+        # Skip the _with_aad variant, helper defs, docstring/comment refs.
+        if echo "$body" | grep -qE 'decrypt_value_by_key_with_aad|pub (async )?fn decrypt_value_by_key|^\s*//|//!|/\*'; then
+            continue
+        fi
+
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-decrypt-no-aad:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        ENCRYPT_VIOLATIONS=$((ENCRYPT_VIOLATIONS + 1))
+    done <<< "$dec_matches"
+fi
+
 if [ "$ENCRYPT_VIOLATIONS" -gt 0 ]; then
-    red "✗ $ENCRYPT_VIOLATIONS encrypt_value() call(s) without AAD found"
-    yellow "  → use SecretsManager::encrypt_value_aad_v1(value, row_id.as_bytes()) and persist"
-    yellow "    the returned format_version to a per-row column. Reads dispatch via"
-    yellow "    SecretsManager::decrypt_versioned."
-    yellow "  → Opt out (legacy/migration-only) with: // allow-encrypt-value-no-aad: <reason>"
-    yellow "  → See MCP-S2 (2026-05-28) for the full migration pattern."
+    red "✗ $ENCRYPT_VIOLATIONS encrypt_value()/decrypt_value_by_key() call(s) without AAD found"
+    yellow "  → encrypt: SecretsManager::encrypt_value_aad_v1(value, row_id.as_bytes()); persist"
+    yellow "    the returned format_version to a per-row column."
+    yellow "  → decrypt: SecretsManager::decrypt_versioned(kid, bytes, row_id.as_bytes(), fmt)"
+    yellow "    (or talos_module_payload_encryption::decrypt_payload_slot); SELECT id + format."
+    yellow "  → Opt out (legacy/v0-only) with: // allow-encrypt-value-no-aad: <reason>"
+    yellow "    or // allow-decrypt-no-aad: <reason>"
+    yellow "  → See MCP-S2 (2026-05-28) + the 2026-05-30 reader sweep."
     EXIT_CODE=1
 else
-    green "✓ AEAD AAD-binding discipline holds (MCP-S2 sweep)"
+    green "✓ AEAD AAD-binding discipline holds (MCP-S2 sweep + reader sweep)"
 fi
 echo
 

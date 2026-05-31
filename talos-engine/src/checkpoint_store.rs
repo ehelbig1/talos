@@ -316,8 +316,14 @@ impl CheckpointStore for ControllerCheckpointStore {
             return Ok(HashMap::new());
         };
 
-        let dek_row: Option<(Option<Vec<u8>>, Option<Uuid>)> = sqlx::query_as(
-            "SELECT output_data_enc, output_enc_key_id FROM workflow_executions \
+        // MCP-S2: `output_data_enc` is written AAD-bound to the execution
+        // `id` (`encrypt_value_aad_v1`), so the read MUST dispatch on
+        // `output_data_format` and supply the same AAD via
+        // `decrypt_versioned`. A bare `decrypt_value_by_key` (empty AAD)
+        // tag-fails every v1 row, silently dropping the resume seed back to
+        // a fresh run on encrypted deploys.
+        let dek_row: Option<(Option<Vec<u8>>, Option<Uuid>, i16)> = sqlx::query_as(
+            "SELECT output_data_enc, output_enc_key_id, output_data_format FROM workflow_executions \
              WHERE id = $1 AND status = ANY($2) AND output_data_enc IS NOT NULL",
         )
         .bind(execution_id)
@@ -325,7 +331,7 @@ impl CheckpointStore for ControllerCheckpointStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        let Some((Some(enc_bytes), Some(key_id))) = dek_row else {
+        let Some((Some(enc_bytes), Some(key_id), output_format)) = dek_row else {
             return Ok(HashMap::new());
         };
 
@@ -333,7 +339,10 @@ impl CheckpointStore for ControllerCheckpointStore {
         // safer than panicking the resume thread. The engine then
         // re-runs from scratch which is a worse UX than a clean
         // resume but better than a crash loop.
-        let plain = match sm.decrypt_value_by_key(key_id, &enc_bytes).await {
+        let plain = match sm
+            .decrypt_versioned(key_id, &enc_bytes, execution_id.as_bytes(), output_format)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(

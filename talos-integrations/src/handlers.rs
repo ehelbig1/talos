@@ -103,12 +103,18 @@ pub async fn latest_briefing_handler(
     // Extension passed in from the controller (sibling of the
     // MCP-680 fixes in talos-module-repository,
     // talos-workflow-repository, and talos-analytics-repository).
+    // MCP-S2: `output_data_enc` is AAD-bound to the execution `id`, so the
+    // read dispatches on `output_data_format` and supplies the same AAD via
+    // `decrypt_versioned` — a bare `decrypt_value_by_key` (empty AAD)
+    // tag-fails every v1 row written after the 2026-05-28 sweep.
     let row: Option<(
+        Uuid,
         Option<serde_json::Value>,
         Option<Vec<u8>>,
         Option<Uuid>,
+        i16,
     )> = sqlx::query_as(
-        "SELECT output_data, output_data_enc, output_enc_key_id \
+        "SELECT id, output_data, output_data_enc, output_enc_key_id, output_data_format \
          FROM workflow_executions \
          WHERE workflow_id = $1 AND user_id = $2 AND status = 'completed' \
            AND (output_data IS NOT NULL OR output_data_enc IS NOT NULL) \
@@ -122,10 +128,13 @@ pub async fn latest_briefing_handler(
     .flatten();
 
     let output_json: serde_json::Value = match row {
-        Some((plaintext, enc_bytes, key_id)) => {
+        Some((exec_id, plaintext, enc_bytes, key_id, output_format)) => {
             match (enc_bytes, key_id) {
                 (Some(bytes), Some(kid)) => {
-                    match secrets_manager.decrypt_value_by_key(kid, &bytes).await {
+                    match secrets_manager
+                        .decrypt_versioned(kid, &bytes, exec_id.as_bytes(), output_format)
+                        .await
+                    {
                         Ok(s) => match serde_json::from_str(&s) {
                             Ok(v) => v,
                             Err(_) => {
