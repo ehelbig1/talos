@@ -502,7 +502,7 @@ impl WorkflowRepository {
 
         let where_str = conditions.join(" AND ");
         let data_sql = format!(
-            "{base_select} {from_clause} WHERE {where_str} ORDER BY w.updated_at DESC LIMIT ${limit_param} OFFSET ${offset_param}"
+            "{base_select} {from_clause} WHERE {where_str} ORDER BY w.updated_at DESC, w.id DESC LIMIT ${limit_param} OFFSET ${offset_param}"
         );
         let count_sql = format!("SELECT COUNT(*) FROM workflows w WHERE {where_str}");
 

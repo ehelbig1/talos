@@ -2355,6 +2355,10 @@ impl AdvancedRepository {
                     .await
             }
             PaginationMode::Offset { offset } => {
+                // Generic paginator: the ORDER BY + any unique tiebreaker live in
+                // the caller-supplied, pre-validated `validated_base_query`. The
+                // Cursor mode above is the deterministic keyset path.
+                // allow-offset-no-tiebreaker: caller-owned ORDER BY in base query
                 let q = format!(
                     "SELECT * FROM ({}) AS _paginated_subquery LIMIT $1 OFFSET $2",
                     validated_base_query

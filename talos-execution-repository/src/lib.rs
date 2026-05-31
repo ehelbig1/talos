@@ -723,7 +723,7 @@ impl ExecutionRepository {
              FROM workflow_executions e \
              LEFT JOIN workflows w ON w.id = e.workflow_id \
              WHERE e.workflow_id = $1 AND e.user_id = $2 \
-             ORDER BY e.started_at DESC LIMIT $3 OFFSET $4",
+             ORDER BY e.started_at DESC, e.id DESC LIMIT $3 OFFSET $4",
         )
         .bind(wf_id)
         .bind(user_id)

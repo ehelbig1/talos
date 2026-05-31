@@ -2185,6 +2185,69 @@ else
 fi
 echo
 
+# ── 28. OFFSET pagination must ORDER BY a unique tiebreaker ──
+bold "▶ check 28: OFFSET pagination needs a unique ORDER BY tiebreaker"
+
+# (2026-05-31) `... ORDER BY <non-unique col> LIMIT $n OFFSET $m` silently
+# SKIPS or DUPLICATES rows at page boundaries: when the sort key has ties
+# (created_at / started_at / updated_at / name / timestamp all do), Postgres
+# may order the tied rows differently between the page-N and page-N+1 queries,
+# so a row at the boundary is seen twice or not at all. The fix is to append a
+# unique tiebreaker (the PK `id`) so the sort is a TOTAL order:
+#   ORDER BY created_at DESC, id DESC
+# A sort whose trailing column is already unique within the query's scope
+# (e.g. `version_number` under a single workflow_id) is fine.
+#
+# This check flags any `OFFSET $n` whose nearest preceding ORDER BY (within 4
+# lines) lacks a standalone `id` / `version_number` token. Opt out (caller-owned
+# ORDER BY, provably-unique sort) with `// allow-offset-no-tiebreaker: <reason>`.
+
+OFFSET_VIOLATIONS=0
+# id / .id / , id / version_number as a standalone token (not workflow_id, valid, uuid).
+TIEBREAKER_RE='(^|[^a-z_])id([^a-z_]|$)|version_number'
+
+offset_files=$(grep -rlE "OFFSET \\\$[0-9]" --include='*.rs' talos-* controller worker 2>/dev/null \
+    | grep -vE '/tests/|_tests\.rs' || true)
+
+for file in $offset_files; do
+    [ -f "$file" ] || continue
+    # Each line number that contains an OFFSET bind.
+    for lineno in $(grep -nE "OFFSET \\\$[0-9]" "$file" | cut -d: -f1); do
+        start=$((lineno > 4 ? lineno - 4 : 1))
+        window=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+        # Opt-out marker anywhere in the window.
+        if echo "$window" | grep -q '// allow-offset-no-tiebreaker:'; then
+            continue
+        fi
+        # The ORDER BY → OFFSET slice. If there's no ORDER BY in the window the
+        # sort is unspecified (flag); if there is, it must carry a tiebreaker.
+        order_slice=$(echo "$window" | sed -n '/[Oo][Rr][Dd][Ee][Rr] [Bb][Yy]/,$p')
+        if [ -z "$order_slice" ]; then
+            # No ORDER BY near the OFFSET — non-deterministic pagination.
+            printf '  %s:%s  (OFFSET with no ORDER BY in scope)\n' "$file" "$lineno"
+            OFFSET_VIOLATIONS=$((OFFSET_VIOLATIONS + 1))
+            continue
+        fi
+        if echo "$order_slice" | grep -qE "$TIEBREAKER_RE"; then
+            continue
+        fi
+        printf '  %s:%s  %s\n' "$file" "$lineno" \
+            "$(echo "$order_slice" | grep -iE 'order by' | head -1 | sed 's/^[[:space:]]*//')"
+        OFFSET_VIOLATIONS=$((OFFSET_VIOLATIONS + 1))
+    done
+done
+
+if [ "$OFFSET_VIOLATIONS" -gt 0 ]; then
+    red "✗ $OFFSET_VIOLATIONS OFFSET pagination quer(ies) without a unique ORDER BY tiebreaker"
+    yellow "  → append the PK to make the sort total: ORDER BY <col> DESC, id DESC"
+    yellow "    (qualify when joined: we.id / e.id / l.id). Without it, paging skips/duplicates rows."
+    yellow "  → provably-unique sort or caller-owned ORDER BY: // allow-offset-no-tiebreaker: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ OFFSET pagination queries carry a unique ORDER BY tiebreaker"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"

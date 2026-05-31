@@ -363,7 +363,7 @@ impl ModuleRegistry {
                         COALESCE(source_code, '') AS code_template, wasm_bytes AS precompiled_wasm, \
                         NULL::TEXT AS icon, oci_url, allowed_hosts, allowed_methods, allowed_secrets, \
                         requires_approval_for, max_retries, retry_backoff_ms, capability_world, dependencies \
-                 FROM modules WHERE COALESCE(category, kind) = $1 ORDER BY name ASC LIMIT $2 OFFSET $3"
+                 FROM modules WHERE COALESCE(category, kind) = $1 ORDER BY name ASC, id ASC LIMIT $2 OFFSET $3"
             )
             .bind(cat)
             .bind(limit)
@@ -376,7 +376,7 @@ impl ModuleRegistry {
                         COALESCE(source_code, '') AS code_template, wasm_bytes AS precompiled_wasm, \
                         NULL::TEXT AS icon, oci_url, allowed_hosts, allowed_methods, allowed_secrets, \
                         requires_approval_for, max_retries, retry_backoff_ms, capability_world, dependencies \
-                 FROM modules ORDER BY name ASC LIMIT $1 OFFSET $2"
+                 FROM modules ORDER BY name ASC, id ASC LIMIT $1 OFFSET $2"
             )
             .bind(limit)
             .bind(offset)
@@ -412,7 +412,7 @@ impl ModuleRegistry {
                  FROM modules \
                  WHERE COALESCE(category, kind) = $1 \
                    AND (user_id IS NULL OR user_id = $2) \
-                 ORDER BY name ASC LIMIT $3 OFFSET $4"
+                 ORDER BY name ASC, id ASC LIMIT $3 OFFSET $4"
             )
             .bind(cat)
             .bind(user_id)
@@ -428,7 +428,7 @@ impl ModuleRegistry {
                         requires_approval_for, max_retries, retry_backoff_ms, capability_world, dependencies \
                  FROM modules \
                  WHERE user_id IS NULL OR user_id = $1 \
-                 ORDER BY name ASC LIMIT $2 OFFSET $3"
+                 ORDER BY name ASC, id ASC LIMIT $2 OFFSET $3"
             )
             .bind(user_id)
             .bind(limit)

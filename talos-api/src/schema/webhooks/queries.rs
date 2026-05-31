@@ -54,7 +54,7 @@ impl WebhooksQueries {
                    last_triggered_at
             FROM webhook_triggers
             WHERE user_id = $1
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT $2 OFFSET $3
             "#,
             user_id,

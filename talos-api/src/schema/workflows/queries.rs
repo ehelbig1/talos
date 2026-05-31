@@ -175,7 +175,7 @@ impl WorkflowsQueries {
             FROM workflow_executions we
             LEFT JOIN workflows w ON w.id = we.workflow_id
             WHERE we.workflow_id = $1 AND (we.user_id = $2 OR w.org_id = ANY($5))
-            ORDER BY we.created_at DESC
+            ORDER BY we.created_at DESC, we.id DESC
             LIMIT $3 OFFSET $4
             "#,
         )
@@ -341,7 +341,7 @@ impl WorkflowsQueries {
             .await
             .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
         let workflows = sqlx::query_as::<_, WorkflowRow>(
-            "SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+            "SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
         )
         .bind(user_id)
         .bind(limit_val)
@@ -689,7 +689,7 @@ impl WorkflowsQueries {
                    last_triggered_at, next_trigger_at, created_at, updated_at
             FROM workflow_schedules
             WHERE user_id = $1
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT $2 OFFSET $3
             "#,
         )

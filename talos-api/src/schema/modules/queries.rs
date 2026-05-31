@@ -295,7 +295,7 @@ impl ModulesQueries {
                     config, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE (user_id = $1 OR org_id = ANY($4))
-             ORDER BY COALESCE(compiled_at, created_at) DESC
+             ORDER BY COALESCE(compiled_at, created_at) DESC, id DESC
              LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
