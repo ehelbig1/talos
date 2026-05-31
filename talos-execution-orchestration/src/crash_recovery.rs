@@ -87,10 +87,13 @@ pub async fn recover_stuck_executions(deps: RecoveryDeps, stale_after_minutes: i
         .reclaim_orphaned_resuming(stale_after_minutes)
         .await
     {
-        Ok(n) if n > 0 => tracing::warn!(
-            reclaimed = n,
-            "crash-recovery: failed {n} execution(s) wedged in 'resuming' from a prior interrupted recovery"
-        ),
+        Ok(n) if n > 0 => {
+            record_outcome("reclaimed", n);
+            tracing::warn!(
+                reclaimed = n,
+                "crash-recovery: failed {n} execution(s) wedged in 'resuming' from a prior interrupted recovery"
+            );
+        }
         Ok(_) => {}
         Err(e) => tracing::error!(error = %e, "crash-recovery: reclaim_orphaned_resuming failed"),
     }
@@ -231,7 +234,10 @@ async fn resume_one(deps: RecoveryDeps, row: StuckExecutionForResume) {
     {
         // The engine wrote the terminal status (completed / failed / waiting),
         // moving the row out of `resuming`.
-        Ok(_ctx) => tracing::info!(execution_id = %exec_id, "crash-recovery: execution resumed"),
+        Ok(_ctx) => {
+            record_outcome("resumed", 1);
+            tracing::info!(execution_id = %exec_id, "crash-recovery: execution resumed");
+        }
         Err(e) => {
             let redacted = talos_dlp_provider::redact_str(&e.to_string());
             fail(
@@ -245,10 +251,28 @@ async fn resume_one(deps: RecoveryDeps, row: StuckExecutionForResume) {
     }
 }
 
+/// Record a crash-recovery outcome on the `talos_crash_recovery_total{outcome}`
+/// counter. No-op until `talos_metrics::set_global` has run (it runs at
+/// controller startup, before this sweep is spawned) — never unwraps, so it's
+/// inert in tests and in any process without metrics wired.
+fn record_outcome(outcome: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    if let Some(m) = talos_metrics::global() {
+        m.crash_recovery_total
+            .with_label_values(&[outcome])
+            .inc_by(n as f64);
+    }
+}
+
 /// Status-guarded terminal fail (`resuming -> failed`). Logs if the guarded
 /// UPDATE doesn't land (row already moved on, or DB error) but never panics —
 /// a failure here just leaves the row for the next restart's reclaim.
 async fn fail(deps: &RecoveryDeps, exec_id: Uuid, message: &str) {
+    // Count the recovery's decision to give up on this execution (deleted
+    // workflow / engine-build error / dispatch error all route through here).
+    record_outcome("failed", 1);
     match deps
         .execution_repo
         .fail_resuming_execution(exec_id, message)
