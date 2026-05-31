@@ -53,6 +53,11 @@ pub struct TalosMetrics {
     pub workflow_executions_total: CounterVec,
     pub workflow_execution_duration_seconds: HistogramVec,
 
+    // Crash-recovery metrics (durable execution, RFC 0003). Labeled by
+    // `outcome`: resumed | failed | reclaimed. Lets operators alert on a
+    // restart-resume sweep that silently does nothing or whose resumes fail.
+    pub crash_recovery_total: CounterVec,
+
     // Rate limiting metrics
     pub rate_limit_hits_total: CounterVec,
 
@@ -209,6 +214,23 @@ impl TalosMetrics {
             &["status"],
         )?;
         registry.register(Box::new(workflow_execution_duration_seconds.clone()))?;
+
+        let crash_recovery_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_crash_recovery_total",
+                "Total crash-recovery resume outcomes since process start",
+            ),
+            &["outcome"], // resumed, failed, reclaimed
+        )?;
+        registry.register(Box::new(crash_recovery_total.clone()))?;
+        // Pre-seed the outcome series to 0. Unlike the high-frequency execution
+        // counters above, crash-recovery only fires on a restart-with-orphans,
+        // so without seeding these series would be absent in steady state and
+        // `rate()` / absence alerts + dashboard panels would have nothing to
+        // reference. A counter seeded at 0 is correct and always present.
+        for outcome in ["resumed", "failed", "reclaimed"] {
+            crash_recovery_total.with_label_values(&[outcome]).inc_by(0.0);
+        }
 
         // Rate limiting metrics
         let rate_limit_hits_total = CounterVec::new(
@@ -375,6 +397,7 @@ impl TalosMetrics {
             module_execution_duration_seconds,
             workflow_executions_total,
             workflow_execution_duration_seconds,
+            crash_recovery_total,
             rate_limit_hits_total,
             cache_hits_total,
             cache_misses_total,
@@ -486,6 +509,36 @@ mod tests {
         assert!(rendered.contains(r#"talos_kek_decrypt_failures_total{provider="both"} 2"#));
         assert!(rendered.contains("talos_actor_memory_orphaned_rows 3"));
         assert!(rendered.contains("talos_dek_cache_size 42"));
+    }
+
+    // Crash-recovery outcome counter (durable execution, RFC 0003) must be
+    // registered, pre-seeded at 0 for all three outcomes (so dashboards/alerts
+    // have a series in steady state), and increment correctly. A regression
+    // here means the crash-recovery observability surface silently disappears.
+    #[test]
+    fn crash_recovery_metric_seeded_and_increments() {
+        let m = TalosMetrics::new().unwrap();
+
+        // Pre-seeded at 0 from new() — present before any recovery runs.
+        let rendered = m.render_prometheus().expect("render");
+        for outcome in ["resumed", "failed", "reclaimed"] {
+            assert!(
+                rendered.contains(&format!(
+                    "talos_crash_recovery_total{{outcome=\"{outcome}\"}} 0"
+                )),
+                "crash_recovery_total[{outcome}] not pre-seeded at 0\n{rendered}"
+            );
+        }
+
+        // Increment behaves: counts accumulate per outcome label.
+        m.crash_recovery_total.with_label_values(&["resumed"]).inc();
+        m.crash_recovery_total
+            .with_label_values(&["reclaimed"])
+            .inc_by(3.0);
+        let rendered = m.render_prometheus().expect("render");
+        assert!(rendered.contains(r#"talos_crash_recovery_total{outcome="resumed"} 1"#));
+        assert!(rendered.contains(r#"talos_crash_recovery_total{outcome="reclaimed"} 3"#));
+        assert!(rendered.contains(r#"talos_crash_recovery_total{outcome="failed"} 0"#));
     }
 
     // set_global / global round-trip. One-shot semantics: subsequent

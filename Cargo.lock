@@ -7823,6 +7823,7 @@ dependencies = [
  "talos-execution-repository",
  "talos-execution-result-collector",
  "talos-http-utils",
+ "talos-metrics",
  "talos-registry",
  "talos-secrets-manager",
  "talos-text-util",

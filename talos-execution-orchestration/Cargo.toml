@@ -21,6 +21,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Talos crates — utility
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-metrics = { path = "../talos-metrics" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-text-util = { path = "../talos-text-util" }
 
