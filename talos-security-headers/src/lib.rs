@@ -83,12 +83,16 @@ pub async fn add_security_headers(
         HeaderValue::from_static("nosniff"),
     );
 
-    // X-XSS-Protection: Legacy XSS protection (for older browsers)
-    // Modern browsers use CSP, but this helps older browsers
-    headers.insert(
-        "X-XSS-Protection",
-        HeaderValue::from_static("1; mode=block"),
-    );
+    // X-XSS-Protection: explicitly DISABLED (`0`), per current guidance from
+    // the OWASP Secure Headers Project, MDN, and Google web.dev. The legacy
+    // XSS auditor this header enabled was removed from Chrome 78+/Edge and was
+    // never in Firefox; on the browsers that still honoured `1; mode=block` it
+    // was a known XS-Leak / "scriptgadget" oracle (the filter could be abused
+    // to selectively disable page scripts and infer cross-origin state). With
+    // the strict CSP above (`script-src 'self'`, no unsafe-inline) doing the
+    // real XSS defense, the legacy auditor adds only risk — so we turn it off
+    // rather than re-enable a deprecated, exploitable feature.
+    headers.insert("X-XSS-Protection", HeaderValue::from_static("0"));
 
     // Referrer-Policy: Controls how much referrer information is sent
     // 'strict-origin-when-cross-origin' provides good balance
