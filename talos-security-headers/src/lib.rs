@@ -107,9 +107,16 @@ pub async fn add_security_headers(
              camera=(), \
              payment=(), \
              usb=(), \
+             serial=(), \
+             bluetooth=(), \
+             hid=(), \
+             midi=(), \
              magnetometer=(), \
              gyroscope=(), \
-             accelerometer=()",
+             accelerometer=(), \
+             display-capture=(), \
+             browsing-topics=(), \
+             interest-cohort=()",
         ),
     );
 

@@ -39,6 +39,12 @@ data:
         add_header Cross-Origin-Opener-Policy "same-origin" always;
         add_header Cross-Origin-Resource-Policy "same-origin" always;
         add_header X-Frame-Options "DENY" always;
+        # Permissions-Policy: deny invasive hardware/sensor/tracking APIs the
+        # workflow editor never uses. `clipboard-write` is deliberately NOT
+        # denied — the UI's copy buttons (navigator.clipboard.writeText) rely on
+        # it. If XSS ever landed, it still couldn't reach camera/mic/geolocation/
+        # serial/etc. The controller sets its own; the SPA had none until now.
+        add_header Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=(), display-capture=(), browsing-topics=(), interest-cohort=()" always;
 
         gzip on;
         gzip_vary on;
@@ -194,6 +200,7 @@ data:
             add_header Cross-Origin-Opener-Policy "same-origin" always;
             add_header Cross-Origin-Resource-Policy "same-origin" always;
             add_header X-Frame-Options "DENY" always;
+            add_header Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=(), display-capture=(), browsing-topics=(), interest-cohort=()" always;
         }
     }
 {{- end }}
