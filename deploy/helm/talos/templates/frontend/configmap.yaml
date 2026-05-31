@@ -29,6 +29,16 @@ data:
         add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; object-src 'none'; frame-ancestors 'none';" always;
         # HSTS unconditional — browsers ignore over HTTP per RFC 6797 §8.1.
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        # Cross-origin isolation + clickjacking — parity with the controller's
+        # talos-security-headers middleware. COOP same-origin isolates the SPA's
+        # browsing context (XS-Leaks / cross-window); CORP same-origin blocks
+        # other origins from no-cors loading our resources; X-Frame-Options is
+        # the legacy clickjacking belt to CSP's frame-ancestors 'none' braces.
+        # COEP is intentionally omitted — require-corp would break the
+        # cross-origin Google Fonts / `img-src https:` the CSP above permits.
+        add_header Cross-Origin-Opener-Policy "same-origin" always;
+        add_header Cross-Origin-Resource-Policy "same-origin" always;
+        add_header X-Frame-Options "DENY" always;
 
         gzip on;
         gzip_vary on;
@@ -177,6 +187,13 @@ data:
             add_header Referrer-Policy "strict-origin-when-cross-origin" always;
             add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; object-src 'none'; frame-ancestors 'none';" always;
             add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            # Re-stated for the same non-inheritance reason. CORP same-origin is
+            # the meaningful one here — it stops other origins from no-cors
+            # hotlinking/embedding our JS/CSS/image assets; COOP / X-Frame-Options
+            # are document-scoped and harmless-but-uniform on sub-resources.
+            add_header Cross-Origin-Opener-Policy "same-origin" always;
+            add_header Cross-Origin-Resource-Policy "same-origin" always;
+            add_header X-Frame-Options "DENY" always;
         }
     }
 {{- end }}
