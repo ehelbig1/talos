@@ -3399,7 +3399,7 @@ impl AnalyticsRepository {
             "SELECT we.id, we.workflow_id, w.name AS workflow_name, we.started_at, we.status \
              FROM workflow_executions we \
              JOIN workflows w ON w.id = we.workflow_id \
-             WHERE we.user_id = $1 AND we.status IN ('running', 'queued') \
+             WHERE we.user_id = $1 AND we.status IN ('running', 'queued', 'resuming') \
                AND we.started_at < NOW() - INTERVAL '2 hours' \
              ORDER BY we.started_at ASC LIMIT 25",
         )

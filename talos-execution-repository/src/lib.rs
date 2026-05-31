@@ -1492,7 +1492,7 @@ impl ExecutionRepository {
         let result = sqlx::query(
             "UPDATE workflow_executions \
              SET status = 'cancelled', error_message = 'Cancelled by user', completed_at = NOW() \
-             WHERE id = $1 AND user_id = $2 AND status IN ('running', 'queued', 'pending')",
+             WHERE id = $1 AND user_id = $2 AND status IN ('running', 'queued', 'pending', 'resuming')",
         )
         .bind(exec_id)
         .bind(user_id)

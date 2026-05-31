@@ -945,7 +945,7 @@ impl WorkflowRepository {
             "DELETE FROM workflows WHERE id = ANY($1) AND user_id = $2 \
              AND NOT EXISTS ( \
                  SELECT 1 FROM workflow_executions \
-                 WHERE workflow_id = workflows.id AND status IN ('running', 'queued', 'pending') \
+                 WHERE workflow_id = workflows.id AND status IN ('running', 'queued', 'pending', 'resuming') \
              ) \
              RETURNING id",
         )
@@ -962,7 +962,7 @@ impl WorkflowRepository {
             "SELECT id FROM workflows WHERE id = ANY($1) AND user_id = $2 \
              AND EXISTS ( \
                  SELECT 1 FROM workflow_executions \
-                 WHERE workflow_id = workflows.id AND status IN ('running', 'queued', 'pending') \
+                 WHERE workflow_id = workflows.id AND status IN ('running', 'queued', 'pending', 'resuming') \
              )",
         )
         .bind(ids)
@@ -1034,7 +1034,7 @@ impl WorkflowRepository {
     pub async fn count_running_executions(&self, workflow_id: Uuid) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM workflow_executions \
-             WHERE workflow_id = $1 AND status IN ('running', 'queued', 'pending')",
+             WHERE workflow_id = $1 AND status IN ('running', 'queued', 'pending', 'resuming')",
         )
         .bind(workflow_id)
         .fetch_one(&self.db_pool)
@@ -1161,7 +1161,7 @@ impl WorkflowRepository {
         if let Some(limit) = max_concurrent {
             let running: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM workflow_executions \
-                 WHERE workflow_id = $1 AND status IN ('running', 'queued', 'pending')",
+                 WHERE workflow_id = $1 AND status IN ('running', 'queued', 'pending', 'resuming')",
             )
             .bind(workflow_id)
             .fetch_one(&mut *tx)
@@ -1205,7 +1205,7 @@ impl WorkflowRepository {
     ///
     /// Without this gate, a single `enqueue_workflow(inputs=[...])` call
     /// blasted N `'queued'` rows past the cap. Because the cap query
-    /// (`status IN ('running','queued','pending')`) counts queued rows,
+    /// (`status IN ('running','queued','pending','resuming')`) counts queued rows,
     /// every other dispatch path (`trigger_workflow`, `bulk_trigger`)
     /// then refused with `LimitReached` for the duration of the drain
     /// — minutes to tens of minutes for a 10K-input batch. Pre-cap'ing
@@ -1248,7 +1248,7 @@ impl WorkflowRepository {
         let running: i64 = if max_concurrent.is_some() {
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM workflow_executions \
-                 WHERE workflow_id = $1 AND status IN ('running', 'queued', 'pending')",
+                 WHERE workflow_id = $1 AND status IN ('running', 'queued', 'pending', 'resuming')",
             )
             .bind(wf_id)
             .fetch_one(&mut *tx)

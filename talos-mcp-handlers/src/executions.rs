@@ -2670,7 +2670,7 @@ async fn handle_enqueue_workflow(
     // cap-aware admission helper enforces `max_concurrent_executions`
     // — without it, this batch silently bypassed the cap. Because
     // `'queued'` rows are counted by the cap query
-    // (status IN ('running','queued','pending')), an unbounded enqueue
+    // (status IN ('running','queued','pending','resuming')), an unbounded enqueue
     // against a workflow at its limit starved every other dispatch
     // path (`trigger_workflow`, `bulk_trigger_workflow`) for the
     // duration of the drain. The helper's transaction locks the
