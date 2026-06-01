@@ -1,0 +1,24 @@
+[package]
+name = "talos-http-body"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Bounded HTTP response-body reads, shared across every controller-side
+# crate that calls an external endpoint (LLM, embeddings, Google APIs,
+# OAuth token endpoints, OCI registries, Vault). The single source of truth
+# for the OOM-defense established across PRs #76–#81 — replaces the
+# per-crate copies of the same `Response::chunk()` cap loop.
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
+
+[lints]
+workspace = true

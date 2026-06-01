@@ -594,7 +594,7 @@ impl GraphRagService {
             anyhow::bail!("LLM extraction returned HTTP {}", resp.status());
         }
 
-        let response: serde_json::Value = resp.json().await?;
+        let response: serde_json::Value = talos_http_body::read_json_capped(resp).await?;
         let tool_input = response
             .get("content")
             .and_then(|c| c.get(0))
