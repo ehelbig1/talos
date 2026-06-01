@@ -19,6 +19,7 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 subtle = "2"
+talos-http-body = { path = "../talos-http-body" }
 # MCP-1050: canonical truncate_at_char_boundary for embedding input.
 talos-text-util = { path = "../talos-text-util" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread"] }
