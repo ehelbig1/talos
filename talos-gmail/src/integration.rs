@@ -347,7 +347,7 @@ impl GmailIntegrationService {
             // `code_verifier` / `refresh_token`. Pre-fix the bare
             // body_preview rode any echoed credential into the log
             // aggregator. Same DLP boundary as MCP-527 / MCP-528.
-            let body = token_resp.text().await.unwrap_or_default();
+            let body = crate::http_body::read_error_text_capped(token_resp).await;
             let preview =
                 talos_text_util::truncate_at_char_boundary(&body, 500);
             let redacted = talos_dlp_provider::redact_str(preview);

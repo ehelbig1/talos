@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub mod admin;
 pub mod api;
 pub mod dispatch;
+pub(crate) mod http_body;
 pub mod integration;
 pub mod pubsub_jwt;
 pub mod scheduler;

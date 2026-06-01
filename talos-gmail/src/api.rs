@@ -157,13 +157,13 @@ impl GmailWatchApiClient {
             // localised error messages. DLP scrubbing closes the
             // log-aggregator-leak path opened in MCP-527 / MCP-528 in
             // case Google ever echoes back token / email content.
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::http_body::read_error_text_capped(resp).await;
             let preview = talos_text_util::truncate_at_char_boundary(&text, 500);
             let redacted = talos_dlp_provider::redact_str(preview);
             tracing::warn!(%status, body = %redacted, "users.watch returned error");
             bail!("users.watch returned {}", status);
         }
-        resp.json::<WatchResponse>()
+        crate::http_body::read_json_capped::<WatchResponse>(resp)
             .await
             .context("decode users.watch response")
     }
@@ -182,7 +182,7 @@ impl GmailWatchApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             // MCP-529: same fix as users.watch above.
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::http_body::read_error_text_capped(resp).await;
             let preview = talos_text_util::truncate_at_char_boundary(&text, 500);
             let redacted = talos_dlp_provider::redact_str(preview);
             tracing::warn!(%status, body = %redacted, "users.stop returned error");
@@ -224,13 +224,13 @@ impl GmailWatchApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             // MCP-529: same fix as users.watch above.
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::http_body::read_error_text_capped(resp).await;
             let preview = talos_text_util::truncate_at_char_boundary(&text, 500);
             let redacted = talos_dlp_provider::redact_str(preview);
             tracing::warn!(%status, body = %redacted, "history.list returned error");
             bail!("history.list returned {}", status);
         }
-        resp.json::<HistoryListResponse>()
+        crate::http_body::read_json_capped::<HistoryListResponse>(resp)
             .await
             .context("decode history.list response")
     }
