@@ -498,6 +498,36 @@ fn strip_graphql_string_literals(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The CSRF cookie must carry the right flags for the double-submit
+    /// pattern: NOT HttpOnly (the SPA reads it to echo into the X-CSRF-Token
+    /// header), SameSite=Strict (never sent cross-site), Secure in production,
+    /// Path=/. A regression here silently weakens CSRF protection — flipping
+    /// SameSite to Lax (a tempting "fix" for cross-subdomain) or making it
+    /// HttpOnly (which breaks the header echo) — so pin it. Sibling of the
+    /// session-cookie flag test in talos-api.
+    #[test]
+    fn csrf_cookie_carries_double_submit_flags() {
+        let cookie = build_csrf_cookie("deadbeef".to_string());
+        // Readable by JS — the double-submit pattern needs the SPA to echo it.
+        assert_ne!(
+            cookie.http_only(),
+            Some(true),
+            "CSRF cookie must NOT be HttpOnly (the SPA must read it)"
+        );
+        assert_eq!(
+            cookie.same_site(),
+            Some(tower_cookies::cookie::SameSite::Strict),
+            "CSRF cookie must be SameSite=Strict"
+        );
+        assert_eq!(cookie.path(), Some("/"), "CSRF cookie must be Path=/");
+        assert_eq!(
+            cookie.secure(),
+            Some(talos_config::is_production()),
+            "CSRF cookie Secure flag must follow is_production()"
+        );
+        assert_eq!(cookie.name(), CSRF_COOKIE_NAME);
+    }
+
     #[test]
     fn test_generate_csrf_token() {
         let token1 = generate_csrf_token();
