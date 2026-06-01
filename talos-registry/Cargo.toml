@@ -20,6 +20,7 @@ async-trait = "0.1"
 subtle = "2.6"
 talos-capability-world = { path = "../talos-capability-world" }
 talos-config = { path = "../talos-config" }
+talos-http-body = { path = "../talos-http-body" }
 # MCP-1036: bounded_preview for caller-supplied reflection in error messages.
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }

@@ -258,7 +258,7 @@ impl AtlassianIntegrationService {
 
         if !token_resp.status().is_success() {
             let status = token_resp.status();
-            let body = token_resp.text().await.unwrap_or_default();
+            let body = talos_http_body::read_error_text_capped(token_resp).await;
             // SECURITY: Log body length only — error bodies may echo client_secret or refresh_token.
             tracing::error!(
                 status = %status,
@@ -342,7 +342,7 @@ impl AtlassianIntegrationService {
                 .await;
             match myself_resp {
                 Ok(resp) if resp.status().is_success() => {
-                    resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                    talos_http_body::read_json_capped::<serde_json::Value>(resp).await.ok().and_then(|v| {
                         v.get("accountId")
                             .and_then(|a| a.as_str())
                             .map(|s| s.to_string())
@@ -551,7 +551,7 @@ impl AtlassianIntegrationService {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = talos_http_body::read_error_text_capped(resp).await;
             // SECURITY: Log body server-side with length only — error bodies may echo
             // client_secret or refresh_token values.
             tracing::error!(

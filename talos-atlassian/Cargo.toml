@@ -18,6 +18,7 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 # MCP-1021: route FRONTEND_URL through the canonical validated helper
 # (rejects ? and # in addition to /; the inline validator only checked /).
 talos-config = { path = "../talos-config" }
+talos-http-body = { path = "../talos-http-body" }
 talos-oauth = { path = "../talos-oauth" }
 tracing.workspace = true
 urlencoding = "2.1"
