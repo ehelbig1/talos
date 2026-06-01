@@ -61,3 +61,51 @@ pub fn clear_session_cookies(cookies: &Cookies) {
     cookies.remove(Cookie::build(("talos_access_token", "")).path("/").build());
     cookies.remove(Cookie::build(("talos_refresh_token", "")).path("/").build());
 }
+
+#[cfg(test)]
+mod cookie_security_tests {
+    use super::{set_session_cookies, Cookies};
+    use tower_cookies::cookie::SameSite;
+
+    /// CLAUDE.md security rule: auth cookies MUST be HttpOnly + Secure +
+    /// SameSite=Strict. A regression that drops any of these is a real hole
+    /// (HttpOnly off → XSS can read the session token; Secure off in prod →
+    /// MITM over HTTP; SameSite≠Strict → CSRF surface). This pins the setter
+    /// so such a regression fails at PR time instead of shipping silently.
+    #[test]
+    fn session_cookies_carry_the_security_flags() {
+        let cookies = Cookies::default();
+        set_session_cookies(&cookies, "access-tok-value", "refresh-tok-value");
+
+        let list = cookies.list();
+        let access = list
+            .iter()
+            .find(|c| c.name() == "talos_access_token")
+            .expect("access-token cookie must be set");
+        let refresh = list
+            .iter()
+            .find(|c| c.name() == "talos_refresh_token")
+            .expect("refresh-token cookie must be set");
+
+        for (label, c) in [("access", access), ("refresh", refresh)] {
+            assert_eq!(c.http_only(), Some(true), "{label} cookie must be HttpOnly");
+            assert_eq!(
+                c.same_site(),
+                Some(SameSite::Strict),
+                "{label} cookie must be SameSite=Strict"
+            );
+            assert_eq!(c.path(), Some("/"), "{label} cookie must be Path=/");
+            assert!(
+                c.max_age().is_some(),
+                "{label} cookie must have a bounded Max-Age"
+            );
+            // Secure is tied to the production flag (false in dev so localhost
+            // http works); assert the tie rather than a fixed value.
+            assert_eq!(
+                c.secure(),
+                Some(talos_config::is_production()),
+                "{label} cookie Secure flag must follow is_production()"
+            );
+        }
+    }
+}
