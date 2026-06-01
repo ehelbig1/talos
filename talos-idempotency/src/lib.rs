@@ -455,6 +455,45 @@ pub fn valid_idempotency_key(k: &str) -> bool {
     !k.is_empty() && k.len() <= MAX_IDEMPOTENCY_KEY_LEN && k.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// Caller-identifying bytes used to NAMESPACE idempotency keys per caller.
+///
+/// SECURITY: without this, the Redis key is `idempotency:<client-key>` — a
+/// GLOBAL namespace. Two callers choosing the same `Idempotency-Key` with the
+/// same body would collide, so caller B's `begin` would replay caller A's
+/// cached response (a created API key, a secret, …). Folding the caller's
+/// credential into the key (`idempotency:<hash(creds)>.<client-key>`) gives
+/// each caller an independent namespace. Uses whatever auth material the
+/// request carries — `Authorization`, `X-API-Key`, and the `talos_access_token`
+/// session cookie — so the scope is stable across a caller's retries but
+/// differs between callers. Unauthenticated requests share the empty scope, but
+/// their mutations are rejected downstream so nothing sensitive is cached.
+fn caller_scope(headers: &axum::http::HeaderMap) -> Vec<u8> {
+    let mut scope = Vec::new();
+    if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {
+        scope.extend_from_slice(b"a:");
+        scope.extend_from_slice(v.as_bytes());
+        scope.push(0);
+    }
+    if let Some(v) = headers.get("x-api-key") {
+        scope.extend_from_slice(b"k:");
+        scope.extend_from_slice(v.as_bytes());
+        scope.push(0);
+    }
+    if let Some(cookie) = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+    {
+        for part in cookie.split(';') {
+            if let Some(tok) = part.trim().strip_prefix("talos_access_token=") {
+                scope.extend_from_slice(b"s:");
+                scope.extend_from_slice(tok.as_bytes());
+                scope.push(0);
+            }
+        }
+    }
+    scope
+}
+
 /// Opt-in idempotency middleware. Requests WITHOUT an `Idempotency-Key` header
 /// take a zero-touch passthrough — so existing traffic (none sends the header)
 /// is entirely unaffected. With the header:
@@ -495,6 +534,11 @@ pub async fn idempotency_middleware(
         return next.run(request).await;
     };
 
+    // Namespace the key per caller so a key + body chosen by one caller can
+    // never replay another caller's cached response (cross-user cache leak).
+    let scope_hash = IdempotencyService::hash_request(&caller_scope(request.headers()));
+    let scoped_key = format!("{scope_hash}.{key}");
+
     // Buffer the request body to hash it, then rebuild the request unchanged.
     let (parts, body) = request.into_parts();
     let body_bytes = match to_bytes(body, MAX_IDEMPOTENT_REQUEST_BYTES).await {
@@ -505,7 +549,7 @@ pub async fn idempotency_middleware(
     };
     let request_hash = IdempotencyService::hash_request(&body_bytes);
 
-    match service.begin(&key, &request_hash).await {
+    match service.begin(&scoped_key, &request_hash).await {
         Ok(BeginOutcome::Hit(rec)) => {
             let status =
                 StatusCode::from_u16(rec.status_code as u16).unwrap_or(StatusCode::OK);
@@ -550,7 +594,7 @@ pub async fn idempotency_middleware(
                         let body_str = String::from_utf8_lossy(&bytes).into_owned();
                         if let Err(e) = service
                             .complete(
-                                &key,
+                                &scoped_key,
                                 &request_hash,
                                 status.as_u16() as i32,
                                 Some(&body_str),
@@ -560,7 +604,7 @@ pub async fn idempotency_middleware(
                         {
                             tracing::warn!(error = %e, "idempotency complete failed; response not cached");
                         }
-                    } else if let Err(e) = service.release(&key, &request_hash).await {
+                    } else if let Err(e) = service.release(&scoped_key, &request_hash).await {
                         tracing::warn!(error = %e, "idempotency release failed after 5xx");
                     }
                     Response::from_parts(resp_parts, Body::from(bytes))
@@ -568,7 +612,7 @@ pub async fn idempotency_middleware(
                 Err(_) => {
                     // Body exceeded the cache cap and is now consumed; release so
                     // a retry can proceed, and surface a clear error.
-                    let _ = service.release(&key, &request_hash).await;
+                    let _ = service.release(&scoped_key, &request_hash).await;
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Response too large for idempotent handling",
@@ -720,6 +764,60 @@ mod tests {
         serde_json::from_str::<BeginPayload>(json)
             .expect("valid begin payload")
             .into_outcome("k", "h")
+    }
+
+    #[test]
+    fn caller_scope_isolates_distinct_callers() {
+        use axum::http::HeaderMap;
+        let scope = |build: &dyn Fn(&mut HeaderMap)| {
+            let mut h = HeaderMap::new();
+            build(&mut h);
+            super::caller_scope(&h)
+        };
+        let user_a = scope(&|h| {
+            h.insert("authorization", "Bearer token-A".parse().unwrap());
+        });
+        let user_b = scope(&|h| {
+            h.insert("authorization", "Bearer token-B".parse().unwrap());
+        });
+        let api_key = scope(&|h| {
+            h.insert("x-api-key", "key-123".parse().unwrap());
+        });
+        let cookie_a = scope(&|h| {
+            h.insert(
+                "cookie",
+                "csrf=z; talos_access_token=A; foo=bar".parse().unwrap(),
+            );
+        });
+        let cookie_b = scope(&|h| {
+            h.insert(
+                "cookie",
+                "csrf=z; talos_access_token=B; foo=bar".parse().unwrap(),
+            );
+        });
+        let none = scope(&|_| {});
+
+        // Distinct credentials → distinct scopes (no cross-caller cache hit).
+        assert_ne!(user_a, user_b);
+        assert_ne!(user_a, api_key);
+        assert_ne!(cookie_a, cookie_b, "different session token → different scope");
+        // The empty (unauthenticated) scope is distinct from any credentialed one.
+        assert!(none.is_empty());
+        assert_ne!(none, user_a);
+        // Same credential → same scope (a caller's own retry still hits cache).
+        assert_eq!(
+            user_a,
+            scope(&|h| {
+                h.insert("authorization", "Bearer token-A".parse().unwrap());
+            })
+        );
+        // Only the session cookie matters, not unrelated cookies (csrf/foo here).
+        assert_eq!(
+            cookie_a,
+            scope(&|h| {
+                h.insert("cookie", "talos_access_token=A".parse().unwrap());
+            })
+        );
     }
 
     #[test]
