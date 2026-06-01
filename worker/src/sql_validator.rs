@@ -1557,6 +1557,25 @@ mod tests {
     }
 
     #[test]
+    fn pg_notify_blocked_as_function_form_of_notify() {
+        // `pg_notify(channel, payload)` is the FUNCTION equivalent of the
+        // statement-level-blocked `NOTIFY` — the same inter-session side
+        // channel, reached as a plain function call. Must be denied for parity
+        // (sibling of the set_config↔SET gap).
+        let err = validate_sql("SELECT pg_notify('chan', 'secret-exfil')", &[]).unwrap_err();
+        match err {
+            SqlValidationError::DisallowedFunction(name) => assert!(
+                name.contains("pg_notify"),
+                "error must reference pg_notify, got `{name}`"
+            ),
+            other => panic!("expected DisallowedFunction, got {other:?}"),
+        }
+        // pg_catalog-qualified form too.
+        let err = validate_sql("SELECT pg_catalog.pg_notify('chan', 'x')", &[]).unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    #[test]
     fn current_setting_is_not_over_blocked() {
         // Negative control: `current_setting` is READ-only — it mutates
         // nothing, so it is intentionally NOT on the deny-list. Blocking it

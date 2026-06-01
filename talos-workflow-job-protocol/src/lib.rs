@@ -556,6 +556,18 @@ pub const DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
     // forms are both caught by the matcher). `current_setting` (read-only)
     // is intentionally NOT blocked — it mutates nothing.
     "set_config",
+    // ── Inter-session side channel — the FUNCTION form of blocked NOTIFY ─
+    // The statement-level deny-list blocks `LISTEN` / `NOTIFY` / `UNLISTEN`
+    // because they are inter-session side channels (a guest could signal or
+    // exfiltrate to another connection out-of-band). `pg_notify(channel,
+    // payload)` is the FUNCTION equivalent of the `NOTIFY` statement —
+    // `SELECT pg_notify('chan', 'secret')` delivers the same async
+    // notification, slipping past the statement gate as a plain function
+    // call. Same parity gap as set_config↔SET (PR #114). There is no function
+    // form of LISTEN/UNLISTEN to receive, but a one-way emit is still the
+    // side channel the NOTIFY block exists to close. Denied fail-closed; a
+    // WASM data query has no legitimate need to emit NOTIFY traffic.
+    "pg_notify",
 ];
 
 /// True iff `name` (case-insensitive, schema component already stripped)
