@@ -51,6 +51,7 @@ talos-dlp = { path = "../talos-dlp" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-engine = { path = "../talos-engine" }
 talos-execution-repository = { path = "../talos-execution-repository" }
+talos-http-body = { path = "../talos-http-body" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-llm = { path = "../talos-llm" }

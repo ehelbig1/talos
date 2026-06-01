@@ -1551,7 +1551,12 @@ async fn handle_call_a2a_agent(
     };
 
     let status = resp.status().as_u16();
-    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+    // Bounded read, NOT unbounded `resp.json()`: `endpoint_url` is
+    // caller-supplied, so a malicious / misconfigured A2A endpoint returning
+    // a multi-GB body would otherwise OOM the controller (talos-http-body).
+    let body: serde_json::Value = talos_http_body::read_json_capped(resp)
+        .await
+        .unwrap_or(serde_json::json!({}));
 
     if status >= 400 {
         return mcp_text(
