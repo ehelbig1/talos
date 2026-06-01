@@ -2639,6 +2639,38 @@ else
 fi
 echo
 
+# ── 36. RustSec advisory scan (cargo audit) ──────────────────────────
+bold "▶ check 36: cargo audit (RustSec dependency advisories)"
+
+# 2026-06-01: RUSTSEC-2026-0149 (HIGH, CVSS 7.5) — a WASI sandbox-escape in
+# wasmtime-wasi 43 reachable from the worker's read-only preopen — sat in the
+# tree and was caught only by a manual `cargo audit` run (PR #121). The
+# advisory check lives in `make audit` (cargo-deny), but the pre-commit path
+# people actually use is THIS script, which never ran it. Running it here means
+# a newly-introduced vulnerable dep — or a freshly-published advisory against an
+# existing one — surfaces at the gate.
+#
+# ENV-GATED like clippy (check 7): advisory scans hit the network to refresh
+# the RustSec DB and their result changes as advisories are published
+# (independent of code), so an always-on default would make this script
+# non-deterministic and offline-hostile. CI / pre-publish should export
+# `TALOS_LINT_AUDIT=1`; locally, run `make audit` or set the env for parity.
+if [ "${TALOS_LINT_AUDIT:-0}" = "1" ]; then
+    if ! command -v cargo-audit >/dev/null 2>&1; then
+        yellow "⊘ audit check skipped (cargo-audit not installed — \`cargo install cargo-audit\`)"
+    elif cargo audit >/dev/null 2>&1; then
+        green "✓ cargo audit clean (no RustSec advisories)"
+    else
+        red "✗ cargo audit found a vulnerable dependency"
+        yellow "  → run \`cargo audit\` for the advisory + fixed-version range"
+        EXIT_CODE=1
+    fi
+else
+    yellow "⊘ audit check skipped (set TALOS_LINT_AUDIT=1 to enable)"
+    yellow "  CI / pre-publish should run this; \`make audit\` covers it via cargo-deny"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
