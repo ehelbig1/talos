@@ -542,6 +542,20 @@ pub const DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
     "plperlu_call_handler",
     "plpythonu_call_handler",
     "plpython3u_call_handler",
+    // ── Session-state mutation — the FUNCTION form of the blocked SET ────
+    // The statement-level deny-list blocks `SET` / `SET ROLE` /
+    // `SET search_path` because (per its own rationale) they are
+    // "session-level state mutation that can pivot privileges or change
+    // query semantics for the rest of the connection". `set_config(name,
+    // value, is_local)` is the FUNCTION equivalent — `SELECT
+    // set_config('search_path', …, false)` / `set_config('role', …, false)`
+    // / `set_config('statement_timeout', '0', false)` reach the exact state
+    // the SET block prevents, but slip past it as a plain function call in a
+    // SELECT. A WASM data query has no legitimate need to mutate session
+    // config, so deny it fail-closed (the bare AND `pg_catalog.set_config`
+    // forms are both caught by the matcher). `current_setting` (read-only)
+    // is intentionally NOT blocked — it mutates nothing.
+    "set_config",
 ];
 
 /// True iff `name` (case-insensitive, schema component already stripped)
