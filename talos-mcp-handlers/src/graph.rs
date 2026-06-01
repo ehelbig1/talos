@@ -1743,12 +1743,15 @@ async fn handle_update_node_positions(
     // this surface silently dropped typo'd ids and reported a
     // misleading "Updated positions for N nodes" — operator passing
     // 5 ids with 3 typos couldn't tell anything was wrong.
-    let mut matched_node_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut matched_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     if let Some(nodes) = graph.get_mut("nodes").and_then(|n| n.as_array_mut()) {
         for node in nodes.iter_mut() {
-            let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let node_id = node
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if let Some(pos_val) = positions.get(&node_id) {
                 // MCP-244 (2026-05-08): pre-fix `pos_val.get("x").and_then(|v|
                 // v.as_f64())` returned None for both ABSENT and WRONG-TYPE
@@ -2206,7 +2209,11 @@ async fn handle_add_loop_node(
     // (test_condition) family.
     let condition = match args.get("condition").and_then(|v| v.as_str()) {
         Some(c) if c.trim().is_empty() => {
-            return mcp_error(req_id, -32602, "Missing or empty (whitespace-only) 'condition' parameter")
+            return mcp_error(
+                req_id,
+                -32602,
+                "Missing or empty (whitespace-only) 'condition' parameter",
+            )
         }
         Some(c) if c.len() > 2000 => {
             return mcp_error(req_id, -32602, "condition must be ≤2000 characters")
@@ -2417,17 +2424,11 @@ async fn handle_add_sub_workflow_node(
     // unwrap_or silently substituted 30 for negative / fractional /
     // wrong-type. Switched to validate_range_u64 [1, 600] (per-node
     // timeout matches workflow-level test_workflow ceiling).
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        30,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 30, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let data = serde_json::json!({
         "sub_workflow_id": sub_workflow_id.to_string(),
         "timeout_secs": timeout_secs,
@@ -2875,15 +2876,11 @@ async fn handle_duplicate_workflow(
             // MCP-246 (2026-05-08): pre-fix `copy_schema: "true"` (string)
             // silently became false; caller's intent to copy the source
             // schema dropped with no signal. Use validate_optional_bool.
-            let copy_schema = match crate::utils::validate_optional_bool(
-                args,
-                "copy_schema",
-                false,
-                &req_id,
-            ) {
-                Ok(b) => b,
-                Err(resp) => return resp,
-            };
+            let copy_schema =
+                match crate::utils::validate_optional_bool(args, "copy_schema", false, &req_id) {
+                    Ok(b) => b,
+                    Err(resp) => return resp,
+                };
             // MCP-738 (2026-05-13): reflect the ACTUAL outcome of
             // copy_input_schema instead of echoing the request flag.
             // Pre-fix `let _ = ...await;` silently swallowed copy
@@ -2955,7 +2952,11 @@ async fn handle_add_skip_condition(
     // logic. MCP-208 family.
     let skip_condition = match args.get("skip_condition").and_then(|v| v.as_str()) {
         Some(c) if c.trim().is_empty() => {
-            return mcp_error(req_id, -32602, "Missing or empty (whitespace-only) 'skip_condition'")
+            return mcp_error(
+                req_id,
+                -32602,
+                "Missing or empty (whitespace-only) 'skip_condition'",
+            )
         }
         Some(c) if c.len() > 2000 => {
             return mcp_error(req_id, -32602, "skip_condition must be ≤2000 characters")
@@ -3122,17 +3123,11 @@ async fn handle_add_capability_dispatch_node(
     // MCP-234: timeout_secs same family as MCP-227 — pre-fix
     // as_u64-then-unwrap_or silently substituted 30 for negative,
     // fractional, or wrong-type. Use validate_range_u64.
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        300,
-        30,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 300, 30, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     // MCP-386 (2026-05-11): strict-parse so a typo'd or wrong-type
     // `fallback_workflow_id` doesn't silently drop the fallback. Pre-fix
     // `optional_uuid` returned None for both ABSENT and INVALID — the
@@ -3141,14 +3136,11 @@ async fn handle_add_capability_dispatch_node(
     // capability match was found (when the operator clearly wanted
     // the fallback to catch that case). Same MCP-309 family applied
     // to a dispatch-routing surface.
-    let fallback_wf_id: Option<uuid::Uuid> = match crate::utils::parse_optional_uuid_strict(
-        args,
-        "fallback_workflow_id",
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let fallback_wf_id: Option<uuid::Uuid> =
+        match crate::utils::parse_optional_uuid_strict(args, "fallback_workflow_id", &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
     // Fallback ownership check — security gate. Without this, a user
     // could point capability_dispatch at another user's workflow UUID
@@ -3269,17 +3261,11 @@ async fn handle_add_dispatch_node(
     // unwrap_or silently substituted 30 for negative / fractional /
     // wrong-type. Switched to validate_range_u64 [1, 600] (per-node
     // timeout matches workflow-level test_workflow ceiling).
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        30,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 30, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let data = serde_json::json!({
         "dispatch_expression": dispatch_expression,
         "timeout_secs": timeout_secs,
@@ -3420,20 +3406,21 @@ async fn handle_add_error_handler(
     // node's display label — UI / list_workflows would render a
     // blank-looking handler with no recoverable identifier. Empty-
     // after-trim falls through to the documented "Error Handler" default.
-    let handler_label_owned: Option<String> = match args.get("handler_label").and_then(|v| v.as_str()) {
-        Some(l) if l.len() > 200 => {
-            return mcp_error(req_id, -32602, "handler_label must be ≤ 200 characters")
-        }
-        Some(l) => {
-            let trimmed = l.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
+    let handler_label_owned: Option<String> =
+        match args.get("handler_label").and_then(|v| v.as_str()) {
+            Some(l) if l.len() > 200 => {
+                return mcp_error(req_id, -32602, "handler_label must be ≤ 200 characters")
             }
-        }
-        None => None,
-    };
+            Some(l) => {
+                let trimmed = l.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            None => None,
+        };
     let handler_label: &str = handler_label_owned.as_deref().unwrap_or("Error Handler");
 
     // MCP-349 (2026-05-11): pre-fix `filter_map(|v| v.as_str()...)` on the
@@ -3873,36 +3860,35 @@ async fn handle_preview_capability_dispatch(
     // operator, so the operator visually sees the narrowed list — but
     // they can also miss it when scanning long results. Better to reject
     // loudly at the input boundary. Same MCP-285/313/335 family.
-    let required_caps: Vec<String> =
-        match crate::utils::json_string_array_field_strict(
-            args,
-            "required_capabilities",
-            &req_id,
-        ) {
-            Ok(Some(arr)) if !arr.is_empty() => {
-                let cleaned: Vec<String> = arr
-                    .into_iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if cleaned.is_empty() {
-                    return mcp_error(
+    let required_caps: Vec<String> = match crate::utils::json_string_array_field_strict(
+        args,
+        "required_capabilities",
+        &req_id,
+    ) {
+        Ok(Some(arr)) if !arr.is_empty() => {
+            let cleaned: Vec<String> = arr
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if cleaned.is_empty() {
+                return mcp_error(
                         req_id,
                         -32602,
                         "required_capabilities must contain at least one non-empty, non-whitespace string",
                     );
-                }
-                cleaned
             }
-            Err(resp) => return resp,
-            _ => {
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    "Missing or empty 'required_capabilities' array",
-                )
-            }
-        };
+            cleaned
+        }
+        Err(resp) => return resp,
+        _ => {
+            return mcp_error(
+                req_id,
+                -32602,
+                "Missing or empty 'required_capabilities' array",
+            )
+        }
+    };
 
     // Match the engine's exact SQL (parallel.rs:2715-2718 and 4519-4522):
     // No status filter — the runtime dispatches to any workflow regardless of status.
@@ -3950,7 +3936,11 @@ async fn handle_add_verify_node(
     // MCP-235 (2026-05-08): trim verify-node condition. MCP-208 family.
     let condition = match args.get("condition").and_then(|v| v.as_str()) {
         Some(c) if c.trim().is_empty() => {
-            return mcp_error(req_id, -32602, "condition must not be empty or whitespace-only")
+            return mcp_error(
+                req_id,
+                -32602,
+                "condition must not be empty or whitespace-only",
+            )
         }
         Some(c) if c.len() > 2000 => {
             return mcp_error(req_id, -32602, "condition must be 2000 characters or fewer")
@@ -4142,17 +4132,11 @@ async fn handle_add_agent_loop_node(
             Err(resp) => return resp,
         };
     // MCP-237 (2026-05-08): MCP-227 family — fix silent default.
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        60,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 60, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let data = serde_json::json!({
         "body_workflow_id": body_workflow_id.to_string(),
         "max_iterations": max_iterations,
@@ -4231,17 +4215,11 @@ async fn handle_add_react_loop_node(
             Err(resp) => return resp,
         };
     // MCP-237 (2026-05-08): MCP-227 family — fix silent default.
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        60,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 60, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let data = serde_json::json!({
         "body_workflow_id": body_workflow_id.to_string(),
         "max_iterations": max_iterations,
@@ -4355,7 +4333,11 @@ async fn handle_add_judge_node(
     // language criteria — guaranteed nonsense judgments at runtime.
     let rubric = match args.get("rubric").and_then(|v| v.as_str()) {
         Some(r) if r.trim().is_empty() => {
-            return mcp_error(req_id, -32602, "rubric must not be empty or whitespace-only")
+            return mcp_error(
+                req_id,
+                -32602,
+                "rubric must not be empty or whitespace-only",
+            )
         }
         Some(r) if r.len() > 2000 => {
             return mcp_error(req_id, -32602, "rubric must be 2000 characters or fewer")
@@ -4416,17 +4398,11 @@ async fn handle_add_judge_node(
         },
     };
     // MCP-237 (2026-05-08): MCP-227 family — fix silent default.
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        60,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 60, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let mut data = serde_json::json!({
         "judge_workflow_id": judge_workflow_id.to_string(),
         "rubric": rubric,
@@ -4471,7 +4447,11 @@ async fn handle_add_inline_judge_node(
     // MCP-235 (2026-05-08): trim verdict_expr. MCP-208 family.
     let verdict_expr = match args.get("verdict_expr").and_then(|v| v.as_str()) {
         Some(e) if e.trim().is_empty() => {
-            return mcp_error(req_id, -32602, "verdict_expr must not be empty or whitespace-only")
+            return mcp_error(
+                req_id,
+                -32602,
+                "verdict_expr must not be empty or whitespace-only",
+            )
         }
         Some(e) if e.len() > 2000 => {
             return mcp_error(
@@ -4647,17 +4627,11 @@ async fn handle_add_ensemble_node(
         None
     };
     // MCP-237 (2026-05-08): MCP-227 family — fix silent default.
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        60,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 60, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let mut data = serde_json::json!({
         "child_workflow_id": child_workflow_id.to_string(),
         "count": count,
@@ -4821,22 +4795,17 @@ async fn handle_add_reflective_retry_node(
     }
     // MCP-238 (2026-05-08): same inline-match shape as count above.
     // Negative / fractional / wrong-type silently became 2.
-    let max_retries = match crate::utils::validate_range_u64(args, "max_retries", 1, 5, 2, &req_id) {
+    let max_retries = match crate::utils::validate_range_u64(args, "max_retries", 1, 5, 2, &req_id)
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     // MCP-237 (2026-05-08): MCP-227 family — fix silent default.
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        60,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 60, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let data = serde_json::json!({
         "child_workflow_id": child_workflow_id.to_string(),
         "reflection_workflow_id": reflection_workflow_id.to_string(),
@@ -4990,17 +4959,11 @@ async fn handle_add_llm_dispatch_node(
         None => None,
     };
     // MCP-237 (2026-05-08): MCP-227 family — fix silent default.
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        60,
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 60, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     let route_count = routes_map.len();
     let mut data = serde_json::json!({
         "classifier_workflow_id": classifier_workflow_id.to_string(),

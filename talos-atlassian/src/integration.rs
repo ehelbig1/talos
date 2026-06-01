@@ -90,9 +90,15 @@ impl AtlassianIntegrationService {
         Ok(Self {
             db_pool,
             // MCP-710 (2026-05-13): empty-env class — see GmailIntegrationService.
-            client_id: std::env::var("ATLASSIAN_CLIENT_ID").ok().filter(|v| !v.is_empty()),
-            client_secret: std::env::var("ATLASSIAN_CLIENT_SECRET").ok().filter(|v| !v.is_empty()),
-            redirect_uri: std::env::var("ATLASSIAN_REDIRECT_URI").ok().filter(|v| !v.is_empty()),
+            client_id: std::env::var("ATLASSIAN_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            client_secret: std::env::var("ATLASSIAN_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            redirect_uri: std::env::var("ATLASSIAN_REDIRECT_URI")
+                .ok()
+                .filter(|v| !v.is_empty()),
             credentials_service: None,
         })
     }
@@ -342,11 +348,14 @@ impl AtlassianIntegrationService {
                 .await;
             match myself_resp {
                 Ok(resp) if resp.status().is_success() => {
-                    talos_http_body::read_json_capped::<serde_json::Value>(resp).await.ok().and_then(|v| {
-                        v.get("accountId")
-                            .and_then(|a| a.as_str())
-                            .map(|s| s.to_string())
-                    })
+                    talos_http_body::read_json_capped::<serde_json::Value>(resp)
+                        .await
+                        .ok()
+                        .and_then(|v| {
+                            v.get("accountId")
+                                .and_then(|a| a.as_str())
+                                .map(|s| s.to_string())
+                        })
                 }
                 Ok(resp) => {
                     tracing::warn!(status = %resp.status(), "Could not fetch Jira /myself — account_id unavailable");
@@ -593,7 +602,10 @@ impl AtlassianIntegrationService {
         let scope_for_store = if let Some(s) = token_resp.scope.as_deref() {
             s.to_string()
         } else {
-            match creds.get_credential_scope(user_id, "atlassian", cloud_id).await {
+            match creds
+                .get_credential_scope(user_id, "atlassian", cloud_id)
+                .await
+            {
                 Ok(Some(existing)) => existing,
                 Ok(None) | Err(_) => {
                     // No DB row or read failure — fall back to the full

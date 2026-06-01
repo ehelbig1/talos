@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use redis::AsyncCommands;
 use sqlx::{Pool, Postgres};
@@ -577,8 +577,7 @@ impl TotpService {
         // totp_secret onto attacker's row (silent 2FA bypass pre-fix).
         // The encrypt helper returns the wire-format string and the
         // AAD version constant (1); both must be persisted together.
-        let (encrypted_secret, format_version) =
-            self.encrypt_totp_secret(secret, user_id).await?;
+        let (encrypted_secret, format_version) = self.encrypt_totp_secret(secret, user_id).await?;
 
         // Atomic enable — `WHERE totp_enabled IS NOT TRUE` rejects the
         // overwrite if 2FA is already on. `rows_affected() == 0` means

@@ -140,7 +140,11 @@ impl TenantReadScope {
     /// injectable text.
     #[must_use]
     pub fn set_local_sql(&self) -> String {
-        format!("{}; {}", self.set_local_user_sql(), self.set_local_orgs_sql())
+        format!(
+            "{}; {}",
+            self.set_local_user_sql(),
+            self.set_local_orgs_sql()
+        )
     }
 }
 

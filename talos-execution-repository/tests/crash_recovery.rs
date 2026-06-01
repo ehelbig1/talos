@@ -24,11 +24,17 @@ use uuid::Uuid;
 static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn db_url() -> Option<String> {
-    std::env::var("TALOS_TEST_DATABASE_URL").ok().filter(|u| !u.is_empty())
+    std::env::var("TALOS_TEST_DATABASE_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
 }
 
 async fn connect(url: &str) -> Pool<Postgres> {
-    PgPoolOptions::new().max_connections(8).connect(url).await.expect("connect")
+    PgPoolOptions::new()
+        .max_connections(8)
+        .connect(url)
+        .await
+        .expect("connect")
 }
 
 async fn seed_running_exec(pool: &Pool<Postgres>, age_minutes: i64) -> (Uuid, Uuid, Uuid) {
@@ -87,9 +93,18 @@ async fn status_of(pool: &Pool<Postgres>, id: Uuid) -> String {
 }
 
 async fn cleanup(pool: &Pool<Postgres>, user_id: Uuid, wf_id: Uuid) {
-    let _ = sqlx::query("DELETE FROM workflow_executions WHERE workflow_id = $1").bind(wf_id).execute(pool).await;
-    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf_id).execute(pool).await;
-    let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(pool).await;
+    let _ = sqlx::query("DELETE FROM workflow_executions WHERE workflow_id = $1")
+        .bind(wf_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1")
+        .bind(wf_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await;
 }
 
 /// The safety-critical property: N concurrent claimers, one stale row →
@@ -114,13 +129,26 @@ async fn claim_is_exactly_once_under_concurrency() {
     for h in handles {
         if let Some(row) = h.await.unwrap() {
             won += 1;
-            assert_eq!(row.id, exec_id, "the only claimable row must be the seeded one");
+            assert_eq!(
+                row.id, exec_id,
+                "the only claimable row must be the seeded one"
+            );
             assert_eq!(row.workflow_id, wf_id);
-            assert!(row.graph_json.is_some(), "graph_json must come through the correlated subquery");
+            assert!(
+                row.graph_json.is_some(),
+                "graph_json must come through the correlated subquery"
+            );
         }
     }
-    assert_eq!(won, 1, "exactly one concurrent claimer must win the single stale row");
-    assert_eq!(status_of(&pool, exec_id).await, "resuming", "claimed row must be in resuming");
+    assert_eq!(
+        won, 1,
+        "exactly one concurrent claimer must win the single stale row"
+    );
+    assert_eq!(
+        status_of(&pool, exec_id).await,
+        "resuming",
+        "claimed row must be in resuming"
+    );
 
     // A second claim no longer finds it (no longer 'running').
     let repo = ExecutionRepository::new(pool.clone());
@@ -150,8 +178,16 @@ async fn claim_respects_stale_threshold_and_refuses_nonpositive() {
     assert_eq!(status_of(&pool, fresh_id).await, "running");
 
     // Non-positive threshold is refused (would claim everything).
-    assert!(repo.claim_stuck_execution_for_resume(0).await.unwrap().is_none());
-    assert!(repo.claim_stuck_execution_for_resume(-5).await.unwrap().is_none());
+    assert!(repo
+        .claim_stuck_execution_for_resume(0)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repo
+        .claim_stuck_execution_for_resume(-5)
+        .await
+        .unwrap()
+        .is_none());
 
     cleanup(&pool, user_id, wf_id).await;
 }
@@ -174,7 +210,10 @@ async fn fail_and_reclaim_are_status_guarded() {
     // Claim → resuming, then fail_resuming → failed.
     let claimed = repo.claim_stuck_execution_for_resume(5).await.unwrap();
     assert_eq!(claimed.unwrap().id, exec_id);
-    assert!(repo.fail_resuming_execution(exec_id, "dispatch failed").await.unwrap());
+    assert!(repo
+        .fail_resuming_execution(exec_id, "dispatch failed")
+        .await
+        .unwrap());
     assert_eq!(status_of(&pool, exec_id).await, "failed");
 
     // reclaim_orphaned_resuming: a stale 'resuming' row → failed. Seed it
@@ -182,7 +221,11 @@ async fn fail_and_reclaim_are_status_guarded() {
     // updated_at a checkpoint heartbeat in production) would otherwise reset
     // updated_at to NOW() on an UPDATE, hiding the staleness.
     let (orphan, wf2, user2) = seed_running_exec(&pool, 60).await;
-    sqlx::query("DELETE FROM workflow_executions WHERE id = $1").bind(orphan).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM workflow_executions WHERE id = $1")
+        .bind(orphan)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO workflow_executions (id,workflow_id,user_id,status,started_at,updated_at) \
          VALUES ($1,$2,$3,'resuming', NOW()-make_interval(mins=>60), NOW()-make_interval(mins=>30))",

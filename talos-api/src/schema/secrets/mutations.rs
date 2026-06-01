@@ -116,7 +116,8 @@ impl SecretsMutations {
                 // MCP-918: .extend_safe()
                 return Err(async_graphql::Error::new(
                     "You are not a writable member of the requested org_id",
-                ).extend_safe());
+                )
+                .extend_safe());
             }
             Some(target_org)
         } else {
@@ -129,7 +130,7 @@ impl SecretsMutations {
                 &input.key_path,
                 &input.value,
                 description.as_deref(), // MCP-833: validated + trimmed
-                *user_id, // Set creator to current user
+                *user_id,               // Set creator to current user
                 input.allowed_modules.unwrap_or_default(),
                 org_id,
             )
@@ -268,8 +269,7 @@ impl SecretsMutations {
                 );
                 // MCP-964: lowercase 'n' in "not found" + lowercase
                 // 'p' in "permission" miss the case-sensitive whitelist.
-                async_graphql::Error::new("Secret not found or permission denied")
-                    .extend_safe()
+                async_graphql::Error::new("Secret not found or permission denied").extend_safe()
             })?;
         Ok(true)
     }

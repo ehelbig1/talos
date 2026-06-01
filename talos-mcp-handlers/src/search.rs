@@ -315,7 +315,10 @@ async fn handle_search_workflows(
             });
             if let Some(t) = tag_filter {
                 if let Some(map) = envelope.as_object_mut() {
-                    map.insert("tag_filter".to_string(), serde_json::Value::String(t.to_string()));
+                    map.insert(
+                        "tag_filter".to_string(),
+                        serde_json::Value::String(t.to_string()),
+                    );
                 }
             }
             mcp_text(
@@ -440,8 +443,7 @@ async fn handle_bulk_tag_workflows(
             // `[X, X]` returned `tagged_count: 1, not_found_count: 1`
             // — the warning falsely accused the second entry of being
             // a missing/unauthorized workflow.
-            let mut seen: std::collections::HashSet<uuid::Uuid> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
             for item in arr {
                 match item.as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
                     Some(id) => {
@@ -695,11 +697,7 @@ async fn handle_search_workflows_semantic(
         Some(q) => {
             let trimmed = q.trim();
             if trimmed.is_empty() {
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    "Query must be non-empty and non-whitespace",
-                );
+                return mcp_error(req_id, -32602, "Query must be non-empty and non-whitespace");
             }
             trimmed.to_string()
         }
@@ -756,16 +754,20 @@ async fn handle_search_workflows_semantic(
         .and_then(|v| v.parse::<f64>().ok())
         .map(|f| f.clamp(0.0, 1.0));
     let default_min_score = env_default.unwrap_or(DEFAULT_MIN_SCORE_FALLBACK);
-    let min_score =
-        match crate::utils::validate_range_f64(args, "min_score", 0.0, 1.0, default_min_score, &req_id) {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let min_score = match crate::utils::validate_range_f64(
+        args,
+        "min_score",
+        0.0,
+        1.0,
+        default_min_score,
+        &req_id,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     // MCP-308 (2026-05-11): strict-parse via parse_embedding_array — see
     // `handle_set_workflow_embedding` above for the rationale.
-    let caller_embedding: Option<Vec<f64>> = match args
-        .get("embedding")
-        .and_then(|v| v.as_array())
+    let caller_embedding: Option<Vec<f64>> = match args.get("embedding").and_then(|v| v.as_array())
     {
         Some(arr) => match crate::utils::parse_embedding_array(arr) {
             Ok(parsed) => Some(parsed),
@@ -785,8 +787,7 @@ async fn handle_search_workflows_semantic(
     // a clean "operator misconfiguration" substitution. Same
     // `=0` footgun class as MCP-638/643/661/663/664/665/703/758 —
     // helper substitutes the default + emits a structured WARN.
-    let expected_dims =
-        talos_config::positive_env_or_default::<usize>("EMBEDDING_DIMENSIONS", 768);
+    let expected_dims = talos_config::positive_env_or_default::<usize>("EMBEDDING_DIMENSIONS", 768);
 
     let outcome = match state
         .search_service
@@ -830,9 +831,7 @@ async fn handle_search_workflows_semantic(
         // the mutable borrow of `results`), then re-borrow `map` to
         // insert the count field — borrow checker doesn't allow holding
         // both mutable references simultaneously.
-        let count = if let Some(serde_json::Value::Array(results)) =
-            map.get_mut("results")
-        {
+        let count = if let Some(serde_json::Value::Array(results)) = map.get_mut("results") {
             for entry in results.iter_mut() {
                 if let Some(obj) = entry.as_object_mut() {
                     if let Some(id_val) = obj.get("id").cloned() {
@@ -856,10 +855,7 @@ async fn handle_search_workflows_semantic(
             None
         };
         if let Some(c) = count {
-            map.insert(
-                "count".to_string(),
-                serde_json::Value::Number(c.into()),
-            );
+            map.insert("count".to_string(), serde_json::Value::Number(c.into()));
         }
     }
     mcp_text(

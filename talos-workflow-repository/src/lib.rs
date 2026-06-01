@@ -21,7 +21,10 @@ use uuid::Uuid;
 /// secret grants. Surfacing the sqlx error lets operators tell apart
 /// schema drift from a legitimately empty grant. Mirrors the helper
 /// in `talos-registry`.
-fn decode_allowed_secrets_row(row: &sqlx::postgres::PgRow, context_id: Option<Uuid>) -> Vec<String> {
+fn decode_allowed_secrets_row(
+    row: &sqlx::postgres::PgRow,
+    context_id: Option<Uuid>,
+) -> Vec<String> {
     match row.try_get::<Vec<String>, _>("allowed_secrets") {
         Ok(v) => v,
         Err(e) => {
@@ -187,7 +190,10 @@ mod initial_execution_status_tests {
 
     #[test]
     fn default_is_running() {
-        assert_eq!(InitialExecutionStatus::default(), InitialExecutionStatus::Running);
+        assert_eq!(
+            InitialExecutionStatus::default(),
+            InitialExecutionStatus::Running
+        );
     }
 
     #[test]
@@ -378,7 +384,6 @@ impl WorkflowRepository {
 }
 
 impl WorkflowRepository {
-
     // ── Listing & retrieval ────────────────────────────────────────────────
 
     /// List workflows for a user, optionally filtered by tag. Returns up to 50.
@@ -1554,12 +1559,12 @@ impl WorkflowRepository {
         let redacted_error = talos_dlp_provider::redact_str(truncated_error);
         // MCP-1204: bound the optional output before both branches.
         let bounded_output = output.map(bound_execution_payload);
-        let output: Option<&serde_json::Value> =
-            bounded_output.as_ref().map(|c| c.as_ref());
+        let output: Option<&serde_json::Value> = bounded_output.as_ref().map(|c| c.as_ref());
         // Optional encryption: only encrypt if SM is wired AND we have output.
         let encrypted = match (self.secrets_manager.as_ref(), output) {
             (Some(_), Some(out)) => {
-                self.maybe_encrypt_execution_output(execution_id, out).await?
+                self.maybe_encrypt_execution_output(execution_id, out)
+                    .await?
             }
             _ => None,
         };
@@ -1596,8 +1601,7 @@ impl WorkflowRepository {
             // defence-in-depth as mark_execution_completed above. The
             // Option<&Value> is mapped through `redact_json` to preserve
             // None semantics (clears the column).
-            let redacted_output =
-                output.map(talos_dlp_provider::redact_json);
+            let redacted_output = output.map(talos_dlp_provider::redact_json);
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'failed', error_message = $1, output_data = $2, \
@@ -1673,11 +1677,11 @@ impl WorkflowRepository {
         // MCP-1204: bound the optional output before both branches —
         // sibling to mark_execution_failed above.
         let bounded_output = output.map(bound_execution_payload);
-        let output: Option<&serde_json::Value> =
-            bounded_output.as_ref().map(|c| c.as_ref());
+        let output: Option<&serde_json::Value> = bounded_output.as_ref().map(|c| c.as_ref());
         let encrypted = match (self.secrets_manager.as_ref(), output) {
             (Some(_), Some(out)) => {
-                self.maybe_encrypt_execution_output(execution_id, out).await?
+                self.maybe_encrypt_execution_output(execution_id, out)
+                    .await?
             }
             _ => None,
         };
@@ -1914,13 +1918,8 @@ impl WorkflowRepository {
         &self,
         actor_id: Uuid,
     ) -> Result<Vec<(String, serde_json::Value, String)>> {
-        talos_memory::recall_recent_by_types(
-            &self.db_pool,
-            actor_id,
-            &["working", "episodic"],
-            10,
-        )
-        .await
+        talos_memory::recall_recent_by_types(&self.db_pool, actor_id, &["working", "episodic"], 10)
+            .await
     }
 
     /// Fetch relevant actor memories + graph context for injection.
@@ -2077,13 +2076,11 @@ impl WorkflowRepository {
                 .replace('\\', "\\\\")
                 .replace('%', "\\%")
                 .replace('_', "\\_");
-            sqlx::query(
-                "DELETE FROM workflows WHERE user_id = $1 AND name LIKE $2 ESCAPE '\\'",
-            )
-            .bind(user_id)
-            .bind(format!("{}%", escaped))
-            .execute(&self.db_pool)
-            .await?
+            sqlx::query("DELETE FROM workflows WHERE user_id = $1 AND name LIKE $2 ESCAPE '\\'")
+                .bind(user_id)
+                .bind(format!("{}%", escaped))
+                .execute(&self.db_pool)
+                .await?
         } else {
             sqlx::query("DELETE FROM workflows WHERE user_id = $1")
                 .bind(user_id)
@@ -4025,8 +4022,7 @@ impl WorkflowRepository {
                         .decrypt_versioned(kid, &bytes, exec_id.as_bytes(), format_version)
                         .await
                     {
-                        Ok(s) => serde_json::from_str(&s)
-                            .unwrap_or_else(|_| serde_json::json!({})),
+                        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
                         Err(e) => {
                             tracing::warn!(
                                 err = ?e,

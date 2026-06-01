@@ -78,7 +78,9 @@ impl WorkflowsQueries {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(rows
             .into_iter()
@@ -187,7 +189,9 @@ impl WorkflowsQueries {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(rows
             .into_iter()
@@ -349,7 +353,9 @@ impl WorkflowsQueries {
         .bind(&scope.accessible_org_ids)
         .fetch_all(&mut *tx)
         .await?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(workflows
             .into_iter()
@@ -558,7 +564,9 @@ impl WorkflowsQueries {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(version.map(|v| v.into()))
     }
@@ -651,7 +659,9 @@ impl WorkflowsQueries {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(row.map(|s| WorkflowScheduleObj {
             id: s.id,
@@ -1006,8 +1016,7 @@ impl WorkflowsQueries {
     async fn pending_approvals(
         &self,
         ctx: &Context<'_>,
-        #[graphql(desc = "Max rows to return (default 20, max 100)")]
-        limit: Option<i32>,
+        #[graphql(desc = "Max rows to return (default 20, max 100)")] limit: Option<i32>,
     ) -> Result<Vec<ExecutionApproval>> {
         // MCP-757 (2026-05-13): the sole query in this file missing
         // `require_scope(WorkflowsRead)`. Every sibling query (14 of them

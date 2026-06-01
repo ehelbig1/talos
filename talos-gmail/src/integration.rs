@@ -113,9 +113,15 @@ impl GmailIntegrationService {
             // rejects with a confusing "Missing required parameter"
             // and operators chase the wrong root cause. Same
             // empty-env class as MCP-590/591/592/653/etc.
-            client_id: std::env::var("GMAIL_CLIENT_ID").ok().filter(|v| !v.is_empty()),
-            client_secret: std::env::var("GMAIL_CLIENT_SECRET").ok().filter(|v| !v.is_empty()),
-            redirect_uri: std::env::var("GMAIL_REDIRECT_URI").ok().filter(|v| !v.is_empty()),
+            client_id: std::env::var("GMAIL_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            client_secret: std::env::var("GMAIL_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            redirect_uri: std::env::var("GMAIL_REDIRECT_URI")
+                .ok()
+                .filter(|v| !v.is_empty()),
             secrets_manager: None,
             credentials_service: None,
         })
@@ -348,8 +354,7 @@ impl GmailIntegrationService {
             // body_preview rode any echoed credential into the log
             // aggregator. Same DLP boundary as MCP-527 / MCP-528.
             let body = talos_http_body::read_error_text_capped(token_resp).await;
-            let preview =
-                talos_text_util::truncate_at_char_boundary(&body, 500);
+            let preview = talos_text_util::truncate_at_char_boundary(&body, 500);
             let redacted = talos_dlp_provider::redact_str(preview);
             tracing::error!(
                 status = %status,

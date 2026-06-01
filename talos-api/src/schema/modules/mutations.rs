@@ -78,7 +78,8 @@ impl ModulesMutations {
                         error = %e,
                         "create_module_from_template: get_template_for_user failed"
                     );
-                    async_graphql::Error::new("Template not found or access denied").extend_safe()
+                    async_graphql::Error::new("Template not found or access denied")
+                        .extend_safe()
                         .extend_safe()
                 })?;
             (*user_id, template)
@@ -90,11 +91,7 @@ impl ModulesMutations {
         // `\0` rejection). Module name is rendered in the dashboard +
         // logs; pre-fix `name: "   "` persisted as whitespace and `\0`
         // embedded names crashed downstream UPDATEs (MCP-431).
-        let trimmed_name = crate::schema::validate_display_name(
-            "Module name",
-            &input.name,
-            200,
-        )?;
+        let trimmed_name = crate::schema::validate_display_name("Module name", &input.name, 200)?;
         let module_name = trimmed_name.to_string();
         if input.config.len() > 100_000 {
             // MCP-916: extend_safe so production scrubber doesn't replace
@@ -145,7 +142,8 @@ impl ModulesMutations {
                 return Err(async_graphql::Error::new(format!(
                     "Secret not found: {}. Please create it first.",
                     missing
-                )).extend_safe());
+                ))
+                .extend_safe());
             }
         }
 
@@ -224,14 +222,16 @@ impl ModulesMutations {
                 // MCP-918: chain .extend_safe() after .extend_with so
                 // operators see the compiler errors instead of "Internal
                 // server error" — same UX class as test_module size cap.
-                return Err(async_graphql::Error::new("Compilation failed").extend_safe()
+                return Err(async_graphql::Error::new("Compilation failed")
+                    .extend_safe()
                     .extend_with(|_, e| e.set("errors", error_messages))
                     .extend_safe());
             }
 
             (
                 result.wasm_bytes.ok_or_else(|| {
-                    async_graphql::Error::new("Missing wasm bytes in compilation result").extend_safe()
+                    async_graphql::Error::new("Missing wasm bytes in compilation result")
+                        .extend_safe()
                 })?,
                 template.code_template.clone(),
                 result.size_bytes,

@@ -81,7 +81,9 @@ fn bearer_from_headers(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Returns Ok(()) if the request is authorized, Err(response) otherwise.
-fn check_publish_authorized(headers: &HeaderMap) -> Result<(), (StatusCode, Json<PublishTemplateResp>)> {
+fn check_publish_authorized(
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<PublishTemplateResp>)> {
     // MCP-590 (2026-05-12): treat empty-string env as "no token
     // configured". Pre-fix `REGISTRY_PUBLISH_TOKEN=""` produced
     // `configured = Some("")`, which then matched any request with
@@ -126,7 +128,9 @@ fn check_publish_authorized(headers: &HeaderMap) -> Result<(), (StatusCode, Json
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(PublishTemplateResp {
                     success: false,
-                    message: "Catalog publish endpoint disabled — set REGISTRY_PUBLISH_TOKEN to enable".to_string(),
+                    message:
+                        "Catalog publish endpoint disabled — set REGISTRY_PUBLISH_TOKEN to enable"
+                            .to_string(),
                 }),
             ))
         }

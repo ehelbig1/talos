@@ -83,13 +83,11 @@ static MASK_PATTERNS: std::sync::LazyLock<[(regex::Regex, &'static str); 3]> =
     std::sync::LazyLock::new(|| {
         [
             (
-                regex::Regex::new(r#"(?i)(bearer\s+)[^\s,;)\]"']+"#)
-                    .expect("valid bearer regex"),
+                regex::Regex::new(r#"(?i)(bearer\s+)[^\s,;)\]"']+"#).expect("valid bearer regex"),
                 "${1}***",
             ),
             (
-                regex::Regex::new(r"(?i)(api[_-]?key\s*=\s*)[^\s&]+")
-                    .expect("valid api-key regex"),
+                regex::Regex::new(r"(?i)(api[_-]?key\s*=\s*)[^\s&]+").expect("valid api-key regex"),
                 "${1}***",
             ),
             (
@@ -265,21 +263,14 @@ mod tests {
                 "msg=\"auth failed Bearer abc.def\", err=timeout",
                 "msg=\"auth failed Bearer ***\", err=timeout",
             ),
-            (
-                "context: (Bearer xyz_abc.def_xyz)",
-                "context: (Bearer ***)",
-            ),
+            ("context: (Bearer xyz_abc.def_xyz)", "context: (Bearer ***)"),
             (
                 "trace=[Bearer t1.t2.t3] continued",
                 "trace=[Bearer ***] continued",
             ),
         ] {
             let out = mask_secrets(input);
-            assert_eq!(
-                out, want,
-                "delimiter boundary failed for input {:?}",
-                input
-            );
+            assert_eq!(out, want, "delimiter boundary failed for input {:?}", input);
         }
     }
 }

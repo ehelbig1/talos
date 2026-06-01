@@ -95,9 +95,15 @@ impl SlackIntegrationService {
         Ok(Self {
             db_pool,
             // MCP-710 (2026-05-13): empty-env class — see GmailIntegrationService.
-            client_id: std::env::var("SLACK_CLIENT_ID").ok().filter(|v| !v.is_empty()),
-            client_secret: std::env::var("SLACK_CLIENT_SECRET").ok().filter(|v| !v.is_empty()),
-            redirect_uri: std::env::var("SLACK_REDIRECT_URI").ok().filter(|v| !v.is_empty()),
+            client_id: std::env::var("SLACK_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            client_secret: std::env::var("SLACK_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            redirect_uri: std::env::var("SLACK_REDIRECT_URI")
+                .ok()
+                .filter(|v| !v.is_empty()),
             secrets_manager: None,
             credentials_service: None,
         })

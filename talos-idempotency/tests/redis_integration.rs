@@ -61,7 +61,13 @@ async fn proceed_then_inflight_then_complete_then_hit() {
     ));
     // The winner records the response …
     assert!(svc
-        .complete(&key, hash, 201, Some("{\"ok\":true}"), Some("application/json"))
+        .complete(
+            &key,
+            hash,
+            201,
+            Some("{\"ok\":true}"),
+            Some("application/json")
+        )
         .await
         .unwrap());
     // … and now begin replays the cached response.
@@ -168,6 +174,13 @@ async fn concurrent_begin_yields_exactly_one_proceed() {
             other => panic!("unexpected outcome under contention: {other:?}"),
         }
     }
-    assert_eq!(proceed, 1, "exactly one concurrent caller must win the reservation");
-    assert_eq!(inflight, n - 1, "all other concurrent callers must be InFlight");
+    assert_eq!(
+        proceed, 1,
+        "exactly one concurrent caller must win the reservation"
+    );
+    assert_eq!(
+        inflight,
+        n - 1,
+        "all other concurrent callers must be InFlight"
+    );
 }

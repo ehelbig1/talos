@@ -228,11 +228,9 @@ mod tests {
     #[test]
     fn validate_structure_accepts_canonical_select() {
         assert!(validate_structure("SELECT 1", &[]).is_ok());
-        assert!(validate_structure(
-            "SELECT * FROM widgets WHERE id = $1",
-            &["abc".to_string()]
-        )
-        .is_ok());
+        assert!(
+            validate_structure("SELECT * FROM widgets WHERE id = $1", &["abc".to_string()]).is_ok()
+        );
     }
 
     #[test]

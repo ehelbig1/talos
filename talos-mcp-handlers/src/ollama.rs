@@ -82,9 +82,7 @@ pub async fn dispatch(
     match tool_name {
         "ollama_list_models" => Some(handle_list_models(req_id, state).await),
         "ollama_pull_model" => Some(handle_pull_model(req_id, args, state, user_id).await),
-        "ollama_delete_model" => {
-            Some(handle_delete_model(req_id, args, state, user_id).await)
-        }
+        "ollama_delete_model" => Some(handle_delete_model(req_id, args, state, user_id).await),
         "ollama_show_model" => Some(handle_show_model(req_id, args, state).await),
         "local_llm_complete" => Some(handle_local_complete(req_id, args, state).await),
         _ => None,
@@ -183,11 +181,7 @@ async fn handle_pull_model(
             // (e.g. `http://talos-ollama.talos.svc.cluster.local:11434/...`)
             // from caller-visible errors. Log the full error server-side.
             tracing::error!(model = %name, "ollama pull_model failed: {:#}", e);
-            mcp_error(
-                req_id,
-                -32000,
-                &format!("Failed to pull model '{}'", name),
-            )
+            mcp_error(req_id, -32000, &format!("Failed to pull model '{}'", name))
         }
     }
 }
@@ -208,7 +202,13 @@ fn validate_ollama_model_name(
             return Err(mcp_error(req_id, -32602, "name must be ≤ 200 characters"))
         }
         Some(n) => n,
-        None => return Err(mcp_error(req_id, -32602, "name is required (max 200 chars)")),
+        None => {
+            return Err(mcp_error(
+                req_id,
+                -32602,
+                "name is required (max 200 chars)",
+            ))
+        }
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -338,12 +338,11 @@ async fn handle_local_complete(
     // operator gets responses that don't match the model they
     // believe they're testing. Same MCP-346 family applied to an
     // inference-target surface.
-    let model = match crate::utils::validate_optional_string(
-        args, "model", "mistral", None, &req_id,
-    ) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let model =
+        match crate::utils::validate_optional_string(args, "model", "mistral", None, &req_id) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
     let system_prompt = args
         .get("system_prompt")
         .and_then(|v| v.as_str())

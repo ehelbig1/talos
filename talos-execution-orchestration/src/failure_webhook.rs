@@ -58,7 +58,9 @@ static FAILURE_WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .connect_timeout(Duration::from_secs(2))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("talos-execution-orchestration: failed to build failure-webhook HTTP client (TLS init)")
+        .expect(
+            "talos-execution-orchestration: failed to build failure-webhook HTTP client (TLS init)",
+        )
 });
 
 pub(crate) async fn dispatch_failure_webhook(

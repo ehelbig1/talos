@@ -106,28 +106,28 @@ pub async fn trigger_continuation_workflow(
     // DB issues will see a clear "denied by DB error" warn instead
     // of silently elevated privilege.
     let actor_repo = Arc::new(ActorRepository::new(db_pool.clone()));
-    let workflow_repo_for_auth =
-        Arc::new(WorkflowRepository::new(db_pool.clone()));
-    let workflow_row: Option<(Option<Uuid>, String)> = match sqlx::query_as::<_, (Option<Uuid>, String)>(
-        "SELECT actor_id, graph_json FROM workflows WHERE id = $1 AND user_id = $2",
-    )
-    .bind(workflow_id)
-    .bind(user_id)
-    .fetch_optional(db_pool)
-    .await
-    {
-        Ok(row) => row,
-        Err(e) => {
-            tracing::warn!(
-                target: "talos_continuation_trigger",
-                event_kind = "continuation_workflow_lookup_failed",
-                workflow_id = %workflow_id,
-                error = %e,
-                "MCP-708: workflow lookup for auth gate failed — failing closed"
-            );
-            return None;
-        }
-    };
+    let workflow_repo_for_auth = Arc::new(WorkflowRepository::new(db_pool.clone()));
+    let workflow_row: Option<(Option<Uuid>, String)> =
+        match sqlx::query_as::<_, (Option<Uuid>, String)>(
+            "SELECT actor_id, graph_json FROM workflows WHERE id = $1 AND user_id = $2",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .fetch_optional(db_pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_continuation_trigger",
+                    event_kind = "continuation_workflow_lookup_failed",
+                    workflow_id = %workflow_id,
+                    error = %e,
+                    "MCP-708: workflow lookup for auth gate failed — failing closed"
+                );
+                return None;
+            }
+        };
     let (workflow_actor_id, graph_json) = match workflow_row {
         Some(row) => row,
         None => {

@@ -135,10 +135,7 @@ mod tests {
     fn three_levels_deep_merge() {
         let mut base = json!({"l1": {"l2": {"l3": 1, "kept": true}}});
         deep_merge(&mut base, &json!({"l1": {"l2": {"l3": 99}}}));
-        assert_eq!(
-            base,
-            json!({"l1": {"l2": {"l3": 99, "kept": true}}})
-        );
+        assert_eq!(base, json!({"l1": {"l2": {"l3": 99, "kept": true}}}));
     }
 
     // MCP-560: tripwire — confirm deep_merge bails at MAX_MERGE_DEPTH

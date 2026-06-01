@@ -28,9 +28,8 @@ impl OrganizationsMutations {
         // Name routed through the canonical `validate_display_name` helper
         // (introduced in MCP-832 — same focused subset that the inline
         // shape used here originally).
-        let trimmed_name =
-            crate::schema::validate_display_name("Organization name", &name, 255)
-                .map_err(|e| e.extend_safe())?;
+        let trimmed_name = crate::schema::validate_display_name("Organization name", &name, 255)
+            .map_err(|e| e.extend_safe())?;
         let name = trimmed_name.to_string();
 
         // Slug gate previously said "1–100 characters" but the

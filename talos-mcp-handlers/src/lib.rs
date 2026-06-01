@@ -269,8 +269,7 @@ pub struct McpState {
     /// remap, dry-run preview, batched DB lookups) lives in
     /// `talos-workflow-manifest`. Cross-protocol-ready: the same Arc
     /// can back a future GraphQL mutation without duplicating logic.
-    pub workflow_manifest_service:
-        std::sync::Arc<talos_workflow_manifest::WorkflowManifestService>,
+    pub workflow_manifest_service: std::sync::Arc<talos_workflow_manifest::WorkflowManifestService>,
     /// Replay service — backs `replay_module_regression` (both module
     /// and workflow modes). Owns the load-with-template-fallback,
     /// secret prefetch, and per-row execute-and-diff kernel that was
@@ -284,8 +283,7 @@ pub struct McpState {
     /// that were ~330 LoC of inline-handler logic. Cross-protocol-ready:
     /// typed input + outcome, `InlineCompileError` with stable
     /// `jsonrpc_code()` mapping.
-    pub inline_compile_service:
-        std::sync::Arc<talos_inline_compile_service::InlineCompileService>,
+    pub inline_compile_service: std::sync::Arc<talos_inline_compile_service::InlineCompileService>,
     /// Search service — backs `search_workflows_semantic`. Owns the
     /// fallback chain (caller embedding → auto-generate → vector →
     /// trigram → ILIKE) plus the embedding pipeline (config, rate-
@@ -317,13 +315,9 @@ pub fn create_router(
     execution_orchestration_service: std::sync::Arc<
         talos_execution_orchestration::ExecutionOrchestrationService,
     >,
-    workflow_manifest_service: std::sync::Arc<
-        talos_workflow_manifest::WorkflowManifestService,
-    >,
+    workflow_manifest_service: std::sync::Arc<talos_workflow_manifest::WorkflowManifestService>,
     replay_service: std::sync::Arc<talos_replay_service::ReplayService>,
-    inline_compile_service: std::sync::Arc<
-        talos_inline_compile_service::InlineCompileService,
-    >,
+    inline_compile_service: std::sync::Arc<talos_inline_compile_service::InlineCompileService>,
     search_service: std::sync::Arc<talos_search_service::SearchService>,
 ) -> Router {
     // Initialize Ollama client for Tier 1 (local) LLM inference.
@@ -998,8 +992,9 @@ async fn handle_tools_list(
                 result: None,
                 error: Some(JsonRpcError {
                     code: -32000,
-                    message: "Database error: failed to list catalog templates (see controller logs)"
-                        .to_string(),
+                    message:
+                        "Database error: failed to list catalog templates (see controller logs)"
+                            .to_string(),
                     data: None,
                 }),
             };

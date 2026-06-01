@@ -194,7 +194,10 @@ mod tests {
     #[test]
     fn key_path_constructor_pins_namespace() {
         match SecretIdentifier::key_path("anthropic/api_key", "default") {
-            SecretIdentifier::KeyPath { key_path, namespace } => {
+            SecretIdentifier::KeyPath {
+                key_path,
+                namespace,
+            } => {
                 assert_eq!(key_path, "anthropic/api_key");
                 assert_eq!(namespace, "default");
             }

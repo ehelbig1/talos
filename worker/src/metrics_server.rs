@@ -540,7 +540,10 @@ mod tests {
         std::env::set_var("METRICS_AUTH_TOKENS", ",");
         let prev_result = validate_bearer_token(Some("Bearer "));
         std::env::remove_var("METRICS_AUTH_TOKENS");
-        assert!(!prev_result, "comma-only METRICS_AUTH_TOKENS must not accept empty bearer");
+        assert!(
+            !prev_result,
+            "comma-only METRICS_AUTH_TOKENS must not accept empty bearer"
+        );
     }
 
     #[test]

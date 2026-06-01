@@ -161,7 +161,12 @@ async fn resume_one(deps: RecoveryDeps, row: StuckExecutionForResume) {
     // The workflow was deleted between the original run and this restart — we
     // have no graph to resume against. Fail terminally.
     let Some(graph_json) = row.graph_json else {
-        fail(&deps, exec_id, "crash-recovery: workflow was deleted before resume").await;
+        fail(
+            &deps,
+            exec_id,
+            "crash-recovery: workflow was deleted before resume",
+        )
+        .await;
         tracing::warn!(execution_id = %exec_id, "crash-recovery: workflow deleted — marked failed");
         return;
     };
@@ -202,7 +207,9 @@ async fn resume_one(deps: RecoveryDeps, row: StuckExecutionForResume) {
     // scratch (at-least-once; the workflow's idempotency design owns dedupe).
     let initial_results = load_checkpoint_for_resume(
         &deps.db_pool,
-        deps.worker_shared_key.as_ref().map(WorkerSharedKey::as_bytes),
+        deps.worker_shared_key
+            .as_ref()
+            .map(WorkerSharedKey::as_bytes),
         Some(deps.secrets_manager.clone()),
         exec_id,
     )

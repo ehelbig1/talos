@@ -47,8 +47,7 @@ use uuid::Uuid;
 /// visible to a future reader who refactors the upstream errors —
 /// a search for `MEMORY_WRITE_*_MARKERS` will surface every
 /// downstream classifier that depends on the wording.
-const MEMORY_WRITE_CRYPTO_MARKERS: &[&str] =
-    &["decrypt_dek", "encrypt_value", "aead::Error"];
+const MEMORY_WRITE_CRYPTO_MARKERS: &[&str] = &["decrypt_dek", "encrypt_value", "aead::Error"];
 const MEMORY_WRITE_DB_MARKERS: &[&str] = &["database", "pool", "sqlx"];
 
 /// Classify a stringified `__memory_write__` failure for metric
@@ -166,10 +165,7 @@ impl ControllerNodeHook {
         // mirroring MCP-388). Failure here is best-effort like every
         // other __memory_write__ failure: log + metric, don't stall
         // the execution.
-        let key_raw = mw
-            .get("key")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("");
+        let key_raw = mw.get("key").and_then(JsonValue::as_str).unwrap_or("");
         let key = match talos_memory::validate_memory_key(key_raw) {
             Ok(trimmed) => trimmed.to_string(),
             Err(reason) => {

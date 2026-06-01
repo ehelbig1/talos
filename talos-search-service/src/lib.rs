@@ -522,8 +522,10 @@ mod tests {
             match_method: MatchMethod::Trigram,
         };
         let s = serde_json::to_value(row).unwrap();
-        assert!(s.get("min_score_applied").is_none(),
-            "MCP-5: per-row min_score_applied removed; envelope-level only");
+        assert!(
+            s.get("min_score_applied").is_none(),
+            "MCP-5: per-row min_score_applied removed; envelope-level only"
+        );
         assert!(s.get("description").is_none());
     }
 
@@ -539,8 +541,10 @@ mod tests {
             match_method: MatchMethod::Vector,
         };
         let s = serde_json::to_value(row).unwrap();
-        assert!(s.get("min_score_applied").is_none(),
-            "MCP-5: per-row min_score_applied removed across all match_methods");
+        assert!(
+            s.get("min_score_applied").is_none(),
+            "MCP-5: per-row min_score_applied removed across all match_methods"
+        );
         assert_eq!(s["match_method"], serde_json::json!("vector"));
     }
 
@@ -573,7 +577,11 @@ mod tests {
         // `"🙂"` (4 bytes) passed the gate; post-fix it's correctly
         // rejected as a single codepoint.
         let words = extract_query_ilike_words("🙂");
-        assert!(words.is_empty(), "single emoji must be filtered, got {:?}", words);
+        assert!(
+            words.is_empty(),
+            "single emoji must be filtered, got {:?}",
+            words
+        );
     }
 
     #[test]

@@ -188,7 +188,8 @@ impl HotUpdateService {
         // we can't reason about, double-check workflows manually."
         let mut downgrade_warnings: Vec<String> = Vec::new();
         if let (Ok(old_w), Ok(new_w)) = (
-            ctx.capability_world.parse::<talos_capability_world::CapabilityWorld>(),
+            ctx.capability_world
+                .parse::<talos_capability_world::CapabilityWorld>(),
             effective_world.parse::<talos_capability_world::CapabilityWorld>(),
         ) {
             if let Some(msg) =
@@ -255,11 +256,8 @@ impl HotUpdateService {
             };
             for (workflow_id, workflow_name, actor_opt) in &bindings {
                 let Some(actor_id) = actor_opt else { continue };
-                let actor_max = talos_actor_repository::get_actor_max_world(
-                    &self.db_pool,
-                    *actor_id,
-                )
-                .await;
+                let actor_max =
+                    talos_actor_repository::get_actor_max_world(&self.db_pool, *actor_id).await;
                 let Some(actor_max) = actor_max else {
                     // Actor row missing — fail closed. A binding that
                     // points at a non-existent actor is already
@@ -299,9 +297,7 @@ impl HotUpdateService {
             // helper handles DLP redaction + truncation; we never
             // block the hot-update on the audit write.
             if effective_world != ctx.capability_world {
-                let kind = if new_rank
-                    > talos_capability_world::world_rank(&ctx.capability_world)
-                {
+                let kind = if new_rank > talos_capability_world::world_rank(&ctx.capability_world) {
                     "upgrade"
                 } else {
                     "change"

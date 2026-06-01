@@ -251,20 +251,11 @@ fn engine_config_fingerprint_hash() -> &'static [u8; 32] {
 /// per-cap caches. The engine-config fingerprint hash is THIRD so a
 /// config knob change (fuel cost, pool size, opt level, …) invalidates
 /// cached blobs without requiring an `AOT_VERSION_HDR` bump.
-fn aot_hmac_input(
-    cap: &crate::wit_inspector::CapabilityWorld,
-    serialized: &[u8],
-) -> Vec<u8> {
+fn aot_hmac_input(cap: &crate::wit_inspector::CapabilityWorld, serialized: &[u8]) -> Vec<u8> {
     let cap_tag = cap.as_str().as_bytes();
     let config_fp = engine_config_fingerprint_hash();
     let mut buf = Vec::with_capacity(
-        AOT_VERSION_HDR.len()
-            + 1
-            + cap_tag.len()
-            + 1
-            + config_fp.len()
-            + 1
-            + serialized.len(),
+        AOT_VERSION_HDR.len() + 1 + cap_tag.len() + 1 + config_fp.len() + 1 + serialized.len(),
     );
     buf.extend_from_slice(AOT_VERSION_HDR);
     buf.push(0xff);
@@ -412,8 +403,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited.
         // See test doc for the update procedure.
-        const EXPECTED: &str =
-            "637f69bd756f8c07ee378f4870fbada7809c23080685da82d290536aff02f924";
+        const EXPECTED: &str = "637f69bd756f8c07ee378f4870fbada7809c23080685da82d290536aff02f924";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,
@@ -4148,9 +4138,7 @@ mod tests {
         // `sk-…`) — what matters is that the secret value is gone AND
         // a redaction marker took its place.
         let secret = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let raw = format!(
-            "thread '<unnamed>' panicked at '{secret} leaked', src/lib.rs:7:5\n"
-        );
+        let raw = format!("thread '<unnamed>' panicked at '{secret} leaked', src/lib.rs:7:5\n");
         let redacted = talos_dlp_provider::redact_str(&raw);
         assert!(
             !redacted.contains(secret),
@@ -4342,8 +4330,16 @@ mod tests {
         // Same module + identical input, but two different workflows
         // (each owned by exactly one tenant) → DIFFERENT cache keys, so a
         // non-pure module's cached output can't leak across tenants.
-        let ctx_a = ("wf-A".to_string(), "exec-1".to_string(), "mod-1".to_string());
-        let ctx_b = ("wf-B".to_string(), "exec-2".to_string(), "mod-1".to_string());
+        let ctx_a = (
+            "wf-A".to_string(),
+            "exec-1".to_string(),
+            "mod-1".to_string(),
+        );
+        let ctx_b = (
+            "wf-B".to_string(),
+            "exec-2".to_string(),
+            "mod-1".to_string(),
+        );
         let key_a = TalosRuntime::result_cache_key("modhash", &input, Some(&ctx_a));
         let key_b = TalosRuntime::result_cache_key("modhash", &input, Some(&ctx_b));
         assert_ne!(
@@ -4353,7 +4349,11 @@ mod tests {
 
         // execution_id is intentionally excluded → caching across runs of
         // the SAME workflow is the whole point.
-        let ctx_a2 = ("wf-A".to_string(), "exec-999".to_string(), "mod-1".to_string());
+        let ctx_a2 = (
+            "wf-A".to_string(),
+            "exec-999".to_string(),
+            "mod-1".to_string(),
+        );
         let key_a2 = TalosRuntime::result_cache_key("modhash", &input, Some(&ctx_a2));
         assert_eq!(
             key_a, key_a2,

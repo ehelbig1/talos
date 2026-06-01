@@ -162,9 +162,7 @@ impl Job {
         // belt-and-suspenders against future tweaks to the constants.
         let exponent = self.retry_count.min(6);
         let backoff_factor = 2_u32.saturating_pow(exponent);
-        let backoff = base_delay
-            .checked_mul(backoff_factor)
-            .unwrap_or(max_delay);
+        let backoff = base_delay.checked_mul(backoff_factor).unwrap_or(max_delay);
         let delay = std::cmp::min(backoff, max_delay);
 
         // MCP-508: real ±10% jitter to prevent thundering herd. The
@@ -238,9 +236,7 @@ pub trait JobHandler: Send + Sync {
 fn worker_id() -> String {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
-        let host = std::env::var("HOSTNAME")
-            .ok()
-            .filter(|v| !v.is_empty());
+        let host = std::env::var("HOSTNAME").ok().filter(|v| !v.is_empty());
         let pid = std::process::id();
         match host {
             Some(h) => format!("{}:{}", h, pid),

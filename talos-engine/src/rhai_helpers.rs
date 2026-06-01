@@ -533,10 +533,7 @@ mod html_entity_decode_tests {
             "preview/policy path must agree with edge evaluator on __error",
         );
         assert_eq!(
-            evaluate_condition_with_error(
-                r#"error_message.contains("timeout")"#,
-                &ctx,
-            ),
+            evaluate_condition_with_error(r#"error_message.contains("timeout")"#, &ctx,),
             Ok(true),
         );
     }
@@ -547,10 +544,7 @@ mod html_entity_decode_tests {
         // Must NOT trip is_error.
         let ctx = json!({ "error": null });
         assert!(!evaluate_condition("is_error", &ctx));
-        assert_eq!(
-            evaluate_condition_with_error("is_error", &ctx),
-            Ok(false),
-        );
+        assert_eq!(evaluate_condition_with_error("is_error", &ctx), Ok(false),);
     }
 
     #[test]
@@ -581,10 +575,7 @@ mod html_entity_decode_tests {
         // still trigger is_error in both evaluators.
         let ctx = json!({ "error": { "code": 500, "msg": "fail" } });
         assert!(evaluate_condition("is_error", &ctx));
-        assert_eq!(
-            evaluate_condition_with_error("is_error", &ctx),
-            Ok(true),
-        );
+        assert_eq!(evaluate_condition_with_error("is_error", &ctx), Ok(true),);
     }
 }
 
@@ -639,9 +630,9 @@ mod looks_like_error_string_tests {
         let mut s = prefix;
         s.push('€'); // 3 bytes: starts at 4094, ends at 4097 — boundary 4095 + 4096 are inside the char
         s.push_str(" error after"); // ASCII tail
-        // Walk-back from 4096 to 4094 lands on the start of '€' — &s[..4094]
-        // doesn't contain "error", so we expect false (no match).
-        // The point of this test is that we DON'T panic.
+                                    // Walk-back from 4096 to 4094 lands on the start of '€' — &s[..4094]
+                                    // doesn't contain "error", so we expect false (no match).
+                                    // The point of this test is that we DON'T panic.
         let _ = looks_like_error_string(&s);
     }
 

@@ -645,7 +645,12 @@ mod ceiling_tests {
         // The exact bypass class the 2026-05-28 review found: a ceiling
         // intended to DENY vault access must reject a secrets module even
         // though world_rank(secrets)=3 < world_rank(cache)=5.
-        for ceiling in ["cache-node", "messaging-node", "filesystem-node", "governance-node"] {
+        for ceiling in [
+            "cache-node",
+            "messaging-node",
+            "filesystem-node",
+            "governance-node",
+        ] {
             assert!(
                 !ceiling_permits(ceiling, "secrets-node"),
                 "{ceiling} must NOT permit a secrets-node module (Secrets ⊄ {ceiling})"
@@ -662,7 +667,12 @@ mod ceiling_tests {
         assert!(!ceiling_permits("database-node", "agent-node"));
         assert!(!ceiling_permits("agent-node", "database-node"));
         // agent does NOT include cache/messaging/filesystem/database.
-        for requested in ["cache-node", "messaging-node", "filesystem-node", "database-node"] {
+        for requested in [
+            "cache-node",
+            "messaging-node",
+            "filesystem-node",
+            "database-node",
+        ] {
             assert!(!ceiling_permits("agent-node", requested));
         }
     }

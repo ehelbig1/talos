@@ -12,10 +12,7 @@ use anyhow::{anyhow, Result};
 /// Sibling rule to `read_env_or_file` in talos-config (MCP-597) and
 /// the controller-side `seed_templates` filter (MCP-598).
 pub(crate) fn env_var_is_set_nonempty(var: &str) -> bool {
-    std::env::var(var)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some()
+    std::env::var(var).ok().filter(|v| !v.is_empty()).is_some()
 }
 
 /// Returns true iff the secret resolves via EITHER `<VAR>` (direct env)
@@ -507,9 +504,7 @@ mod tests {
 
     #[test]
     fn database_url_accepts_short_postgres_scheme() {
-        assert!(db_url_scheme_accepted(
-            "postgres://user:pw@host:5432/db"
-        ));
+        assert!(db_url_scheme_accepted("postgres://user:pw@host:5432/db"));
     }
 
     #[test]

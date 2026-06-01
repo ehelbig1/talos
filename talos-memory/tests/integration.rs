@@ -107,7 +107,8 @@ mod test_crypto {
                     .map_err(|_| {
                         anyhow::anyhow!("test decrypt failed (AAD mismatch or tampered ciphertext)")
                     })?;
-                let s = String::from_utf8(pt).map_err(|_| anyhow::anyhow!("decrypted bytes not UTF-8"))?;
+                let s = String::from_utf8(pt)
+                    .map_err(|_| anyhow::anyhow!("decrypted bytes not UTF-8"))?;
                 Ok(zeroize::Zeroizing::new(s))
             })
         }
@@ -287,7 +288,10 @@ async fn aad_binding_blocks_cross_row_ciphertext_swap() {
         .await
         .expect("recall A pre-swap")
         .expect("row A present");
-    assert_eq!(pre.value.get("secret").and_then(|v| v.as_str()), Some("value-A"));
+    assert_eq!(
+        pre.value.get("secret").and_then(|v| v.as_str()),
+        Some("value-A")
+    );
 
     // Attacker overwrites row A's ciphertext columns with row B's. Both rows
     // were encrypted under the same test key (same value_key_id), so a naive
@@ -307,7 +311,11 @@ async fn aad_binding_blocks_cross_row_ciphertext_swap() {
     .execute(&pool)
     .await
     .expect("swap ciphertext");
-    assert_eq!(swapped.rows_affected(), 1, "swap should touch exactly row A");
+    assert_eq!(
+        swapped.rows_affected(),
+        1,
+        "swap should touch exactly row A"
+    );
 
     // Reading the tampered row A must FAIL AES-GCM tag verification (its AAD is
     // derived from key_a, but the ciphertext was sealed under key_b's AAD) —

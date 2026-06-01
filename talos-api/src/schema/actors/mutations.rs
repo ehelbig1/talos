@@ -47,12 +47,13 @@ impl ActorsMutations {
         if trimmed_name.is_empty() {
             return Err(async_graphql::Error::new(
                 "Agent name must be 1-100 characters (non-whitespace)",
-            ).extend_safe());
+            )
+            .extend_safe());
         }
         if trimmed_name.len() > 100 {
-            return Err(async_graphql::Error::new(
-                "Agent name must be 1-100 characters",
-            ).extend_safe());
+            return Err(
+                async_graphql::Error::new("Agent name must be 1-100 characters").extend_safe(),
+            );
         }
         talos_validation::reject_control_chars(
             "Agent name",
@@ -213,12 +214,8 @@ impl ActorsMutations {
         // adds the control-char rejection that was missing and trims
         // the bound value so the persisted name matches what readers
         // see (MCP-231 parity for actors).
-        let trimmed_name = crate::schema::validate_display_name(
-            "Actor name",
-            &input.name,
-            100,
-        )
-        .map_err(|e| e.extend_safe())?;
+        let trimmed_name = crate::schema::validate_display_name("Actor name", &input.name, 100)
+            .map_err(|e| e.extend_safe())?;
         let name = trimmed_name.to_string();
         // MCP-748: mirror MCP `handle_create_actor` content discipline
         // (cap 5000, trim, reject whitespace-only / control chars / `\0`).
@@ -363,7 +360,8 @@ impl ActorsMutations {
 
         if status != "active" && status != "suspended" {
             return Err(
-                async_graphql::Error::new("Invalid status. Use 'active' or 'suspended'").extend_safe()
+                async_graphql::Error::new("Invalid status. Use 'active' or 'suspended'")
+                    .extend_safe()
                     .extend_safe(),
             );
         }
@@ -1028,8 +1026,7 @@ impl ActorsMutations {
         // source-actor-ownership probe from the actual call could let a
         // ciphertext-passthrough cross-user clone slip through; the DEK
         // lineage is per-user and the wrapper fails closed on mismatch.
-        let actor_repo_for_clone =
-            talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let actor_repo_for_clone = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let memories_copied: i64 = match actor_repo_for_clone
             .clone_actor_memories(user_id, new_id, id)
             .await

@@ -475,7 +475,11 @@ impl ModuleExecutionService {
         // subsequent reads of input_data_enc / trigger_metadata_enc on
         // the SAME row. Preserve the prior format unless we're
         // actually writing new ciphertext.
-        let format_arg: Option<i16> = if encrypting { Some(payload_format) } else { None };
+        let format_arg: Option<i16> = if encrypting {
+            Some(payload_format)
+        } else {
+            None
+        };
         let result = sqlx::query(
             r#"
             UPDATE module_executions
@@ -762,13 +766,34 @@ impl ModuleExecutionService {
         let payload_format: i16 = r.try_get("payload_format").unwrap_or(0);
         use talos_module_payload_encryption::PayloadSlot;
         let trigger_metadata = self
-            .read_payload(execution_id, PayloadSlot::Trigger, pt_trigger, enc_trigger, key_id, payload_format)
+            .read_payload(
+                execution_id,
+                PayloadSlot::Trigger,
+                pt_trigger,
+                enc_trigger,
+                key_id,
+                payload_format,
+            )
             .await?;
         let input_data = self
-            .read_payload(execution_id, PayloadSlot::Input, pt_input, enc_input, key_id, payload_format)
+            .read_payload(
+                execution_id,
+                PayloadSlot::Input,
+                pt_input,
+                enc_input,
+                key_id,
+                payload_format,
+            )
             .await?;
         let output_data = self
-            .read_payload(execution_id, PayloadSlot::Output, pt_output, enc_output, key_id, payload_format)
+            .read_payload(
+                execution_id,
+                PayloadSlot::Output,
+                pt_output,
+                enc_output,
+                key_id,
+                payload_format,
+            )
             .await?;
         Ok(Some(ModuleExecution {
             id: r.get("id"),
@@ -834,21 +859,41 @@ impl ModuleExecutionService {
             let pt_trigger: Option<JsonValue> = r.try_get("trigger_metadata").ok().flatten();
             let pt_input: Option<JsonValue> = r.try_get("input_data").ok().flatten();
             let pt_output: Option<JsonValue> = r.try_get("output_data").ok().flatten();
-            let enc_trigger: Option<Vec<u8>> =
-                r.try_get("trigger_metadata_enc").ok().flatten();
+            let enc_trigger: Option<Vec<u8>> = r.try_get("trigger_metadata_enc").ok().flatten();
             let enc_input: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
             let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
             let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
             let payload_format: i16 = r.try_get("payload_format").unwrap_or(0);
             use talos_module_payload_encryption::PayloadSlot;
             let trigger_metadata = self
-                .read_payload(exec_id, PayloadSlot::Trigger, pt_trigger, enc_trigger, key_id, payload_format)
+                .read_payload(
+                    exec_id,
+                    PayloadSlot::Trigger,
+                    pt_trigger,
+                    enc_trigger,
+                    key_id,
+                    payload_format,
+                )
                 .await?;
             let input_data = self
-                .read_payload(exec_id, PayloadSlot::Input, pt_input, enc_input, key_id, payload_format)
+                .read_payload(
+                    exec_id,
+                    PayloadSlot::Input,
+                    pt_input,
+                    enc_input,
+                    key_id,
+                    payload_format,
+                )
                 .await?;
             let output_data = self
-                .read_payload(exec_id, PayloadSlot::Output, pt_output, enc_output, key_id, payload_format)
+                .read_payload(
+                    exec_id,
+                    PayloadSlot::Output,
+                    pt_output,
+                    enc_output,
+                    key_id,
+                    payload_format,
+                )
                 .await?;
             out.push(ModuleExecution {
                 id: r.get("id"),

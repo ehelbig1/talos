@@ -389,32 +389,28 @@ async fn handle_set_wasm_config(
     // which distinguishes absent (skip) from wrong-type / out-of-range
     // (loud reject). Default is u64::MAX as a sentinel since the
     // None case is the only valid skip-this-field path.
-    let read_optional_u64 = |field: &str,
-                             min: u64,
-                             max: u64|
-     -> Result<Option<u64>, JsonRpcResponse> {
-        match args.get(field) {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(v) => match v.as_u64() {
-                Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
-                Some(n) => Err(mcp_error(
-                    req_id.clone(),
-                    -32602,
-                    &format!("{field} must be between {min} and {max}, got {n}"),
-                )),
-                None => {
-                    let kind = crate::utils::json_type_name(v);
-                    Err(mcp_error(
+    let read_optional_u64 =
+        |field: &str, min: u64, max: u64| -> Result<Option<u64>, JsonRpcResponse> {
+            match args.get(field) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => match v.as_u64() {
+                    Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
+                    Some(n) => Err(mcp_error(
                         req_id.clone(),
                         -32602,
-                        &format!(
-                            "{field} must be a non-negative integer, got {kind}"
-                        ),
-                    ))
-                }
-            },
-        }
-    };
+                        &format!("{field} must be between {min} and {max}, got {n}"),
+                    )),
+                    None => {
+                        let kind = crate::utils::json_type_name(v);
+                        Err(mcp_error(
+                            req_id.clone(),
+                            -32602,
+                            &format!("{field} must be a non-negative integer, got {kind}"),
+                        ))
+                    }
+                },
+            }
+        };
 
     match read_optional_u64("max_memory_mb", 16, 512) {
         Ok(Some(v)) => {
@@ -956,9 +952,7 @@ async fn handle_import_platform_state(
     // pre-extraction handler exactly).
     let mut body = match serde_json::to_value(&outcome) {
         Ok(v) => v,
-        Err(_) => {
-            return mcp_error(req_id, -32000, "Failed to serialize import outcome")
-        }
+        Err(_) => return mcp_error(req_id, -32000, "Failed to serialize import outcome"),
     };
     if outcome.dry_run {
         if let Some(obj) = body.as_object_mut() {
@@ -1068,12 +1062,7 @@ async fn handle_security_audit(
     // four sites share one helper without escaping a module-level
     // function (this file already has a different `env_set` helper
     // shape in the validator crate, but this file doesn't depend on it).
-    let env_present = |var: &str| {
-        std::env::var(var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-    };
+    let env_present = |var: &str| std::env::var(var).ok().filter(|v| !v.is_empty()).is_some();
 
     // Check 3: TALOS_MASTER_KEY set
     let has_master_key = env_present("TALOS_MASTER_KEY");
@@ -1606,9 +1595,7 @@ fn handle_get_js_scaffold(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "capability_world must be a string (e.g. 'agent-node'), got {kind}"
-                    ),
+                    &format!("capability_world must be a string (e.g. 'agent-node'), got {kind}"),
                 );
             }
         },
@@ -1744,9 +1731,7 @@ fn handle_get_python_scaffold(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "capability_world must be a string (e.g. 'agent-node'), got {kind}"
-                    ),
+                    &format!("capability_world must be a string (e.g. 'agent-node'), got {kind}"),
                 );
             }
         },

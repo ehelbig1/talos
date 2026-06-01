@@ -97,7 +97,11 @@ async fn send_with_optional_inbox(
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, talos_workflow_engine_core::BoxError> {
     match reply_inbox {
-        Some(inbox) => transport.request_with_reply_inbox(topic, inbox, payload).await,
+        Some(inbox) => {
+            transport
+                .request_with_reply_inbox(topic, inbox, payload)
+                .await
+        }
         None => transport.request(topic, payload).await,
     }
 }
@@ -173,9 +177,8 @@ pub(crate) async fn dispatch_with_retry(
                 // the worker's nonce cache doesn't reject the retry as
                 // replay. See `execute_job_with_retry`.
                 if let Some(key) = pipeline_resign_key {
-                    current_payload =
-                        resign_pipeline_payload_for_retry(&current_payload, key)
-                            .unwrap_or(current_payload);
+                    current_payload = resign_pipeline_payload_for_retry(&current_payload, key)
+                        .unwrap_or(current_payload);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
@@ -508,9 +511,8 @@ pub(crate) async fn execute_job_with_retry(
                     // security impact: a fresh nonce + valid HMAC is
                     // exactly what a non-retry dispatch would produce.
                     if let Some(key) = worker_shared_key {
-                        current_payload =
-                            resign_payload_for_retry(&current_payload, key)
-                                .unwrap_or(current_payload);
+                        current_payload = resign_payload_for_retry(&current_payload, key)
+                            .unwrap_or(current_payload);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
@@ -547,8 +549,7 @@ pub(crate) async fn execute_job_with_retry(
                 // the nonce before the controller's request timed out.
                 if let Some(key) = worker_shared_key {
                     current_payload =
-                        resign_payload_for_retry(&current_payload, key)
-                            .unwrap_or(current_payload);
+                        resign_payload_for_retry(&current_payload, key).unwrap_or(current_payload);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }

@@ -260,10 +260,7 @@ mod structural_tests {
 
     #[test]
     fn accepts_canonical_get() {
-        assert!(validate_structure(&MemoryOp::Get {
-            key: "foo".into()
-        })
-        .is_some());
+        assert!(validate_structure(&MemoryOp::Get { key: "foo".into() }).is_some());
     }
 
     #[test]
@@ -361,8 +358,9 @@ mod structural_tests {
 
     #[test]
     fn rejects_too_many_exclude_kinds() {
-        let kinds: Vec<String> =
-            (0..MAX_EXCLUDE_KINDS + 1).map(|i| format!("k{i}")).collect();
+        let kinds: Vec<String> = (0..MAX_EXCLUDE_KINDS + 1)
+            .map(|i| format!("k{i}"))
+            .collect();
         assert!(validate_structure(&MemoryOp::Search {
             query: "alice".into(),
             limit: 10,

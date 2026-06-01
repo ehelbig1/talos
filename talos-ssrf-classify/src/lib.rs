@@ -171,19 +171,33 @@ mod tests {
             "192.168.1.1",
             "169.254.169.254", // cloud metadata
             "0.0.0.0",
-            "0.1.2.3",     // 0.0.0.0/8
-            "100.64.0.1",  // CGNAT
-            "224.0.0.1",   // multicast
+            "0.1.2.3",    // 0.0.0.0/8
+            "100.64.0.1", // CGNAT
+            "224.0.0.1",  // multicast
             "255.255.255.255",
         ] {
-            assert!(classify_private_ip(ip(s)).is_some(), "{s} should be blocked");
+            assert!(
+                classify_private_ip(ip(s)).is_some(),
+                "{s} should be blocked"
+            );
         }
     }
 
     #[test]
     fn rejects_v6_special_ranges() {
-        for s in ["::1", "fe80::1", "fc00::1", "fd00:ec2::254", "::", "ff02::1", "fec0::1"] {
-            assert!(classify_private_ip(ip(s)).is_some(), "{s} should be blocked");
+        for s in [
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd00:ec2::254",
+            "::",
+            "ff02::1",
+            "fec0::1",
+        ] {
+            assert!(
+                classify_private_ip(ip(s)).is_some(),
+                "{s} should be blocked"
+            );
         }
     }
 
@@ -226,8 +240,14 @@ mod tests {
     #[test]
     fn rejects_6to4_embedding_private_v4() {
         // 2002:a9fe:a9fe:: — 6to4 wrapping 169.254.169.254.
-        assert_eq!(classify_private_ip(ip("2002:a9fe:a9fe::")), Some("private-ip-6to4"));
+        assert_eq!(
+            classify_private_ip(ip("2002:a9fe:a9fe::")),
+            Some("private-ip-6to4")
+        );
         // 2002:0a00:0001:: — 6to4 wrapping 10.0.0.1.
-        assert_eq!(classify_private_ip(ip("2002:a00:1::")), Some("private-ip-6to4"));
+        assert_eq!(
+            classify_private_ip(ip("2002:a00:1::")),
+            Some("private-ip-6to4")
+        );
     }
 }

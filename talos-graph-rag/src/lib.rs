@@ -61,10 +61,7 @@ impl GraphRagService {
     /// When unset, the LLM-fallback path uses `ANTHROPIC_API_KEY`
     /// from the process env (legacy behaviour).
     #[must_use]
-    pub fn with_secrets(
-        mut self,
-        secrets: Arc<talos_secrets_manager::SecretsManager>,
-    ) -> Self {
+    pub fn with_secrets(mut self, secrets: Arc<talos_secrets_manager::SecretsManager>) -> Self {
         self.secrets = Some(secrets);
         self
     }
@@ -479,9 +476,7 @@ impl GraphRagService {
     /// guarantee — the key flows into one reqwest header for one
     /// HTTP call and is dropped, bounding the heap-exposure window
     /// to the request lifetime.
-    async fn resolve_anthropic_key(
-        &self,
-    ) -> Option<talos_secrets_manager::Zeroizing<String>> {
+    async fn resolve_anthropic_key(&self) -> Option<talos_secrets_manager::Zeroizing<String>> {
         if let Some(sm) = &self.secrets {
             // None scope — controller-side LLM keys live under the
             // platform's trust boundary, not a specific end-user.
@@ -1138,10 +1133,7 @@ mod tier_gate_tests {
 
     #[test]
     fn tier2_actor_permits_extraction() {
-        assert!(tier_decision_for_test(
-            true,
-            Some(Ok(Some(LlmTier::Tier2)))
-        ));
+        assert!(tier_decision_for_test(true, Some(Ok(Some(LlmTier::Tier2)))));
     }
 
     #[test]

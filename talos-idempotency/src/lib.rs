@@ -175,8 +175,7 @@ impl IdempotencyService {
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(Utc::now);
-                let expires =
-                    Utc::now() + chrono::Duration::seconds(ttl_seconds.max(0));
+                let expires = Utc::now() + chrono::Duration::seconds(ttl_seconds.max(0));
                 Ok(Some(IdempotencyRecord {
                     key: key.to_string(),
                     request_hash: request_hash.to_string(),
@@ -425,7 +424,6 @@ impl IdempotencyService {
         hasher.update(body);
         hex::encode(hasher.finalize())[..32].to_string()
     }
-
 }
 
 /// HTTP header carrying the client-chosen idempotency key.
@@ -551,25 +549,22 @@ pub async fn idempotency_middleware(
     let (parts, body) = request.into_parts();
     let body_bytes = match to_bytes(body, MAX_IDEMPOTENT_REQUEST_BYTES).await {
         Ok(b) => b,
-        Err(_) => {
-            return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response()
-        }
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response(),
     };
     let request_hash = IdempotencyService::hash_request(&body_bytes);
 
     match service.begin(&scoped_key, &request_hash).await {
         Ok(BeginOutcome::Hit(rec)) => {
-            let status =
-                StatusCode::from_u16(rec.status_code as u16).unwrap_or(StatusCode::OK);
-            let mut resp =
-                Response::new(Body::from(rec.response_body.unwrap_or_default()));
+            let status = StatusCode::from_u16(rec.status_code as u16).unwrap_or(StatusCode::OK);
+            let mut resp = Response::new(Body::from(rec.response_body.unwrap_or_default()));
             *resp.status_mut() = status;
             // Faithful replay: restore the cached Content-Type so the replayed
             // body parses like the original. Default to JSON (the content type
             // of the API routes this middleware fronts) if none was cached.
             let ct = rec.content_type.as_deref().unwrap_or("application/json");
             if let Ok(v) = ct.parse() {
-                resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, v);
+                resp.headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, v);
             }
             if let Ok(v) = "true".parse() {
                 resp.headers_mut().insert(IDEMPOTENT_REPLAYED_HEADER, v);
@@ -821,7 +816,10 @@ mod tests {
         // Distinct credentials → distinct scopes (no cross-caller cache hit).
         assert_ne!(user_a, user_b);
         assert_ne!(user_a, api_key);
-        assert_ne!(cookie_a, cookie_b, "different session token → different scope");
+        assert_ne!(
+            cookie_a, cookie_b,
+            "different session token → different scope"
+        );
         // The empty (unauthenticated) scope is distinct from any credentialed one.
         assert!(none.is_empty());
         assert_ne!(none, user_a);
@@ -853,9 +851,18 @@ mod tests {
 
     #[test]
     fn begin_payload_proceed_in_flight_mismatch() {
-        assert!(matches!(parse(r#"{"tag":"proceed"}"#), BeginOutcome::Proceed));
-        assert!(matches!(parse(r#"{"tag":"in_flight"}"#), BeginOutcome::InFlight));
-        assert!(matches!(parse(r#"{"tag":"mismatch"}"#), BeginOutcome::Mismatch));
+        assert!(matches!(
+            parse(r#"{"tag":"proceed"}"#),
+            BeginOutcome::Proceed
+        ));
+        assert!(matches!(
+            parse(r#"{"tag":"in_flight"}"#),
+            BeginOutcome::InFlight
+        ));
+        assert!(matches!(
+            parse(r#"{"tag":"mismatch"}"#),
+            BeginOutcome::Mismatch
+        ));
     }
 
     #[test]

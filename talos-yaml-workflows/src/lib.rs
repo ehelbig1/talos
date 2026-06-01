@@ -90,7 +90,11 @@ pub fn validate(workflow: &YamlWorkflow) -> Result<()> {
     // Check that all edge endpoints reference existing nodes
     for edge in &workflow.edges {
         if edge.from.trim().is_empty() || edge.to.trim().is_empty() {
-            anyhow::bail!("Edge has empty endpoint (from='{}', to='{}')", edge.from, edge.to);
+            anyhow::bail!(
+                "Edge has empty endpoint (from='{}', to='{}')",
+                edge.from,
+                edge.to
+            );
         }
         if !seen.contains(&edge.from) {
             anyhow::bail!("Edge references unknown source node: '{}'", edge.from);

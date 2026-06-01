@@ -41,8 +41,7 @@ static URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Match http(s):// followed by any non-whitespace run, then a
     // trim pass strips trailing punctuation that's almost certainly
     // not part of the URL itself ()", >, ], }, ., ,, ;).
-    Regex::new("https?://[^ \t\n\r]+")
-        .expect("BUG: provider-health URL strip regex must compile")
+    Regex::new("https?://[^ \t\n\r]+").expect("BUG: provider-health URL strip regex must compile")
 });
 
 /// MCP-634/MCP-768: strip URL-looking substrings from an error string
@@ -129,7 +128,10 @@ pub async fn refresh_embedding_provider_health() {
                 error = %e,
                 "embedding provider probe failed"
             );
-            (false, Some(sanitize_provider_error_for_caller(e.to_string())))
+            (
+                false,
+                Some(sanitize_provider_error_for_caller(e.to_string())),
+            )
         }
     };
     provider_health_cell().store(Arc::new(ProviderHealth {

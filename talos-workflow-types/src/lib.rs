@@ -336,8 +336,7 @@ pub fn validate_graph_timeouts(graph_json: &str) -> Result<(), String> {
             // 2e. `llm_dispatch.data.routes` entry-count cap
             //     (MCP-1221). Engine builds an unbounded
             //     `HashMap<String, Uuid>` from the routes object.
-            let is_llm_dispatch =
-                kind == Some("llm_dispatch") || ty == Some("system:llm_dispatch");
+            let is_llm_dispatch = kind == Some("llm_dispatch") || ty == Some("system:llm_dispatch");
             if is_llm_dispatch {
                 if let Some(data) = node.get("data") {
                     if let Some(routes) = data.get("routes").and_then(|v| v.as_object()) {
@@ -359,13 +358,11 @@ pub fn validate_graph_timeouts(graph_json: &str) -> Result<(), String> {
             //     length cap (MCP-1221). Engine iterates linearly
             //     per dispatch — unbounded length = unbounded CPU
             //     per call.
-            let is_cap_dispatch = kind == Some("capability_dispatch")
-                || ty == Some("system:capability_dispatch");
+            let is_cap_dispatch =
+                kind == Some("capability_dispatch") || ty == Some("system:capability_dispatch");
             if is_cap_dispatch {
                 if let Some(data) = node.get("data") {
-                    if let Some(caps) = data
-                        .get("required_capabilities")
-                        .and_then(|v| v.as_array())
+                    if let Some(caps) = data.get("required_capabilities").and_then(|v| v.as_array())
                     {
                         if caps.len() > MAX_REQUIRED_CAPABILITIES {
                             return Err(format!(
@@ -415,8 +412,7 @@ pub fn validate_graph_timeouts(graph_json: &str) -> Result<(), String> {
             ];
             for (target_kind, fields) in rhai_field_for_kind {
                 let system_ty = format!("system:{}", target_kind);
-                let matches_kind =
-                    kind == Some(*target_kind) || ty == Some(system_ty.as_str());
+                let matches_kind = kind == Some(*target_kind) || ty == Some(system_ty.as_str());
                 if !matches_kind {
                     continue;
                 }
@@ -444,7 +440,6 @@ pub fn validate_graph_timeouts(graph_json: &str) -> Result<(), String> {
 
     Ok(())
 }
-
 
 /// Declarative YAML workflow definition.
 /// Designed for version control, code review, and CI/CD pipelines.
@@ -1087,7 +1082,8 @@ version: null
     fn repeat_loop_validator_rejects_4_billion() {
         // The canonical attack value (engine's u32::MAX type-coerce
         // clamp made this look bounded but isn't).
-        let g = r#"{"nodes": [{"id": "rl", "kind": "repeat_loop", "data": {"count": 4000000000}}]}"#;
+        let g =
+            r#"{"nodes": [{"id": "rl", "kind": "repeat_loop", "data": {"count": 4000000000}}]}"#;
         let err = validate_graph_timeouts(g).unwrap_err();
         assert!(err.contains("4000000000"));
     }
@@ -1133,7 +1129,10 @@ version: null
             if i > 0 {
                 routes.push(',');
             }
-            routes.push_str(&format!(r#""r{}": "00000000-0000-0000-0000-000000000000""#, i));
+            routes.push_str(&format!(
+                r#""r{}": "00000000-0000-0000-0000-000000000000""#,
+                i
+            ));
         }
         let g = format!(
             r#"{{"nodes": [{{"id": "d", "kind": "llm_dispatch", "data": {{"routes": {{{}}}}}}}]}}"#,

@@ -373,8 +373,7 @@ pub async fn check_resource_access(
 pub use crate::validation::{
     validate_api_key_expires_in_days, validate_description_content, validate_display_name,
     validate_max_concurrent_executions, validate_payload_size, validate_resource_name,
-    validate_secret_value, validate_short_text_field, validate_text_field,
-    validate_vault_key_path,
+    validate_secret_value, validate_short_text_field, validate_text_field, validate_vault_key_path,
 };
 
 /// Maintain the `workflow_module_refs` junction table for a workflow save (create or update).

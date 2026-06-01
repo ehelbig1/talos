@@ -46,8 +46,9 @@ pub const MIN_NAME_LENGTH: usize = 1;
 /// diagnostic for backwards-compatible test assertions (`\0`, `\n`,
 /// `\r`). The long tail of control characters is caught by the
 /// `is_control()` sweep in [`validate_resource_name`].
-const FORBIDDEN_NAME_CHARS: &[char] =
-    &['/', '\\', '<', '>', ':', '"', '|', '?', '*', '\0', '\n', '\r'];
+const FORBIDDEN_NAME_CHARS: &[char] = &[
+    '/', '\\', '<', '>', ':', '"', '|', '?', '*', '\0', '\n', '\r',
+];
 
 /// Reserved Windows device filenames — rejected as resource names because
 /// a workflow/module persisted under one of these breaks on any operator
@@ -97,7 +98,11 @@ pub enum LineMode {
 ///
 /// The diagnostic is `"{field} cannot contain control characters or null
 /// bytes"` — identical on both protocol surfaces.
-pub fn reject_control_chars(field: &str, value: &str, mode: LineMode) -> Result<(), ValidationError> {
+pub fn reject_control_chars(
+    field: &str,
+    value: &str,
+    mode: LineMode,
+) -> Result<(), ValidationError> {
     let has_bad = value.contains('\0')
         || value.chars().any(|c| match mode {
             LineMode::SingleLine => c.is_control() && c != '\t',
@@ -195,7 +200,9 @@ pub fn validate_multiline_description<'a>(
 pub fn validate_resource_name(name: &str) -> Result<(), ValidationError> {
     let trimmed = name.trim();
     if trimmed.len() < MIN_NAME_LENGTH {
-        return Err(ValidationError::new("Name cannot be empty or whitespace-only"));
+        return Err(ValidationError::new(
+            "Name cannot be empty or whitespace-only",
+        ));
     }
     if trimmed.len() > MAX_NAME_LENGTH {
         return Err(ValidationError::new(format!(
@@ -210,7 +217,9 @@ pub fn validate_resource_name(name: &str) -> Result<(), ValidationError> {
     // Long tail of control chars beyond the FORBIDDEN_NAME_CHARS shortlist
     // (BEL, BS, VT, FF, SOH, DEL, …); tab stays allowed.
     if trimmed.chars().any(|c| c.is_control() && c != '\t') {
-        return Err(ValidationError::new("Name cannot contain control characters"));
+        return Err(ValidationError::new(
+            "Name cannot contain control characters",
+        ));
     }
     if trimmed.starts_with('.') {
         return Err(ValidationError::new("Name cannot start with a dot (.)"));
@@ -257,16 +266,31 @@ mod tests {
     #[test]
     fn control_char_message_is_stable() {
         let e = reject_control_chars("Actor name", "x\x07y", LineMode::SingleLine).unwrap_err();
-        assert_eq!(e.message, "Actor name cannot contain control characters or null bytes");
+        assert_eq!(
+            e.message,
+            "Actor name cannot contain control characters or null bytes"
+        );
     }
 
     // ---- validate_display_name -------------------------------------
 
     #[test]
     fn display_name_accepts_canonical_and_returns_trimmed() {
-        assert_eq!(validate_display_name("N", "  Acme Corp  ", 255).unwrap(), "Acme Corp");
-        for ok in ["My Workflow", "Actor 1", "Org-Name_42", ".NET Consulting", "Tab\there"] {
-            assert!(validate_display_name("N", ok, 255).is_ok(), "must accept {ok:?}");
+        assert_eq!(
+            validate_display_name("N", "  Acme Corp  ", 255).unwrap(),
+            "Acme Corp"
+        );
+        for ok in [
+            "My Workflow",
+            "Actor 1",
+            "Org-Name_42",
+            ".NET Consulting",
+            "Tab\there",
+        ] {
+            assert!(
+                validate_display_name("N", ok, 255).is_ok(),
+                "must accept {ok:?}"
+            );
         }
     }
 
@@ -282,11 +306,15 @@ mod tests {
     #[test]
     fn display_name_messages_are_stable() {
         assert_eq!(
-            validate_display_name("Org name", "  ", 255).unwrap_err().message,
+            validate_display_name("Org name", "  ", 255)
+                .unwrap_err()
+                .message,
             "Org name cannot be empty or whitespace-only"
         );
         assert_eq!(
-            validate_display_name("Org name", &"a".repeat(10), 5).unwrap_err().message,
+            validate_display_name("Org name", &"a".repeat(10), 5)
+                .unwrap_err()
+                .message,
             "Org name must be 1–5 characters"
         );
     }
@@ -304,7 +332,9 @@ mod tests {
     #[test]
     fn multiline_empty_message_uses_default_or_custom_hint() {
         assert_eq!(
-            validate_multiline_description("D", "   ", 10_000, "").unwrap_err().message,
+            validate_multiline_description("D", "   ", 10_000, "")
+                .unwrap_err()
+                .message,
             "D must be non-empty and non-whitespace when provided. \
              Omit the field to leave it blank."
         );
@@ -319,7 +349,9 @@ mod tests {
     #[test]
     fn multiline_length_message_is_stable() {
         assert_eq!(
-            validate_multiline_description("D", &"a".repeat(11), 10, "").unwrap_err().message,
+            validate_multiline_description("D", &"a".repeat(11), 10, "")
+                .unwrap_err()
+                .message,
             "D must be ≤ 10 characters"
         );
     }

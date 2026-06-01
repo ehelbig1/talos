@@ -222,7 +222,10 @@ mod tests {
     #[test]
     fn test_get_frontend_url_crlf_rejected() {
         let _g = env_lock();
-        env::set_var("FRONTEND_URL", "https://app.example.com\r\nX-Injected: evil");
+        env::set_var(
+            "FRONTEND_URL",
+            "https://app.example.com\r\nX-Injected: evil",
+        );
         assert_eq!(get_frontend_url(), "http://localhost:3000");
         env::remove_var("FRONTEND_URL");
     }
@@ -395,7 +398,9 @@ mod tests {
     #[test]
     fn test_bool_env_truthy_tokens() {
         let _g = env_lock();
-        for v in &["true", "TRUE", "True", "1", "yes", "YES", "on", "ON", "  on  "] {
+        for v in &[
+            "true", "TRUE", "True", "1", "yes", "YES", "on", "ON", "  on  ",
+        ] {
             env::set_var("TEST_BOOL_ENV", v);
             assert!(
                 bool_env_or_default("TEST_BOOL_ENV", false),

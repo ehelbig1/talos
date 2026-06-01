@@ -93,11 +93,7 @@ impl JobTransport for NatsTransport {
             .await
             .map_err(|e| -> BoxError { format!("inbox subscribe: {e}").into() })?;
         self.client
-            .publish_with_reply(
-                topic.to_string(),
-                reply_inbox.to_string(),
-                payload.into(),
-            )
+            .publish_with_reply(topic.to_string(), reply_inbox.to_string(), payload.into())
             .await
             .map_err(|e| -> BoxError { format!("publish_with_reply: {e}").into() })?;
         // Best-effort flush so the publish doesn't sit in the local

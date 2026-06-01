@@ -279,7 +279,11 @@ impl ReplayService {
         let Some(wf_id) = workflow_id else {
             return talos_workflow_job_protocol::LlmTier::Tier1;
         };
-        let actor_id = match self.workflow_repo.get_workflow_actor_id(wf_id, user_id).await {
+        let actor_id = match self
+            .workflow_repo
+            .get_workflow_actor_id(wf_id, user_id)
+            .await
+        {
             Ok(Some(aid)) => aid,
             Ok(None) => return talos_workflow_job_protocol::LlmTier::Tier1,
             Err(e) => {
@@ -535,9 +539,7 @@ impl ReplayService {
             .registry
             .get_template_for_user(module_id, user_id)
             .await
-            .map_err(|_| {
-                ReplayError::NotFound("Module not found or access denied".to_string())
-            })?;
+            .map_err(|_| ReplayError::NotFound("Module not found or access denied".to_string()))?;
         let wasm_bytes = template.precompiled_wasm.ok_or_else(|| {
             ReplayError::NotFound(
                 "Template has no compiled WASM. Use compile_template first.".to_string(),
@@ -722,7 +724,10 @@ fn reject_unreplayable_world(
     world: &CapabilityWorld,
     workflow_mode: bool,
 ) -> Result<(), ReplayError> {
-    if matches!(world, CapabilityWorld::Governance | CapabilityWorld::Unknown) {
+    if matches!(
+        world,
+        CapabilityWorld::Governance | CapabilityWorld::Unknown
+    ) {
         let msg = if workflow_mode {
             "governance-node / unknown worlds cannot be replayed"
         } else {
@@ -803,8 +808,8 @@ async fn run_replays(
                 None,
                 None,
                 false,
-                None,              // actor_id
-                Uuid::nil(),       // user_id (controller-internal replay path)
+                None,        // actor_id
+                Uuid::nil(), // user_id (controller-internal replay path)
                 // MCP-691: inherit the original actor's tier ceiling
                 // (caller-resolved). Default Tier-1 for replays without
                 // a bound actor; do NOT use LlmTier::default() (Tier-2)
@@ -961,7 +966,11 @@ mod tests {
         assert!(plan.predecessor_label.is_none());
         let expected: Uuid = "00000000-0000-0000-0000-000000000001".parse().unwrap();
         assert_eq!(plan.module_type_id, expected);
-        assert!(plan.node_config.is_object() || plan.node_config.is_null() || plan.node_config == serde_json::json!({}));
+        assert!(
+            plan.node_config.is_object()
+                || plan.node_config.is_null()
+                || plan.node_config == serde_json::json!({})
+        );
     }
 
     #[test]
@@ -1008,7 +1017,11 @@ mod tests {
         match err {
             ReplayError::InvalidArg(m) => {
                 assert!(m.contains("governance-node"), "msg: {}", m);
-                assert!(!m.contains("workflow engine"), "msg should be the shorter workflow-mode form: {}", m);
+                assert!(
+                    !m.contains("workflow engine"),
+                    "msg should be the shorter workflow-mode form: {}",
+                    m
+                );
             }
             _ => panic!("expected InvalidArg"),
         }

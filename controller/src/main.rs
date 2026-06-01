@@ -3,7 +3,6 @@
     clippy::type_complexity,
     clippy::needless_return
 )]
-
 // async-graphql 7.x's macro expansion of MutationRoot::add_set walks the
 // schema metadata at compile time and overflows the default 128-deep
 // recursion limit when building the bin target. The lib target carries the
@@ -395,7 +394,9 @@ async fn main() -> anyhow::Result<()> {
         // than the documented "no credentials" fallback. Same
         // empty-env class as MCP-590/591/592/653/etc.
         let nats_user = std::env::var("NATS_USER").ok().filter(|v| !v.is_empty());
-        let nats_password = std::env::var("NATS_PASSWORD").ok().filter(|v| !v.is_empty());
+        let nats_password = std::env::var("NATS_PASSWORD")
+            .ok()
+            .filter(|v| !v.is_empty());
 
         // Sanitize the URL before logging — it may contain embedded credentials
         // (e.g. `nats://user:secret@host:4222`).  Strip the userinfo component.
@@ -821,7 +822,11 @@ async fn main() -> anyhow::Result<()> {
     let bcrypt_cost: u32 = std::env::var("BCRYPT_COST")
         .unwrap_or_else(|_| "12".to_string())
         .parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("BCRYPT_COST must be a valid number between 4 and 31 (recommended 10-14)"))?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "BCRYPT_COST must be a valid number between 4 and 31 (recommended 10-14)"
+            )
+        })?;
     if !(4..=31).contains(&bcrypt_cost) {
         return Err(anyhow::anyhow!(
             "BCRYPT_COST={} is outside bcrypt's valid range [4, 31] — every login would fail. \
@@ -900,7 +905,8 @@ async fn main() -> anyhow::Result<()> {
         false,
         "The scrape endpoint exposes the full Prometheus metrics registry — a \
          trivially-guessable token gives attackers cross-tenant metrics access.",
-    ).map_err(|e| anyhow::anyhow!(e))?;
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     // MCP-1080/1081: REGISTRY_PUBLISH_TOKEN strength via canonical validator.
     talos_config::validate_shared_secret_token(
@@ -909,7 +915,8 @@ async fn main() -> anyhow::Result<()> {
         false,
         "The publish endpoint accepts module template artifacts distributed across the fleet — \
          a trivially-guessable token gives attackers arbitrary template injection capability.",
-    ).map_err(|e| anyhow::anyhow!(e))?;
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     // ---------- Initialize TOTP/2FA service ----------
     let totp_service = std::sync::Arc::new(totp_2fa::TotpService::new(
@@ -1315,10 +1322,7 @@ async fn main() -> anyhow::Result<()> {
     // here at controller startup with the canonical db_pool — a
     // single batched query against ALL cached agent_ids drops the
     // revocation window from 10 s (TTL only) to ~3 s.
-    crate::mcp::auth::spawn_bcrypt_cache_revocation_sweep(
-        db_pool.clone(),
-        bg_shutdown_rx.clone(),
-    );
+    crate::mcp::auth::spawn_bcrypt_cache_revocation_sweep(db_pool.clone(), bg_shutdown_rx.clone());
 
     // ---------- Phase 1.3 / Phase 5 residual reconciliation sweep ----------
     // Historical context: originally a dual-write safety net that mirrored
@@ -2586,21 +2590,21 @@ async fn main() -> anyhow::Result<()> {
         // Wait 2 minutes after startup before first check to let executions settle
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(900)); // 15 min
-        // MCP-469: disable redirect following for SLA notification
-        // webhooks. The SSRF check at fire time validates the literal
-        // URL, but reqwest's default `Policy::limited(10)` would follow
-        // a 302/303 to an internal host beneath the SSRF gate. Matches
-        // the canonical pattern in approval_gate / failure_webhook.
-        //
-        // Fallback to `Client::new()` removed: that path re-enabled the
-        // default redirect policy and would silently reopen the SSRF
-        // gap. `.build()` rarely fails (TLS init issues only), and
-        // `Client::new()` would also panic on the same failure mode —
-        // so a loud `.expect()` is functionally equivalent and removes
-        // the false sense of recovery.
-        // MCP-1034: explicit connect_timeout (2s on 5s budget) so a
-        // black-holed SLA-webhook endpoint fails on connect rather than
-        // burning the whole loop tick.
+                                                                                       // MCP-469: disable redirect following for SLA notification
+                                                                                       // webhooks. The SSRF check at fire time validates the literal
+                                                                                       // URL, but reqwest's default `Policy::limited(10)` would follow
+                                                                                       // a 302/303 to an internal host beneath the SSRF gate. Matches
+                                                                                       // the canonical pattern in approval_gate / failure_webhook.
+                                                                                       //
+                                                                                       // Fallback to `Client::new()` removed: that path re-enabled the
+                                                                                       // default redirect policy and would silently reopen the SSRF
+                                                                                       // gap. `.build()` rarely fails (TLS init issues only), and
+                                                                                       // `Client::new()` would also panic on the same failure mode —
+                                                                                       // so a loud `.expect()` is functionally equivalent and removes
+                                                                                       // the false sense of recovery.
+                                                                                       // MCP-1034: explicit connect_timeout (2s on 5s budget) so a
+                                                                                       // black-holed SLA-webhook endpoint fails on connect rather than
+                                                                                       // burning the whole loop tick.
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .connect_timeout(std::time::Duration::from_secs(2))
@@ -2876,7 +2880,11 @@ async fn main() -> anyhow::Result<()> {
         let renewal_service = google_calendar_service.clone();
         let gcal_renewal_shutdown = bg_shutdown_rx.clone();
         tokio::spawn(async move {
-            google_calendar::scheduler::channel_renewal_task(renewal_service, gcal_renewal_shutdown).await;
+            google_calendar::scheduler::channel_renewal_task(
+                renewal_service,
+                gcal_renewal_shutdown,
+            )
+            .await;
         });
         tracing::info!("Google Calendar channel renewal task started (runs every hour)");
 
@@ -2941,163 +2949,163 @@ async fn main() -> anyhow::Result<()> {
             // caps at 60s, resets on successful bind.
             let mut backoff_secs: u64 = 1;
             'supervisor: loop {
-            // Subscribe to all WASM log topics (wasm.log.{execution_id})
-            let mut subscriber = match nats.subscribe("wasm.log.*").await {
-                Ok(sub) => sub,
-                Err(e) => {
-                    tracing::error!(
-                        target: "talos_controller",
-                        event_kind = "wasm_log_subscribe_failed",
-                        error = %e,
-                        backoff_secs,
-                        "Failed to subscribe to WASM logs; retrying after backoff"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue 'supervisor;
-                }
-            };
-            backoff_secs = 1;
+                // Subscribe to all WASM log topics (wasm.log.{execution_id})
+                let mut subscriber = match nats.subscribe("wasm.log.*").await {
+                    Ok(sub) => sub,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "talos_controller",
+                            event_kind = "wasm_log_subscribe_failed",
+                            error = %e,
+                            backoff_secs,
+                            "Failed to subscribe to WASM logs; retrying after backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(60);
+                        continue 'supervisor;
+                    }
+                };
+                backoff_secs = 1;
 
-            tracing::info!("WASM log subscriber active - waiting for messages");
+                tracing::info!("WASM log subscriber active - waiting for messages");
 
-            // Process messages as they arrive
-            while let Some(msg) = subscriber.next().await {
-                // DEBUG: Log when message is received
-                tracing::info!("📩 Received WASM log from NATS topic: {}", msg.subject);
+                // Process messages as they arrive
+                while let Some(msg) = subscriber.next().await {
+                    // DEBUG: Log when message is received
+                    tracing::info!("📩 Received WASM log from NATS topic: {}", msg.subject);
 
-                // Parse log message from NATS
-                match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                    Ok(log_msg) => {
-                        // Extract fields with defaults
-                        let execution_id = log_msg
-                            .get("execution_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok());
-
-                        let level_str = log_msg
-                            .get("level")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("info");
-
-                        // Convert string to LogLevel enum. Case-insensitive
-                        // because the worker emits UPPERCASE ("INFO", "WARN",
-                        // ...) while older test paths used lowercase. Without
-                        // the fold, every uppercase line collapsed to Info.
-                        let level = match level_str.to_ascii_lowercase().as_str() {
-                            "debug" => LogLevel::Debug,
-                            "warn" => LogLevel::Warn,
-                            "error" => LogLevel::Error,
-                            _ => LogLevel::Info,
-                        };
-
-                        let message = log_msg
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        let metadata = log_msg.get("metadata").cloned();
-                        let trace_id = log_msg
-                            .get("trace_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let span_id = log_msg
-                            .get("span_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-
-                        // Save to database (best-effort - don't crash on error)
-                        if let Some(exec_id) = execution_id {
-                            let node_id = metadata
-                                .as_ref()
-                                .and_then(|m| m.get("node_id"))
+                    // Parse log message from NATS
+                    match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                        Ok(log_msg) => {
+                            // Extract fields with defaults
+                            let execution_id = log_msg
+                                .get("execution_id")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
-                            // MCP-1011 sibling: scrub the broadcast `message`
-                            // the same way `add_workflow_log` scrubs before
-                            // persisting. Pre-fix the persistence path
-                            // (`workflow_execution_logs.message`) applied
-                            // MCP-481 truncation + control-char strip +
-                            // `redact_str`, but the parallel `tx_for_wasm_logs`
-                            // broadcast used the raw `message` — a WASM module
-                            // emitting a Bearer / sk- / ghp_ token leaked it
-                            // to live `execution_updates` GraphQL subscribers
-                            // even though the persisted row was clean. See
-                            // `scrub_wasm_log_for_broadcast` (above) for the
-                            // canonical pipeline — kept in lockstep with the
-                            // persistence path so the live channel can't
-                            // carry more than the persisted row.
-                            let scrubbed_for_broadcast = scrub_wasm_log_for_broadcast(&message);
+                            let level_str = log_msg
+                                .get("level")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("info");
 
-                            // Broadcast the live log to all connected GraphQL clients!
-                            let _ = tx_for_wasm_logs.send(ExecutionEvent {
-                                execution_id: exec_id,
-                                node_id,
-                                status: ExecutionStatus::Running,
-                                trace_id,
-                                span_id,
-                                log_message: Some(format!(
-                                    "[{}] {}",
-                                    level_str.to_uppercase(),
-                                    scrubbed_for_broadcast
-                                )),
-                                iteration_index: None,
-                                iteration_total: None,
-                                duration_ms: None,
-                                output: None,
-                            });
-
-                            // Route to the right log table:
-                            //   - workflow_execution_logs when exec_id is a workflow_executions.id
-                            //     (the common case — every run via trigger_workflow / call_workflow / scheduled)
-                            //   - module_execution_logs when exec_id is a module_executions.id
-                            //     (standalone module runs via webhook / test_module)
-                            // Try workflow path first, fall back on FK violation. The table
-                            // routing is determined by which FK lookup succeeds, which is
-                            // O(1) — no extra round trip.
-                            let level_upper = match level {
-                                LogLevel::Debug => "DEBUG",
-                                LogLevel::Info => "INFO",
-                                LogLevel::Warn => "WARN",
-                                LogLevel::Error => "ERROR",
+                            // Convert string to LogLevel enum. Case-insensitive
+                            // because the worker emits UPPERCASE ("INFO", "WARN",
+                            // ...) while older test paths used lowercase. Without
+                            // the fold, every uppercase line collapsed to Info.
+                            let level = match level_str.to_ascii_lowercase().as_str() {
+                                "debug" => LogLevel::Debug,
+                                "warn" => LogLevel::Warn,
+                                "error" => LogLevel::Error,
+                                _ => LogLevel::Info,
                             };
-                            match exec_repo_for_wasm_logs
-                                .add_workflow_log(
-                                    exec_id,
+
+                            let message = log_msg
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            let metadata = log_msg.get("metadata").cloned();
+                            let trace_id = log_msg
+                                .get("trace_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let span_id = log_msg
+                                .get("span_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+
+                            // Save to database (best-effort - don't crash on error)
+                            if let Some(exec_id) = execution_id {
+                                let node_id = metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("node_id"))
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+                                // MCP-1011 sibling: scrub the broadcast `message`
+                                // the same way `add_workflow_log` scrubs before
+                                // persisting. Pre-fix the persistence path
+                                // (`workflow_execution_logs.message`) applied
+                                // MCP-481 truncation + control-char strip +
+                                // `redact_str`, but the parallel `tx_for_wasm_logs`
+                                // broadcast used the raw `message` — a WASM module
+                                // emitting a Bearer / sk- / ghp_ token leaked it
+                                // to live `execution_updates` GraphQL subscribers
+                                // even though the persisted row was clean. See
+                                // `scrub_wasm_log_for_broadcast` (above) for the
+                                // canonical pipeline — kept in lockstep with the
+                                // persistence path so the live channel can't
+                                // carry more than the persisted row.
+                                let scrubbed_for_broadcast = scrub_wasm_log_for_broadcast(&message);
+
+                                // Broadcast the live log to all connected GraphQL clients!
+                                let _ = tx_for_wasm_logs.send(ExecutionEvent {
+                                    execution_id: exec_id,
                                     node_id,
-                                    level_upper,
-                                    &message,
-                                    metadata.as_ref(),
-                                )
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(_) => {
-                                    // Not a workflow execution; try module-execution path.
-                                    exec_service_for_logs
-                                        .add_log_best_effort(exec_id, level, message, metadata)
-                                        .await;
+                                    status: ExecutionStatus::Running,
+                                    trace_id,
+                                    span_id,
+                                    log_message: Some(format!(
+                                        "[{}] {}",
+                                        level_str.to_uppercase(),
+                                        scrubbed_for_broadcast
+                                    )),
+                                    iteration_index: None,
+                                    iteration_total: None,
+                                    duration_ms: None,
+                                    output: None,
+                                });
+
+                                // Route to the right log table:
+                                //   - workflow_execution_logs when exec_id is a workflow_executions.id
+                                //     (the common case — every run via trigger_workflow / call_workflow / scheduled)
+                                //   - module_execution_logs when exec_id is a module_executions.id
+                                //     (standalone module runs via webhook / test_module)
+                                // Try workflow path first, fall back on FK violation. The table
+                                // routing is determined by which FK lookup succeeds, which is
+                                // O(1) — no extra round trip.
+                                let level_upper = match level {
+                                    LogLevel::Debug => "DEBUG",
+                                    LogLevel::Info => "INFO",
+                                    LogLevel::Warn => "WARN",
+                                    LogLevel::Error => "ERROR",
+                                };
+                                match exec_repo_for_wasm_logs
+                                    .add_workflow_log(
+                                        exec_id,
+                                        node_id,
+                                        level_upper,
+                                        &message,
+                                        metadata.as_ref(),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {}
+                                    Err(_) => {
+                                        // Not a workflow execution; try module-execution path.
+                                        exec_service_for_logs
+                                            .add_log_best_effort(exec_id, level, message, metadata)
+                                            .await;
+                                    }
                                 }
+                            } else {
+                                tracing::debug!("Received WASM log without valid execution_id");
                             }
-                        } else {
-                            tracing::debug!("Received WASM log without valid execution_id");
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to parse WASM log message: {}", e);
                         }
                     }
-                    Err(e) => {
-                        tracing::debug!("Failed to parse WASM log message: {}", e);
-                    }
                 }
-            }
 
-            // MCP-1121: stream ended — supervisor re-binds.
-            tracing::warn!(
-                target: "talos_controller",
-                event_kind = "wasm_log_subscriber_rebinding",
-                "WASM log subscriber stream ended; supervisor re-binding (no controller restart required)"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // MCP-1121: stream ended — supervisor re-binds.
+                tracing::warn!(
+                    target: "talos_controller",
+                    event_kind = "wasm_log_subscriber_rebinding",
+                    "WASM log subscriber stream ended; supervisor re-binding (no controller restart required)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             } // end 'supervisor
         });
         tracing::info!("WASM log subscriber task started");
@@ -3131,180 +3139,182 @@ async fn main() -> anyhow::Result<()> {
             // mysteriously stopped updating after a NATS hiccup."
             let mut backoff_secs: u64 = 1;
             'supervisor: loop {
-            let mut sub = match nats_for_results.subscribe("talos.results.*").await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(
-                        target: "talos_controller",
-                        event_kind = "job_result_subscribe_failed",
-                        error = %e,
-                        backoff_secs,
-                        "Failed to subscribe to job results; retrying after backoff"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue 'supervisor;
-                }
-            };
-            backoff_secs = 1;
+                let mut sub = match nats_for_results.subscribe("talos.results.*").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "talos_controller",
+                            event_kind = "job_result_subscribe_failed",
+                            error = %e,
+                            backoff_secs,
+                            "Failed to subscribe to job results; retrying after backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(60);
+                        continue 'supervisor;
+                    }
+                };
+                backoff_secs = 1;
 
-            tracing::info!("Job result subscriber active");
+                tracing::info!("Job result subscriber active");
 
-            while let Some(msg) = sub.next().await {
-                match serde_json::from_slice::<talos_workflow_job_protocol::JobResult>(&msg.payload)
-                {
-                    Ok(result) => {
-                        let job_id = result.job_id;
+                while let Some(msg) = sub.next().await {
+                    match serde_json::from_slice::<talos_workflow_job_protocol::JobResult>(
+                        &msg.payload,
+                    ) {
+                        Ok(result) => {
+                            let job_id = result.job_id;
 
-                        // SECURITY: Verify HMAC-SHA256 signature + freshness
-                        // window. Rejects results injected by any process that
-                        // can publish to NATS but does not know the pre-shared
-                        // key.
-                        //
-                        // Post-r301 the worker single-publishes: it sends a
-                        // result to EITHER the request-reply inbox OR
-                        // `talos.results.{job_id}` based on whether the
-                        // requester awaited the reply, never both. So this
-                        // subscriber only sees results that no other in-process
-                        // verifier has handled — there's no second verify to
-                        // race.
-                        //
-                        // We still call `verify_no_replay` here (not `verify`)
-                        // as defense-in-depth: it keeps this subscriber
-                        // safe-by-default if a future code path re-introduces a
-                        // dual-publish or a sibling subscriber, and the side
-                        // effect (`UPDATE module_executions WHERE status IN
-                        // ('pending','running')`) is idempotent under replay
-                        // anyway. HMAC + freshness still catch forgery and
-                        // stale-replay; the worker is the primary
-                        // replay-cache writer for fire-and-forget results.
-                        //
-                        // Today every NATS-dispatched code path uses
-                        // request-reply, so this subscriber is mostly dormant
-                        // — kept as the canonical landing point for future
-                        // truly-async dispatches (work-queue style).
-                        // L-4: typed Observer verifier — this audit
-                        // subscriber on `talos.results.*` only writes
-                        // an idempotent UPDATE; primary verification
-                        // happens at the request-reply inbox in the
-                        // engine dispatcher / webhook handler. Using
-                        // `Verifier::Observer` documents the role at
-                        // the type level so a future refactor can't
-                        // accidentally convert this site to a primary
-                        // verifier and reintroduce the r300 regression.
-                        if let Some(ref key) = worker_shared_key_for_results {
-                            if let Err(e) = result.verify_as(
-                                key.as_bytes(),
-                                300,
-                                talos_workflow_job_protocol::Verifier::Observer,
-                            ) {
-                                tracing::warn!(
+                            // SECURITY: Verify HMAC-SHA256 signature + freshness
+                            // window. Rejects results injected by any process that
+                            // can publish to NATS but does not know the pre-shared
+                            // key.
+                            //
+                            // Post-r301 the worker single-publishes: it sends a
+                            // result to EITHER the request-reply inbox OR
+                            // `talos.results.{job_id}` based on whether the
+                            // requester awaited the reply, never both. So this
+                            // subscriber only sees results that no other in-process
+                            // verifier has handled — there's no second verify to
+                            // race.
+                            //
+                            // We still call `verify_no_replay` here (not `verify`)
+                            // as defense-in-depth: it keeps this subscriber
+                            // safe-by-default if a future code path re-introduces a
+                            // dual-publish or a sibling subscriber, and the side
+                            // effect (`UPDATE module_executions WHERE status IN
+                            // ('pending','running')`) is idempotent under replay
+                            // anyway. HMAC + freshness still catch forgery and
+                            // stale-replay; the worker is the primary
+                            // replay-cache writer for fire-and-forget results.
+                            //
+                            // Today every NATS-dispatched code path uses
+                            // request-reply, so this subscriber is mostly dormant
+                            // — kept as the canonical landing point for future
+                            // truly-async dispatches (work-queue style).
+                            // L-4: typed Observer verifier — this audit
+                            // subscriber on `talos.results.*` only writes
+                            // an idempotent UPDATE; primary verification
+                            // happens at the request-reply inbox in the
+                            // engine dispatcher / webhook handler. Using
+                            // `Verifier::Observer` documents the role at
+                            // the type level so a future refactor can't
+                            // accidentally convert this site to a primary
+                            // verifier and reintroduce the r300 regression.
+                            if let Some(ref key) = worker_shared_key_for_results {
+                                if let Err(e) = result.verify_as(
+                                    key.as_bytes(),
+                                    300,
+                                    talos_workflow_job_protocol::Verifier::Observer,
+                                ) {
+                                    tracing::warn!(
                                     "Rejected job result {}: signature verification failed — {}",
                                     job_id,
                                     e
                                 );
-                                continue;
-                            }
-                        }
-                        tracing::debug!(
-                            "📥 Received job result: {} ({:?}, {}ms)",
-                            job_id,
-                            result.status,
-                            result.execution_time_ms
-                        );
-
-                        match result.status {
-                            talos_workflow_job_protocol::JobStatus::Success => {
-                                if let Err(e) = exec_service_for_results
-                                    .complete_execution_from_worker(
-                                        job_id,
-                                        Some(result.output_payload),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "Failed to mark execution {} as completed: {}",
-                                        job_id,
-                                        e
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        "✅ Execution {} completed ({}ms)",
-                                        job_id,
-                                        result.execution_time_ms
-                                    );
+                                    continue;
                                 }
                             }
-                            talos_workflow_job_protocol::JobStatus::Failed
-                            | talos_workflow_job_protocol::JobStatus::TimedOut => {
-                                let error_msg = result
-                                    .output_payload
-                                    .get("error")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Worker reported failure")
-                                    .to_string();
-                                let error_type = matches!(
-                                    result.status,
-                                    talos_workflow_job_protocol::JobStatus::TimedOut
-                                )
-                                .then_some("timeout".to_string());
+                            tracing::debug!(
+                                "📥 Received job result: {} ({:?}, {}ms)",
+                                job_id,
+                                result.status,
+                                result.execution_time_ms
+                            );
 
-                                if let Err(e) = exec_service_for_results
-                                    .fail_execution_from_worker(
-                                        job_id,
-                                        error_msg.clone(),
-                                        error_type,
+                            match result.status {
+                                talos_workflow_job_protocol::JobStatus::Success => {
+                                    if let Err(e) = exec_service_for_results
+                                        .complete_execution_from_worker(
+                                            job_id,
+                                            Some(result.output_payload),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to mark execution {} as completed: {}",
+                                            job_id,
+                                            e
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "✅ Execution {} completed ({}ms)",
+                                            job_id,
+                                            result.execution_time_ms
+                                        );
+                                    }
+                                }
+                                talos_workflow_job_protocol::JobStatus::Failed
+                                | talos_workflow_job_protocol::JobStatus::TimedOut => {
+                                    let error_msg = result
+                                        .output_payload
+                                        .get("error")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("Worker reported failure")
+                                        .to_string();
+                                    let error_type = matches!(
+                                        result.status,
+                                        talos_workflow_job_protocol::JobStatus::TimedOut
                                     )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "Failed to mark execution {} as failed: {}",
-                                        job_id,
-                                        e
-                                    );
-                                } else {
-                                    // MCP-989 (2026-05-15): DLP-redact the
-                                    // failure preview at the operator-log
-                                    // boundary. `fail_execution_from_worker`
-                                    // redacts before persisting to
-                                    // `module_executions.error_message`
-                                    // (MCP-968), but this INFO log was
-                                    // taking the first 100 chars of the
-                                    // ORIGINAL worker-supplied error_msg.
-                                    // Worker failures regularly carry
-                                    // upstream auth errors that echo the
-                                    // rejected token in the body; secret-
-                                    // shaped prefixes must not land in
-                                    // operator log pipelines. Same
-                                    // wrapper class as the two
-                                    // talos-module-executions sites
-                                    // closed in this MCP.
-                                    let preview: String = talos_dlp_provider::redact_str(&error_msg)
-                                        .chars()
-                                        .take(100)
-                                        .collect();
-                                    tracing::info!(
-                                        "❌ Execution {} failed: {}",
-                                        job_id,
-                                        preview
-                                    );
+                                    .then_some("timeout".to_string());
+
+                                    if let Err(e) = exec_service_for_results
+                                        .fail_execution_from_worker(
+                                            job_id,
+                                            error_msg.clone(),
+                                            error_type,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to mark execution {} as failed: {}",
+                                            job_id,
+                                            e
+                                        );
+                                    } else {
+                                        // MCP-989 (2026-05-15): DLP-redact the
+                                        // failure preview at the operator-log
+                                        // boundary. `fail_execution_from_worker`
+                                        // redacts before persisting to
+                                        // `module_executions.error_message`
+                                        // (MCP-968), but this INFO log was
+                                        // taking the first 100 chars of the
+                                        // ORIGINAL worker-supplied error_msg.
+                                        // Worker failures regularly carry
+                                        // upstream auth errors that echo the
+                                        // rejected token in the body; secret-
+                                        // shaped prefixes must not land in
+                                        // operator log pipelines. Same
+                                        // wrapper class as the two
+                                        // talos-module-executions sites
+                                        // closed in this MCP.
+                                        let preview: String =
+                                            talos_dlp_provider::redact_str(&error_msg)
+                                                .chars()
+                                                .take(100)
+                                                .collect();
+                                        tracing::info!(
+                                            "❌ Execution {} failed: {}",
+                                            job_id,
+                                            preview
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Failed to parse job result message: {}", e);
+                        Err(e) => {
+                            tracing::debug!("Failed to parse job result message: {}", e);
+                        }
                     }
                 }
-            }
 
-            // MCP-1122: stream ended — supervisor re-binds.
-            tracing::warn!(
-                target: "talos_controller",
-                event_kind = "job_result_subscriber_rebinding",
-                "Job result subscriber stream ended; supervisor re-binding"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // MCP-1122: stream ended — supervisor re-binds.
+                tracing::warn!(
+                    target: "talos_controller",
+                    event_kind = "job_result_subscriber_rebinding",
+                    "Job result subscriber stream ended; supervisor re-binding"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             } // end 'supervisor
         });
         tracing::info!("Job result subscriber task started");
@@ -3427,13 +3437,12 @@ async fn main() -> anyhow::Result<()> {
     // Workflow-manifest service. Single shared instance backs the MCP
     // import_platform_state / export_platform_state tools and is ready
     // to back a future GraphQL surface without protocol branching.
-    let workflow_manifest_service = std::sync::Arc::new(
-        talos_workflow_manifest::WorkflowManifestService::new(
+    let workflow_manifest_service =
+        std::sync::Arc::new(talos_workflow_manifest::WorkflowManifestService::new(
             workflow_repo.clone(),
             module_repo.clone(),
             secrets_manager.clone(),
-        ),
-    );
+        ));
 
     // Replay service. Single shared instance backs the MCP
     // replay_module_regression handler (both module and workflow
@@ -3458,14 +3467,13 @@ async fn main() -> anyhow::Result<()> {
     // back any future protocol surface — same Arc → same wrap-lint-
     // compile-mirror flow). Owns the shared-module-overwrite +
     // permission-drift guards that were inline in workflows.rs.
-    let inline_compile_service = std::sync::Arc::new(
-        talos_inline_compile_service::InlineCompileService::new(
+    let inline_compile_service =
+        std::sync::Arc::new(talos_inline_compile_service::InlineCompileService::new(
             workflow_repo.clone(),
             module_repo.clone(),
             compiler.clone(),
             db_pool.clone(),
-        ),
-    );
+        ));
 
     // Search service. Owns the semantic-search fallback chain
     // (caller embedding → auto-generate → vector → trigram → ILIKE)
@@ -4475,17 +4483,17 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut shutdown = sla_breach_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Every 5 min
-        // MCP-497: same SSRF-via-redirect fix as MCP-469/470 — the
-        // `check_outbound_url_no_ssrf` gate below catches the literal
-        // URL but a 302 from the validated host to an internal host
-        // bypasses it if reqwest's default redirect policy is in
-        // effect. `Client::default()` (the prior fallback) re-enables
-        // following up to 10 hops, so a build-time TLS failure here
-        // silently reopened the SSRF gap. `.expect()` makes the
-        // failure loud at startup; `.redirect(Policy::none())` makes
-        // the SSRF re-check load-bearing.
-        // MCP-1034: explicit connect_timeout — fast-fail on black-holed
-        // SLA-alert endpoint.
+                                                                                       // MCP-497: same SSRF-via-redirect fix as MCP-469/470 — the
+                                                                                       // `check_outbound_url_no_ssrf` gate below catches the literal
+                                                                                       // URL but a 302 from the validated host to an internal host
+                                                                                       // bypasses it if reqwest's default redirect policy is in
+                                                                                       // effect. `Client::default()` (the prior fallback) re-enables
+                                                                                       // following up to 10 hops, so a build-time TLS failure here
+                                                                                       // silently reopened the SSRF gap. `.expect()` makes the
+                                                                                       // failure loud at startup; `.redirect(Policy::none())` makes
+                                                                                       // the SSRF re-check load-bearing.
+                                                                                       // MCP-1034: explicit connect_timeout — fast-fail on black-holed
+                                                                                       // SLA-alert endpoint.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(5))
@@ -5039,7 +5047,12 @@ async fn cors_middleware(req: Request<axum::body::Body>, next: Next) -> Response
     // layer sets `Vary: Cookie` already; both must apply so caches
     // partition by both axes.
     match headers.get(header::VARY) {
-        Some(existing) if existing.to_str().ok().is_some_and(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("Origin"))) => {
+        Some(existing)
+            if existing.to_str().ok().is_some_and(|s| {
+                s.split(',')
+                    .any(|p| p.trim().eq_ignore_ascii_case("Origin"))
+            }) =>
+        {
             // Origin already in Vary — leave existing value untouched.
         }
         Some(existing) => {
@@ -5246,10 +5259,9 @@ async fn seed_csrf_handler(headers: axum::http::HeaderMap) -> axum::response::Re
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, private"),
     );
-    response.headers_mut().insert(
-        header::VARY,
-        HeaderValue::from_static("Cookie"),
-    );
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Cookie"));
 
     if !already_has_cookie {
         let mut bytes = [0u8; 32];

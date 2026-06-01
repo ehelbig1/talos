@@ -1129,7 +1129,9 @@ async fn handle_validate_all_workflows(
                     .workflow_repo
                     .get_installed_secrets_by_template_ids(&all_module_ids, user_id),
                 state.workflow_repo.get_templates_by_ids(&all_module_ids),
-                state.analytics_repo.check_template_ids_exist(&all_module_ids),
+                state
+                    .analytics_repo
+                    .check_template_ids_exist(&all_module_ids),
                 state.analytics_repo.check_module_ids_exist(&all_module_ids),
             )
         } else {
@@ -1477,7 +1479,11 @@ fn clean_truncate_error(error: &str, max_chars: usize) -> String {
     }
     let cut = talos_text_util::truncate_at_char_boundary(error, max_chars);
     // Look for clause boundaries first — they're the most natural cut.
-    if let Some(idx) = cut.rfind(". ").or_else(|| cut.rfind(": ")).or_else(|| cut.rfind("; ")) {
+    if let Some(idx) = cut
+        .rfind(". ")
+        .or_else(|| cut.rfind(": "))
+        .or_else(|| cut.rfind("; "))
+    {
         // Include the punctuation, drop the trailing space, append ellipsis.
         return format!("{}…", &cut[..idx + 1]);
     }
@@ -1579,9 +1585,7 @@ async fn handle_get_workflow_audit_trail(
             .as_ref()
             .map(|t| format!(", trigger: {}", t))
             .unwrap_or_default();
-        let error_preview = error_message
-            .as_ref()
-            .map(|e| clean_truncate_error(e, 140));
+        let error_preview = error_message.as_ref().map(|e| clean_truncate_error(e, 140));
 
         let detail = match &error_preview {
             Some(p) => format!(
@@ -1655,11 +1659,17 @@ async fn handle_get_workflow_sla_report(
         Err(resp) => return resp,
     };
 
-    let target_success_rate: f64 =
-        match crate::utils::validate_range_f64(args, "target_success_rate", 0.0, 100.0, 99.0, &req_id) {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let target_success_rate: f64 = match crate::utils::validate_range_f64(
+        args,
+        "target_success_rate",
+        0.0,
+        100.0,
+        99.0,
+        &req_id,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     // target_max_duration_ms is open-ended on the upper side (very long-running
     // workflows are legitimate), but reject negative / zero values explicitly.
@@ -1673,26 +1683,26 @@ async fn handle_get_workflow_sla_report(
     // absent / null (legitimate default) from wrong-type (loud reject).
     let target_max_duration_ms: f64 = match args.get("target_max_duration_ms") {
         None | Some(serde_json::Value::Null) => 5000.0,
-        Some(v) => match v.as_f64() {
-            Some(n) if !n.is_finite() || n < 1.0 => {
-                return mcp_error(
+        Some(v) => {
+            match v.as_f64() {
+                Some(n) if !n.is_finite() || n < 1.0 => {
+                    return mcp_error(
                     req_id,
                     -32602,
                     &format!("Invalid 'target_max_duration_ms' value {n}: must be a finite number ≥ 1.0"),
                 );
+                }
+                Some(n) => n,
+                None => {
+                    let kind = crate::utils::json_type_name(v);
+                    return mcp_error(
+                        req_id,
+                        -32602,
+                        &format!("target_max_duration_ms must be a number ≥ 1.0, got {kind}"),
+                    );
+                }
             }
-            Some(n) => n,
-            None => {
-                let kind = crate::utils::json_type_name(v);
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    &format!(
-                        "target_max_duration_ms must be a number ≥ 1.0, got {kind}"
-                    ),
-                );
-            }
-        },
+        }
     };
 
     let days: i32 = match crate::utils::validate_range_i64(args, "days", 1, 90, 30, &req_id) {
@@ -1989,11 +1999,10 @@ async fn handle_get_workflow_call_tree(
     // MCP-38 (2026-05-07): N-J validation matches the schema-declared
     // bound. Pre-fix the silent `.min(5)` clamp accepted out-of-range
     // values and silently truncated, hiding caller typos.
-    let max_depth =
-        match crate::utils::validate_range_u64(args, "max_depth", 1, 5, 3, &req_id) {
-            Ok(v) => v as usize,
-            Err(resp) => return resp,
-        };
+    let max_depth = match crate::utils::validate_range_u64(args, "max_depth", 1, 5, 3, &req_id) {
+        Ok(v) => v as usize,
+        Err(resp) => return resp,
+    };
 
     // Recursive function to build call tree
     async fn build_call_tree(
@@ -2267,14 +2276,13 @@ async fn handle_get_error_report(
             if let Some(nodes) = graph.get("nodes").and_then(|n| n.as_array()) {
                 for node in nodes {
                     if let Some(node_id_str) = node.get("id").and_then(|v| v.as_str()) {
-                        let node_uuid =
-                            uuid::Uuid::parse_str(node_id_str).unwrap_or_else(|_| {
-                                use sha2::{Digest, Sha256};
-                                let hash = Sha256::digest(node_id_str.as_bytes());
-                                let mut bytes = [0u8; 16];
-                                bytes.copy_from_slice(&hash[..16]);
-                                uuid::Uuid::from_bytes(bytes)
-                            });
+                        let node_uuid = uuid::Uuid::parse_str(node_id_str).unwrap_or_else(|_| {
+                            use sha2::{Digest, Sha256};
+                            let hash = Sha256::digest(node_id_str.as_bytes());
+                            let mut bytes = [0u8; 16];
+                            bytes.copy_from_slice(&hash[..16]);
+                            uuid::Uuid::from_bytes(bytes)
+                        });
                         let label = node
                             .get("data")
                             .and_then(|d| d.get("label"))
@@ -2729,7 +2737,9 @@ async fn handle_suggest_retry_config(
         ));
         suggested_retry_count = 0;
         retry_condition = "none";
-        retry_advisory = Some("Failures appear deterministic — retrying will not help. Fix the upstream cause first.");
+        retry_advisory = Some(
+            "Failures appear deterministic — retrying will not help. Fix the upstream cause first.",
+        );
         error_class = "deterministic";
     } else if timeout_errors > 0 || rate_limit_errors > 0 {
         reasoning.push(format!(
@@ -3190,8 +3200,14 @@ fn build_node_failure_fingerprint_groups(
         .collect();
     // Most-impactful group first (by total failures, then node count).
     groups.sort_by(|a, b| {
-        let af = a.get("total_failure_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let bf = b.get("total_failure_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let af = a
+            .get("total_failure_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let bf = b
+            .get("total_failure_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         bf.cmp(&af).then_with(|| {
             let an = a.get("node_count").and_then(|v| v.as_i64()).unwrap_or(0);
             let bn = b.get("node_count").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -3400,8 +3416,15 @@ async fn handle_get_workflow_performance_report(
     // p95_ms emitted f64 from SQL percentile_cont with values like
     // 22205.164099999998 (12 decimals). Same shape as MCP-30 +
     // get_execution_cost.avg_node_time_ms.
-    let round_2dp =
-        |v: Option<f64>| v.map(|x| if x.is_finite() { (x * 100.0).round() / 100.0 } else { 0.0 });
+    let round_2dp = |v: Option<f64>| {
+        v.map(|x| {
+            if x.is_finite() {
+                (x * 100.0).round() / 100.0
+            } else {
+                0.0
+            }
+        })
+    };
     let p50_ms = round_2dp(perf.p50_ms);
     let p95_ms = round_2dp(perf.p95_ms);
     let p99_ms = round_2dp(perf.p99_ms);
@@ -4335,9 +4358,7 @@ async fn handle_set_workflow_capabilities(
                         return mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "capabilities[{i}] must be a string, got {kind}"
-                            ),
+                            &format!("capabilities[{i}] must be a string, got {kind}"),
                         );
                     }
                 }
@@ -4353,10 +4374,14 @@ async fn handle_set_workflow_capabilities(
     // (talos-workflow-creation-helpers).
     for cap in &capabilities {
         if !talos_workflow_creation_helpers::is_valid_capability_name(cap) {
-            return mcp_error(req_id, -32602, &format!(
+            return mcp_error(
+                req_id,
+                -32602,
+                &format!(
                 "Invalid capability '{}'. Must be lowercase alphanumeric + hyphens, 1-50 chars.",
                 talos_text_util::bounded_preview(cap, 64)
-            ));
+            ),
+            );
         }
     }
     match state
@@ -4408,9 +4433,7 @@ async fn handle_get_workflows_by_capability(
                         return mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "capabilities[{i}] must be a string, got {kind}"
-                            ),
+                            &format!("capabilities[{i}] must be a string, got {kind}"),
                         );
                     }
                 }
@@ -4457,9 +4480,9 @@ async fn handle_get_workflows_by_capability(
                         }
                     });
                     let percent_value: serde_json::Value = match frac_opt {
-                        Some(f) if f.is_finite() => serde_json::json!(
-                            talos_analytics_repository::format_percent(f * 100.0)
-                        ),
+                        Some(f) if f.is_finite() => {
+                            serde_json::json!(talos_analytics_repository::format_percent(f * 100.0))
+                        }
                         _ => serde_json::Value::Null,
                     };
                     serde_json::json!({
@@ -4985,11 +5008,8 @@ async fn handle_get_readiness_breakdown(
         .unwrap_or(false);
     let has_caps = !caps.is_empty();
     // has_desc: 10, has_node_desc: 5, has_caps: 5 = max 20 — shared with validate_workflow.
-    let documentation = talos_analytics_repository::compute_documentation_score(
-        has_desc,
-        has_node_desc,
-        has_caps,
-    );
+    let documentation =
+        talos_analytics_repository::compute_documentation_score(has_desc, has_node_desc, has_caps);
 
     // ── Freshness (20%) ───────────────────────────────────────────────────
     let last_exec_at = state
@@ -5333,8 +5353,7 @@ async fn handle_get_all_readiness_scores(
             // shared by the per-row state label AND the aggregate
             // counter so they can never diverge again. See
             // `classify_readiness_state` for the full rationale.
-            let (is_unscored, score_state) =
-                classify_readiness_state(raw_score, scored_at);
+            let (is_unscored, score_state) = classify_readiness_state(raw_score, scored_at);
 
             score_sum += score as i64;
             if score < 50 {
@@ -6311,16 +6330,14 @@ mod readiness_classification_tests {
 
     #[test]
     fn scored_zero_when_scored_at_present_and_score_zero() {
-        let (is_unscored, label) =
-            classify_readiness_state(Some(0), Some(t(2026, 5, 7)));
+        let (is_unscored, label) = classify_readiness_state(Some(0), Some(t(2026, 5, 7)));
         assert!(!is_unscored);
         assert_eq!(label, "scored_zero");
     }
 
     #[test]
     fn scored_when_both_present_and_nonzero() {
-        let (is_unscored, label) =
-            classify_readiness_state(Some(85), Some(t(2026, 5, 7)));
+        let (is_unscored, label) = classify_readiness_state(Some(85), Some(t(2026, 5, 7)));
         assert!(!is_unscored);
         assert_eq!(label, "scored");
     }
@@ -6331,8 +6348,7 @@ mod readiness_classification_tests {
         // classify as "scored_zero" so operators know the scoring
         // pipeline at least ran. Either way, the per-row label and
         // the aggregate counter MUST agree.
-        let (is_unscored, label) =
-            classify_readiness_state(None, Some(t(2026, 5, 7)));
+        let (is_unscored, label) = classify_readiness_state(None, Some(t(2026, 5, 7)));
         assert!(!is_unscored);
         assert_eq!(label, "scored_zero");
     }

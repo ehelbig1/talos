@@ -90,10 +90,10 @@ impl AuthQueries {
         if !oauth_service.is_provider_enabled(&provider_enum) {
             // MCP-918: .extend_safe() — operator needs to know which
             // provider is misconfigured, not "Internal server error".
-            return Err(async_graphql::Error::new(format!(
-                "{} OAuth is not configured",
-                provider
-            )).extend_safe());
+            return Err(
+                async_graphql::Error::new(format!("{} OAuth is not configured", provider))
+                    .extend_safe(),
+            );
         }
 
         let (auth_url, _csrf_token) = oauth_service

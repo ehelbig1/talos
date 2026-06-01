@@ -34,10 +34,7 @@ const REPLAY_OVERRIDE_MAX_BYTES: usize = 1_000_000;
 
 impl ExecutionOrchestrationService {
     /// Re-run a prior execution with its original `trigger_input`.
-    pub async fn replay(
-        &self,
-        input: ReplayInput,
-    ) -> Result<ExecutionOutcome, OrchestrationError> {
+    pub async fn replay(&self, input: ReplayInput) -> Result<ExecutionOutcome, OrchestrationError> {
         self.replay_common(
             input.original_execution_id,
             input.user_id,
@@ -185,8 +182,7 @@ impl ExecutionOrchestrationService {
 
         // 6. Recover the original trigger input from the stored output
         // bundle, then optionally merge overrides on top.
-        let mut trigger_input =
-            result_collector::extract_trigger_input(output_data.as_ref());
+        let mut trigger_input = result_collector::extract_trigger_input(output_data.as_ref());
         if let Some(overrides) = input_overrides {
             deep_merge(&mut trigger_input, &overrides);
         }
@@ -321,11 +317,7 @@ impl ExecutionOrchestrationService {
                     let fail_output =
                         result_collector::collect_failure_output(&trigger_input_for_storage);
                     if let Err(db_err) = repo_for_task
-                        .mark_execution_failed(
-                            new_execution_id,
-                            &redacted_err,
-                            Some(&fail_output),
-                        )
+                        .mark_execution_failed(new_execution_id, &redacted_err, Some(&fail_output))
                         .await
                     {
                         tracing::error!(

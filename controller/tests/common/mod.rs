@@ -154,15 +154,13 @@ pub async fn add_user_to_organization(
     // exercised it. Currently the helper has zero callers but keep it
     // accurate so a future user of the harness doesn't get a confusing
     // surprise.
-    sqlx::query(
-        "INSERT INTO organization_members (user_id, org_id, role) VALUES ($1, $2, $3)",
-    )
-    .bind(user_id)
-    .bind(organization_id)
-    .bind(role)
-    .execute(db_pool)
-    .await
-    .expect("Failed to add user to organization");
+    sqlx::query("INSERT INTO organization_members (user_id, org_id, role) VALUES ($1, $2, $3)")
+        .bind(user_id)
+        .bind(organization_id)
+        .bind(role)
+        .execute(db_pool)
+        .await
+        .expect("Failed to add user to organization");
 }
 
 #[allow(dead_code)]

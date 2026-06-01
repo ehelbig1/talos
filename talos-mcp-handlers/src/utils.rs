@@ -598,8 +598,12 @@ pub fn validate_name_no_control_chars(
     // Canonical single-line control-char rule lives in `talos-validation`
     // (shared with the GraphQL surface). allow-validation-predicate: thin
     // wrapper mapping the shared error into the MCP -32602 shape.
-    talos_validation::reject_control_chars(field_label, value, talos_validation::LineMode::SingleLine)
-        .map_err(|e| mcp_error(req_id, -32602, &e.message))
+    talos_validation::reject_control_chars(
+        field_label,
+        value,
+        talos_validation::LineMode::SingleLine,
+    )
+    .map_err(|e| mcp_error(req_id, -32602, &e.message))
 }
 
 /// MCP-429 (2026-05-11): canonical validator for multi-line
@@ -789,9 +793,7 @@ pub fn validate_range_f64(
             Some(n) if !n.is_finite() => Err(mcp_error(
                 req_id.clone(),
                 -32602,
-                &format!(
-                    "Invalid '{field}' value {n}: must be a finite number in [{min}, {max}]"
-                ),
+                &format!("Invalid '{field}' value {n}: must be a finite number in [{min}, {max}]"),
             )),
             Some(n) if !(min..=max).contains(&n) => Err(mcp_error(
                 req_id.clone(),
@@ -1032,10 +1034,7 @@ pub fn require_node_id(
                 Err(mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "'{}' must be a non-empty, non-whitespace string",
-                        field
-                    ),
+                    &format!("'{}' must be a non-empty, non-whitespace string", field),
                 ))
             } else {
                 Ok(trimmed.to_string())
@@ -1125,11 +1124,7 @@ pub fn enforce_payload_size_limit(
     payload: &serde_json::Value,
     req_id: Option<serde_json::Value>,
 ) -> Result<(), JsonRpcResponse> {
-    if serde_json::to_string(payload)
-        .map(|s| s.len())
-        .unwrap_or(0)
-        > 1_000_000
-    {
+    if serde_json::to_string(payload).map(|s| s.len()).unwrap_or(0) > 1_000_000 {
         return Err(mcp_error(
             req_id,
             -32602,
@@ -1168,10 +1163,7 @@ pub fn manifest_error_to_response(
 /// or capability ceilings (test paths). Production dispatch goes through
 /// `talos-execution-orchestration` instead.
 pub fn actor_dispatch_lifecycle_to_response(
-    result: Result<
-        talos_workflow_authorization::ActorDispatchLifecycle,
-        anyhow::Error,
-    >,
+    result: Result<talos_workflow_authorization::ActorDispatchLifecycle, anyhow::Error>,
     req_id: Option<serde_json::Value>,
     log_context: &str,
 ) -> Result<(), JsonRpcResponse> {
@@ -1458,9 +1450,7 @@ pub fn json_optional_string(obj: &serde_json::Value, field: &str) -> Option<Stri
 /// * Does NOT check length — the caller's required dimension count is
 ///   provider-specific (1536 for OpenAI ada-002, 768 for nomic-embed-text),
 ///   so that check stays at the call site.
-pub fn parse_embedding_array(
-    arr: &[serde_json::Value],
-) -> Result<Vec<f64>, String> {
+pub fn parse_embedding_array(arr: &[serde_json::Value]) -> Result<Vec<f64>, String> {
     let mut out = Vec::with_capacity(arr.len());
     for (idx, v) in arr.iter().enumerate() {
         let f = match v.as_f64() {
@@ -1473,9 +1463,7 @@ pub fn parse_embedding_array(
             }
         };
         if !f.is_finite() {
-            return Err(format!(
-                "embedding[{idx}] must be a finite number, got {f}"
-            ));
+            return Err(format!("embedding[{idx}] must be a finite number, got {f}"));
         }
         out.push(f);
     }
@@ -1719,24 +1707,24 @@ mod optional_string_tests {
     #[test]
     fn absent_uses_default() {
         let args = json!({});
-        let got = validate_optional_string(&args, "policy", "suspend", Some(POLICIES), &None)
-            .unwrap();
+        let got =
+            validate_optional_string(&args, "policy", "suspend", Some(POLICIES), &None).unwrap();
         assert_eq!(got, "suspend");
     }
 
     #[test]
     fn null_uses_default() {
         let args = json!({"policy": null});
-        let got = validate_optional_string(&args, "policy", "suspend", Some(POLICIES), &None)
-            .unwrap();
+        let got =
+            validate_optional_string(&args, "policy", "suspend", Some(POLICIES), &None).unwrap();
         assert_eq!(got, "suspend");
     }
 
     #[test]
     fn valid_allowlist_value_returned() {
         let args = json!({"policy": "block"});
-        let got = validate_optional_string(&args, "policy", "suspend", Some(POLICIES), &None)
-            .unwrap();
+        let got =
+            validate_optional_string(&args, "policy", "suspend", Some(POLICIES), &None).unwrap();
         assert_eq!(got, "block");
     }
 
@@ -1747,7 +1735,10 @@ mod optional_string_tests {
             .unwrap_err();
         let body = serde_json::to_string(&err).unwrap();
         assert!(body.contains("'ignore'"), "value not echoed: {body}");
-        assert!(body.contains("suspend, alert, block"), "list missing: {body}");
+        assert!(
+            body.contains("suspend, alert, block"),
+            "list missing: {body}"
+        );
     }
 
     #[test]
@@ -1764,8 +1755,7 @@ mod optional_string_tests {
     #[test]
     fn wrong_type_array_rejects_loudly_with_kind() {
         let args = json!({"namespace": ["prod"]});
-        let err = validate_optional_string(&args, "namespace", "default", None, &None)
-            .unwrap_err();
+        let err = validate_optional_string(&args, "namespace", "default", None, &None).unwrap_err();
         let body = serde_json::to_string(&err).unwrap();
         assert!(body.contains("got array"), "kind missing: {body}");
     }
@@ -1960,7 +1950,10 @@ mod require_int_range_i32_tests {
     #[test]
     fn one_accepts() {
         let args = json!({"v": 1});
-        assert_eq!(require_int_range_i32(&args, "v", 1, i32::MAX, &None).unwrap(), 1);
+        assert_eq!(
+            require_int_range_i32(&args, "v", 1, i32::MAX, &None).unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -2699,7 +2692,9 @@ mod name_no_control_chars_tests {
     fn rejects_null_byte() {
         let resp = validate_name_no_control_chars("Field", "ab\0cd", None).unwrap_err();
         assert!(body_text(&resp).contains("Field"));
-        assert!(body_text(&resp).to_lowercase().contains("control characters or null"));
+        assert!(body_text(&resp)
+            .to_lowercase()
+            .contains("control characters or null"));
     }
 
     #[test]
@@ -2798,16 +2793,14 @@ mod multiline_description_tests {
         // trimmed is exactly the cap — should accept.
         let body = "x".repeat(5000);
         let padded = format!("   {body}   ");
-        assert!(
-            validate_multiline_description("X", Some(&padded), 5000, "", None).is_ok()
-        );
+        assert!(validate_multiline_description("X", Some(&padded), 5000, "", None).is_ok());
     }
 
     #[test]
     fn rejects_over_length_after_trim() {
         let too_long = "x".repeat(5001);
-        let resp = validate_multiline_description("X", Some(&too_long), 5000, "", None)
-            .unwrap_err();
+        let resp =
+            validate_multiline_description("X", Some(&too_long), 5000, "", None).unwrap_err();
         let text = body_text(&resp);
         assert!(text.contains("5000"));
     }

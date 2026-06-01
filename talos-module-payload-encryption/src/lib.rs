@@ -195,7 +195,11 @@ mod tests {
     fn slot_aad_v1_is_row_id_only_for_every_slot() {
         let id = Uuid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788);
         let v1 = talos_secrets_manager::SecretsManager::AAD_FORMAT_V1;
-        for slot in [PayloadSlot::Input, PayloadSlot::Output, PayloadSlot::Trigger] {
+        for slot in [
+            PayloadSlot::Input,
+            PayloadSlot::Output,
+            PayloadSlot::Trigger,
+        ] {
             assert_eq!(payload_slot_aad(id, slot, v1), id.as_bytes().to_vec());
         }
         // v0 (legacy) behaves like v1: row-id only.

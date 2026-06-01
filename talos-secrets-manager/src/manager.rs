@@ -454,8 +454,7 @@ impl SecretsManager {
         // controller load 10-100× per workflow run. Same =0 footgun
         // class as MCP-665/689/695/703 (and a sibling of
         // LLM_KEYS_CACHE_TTL_SECS, fixed in the same commit below).
-        let cache_ttl_secs =
-            talos_config::positive_env_or_default("DEK_CACHE_TTL_SECS", 300u64);
+        let cache_ttl_secs = talos_config::positive_env_or_default("DEK_CACHE_TTL_SECS", 300u64);
 
         tracing::info!(
             ttl_seconds = cache_ttl_secs,
@@ -1098,8 +1097,9 @@ impl SecretsManager {
         //     not user ownership, and modules are intentionally
         //     cross-user when the operator lists them in allowed_modules.
         let row = match &requestor {
-            SecretRequestor::User(user_id) => sqlx::query(
-                r#"
+            SecretRequestor::User(user_id) => {
+                sqlx::query(
+                    r#"
                     SELECT id,
                            encrypted_value,
                            encryption_key_id,
@@ -1113,14 +1113,16 @@ impl SecretsManager {
                       AND (owner_user_id = $2 OR org_id = ANY($3))
                     LIMIT 1
                 "#,
-            )
-            .bind(key_path)
-            .bind(user_id)
-            .bind(accessible_org_ids)
-            .fetch_one(&self.db_pool)
-            .await?,
-            SecretRequestor::Module(_) | SecretRequestor::System => sqlx::query(
-                r#"
+                )
+                .bind(key_path)
+                .bind(user_id)
+                .bind(accessible_org_ids)
+                .fetch_one(&self.db_pool)
+                .await?
+            }
+            SecretRequestor::Module(_) | SecretRequestor::System => {
+                sqlx::query(
+                    r#"
                     SELECT id,
                            encrypted_value,
                            encryption_key_id,
@@ -1133,10 +1135,11 @@ impl SecretsManager {
                     WHERE key_path = $1
                     LIMIT 1
                 "#,
-            )
-            .bind(key_path)
-            .fetch_one(&self.db_pool)
-            .await?,
+                )
+                .bind(key_path)
+                .fetch_one(&self.db_pool)
+                .await?
+            }
         };
 
         let record = SecretRecord {
@@ -1421,7 +1424,8 @@ impl SecretsManager {
         encrypted: &[u8],
     ) -> Result<Zeroizing<String>> {
         // Empty AAD path. Equivalent to the v0 ciphertext format.
-        self.decrypt_value_by_key_with_aad(key_id, encrypted, &[]).await
+        self.decrypt_value_by_key_with_aad(key_id, encrypted, &[])
+            .await
     }
 
     /// AES-GCM AAD format version used for `secrets` rows that bind
@@ -1579,11 +1583,7 @@ impl SecretsManager {
     /// `secrets.encryption_format_version`), NOT by an in-band flag —
     /// AES-GCM offers no way to tell from a ciphertext alone whether
     /// it was encrypted with AAD.
-    pub async fn encrypt_value_with_aad(
-        &self,
-        value: &str,
-        aad: &[u8],
-    ) -> Result<(Uuid, Vec<u8>)> {
+    pub async fn encrypt_value_with_aad(&self, value: &str, aad: &[u8]) -> Result<(Uuid, Vec<u8>)> {
         let dek = self.get_active_dek().await?;
         let cipher = Aes256Gcm::new_from_slice(&dek.key)?;
         let nonce_bytes = Self::generate_nonce();
@@ -1684,7 +1684,8 @@ impl SecretsManager {
         module_id: Uuid,
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<String, String>> {
-        self.get_module_secrets_inner(module_id, Some(user_id)).await
+        self.get_module_secrets_inner(module_id, Some(user_id))
+            .await
     }
 
     async fn get_module_secrets_inner(
@@ -2138,7 +2139,8 @@ impl SecretsManager {
         // filter. Scope carries (requestor, accessible orgs); the policy
         // matches owner_user_id/created_by = current_user_id OR
         // org_id = ANY(current_org_ids).
-        let scope = talos_tenancy::TenantReadScope::new(requestor_user_id, accessible_org_ids.to_vec());
+        let scope =
+            talos_tenancy::TenantReadScope::new(requestor_user_id, accessible_org_ids.to_vec());
         let mut tx = talos_db::begin_tenant_read_scoped(&self.db_pool, &scope).await?;
         let row = sqlx::query(
             r#"
@@ -2524,20 +2526,22 @@ impl SecretsManager {
         // 2nd row.
         let ids: Vec<Uuid> = match ident {
             crate::SecretIdentifier::Id(id) => {
-                let found: Option<Uuid> = sqlx::query_scalar(
-                    "SELECT id FROM secrets WHERE id = $1 AND created_by = $2",
-                )
-                .bind(id)
-                .bind(user_id)
-                .fetch_optional(&self.db_pool)
-                .await
-                .map_err(|e| {
-                    tracing::error!(err = ?e, "resolve_to_id Id lookup failed");
-                    SecretResolveError::Internal(e.into())
-                })?;
+                let found: Option<Uuid> =
+                    sqlx::query_scalar("SELECT id FROM secrets WHERE id = $1 AND created_by = $2")
+                        .bind(id)
+                        .bind(user_id)
+                        .fetch_optional(&self.db_pool)
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(err = ?e, "resolve_to_id Id lookup failed");
+                            SecretResolveError::Internal(e.into())
+                        })?;
                 found.into_iter().collect()
             }
-            crate::SecretIdentifier::KeyPath { key_path, namespace } => {
+            crate::SecretIdentifier::KeyPath {
+                key_path,
+                namespace,
+            } => {
                 let found: Option<Uuid> = sqlx::query_scalar(
                     "SELECT id FROM secrets \
                      WHERE key_path = $1 AND namespace = $2 AND created_by = $3",
@@ -2554,37 +2558,33 @@ impl SecretsManager {
                 found.into_iter().collect()
             }
             crate::SecretIdentifier::Name { name, namespace } => match namespace {
-                Some(ns) => {
-                    sqlx::query_scalar(
-                        "SELECT id FROM secrets \
+                Some(ns) => sqlx::query_scalar(
+                    "SELECT id FROM secrets \
                          WHERE name = $1 AND namespace = $2 AND created_by = $3 \
                          LIMIT 2",
-                    )
-                    .bind(name)
-                    .bind(ns)
-                    .bind(user_id)
-                    .fetch_all(&self.db_pool)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(err = ?e, "resolve_to_id Name+ns lookup failed");
-                        SecretResolveError::Internal(e.into())
-                    })?
-                }
-                None => {
-                    sqlx::query_scalar(
-                        "SELECT id FROM secrets \
+                )
+                .bind(name)
+                .bind(ns)
+                .bind(user_id)
+                .fetch_all(&self.db_pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!(err = ?e, "resolve_to_id Name+ns lookup failed");
+                    SecretResolveError::Internal(e.into())
+                })?,
+                None => sqlx::query_scalar(
+                    "SELECT id FROM secrets \
                          WHERE name = $1 AND created_by = $2 \
                          LIMIT 2",
-                    )
-                    .bind(name)
-                    .bind(user_id)
-                    .fetch_all(&self.db_pool)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(err = ?e, "resolve_to_id Name lookup failed");
-                        SecretResolveError::Internal(e.into())
-                    })?
-                }
+                )
+                .bind(name)
+                .bind(user_id)
+                .fetch_all(&self.db_pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!(err = ?e, "resolve_to_id Name lookup failed");
+                    SecretResolveError::Internal(e.into())
+                })?,
             },
         };
 
@@ -3957,11 +3957,9 @@ impl SecretsManager {
         // every subsequent `rotate_dek` until the connection is
         // recycled out of the pool (which may never happen).
         const ROTATE_DEK_LOCK_KEY: i64 = 0x44_4B_5F_52_4F_54_41_54;
-        let mut lock_conn = self
-            .db_pool
-            .acquire()
-            .await
-            .context("Failed to acquire dedicated connection for rotate_master_key advisory lock")?;
+        let mut lock_conn = self.db_pool.acquire().await.context(
+            "Failed to acquire dedicated connection for rotate_master_key advisory lock",
+        )?;
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(ROTATE_DEK_LOCK_KEY)
             .execute(&mut *lock_conn)
@@ -3972,173 +3970,174 @@ impl SecretsManager {
         // async block so `?`-bails inside still flow through the
         // explicit unlock at the bottom of this function.
         let rotation_result: Result<u64> = async {
-        // Snapshot the DEK ids AFTER acquiring the lock so any
-        // rotate_dek that landed between `current_kek()` and the lock
-        // acquire (and committed before our lock was granted) is
-        // captured by this snapshot rather than orphaned.
-        let all_dek_ids: Vec<Uuid> =
-            sqlx::query_scalar::<_, Uuid>("SELECT id FROM encryption_keys ORDER BY created_at ASC")
-                .fetch_all(&self.db_pool)
-                .await
-                .context("Failed to fetch encryption key IDs")?;
+            // Snapshot the DEK ids AFTER acquiring the lock so any
+            // rotate_dek that landed between `current_kek()` and the lock
+            // acquire (and committed before our lock was granted) is
+            // captured by this snapshot rather than orphaned.
+            let all_dek_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM encryption_keys ORDER BY created_at ASC",
+            )
+            .fetch_all(&self.db_pool)
+            .await
+            .context("Failed to fetch encryption key IDs")?;
 
-        if all_dek_ids.is_empty() {
-            tracing::info!("No DEKs found to re-encrypt during master key rotation");
-            *self
-                .kek
-                .write()
-                .map_err(|_| anyhow!("KEK provider lock poisoned"))? = new_provider;
-            return Ok(0);
-        }
+            if all_dek_ids.is_empty() {
+                tracing::info!("No DEKs found to re-encrypt during master key rotation");
+                *self
+                    .kek
+                    .write()
+                    .map_err(|_| anyhow!("KEK provider lock poisoned"))? = new_provider;
+                return Ok(0);
+            }
 
-        tracing::info!(
-            dek_count = all_dek_ids.len(),
-            auditor = ?auditor,
-            "Starting master key rotation"
-        );
+            tracing::info!(
+                dek_count = all_dek_ids.len(),
+                auditor = ?auditor,
+                "Starting master key rotation"
+            );
 
-        // PARTIAL-FAILURE SAFETY BELT (H-1).
-        //
-        // Install the OLD provider as `kek_legacy` BEFORE the rewrap loop
-        // begins. The decrypt_dek fallback path (above) tries the active
-        // provider first and falls back to legacy on failure — so:
-        //
-        //   * Rows already rewrapped (post-loop): unwrappable via NEW
-        //     active provider after the swap below.
-        //   * Rows not yet rewrapped (pre-loop or interrupted): still
-        //     wrapped with the OLD master key — unwrappable via legacy.
-        //
-        // Without this belt, an interrupted rotation (DB error mid-batch,
-        // OOM, pod kill) leaves SOME rows wrapped with NEW master and
-        // SOME with OLD; the manager's `kek` is still OLD because the
-        // swap below was never reached, so NEW-wrapped rows become
-        // un-decryptable until manual intervention. Operators can now
-        // simply retry — every prior partial-rotation row is recovered
-        // via the legacy path.
-        //
-        // We deliberately keep the belt installed even on the success
-        // path until the swap completes; clear it only after both the
-        // rewrap loop AND the active-provider swap have landed.
-        {
-            let mut legacy_guard = self
-                .kek_legacy
-                .write()
-                .map_err(|_| anyhow!("KEK legacy provider lock poisoned"))?;
-            if legacy_guard.is_some() {
-                // Mid-rotation crash + retry: legacy is already populated
-                // from the previous attempt. Don't clobber it — that
-                // legacy provider may still be load-bearing for a
-                // small slice of rows that haven't reached the new
-                // master yet. Bail loudly.
-                return Err(anyhow!(
-                    "rotate_master_key: kek_legacy already populated — \
+            // PARTIAL-FAILURE SAFETY BELT (H-1).
+            //
+            // Install the OLD provider as `kek_legacy` BEFORE the rewrap loop
+            // begins. The decrypt_dek fallback path (above) tries the active
+            // provider first and falls back to legacy on failure — so:
+            //
+            //   * Rows already rewrapped (post-loop): unwrappable via NEW
+            //     active provider after the swap below.
+            //   * Rows not yet rewrapped (pre-loop or interrupted): still
+            //     wrapped with the OLD master key — unwrappable via legacy.
+            //
+            // Without this belt, an interrupted rotation (DB error mid-batch,
+            // OOM, pod kill) leaves SOME rows wrapped with NEW master and
+            // SOME with OLD; the manager's `kek` is still OLD because the
+            // swap below was never reached, so NEW-wrapped rows become
+            // un-decryptable until manual intervention. Operators can now
+            // simply retry — every prior partial-rotation row is recovered
+            // via the legacy path.
+            //
+            // We deliberately keep the belt installed even on the success
+            // path until the swap completes; clear it only after both the
+            // rewrap loop AND the active-provider swap have landed.
+            {
+                let mut legacy_guard = self
+                    .kek_legacy
+                    .write()
+                    .map_err(|_| anyhow!("KEK legacy provider lock poisoned"))?;
+                if legacy_guard.is_some() {
+                    // Mid-rotation crash + retry: legacy is already populated
+                    // from the previous attempt. Don't clobber it — that
+                    // legacy provider may still be load-bearing for a
+                    // small slice of rows that haven't reached the new
+                    // master yet. Bail loudly.
+                    return Err(anyhow!(
+                        "rotate_master_key: kek_legacy already populated — \
                      a previous rotation may still be in progress or \
                      awaiting recovery. Inspect dek_decrypt_failures \
                      metrics and either complete the prior rotation or \
                      manually clear the legacy slot before retrying."
-                ));
-            }
-            *legacy_guard = Some(Arc::clone(&old_provider));
-        }
-
-        const BATCH_SIZE: usize = 50;
-        let mut total_re_encrypted: u64 = 0;
-
-        for batch in all_dek_ids.chunks(BATCH_SIZE) {
-            let mut tx = self
-                .db_pool
-                .begin()
-                .await
-                .context("Failed to begin transaction for master key rotation batch")?;
-
-            for &dek_id in batch {
-                // Fetch the wrapped DEK with row-level lock
-                let row = sqlx::query(
-                    "SELECT encrypted_key FROM encryption_keys WHERE id = $1 FOR UPDATE",
-                )
-                .bind(dek_id)
-                .fetch_one(&mut *tx)
-                .await
-                .context(format!("Failed to fetch DEK {} for re-encryption", dek_id))?;
-
-                let encrypted_key: Vec<u8> = Row::get(&row, "encrypted_key");
-
-                // Unwrap with old provider, rewrap with new provider.
-                let plaintext =
-                    old_provider
-                        .unwrap_dek(&encrypted_key)
-                        .await
-                        .with_context(|| {
-                            format!("Failed to unwrap DEK {} with old provider", dek_id)
-                        })?;
-                let mut dek_arr = [0u8; 32];
-                if plaintext.len() != 32 {
-                    return Err(anyhow!(
-                        "Unwrapped DEK {} has unexpected length: {}",
-                        dek_id,
-                        plaintext.len()
                     ));
                 }
-                dek_arr.copy_from_slice(&plaintext);
-                let new_stored = new_provider.wrap_dek(&dek_arr).await.with_context(|| {
-                    format!("Failed to rewrap DEK {} with new provider", dek_id)
-                })?;
-
-                // Update in database
-                sqlx::query("UPDATE encryption_keys SET encrypted_key = $1 WHERE id = $2")
-                    .bind(&new_stored)
-                    .bind(dek_id)
-                    .execute(&mut *tx)
-                    .await
-                    .context(format!(
-                        "Failed to update DEK {} with new master key encryption",
-                        dek_id
-                    ))?;
-
-                total_re_encrypted += 1;
+                *legacy_guard = Some(Arc::clone(&old_provider));
             }
 
-            tx.commit()
-                .await
-                .context("Failed to commit master key rotation batch")?;
+            const BATCH_SIZE: usize = 50;
+            let mut total_re_encrypted: u64 = 0;
+
+            for batch in all_dek_ids.chunks(BATCH_SIZE) {
+                let mut tx = self
+                    .db_pool
+                    .begin()
+                    .await
+                    .context("Failed to begin transaction for master key rotation batch")?;
+
+                for &dek_id in batch {
+                    // Fetch the wrapped DEK with row-level lock
+                    let row = sqlx::query(
+                        "SELECT encrypted_key FROM encryption_keys WHERE id = $1 FOR UPDATE",
+                    )
+                    .bind(dek_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context(format!("Failed to fetch DEK {} for re-encryption", dek_id))?;
+
+                    let encrypted_key: Vec<u8> = Row::get(&row, "encrypted_key");
+
+                    // Unwrap with old provider, rewrap with new provider.
+                    let plaintext =
+                        old_provider
+                            .unwrap_dek(&encrypted_key)
+                            .await
+                            .with_context(|| {
+                                format!("Failed to unwrap DEK {} with old provider", dek_id)
+                            })?;
+                    let mut dek_arr = [0u8; 32];
+                    if plaintext.len() != 32 {
+                        return Err(anyhow!(
+                            "Unwrapped DEK {} has unexpected length: {}",
+                            dek_id,
+                            plaintext.len()
+                        ));
+                    }
+                    dek_arr.copy_from_slice(&plaintext);
+                    let new_stored = new_provider.wrap_dek(&dek_arr).await.with_context(|| {
+                        format!("Failed to rewrap DEK {} with new provider", dek_id)
+                    })?;
+
+                    // Update in database
+                    sqlx::query("UPDATE encryption_keys SET encrypted_key = $1 WHERE id = $2")
+                        .bind(&new_stored)
+                        .bind(dek_id)
+                        .execute(&mut *tx)
+                        .await
+                        .context(format!(
+                            "Failed to update DEK {} with new master key encryption",
+                            dek_id
+                        ))?;
+
+                    total_re_encrypted += 1;
+                }
+
+                tx.commit()
+                    .await
+                    .context("Failed to commit master key rotation batch")?;
+
+                tracing::info!(
+                    batch_size = batch.len(),
+                    total_re_encrypted,
+                    "Master key rotation batch committed"
+                );
+            }
+
+            // All DEKs rewrapped successfully — atomically publish the new
+            // provider so subsequent reads use it.
+            *self
+                .kek
+                .write()
+                .map_err(|_| anyhow!("KEK provider lock poisoned"))? = new_provider;
+
+            // H-1: clear the partial-failure safety belt now that the swap
+            // has landed and every row is wrapped with the new master key.
+            // The fallback path is no longer needed; keeping legacy
+            // populated would mask a future genuine active-provider failure
+            // by silently succeeding via the (now-stale) old key.
+            if let Ok(mut legacy_guard) = self.kek_legacy.write() {
+                *legacy_guard = None;
+            }
+
+            // Invalidate the DEK cache so cached entries are re-decrypted with the new provider
+            self.dek_cache.clear();
+            {
+                let mut active_cache = self.active_dek_cache.write().await;
+                *active_cache = None;
+            }
 
             tracing::info!(
-                batch_size = batch.len(),
                 total_re_encrypted,
-                "Master key rotation batch committed"
+                auditor = ?auditor,
+                "Master key rotation completed successfully"
             );
-        }
 
-        // All DEKs rewrapped successfully — atomically publish the new
-        // provider so subsequent reads use it.
-        *self
-            .kek
-            .write()
-            .map_err(|_| anyhow!("KEK provider lock poisoned"))? = new_provider;
-
-        // H-1: clear the partial-failure safety belt now that the swap
-        // has landed and every row is wrapped with the new master key.
-        // The fallback path is no longer needed; keeping legacy
-        // populated would mask a future genuine active-provider failure
-        // by silently succeeding via the (now-stale) old key.
-        if let Ok(mut legacy_guard) = self.kek_legacy.write() {
-            *legacy_guard = None;
-        }
-
-        // Invalidate the DEK cache so cached entries are re-decrypted with the new provider
-        self.dek_cache.clear();
-        {
-            let mut active_cache = self.active_dek_cache.write().await;
-            *active_cache = None;
-        }
-
-        tracing::info!(
-            total_re_encrypted,
-            auditor = ?auditor,
-            "Master key rotation completed successfully"
-        );
-
-        Ok(total_re_encrypted)
+            Ok(total_re_encrypted)
         }
         .await;
 
@@ -4547,22 +4546,46 @@ mod aad_binding_tests {
         let pt_b = b"row B plaintext";
 
         let ct_a = cipher
-            .encrypt(nonce_a, Payload { msg: pt_a, aad: aad_a })
+            .encrypt(
+                nonce_a,
+                Payload {
+                    msg: pt_a,
+                    aad: aad_a,
+                },
+            )
             .unwrap();
         let ct_b = cipher
-            .encrypt(nonce_b, Payload { msg: pt_b, aad: aad_b })
+            .encrypt(
+                nonce_b,
+                Payload {
+                    msg: pt_b,
+                    aad: aad_b,
+                },
+            )
             .unwrap();
 
         // Sanity: each decrypts with its own AAD.
         assert_eq!(
             cipher
-                .decrypt(nonce_a, Payload { msg: ct_a.as_ref(), aad: aad_a })
+                .decrypt(
+                    nonce_a,
+                    Payload {
+                        msg: ct_a.as_ref(),
+                        aad: aad_a
+                    }
+                )
                 .unwrap(),
             pt_a
         );
         assert_eq!(
             cipher
-                .decrypt(nonce_b, Payload { msg: ct_b.as_ref(), aad: aad_b })
+                .decrypt(
+                    nonce_b,
+                    Payload {
+                        msg: ct_b.as_ref(),
+                        aad: aad_b
+                    }
+                )
                 .unwrap(),
             pt_b
         );
@@ -4571,7 +4594,10 @@ mod aad_binding_tests {
         // row A) with row B's nonce + AAD. Must fail.
         let swap_attempt = cipher.decrypt(
             nonce_a,
-            Payload { msg: ct_a.as_ref(), aad: aad_b },
+            Payload {
+                msg: ct_a.as_ref(),
+                aad: aad_b,
+            },
         );
         assert!(
             swap_attempt.is_err(),
@@ -4610,7 +4636,13 @@ mod aad_binding_tests {
         assert_eq!(cipher.decrypt(nonce, ct_v0.as_ref()).unwrap(), pt);
         assert_eq!(
             cipher
-                .decrypt(nonce, Payload { msg: ct_v1_empty.as_ref(), aad: &[] })
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: ct_v1_empty.as_ref(),
+                        aad: &[]
+                    }
+                )
                 .unwrap(),
             pt
         );
@@ -4630,16 +4662,34 @@ mod aad_binding_tests {
 
         let pt = b"victim data";
         let ct = cipher
-            .encrypt(nonce, Payload { msg: pt, aad: aad_correct })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: pt,
+                    aad: aad_correct,
+                },
+            )
             .unwrap();
 
         // Right AAD → ok.
         assert!(cipher
-            .decrypt(nonce, Payload { msg: ct.as_ref(), aad: aad_correct })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct.as_ref(),
+                    aad: aad_correct
+                }
+            )
             .is_ok());
         // Off-by-one-bit AAD → fails.
         assert!(cipher
-            .decrypt(nonce, Payload { msg: ct.as_ref(), aad: aad_wrong.as_ref() })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct.as_ref(),
+                    aad: aad_wrong.as_ref()
+                }
+            )
             .is_err());
     }
 
@@ -4721,7 +4771,8 @@ mod aad_binding_tests {
             .await
             .expect_err("negative format_version must fail-closed at dispatch");
         assert!(
-            err.to_string().contains("unknown encryption_format_version"),
+            err.to_string()
+                .contains("unknown encryption_format_version"),
             "got: {err}"
         );
     }

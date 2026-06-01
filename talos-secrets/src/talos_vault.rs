@@ -212,10 +212,7 @@ impl SecretProvider for TalosVaultProvider {
         //      logic below operates on validated bytes.
         // Reject rather than strip: silent sanitization masks a
         // tampered vault value; the operator wants to know.
-        if let Some(bad) = raw
-            .bytes()
-            .find(|b| matches!(b, 0x00 | b'\r' | b'\n'))
-        {
+        if let Some(bad) = raw.bytes().find(|b| matches!(b, 0x00 | b'\r' | b'\n')) {
             anyhow::bail!(
                 "secret value for header '{header_name}' contains a forbidden control \
                  byte (0x{bad:02x}); CR/LF/NUL would split HTTP headers — refusing"
@@ -337,9 +334,7 @@ mod tests {
         // allocation produces large gaps. Assert that at least one
         // gap is much larger than 1 (CSPRNG with 50 draws from a
         // 63-bit space gives expected min-gap ≈ 2^57 / 50 ≈ 1e15).
-        let any_large_gap = sorted
-            .windows(2)
-            .any(|w| w[1].saturating_sub(w[0]) > 1024);
+        let any_large_gap = sorted.windows(2).any(|w| w[1].saturating_sub(w[0]) > 1024);
         assert!(
             any_large_gap,
             "handles look sequential — slot allocator regressed?"
@@ -396,12 +391,7 @@ mod tests {
     /// scheme tokens case-insensitive.
     #[tokio::test]
     async fn bearer_prefix_case_insensitive() {
-        for stored in [
-            "Bearer abc",
-            "bearer abc",
-            "BEARER abc",
-            "BeArEr abc",
-        ] {
+        for stored in ["Bearer abc", "bearer abc", "BEARER abc", "BeArEr abc"] {
             let mut map = HashMap::new();
             map.insert("test/key".into(), stored.to_string());
             let provider = TalosVaultProvider::from_resolved(map);
@@ -490,7 +480,11 @@ mod tests {
     async fn basic_prefix_case_insensitive() {
         // Same surface: `BASIC ...` and `basic ...` must NOT get a
         // `Bearer ` prefix bolted in front.
-        for stored in ["Basic dXNlcjpwYXNz", "basic dXNlcjpwYXNz", "BASIC dXNlcjpwYXNz"] {
+        for stored in [
+            "Basic dXNlcjpwYXNz",
+            "basic dXNlcjpwYXNz",
+            "BASIC dXNlcjpwYXNz",
+        ] {
             let mut map = HashMap::new();
             map.insert("test/basic".into(), stored.to_string());
             let provider = TalosVaultProvider::from_resolved(map);

@@ -147,7 +147,9 @@ pub fn check_outbound_url_no_ssrf(url: &str) -> Result<(), &'static str> {
         // Specific message paths so the operator knows which character
         // class tripped the check.
         if bad.is_whitespace() || bad.is_control() {
-            return Err("URL contains whitespace or control characters; percent-encode them or remove");
+            return Err(
+                "URL contains whitespace or control characters; percent-encode them or remove",
+            );
         }
         return Err(
             "URL contains characters disallowed by RFC 3986 (e.g. < > \" { } | \\ ^ backtick); \
@@ -186,11 +188,7 @@ pub fn check_outbound_url_no_ssrf(url: &str) -> Result<(), &'static str> {
             .unwrap_or("")
             .to_lowercase()
     } else {
-        host_and_port
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_lowercase()
+        host_and_port.split(':').next().unwrap_or("").to_lowercase()
     };
 
     if looks_like_obfuscated_ipv4(&host) {
@@ -559,8 +557,8 @@ mod tests {
     #[test]
     fn rejects_ipv4_multicast_range() {
         for url in [
-            "https://224.0.0.1/",      // all-hosts link-local
-            "https://224.0.0.251/",    // mDNS
+            "https://224.0.0.1/",       // all-hosts link-local
+            "https://224.0.0.251/",     // mDNS
             "https://239.255.255.250/", // SSDP
             "https://225.1.2.3/",
             "https://239.0.0.1/",
@@ -622,12 +620,12 @@ mod tests {
     #[test]
     fn rejects_pure_hex_ipv4_mapped_ipv6() {
         for url in [
-            "https://[::ffff:7f00:1]/",                // ::ffff:127.0.0.1
-            "https://[::ffff:a00:1]/",                 // ::ffff:10.0.0.1
-            "https://[::ffff:c0a8:1]/",                // ::ffff:192.168.0.1
-            "https://[::ffff:ac10:1]/",                // ::ffff:172.16.0.1
-            "https://[0:0:0:0:0:ffff:7f00:1]/",        // expanded form
-            "https://[::ffff:a9fe:a9fe]/",             // ::ffff:169.254.169.254 (cloud metadata)
+            "https://[::ffff:7f00:1]/",         // ::ffff:127.0.0.1
+            "https://[::ffff:a00:1]/",          // ::ffff:10.0.0.1
+            "https://[::ffff:c0a8:1]/",         // ::ffff:192.168.0.1
+            "https://[::ffff:ac10:1]/",         // ::ffff:172.16.0.1
+            "https://[0:0:0:0:0:ffff:7f00:1]/", // expanded form
+            "https://[::ffff:a9fe:a9fe]/",      // ::ffff:169.254.169.254 (cloud metadata)
         ] {
             assert!(
                 check_outbound_url_no_ssrf(url).is_err(),
@@ -642,10 +640,10 @@ mod tests {
     #[test]
     fn rejects_ipv6_loopback_and_local_expanded_forms() {
         for url in [
-            "https://[0:0:0:0:0:0:0:1]/",     // ::1 expanded
-            "https://[fe80::1]/",             // link-local
-            "https://[fc00::1]/",             // ULA
-            "https://[fd00::1]/",             // ULA upper half
+            "https://[0:0:0:0:0:0:0:1]/", // ::1 expanded
+            "https://[fe80::1]/",         // link-local
+            "https://[fc00::1]/",         // ULA
+            "https://[fd00::1]/",         // ULA upper half
         ] {
             assert!(
                 check_outbound_url_no_ssrf(url).is_err(),
@@ -676,7 +674,7 @@ mod tests {
             "https://anything@169.254.169.254/computeMetadata/v1/",
             "https://decoy.com@0177.0.0.1/", // userinfo + octal-loopback
             "https://decoy.com@0x7f.0.0.1/", // userinfo + hex-loopback
-            "https://attacker@2130706433/", // userinfo + integer-loopback
+            "https://attacker@2130706433/",  // userinfo + integer-loopback
         ] {
             assert!(
                 check_outbound_url_no_ssrf(url).is_err(),

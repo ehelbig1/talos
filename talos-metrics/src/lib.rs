@@ -229,7 +229,9 @@ impl TalosMetrics {
         // `rate()` / absence alerts + dashboard panels would have nothing to
         // reference. A counter seeded at 0 is correct and always present.
         for outcome in ["resumed", "failed", "reclaimed"] {
-            crash_recovery_total.with_label_values(&[outcome]).inc_by(0.0);
+            crash_recovery_total
+                .with_label_values(&[outcome])
+                .inc_by(0.0);
         }
 
         // Rate limiting metrics

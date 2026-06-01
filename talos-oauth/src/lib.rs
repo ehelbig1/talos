@@ -175,7 +175,10 @@ pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bo
                 );
             }
             // Best-effort parse: tolerate non-JSON bodies (network proxy injecting HTML, etc).
-            let body: serde_json::Value = talos_http_body::read_json_capped::<serde_json::Value>(resp).await.unwrap_or_default();
+            let body: serde_json::Value =
+                talos_http_body::read_json_capped::<serde_json::Value>(resp)
+                    .await
+                    .unwrap_or_default();
             let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             // Slack returns {ok:false,error:"invalid_auth"} when token is already dead — accept that.
             let already_dead = !ok
@@ -321,9 +324,7 @@ fn is_valid_okta_domain(domain: &str) -> bool {
     domain.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
-            && label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
             && !label.starts_with('-')
             && !label.ends_with('-')
     })
@@ -904,12 +905,13 @@ impl OAuthService {
                 tracing::error!(error = %e, "Failed to request token endpoint");
                 anyhow!("Failed to exchange authorization code for token: {}", e)
             })?;
-        let token_response = talos_http_body::read_json_capped::<oauth2::basic::BasicTokenResponse>(token_resp)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to parse token response");
-                anyhow!("Failed to parse token response: {}", e)
-            })?;
+        let token_response =
+            talos_http_body::read_json_capped::<oauth2::basic::BasicTokenResponse>(token_resp)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Failed to parse token response");
+                    anyhow!("Failed to parse token response: {}", e)
+                })?;
 
         // Get user info from Google
         let user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo";
@@ -1484,7 +1486,10 @@ mod redaction_tests {
             !dbg.contains("LIVE_REFRESH_TOKEN_XYZ"),
             "refresh_token leaked: {dbg}"
         );
-        assert!(dbg.contains("[REDACTED]"), "redaction marker missing: {dbg}");
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "redaction marker missing: {dbg}"
+        );
         // Non-secret fields still visible — the point is targeted
         // redaction, not blackboxing the whole struct.
         assert!(dbg.contains("alice@example.com"), "email lost: {dbg}");

@@ -336,7 +336,8 @@ pub async fn csrf_protection_graphql(
         // Even with a false-positive sniff, production stayed safe (production
         // doesn't reach this branch at all) — this fix tightens dev so the
         // CSRF gate isn't accidentally weakened by misleading payloads.
-        if allow_dev_bypass || is_pure_introspection_request(&String::from_utf8_lossy(&body_bytes)) {
+        if allow_dev_bypass || is_pure_introspection_request(&String::from_utf8_lossy(&body_bytes))
+        {
             if allow_dev_bypass {
                 tracing::warn!(
                     "⚠️ DANGER: Skipping CSRF for GraphQL request due to ALLOW_DEV_UNSAFE_CSRF_BYPASS=true"
@@ -557,7 +558,8 @@ mod tests {
     fn introspection_not_detected_when_marker_in_string_literal() {
         // Pre-fix, this would have matched on the substring `__schema`
         // inside the string argument.
-        let body = r#"{"query":"mutation { setValue(v: \"contains __schema lookalike\") { id } }"}"#;
+        let body =
+            r#"{"query":"mutation { setValue(v: \"contains __schema lookalike\") { id } }"}"#;
         assert!(!is_pure_introspection_request(body));
     }
 

@@ -123,10 +123,7 @@ mod tests {
             OrchestrationError::WorkflowNotFound(Uuid::nil()).jsonrpc_code(),
             -32001
         );
-        assert_eq!(
-            OrchestrationError::ExecutionPaused.jsonrpc_code(),
-            -32003
-        );
+        assert_eq!(OrchestrationError::ExecutionPaused.jsonrpc_code(), -32003);
         assert_eq!(
             OrchestrationError::AuthorizationDenied("denied".into()).jsonrpc_code(),
             -32004

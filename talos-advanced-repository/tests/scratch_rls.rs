@@ -80,20 +80,43 @@ async fn scratch_sessions_rls_isolates_users_through_the_repository() {
         .await
         .expect("A upsert");
     assert!(
-        repo.get_scratch_session(user_a, "s1").await.expect("A get").is_some(),
+        repo.get_scratch_session(user_a, "s1")
+            .await
+            .expect("A get")
+            .is_some(),
         "A must see its own session"
     );
-    assert_eq!(repo.list_scratch_sessions(user_a).await.expect("A list").len(), 1);
+    assert_eq!(
+        repo.list_scratch_sessions(user_a)
+            .await
+            .expect("A list")
+            .len(),
+        1
+    );
 
     // User B (same repo, same pooled non-superuser role) CANNOT see A's
     // session — defense in depth (app-layer WHERE + RLS).
     assert!(
-        repo.get_scratch_session(user_b, "s1").await.expect("B get").is_none(),
+        repo.get_scratch_session(user_b, "s1")
+            .await
+            .expect("B get")
+            .is_none(),
         "B must NOT see A's session"
     );
-    assert_eq!(repo.list_scratch_sessions(user_b).await.expect("B list").len(), 0);
+    assert_eq!(
+        repo.list_scratch_sessions(user_b)
+            .await
+            .expect("B list")
+            .len(),
+        0
+    );
     // B's delete of A's session affects zero rows.
-    assert_eq!(repo.delete_scratch_session(user_b, "s1").await.expect("B delete"), 0);
+    assert_eq!(
+        repo.delete_scratch_session(user_b, "s1")
+            .await
+            .expect("B delete"),
+        0
+    );
 
     // RLS-SPECIFIC proof: a raw `SELECT` with NO app-layer WHERE, run on a
     // tenant-scoped tx, sees only the scoping user's rows. This isolates
@@ -106,7 +129,10 @@ async fn scratch_sessions_rls_isolates_users_through_the_repository() {
         .await
         .unwrap();
     tx_b.commit().await.unwrap();
-    assert_eq!(b_visible, 0, "RLS must hide A's row from B even with no WHERE clause");
+    assert_eq!(
+        b_visible, 0,
+        "RLS must hide A's row from B even with no WHERE clause"
+    );
 
     let mut tx_a = begin_tenant_read_scoped(&app_pool, &TenantReadScope::new(user_a, vec![]))
         .await
@@ -119,11 +145,18 @@ async fn scratch_sessions_rls_isolates_users_through_the_repository() {
     assert_eq!(a_visible, 1, "RLS must show A its own row");
 
     // Cleanup.
-    let _ = su.execute("DELETE FROM scratch_sessions WHERE name = 's1';").await;
+    let _ = su
+        .execute("DELETE FROM scratch_sessions WHERE name = 's1';")
+        .await;
     for u in [user_a, user_b] {
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
     }
-    let _ = su.execute(format!("DROP ROLE IF EXISTS {ROLE};").as_str()).await;
+    let _ = su
+        .execute(format!("DROP ROLE IF EXISTS {ROLE};").as_str())
+        .await;
 }
 
 const PINS_ROLE: &str = "talos_pins_rls_app";
@@ -145,9 +178,11 @@ async fn user_module_pins_rls_isolates_per_user() {
     )
     .await
     .expect("create pins role");
-    su.execute(format!("GRANT SELECT, INSERT, DELETE ON user_module_pins TO {PINS_ROLE};").as_str())
-        .await
-        .expect("grant");
+    su.execute(
+        format!("GRANT SELECT, INSERT, DELETE ON user_module_pins TO {PINS_ROLE};").as_str(),
+    )
+    .await
+    .expect("grant");
     for (u, label) in [(user_a, "pa"), (user_b, "pb")] {
         sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
             .bind(u)
@@ -181,7 +216,11 @@ async fn user_module_pins_rls_isolates_per_user() {
         .await
         .unwrap();
     tx_a.commit().await.unwrap();
-    assert_eq!(a_names, vec!["mod-a".to_string()], "A sees only its own pin");
+    assert_eq!(
+        a_names,
+        vec!["mod-a".to_string()],
+        "A sees only its own pin"
+    );
 
     let mut tx_b = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_b, vec![]))
         .await
@@ -191,13 +230,22 @@ async fn user_module_pins_rls_isolates_per_user() {
         .await
         .unwrap();
     tx_b.commit().await.unwrap();
-    assert_eq!(b_names, vec!["mod-b".to_string()], "B sees only its own pin");
+    assert_eq!(
+        b_names,
+        vec!["mod-b".to_string()],
+        "B sees only its own pin"
+    );
 
     let _ = su
         .execute("DELETE FROM user_module_pins WHERE module_name IN ('mod-a','mod-b');")
         .await;
     for u in [user_a, user_b] {
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
     }
-    let _ = su.execute(format!("DROP ROLE IF EXISTS {PINS_ROLE};").as_str()).await;
+    let _ = su
+        .execute(format!("DROP ROLE IF EXISTS {PINS_ROLE};").as_str())
+        .await;
 }

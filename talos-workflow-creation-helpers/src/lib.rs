@@ -1066,10 +1066,7 @@ pub fn wrap_rust_code_with_talos_module(rust_code: &str, capability_world: &str)
 ///
 /// `explicit` short-circuits — when `Some(_)` the caller's list wins
 /// regardless of world. `None` means "fall through to defaults".
-pub fn resolve_default_allowed_hosts(
-    world: &str,
-    explicit: Option<Vec<String>>,
-) -> Vec<String> {
+pub fn resolve_default_allowed_hosts(world: &str, explicit: Option<Vec<String>>) -> Vec<String> {
     if let Some(hosts) = explicit {
         return hosts;
     }
@@ -1349,14 +1346,8 @@ pub fn detect_template_interpolation_warnings(config: &Value) -> Vec<String> {
 ///
 /// Returns `Ok(())` on success or `Err(formatted_message)` listing every
 /// mismatch in one error string. Callers render as `mcp_error(req_id, -32602, &msg)`.
-pub fn validate_config_field_types(
-    config: &Value,
-    config_schema: &Value,
-) -> Result<(), String> {
-    let Some(props) = config_schema
-        .get("properties")
-        .and_then(|p| p.as_object())
-    else {
+pub fn validate_config_field_types(config: &Value, config_schema: &Value) -> Result<(), String> {
+    let Some(props) = config_schema.get("properties").and_then(|p| p.as_object()) else {
         return Ok(());
     };
     let Some(config_obj) = config.as_object() else {
@@ -1543,10 +1534,7 @@ pub fn build_add_node_payload(inputs: AddNodeInputs<'_>) -> Value {
     // retry_count — three-way: caller > existing > template default
     if let Some(v) = retry_count {
         obj.insert("retry_count".to_string(), v.clone());
-    } else if existing_node
-        .and_then(|n| n.get("retry_count"))
-        .is_some()
-    {
+    } else if existing_node.and_then(|n| n.get("retry_count")).is_some() {
         preserve("retry_count", obj);
     } else if let Some(mr) = template_max_retries {
         obj.insert("retry_count".to_string(), serde_json::json!(mr));
@@ -1561,10 +1549,7 @@ pub fn build_add_node_payload(inputs: AddNodeInputs<'_>) -> Value {
 
     // retry_condition (string)
     if let Some(s) = retry_condition {
-        obj.insert(
-            "retry_condition".to_string(),
-            Value::String(s.to_string()),
-        );
+        obj.insert("retry_condition".to_string(), Value::String(s.to_string()));
     } else {
         preserve("retry_condition", obj);
     }
@@ -1581,10 +1566,7 @@ pub fn build_add_node_payload(inputs: AddNodeInputs<'_>) -> Value {
 
     // skip_condition (string)
     if let Some(s) = skip_condition {
-        obj.insert(
-            "skip_condition".to_string(),
-            Value::String(s.to_string()),
-        );
+        obj.insert("skip_condition".to_string(), Value::String(s.to_string()));
     } else {
         preserve("skip_condition", obj);
     }
@@ -2639,10 +2621,8 @@ mod tests {
     fn config_type_validation_no_schema_no_op() {
         // No `properties` key → skip silently; the inline behaviour was
         // "lenient if schema is missing or malformed".
-        let result = validate_config_field_types(
-            &json!({"x": 1}),
-            &json!({"description": "no properties"}),
-        );
+        let result =
+            validate_config_field_types(&json!({"x": 1}), &json!({"description": "no properties"}));
         assert!(result.is_ok());
     }
 
@@ -2729,10 +2709,16 @@ mod tests {
         let mut edges = vec![json!({"source": "n1", "target": "n3"})];
         upsert_node_edges(&mut edges, "n2", Some("n1"), Some("n3"));
         assert_eq!(edges.len(), 2);
-        assert!(edges.iter().any(|e| e["source"] == "n1" && e["target"] == "n2"));
-        assert!(edges.iter().any(|e| e["source"] == "n2" && e["target"] == "n3"));
+        assert!(edges
+            .iter()
+            .any(|e| e["source"] == "n1" && e["target"] == "n2"));
+        assert!(edges
+            .iter()
+            .any(|e| e["source"] == "n2" && e["target"] == "n3"));
         // The bypass edge is gone.
-        assert!(!edges.iter().any(|e| e["source"] == "n1" && e["target"] == "n3"));
+        assert!(!edges
+            .iter()
+            .any(|e| e["source"] == "n1" && e["target"] == "n3"));
     }
 
     #[test]
@@ -3108,11 +3094,7 @@ mod tests {
 
     #[test]
     fn drift_detects_methods_length_mismatch() {
-        let stored = stored_no_world(
-            vec![],
-            vec![],
-            vec!["GET".to_string(), "POST".to_string()],
-        );
+        let stored = stored_no_world(vec![], vec![], vec!["GET".to_string(), "POST".to_string()]);
         let m = vec!["GET".to_string()];
         let drift = compute_permission_drift(None, None, Some(&m), None, &stored);
         assert_eq!(drift.len(), 1);
@@ -3235,13 +3217,7 @@ mod tests {
             capability_world: "http-node".to_string(),
         };
         let h = vec!["api.new.com".to_string()];
-        let drift = compute_permission_drift(
-            Some(&h),
-            None,
-            None,
-            Some("agent-node"),
-            &stored,
-        );
+        let drift = compute_permission_drift(Some(&h), None, None, Some("agent-node"), &stored);
         assert_eq!(drift.len(), 2);
         let joined = drift.join("\n");
         assert!(joined.contains("allowed_hosts"));
@@ -3253,9 +3229,7 @@ mod tests {
     #[test]
     fn permission_drift_error_includes_node_id_module_id_and_drift_lines() {
         let id = Uuid::new_v4();
-        let lines = vec![
-            "  - allowed_hosts: stored=[a] vs requested=[b]".to_string(),
-        ];
+        let lines = vec!["  - allowed_hosts: stored=[a] vs requested=[b]".to_string()];
         let msg = format_permission_drift_error("my-node", id, &lines);
         assert!(msg.contains("my-node"));
         assert!(msg.contains(&id.to_string()));

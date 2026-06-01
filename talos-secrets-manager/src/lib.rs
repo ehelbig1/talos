@@ -59,9 +59,10 @@ pub fn validate_vault_key_path(key_path: &str) -> Result<(), &'static str> {
     if key_path.is_empty() || key_path.len() > 200 {
         return Err("key_path must be 1-200 characters");
     }
-    if !key_path.chars().all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '/'
-    }) {
+    if !key_path
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '/')
+    {
         return Err(
             "key_path may only contain lowercase alphanumeric characters, hyphens (-), underscores (_), and forward-slashes (/)",
         );
@@ -171,7 +172,12 @@ mod validate_vault_key_path_tests {
 
     #[test]
     fn rejects_control_chars_and_traversal() {
-        for bad in ["anthropic/\0api_key", "../secrets", "\tapi_key", "anthropic/\napi_key"] {
+        for bad in [
+            "anthropic/\0api_key",
+            "../secrets",
+            "\tapi_key",
+            "anthropic/\napi_key",
+        ] {
             assert!(
                 validate_vault_key_path(bad).is_err(),
                 "must reject: {bad:?}"
@@ -229,12 +235,12 @@ mod validate_secret_namespace_tests {
     #[test]
     fn rejects_non_alphanumeric_non_hyphen() {
         for bad in [
-            "team_prod",    // underscore
-            "team.prod",    // dot
-            "team/prod",    // slash
-            "team prod",    // space
-            "team:prod",    // colon
-            "team@prod",    // at-sign
+            "team_prod", // underscore
+            "team.prod", // dot
+            "team/prod", // slash
+            "team prod", // space
+            "team:prod", // colon
+            "team@prod", // at-sign
         ] {
             assert!(
                 validate_secret_namespace(bad).is_err(),

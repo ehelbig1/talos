@@ -227,10 +227,8 @@ async fn execute_guest_query(
     params: &[String],
     is_fetch: bool,
     guest_role: Option<&str>,
-) -> Result<
-    talos_memory::database_rpc::DatabaseResult,
-    talos_memory::database_rpc::DatabaseRpcError,
-> {
+) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
+{
     use sqlx::Row;
     use talos_memory::database_rpc::{
         DatabaseResult, DatabaseRpcError, MAX_RESULT_BYTES, MAX_RESULT_ROWS, QUERY_TIMEOUT_SECS,
@@ -262,9 +260,7 @@ async fn execute_guest_query(
                     // configuration errors — surface as ConnectionFailed
                     // (not QueryError) so the metric / log distinguishes
                     // them from guest SQL faults.
-                    DatabaseRpcError::ConnectionFailed(format!(
-                        "SET LOCAL ROLE failed: {e}"
-                    ))
+                    DatabaseRpcError::ConnectionFailed(format!("SET LOCAL ROLE failed: {e}"))
                 })?;
         }
 
@@ -338,12 +334,7 @@ async fn execute_guest_query(
         }
     };
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
-        work,
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_secs(QUERY_TIMEOUT_SECS), work).await {
         Ok(r) => r,
         Err(_) => Err(DatabaseRpcError::Timeout),
     }
@@ -483,58 +474,83 @@ pub fn spawn_graph_rpc_subscriber(
         // existing in-flight work survives a re-bind.
         let mut backoff_secs: u64 = 1;
         'supervisor: loop {
-        let mut sub = match nats.subscribe(SUBJECT_GRAPH_SEARCH).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    subject = SUBJECT_GRAPH_SEARCH,
-                    error = %e,
-                    backoff_secs,
-                    "Graph-RPC subscribe failed; retrying after backoff (worker graph-search calls time out in the meantime)"
-                );
-                // Respect shutdown signal DURING the backoff so a
-                // controller stop doesn't have to wait the full
-                // backoff window before draining.
-                tokio::select! {
-                    _ = shutdown.changed() => break 'supervisor,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            let mut sub = match nats.subscribe(SUBJECT_GRAPH_SEARCH).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        subject = SUBJECT_GRAPH_SEARCH,
+                        error = %e,
+                        backoff_secs,
+                        "Graph-RPC subscribe failed; retrying after backoff (worker graph-search calls time out in the meantime)"
+                    );
+                    // Respect shutdown signal DURING the backoff so a
+                    // controller stop doesn't have to wait the full
+                    // backoff window before draining.
+                    tokio::select! {
+                        _ = shutdown.changed() => break 'supervisor,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    }
+                    backoff_secs = (backoff_secs * 2).min(60);
+                    continue 'supervisor;
                 }
-                backoff_secs = (backoff_secs * 2).min(60);
-                continue 'supervisor;
-            }
-        };
-        backoff_secs = 1;
-        let mut shutdown_requested = false;
-        loop {
-            let msg = tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    tracing::info!("RPC subscriber shutting down");
-                    shutdown_requested = true;
-                    break;
-                }
-                Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                maybe_msg = sub.next() => match maybe_msg {
-                    Some(m) => m,
-                    None => break,
-                },
             };
-            let nats_client = nats.clone();
-            let sem = sem.clone();
-            in_flight.spawn(async move {
-                let start = std::time::Instant::now();
-                let reply_to = match msg.reply.clone() {
-                    Some(r) => r,
-                    None => return,
+            backoff_secs = 1;
+            let mut shutdown_requested = false;
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        tracing::info!("RPC subscriber shutting down");
+                        shutdown_requested = true;
+                        break;
+                    }
+                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
+                    maybe_msg = sub.next() => match maybe_msg {
+                        Some(m) => m,
+                        None => break,
+                    },
                 };
+                let nats_client = nats.clone();
+                let sem = sem.clone();
+                in_flight.spawn(async move {
+                    let start = std::time::Instant::now();
+                    let reply_to = match msg.reply.clone() {
+                        Some(r) => r,
+                        None => return,
+                    };
 
-                let req: GraphSearchRequest = match serde_json::from_slice(&msg.payload) {
-                    Ok(r) => r,
-                    Err(e) => {
+                    let req: GraphSearchRequest = match serde_json::from_slice(&msg.payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let reply = GraphSearchReply {
+                                result: Err(GraphRpcError::InvalidInput(format!(
+                                    "malformed request: {e}"
+                                ))),
+                            };
+                            let _ = nats_client
+                                .publish(
+                                    reply_to,
+                                    serde_json::to_vec(&reply).unwrap_or_default().into(),
+                                )
+                                .await;
+                            record_rpc_metric(
+                                SUBJECT_GRAPH_SEARCH,
+                                uuid::Uuid::nil(),
+                                "invalid",
+                                start.elapsed().as_millis() as u64,
+                                0,
+                            );
+                            return;
+                        }
+                    };
+
+                    if !req.verify() {
+                        tracing::warn!(
+                            actor_id = %req.actor_id,
+                            "graph-search RPC: HMAC or freshness verification failed"
+                        );
                         let reply = GraphSearchReply {
-                            result: Err(GraphRpcError::InvalidInput(format!(
-                                "malformed request: {e}"
-                            ))),
+                            result: Err(GraphRpcError::Unauthorized),
                         };
                         let _ = nats_client
                             .publish(
@@ -544,89 +560,49 @@ pub fn spawn_graph_rpc_subscriber(
                             .await;
                         record_rpc_metric(
                             SUBJECT_GRAPH_SEARCH,
-                            uuid::Uuid::nil(),
-                            "invalid",
+                            req.actor_id,
+                            "unauthorized",
                             start.elapsed().as_millis() as u64,
                             0,
                         );
                         return;
                     }
-                };
 
-                if !req.verify() {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        "graph-search RPC: HMAC or freshness verification failed"
-                    );
-                    let reply = GraphSearchReply {
-                        result: Err(GraphRpcError::Unauthorized),
-                    };
-                    let _ = nats_client
-                        .publish(
-                            reply_to,
-                            serde_json::to_vec(&reply).unwrap_or_default().into(),
-                        )
-                        .await;
-                    record_rpc_metric(
-                        SUBJECT_GRAPH_SEARCH,
+                    if !talos_memory::rpc_auth::check_and_record_nonce(
+                        talos_memory::graph_rpc::SUBJECT_NAME,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
-
-                if !talos_memory::rpc_auth::check_and_record_nonce(
-                    talos_memory::graph_rpc::SUBJECT_NAME,
-                    req.actor_id,
-                    &req.nonce,
-                ) {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        "graph-search RPC: nonce replay rejected"
-                    );
-                    let reply = GraphSearchReply {
-                        result: Err(GraphRpcError::Unauthorized),
-                    };
-                    let _ = nats_client
-                        .publish(
-                            reply_to,
-                            serde_json::to_vec(&reply).unwrap_or_default().into(),
-                        )
-                        .await;
-                    record_rpc_metric(
-                        SUBJECT_GRAPH_SEARCH,
-                        req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
-
-                let depth = req.max_depth.min(MAX_DEPTH);
-                let limit = req.limit.clamp(1, MAX_LIMIT);
-                if req.query.trim().is_empty() {
-                    let reply = GraphSearchReply {
-                        result: Err(GraphRpcError::InvalidInput(
-                            "query must be non-empty".to_string(),
-                        )),
-                    };
-                    let _ = nats_client
-                        .publish(
-                            reply_to,
-                            serde_json::to_vec(&reply).unwrap_or_default().into(),
-                        )
-                        .await;
-                    return;
-                }
-
-                let service = match actor_memory_service::GRAPH_SERVICE.get() {
-                    Some(s) => s,
-                    None => {
+                        &req.nonce,
+                    ) {
+                        tracing::warn!(
+                            actor_id = %req.actor_id,
+                            "graph-search RPC: nonce replay rejected"
+                        );
                         let reply = GraphSearchReply {
-                            result: Err(GraphRpcError::NotAvailable),
+                            result: Err(GraphRpcError::Unauthorized),
+                        };
+                        let _ = nats_client
+                            .publish(
+                                reply_to,
+                                serde_json::to_vec(&reply).unwrap_or_default().into(),
+                            )
+                            .await;
+                        record_rpc_metric(
+                            SUBJECT_GRAPH_SEARCH,
+                            req.actor_id,
+                            "replay",
+                            start.elapsed().as_millis() as u64,
+                            0,
+                        );
+                        return;
+                    }
+
+                    let depth = req.max_depth.min(MAX_DEPTH);
+                    let limit = req.limit.clamp(1, MAX_LIMIT);
+                    if req.query.trim().is_empty() {
+                        let reply = GraphSearchReply {
+                            result: Err(GraphRpcError::InvalidInput(
+                                "query must be non-empty".to_string(),
+                            )),
                         };
                         let _ = nats_client
                             .publish(
@@ -636,108 +612,126 @@ pub fn spawn_graph_rpc_subscriber(
                             .await;
                         return;
                     }
-                };
 
-                // Bound concurrent Neo4j queries. Dropping the permit on
-                // either branch releases it.
-                let _permit = sem.acquire_owned().await;
-                let permit_at = std::time::Instant::now();
+                    let service = match actor_memory_service::GRAPH_SERVICE.get() {
+                        Some(s) => s,
+                        None => {
+                            let reply = GraphSearchReply {
+                                result: Err(GraphRpcError::NotAvailable),
+                            };
+                            let _ = nats_client
+                                .publish(
+                                    reply_to,
+                                    serde_json::to_vec(&reply).unwrap_or_default().into(),
+                                )
+                                .await;
+                            return;
+                        }
+                    };
 
-                let ctx_result = service
-                    .get_graph_context(req.actor_id, &req.query, depth as usize, limit as usize)
-                    .await;
+                    // Bound concurrent Neo4j queries. Dropping the permit on
+                    // either branch releases it.
+                    let _permit = sem.acquire_owned().await;
+                    let permit_at = std::time::Instant::now();
 
-                let reply = match ctx_result {
-                    Ok(json) => {
-                        let entity_count = json
-                            .get("entity_count")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        let mut entities: Vec<RpcHit> = Vec::new();
-                        let mut edges: Vec<serde_json::Value> = Vec::new();
-                        if let Some(arr) = json.get("entities").and_then(|v| v.as_array()) {
-                            for ent in arr {
-                                let label = ent
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let entity_type = ent
-                                    .get("type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Unknown")
-                                    .to_string();
-                                let rels = ent
-                                    .get("relationships")
-                                    .and_then(|v| v.as_array())
-                                    .cloned()
-                                    .unwrap_or_default();
-                                for r in &rels {
-                                    if let Some(target) = r.get("target").and_then(|v| v.as_str()) {
-                                        let edge_type = r
-                                            .get("type")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default();
-                                        edges.push(serde_json::json!({
-                                            "src": label,
-                                            "dst": target,
-                                            "type": edge_type,
-                                        }));
+                    let ctx_result = service
+                        .get_graph_context(req.actor_id, &req.query, depth as usize, limit as usize)
+                        .await;
+
+                    let reply = match ctx_result {
+                        Ok(json) => {
+                            let entity_count = json
+                                .get("entity_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32;
+                            let mut entities: Vec<RpcHit> = Vec::new();
+                            let mut edges: Vec<serde_json::Value> = Vec::new();
+                            if let Some(arr) = json.get("entities").and_then(|v| v.as_array()) {
+                                for ent in arr {
+                                    let label = ent
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let entity_type = ent
+                                        .get("type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("Unknown")
+                                        .to_string();
+                                    let rels = ent
+                                        .get("relationships")
+                                        .and_then(|v| v.as_array())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    for r in &rels {
+                                        if let Some(target) =
+                                            r.get("target").and_then(|v| v.as_str())
+                                        {
+                                            let edge_type = r
+                                                .get("type")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default();
+                                            edges.push(serde_json::json!({
+                                                "src": label,
+                                                "dst": target,
+                                                "type": edge_type,
+                                            }));
+                                        }
                                     }
+                                    entities.push(RpcHit {
+                                        entity_type,
+                                        label,
+                                        distance: 0,
+                                        properties: serde_json::to_string(&rels)
+                                            .unwrap_or_else(|_| "[]".to_string()),
+                                    });
                                 }
-                                entities.push(RpcHit {
-                                    entity_type,
-                                    label,
-                                    distance: 0,
-                                    properties: serde_json::to_string(&rels)
-                                        .unwrap_or_else(|_| "[]".to_string()),
-                                });
+                            }
+                            GraphSearchReply {
+                                result: Ok(GraphSearchResponse {
+                                    entity_count,
+                                    entities,
+                                    relationships: serde_json::json!({ "edges": edges })
+                                        .to_string(),
+                                }),
                             }
                         }
-                        GraphSearchReply {
-                            result: Ok(GraphSearchResponse {
-                                entity_count,
-                                entities,
-                                relationships: serde_json::json!({ "edges": edges }).to_string(),
-                            }),
+                        Err(e) => {
+                            tracing::warn!(
+                                actor_id = %req.actor_id,
+                                query = %req.query,
+                                error = %e,
+                                "graph-search RPC: service error"
+                            );
+                            GraphSearchReply {
+                                result: Err(GraphRpcError::Internal(e.to_string())),
+                            }
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            actor_id = %req.actor_id,
-                            query = %req.query,
-                            error = %e,
-                            "graph-search RPC: service error"
-                        );
-                        GraphSearchReply {
-                            result: Err(GraphRpcError::Internal(e.to_string())),
-                        }
-                    }
-                };
+                    };
 
-                let outcome = match &reply.result {
-                    Ok(_) => "ok",
-                    Err(GraphRpcError::Unauthorized) => "unauthorized",
-                    Err(GraphRpcError::InvalidInput(_)) => "invalid",
-                    Err(GraphRpcError::NotAvailable) => "not_available",
-                    Err(GraphRpcError::Timeout) => "timeout",
-                    Err(GraphRpcError::Internal(_)) => "internal",
-                };
-                let _ = nats_client
-                    .publish(
-                        reply_to,
-                        serde_json::to_vec(&reply).unwrap_or_default().into(),
-                    )
-                    .await;
-                record_rpc_metric(
-                    SUBJECT_GRAPH_SEARCH,
-                    req.actor_id,
-                    outcome,
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    permit_at.elapsed().as_millis() as u64,
-                );
-            });
-        }
+                    let outcome = match &reply.result {
+                        Ok(_) => "ok",
+                        Err(GraphRpcError::Unauthorized) => "unauthorized",
+                        Err(GraphRpcError::InvalidInput(_)) => "invalid",
+                        Err(GraphRpcError::NotAvailable) => "not_available",
+                        Err(GraphRpcError::Timeout) => "timeout",
+                        Err(GraphRpcError::Internal(_)) => "internal",
+                    };
+                    let _ = nats_client
+                        .publish(
+                            reply_to,
+                            serde_json::to_vec(&reply).unwrap_or_default().into(),
+                        )
+                        .await;
+                    record_rpc_metric(
+                        SUBJECT_GRAPH_SEARCH,
+                        req.actor_id,
+                        outcome,
+                        permit_at.saturating_duration_since(start).as_millis() as u64,
+                        permit_at.elapsed().as_millis() as u64,
+                    );
+                });
+            }
             // Inner loop exited.
             if shutdown_requested {
                 break 'supervisor;
@@ -795,160 +789,160 @@ pub fn spawn_memory_rpc_subscriber(
         // permit-leak-safe re-binds.
         let mut backoff_secs: u64 = 1;
         'supervisor: loop {
-        let mut sub = match nats.subscribe(SUBJECT_MEMORY_OP).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    subject = SUBJECT_MEMORY_OP,
-                    error = %e,
-                    backoff_secs,
-                    "Memory-RPC subscribe failed; retrying after backoff (worker agent_memory calls time out in the meantime)"
-                );
-                tokio::select! {
-                    _ = shutdown.changed() => break 'supervisor,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                }
-                backoff_secs = (backoff_secs * 2).min(60);
-                continue 'supervisor;
-            }
-        };
-        backoff_secs = 1;
-        let mut shutdown_requested = false;
-        loop {
-            let msg = tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    tracing::info!("RPC subscriber shutting down");
-                    shutdown_requested = true;
-                    break;
-                }
-                Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                maybe_msg = sub.next() => match maybe_msg {
-                    Some(m) => m,
-                    None => break,
-                },
-            };
-            let nats_client = nats.clone();
-            let sem = sem.clone();
-            let pool = pool.clone();
-            in_flight.spawn(async move {
-                let start = std::time::Instant::now();
-                let reply_to = match msg.reply.clone() {
-                    Some(r) => r,
-                    None => return,
-                };
-
-                let send_err = |err: MemoryRpcError| {
-                    let nats_client = nats_client.clone();
-                    let reply_to = reply_to.clone();
-                    async move {
-                        let reply = MemoryRpcReply { result: Err(err) };
-                        let _ = nats_client
-                            .publish(
-                                reply_to,
-                                serde_json::to_vec(&reply).unwrap_or_default().into(),
-                            )
-                            .await;
+            let mut sub = match nats.subscribe(SUBJECT_MEMORY_OP).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        subject = SUBJECT_MEMORY_OP,
+                        error = %e,
+                        backoff_secs,
+                        "Memory-RPC subscribe failed; retrying after backoff (worker agent_memory calls time out in the meantime)"
+                    );
+                    tokio::select! {
+                        _ = shutdown.changed() => break 'supervisor,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
                     }
+                    backoff_secs = (backoff_secs * 2).min(60);
+                    continue 'supervisor;
+                }
+            };
+            backoff_secs = 1;
+            let mut shutdown_requested = false;
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        tracing::info!("RPC subscriber shutting down");
+                        shutdown_requested = true;
+                        break;
+                    }
+                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
+                    maybe_msg = sub.next() => match maybe_msg {
+                        Some(m) => m,
+                        None => break,
+                    },
                 };
+                let nats_client = nats.clone();
+                let sem = sem.clone();
+                let pool = pool.clone();
+                in_flight.spawn(async move {
+                    let start = std::time::Instant::now();
+                    let reply_to = match msg.reply.clone() {
+                        Some(r) => r,
+                        None => return,
+                    };
 
-                let req: MemoryRpcRequest = match serde_json::from_slice(&msg.payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        send_err(MemoryRpcError::InvalidInput(format!(
-                            "malformed request: {e}"
-                        )))
-                        .await;
+                    let send_err = |err: MemoryRpcError| {
+                        let nats_client = nats_client.clone();
+                        let reply_to = reply_to.clone();
+                        async move {
+                            let reply = MemoryRpcReply { result: Err(err) };
+                            let _ = nats_client
+                                .publish(
+                                    reply_to,
+                                    serde_json::to_vec(&reply).unwrap_or_default().into(),
+                                )
+                                .await;
+                        }
+                    };
+
+                    let req: MemoryRpcRequest = match serde_json::from_slice(&msg.payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            send_err(MemoryRpcError::InvalidInput(format!(
+                                "malformed request: {e}"
+                            )))
+                            .await;
+                            record_rpc_metric(
+                                SUBJECT_MEMORY_OP,
+                                uuid::Uuid::nil(),
+                                "invalid",
+                                start.elapsed().as_millis() as u64,
+                                0,
+                            );
+                            return;
+                        }
+                    };
+
+                    if !req.verify() {
+                        tracing::warn!(
+                            actor_id = %req.actor_id,
+                            "memory RPC: HMAC or freshness verification failed"
+                        );
+                        send_err(MemoryRpcError::Unauthorized).await;
                         record_rpc_metric(
                             SUBJECT_MEMORY_OP,
-                            uuid::Uuid::nil(),
-                            "invalid",
+                            req.actor_id,
+                            "unauthorized",
                             start.elapsed().as_millis() as u64,
                             0,
                         );
                         return;
                     }
-                };
 
-                if !req.verify() {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        "memory RPC: HMAC or freshness verification failed"
-                    );
-                    send_err(MemoryRpcError::Unauthorized).await;
-                    record_rpc_metric(
-                        SUBJECT_MEMORY_OP,
+                    if !talos_memory::rpc_auth::check_and_record_nonce(
+                        talos_memory::memory_rpc::SUBJECT_NAME,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
-
-                if !talos_memory::rpc_auth::check_and_record_nonce(
-                    talos_memory::memory_rpc::SUBJECT_NAME,
-                    req.actor_id,
-                    &req.nonce,
-                ) {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        "memory RPC: nonce replay rejected"
-                    );
-                    send_err(MemoryRpcError::Unauthorized).await;
-                    record_rpc_metric(
-                        SUBJECT_MEMORY_OP,
-                        req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
-
-                let _permit = sem.acquire_owned().await;
-                let permit_at = std::time::Instant::now();
-
-                let op_result = execute_memory_op(&pool, req.actor_id, req.op).await;
-
-                let outcome_tag: &'static str = match &op_result {
-                    Ok(_) => "ok",
-                    // Distinct from "ok" so dashboards can alert on a
-                    // spike (replay lag, actor-id mismatch, cache wipe)
-                    // without being confused by normal traffic.
-                    Err(MemoryRpcError::KeyNotFound) => "not_found",
-                    Err(MemoryRpcError::Unauthorized) => "unauthorized",
-                    Err(MemoryRpcError::InvalidInput(_)) => "invalid",
-                    Err(MemoryRpcError::Timeout) => "timeout",
-                    Err(MemoryRpcError::StorageFull) => "storage_full",
-                    _ => "internal",
-                };
-                let reply = match op_result {
-                    Ok(r) => MemoryRpcReply { result: Ok(r) },
-                    Err(e) => {
+                        &req.nonce,
+                    ) {
                         tracing::warn!(
                             actor_id = %req.actor_id,
-                            error = ?e,
-                            "memory RPC: op failed"
+                            "memory RPC: nonce replay rejected"
                         );
-                        MemoryRpcReply { result: Err(e) }
+                        send_err(MemoryRpcError::Unauthorized).await;
+                        record_rpc_metric(
+                            SUBJECT_MEMORY_OP,
+                            req.actor_id,
+                            "replay",
+                            start.elapsed().as_millis() as u64,
+                            0,
+                        );
+                        return;
                     }
-                };
-                let _ = nats_client
-                    .publish(
-                        reply_to,
-                        serde_json::to_vec(&reply).unwrap_or_default().into(),
-                    )
-                    .await;
-                record_rpc_metric(
-                    SUBJECT_MEMORY_OP,
-                    req.actor_id,
-                    outcome_tag,
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    permit_at.elapsed().as_millis() as u64,
-                );
-            });
-        }
+
+                    let _permit = sem.acquire_owned().await;
+                    let permit_at = std::time::Instant::now();
+
+                    let op_result = execute_memory_op(&pool, req.actor_id, req.op).await;
+
+                    let outcome_tag: &'static str = match &op_result {
+                        Ok(_) => "ok",
+                        // Distinct from "ok" so dashboards can alert on a
+                        // spike (replay lag, actor-id mismatch, cache wipe)
+                        // without being confused by normal traffic.
+                        Err(MemoryRpcError::KeyNotFound) => "not_found",
+                        Err(MemoryRpcError::Unauthorized) => "unauthorized",
+                        Err(MemoryRpcError::InvalidInput(_)) => "invalid",
+                        Err(MemoryRpcError::Timeout) => "timeout",
+                        Err(MemoryRpcError::StorageFull) => "storage_full",
+                        _ => "internal",
+                    };
+                    let reply = match op_result {
+                        Ok(r) => MemoryRpcReply { result: Ok(r) },
+                        Err(e) => {
+                            tracing::warn!(
+                                actor_id = %req.actor_id,
+                                error = ?e,
+                                "memory RPC: op failed"
+                            );
+                            MemoryRpcReply { result: Err(e) }
+                        }
+                    };
+                    let _ = nats_client
+                        .publish(
+                            reply_to,
+                            serde_json::to_vec(&reply).unwrap_or_default().into(),
+                        )
+                        .await;
+                    record_rpc_metric(
+                        SUBJECT_MEMORY_OP,
+                        req.actor_id,
+                        outcome_tag,
+                        permit_at.saturating_duration_since(start).as_millis() as u64,
+                        permit_at.elapsed().as_millis() as u64,
+                    );
+                });
+            }
             // Inner loop exited.
             if shutdown_requested {
                 break 'supervisor;
@@ -1111,9 +1105,7 @@ pub fn spawn_memory_rpc_subscriber(
                     // operator-readable error messages (verify() just
                     // returns false; this branch surfaces the offending
                     // field count back to the worker).
-                    use talos_memory::memory_rpc::{
-                        MAX_EXCLUDE_KINDS, MAX_EXCLUDE_KIND_LEN,
-                    };
+                    use talos_memory::memory_rpc::{MAX_EXCLUDE_KINDS, MAX_EXCLUDE_KIND_LEN};
                     if exclude_kinds.len() > MAX_EXCLUDE_KINDS {
                         return Err(MemoryRpcError::InvalidInput(format!(
                             "exclude_kinds too large ({} entries, max {})",
@@ -1208,43 +1200,43 @@ pub fn spawn_database_rpc_subscriber(
         // uses the database WIT host fn.
         let mut backoff_secs: u64 = 1;
         'supervisor: loop {
-        let mut sub = match nats.subscribe(SUBJECT_DATABASE_QUERY).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    subject = SUBJECT_DATABASE_QUERY,
-                    error = %e,
-                    backoff_secs,
-                    "Database-RPC subscribe failed; retrying after backoff (worker execute_query calls time out in the meantime)"
-                );
-                tokio::select! {
-                    _ = shutdown.changed() => break 'supervisor,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            let mut sub = match nats.subscribe(SUBJECT_DATABASE_QUERY).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        subject = SUBJECT_DATABASE_QUERY,
+                        error = %e,
+                        backoff_secs,
+                        "Database-RPC subscribe failed; retrying after backoff (worker execute_query calls time out in the meantime)"
+                    );
+                    tokio::select! {
+                        _ = shutdown.changed() => break 'supervisor,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    }
+                    backoff_secs = (backoff_secs * 2).min(60);
+                    continue 'supervisor;
                 }
-                backoff_secs = (backoff_secs * 2).min(60);
-                continue 'supervisor;
-            }
-        };
-        backoff_secs = 1;
-        let mut shutdown_requested = false;
-        loop {
-            let msg = tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    tracing::info!("RPC subscriber shutting down");
-                    shutdown_requested = true;
-                    break;
-                }
-                Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                maybe_msg = sub.next() => match maybe_msg {
-                    Some(m) => m,
-                    None => break,
-                },
             };
-            let nats_client = nats.clone();
-            let sem = sem.clone();
-            let pool = pool.clone();
-            in_flight.spawn(async move {
+            backoff_secs = 1;
+            let mut shutdown_requested = false;
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        tracing::info!("RPC subscriber shutting down");
+                        shutdown_requested = true;
+                        break;
+                    }
+                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
+                    maybe_msg = sub.next() => match maybe_msg {
+                        Some(m) => m,
+                        None => break,
+                    },
+                };
+                let nats_client = nats.clone();
+                let sem = sem.clone();
+                let pool = pool.clone();
+                in_flight.spawn(async move {
                 let start = std::time::Instant::now();
                 let reply_to = match msg.reply.clone() {
                     Some(r) => r,
@@ -1583,7 +1575,7 @@ pub fn spawn_database_rpc_subscriber(
                     permit_at.elapsed().as_millis() as u64,
                 );
             });
-        }
+            }
             // Inner loop exited.
             if shutdown_requested {
                 break 'supervisor;
@@ -1640,42 +1632,42 @@ pub fn spawn_state_write_subscriber(
         // window on NATS reconnects / subscription handoff.
         let mut backoff_secs: u64 = 1;
         'supervisor: loop {
-        let mut sub = match nats.subscribe(SUBJECT_STATE_WRITE).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    subject = SUBJECT_STATE_WRITE,
-                    error = %e,
-                    backoff_secs,
-                    "State-write subscribe failed; retrying after backoff (execution_state durability disabled in the meantime)"
-                );
-                tokio::select! {
-                    _ = shutdown.changed() => break 'supervisor,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            let mut sub = match nats.subscribe(SUBJECT_STATE_WRITE).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        subject = SUBJECT_STATE_WRITE,
+                        error = %e,
+                        backoff_secs,
+                        "State-write subscribe failed; retrying after backoff (execution_state durability disabled in the meantime)"
+                    );
+                    tokio::select! {
+                        _ = shutdown.changed() => break 'supervisor,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    }
+                    backoff_secs = (backoff_secs * 2).min(60);
+                    continue 'supervisor;
                 }
-                backoff_secs = (backoff_secs * 2).min(60);
-                continue 'supervisor;
-            }
-        };
-        backoff_secs = 1;
-        let mut shutdown_requested = false;
-        loop {
-            let msg = tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    tracing::info!("RPC subscriber shutting down");
-                    shutdown_requested = true;
-                    break;
-                }
-                Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                maybe_msg = sub.next() => match maybe_msg {
-                    Some(m) => m,
-                    None => break,
-                },
             };
-            let sem = sem.clone();
-            let pool = pool.clone();
-            in_flight.spawn(async move {
+            backoff_secs = 1;
+            let mut shutdown_requested = false;
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        tracing::info!("RPC subscriber shutting down");
+                        shutdown_requested = true;
+                        break;
+                    }
+                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
+                    maybe_msg = sub.next() => match maybe_msg {
+                        Some(m) => m,
+                        None => break,
+                    },
+                };
+                let sem = sem.clone();
+                let pool = pool.clone();
+                in_flight.spawn(async move {
                 let start = std::time::Instant::now();
                 let req: StateWriteRequest = match serde_json::from_slice(&msg.payload) {
                     Ok(r) => r,
@@ -1874,7 +1866,7 @@ pub fn spawn_state_write_subscriber(
                     permit_at.elapsed().as_millis() as u64,
                 );
             });
-        }
+            }
             // Inner loop exited.
             if shutdown_requested {
                 break 'supervisor;
@@ -1948,166 +1940,166 @@ pub fn spawn_integration_state_subscriber(
         // gap on NATS reconnects / subscription handoff.
         let mut backoff_secs: u64 = 1;
         'supervisor: loop {
-        let mut sub = match nats.subscribe(SUBJECT_INTEGRATION_STATE_OP).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    subject = SUBJECT_INTEGRATION_STATE_OP,
-                    error = %e,
-                    backoff_secs,
-                    "Integration-state subscribe failed; retrying after backoff (worker integration_state calls time out in the meantime)"
-                );
-                tokio::select! {
-                    _ = shutdown.changed() => break 'supervisor,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                }
-                backoff_secs = (backoff_secs * 2).min(60);
-                continue 'supervisor;
-            }
-        };
-        backoff_secs = 1;
-        let mut shutdown_requested = false;
-        loop {
-            let msg = tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    tracing::info!("RPC subscriber shutting down");
-                    shutdown_requested = true;
-                    break;
-                }
-                Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                maybe_msg = sub.next() => match maybe_msg {
-                    Some(m) => m,
-                    None => break,
-                },
-            };
-            let nats_client = nats.clone();
-            let sem = sem.clone();
-            let pool = pool.clone();
-            in_flight.spawn(async move {
-                let start = std::time::Instant::now();
-                let reply_to = match msg.reply.clone() {
-                    Some(r) => r,
-                    None => return,
-                };
-
-                let send_err = |err: IntegrationStateError| {
-                    let nats_client = nats_client.clone();
-                    let reply_to = reply_to.clone();
-                    async move {
-                        let reply = IntegrationStateReply { result: Err(err) };
-                        let _ = nats_client
-                            .publish(
-                                reply_to,
-                                serde_json::to_vec(&reply).unwrap_or_default().into(),
-                            )
-                            .await;
+            let mut sub = match nats.subscribe(SUBJECT_INTEGRATION_STATE_OP).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        subject = SUBJECT_INTEGRATION_STATE_OP,
+                        error = %e,
+                        backoff_secs,
+                        "Integration-state subscribe failed; retrying after backoff (worker integration_state calls time out in the meantime)"
+                    );
+                    tokio::select! {
+                        _ = shutdown.changed() => break 'supervisor,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
                     }
+                    backoff_secs = (backoff_secs * 2).min(60);
+                    continue 'supervisor;
+                }
+            };
+            backoff_secs = 1;
+            let mut shutdown_requested = false;
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        tracing::info!("RPC subscriber shutting down");
+                        shutdown_requested = true;
+                        break;
+                    }
+                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
+                    maybe_msg = sub.next() => match maybe_msg {
+                        Some(m) => m,
+                        None => break,
+                    },
                 };
+                let nats_client = nats.clone();
+                let sem = sem.clone();
+                let pool = pool.clone();
+                in_flight.spawn(async move {
+                    let start = std::time::Instant::now();
+                    let reply_to = match msg.reply.clone() {
+                        Some(r) => r,
+                        None => return,
+                    };
 
-                let req: IntegrationStateRequest = match serde_json::from_slice(&msg.payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        send_err(IntegrationStateError::InvalidInput(format!(
-                            "malformed request: {e}"
-                        )))
-                        .await;
+                    let send_err = |err: IntegrationStateError| {
+                        let nats_client = nats_client.clone();
+                        let reply_to = reply_to.clone();
+                        async move {
+                            let reply = IntegrationStateReply { result: Err(err) };
+                            let _ = nats_client
+                                .publish(
+                                    reply_to,
+                                    serde_json::to_vec(&reply).unwrap_or_default().into(),
+                                )
+                                .await;
+                        }
+                    };
+
+                    let req: IntegrationStateRequest = match serde_json::from_slice(&msg.payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            send_err(IntegrationStateError::InvalidInput(format!(
+                                "malformed request: {e}"
+                            )))
+                            .await;
+                            record_rpc_metric(
+                                SUBJECT_INTEGRATION_STATE_OP,
+                                uuid::Uuid::nil(),
+                                "invalid",
+                                start.elapsed().as_millis() as u64,
+                                0,
+                            );
+                            return;
+                        }
+                    };
+
+                    if !req.verify() {
+                        tracing::warn!(
+                            actor_id = %req.actor_id,
+                            integration = %req.integration_name,
+                            "integration-state RPC: HMAC or freshness verification failed"
+                        );
+                        send_err(IntegrationStateError::Unauthorized).await;
                         record_rpc_metric(
                             SUBJECT_INTEGRATION_STATE_OP,
-                            uuid::Uuid::nil(),
-                            "invalid",
+                            req.actor_id,
+                            "unauthorized",
                             start.elapsed().as_millis() as u64,
                             0,
                         );
                         return;
                     }
-                };
 
-                if !req.verify() {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        integration = %req.integration_name,
-                        "integration-state RPC: HMAC or freshness verification failed"
-                    );
-                    send_err(IntegrationStateError::Unauthorized).await;
-                    record_rpc_metric(
-                        SUBJECT_INTEGRATION_STATE_OP,
+                    if !talos_memory::rpc_auth::check_and_record_nonce(
+                        talos_memory::integration_state_rpc::SUBJECT_NAME,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
-
-                if !talos_memory::rpc_auth::check_and_record_nonce(
-                    talos_memory::integration_state_rpc::SUBJECT_NAME,
-                    req.actor_id,
-                    &req.nonce,
-                ) {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        integration = %req.integration_name,
-                        "integration-state RPC: nonce replay rejected"
-                    );
-                    send_err(IntegrationStateError::Unauthorized).await;
-                    record_rpc_metric(
-                        SUBJECT_INTEGRATION_STATE_OP,
-                        req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
-
-                let _permit = sem.acquire_owned().await;
-                let permit_at = std::time::Instant::now();
-
-                let op_result = talos_integration_state::execute_op(
-                    &pool,
-                    &req.integration_name,
-                    req.user_id,
-                    req.op,
-                )
-                .await;
-
-                let outcome_tag: &'static str = match &op_result {
-                    Ok(_) => "ok",
-                    Err(IntegrationStateError::KeyNotFound) => "not_found",
-                    Err(IntegrationStateError::Unauthorized) => "unauthorized",
-                    Err(IntegrationStateError::InvalidInput(_)) => "invalid",
-                    Err(IntegrationStateError::Timeout) => "timeout",
-                    Err(IntegrationStateError::StorageFull) => "storage_full",
-                    _ => "internal",
-                };
-                let reply = match op_result {
-                    Ok(r) => IntegrationStateReply { result: Ok(r) },
-                    Err(e) => {
+                        &req.nonce,
+                    ) {
                         tracing::warn!(
                             actor_id = %req.actor_id,
                             integration = %req.integration_name,
-                            error = ?e,
-                            "integration-state RPC: op failed"
+                            "integration-state RPC: nonce replay rejected"
                         );
-                        IntegrationStateReply { result: Err(e) }
+                        send_err(IntegrationStateError::Unauthorized).await;
+                        record_rpc_metric(
+                            SUBJECT_INTEGRATION_STATE_OP,
+                            req.actor_id,
+                            "replay",
+                            start.elapsed().as_millis() as u64,
+                            0,
+                        );
+                        return;
                     }
-                };
-                let _ = nats_client
-                    .publish(
-                        reply_to,
-                        serde_json::to_vec(&reply).unwrap_or_default().into(),
+
+                    let _permit = sem.acquire_owned().await;
+                    let permit_at = std::time::Instant::now();
+
+                    let op_result = talos_integration_state::execute_op(
+                        &pool,
+                        &req.integration_name,
+                        req.user_id,
+                        req.op,
                     )
                     .await;
-                record_rpc_metric(
-                    SUBJECT_INTEGRATION_STATE_OP,
-                    req.actor_id,
-                    outcome_tag,
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    permit_at.elapsed().as_millis() as u64,
-                );
-            });
-        }
+
+                    let outcome_tag: &'static str = match &op_result {
+                        Ok(_) => "ok",
+                        Err(IntegrationStateError::KeyNotFound) => "not_found",
+                        Err(IntegrationStateError::Unauthorized) => "unauthorized",
+                        Err(IntegrationStateError::InvalidInput(_)) => "invalid",
+                        Err(IntegrationStateError::Timeout) => "timeout",
+                        Err(IntegrationStateError::StorageFull) => "storage_full",
+                        _ => "internal",
+                    };
+                    let reply = match op_result {
+                        Ok(r) => IntegrationStateReply { result: Ok(r) },
+                        Err(e) => {
+                            tracing::warn!(
+                                actor_id = %req.actor_id,
+                                integration = %req.integration_name,
+                                error = ?e,
+                                "integration-state RPC: op failed"
+                            );
+                            IntegrationStateReply { result: Err(e) }
+                        }
+                    };
+                    let _ = nats_client
+                        .publish(
+                            reply_to,
+                            serde_json::to_vec(&reply).unwrap_or_default().into(),
+                        )
+                        .await;
+                    record_rpc_metric(
+                        SUBJECT_INTEGRATION_STATE_OP,
+                        req.actor_id,
+                        outcome_tag,
+                        permit_at.saturating_duration_since(start).as_millis() as u64,
+                        permit_at.elapsed().as_millis() as u64,
+                    );
+                });
+            }
             // Inner loop exited.
             if shutdown_requested {
                 break 'supervisor;
@@ -2260,14 +2252,21 @@ mod controller_function_deny_tests {
     fn parse_one(sql: &str) -> sqlparser::ast::Statement {
         let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
             .unwrap_or_else(|e| panic!("parse failed for `{sql}`: {e}"));
-        assert_eq!(stmts.len(), 1, "test SQL must be a single statement: `{sql}`");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "test SQL must be a single statement: `{sql}`"
+        );
         stmts.pop().unwrap()
     }
 
     #[test]
     fn pg_sleep_top_level() {
         let stmt = parse_one("SELECT pg_sleep(1)");
-        assert_eq!(controller_side_denied_function(&stmt).as_deref(), Some("pg_sleep"));
+        assert_eq!(
+            controller_side_denied_function(&stmt).as_deref(),
+            Some("pg_sleep")
+        );
     }
 
     #[test]

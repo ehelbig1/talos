@@ -236,7 +236,8 @@ pub async fn list_calendars_handler(
                         success: false,
                         data: None::<Vec<CalendarInfo>>,
                         error: Some(
-                            "Failed to resolve access token — reconnect the integration".to_string(),
+                            "Failed to resolve access token — reconnect the integration"
+                                .to_string(),
                         ),
                     })
                     .into_response();
@@ -344,7 +345,10 @@ pub async fn create_watch_handler(
             // MCP-1155: canonical `get_base_url()` (empty-env + open-
             // redirect-misconfig defense in one helper).
             let webhook_url = req.webhook_url.unwrap_or_else(|| {
-                format!("{}/api/google-calendar/webhook", talos_config::get_base_url())
+                format!(
+                    "{}/api/google-calendar/webhook",
+                    talos_config::get_base_url()
+                )
             });
 
             match service
@@ -849,7 +853,9 @@ pub async fn test_watch_channel_handler(
                 Json(ApiResponse::<serde_json::Value> {
                     success: false,
                     data: None,
-                    error: Some("Failed to resolve access token — reconnect the integration".to_string()),
+                    error: Some(
+                        "Failed to resolve access token — reconnect the integration".to_string(),
+                    ),
                 }),
             )
                 .into_response();

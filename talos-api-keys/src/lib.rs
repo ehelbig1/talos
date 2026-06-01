@@ -901,15 +901,14 @@ impl ApiKeyService {
         // macro so the RETURNING-clause addition doesn't require a fresh
         // `cargo sqlx prepare` round-trip against a live DB. The tuple
         // shape is pinned by the query text and exercised at runtime.
-        let expired: Vec<(Uuid, Uuid, String, Option<DateTime<Utc>>)> =
-            sqlx::query_as(
-                "UPDATE api_keys
+        let expired: Vec<(Uuid, Uuid, String, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "UPDATE api_keys
                  SET is_active = false
                  WHERE expires_at < NOW() AND is_active = true
                  RETURNING id, user_id, name, expires_at",
-            )
-            .fetch_all(&self.db_pool)
-            .await?;
+        )
+        .fetch_all(&self.db_pool)
+        .await?;
 
         let count = expired.len() as u64;
         for (id, user_id, name, expires_at) in expired {

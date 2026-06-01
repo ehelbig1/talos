@@ -63,7 +63,8 @@ pub async fn add_security_headers(
     // enabled/disabled" promise. Also fixed: `=1` / `=yes` / `=on`
     // / `=TRUE` (capital) now enable HSTS in dev (the canonical
     // truthy set). Sibling drift class to MCP-1060/1064/1065/1066.
-    let enable_hsts = talos_config::bool_env_or_default("ENABLE_HSTS", talos_config::is_production());
+    let enable_hsts =
+        talos_config::bool_env_or_default("ENABLE_HSTS", talos_config::is_production());
 
     if enable_hsts {
         headers.insert(
@@ -196,9 +197,8 @@ fn csp_and_reporting_headers() -> &'static (HeaderValue, Option<HeaderValue>) {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .filter(|s| {
-                    let ok = s.starts_with("https://")
-                        || s.starts_with("http://")
-                        || s.starts_with('/');
+                    let ok =
+                        s.starts_with("https://") || s.starts_with("http://") || s.starts_with('/');
                     if !ok {
                         tracing::warn!(
                             "CSP_REPORT_URI does not start with http://, https://, or '/' — \
@@ -243,9 +243,9 @@ fn csp_and_reporting_headers() -> &'static (HeaderValue, Option<HeaderValue>) {
                 None => HeaderValue::from_static(csp_value),
             };
 
-            let reporting_value: Option<HeaderValue> = csp_report_endpoint.as_deref().and_then(|uri| {
-                HeaderValue::from_str(&format!("csp-endpoint=\"{uri}\"")).ok()
-            });
+            let reporting_value: Option<HeaderValue> = csp_report_endpoint
+                .as_deref()
+                .and_then(|uri| HeaderValue::from_str(&format!("csp-endpoint=\"{uri}\"")).ok());
 
             (csp_header_value, reporting_value)
         });
@@ -285,7 +285,10 @@ mod tests {
             csp.contains("object-src 'none'"),
             "CSP must explicitly deny plugin objects: {csp}"
         );
-        assert!(csp.contains("frame-ancestors 'none'"), "CSP must deny framing: {csp}");
+        assert!(
+            csp.contains("frame-ancestors 'none'"),
+            "CSP must deny framing: {csp}"
+        );
 
         // Check X-Frame-Options
         assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");

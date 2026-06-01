@@ -225,9 +225,9 @@ async fn verify_oci_artifact_signature(reference: &Reference) -> Result<bool> {
             Ok(true)
         }
         Err(reason) => match policy {
-            SigstorePolicy::Required => anyhow::bail!(
-                "Sigstore verification failed for {reference_str}: {reason}"
-            ),
+            SigstorePolicy::Required => {
+                anyhow::bail!("Sigstore verification failed for {reference_str}: {reason}")
+            }
             SigstorePolicy::Audit => {
                 tracing::warn!(
                     reference = %reference_str,
@@ -581,7 +581,9 @@ async fn try_v2_catalog(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let catalog: CatalogResponse = talos_http_body::read_json_capped(resp).await.context("Parse /v2/_catalog response")?;
+        let catalog: CatalogResponse = talos_http_body::read_json_capped(resp)
+            .await
+            .context("Parse /v2/_catalog response")?;
         all_repos.extend(catalog.repositories);
         pages_walked += 1;
 
@@ -884,7 +886,20 @@ fn is_not_found_error(msg: &str) -> bool {
         let trailing = lower.as_bytes().get(after_idx);
         let is_terminator = match trailing {
             None => true,
-            Some(b) => matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | b':' | b'.' | b',' | b';' | b')' | b']' | b'"' | b'\''),
+            Some(b) => matches!(
+                *b,
+                b' ' | b'\t'
+                    | b'\n'
+                    | b'\r'
+                    | b':'
+                    | b'.'
+                    | b','
+                    | b';'
+                    | b')'
+                    | b']'
+                    | b'"'
+                    | b'\''
+            ),
         };
         if is_terminator {
             return true;
@@ -985,10 +1000,7 @@ mod tests {
     #[test]
     fn parse_next_link_unquoted_rel() {
         let h = r#"</v2/_catalog?last=z>; rel=next"#;
-        assert_eq!(
-            parse_next_link(h),
-            Some("/v2/_catalog?last=z".to_string())
-        );
+        assert_eq!(parse_next_link(h), Some("/v2/_catalog?last=z".to_string()));
     }
 
     #[test]

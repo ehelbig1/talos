@@ -239,9 +239,7 @@ pub type EncryptFuture = std::pin::Pin<
 
 /// Future returned by [`MemoryCryptoHook::decrypt`].
 pub type DecryptFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = anyhow::Result<zeroize::Zeroizing<String>>> + Send,
-    >,
+    Box<dyn std::future::Future<Output = anyhow::Result<zeroize::Zeroizing<String>>> + Send>,
 >;
 
 /// Build the stable AAD bytes for an `actor_memory` row from its
@@ -788,9 +786,9 @@ pub async fn recall_exact(
     // v1 ciphertext to empty-AAD decryption, surfacing as a generic
     // "AES-GCM tag mismatch" that buries the real bug (the dropped column).
     // This is the same projection-drift class as the Phase-B `value` bug.
-    let value_format: i16 = r.try_get("value_format").context(
-        "recall_exact: SELECT must project `value_format` (MCP-S2 AAD dispatch)",
-    )?;
+    let value_format: i16 = r
+        .try_get("value_format")
+        .context("recall_exact: SELECT must project `value_format` (MCP-S2 AAD dispatch)")?;
     let aad = build_memory_aad(actor_id, &row_key);
     let value = resolve_stored_value(None, value_enc, value_key_id, aad, value_format).await?;
 
@@ -985,7 +983,10 @@ pub async fn list_memories(
             expires_at: r.get("expires_at"),
             updated_at: r.get("updated_at"),
             value_bytes: r.get("value_bytes"),
-            metadata: r.try_get::<Option<serde_json::Value>, _>("metadata").ok().flatten(),
+            metadata: r
+                .try_get::<Option<serde_json::Value>, _>("metadata")
+                .ok()
+                .flatten(),
         })
         .collect())
 }
@@ -1170,8 +1171,7 @@ pub async fn recall_semantic_filtered(
                 )?;
                 let aad = build_memory_aad(actor_id, &row_key);
                 let value =
-                    resolve_stored_value(None, value_enc, value_key_id, aad, value_format)
-                        .await?;
+                    resolve_stored_value(None, value_enc, value_key_id, aad, value_format).await?;
                 hits.push(MemoryHit {
                     key: row_key,
                     value,
@@ -1433,8 +1433,7 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
             "rows_to_memory_hits: caller's SELECT must project `value_format` (MCP-S2 dispatch)",
         )?;
         let aad = build_memory_aad(actor_id, &row_key);
-        let value = resolve_stored_value(None, value_enc, value_key_id, aad, value_format)
-            .await?;
+        let value = resolve_stored_value(None, value_enc, value_key_id, aad, value_format).await?;
         hits.push(MemoryHit {
             key: row_key,
             value,
@@ -1691,17 +1690,13 @@ pub async fn clone_memories(
             let plaintext = hook
                 .decrypt(value_key_id, value_enc, source_aad, 1)
                 .await
-                .with_context(|| {
-                    format!("clone_memories: decrypt v1 source row key={key}")
-                })?;
+                .with_context(|| format!("clone_memories: decrypt v1 source row key={key}"))?;
             // Re-encrypt under TARGET AAD.
             let target_aad = build_memory_aad(target_actor_id, &key);
             let (new_key_id, new_ciphertext, new_format) = hook
                 .encrypt(plaintext.to_string(), target_aad)
                 .await
-                .with_context(|| {
-                    format!("clone_memories: re-encrypt v1 row key={key}")
-                })?;
+                .with_context(|| format!("clone_memories: re-encrypt v1 row key={key}"))?;
             let new_expires_at: Option<chrono::DateTime<chrono::Utc>> = match memory_type.as_str() {
                 "semantic" => None,
                 "episodic" => Some(chrono::Utc::now() + chrono::Duration::days(7)),
@@ -1870,29 +1865,33 @@ async fn backfill_embeddings_filtered(
     // (decrypt err → warn + continue), so embeddings never got
     // generated for post-MCP-S2 actor_memory rows.
     let raw_rows = match actor_filter {
-        Some(actor_id) => sqlx::query(
-            "SELECT id, actor_id, key, value_enc, value_key_id, value_format \
+        Some(actor_id) => {
+            sqlx::query(
+                "SELECT id, actor_id, key, value_enc, value_key_id, value_format \
              FROM actor_memory \
              WHERE actor_id = $1 \
                AND embedding IS NULL \
                AND memory_type != 'scratchpad' \
                AND (expires_at IS NULL OR expires_at > NOW()) \
              ORDER BY created_at ASC LIMIT $2",
-        )
-        .bind(actor_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
-        None => sqlx::query(
-            "SELECT id, actor_id, key, value_enc, value_key_id, value_format \
+            )
+            .bind(actor_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "SELECT id, actor_id, key, value_enc, value_key_id, value_format \
              FROM actor_memory \
              WHERE embedding IS NULL AND memory_type != 'scratchpad' \
              AND (expires_at IS NULL OR expires_at > NOW()) \
              ORDER BY created_at ASC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
     };
 
     let total = raw_rows.len();
@@ -1981,8 +1980,7 @@ mod tests {
 
     #[test]
     fn build_memory_aad_encodes_actor_id_then_separator_then_key() {
-        let actor =
-            Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("valid uuid");
+        let actor = Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("valid uuid");
         let aad = build_memory_aad(actor, "my-key");
         // 16 actor_id bytes
         assert_eq!(&aad[..16], actor.as_bytes());
@@ -2101,7 +2099,10 @@ mod tests {
     #[test]
     fn validate_memory_key_accepts_canonical() {
         assert_eq!(validate_memory_key("foo").unwrap(), "foo");
-        assert_eq!(validate_memory_key("daily_brief/2026-04-21").unwrap(), "daily_brief/2026-04-21");
+        assert_eq!(
+            validate_memory_key("daily_brief/2026-04-21").unwrap(),
+            "daily_brief/2026-04-21"
+        );
         // Trim semantics: surrounding whitespace stripped, inner
         // whitespace preserved.
         assert_eq!(validate_memory_key("  foo  ").unwrap(), "foo");
@@ -2565,11 +2566,8 @@ mod tests {
         assert!(got.is_some(), "clamp should produce a valid timestamp");
         let dt = got.unwrap();
         let now = super::Utc::now();
-        let max_window =
-            now + super::Duration::seconds((super::MAX_TTL_HOURS as i64) * 3600 + 60);
-        let min_window = now + super::Duration::seconds(
-            (super::MAX_TTL_HOURS as i64) * 3600 - 60,
-        );
+        let max_window = now + super::Duration::seconds((super::MAX_TTL_HOURS as i64) * 3600 + 60);
+        let min_window = now + super::Duration::seconds((super::MAX_TTL_HOURS as i64) * 3600 - 60);
         assert!(
             dt < max_window && dt > min_window,
             "clamped TTL should be ~10 years out, got {dt}"

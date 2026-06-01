@@ -204,11 +204,7 @@ fn check_and_record_job_nonce(nonce: &str, ts: u64, max_age_secs: u64) -> bool {
 /// remains functional — this accessor errs on the side of "0" rather
 /// than panic-on-read.
 pub fn job_nonce_cache_size() -> usize {
-    JOB_NONCE_CACHE
-        .seen
-        .lock()
-        .map(|g| g.len())
-        .unwrap_or(0)
+    JOB_NONCE_CACHE.seen.lock().map(|g| g.len()).unwrap_or(0)
 }
 
 /// Maximum length of a `worker_id` in bytes. Pod names and host names
@@ -237,9 +233,7 @@ pub fn validate_worker_id(worker_id: &str) -> Result<(), String> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
     {
-        return Err(
-            "worker_id contains invalid chars (allowed: A-Z a-z 0-9 . - _)".into(),
-        );
+        return Err("worker_id contains invalid chars (allowed: A-Z a-z 0-9 . - _)".into());
     }
     Ok(())
 }
@@ -419,9 +413,7 @@ pub fn is_external_llm_host(host_lower: &str) -> bool {
     // Defense in depth — callers are documented to pass an already-lowercased
     // host but we normalise here too: an upstream regression that forwards a
     // mixed-case or trailing-dot value shouldn't silently bypass the gate.
-    let normalised = host_lower
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let normalised = host_lower.trim_end_matches('.').to_ascii_lowercase();
     EXTERNAL_LLM_HOSTS
         .iter()
         .any(|reserved| *reserved == normalised || normalised.ends_with(&format!(".{reserved}")))
@@ -872,7 +864,7 @@ mod disallowed_sql_function_tests {
             "current_user",
             "json_agg",
             "row_number",
-            "version", // Note: version() is allowed (read-only info)
+            "version",   // Note: version() is allowed (read-only info)
             "pg_typeof", // diagnostic, no escalation
             "pg_my_custom_business_func",
         ] {
@@ -904,7 +896,10 @@ mod disallowed_sql_function_tests {
             "pg_ls_dir",
             "pg_stat_file",
         ] {
-            assert!(is_disallowed_sql_function(f), "filesystem-read `{f}` must be denied");
+            assert!(
+                is_disallowed_sql_function(f),
+                "filesystem-read `{f}` must be denied"
+            );
         }
 
         // Sleep / budget burn
@@ -919,12 +914,18 @@ mod disallowed_sql_function_tests {
             "pg_reload_conf",
             "pg_rotate_logfile",
         ] {
-            assert!(is_disallowed_sql_function(f), "backend-control `{f}` must be denied");
+            assert!(
+                is_disallowed_sql_function(f),
+                "backend-control `{f}` must be denied"
+            );
         }
 
         // Large-object I/O + dblink network bypass
         for f in ["lo_import", "lo_export", "dblink", "dblink_connect"] {
-            assert!(is_disallowed_sql_function(f), "io/dblink `{f}` must be denied");
+            assert!(
+                is_disallowed_sql_function(f),
+                "io/dblink `{f}` must be denied"
+            );
         }
     }
 }
@@ -1842,11 +1843,7 @@ impl JobResult {
     /// `[A-Za-z0-9._-]{0,128}`); invalid ids fail closed before any HMAC
     /// is computed so a misconfigured worker can't accidentally publish a
     /// malformed-but-signed result.
-    pub fn sign_with_worker_id(
-        &mut self,
-        key: &[u8],
-        worker_id: &str,
-    ) -> Result<(), String> {
+    pub fn sign_with_worker_id(&mut self, key: &[u8], worker_id: &str) -> Result<(), String> {
         validate_worker_id(worker_id)?;
         self.worker_id = worker_id.to_string();
 
@@ -1899,17 +1896,10 @@ impl JobResult {
     /// [`Verifier::Observer`]. New code should prefer this method —
     /// the role becomes explicit at the call site instead of being
     /// encoded only in the method name.
-    pub fn verify_as(
-        &self,
-        key: &[u8],
-        max_age_secs: u64,
-        role: Verifier,
-    ) -> Result<(), String> {
+    pub fn verify_as(&self, key: &[u8], max_age_secs: u64, role: Verifier) -> Result<(), String> {
         match role {
             Verifier::Primary => self.verify(key, max_age_secs),
-            Verifier::Observer => {
-                self.verify_no_replay(key, max_age_secs).map(|_| ())
-            }
+            Verifier::Observer => self.verify_no_replay(key, max_age_secs).map(|_| ()),
         }
     }
 
@@ -2212,10 +2202,8 @@ impl PipelineJobRequest {
             .steps
             .iter()
             .map(|s| {
-                let config_hash =
-                    hex::encode(Sha256::digest(s.config.to_string().as_bytes()));
-                let secrets_ct_hash =
-                    hex::encode(Sha256::digest(&s.encrypted_secrets.ciphertext));
+                let config_hash = hex::encode(Sha256::digest(s.config.to_string().as_bytes()));
+                let secrets_ct_hash = hex::encode(Sha256::digest(&s.encrypted_secrets.ciphertext));
                 let mut hosts = s.allowed_hosts.clone();
                 hosts.sort_unstable();
                 let hosts_str = hosts.join(",");
@@ -2462,8 +2450,7 @@ impl PipelineJobResult {
                 format!("{}|{}|{}|{}", s.module_id, s_status, s_output, s_error)
             })
             .collect();
-        let step_results_hash =
-            hex::encode(Sha256::digest(step_digests.join("\n").as_bytes()));
+        let step_results_hash = hex::encode(Sha256::digest(step_digests.join("\n").as_bytes()));
 
         format!(
             "pipeline_result:{}:{}:{}:{}:{}:{}:{}",
@@ -2494,11 +2481,7 @@ impl PipelineJobResult {
     /// Sign the pipeline result and bind the worker's self-reported
     /// identity. Mirror of [`JobResult::sign_with_worker_id`] — same
     /// charset validation, same fail-closed-on-invalid-id contract.
-    pub fn sign_with_worker_id(
-        &mut self,
-        key: &[u8],
-        worker_id: &str,
-    ) -> Result<(), String> {
+    pub fn sign_with_worker_id(&mut self, key: &[u8], worker_id: &str) -> Result<(), String> {
         validate_worker_id(worker_id)?;
         self.worker_id = worker_id.to_string();
 
@@ -2542,17 +2525,10 @@ impl PipelineJobResult {
 
     /// L-4 typed verifier — same dispatch as
     /// [`JobResult::verify_as`]. Use this method in new code.
-    pub fn verify_as(
-        &self,
-        key: &[u8],
-        max_age_secs: u64,
-        role: Verifier,
-    ) -> Result<(), String> {
+    pub fn verify_as(&self, key: &[u8], max_age_secs: u64, role: Verifier) -> Result<(), String> {
         match role {
             Verifier::Primary => self.verify(key, max_age_secs),
-            Verifier::Observer => {
-                self.verify_no_replay(key, max_age_secs).map(|_| ())
-            }
+            Verifier::Observer => self.verify_no_replay(key, max_age_secs).map(|_| ()),
         }
     }
 
@@ -3390,8 +3366,11 @@ mod tests {
         let mut req = make_test_request(None);
         req.sign(&key).unwrap();
 
-        req.allowed_sql_operations =
-            vec!["SELECT".to_string(), "INSERT".to_string(), "DELETE".to_string()];
+        req.allowed_sql_operations = vec![
+            "SELECT".to_string(),
+            "INSERT".to_string(),
+            "DELETE".to_string(),
+        ];
         assert!(
             req.verify(&key, 300).is_err(),
             "tampered allowed_sql_operations must fail verification (M-5)"
@@ -3566,7 +3545,9 @@ mod tests {
             worker_id: String::new(),
         };
         result.sign(&key).unwrap();
-        result.verify(&key, 300).expect("empty-logs result should verify");
+        result
+            .verify(&key, 300)
+            .expect("empty-logs result should verify");
     }
 
     // ========================================================================
@@ -3696,9 +3677,8 @@ mod tests {
         req.cancellation_token = Some("abc-123".to_string());
         req.sign(&key).unwrap();
 
-        req.verify(&key, 300).expect(
-            "clean request with newly-bound H-3/H-7 fields must verify",
-        );
+        req.verify(&key, 300)
+            .expect("clean request with newly-bound H-3/H-7 fields must verify");
     }
 
     // ========================================================================
@@ -3775,7 +3755,9 @@ mod tests {
         let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
         req.sign(&key).unwrap();
 
-        req.steps[0].allowed_hosts.push("attacker.example".to_string());
+        req.steps[0]
+            .allowed_hosts
+            .push("attacker.example".to_string());
         assert!(
             req.verify(&key, 300).is_err(),
             "tampered pipeline allowed_hosts must fail verification (C-2)"
@@ -3891,9 +3873,8 @@ mod tests {
         let mut req = make_test_pipeline(vec![step]);
         req.sign(&key).unwrap();
 
-        req.verify(&key, 300).expect(
-            "clean pipeline with C-2 fields populated must verify",
-        );
+        req.verify(&key, 300)
+            .expect("clean pipeline with C-2 fields populated must verify");
     }
 
     /// C-2: per-step independence — mutating step 1 must invalidate the

@@ -407,8 +407,7 @@ mod tests {
         // transient (retry happens either way), but per-error-class
         // operator reports lose the DB precision. Hoisting the
         // DB-transient check above timeout fixes the precedence.
-        let classified =
-            classify_error("ERROR: canceling statement due to lock timeout");
+        let classified = classify_error("ERROR: canceling statement due to lock timeout");
         assert_eq!(classified, "database_transient");
         assert!(is_transient_error_type(&classified));
     }

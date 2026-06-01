@@ -38,7 +38,9 @@ async fn connect(url: &str) -> Pool<Postgres> {
 
 #[tokio::test]
 async fn begin_tenant_read_scoped_enforces_rls_when_flag_on() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     // MUST precede the first helper call so the flag's LazyLock captures it.
     // Safe: single-threaded prologue, before any other thread touches env.
     std::env::set_var("TALOS_RLS_SET_ROLE", "1");
@@ -101,6 +103,12 @@ async fn begin_tenant_read_scoped_enforces_rls_when_flag_on() {
     tx.commit().await.unwrap();
     assert_eq!(a_sees, 1, "owner must see own workflow through the helper");
 
-    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf).execute(&su).await;
-    let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_a).execute(&su).await;
+    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1")
+        .bind(wf)
+        .execute(&su)
+        .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_a)
+        .execute(&su)
+        .await;
 }

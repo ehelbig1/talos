@@ -727,7 +727,11 @@ pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {
                     if !VALID_TYPES.contains(&s.as_str()) {
                         errors.push(format!(
                             "Schema {} has unknown type '{}'. Valid types: {}.",
-                            if path.is_empty() { "root".to_string() } else { format!("at '{}'", path) },
+                            if path.is_empty() {
+                                "root".to_string()
+                            } else {
+                                format!("at '{}'", path)
+                            },
                             s,
                             VALID_TYPES.join(", ")
                         ));
@@ -747,7 +751,11 @@ pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {
                         } else {
                             errors.push(format!(
                                 "Schema {} type-union must contain only strings, got {}.",
-                                if path.is_empty() { "root".to_string() } else { format!("at '{}'", path) },
+                                if path.is_empty() {
+                                    "root".to_string()
+                                } else {
+                                    format!("at '{}'", path)
+                                },
                                 v
                             ));
                         }
@@ -756,7 +764,11 @@ pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {
                 _ => {
                     errors.push(format!(
                         "Schema {} `type` must be a string or array of strings, got {}.",
-                        if path.is_empty() { "root".to_string() } else { format!("at '{}'", path) },
+                        if path.is_empty() {
+                            "root".to_string()
+                        } else {
+                            format!("at '{}'", path)
+                        },
                         t
                     ));
                 }
@@ -785,7 +797,9 @@ pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {
         if let Some(items) = obj.get("items") {
             // items may be a single schema OR an array of schemas (tuple form).
             match items {
-                serde_json::Value::Object(_) => walk(items, &format!("{}.items", path), errors, depth + 1),
+                serde_json::Value::Object(_) => {
+                    walk(items, &format!("{}.items", path), errors, depth + 1)
+                }
                 serde_json::Value::Array(arr) => {
                     for (i, sub) in arr.iter().enumerate() {
                         walk(sub, &format!("{}.items[{}]", path, i), errors, depth + 1);
@@ -793,7 +807,11 @@ pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {
                 }
                 _ => errors.push(format!(
                     "Schema {} `items` must be a schema object or array of schemas, got {}.",
-                    if path.is_empty() { "root".to_string() } else { format!("at '{}'", path) },
+                    if path.is_empty() {
+                        "root".to_string()
+                    } else {
+                        format!("at '{}'", path)
+                    },
                     json_kind(items)
                 )),
             }
@@ -808,7 +826,11 @@ pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {
                     }
                     None => errors.push(format!(
                         "Schema {} `{}` must be an array of schemas, got {}.",
-                        if path.is_empty() { "root".to_string() } else { format!("at '{}'", path) },
+                        if path.is_empty() {
+                            "root".to_string()
+                        } else {
+                            format!("at '{}'", path)
+                        },
                         kw,
                         json_kind(v)
                     )),
@@ -821,7 +843,11 @@ pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {
             } else {
                 errors.push(format!(
                     "Schema {} `not` must be a schema object, got {}.",
-                    if path.is_empty() { "root".to_string() } else { format!("at '{}'", path) },
+                    if path.is_empty() {
+                        "root".to_string()
+                    } else {
+                        format!("at '{}'", path)
+                    },
                     json_kind(not)
                 ));
             }
@@ -830,14 +856,22 @@ pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {
             if !req.is_array() {
                 errors.push(format!(
                     "Schema {} `required` must be an array of strings.",
-                    if path.is_empty() { "root".to_string() } else { format!("at '{}'", path) }
+                    if path.is_empty() {
+                        "root".to_string()
+                    } else {
+                        format!("at '{}'", path)
+                    }
                 ));
             } else if let Some(arr) = req.as_array() {
                 for (i, v) in arr.iter().enumerate() {
                     if !v.is_string() {
                         errors.push(format!(
                             "Schema {} `required[{}]` must be a string, got {}.",
-                            if path.is_empty() { "root".to_string() } else { format!("at '{}'", path) },
+                            if path.is_empty() {
+                                "root".to_string()
+                            } else {
+                                format!("at '{}'", path)
+                            },
                             i,
                             v
                         ));
@@ -871,7 +905,8 @@ mod schema_meta_validation_tests {
         ] {
             let errs = validate_schema_well_formed(&bad);
             assert!(
-                errs.iter().any(|e| e.contains("`properties` must be an object")),
+                errs.iter()
+                    .any(|e| e.contains("`properties` must be an object")),
                 "should reject {bad}; got {errs:?}"
             );
         }
@@ -887,7 +922,8 @@ mod schema_meta_validation_tests {
         ] {
             let errs = validate_schema_well_formed(&bad);
             assert!(
-                errs.iter().any(|e| e.contains("`items` must be a schema object or array")),
+                errs.iter()
+                    .any(|e| e.contains("`items` must be a schema object or array")),
                 "should reject {bad}; got {errs:?}"
             );
         }
@@ -909,7 +945,8 @@ mod schema_meta_validation_tests {
             let bad = json!({ kw: "not-array" });
             let errs = validate_schema_well_formed(&bad);
             assert!(
-                errs.iter().any(|e| e.contains(&format!("`{kw}` must be an array"))),
+                errs.iter()
+                    .any(|e| e.contains(&format!("`{kw}` must be an array"))),
                 "should reject {bad}; got {errs:?}"
             );
         }
@@ -920,7 +957,8 @@ mod schema_meta_validation_tests {
         let bad = json!({"not": "not-an-object"});
         let errs = validate_schema_well_formed(&bad);
         assert!(
-            errs.iter().any(|e| e.contains("`not` must be a schema object")),
+            errs.iter()
+                .any(|e| e.contains("`not` must be a schema object")),
             "got {errs:?}"
         );
     }
@@ -937,7 +975,8 @@ mod schema_meta_validation_tests {
                 "age": {"type": "integer"},
                 "tags": {"type": "array", "items": {"type": "string"}}
             }
-        })).is_empty());
+        }))
+        .is_empty());
     }
 
     #[test]
@@ -964,7 +1003,8 @@ mod schema_meta_validation_tests {
     fn accepts_type_union() {
         assert!(validate_schema_well_formed(&json!({
             "type": ["string", "null"]
-        })).is_empty());
+        }))
+        .is_empty());
     }
 
     #[test]
@@ -1382,10 +1422,9 @@ fn validate_input_against_schema_depth(
             // without this block, combiner schemas on scalars (strings, numbers,
             // booleans) would silently pass regardless of sub-schema constraints.
             if let Some(any_of) = field_schema.get("anyOf").and_then(|v| v.as_array()) {
-                if !any_of
-                    .iter()
-                    .any(|s| validate_input_against_schema_depth(s, input_val, depth + 1).is_empty())
-                {
+                if !any_of.iter().any(|s| {
+                    validate_input_against_schema_depth(s, input_val, depth + 1).is_empty()
+                }) {
                     errors.push(format!(
                         "Field '{}' does not match any of the expected schemas (anyOf)",
                         field
@@ -1395,7 +1434,9 @@ fn validate_input_against_schema_depth(
             if let Some(one_of) = field_schema.get("oneOf").and_then(|v| v.as_array()) {
                 let n = one_of
                     .iter()
-                    .filter(|s| validate_input_against_schema_depth(s, input_val, depth + 1).is_empty())
+                    .filter(|s| {
+                        validate_input_against_schema_depth(s, input_val, depth + 1).is_empty()
+                    })
                     .count();
                 if n != 1 {
                     errors.push(format!(
@@ -1675,7 +1716,11 @@ mod tests {
     fn items_accepts_matching_array() {
         let schema = json!({"type": "array", "items": {"type": "integer"}});
         let errs = validate_input_against_schema(&schema, &json!([1, 2, 3]));
-        assert!(errs.is_empty(), "items {{integer}} must accept [1,2,3]: {:?}", errs);
+        assert!(
+            errs.is_empty(),
+            "items {{integer}} must accept [1,2,3]: {:?}",
+            errs
+        );
     }
 
     #[test]
@@ -1687,12 +1732,10 @@ mod tests {
             }
         });
         let errs = validate_input_against_schema(&schema, &json!({"tags": [1, 2]}));
+        assert!(!errs.is_empty(), "tags items {{string}} must reject [1,2]");
         assert!(
-            !errs.is_empty(),
-            "tags items {{string}} must reject [1,2]"
-        );
-        assert!(
-            errs.iter().any(|e| e.contains("Field 'tags'") && e.contains("items[0]")),
+            errs.iter()
+                .any(|e| e.contains("Field 'tags'") && e.contains("items[0]")),
             "expected field+index prefix in error path: {:?}",
             errs
         );
@@ -1707,11 +1750,13 @@ mod tests {
             "items": [{"type": "string"}, {"type": "integer"}]
         });
         // Valid: [str, int, anything-extra]
-        let errs = validate_input_against_schema(
-            &schema,
-            &json!(["a", 5, "extra-elements-allowed"]),
+        let errs =
+            validate_input_against_schema(&schema, &json!(["a", 5, "extra-elements-allowed"]));
+        assert!(
+            errs.is_empty(),
+            "tuple-extra should be unconstrained: {:?}",
+            errs
         );
-        assert!(errs.is_empty(), "tuple-extra should be unconstrained: {:?}", errs);
         // Invalid: position 0 must be string, got int
         let errs = validate_input_against_schema(&schema, &json!([5, 5]));
         assert!(errs.iter().any(|e| e.contains("items[0]")), "{:?}", errs);

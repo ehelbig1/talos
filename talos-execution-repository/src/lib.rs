@@ -130,7 +130,6 @@ pub struct LoopCappedWorkflowRow {
     pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-
 impl ExecutionRepository {
     pub fn new(db_pool: PgPool) -> Self {
         Self {
@@ -507,9 +506,7 @@ impl ExecutionRepository {
                 if k.starts_with("__") {
                     return false;
                 }
-                v.get("termination_reason")
-                    .and_then(|t| t.as_str())
-                    == Some("max_iterations")
+                v.get("termination_reason").and_then(|t| t.as_str()) == Some("max_iterations")
             });
             if !has_loop_cap {
                 continue;
@@ -531,14 +528,16 @@ impl ExecutionRepository {
         }
         let mut out: Vec<LoopCappedWorkflowRow> = agg
             .into_iter()
-            .map(|(workflow_id, (workflow_name, occurrence_count, last_seen))| {
-                LoopCappedWorkflowRow {
-                    workflow_id,
-                    workflow_name,
-                    occurrence_count,
-                    last_seen,
-                }
-            })
+            .map(
+                |(workflow_id, (workflow_name, occurrence_count, last_seen))| {
+                    LoopCappedWorkflowRow {
+                        workflow_id,
+                        workflow_name,
+                        occurrence_count,
+                        last_seen,
+                    }
+                },
+            )
             .collect();
         out.sort_by(|a, b| {
             b.occurrence_count
@@ -1299,8 +1298,7 @@ impl ExecutionRepository {
         if self.output_encryption_enabled() {
             // MCP-S2: encrypt_output binds AAD = exec_id so a swap of
             // output_data_enc across rows is detected on read.
-            let (key_id, enc_bytes, format_version) =
-                self.encrypt_output(exec_id, output).await?;
+            let (key_id, enc_bytes, format_version) = self.encrypt_output(exec_id, output).await?;
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'waiting', output_data = NULL, \
@@ -1338,8 +1336,7 @@ impl ExecutionRepository {
         output: &serde_json::Value,
     ) -> Result<()> {
         let result = if self.output_encryption_enabled() {
-            let (key_id, enc_bytes, format_version) =
-                self.encrypt_output(exec_id, output).await?;
+            let (key_id, enc_bytes, format_version) = self.encrypt_output(exec_id, output).await?;
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'completed', output_data = NULL, \
@@ -1455,8 +1452,7 @@ impl ExecutionRepository {
         } else {
             // MCP-971: DLP-redact plaintext-fallback output. Sibling
             // to the workflow-repository fix above.
-            let redacted_output =
-                output.map(talos_dlp_provider::redact_json);
+            let redacted_output = output.map(talos_dlp_provider::redact_json);
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'failed', error_message = $1, output_data = $2, completed_at = NOW() \

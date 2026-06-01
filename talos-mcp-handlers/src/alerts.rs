@@ -93,10 +93,11 @@ async fn handle_list_alerts(
     // the filter was malformed. Confirmed by probe. Same MCP-189 /
     // MCP-229 family. Use validate_optional_bool which rejects
     // wrong-type loudly.
-    let acknowledged = match crate::utils::validate_optional_bool(args, "acknowledged", false, &req_id) {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
+    let acknowledged =
+        match crate::utils::validate_optional_bool(args, "acknowledged", false, &req_id) {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
     let limit = match crate::utils::validate_range_i64(args, "limit", 1, 100, 20, &req_id) {
         Ok(v) => v as i32,
         Err(resp) => return resp,
@@ -369,7 +370,11 @@ fn build_fingerprint_groups(
         b.get("occurrence_count")
             .and_then(|v| v.as_i64())
             .unwrap_or(0)
-            .cmp(&a.get("occurrence_count").and_then(|v| v.as_i64()).unwrap_or(0))
+            .cmp(
+                &a.get("occurrence_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+            )
     });
     out
 }
@@ -420,7 +425,13 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use talos_analytics_repository::RecentAlertSummaryRow;
 
-    fn row(workflow: &str, message: &str, occ: i32, acked: bool, secs_ago: i64) -> RecentAlertSummaryRow {
+    fn row(
+        workflow: &str,
+        message: &str,
+        occ: i32,
+        acked: bool,
+        secs_ago: i64,
+    ) -> RecentAlertSummaryRow {
         RecentAlertSummaryRow {
             workflow_name: workflow.to_string(),
             message: message.to_string(),
@@ -491,8 +502,20 @@ mod tests {
     #[test]
     fn distinct_workflow_names_aggregate() {
         let rows = vec![
-            row("alpha", "execution aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee failed", 1, false, 0),
-            row("beta", "execution 11111111-2222-3333-4444-555555555555 failed", 2, false, 5),
+            row(
+                "alpha",
+                "execution aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee failed",
+                1,
+                false,
+                0,
+            ),
+            row(
+                "beta",
+                "execution 11111111-2222-3333-4444-555555555555 failed",
+                2,
+                false,
+                5,
+            ),
         ];
         let groups = build_fingerprint_groups(&rows);
         assert_eq!(groups.len(), 1);

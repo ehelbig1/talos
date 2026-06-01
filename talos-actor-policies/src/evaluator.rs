@@ -117,20 +117,22 @@ impl PolicyEvaluator {
         let notification_webhook = std::env::var("TALOS_POLICY_NOTIFICATION_WEBHOOK")
             .ok()
             .filter(|s| !s.is_empty())
-            .and_then(|url| match talos_http_utils::ssrf::check_outbound_url_no_ssrf(&url) {
-                Ok(()) => Some(url),
-                Err(reason) => {
-                    tracing::error!(
-                        target: "talos_audit",
-                        event_kind = "policy_notification_webhook_rejected",
-                        reason,
-                        "TALOS_POLICY_NOTIFICATION_WEBHOOK failed SSRF validation at startup; \
-                         policy notifications will use the action-log fallback instead. \
-                         Fix the env var to enable external webhook delivery."
-                    );
-                    None
-                }
-            });
+            .and_then(
+                |url| match talos_http_utils::ssrf::check_outbound_url_no_ssrf(&url) {
+                    Ok(()) => Some(url),
+                    Err(reason) => {
+                        tracing::error!(
+                            target: "talos_audit",
+                            event_kind = "policy_notification_webhook_rejected",
+                            reason,
+                            "TALOS_POLICY_NOTIFICATION_WEBHOOK failed SSRF validation at startup; \
+                             policy notifications will use the action-log fallback instead. \
+                             Fix the env var to enable external webhook delivery."
+                        );
+                        None
+                    }
+                },
+            );
 
         // MCP-1155: canonical `talos_config::get_base_url()` —
         // collapses MCP-653 empty-env handling AND the open-redirect-
