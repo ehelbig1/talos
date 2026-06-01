@@ -2248,6 +2248,76 @@ else
 fi
 echo
 
+# ── 29. engine.set_actor_id() only via the canonical actor-application path ──
+bold "▶ check 29: no bare engine.set_actor_id() outside the actor-application path"
+
+# Per-actor `max_llm_tier` is the tier-1 data-egress ceiling (tier1 = local
+# Ollama only, "data must not leave host"). `ActorRepository::apply_actor_to_engine`
+# stamps actor_id AND max_llm_tier together and fail-closes to Tier-1 on DB error.
+# A bare `engine.set_actor_id(aid)` in a consumer crate sets the actor WITHOUT the
+# tier, so the engine keeps the default Tier-2 — a tier-1 actor silently runs as
+# tier-2 and its data can leave the host. CLAUDE.md documents this ("never call
+# bare engine.set_actor_id; the audit team would catch it") but it was only
+# grep-by-hand enforced. This freezes it.
+#
+# Two legitimate definitions own the setter machinery and are exempt:
+#   * talos-workflow-engine/  — defines the engine + the `with_actor_id` builder.
+#   * talos-actor-repository/ — `apply_actor_to_engine` (the canonical stamp).
+# Consumers must route through `apply_actor_to_engine`, or the builder's
+# `with_actor_id(...)` followed by `for_workflow(...)` (which re-applies the tier).
+# Opt out (a new path that stamps the tier itself) with
+# `// allow-bare-set-actor-id: <reason>` within 4 lines above.
+
+SET_ACTOR_VIOLATIONS=0
+if [ -n "$RG_BIN" ]; then
+    sa_matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' \
+        -g '!talos-actor-repository/**' \
+        -g '!talos-workflow-engine/**' \
+        -g '!**/tests/**' -g '!**/*_tests.rs' \
+        -e '\.set_actor_id\(' \
+        . 2>/dev/null || true)
+else
+    sa_matches=$(grep -rnE --include='*.rs' '\.set_actor_id\(' \
+        talos-* worker controller 2>/dev/null \
+        | grep -vE 'talos-actor-repository/|talos-workflow-engine/|/tests/|_tests\.rs' || true)
+fi
+
+if [ -n "$sa_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Skip the definition / doc-comment references / commented lines.
+        if echo "$body" | grep -qE 'fn set_actor_id|^\s*//|//!'; then
+            continue
+        fi
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-bare-set-actor-id:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        SET_ACTOR_VIOLATIONS=$((SET_ACTOR_VIOLATIONS + 1))
+    done <<< "$sa_matches"
+fi
+
+if [ "$SET_ACTOR_VIOLATIONS" -gt 0 ]; then
+    red "✗ $SET_ACTOR_VIOLATIONS bare engine.set_actor_id() call(s) outside the actor-application path"
+    yellow "  → use ActorRepository::apply_actor_to_engine(&mut engine, actor_id) — it stamps"
+    yellow "    actor_id AND max_llm_tier (fail-closed to Tier-1), or the builder's"
+    yellow "    with_actor_id(..) + for_workflow(..). Bare set_actor_id leaves a tier-1 actor at"
+    yellow "    the default Tier-2 — a data-egress hole."
+    yellow "  → Opt out (path stamps the tier itself): // allow-bare-set-actor-id: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ engine.set_actor_id() confined to the canonical actor-application path"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
