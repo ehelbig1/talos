@@ -781,7 +781,16 @@ pub async fn recall_exact(
     let row_key: String = r.get("key");
     let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
     let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
-    let value_format: i16 = r.try_get("value_format").unwrap_or(0);
+    // Fail LOUD on a missing `value_format`, matching decrypt_row_value /
+    // rows_to_memory_hits. value_format is NOT NULL in the schema, so `.ok()`
+    // / `.unwrap_or(0)` here would only ever mask SELECT-projection drift —
+    // and silently defaulting to 0 (legacy no-AAD) would mis-dispatch every
+    // v1 ciphertext to empty-AAD decryption, surfacing as a generic
+    // "AES-GCM tag mismatch" that buries the real bug (the dropped column).
+    // This is the same projection-drift class as the Phase-B `value` bug.
+    let value_format: i16 = r.try_get("value_format").context(
+        "recall_exact: SELECT must project `value_format` (MCP-S2 AAD dispatch)",
+    )?;
     let aad = build_memory_aad(actor_id, &row_key);
     let value = resolve_stored_value(None, value_enc, value_key_id, aad, value_format).await?;
 
@@ -1152,7 +1161,13 @@ pub async fn recall_semantic_filtered(
                 let row_key: String = r.get("key");
                 let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
                 let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
-                let value_format: i16 = r.try_get("value_format").unwrap_or(0);
+                // Fail LOUD on a missing `value_format` (see recall_exact /
+                // decrypt_row_value): silently defaulting to 0 would mis-
+                // dispatch v1 ciphertexts to empty-AAD decryption on any
+                // future SELECT-projection drift.
+                let value_format: i16 = r.try_get("value_format").context(
+                    "recall_semantic_filtered: SELECT must project `value_format` (MCP-S2 AAD dispatch)",
+                )?;
                 let aad = build_memory_aad(actor_id, &row_key);
                 let value =
                     resolve_stored_value(None, value_enc, value_key_id, aad, value_format)
