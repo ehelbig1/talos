@@ -12539,7 +12539,20 @@ impl wit_embedding::Host for TalosContext {
             )));
         }
 
-        let resp_body: serde_json::Value = response.json().await.map_err(|e| {
+        // MCP-1213 sibling: bounded streaming body read + parse, NOT
+        // unbounded `.json()`. This was the last uncapped outbound `.json()`
+        // in the worker — same OOM class the LLM completion path closed.
+        // OpenAI is a trusted endpoint, but a compromised/MITM'd upstream or
+        // an upstream bug returning a 1 GB body would buffer in worker memory
+        // and OOM the pod; the cap is defense-in-depth on a hardcoded host.
+        let body_bytes = read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+            .await
+            .ok_or_else(|| {
+                wit_embedding::Error::ApiError(format!(
+                    "Embedding response exceeded {MAX_LLM_BODY_BYTES} bytes; aborted body read"
+                ))
+            })?;
+        let resp_body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
             wit_embedding::Error::ApiError(format!("Failed to parse response: {e}"))
         })?;
 
