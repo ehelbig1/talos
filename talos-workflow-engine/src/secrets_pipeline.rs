@@ -113,6 +113,19 @@ pub(crate) async fn build_encrypted_secrets_for(
         }
     }
 
+    // 4b. Backstop on the RESOLVED set. `filter_tier1_paths` (steps 2-4)
+    // filters the path LIST before resolution, but a `["*"]` allowed_secrets
+    // grant is passed RAW to the resolver (engine_dispatch_single / _pipeline
+    // pass `wasm_module.allowed_secrets` verbatim), and its `is_wildcard`
+    // branch expands `"*"` to EVERY user secret INSIDE the resolver — after the
+    // list filter already ran. `filter_tier1_paths` only matches concrete LLM
+    // paths, never the literal `"*"`, so for a wildcard grant it was a no-op
+    // and host-internal secrets rode the wildcard into `secrets_map`. Re-filter
+    // the resolved set by actual key_path so this holds regardless of how a
+    // path entered (wildcard / explicit / module grant). Runs BEFORE step 5 so
+    // Tier-2's intentional LLM-key prefetch below is unaffected.
+    retain_wire_safe_secrets(&mut secrets_map, max_llm_tier);
+
     // 5. LLM-provider keys. Errors swallowed: a missing/broken LLM-key
     // vault shouldn't fail nodes that don't use llm::*.
     //
@@ -221,6 +234,39 @@ pub(crate) fn filter_tier1_paths(
     }
 }
 
+/// Drop host-internal secrets from a RESOLVED secret map before it is sealed
+/// onto the wire. The complement to [`filter_tier1_paths`]: that filters the
+/// path *list* before resolution, but a `["*"]` wildcard grant expands to
+/// concrete paths *inside* the resolver (after the list filter ran), so
+/// host-internal secrets can still surface in the resolved map. This is the
+/// backstop on the actual resolved `key_path`s:
+///   * OAuth refresh tokens (`oauth/.../refresh_token`) — host-internal
+///     (controller refresh loop only; the worker denies guest reads). No host
+///     function consumes them, so drop UNCONDITIONALLY: they must never be on
+///     the wire. The sibling `access_token` is NOT matched, so it survives.
+///   * LLM provider keys for Tier-1 — the documented "a tier-1 job must never
+///     carry an LLM key on the wire" invariant. Tier-2 keeps them for the
+///     host `llm::*` path (re-added by step 5 of `build_encrypted_secrets_for`).
+pub(crate) fn retain_wire_safe_secrets(
+    secrets: &mut std::collections::HashMap<String, String>,
+    max_llm_tier: talos_workflow_engine_core::LlmTier,
+) {
+    secrets.retain(|path, _| {
+        let is_llm = talos_workflow_job_protocol::is_llm_provider_vault_path(path);
+        // is_controller_internal == is_llm OR oauth-refresh, so the
+        // `&& !is_llm` isolates the oauth-refresh-token case.
+        let is_oauth_refresh =
+            talos_workflow_job_protocol::is_controller_internal_vault_path(path) && !is_llm;
+        if is_oauth_refresh {
+            return false;
+        }
+        if is_llm && matches!(max_llm_tier, talos_workflow_engine_core::LlmTier::Tier1) {
+            return false;
+        }
+        true
+    });
+}
+
 /// Extract `vault://…` paths from a node config, stripping the prefix.
 ///
 /// Thin wrapper over [`crate::vault_resolver::extract_vault_refs`] that
@@ -236,7 +282,8 @@ pub(crate) fn extract_vault_paths(config: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_tier1_paths;
+    use super::{filter_tier1_paths, retain_wire_safe_secrets};
+    use std::collections::HashMap;
     use talos_workflow_engine_core::LlmTier;
 
     fn paths() -> Vec<String> {
@@ -289,5 +336,64 @@ mod tests {
     fn tier1_empty_input_yields_empty() {
         let out = filter_tier1_paths(&[], LlmTier::Tier1);
         assert!(out.is_empty());
+    }
+
+    // --- retain_wire_safe_secrets: the resolved-map backstop ---------------
+    // These model the `["*"]` wildcard case the LIST filter (filter_tier1_paths)
+    // can't reach: the resolver has already expanded the wildcard to concrete
+    // key_paths in the map, so the backstop must filter on the actual paths.
+
+    fn resolved() -> HashMap<String, String> {
+        HashMap::from([
+            ("anthropic/api_key".to_string(), "llm".to_string()),
+            (
+                "oauth/gmail/u1/primary/refresh_token".to_string(),
+                "rt".to_string(),
+            ),
+            (
+                "oauth/gmail/u1/primary/access_token".to_string(),
+                "at".to_string(),
+            ),
+            ("stripe/secret_key".to_string(), "sk".to_string()),
+        ])
+    }
+
+    #[test]
+    fn retain_drops_oauth_refresh_token_on_every_tier() {
+        for tier in [LlmTier::Tier1, LlmTier::Tier2] {
+            let mut m = resolved();
+            retain_wire_safe_secrets(&mut m, tier);
+            assert!(
+                !m.contains_key("oauth/gmail/u1/primary/refresh_token"),
+                "refresh token must never be on the wire ({tier:?})"
+            );
+            // The sibling access_token is module-readable and must survive.
+            assert!(
+                m.contains_key("oauth/gmail/u1/primary/access_token"),
+                "access token must be preserved ({tier:?})"
+            );
+            // Ordinary module secrets untouched.
+            assert!(m.contains_key("stripe/secret_key"));
+        }
+    }
+
+    #[test]
+    fn retain_drops_llm_keys_only_for_tier1() {
+        // Tier-1: LLM key dropped (the wildcard bypass of the "never on the
+        // wire" invariant this whole backstop closes).
+        let mut t1 = resolved();
+        retain_wire_safe_secrets(&mut t1, LlmTier::Tier1);
+        assert!(
+            !t1.contains_key("anthropic/api_key"),
+            "tier-1 must not carry an LLM key on the wire, even via a wildcard grant"
+        );
+
+        // Tier-2: LLM key kept — the host `llm::*` path legitimately needs it.
+        let mut t2 = resolved();
+        retain_wire_safe_secrets(&mut t2, LlmTier::Tier2);
+        assert!(
+            t2.contains_key("anthropic/api_key"),
+            "tier-2 keeps LLM keys for host llm::* consumption"
+        );
     }
 }
