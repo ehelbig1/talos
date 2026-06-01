@@ -625,3 +625,34 @@ async fn xml_depth_vastly_exceeding_limit_rejected() {
         result
     );
 }
+
+/// XXE freeze: the XML→JSON converter must NEVER resolve external entities.
+/// `xml_string_to_json` uses quick-xml, which does not process DTDs / external
+/// entities (only the five predefined XML entities), so a classic XXE payload
+/// cannot read a local file. This pins that property: if a future change
+/// swapped in a DTD-resolving parser (libxml2-style), `&xxe;` would expand to
+/// the file's contents and this test would fail. Depth tests above don't cover
+/// this — XXE is a distinct, higher-severity class (arbitrary file read / SSRF).
+#[tokio::test]
+async fn xml_external_entity_is_not_resolved_xxe() {
+    use worker::bindings::talos::core::data_transform::Host;
+    let mut ctx = make_context();
+
+    // Classic XXE: declare an external entity pointing at a local file and
+    // reference it in the document body.
+    let xxe = r#"<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>"#;
+    let result = ctx.xml_to_json(xxe.to_string()).await;
+
+    // Either outcome is XXE-safe, as long as the entity was NOT expanded to the
+    // file's contents:
+    //   * quick-xml rejects the unrecognised custom entity → Err (the entity
+    //     was never resolved), or
+    //   * the converter returns a document with no expanded external content.
+    if let Ok(json) = &result {
+        let s = json.to_string();
+        assert!(
+            !s.contains("root:") && !s.contains(":/bin/") && !s.contains("daemon:"),
+            "XXE: external entity was resolved into the output — {s}"
+        );
+    }
+}
