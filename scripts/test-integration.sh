@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
 #
-# Run the SELF-CONTAINED, env-gated integration tests against disposable
-# Redis + Postgres, then tear the datastores down. These tests are normally
-# SKIPPED by `cargo test` / `make test` (they no-op unless TALOS_TEST_*_URL is
-# set), so without this target they never actually run.
+# Run the env-gated integration tests against disposable Redis + Postgres, then
+# tear the datastores down. These tests no-op under a plain `cargo test`
+# (they return early unless TALOS_TEST_*_URL is set), so without this target
+# they never actually run.
 #
-# "Self-contained" = the test creates (and drops) its own schema, so a plain
-# empty Postgres is enough — no migration pipeline required.
+# Two Postgres databases are provisioned on one pgvector instance:
+#   * `talos`    — the FULL migrated schema (`sqlx migrate run`), for tests that
+#                  query real tables (RLS isolation, crash-recovery, …).
+#   * `talos_sc` — an empty DB, for SELF-CONTAINED tests that DROP/CREATE their
+#                  own minimal schema (so they can't clobber the migrated one).
+# Plus a disposable Redis for the idempotency atomicity test.
 #
-# NOT run here (yet): the migration-dependent integration tests
-#   talos-execution-repository/crash_recovery, talos-memory/integration,
-#   talos-advanced-repository/scratch_rls, talos-db/rls_helper_enforcement,
-#   talos-db/rls_org_isolation, talos-organizations/personal_org_resolution
-# which query the real migrated schema (users/secrets/workflows/…) and the
-# `talos_app` role, so they need `sqlx migrate run` against a pgvector image
-# first. Wiring those in is a follow-up.
+# Requires Docker and sqlx-cli (`cargo install sqlx-cli`).
+#
+# NOT run here: talos-memory/integration — its writes require a registered
+# actor_memory crypto hook (SecretsManager/DEK envelope encryption) that the
+# test does not set up. (Its separate nested-runtime bug is fixed; the
+# crypto-hook setup is the remaining follow-up.)
 #
 # Usage:  bash scripts/test-integration.sh   (or: make test-integration)
 set -euo pipefail
 
 REDIS_PORT="${TALOS_IT_REDIS_PORT:-16399}"
-PG_PORT="${TALOS_IT_PG_PORT:-15433}"
+PG_PORT="${TALOS_IT_PG_PORT:-15435}"
 REDIS_NAME="talos-it-redis"
-PG_NAME="talos-it-pg"
+PG_NAME="talos-it-pgvector"
+PG_USER="postgres"
+PG_PASS="test"
 
 cleanup() {
     docker rm -f "$REDIS_NAME" "$PG_NAME" >/dev/null 2>&1 || true
@@ -30,45 +35,66 @@ cleanup() {
 trap cleanup EXIT
 cleanup # remove any stale containers from a previous interrupted run
 
-echo "▶ starting disposable Redis + Postgres…"
+command -v sqlx >/dev/null 2>&1 \
+    || { echo "✗ sqlx-cli missing — install: cargo install sqlx-cli --locked"; exit 1; }
+
+echo "▶ starting disposable Redis + pgvector…"
 docker run -d --rm --name "$REDIS_NAME" -p "${REDIS_PORT}:6379" redis:7-alpine >/dev/null
 docker run -d --rm --name "$PG_NAME" \
-    -e POSTGRES_PASSWORD=test -e POSTGRES_DB=talos \
-    -p "${PG_PORT}:5432" postgres:16-alpine >/dev/null
+    -e "POSTGRES_USER=${PG_USER}" -e "POSTGRES_PASSWORD=${PG_PASS}" -e POSTGRES_DB=talos \
+    -p "${PG_PORT}:5432" pgvector/pgvector:pg17 >/dev/null
 
 echo "▶ waiting for Postgres…"
-for _ in $(seq 1 30); do
-    if docker exec "$PG_NAME" pg_isready >/dev/null 2>&1; then break; fi
+for _ in $(seq 1 60); do
+    docker exec "$PG_NAME" pg_isready >/dev/null 2>&1 && break
     sleep 1
 done
 docker exec "$PG_NAME" pg_isready >/dev/null 2>&1 || { echo "Postgres never became ready"; exit 1; }
 
-export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
-# The self-contained PG tests connect as a superuser and create their own
-# non-superuser role via SET ROLE to exercise RLS enforcement.
-export TALOS_TEST_DATABASE_URL="postgres://postgres:test@127.0.0.1:${PG_PORT}/talos"
+PG_BASE="postgres://${PG_USER}:${PG_PASS}@127.0.0.1:${PG_PORT}"
+MIGRATED_URL="${PG_BASE}/talos"
+SELFCONTAINED_URL="${PG_BASE}/talos_sc"
 
-# crate : integration-test-binary
-SELF_CONTAINED=(
-    "talos-idempotency:redis_integration"
-    "talos-tenancy:rls_integration"
-    "talos-actor-repository:budget_guard_integration"
+echo "▶ applying migrations to 'talos'…"
+DATABASE_URL="$MIGRATED_URL" sqlx migrate run --source migrations >/dev/null
+echo "▶ creating empty 'talos_sc' for self-contained tests…"
+docker exec "$PG_NAME" psql -U "$PG_USER" -d talos -c "CREATE DATABASE talos_sc" >/dev/null
+
+export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
+
+# crate : integration-test-binary : datastore (redis | migrated | selfcontained)
+TESTS=(
+    "talos-idempotency:redis_integration:redis"
+    "talos-tenancy:rls_integration:selfcontained"
+    "talos-actor-repository:budget_guard_integration:selfcontained"
+    "talos-db:rls_helper_enforcement:migrated"
+    "talos-db:rls_org_isolation:migrated"
+    "talos-organizations:personal_org_resolution:migrated"
+    "talos-advanced-repository:scratch_rls:migrated"
+    "talos-execution-repository:crash_recovery:migrated"
 )
 
 rc=0
-for entry in "${SELF_CONTAINED[@]}"; do
+for entry in "${TESTS[@]}"; do
     crate="${entry%%:*}"
-    test="${entry##*:}"
+    rest="${entry#*:}"
+    test="${rest%%:*}"
+    store="${rest##*:}"
+    case "$store" in
+        redis)         db="" ;;
+        migrated)      db="$MIGRATED_URL" ;;
+        selfcontained) db="$SELFCONTAINED_URL" ;;
+    esac
     echo
-    echo "▶ ${crate} :: ${test}"
-    if ! cargo test -p "$crate" --test "$test"; then
+    echo "▶ ${crate} :: ${test}  [${store}]"
+    if ! TALOS_TEST_DATABASE_URL="$db" cargo test -p "$crate" --test "$test"; then
         rc=1
     fi
 done
 
 echo
 if [ "$rc" -eq 0 ]; then
-    echo "✓ self-contained integration tests passed"
+    echo "✓ integration tests passed"
 else
     echo "✗ one or more integration tests failed"
 fi
