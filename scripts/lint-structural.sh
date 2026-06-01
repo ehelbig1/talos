@@ -2508,6 +2508,70 @@ else
 fi
 echo
 
+# ── 33. No local capability-world → integer rank re-implementations ───
+bold "▶ check 33: capability-world ranking must use talos-capability-world, not a local re-impl"
+
+# Capability worlds form a LATTICE, not a linear order — incomparable tier
+# siblings (secrets vs governance, llm vs network, database vs agent) are NOT
+# mutually ordered. A local `match world { "secrets" | "governance" => 3, … }`
+# closure flattens them onto a line, so a `rank(a) > rank(b)` gate lets one
+# sibling stand in for the other — a capability-escalation (the platform
+# grant_capability_ceiling bug) or a wrong compatibility report. The canonical
+# ranking (`world_rank`) and the lattice gate (`ceiling_permits` /
+# `is_lattice_world`) live ONLY in talos-capability-world; everyone else must
+# call them. This flags a capability-world string literal mapped to an integer
+# in a match arm — the smell of a local rank re-implementation.
+#
+# Exempt: talos-capability-world (the canonical home), tests, comments.
+# Opt out (a genuine non-ranking numeric mapping, e.g. a metrics bucket) with
+# `// allow-local-world-rank: <reason>` within 4 lines above.
+
+WORLD_RANK_VIOLATIONS=0
+WORLD_RANK_RE='"(minimal|http|llm|network|secrets|governance|messaging|filesystem|cache|database|agent|automation|trusted)"( *\| *"[a-z]+")* *=> *-?[0-9]+'
+if [ -n "$RG_BIN" ]; then
+    wr_matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' \
+        -g '!talos-capability-world/**' \
+        -g '!**/tests/**' -g '!**/*_tests.rs' \
+        -e "$WORLD_RANK_RE" \
+        . 2>/dev/null || true)
+else
+    wr_matches=$(grep -rnE --include='*.rs' "$WORLD_RANK_RE" \
+        talos-* worker controller 2>/dev/null \
+        | grep -vE 'talos-capability-world/|/tests/|_tests\.rs' || true)
+fi
+
+if [ -n "$wr_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        if echo "$body" | grep -qE '^\s*//|^\s*\*|//!'; then
+            continue
+        fi
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-local-world-rank:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        WORLD_RANK_VIOLATIONS=$((WORLD_RANK_VIOLATIONS + 1))
+    done <<< "$wr_matches"
+fi
+
+if [ "$WORLD_RANK_VIOLATIONS" -gt 0 ]; then
+    red "✗ $WORLD_RANK_VIOLATIONS local capability-world rank re-implementation(s) — lattice-bypass / wrong-report risk"
+    yellow "  → use talos_capability_world::ceiling_permits / is_lattice_world / world_rank instead of a local closure."
+    yellow "  → Opt out (a real non-ranking numeric mapping): // allow-local-world-rank: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ capability-world ranking confined to talos-capability-world"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
