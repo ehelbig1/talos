@@ -2459,12 +2459,61 @@ mod s3_identifier_validation_tests {
 // Vault header resolution — shared by HTTP, fetch_all, GraphQL, Webhook, NATS
 // ============================================================================
 
-/// Re-export of the canonical LLM provider check. The actual list lives in
-/// `talos_workflow_job_protocol::LLM_PROVIDER_VAULT_PATHS` so controller + worker share
-/// one definition — if you add a provider there, every deny/prefetch/cache
-/// site picks it up automatically. See `talos_workflow_job_protocol` for the security-
-/// rationale doc and test coverage.
-use talos_workflow_job_protocol::is_llm_provider_vault_path as is_reserved_host_secret_path;
+/// Re-export of the canonical host-internal vault-path check. The host-reserved
+/// secret deny-list must cover EVERY controller-internal path, not just LLM
+/// provider keys: `is_controller_internal_vault_path` is the superset that adds
+/// the `oauth/{provider}/{user}/{key}/refresh_token` paths. Refresh tokens are
+/// host-only — the controller's OAuth refresh loop consumes them; modules read
+/// only the sibling `access_token` via `vault://`. Using the LLM-only
+/// `is_llm_provider_vault_path` here previously let a module with a matching
+/// `allowed_secrets` grant (or `["*"]`) read a refresh token, defeating this
+/// gate's "host-reserved wins over allowed_secrets" contract. The underlying
+/// `LLM_PROVIDER_VAULT_PATHS` list lives in `talos_workflow_job_protocol` so
+/// controller + worker share one definition.
+use talos_workflow_job_protocol::is_controller_internal_vault_path as is_reserved_host_secret_path;
+
+#[cfg(test)]
+mod reserved_host_secret_path_tests {
+    use super::is_reserved_host_secret_path;
+
+    #[test]
+    fn blocks_llm_provider_keys() {
+        assert!(is_reserved_host_secret_path("anthropic/api_key"));
+        assert!(is_reserved_host_secret_path("openai/api_key"));
+        assert!(is_reserved_host_secret_path("gemini/api_key"));
+    }
+
+    #[test]
+    fn blocks_oauth_refresh_tokens() {
+        // Host-internal: the controller's refresh loop owns these. A guest must
+        // never read one, even with `allowed_secrets: ["*"]`. This is the gap
+        // the LLM-only predecessor (`is_llm_provider_vault_path`) left open.
+        assert!(is_reserved_host_secret_path(
+            "oauth/gmail/1a361562-e551-41aa-9cb4-6f8988b035f7/primary/refresh_token"
+        ));
+        assert!(is_reserved_host_secret_path(
+            "oauth/google_calendar/9c4d/primary/refresh_token"
+        ));
+    }
+
+    #[test]
+    fn allows_oauth_access_tokens() {
+        // Access tokens are legitimately module-readable via `vault://` — the
+        // alias swap must NOT start blocking them.
+        assert!(!is_reserved_host_secret_path(
+            "oauth/gmail/1a361562-e551-41aa-9cb4-6f8988b035f7/primary/access_token"
+        ));
+    }
+
+    #[test]
+    fn allows_ordinary_module_secrets() {
+        assert!(!is_reserved_host_secret_path("stripe/api_key"));
+        assert!(!is_reserved_host_secret_path("my-module/webhook_secret"));
+        // A short/orphan oauth shape that isn't the canonical 4-segment
+        // refresh-token path stays unmatched (mirrors job-protocol's guard).
+        assert!(!is_reserved_host_secret_path("oauth/refresh_token"));
+    }
+}
 
 /// 16-hex-char (8-byte) SHA-256 prefix of a vault path. Stable identity for
 /// host-log ↔ guest-error correlation without leaking the literal path back
@@ -2566,9 +2615,13 @@ impl TalosContext {
     /// so no WASM-reachable code path can bypass either check.
     fn check_secret_allowlist(&self, key_path: &str) -> Result<(), ()> {
         // Host-reserved paths win over allowed_secrets — a module with
-        // `allowed_secrets: ["*"]` must still not read LLM provider keys,
-        // because those are pre-fetched into every job by the controller
-        // purely for internal `llm::*` consumption.
+        // `allowed_secrets: ["*"]` must still not read host-internal
+        // credentials. Two classes: (1) LLM provider keys, pre-fetched into
+        // every job purely for internal `llm::*` consumption; (2) OAuth
+        // refresh tokens (`oauth/.../refresh_token`), consumed only by the
+        // controller's token-refresh loop. Both are blocked here regardless of
+        // grant; modules read the sibling OAuth `access_token` via `vault://`,
+        // which is NOT reserved.
         if is_reserved_host_secret_path(key_path) {
             tracing::warn!(
                 gate = "reserved_host_path",
@@ -2576,8 +2629,9 @@ impl TalosContext {
                 module_id = ?self.module_id,
                 capability_world = ?self.capability_world,
                 "WASM module attempted to read a reserved host secret path — denied. \
-                 LLM provider keys are host-only; use the `llm::*` host functions, \
-                 which resolve these paths internally without exposing them to guests."
+                 LLM provider keys and OAuth refresh tokens are host-only; LLM keys \
+                 are reached via the `llm::*` host functions, and refresh tokens never \
+                 leave the controller (modules use the OAuth access_token instead)."
             );
             return Err(());
         }
