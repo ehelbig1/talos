@@ -596,9 +596,22 @@ pub async fn idempotency_middleware(
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            // Never cache a response that establishes client state via
+            // `Set-Cookie` (login/refresh set a session cookie). Two reasons:
+            // (1) the replay path restores only status+body+Content-Type, so a
+            //     replayed login would return "success" with NO session cookie
+            //     — a broken, confusing auth state; and
+            // (2) caching the Set-Cookie would store a live session token in
+            //     Redis for the full TTL.
+            // Such responses are returned to THIS caller intact (resp_parts
+            // keeps Set-Cookie) but the reservation is released so a retry
+            // re-executes and gets a fresh cookie.
+            let sets_cookie = resp_parts
+                .headers
+                .contains_key(axum::http::header::SET_COOKIE);
             match to_bytes(resp_body, MAX_IDEMPOTENT_RESPONSE_BYTES).await {
                 Ok(bytes) => {
-                    if status.as_u16() < 500 {
+                    if status.as_u16() < 500 && !sets_cookie {
                         let body_str = String::from_utf8_lossy(&bytes).into_owned();
                         if let Err(e) = service
                             .complete(
@@ -613,7 +626,7 @@ pub async fn idempotency_middleware(
                             tracing::warn!(error = %e, "idempotency complete failed; response not cached");
                         }
                     } else if let Err(e) = service.release(&scoped_key, &request_hash).await {
-                        tracing::warn!(error = %e, "idempotency release failed after 5xx");
+                        tracing::warn!(error = %e, "idempotency release failed (5xx or Set-Cookie response)");
                     }
                     Response::from_parts(resp_parts, Body::from(bytes))
                 }
