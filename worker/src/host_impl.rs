@@ -1116,6 +1116,77 @@ static ALLOW_PRIVATE_HOST_TARGETS: std::sync::LazyLock<bool> = std::sync::LazyLo
 // "private-ip-ipv4-mapped-ipv6", …) are preserved for the audit trail.
 pub(crate) use talos_ssrf_classify::classify_private_ip;
 
+/// SSRF chokepoint: extract an IP-literal host from `url` and classify it
+/// against the shared deny-list in ONE place. Returns `Some((ip, policy))` when
+/// the URL host is an IP literal in a denied range (private / loopback /
+/// link-local / metadata / CGNAT / IPv4-mapped-IPv6 / …), else `None`.
+///
+/// EVERY guest egress path (`wit_http::fetch` / `fetch_all`,
+/// `wit_graphql::execute`, `wit_webhook::send`, `wit_http_stream::connect`)
+/// MUST funnel its literal-IP SSRF check through here. The check used to be
+/// inlined at each call site, and the inline copies DRIFTED — some were missing
+/// CGNAT / IPv4-mapped-IPv6 until they were consolidated onto
+/// `classify_private_ip`. Worse, a copy that forgets the `Host::Ipv6` arm
+/// silently lets `http://[::1]/` through. One helper makes both failure modes
+/// structurally impossible: a new egress path that calls this gets IPv4 + IPv6
+/// + the full classifier for free, and can't half-implement the check.
+///
+/// IP-literal extraction uses `url::Host` (WHATWG-normalised), so decimal /
+/// octal / hex encodings (`http://2130706433/`) are already dotted-quad here.
+fn denied_ip_literal(url: &url::Url) -> Option<(std::net::IpAddr, &'static str)> {
+    let ip: std::net::IpAddr = match url.host() {
+        Some(url::Host::Ipv4(a)) => a.into(),
+        Some(url::Host::Ipv6(a)) => a.into(),
+        _ => return None,
+    };
+    classify_private_ip(ip).map(|policy| (ip, policy))
+}
+
+#[cfg(test)]
+mod denied_ip_literal_tests {
+    fn denied(u: &str) -> Option<&'static str> {
+        let url = url::Url::parse(u).expect("parse url");
+        super::denied_ip_literal(&url).map(|(_, policy)| policy)
+    }
+
+    #[test]
+    fn blocks_ipv4_private_and_metadata() {
+        assert!(denied("http://127.0.0.1/").is_some());
+        assert!(denied("http://10.0.0.1/").is_some());
+        assert!(denied("http://192.168.1.1/").is_some());
+        // Cloud-metadata IAM credentials — the canonical SSRF prize.
+        assert!(denied("http://169.254.169.254/latest/meta-data/").is_some());
+    }
+
+    #[test]
+    fn blocks_ipv6_loopback_and_mapped() {
+        // The `Host::Ipv6`-arm-omission bypass the chokepoint exists to make
+        // structurally impossible: a path that forgot the IPv6 arm let `[::1]`
+        // through.
+        assert!(denied("http://[::1]/").is_some());
+        assert!(denied("http://[::ffff:127.0.0.1]/").is_some());
+    }
+
+    #[test]
+    fn blocks_decimal_encoded_loopback() {
+        // `url::Host` is WHATWG-normalised, so 2130706433 is already 127.0.0.1
+        // here — the decimal/octal/hex IP-encoding bypass is closed for free.
+        assert!(
+            denied("http://2130706433/").is_some(),
+            "decimal-encoded loopback must be blocked"
+        );
+    }
+
+    #[test]
+    fn allows_public_ips_and_domains() {
+        assert!(denied("http://8.8.8.8/").is_none());
+        assert!(denied("http://[2001:4860:4860::8888]/").is_none());
+        // A domain is NOT an IP literal — it's allowed past this gate and
+        // checked at DNS-resolution time by the SSRF-aware resolver.
+        assert!(denied("http://example.com/").is_none());
+    }
+}
+
 /// Tier-1 (local-Ollama-only) data-egress deny-check on a URL host.
 ///
 /// Returns `Some(policy)` — the `record_capability_denied` reason — when a
@@ -3090,22 +3161,18 @@ impl wit_http::Host for TalosContext {
         // reject private, loopback, link-local, multicast, broadcast, and CGNAT ranges
         // immediately. This prevents a WASM module from using an IP literal to reach
         // internal services even when the allowlist contains a wildcard ("*").
-        let ip_literal: Option<std::net::IpAddr> = match url.host() {
-            Some(url::Host::Ipv4(a)) => Some(a.into()),
-            Some(url::Host::Ipv6(a)) => Some(a.into()),
-            _ => None, // hostname — DNS check happens after allowlist
-        };
-        if let Some(ip) = ip_literal {
-            if let Some(policy) = classify_private_ip(ip) {
-                self.record_capability_denied("http-fetch", policy, &ip.to_string())
-                    .await;
-                tracing::warn!(
-                    ip = %ip,
-                    policy,
-                    "WASM module attempted to reach a private IP literal — blocking"
-                );
-                return Err(wit_http::Error::Forbiddenhost);
-            }
+        // SSRF: reject IP-literal hosts in denied ranges via the shared
+        // chokepoint (covers IPv4 + IPv6 + CGNAT + IPv4-mapped). Blocks even
+        // when the allowlist contains a wildcard ("*").
+        if let Some((ip, policy)) = denied_ip_literal(&url) {
+            self.record_capability_denied("http-fetch", policy, &ip.to_string())
+                .await;
+            tracing::warn!(
+                ip = %ip,
+                policy,
+                "WASM module attempted to reach a private IP literal — blocking"
+            );
+            return Err(wit_http::Error::Forbiddenhost);
         }
 
         if !host_allowlist_match(&self.allowed_hosts, host) {
@@ -3654,18 +3721,11 @@ impl wit_http::Host for TalosContext {
             // 3. SSRF: classify IP literals (no network I/O).
             //    Single source of truth in classify_private_ip — covers
             //    CGNAT and IPv4-mapped IPv6 too.
-            let ip_literal: Option<std::net::IpAddr> = match url.host() {
-                Some(url::Host::Ipv4(a)) => Some(a.into()),
-                Some(url::Host::Ipv6(a)) => Some(a.into()),
-                _ => None,
-            };
-            if let Some(ip) = ip_literal {
-                if let Some(policy) = classify_private_ip(ip) {
-                    self.record_capability_denied("http-fetch-all", policy, &ip.to_string())
-                        .await;
-                    validated.push(Err(wit_http::Error::Forbiddenhost));
-                    continue;
-                }
+            if let Some((ip, policy)) = denied_ip_literal(&url) {
+                self.record_capability_denied("http-fetch-all", policy, &ip.to_string())
+                    .await;
+                validated.push(Err(wit_http::Error::Forbiddenhost));
+                continue;
             }
 
             // 4. allowed_hosts pattern match.
@@ -6815,22 +6875,15 @@ impl TalosContext {
 
             // SSRF protection: shared classifier covers CGNAT and IPv4-mapped IPv6
             // the duplicated logic was missing.
-            let ip_literal: Option<std::net::IpAddr> = match parsed.host() {
-                Some(url::Host::Ipv4(a)) => Some(a.into()),
-                Some(url::Host::Ipv6(a)) => Some(a.into()),
-                _ => None,
-            };
-            if let Some(ip) = ip_literal {
-                if let Some(policy) = classify_private_ip(ip) {
-                    self.record_capability_denied("graphql", policy, &ip.to_string())
-                        .await;
-                    tracing::warn!(
-                        ip = %ip,
-                        policy,
-                        "WASM module attempted GraphQL request to a private IP literal — blocking"
-                    );
-                    return Err(wit_graphql::Error::Networkerror);
-                }
+            if let Some((ip, policy)) = denied_ip_literal(&parsed) {
+                self.record_capability_denied("graphql", policy, &ip.to_string())
+                    .await;
+                tracing::warn!(
+                    ip = %ip,
+                    policy,
+                    "WASM module attempted GraphQL request to a private IP literal — blocking"
+                );
+                return Err(wit_graphql::Error::Networkerror);
             }
 
             if !host_allowlist_match(&allowed_hosts, &host) {
@@ -7182,22 +7235,15 @@ impl wit_webhook::Host for TalosContext {
         // Block private/loopback/link-local IP addresses to prevent SSRF.
         // Shared classifier — covers CGNAT and IPv4-mapped IPv6 the
         // duplicated logic was missing.
-        let ip_literal: Option<std::net::IpAddr> = match parsed_url.host() {
-            Some(url::Host::Ipv4(a)) => Some(a.into()),
-            Some(url::Host::Ipv6(a)) => Some(a.into()),
-            _ => None,
-        };
-        if let Some(ip) = ip_literal {
-            if let Some(policy) = classify_private_ip(ip) {
-                self.record_capability_denied("webhook", policy, &ip.to_string())
-                    .await;
-                tracing::warn!(
-                    ip = %ip,
-                    policy,
-                    "WASM module attempted webhook to a private IP literal — blocking"
-                );
-                return Err(wit_webhook::Error::Sendfailed);
-            }
+        if let Some((ip, policy)) = denied_ip_literal(&parsed_url) {
+            self.record_capability_denied("webhook", policy, &ip.to_string())
+                .await;
+            tracing::warn!(
+                ip = %ip,
+                policy,
+                "WASM module attempted webhook to a private IP literal — blocking"
+            );
+            return Err(wit_webhook::Error::Sendfailed);
         }
 
         if !host_allowlist_match(&self.allowed_hosts, &host) {
@@ -12752,22 +12798,15 @@ impl wit_http_stream::Host for TalosContext {
         }
         // SSRF: block private IPs via the shared classifier (covers
         // CGNAT and IPv4-mapped IPv6 the duplicated logic was missing).
-        let ip_literal: Option<std::net::IpAddr> = match parsed.host() {
-            Some(url::Host::Ipv4(a)) => Some(a.into()),
-            Some(url::Host::Ipv6(a)) => Some(a.into()),
-            _ => None,
-        };
-        if let Some(ip) = ip_literal {
-            if let Some(policy) = classify_private_ip(ip) {
-                self.record_capability_denied("http-stream", policy, &ip.to_string())
-                    .await;
-                tracing::warn!(
-                    ip = %ip,
-                    policy,
-                    "WASM module attempted SSE stream to a private IP literal — blocking"
-                );
-                return Err(wit_http_stream::Error::ForbiddenHost);
-            }
+        if let Some((ip, policy)) = denied_ip_literal(&parsed) {
+            self.record_capability_denied("http-stream", policy, &ip.to_string())
+                .await;
+            tracing::warn!(
+                ip = %ip,
+                policy,
+                "WASM module attempted SSE stream to a private IP literal — blocking"
+            );
+            return Err(wit_http_stream::Error::ForbiddenHost);
         }
         if !host_allowlist_match(&self.allowed_hosts, &host) {
             self.record_capability_denied("http-stream", "allowed-hosts", &host)
