@@ -516,6 +516,14 @@ pub async fn idempotency_middleware(
     use axum::http::{Request, StatusCode};
     use axum::response::{IntoResponse, Response};
 
+    // Never intercept a protocol upgrade (e.g. WebSocket on /ws, which shares
+    // this middleware's route group). Buffering a `101 Switching Protocols`
+    // response would drop the `OnUpgrade` extension and break the handshake.
+    // Clients don't send Idempotency-Key on WS, but this is the safe gate.
+    if request.headers().contains_key(axum::http::header::UPGRADE) {
+        return next.run(request).await;
+    }
+
     // Opt-in gate: no header → unchanged path. MUST stay first so existing
     // traffic never touches the buffering/Redis path.
     let key = match request
@@ -1025,6 +1033,25 @@ mod middleware_tests {
     async fn no_header_passes_through_untouched() {
         let resp = app(never_connect_service())
             .oneshot(Request::post("/").body(Body::from("payload")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(IDEMPOTENT_REPLAYED_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn upgrade_request_passes_through_even_with_key() {
+        // A protocol upgrade (WebSocket) carrying an Idempotency-Key must NOT be
+        // intercepted — the middleware would otherwise break the handshake. The
+        // guard runs before any Redis touch, so the handler is reached.
+        let resp = app(never_connect_service())
+            .oneshot(
+                Request::post("/")
+                    .header(IDEMPOTENCY_KEY_HEADER, "valid-key-123")
+                    .header(axum::http::header::UPGRADE, "websocket")
+                    .body(Body::from("payload"))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
