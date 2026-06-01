@@ -2318,6 +2318,58 @@ else
 fi
 echo
 
+# ── 30. No CREATE INDEX CONCURRENTLY (or any CONCURRENTLY) in migrations ──
+bold "▶ check 30: no CONCURRENTLY in migrations (sqlx runs them in a transaction)"
+
+# sqlx wraps every migration in a single transaction. `CREATE INDEX
+# CONCURRENTLY` (and `DROP INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY`, …)
+# CANNOT run inside a transaction — Postgres errors with
+# "CREATE INDEX CONCURRENTLY cannot run inside a transaction block", which
+# aborts the ENTIRE migration run on deploy, not just that statement. The
+# production instinct to reach for CONCURRENTLY on a big table is exactly the
+# trap. CLAUDE.md: "Use CREATE INDEX (not CONCURRENTLY) in migration files."
+# Build the index non-concurrently (it briefly locks writes) or run the
+# CONCURRENTLY build out-of-band, outside the migration.
+#
+# Comment lines (`-- … CONCURRENTLY …`) are exempt. Opt out (a migration the
+# operator runs out-of-band, not via sqlx) with
+# `-- allow-concurrently: <reason>` within 4 lines above.
+
+CONCURRENTLY_VIOLATIONS=0
+mig_matches=$(grep -rniE "CONCURRENTLY" migrations/*.sql 2>/dev/null || true)
+if [ -n "$mig_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Skip SQL line comments (-- …) — they only document the rule.
+        if echo "$body" | grep -qE '^\s*--'; then
+            continue
+        fi
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q -- '-- allow-concurrently:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        CONCURRENTLY_VIOLATIONS=$((CONCURRENTLY_VIOLATIONS + 1))
+    done <<< "$mig_matches"
+fi
+
+if [ "$CONCURRENTLY_VIOLATIONS" -gt 0 ]; then
+    red "✗ $CONCURRENTLY_VIOLATIONS CONCURRENTLY statement(s) in migrations — these abort the whole migration run"
+    yellow "  → drop CONCURRENTLY: CREATE INDEX (not CONCURRENTLY) — sqlx runs migrations in a tx."
+    yellow "    Build big indexes out-of-band if the brief write lock is unacceptable."
+    yellow "  → Opt out (run out-of-band, not via sqlx): -- allow-concurrently: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ no transaction-incompatible CONCURRENTLY in migrations"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
