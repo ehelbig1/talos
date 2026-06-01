@@ -3617,6 +3617,15 @@ async fn main() -> anyhow::Result<()> {
         // L5: shares `csrf::GRAPHQL_MAX_BODY_BYTES` with the CSRF middleware's
         // dev body-buffer cap so the two limits can never silently diverge.
         .layer(DefaultBodyLimit::max(csrf::GRAPHQL_MAX_BODY_BYTES))
+        // Opt-in request idempotency. Registered BEFORE the CSRF/rate-limit
+        // layers so it is INNER of them (they run first); a request without an
+        // `Idempotency-Key` header takes a zero-touch passthrough, so existing
+        // traffic is unaffected. Present + valid key → exactly-once via the
+        // begin/complete reservation (closes the double-execution window on
+        // retried mutations like triggerWorkflow). `idempotency_service` is
+        // `None` when Redis is unconfigured → the middleware passes through.
+        .layer(from_fn(idempotency::idempotency_middleware))
+        .layer(Extension(idempotency_service.clone()))
         // CSRF protection (production only for mutations, lenient in dev)
         .layer(from_fn(csrf::csrf_protection_graphql))
         .layer(from_fn(rate_limit::rate_limit_middleware))

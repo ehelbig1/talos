@@ -8047,6 +8047,7 @@ name = "talos-idempotency"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum 0.8.9",
  "chrono",
  "hex",
  "redis",
@@ -8054,6 +8055,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "uuid",
 ]
