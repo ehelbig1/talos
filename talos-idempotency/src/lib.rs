@@ -370,6 +370,37 @@ impl IdempotencyService {
         Ok(wrote == 1)
     }
 
+    /// Release a reservation WITHOUT caching a response. Used when the
+    /// operation failed transiently (5xx) so a retry can proceed fresh rather
+    /// than being told `InFlight` until [`RESERVATION_TTL_SECS`](Self::RESERVATION_TTL_SECS)
+    /// elapses. Only deletes a key still held as OUR reservation (same hash,
+    /// still `reserved`) — never a completed record or one another request
+    /// now owns.
+    pub async fn release(&self, key: &str, request_hash: &str) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let redis_key = format!("idempotency:{}", key);
+        let script = r#"
+            local key = KEYS[1]
+            local request_hash = ARGV[1]
+            local data = redis.call('GET', key)
+            if data then
+                local cur = cjson.decode(data)
+                if cur.request_hash == request_hash and cur.tag == 'reserved' then
+                    redis.call('DEL', key)
+                end
+            end
+            return 1
+        "#;
+        let _: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(1)
+            .arg(&redis_key)
+            .arg(request_hash)
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
     /// Generate hash of request body for idempotency check.
     ///
     /// MCP-440: returns 32 hex chars (128 bits) rather than 16 (64 bits).
@@ -386,6 +417,146 @@ impl IdempotencyService {
         hex::encode(hasher.finalize())[..32].to_string()
     }
 
+}
+
+/// HTTP header carrying the client-chosen idempotency key.
+pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
+/// Response header stamped on a replayed (cache-hit) response so clients and
+/// operators can tell a replay from a fresh execution.
+pub const IDEMPOTENT_REPLAYED_HEADER: &str = "idempotent-replayed";
+
+/// Max accepted idempotency-key length (matches typical provider limits).
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
+
+/// Cap on the request body buffered to hash it — deliberately ABOVE the
+/// largest route `DefaultBodyLimit` (GraphQL's 5 MiB) so the route's own limit,
+/// not this one, rejects oversized bodies. This is only a backstop against
+/// unbounded buffering on the idempotency path.
+const MAX_IDEMPOTENT_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
+/// Cap on a response body cached + replayed. A larger response can't be cached
+/// (the buffered stream is consumed), so the idempotent request gets a 500 and
+/// the reservation is released so a retry can proceed.
+const MAX_IDEMPOTENT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// True if `k` is a well-formed idempotency key: non-empty, ≤ 255 chars, and
+/// all printable ASCII (so it's safe as a Redis key suffix + a header value).
+pub fn valid_idempotency_key(k: &str) -> bool {
+    !k.is_empty() && k.len() <= MAX_IDEMPOTENCY_KEY_LEN && k.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Opt-in idempotency middleware. Requests WITHOUT an `Idempotency-Key` header
+/// take a zero-touch passthrough — so existing traffic (none sends the header)
+/// is entirely unaffected. With the header:
+///   * malformed key → 400.
+///   * no Redis configured → passthrough (can't enforce; never block).
+///   * the request body is buffered + hashed, then `begin()` decides:
+///     - `Hit`      → replay the cached response (stamped `idempotent-replayed`).
+///     - `InFlight` → 409 (a same-key+body request is mid-flight).
+///     - `Mismatch` → 422 (key reused with a different body).
+///     - `Proceed`  → run the handler; cache the response via `complete()` for
+///       status < 500, or `release()` on 5xx so a retry isn't stuck `InFlight`.
+///   * a Redis error during `begin` fails OPEN (run the handler un-deduped)
+///     rather than blocking the request.
+pub async fn idempotency_middleware(
+    axum::extract::Extension(service): axum::extract::Extension<Option<Arc<IdempotencyService>>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use axum::response::{IntoResponse, Response};
+
+    // Opt-in gate: no header → unchanged path. MUST stay first so existing
+    // traffic never touches the buffering/Redis path.
+    let key = match request
+        .headers()
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(k) => k.to_string(),
+        None => return next.run(request).await,
+    };
+    if !valid_idempotency_key(&key) {
+        return (StatusCode::BAD_REQUEST, "Invalid Idempotency-Key header").into_response();
+    }
+    // Redis not configured → can't enforce; never block the request.
+    let Some(service) = service else {
+        return next.run(request).await;
+    };
+
+    // Buffer the request body to hash it, then rebuild the request unchanged.
+    let (parts, body) = request.into_parts();
+    let body_bytes = match to_bytes(body, MAX_IDEMPOTENT_REQUEST_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response()
+        }
+    };
+    let request_hash = IdempotencyService::hash_request(&body_bytes);
+
+    match service.begin(&key, &request_hash).await {
+        Ok(BeginOutcome::Hit(rec)) => {
+            let status =
+                StatusCode::from_u16(rec.status_code as u16).unwrap_or(StatusCode::OK);
+            let mut resp =
+                Response::new(Body::from(rec.response_body.unwrap_or_default()));
+            *resp.status_mut() = status;
+            if let Ok(v) = "true".parse() {
+                resp.headers_mut().insert(IDEMPOTENT_REPLAYED_HEADER, v);
+            }
+            resp
+        }
+        Ok(BeginOutcome::InFlight) => (
+            StatusCode::CONFLICT,
+            "A request with this Idempotency-Key is already in progress",
+        )
+            .into_response(),
+        Ok(BeginOutcome::Mismatch) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Idempotency-Key was already used with a different request body",
+        )
+            .into_response(),
+        Ok(BeginOutcome::Proceed) => {
+            let request = Request::from_parts(parts, Body::from(body_bytes));
+            let response = next.run(request).await;
+            let (resp_parts, resp_body) = response.into_parts();
+            let status = resp_parts.status;
+            match to_bytes(resp_body, MAX_IDEMPOTENT_RESPONSE_BYTES).await {
+                Ok(bytes) => {
+                    if status.as_u16() < 500 {
+                        let body_str = String::from_utf8_lossy(&bytes).into_owned();
+                        if let Err(e) = service
+                            .complete(&key, &request_hash, status.as_u16() as i32, Some(&body_str))
+                            .await
+                        {
+                            tracing::warn!(error = %e, "idempotency complete failed; response not cached");
+                        }
+                    } else if let Err(e) = service.release(&key, &request_hash).await {
+                        tracing::warn!(error = %e, "idempotency release failed after 5xx");
+                    }
+                    Response::from_parts(resp_parts, Body::from(bytes))
+                }
+                Err(_) => {
+                    // Body exceeded the cache cap and is now consumed; release so
+                    // a retry can proceed, and surface a clear error.
+                    let _ = service.release(&key, &request_hash).await;
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Response too large for idempotent handling",
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Err(e) => {
+            // Fail open: a Redis hiccup must not block the request.
+            tracing::warn!(error = %e, "idempotency begin failed; processing without idempotency");
+            let request = Request::from_parts(parts, Body::from(body_bytes));
+            next.run(request).await
+        }
+    }
 }
 
 /// Internal representation of the `check` Lua script's outcome payload.
@@ -514,6 +685,16 @@ mod tests {
         serde_json::from_str::<BeginPayload>(json)
             .expect("valid begin payload")
             .into_outcome("k", "h")
+    }
+
+    #[test]
+    fn valid_idempotency_key_rules() {
+        assert!(valid_idempotency_key("abc-123_XYZ.req:42"));
+        assert!(!valid_idempotency_key("")); // empty
+        assert!(!valid_idempotency_key("has space")); // whitespace
+        assert!(!valid_idempotency_key("tab\there")); // control
+        assert!(!valid_idempotency_key(&"a".repeat(256))); // too long
+        assert!(valid_idempotency_key(&"a".repeat(255))); // at the cap
     }
 
     #[test]
@@ -649,5 +830,85 @@ mod tests {
         let json = r#"{"tag": "pending"}"#;
         let err = serde_json::from_str::<CheckOutcome>(json);
         assert!(err.is_err(), "unknown tag must error, got {:?}", err);
+    }
+}
+
+#[cfg(test)]
+mod middleware_tests {
+    //! Pins the two safety-critical paths that DON'T need a live Redis: the
+    //! opt-in passthrough (no header → handler runs, Redis never touched) and
+    //! malformed-key rejection (400 before any Redis call). The begin/complete
+    //! cache-hit/replay paths need Redis and are covered by manual/integration
+    //! testing.
+    use super::*;
+    use axum::{
+        body::Body,
+        extract::Extension,
+        http::{Request, StatusCode},
+        middleware::from_fn,
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    async fn ok_handler() -> &'static str {
+        "handled"
+    }
+
+    /// A service whose Redis client points at a closed port — constructing it
+    /// is lazy (no connection), and the tested paths must never reach Redis, so
+    /// any accidental connection attempt would surface as a test failure/hang.
+    fn never_connect_service() -> Option<Arc<IdempotencyService>> {
+        let client = redis::Client::open("redis://127.0.0.1:1/").unwrap();
+        Some(Arc::new(IdempotencyService::new(
+            Arc::new(client),
+            Duration::from_secs(60),
+        )))
+    }
+
+    fn app(service: Option<Arc<IdempotencyService>>) -> Router {
+        Router::new()
+            .route("/", post(ok_handler))
+            .layer(from_fn(idempotency_middleware))
+            .layer(Extension(service))
+    }
+
+    #[tokio::test]
+    async fn no_header_passes_through_untouched() {
+        let resp = app(never_connect_service())
+            .oneshot(Request::post("/").body(Body::from("payload")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(IDEMPOTENT_REPLAYED_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_key_rejected_before_redis() {
+        let resp = app(never_connect_service())
+            .oneshot(
+                Request::post("/")
+                    .header(IDEMPOTENCY_KEY_HEADER, "bad key with spaces")
+                    .body(Body::from("payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn no_service_configured_passes_through() {
+        // Redis unconfigured (None) + a valid key → must NOT block the request.
+        let resp = app(None)
+            .oneshot(
+                Request::post("/")
+                    .header(IDEMPOTENCY_KEY_HEADER, "valid-key-123")
+                    .body(Body::from("payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

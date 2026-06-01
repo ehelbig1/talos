@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum = { version = "0.8", features = ["json"] }
 chrono.workspace = true
 hex = "0.4"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
@@ -17,6 +18,10 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["sync"] }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true
