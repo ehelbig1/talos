@@ -72,9 +72,14 @@ PROJECTION_PATTERNS=(
     # specific enough to actor_memory column projections to be reliable.
 )
 
+# Default scan scope: the credential-bearing crates that must route through
+# talos_memory::*. Deliberately EXCLUDES talos-memory/src, the canonical writer.
+DEFAULT_DIRS="controller/src talos-secrets/src talos-dlp/src worker/src"
+
 VIOLATIONS=0
 check_pattern() {
     local pattern="$1"
+    local dirs="${2:-$DEFAULT_DIRS}"
     while IFS= read -r line; do
         # Opt-out marker may be on the matched line OR within the 8 lines
         # preceding it. Rust idiom is to put the comment above the binding
@@ -93,11 +98,19 @@ check_pattern() {
     done < <(grep -rEn "$pattern" \
                 --include='*.rs' \
                 --exclude-dir=target \
-                controller/src talos-secrets/src talos-dlp/src worker/src 2>/dev/null \
+                $dirs 2>/dev/null \
             || true)
 }
 for p in "${WRITE_PATTERNS[@]}";      do check_pattern "$p"; done
 for p in "${PROJECTION_PATTERNS[@]}"; do check_pattern "$p"; done
+# The legacy-`value`-column projection check ALSO scans talos-memory/src —
+# the canonical writer is exempt from the WRITE check but NOT from selecting a
+# DROPPED column. recall_recent_by_types / recall_recent_excluding_types both
+# carried `SELECT … value, value_enc …` here and broke at runtime with
+# `column "value" does not exist` after Phase B dropped the column; the scan
+# excluding talos-memory/ is exactly why it survived. (Found by activating the
+# live-Postgres memory integration suite.)
+for p in "${PROJECTION_PATTERNS[@]}"; do check_pattern "$p" "talos-memory/src"; done
 
 if [ "$VIOLATIONS" -gt 0 ]; then
     red "✗ found $VIOLATIONS sites"

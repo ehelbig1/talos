@@ -14,11 +14,6 @@
 #
 # Requires Docker and sqlx-cli (`cargo install sqlx-cli`).
 #
-# NOT run here: talos-memory/integration — its writes require a registered
-# actor_memory crypto hook (SecretsManager/DEK envelope encryption) that the
-# test does not set up. (Its separate nested-runtime bug is fixed; the
-# crypto-hook setup is the remaining follow-up.)
-#
 # Usage:  bash scripts/test-integration.sh   (or: make test-integration)
 set -euo pipefail
 
@@ -72,6 +67,7 @@ TESTS=(
     "talos-organizations:personal_org_resolution:migrated"
     "talos-advanced-repository:scratch_rls:migrated"
     "talos-execution-repository:crash_recovery:migrated"
+    "talos-memory:integration:migrated"
 )
 
 rc=0

@@ -842,8 +842,14 @@ pub async fn recall_recent_by_types(
     // with empty AAD → AES-GCM tag mismatch → `?` propagated Err from
     // the loop, breaking Layer 3 context recall entirely for any
     // actor with at least one post-MCP-S2 row.
+    //
+    // Do NOT project the legacy `value` column — it was DROPPED in Phase B
+    // (migration 20260424010000). Selecting it raised `column "value" does
+    // not exist` at runtime, breaking this function entirely. The ciphertext
+    // columns are the only value source post-Phase-B; `decrypt_row_value`
+    // tolerates the absent `value` via `try_get(...).ok()`.
     let rows = sqlx::query(
-        "SELECT actor_id, key, value, value_enc, value_key_id, value_format, memory_type \
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type \
          FROM actor_memory \
          WHERE actor_id = $1 \
            AND memory_type = ANY($2) \
@@ -886,11 +892,14 @@ pub async fn recall_recent_excluding_types(
 ) -> Result<Vec<(String, serde_json::Value, String)>> {
     let limit = limit.clamp(1, MAX_LIST_LIMIT);
     let owned: Vec<String> = exclude.iter().map(|s| (*s).to_string()).collect();
-    // MCP-S2 follow-up: same SELECT-projection drift as
-    // recall_recent_by_types above — project actor_id + value +
-    // value_format so decrypt_row_value can route v1 ciphertexts.
+    // MCP-S2 follow-up: same SELECT-projection requirement as
+    // recall_recent_by_types above — project actor_id + value_format so
+    // decrypt_row_value can route v1 ciphertexts. And, as there, do NOT
+    // project the legacy `value` column (DROPPED in Phase B migration
+    // 20260424010000) — selecting it raised `column "value" does not exist`
+    // at runtime, breaking this recency-fallback path entirely.
     let rows = sqlx::query(
-        "SELECT actor_id, key, value, value_enc, value_key_id, value_format, memory_type \
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type \
          FROM actor_memory \
          WHERE actor_id = $1 \
            AND NOT (memory_type = ANY($2)) \
