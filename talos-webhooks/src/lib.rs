@@ -363,6 +363,20 @@ pub(crate) fn webhook_must_fail_closed_on_hmac(
     hmac_configured && !hmac_secret_resolved
 }
 
+/// Absolute difference in seconds between `now_secs` and a caller-supplied
+/// `ts_secs` (a webhook timestamp header), using overflow-free `i64::abs_diff`.
+///
+/// `(now_secs - ts_secs).abs()` is NOT safe here: `ts_secs` is parsed from an
+/// attacker-controlled header, so a value near `i64::MIN` overflows the
+/// subtraction. In debug builds that panics (a request-triggered DoS); in
+/// release the wrapped result can land on `i64::MIN`, whose `.abs()` stays
+/// negative — so a `> window` freshness check silently PASSES a stale request.
+/// `abs_diff` returns `u64` and cannot overflow, so the freshness gate holds
+/// for every possible `ts_secs`.
+fn webhook_timestamp_skew_secs(now_secs: i64, ts_secs: i64) -> u64 {
+    now_secs.abs_diff(ts_secs)
+}
+
 impl WebhookRouter {
     /// MCP-1131 (2026-05-16): signal the DLQ batch processor to flush
     /// its in-memory batch and exit before tokio aborts the task.
@@ -2117,7 +2131,8 @@ impl WebhookRouter {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs() as i64)
                                     .unwrap_or(0);
-                                if (now_secs - ts_secs).abs() > 300 {
+                                // Overflow-free skew (see webhook_timestamp_skew_secs).
+                                if webhook_timestamp_skew_secs(now_secs, ts_secs) > 300 {
                                     tracing::warn!(
                                         timestamp = ts_secs,
                                         now = now_secs,
@@ -2192,7 +2207,10 @@ impl WebhookRouter {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs() as i64)
                                 .unwrap_or(0);
-                            let skew = (now_secs - ts_secs).abs();
+                            // Overflow-free skew (see webhook_timestamp_skew_secs):
+                            // the timestamp-bound HMAC below is the primary replay
+                            // defense, but the freshness gate must hold on its own.
+                            let skew = webhook_timestamp_skew_secs(now_secs, ts_secs);
                             if skew > 300 {
                                 tracing::warn!(
                                     timestamp = ts_secs,
@@ -3431,6 +3449,42 @@ pub async fn suspension_callback_handler(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod timestamp_skew_tests {
+    use super::webhook_timestamp_skew_secs;
+
+    // The webhook freshness gate (`skew > 300 → reject`) must hold for EVERY
+    // caller-supplied timestamp. `(now - ts).abs()` did not: ts near i64::MIN
+    // overflows (debug panic; release .abs()-of-wrapped-MIN is negative, so the
+    // `> 300` check silently passes a stale request). abs_diff is overflow-free.
+    #[test]
+    fn normal_skew_is_exact() {
+        assert_eq!(webhook_timestamp_skew_secs(1_700_000_300, 1_700_000_000), 300);
+        assert_eq!(webhook_timestamp_skew_secs(1_700_000_000, 1_700_000_300), 300);
+        assert_eq!(webhook_timestamp_skew_secs(1_700_000_000, 1_700_000_000), 0);
+    }
+
+    #[test]
+    fn extreme_timestamps_yield_huge_skew_not_panic_or_negative() {
+        let now = 1_700_000_000i64;
+        // The exact crafted value that made `(now - ts)` wrap to i64::MIN under
+        // the old code (now - 2^63), plus the i64 extremes. All must produce a
+        // huge skew that is comfortably > the 300s window — i.e. REJECTED.
+        for ts in [
+            i64::MIN,
+            i64::MAX,
+            now.wrapping_sub(i64::MIN), // = now + 2^63 region
+            -9_223_372_035_154_775_808, // ≈ now - 2^63: old code → skew == i64::MIN (negative!)
+        ] {
+            let skew = webhook_timestamp_skew_secs(now, ts);
+            assert!(
+                skew > 300,
+                "ts={ts} produced skew={skew}, which would PASS the freshness gate"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
