@@ -19,6 +19,10 @@ pub struct IdempotencyRecord {
     pub key: String,
     pub request_hash: String,
     pub response_body: Option<String>,
+    /// The original response's `Content-Type`, cached so a replayed response is
+    /// faithful — without it a replayed JSON body arrives with no Content-Type
+    /// and clients (e.g. GraphQL clients) mis-parse it.
+    pub content_type: Option<String>,
     pub status_code: i32,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -178,6 +182,8 @@ impl IdempotencyService {
                     request_hash: request_hash.to_string(),
                     status_code,
                     response_body,
+                    // Legacy `check` predates content_type caching.
+                    content_type: None,
                     created_at: created,
                     expires_at: expires,
                 }))
@@ -293,6 +299,7 @@ impl IdempotencyService {
                 tag = 'hit',
                 status_code = record.status_code,
                 response_body = record.response_body,
+                content_type = record.content_type,
                 created_at = record.created_at,
                 ttl_seconds = ttl
             })
@@ -326,6 +333,7 @@ impl IdempotencyService {
         request_hash: &str,
         status_code: i32,
         response_body: Option<&str>,
+        content_type: Option<&str>,
     ) -> Result<bool> {
         let mut conn = self.conn().await?;
         let redis_key = format!("idempotency:{}", key);
@@ -335,6 +343,7 @@ impl IdempotencyService {
             "request_hash": request_hash,
             "status_code": status_code,
             "response_body": response_body,
+            "content_type": content_type,
             "created_at": Utc::now().to_rfc3339(),
         });
         let ttl_secs = self.default_ttl.as_secs() as usize;
@@ -503,6 +512,13 @@ pub async fn idempotency_middleware(
             let mut resp =
                 Response::new(Body::from(rec.response_body.unwrap_or_default()));
             *resp.status_mut() = status;
+            // Faithful replay: restore the cached Content-Type so the replayed
+            // body parses like the original. Default to JSON (the content type
+            // of the API routes this middleware fronts) if none was cached.
+            let ct = rec.content_type.as_deref().unwrap_or("application/json");
+            if let Ok(v) = ct.parse() {
+                resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, v);
+            }
             if let Ok(v) = "true".parse() {
                 resp.headers_mut().insert(IDEMPOTENT_REPLAYED_HEADER, v);
             }
@@ -523,12 +539,23 @@ pub async fn idempotency_middleware(
             let response = next.run(request).await;
             let (resp_parts, resp_body) = response.into_parts();
             let status = resp_parts.status;
+            let content_type = resp_parts
+                .headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             match to_bytes(resp_body, MAX_IDEMPOTENT_RESPONSE_BYTES).await {
                 Ok(bytes) => {
                     if status.as_u16() < 500 {
                         let body_str = String::from_utf8_lossy(&bytes).into_owned();
                         if let Err(e) = service
-                            .complete(&key, &request_hash, status.as_u16() as i32, Some(&body_str))
+                            .complete(
+                                &key,
+                                &request_hash,
+                                status.as_u16() as i32,
+                                Some(&body_str),
+                                content_type.as_deref(),
+                            )
                             .await
                         {
                             tracing::warn!(error = %e, "idempotency complete failed; response not cached");
@@ -587,7 +614,13 @@ enum BeginPayload {
     #[serde(rename = "hit")]
     Hit {
         status_code: i32,
+        // `default` so a record written before content_type existed (or any
+        // partial record) decodes to None rather than failing the whole begin.
+        #[serde(default)]
         response_body: Option<String>,
+        #[serde(default)]
+        content_type: Option<String>,
+        #[serde(default)]
         created_at: Option<String>,
         ttl_seconds: i64,
     },
@@ -602,6 +635,7 @@ impl BeginPayload {
             BeginPayload::Hit {
                 status_code,
                 response_body,
+                content_type,
                 created_at,
                 ttl_seconds,
             } => {
@@ -616,6 +650,7 @@ impl BeginPayload {
                     request_hash: request_hash.to_string(),
                     status_code,
                     response_body,
+                    content_type,
                     created_at: created,
                     expires_at: expires,
                 })
@@ -707,7 +742,7 @@ mod tests {
     #[test]
     fn begin_payload_hit_builds_record() {
         let out = parse(
-            r#"{"tag":"hit","status_code":201,"response_body":"{\"ok\":true}","created_at":"2026-06-01T00:00:00+00:00","ttl_seconds":3600}"#,
+            r#"{"tag":"hit","status_code":201,"response_body":"{\"ok\":true}","content_type":"application/json","created_at":"2026-06-01T00:00:00+00:00","ttl_seconds":3600}"#,
         );
         match out {
             BeginOutcome::Hit(rec) => {
@@ -715,8 +750,23 @@ mod tests {
                 assert_eq!(rec.request_hash, "h");
                 assert_eq!(rec.status_code, 201);
                 assert_eq!(rec.response_body.as_deref(), Some("{\"ok\":true}"));
+                assert_eq!(rec.content_type.as_deref(), Some("application/json"));
                 assert!(rec.expires_at > rec.created_at);
             }
+            other => panic!("expected Hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn begin_payload_hit_missing_content_type_is_none() {
+        // A record cached before content_type existed omits the field — it must
+        // decode to None (not fail the whole begin), and the replay then falls
+        // back to the default content type.
+        let out = parse(
+            r#"{"tag":"hit","status_code":200,"response_body":"x","created_at":null,"ttl_seconds":60}"#,
+        );
+        match out {
+            BeginOutcome::Hit(rec) => assert!(rec.content_type.is_none()),
             other => panic!("expected Hit, got {other:?}"),
         }
     }
