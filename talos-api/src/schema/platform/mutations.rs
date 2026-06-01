@@ -243,21 +243,17 @@ impl PlatformMutations {
         .map_err(|e| e.extend_safe())?
         .unwrap_or_else(|| "http-node".to_string());
 
-        let rank = |world: &str| -> u8 {
-            match world.trim_end_matches("-node") {
-                "minimal" => 0,
-                "http" => 1,
-                "llm" | "network" => 2,
-                "secrets" | "governance" => 3,
-                "messaging" | "filesystem" => 4,
-                "cache" => 5,
-                "database" | "agent" => 6,
-                "automation" | "trusted" => 7,
-                _ => 7,
-            }
-        };
-
-        if rank(&input.max_capability_world) > rank(&granter_ceiling) {
+        // Lattice gate — NOT a linear rank comparison. You may only grant a
+        // ceiling that is a SUBSET of your own. The previous local `rank`
+        // closure mapped incomparable tier-3 siblings to the SAME rank
+        // (governance == secrets == 3), so `rank(requested) > rank(granter)`
+        // was false for the (governance-ceiling, grant-secrets) pair and let a
+        // granter hand out a capability — vault access — they don't hold. This
+        // is the exact lattice-bypass the 2026-05-28 review fixed on the actor
+        // grant gates (actors/mutations.rs); the platform grant gate must use
+        // the SAME canonical helper. `ceiling_permits` fails closed on any
+        // unrecognised world.
+        if !talos_capability_world::ceiling_permits(&granter_ceiling, &input.max_capability_world) {
             return Err(async_graphql::Error::new(format!(
                 "Cannot grant '{}': your ceiling is '{}'. You cannot grant more than you have.",
                 input.max_capability_world, granter_ceiling
