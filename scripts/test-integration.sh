@@ -69,6 +69,7 @@ TESTS=(
     "talos-advanced-repository:scratch_rls:migrated"
     "talos-execution-repository:crash_recovery:migrated"
     "talos-memory:integration:migrated"
+    "talos-system-repo:revocation_query:migrated"
 )
 
 rc=0

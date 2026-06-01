@@ -14,5 +14,9 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4"] }
+
 [lints]
 workspace = true
