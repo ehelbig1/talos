@@ -345,6 +345,31 @@ static EMBED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .expect("talos-memory: failed to build embedding HTTP client (TLS init)")
     });
 
+/// Generous upper bound on an embedding provider's response body. A single
+/// embedding vector is tens of KiB even for the largest models; 10 MiB
+/// (matching the worker's `MAX_LLM_BODY_BYTES` / `WASM_HTTP_MAX_RESPONSE_BYTES`)
+/// leaves ample headroom while refusing a runaway body.
+const MAX_EMBEDDING_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Read a response body into memory, aborting if it exceeds `max` bytes.
+///
+/// Controller-side sibling of the worker's `read_llm_response_body_bounded`
+/// (PR #76): `resp.json()` / `resp.bytes()` buffer the WHOLE body with no
+/// size limit, so a compromised / MITM'd / buggy `EMBEDDING_API_URL`
+/// returning a multi-GB body would OOM the controller — the credential-
+/// holding host. `reqwest::Response::chunk()` streams without needing the
+/// `stream` cargo feature (not enabled in this crate), so we cap as we go.
+async fn read_body_capped(resp: &mut reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("body read: {e}"))? {
+        if body.len() + chunk.len() > max {
+            return Err(format!("embedding response exceeded {max}-byte cap"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Option<Vec<f32>> {
     // MCP-520: same Mode-B credential-leak class as the sibling
     // `talos-search-service` embedding client. Operator-configured
@@ -376,8 +401,17 @@ async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Opti
             req = req.bearer_auth(key);
         }
         match req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let json: serde_json::Value = match resp.json().await {
+            Ok(mut resp) if resp.status().is_success() => {
+                // Bounded read, NOT unbounded `resp.json()` (see
+                // `read_body_capped` — OOM defense-in-depth on the controller).
+                let body = match read_body_capped(&mut resp, MAX_EMBEDDING_RESPONSE_BYTES).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+                let json: serde_json::Value = match serde_json::from_slice(&body) {
                     Ok(j) => j,
                     Err(e) => {
                         last_err = Some(format!("json decode: {e}"));
