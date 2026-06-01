@@ -52,8 +52,22 @@ const MAX_MESSAGING_PUBLISHES_PER_EXECUTION: u64 = 1000;
 /// Each entry is a prefix matched with `starts_with`; trailing `.`s
 /// keep them from accidentally matching legitimate user subjects (e.g.
 /// `talos_app.*` doesn't match `talos.`).
+///
+/// The NATS-reserved namespaces are blocked too: NATS reserves the `$`
+/// prefix wholesale for system subjects (`$SYS.*` server control,
+/// `$JS.API.*` JetStream stream/consumer management, `$KV`/`$OBJ` stores,
+/// …) and uses `_INBOX.` for request/reply inboxes. A guest has no
+/// legitimate reason to publish to either. Crucially, absent fine-grained
+/// NATS account permissions — NOT guaranteed; the single-user deploy path
+/// ships without per-subject ACLs — this app-level check is the ONLY gate,
+/// so e.g. `$JS.API.STREAM.DELETE.<name>` from guest code could otherwise
+/// delete a JetStream stream. `$` has no trailing dot on purpose: the whole
+/// prefix is reserved, so the bare marker blocks every current AND future
+/// system namespace in one rule.
 const RESERVED_PUBLISH_PREFIXES: &[&str] = &[
-    "talos.", "wasm.", // wasm.log.* — controller WASM-log subscriber
+    "talos.", "wasm.",   // wasm.log.* — controller WASM-log subscriber
+    "$",       // NATS system subjects: $SYS.*, $JS.API.*, $KV, $OBJ, …
+    "_INBOX.", // NATS request/reply inboxes
 ];
 
 /// Returns `true` when `topic` is on the platform-reserved prefix
@@ -1708,6 +1722,46 @@ mod reserved_topic_prefix_tests {
         // only handles the prefix concern. Don't accidentally match
         // empty against `""` prefix (would always be true).
         assert!(!reject_reserved_topic_prefix(""));
+    }
+
+    #[test]
+    fn rejects_nats_reserved_system_and_inbox_subjects() {
+        // NATS reserves `$` wholesale for system subjects, and `_INBOX.`
+        // for request/reply. A guest must not publish to either — most
+        // dangerously `$JS.API.*` (JetStream management) when the worker's
+        // NATS account lacks per-subject ACLs.
+        for subj in &[
+            "$SYS.REQ.SERVER.PING",
+            "$JS.API.STREAM.DELETE.MY_STREAM",
+            "$JS.API.CONSUMER.DELETE.S.C",
+            "$KV.store.key",
+            "$OBJ.bucket.chunk",
+            "$", // bare marker
+            "_INBOX.aBcD1234efGh5678",
+            "_INBOX.",
+        ] {
+            assert!(
+                reject_reserved_topic_prefix(subj),
+                "must reject NATS-reserved subject {subj}"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_and_inbox_do_not_over_match_user_subjects() {
+        // The `$` / `_INBOX.` additions must not catch legitimate subjects
+        // that merely CONTAIN those tokens mid-string or share a stem.
+        for subj in &[
+            "orders.$pecial",     // `$` not at the start
+            "_INBOXING.notice",   // shares stem but not the `_INBOX.` prefix
+            "team._inbox.shadow", // `_inbox` lowercase, not at start
+            "prices.usd$.update", // `$` mid-subject
+        ] {
+            assert!(
+                !reject_reserved_topic_prefix(subj),
+                "must allow user subject {subj}"
+            );
+        }
     }
 }
 
