@@ -2617,6 +2617,28 @@ else
 fi
 echo
 
+# ── 35. rustfmt is clean (recurrence-proof for PR #111) ──────────────
+bold "▶ check 35: cargo fmt --all -- --check (rustfmt drift)"
+
+# `make lint` runs this gate, but the pre-commit path people actually use is
+# THIS script invoked directly — which never ran rustfmt, so drift accumulated
+# silently to ~150 files before PR #111 swept it (2026-06-01). Running the
+# fmt check HERE means the script people run pre-commit catches drift the
+# moment it lands, instead of letting it pile up unseen. Unlike clippy
+# (check 7, ~60-90s, env-gated), `cargo fmt --check` is ~1s — cheap enough to
+# run by default. There is no rustfmt.toml; this is plain default rustfmt
+# under the pinned toolchain (rust-toolchain.toml).
+if ! command -v cargo >/dev/null 2>&1; then
+    yellow "⊘ fmt check skipped (cargo not on PATH)"
+elif cargo fmt --all -- --check >/dev/null 2>&1; then
+    green "✓ rustfmt clean (cargo fmt --all -- --check)"
+else
+    red "✗ rustfmt drift detected"
+    yellow "  → run \`cargo fmt --all\` to fix (formatting-only, AST-token-preserving)"
+    EXIT_CODE=1
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
