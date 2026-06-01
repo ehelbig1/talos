@@ -2081,20 +2081,6 @@ async fn handle_get_module_compatibility(
     // table needs to recognize what's actually persisted; refusing the
     // module with "Unknown module world 'llm'" was the prod bug
     // surfaced when probing get_module_compatibility on LLM Inference.
-    let get_world_level = |w: &str| -> i32 {
-        match w {
-            "minimal" => 0,
-            "http" | "network" => 1,
-            "secrets" | "llm" => 2,
-            "filesystem" | "cache" | "messaging" => 3,
-            "database" | "agent" => 4,
-            "governance" => 5,
-            "automation" | "trusted" => 6,
-            "" => 0, // Unknown/empty defaults to minimal
-            _ => -1, // Truly unknown
-        }
-    };
-
     // Check wasm_modules first, then node_templates
     let module_world: String = match state
         .module_repo
@@ -2115,34 +2101,48 @@ async fn handle_get_module_compatibility(
     let module_world_normalized = normalize_world(&module_world);
     let target_world_normalized = normalize_world(&target_world);
 
-    let module_level = get_world_level(&module_world_normalized);
-    let target_level = get_world_level(&target_world_normalized);
-
     let known_worlds_msg = "Known worlds: minimal, http, network, secrets, llm, filesystem, cache, messaging, database, agent, governance, automation";
-    let (compatible, reason) = if module_level < 0 {
-        (false, format!("Unknown module world '{}'. {}", module_world_normalized, known_worlds_msg))
-    } else if target_level < 0 {
-        (false, format!("Unknown target world '{}'. {}", target_world_normalized, known_worlds_msg))
-    } else if target_level >= module_level {
+    // Compatibility is a LATTICE decision (module world ⊆ target world), NOT a
+    // linear level comparison. Incomparable worlds (e.g. secrets vs governance)
+    // are NOT mutually compatible even though a linear rank would say so —
+    // route through the canonical ceiling_permits, the same helper the
+    // capability-grant gates use.
+    let (compatible, reason) = if !talos_capability_world::is_lattice_world(&module_world_normalized)
+    {
+        (
+            false,
+            format!("Unknown module world '{module_world_normalized}'. {known_worlds_msg}"),
+        )
+    } else if !talos_capability_world::is_lattice_world(&target_world_normalized) {
+        (
+            false,
+            format!("Unknown target world '{target_world_normalized}'. {known_worlds_msg}"),
+        )
+    } else if talos_capability_world::ceiling_permits(
+        &target_world_normalized,
+        &module_world_normalized,
+    ) {
         (
             true,
-            if target_level == module_level {
+            if module_world_normalized == target_world_normalized {
                 format!(
-                    "Module world '{}' matches target world '{}'",
-                    module_world_normalized, target_world_normalized
+                    "Module world '{module_world_normalized}' matches target world '{target_world_normalized}'"
                 )
             } else {
                 format!(
-                    "Target world '{}' (level {}) is a superset of module world '{}' (level {})",
-                    target_world_normalized, target_level, module_world_normalized, module_level
+                    "Target world '{target_world_normalized}' is a superset of module world '{module_world_normalized}'"
                 )
             },
         )
     } else {
-        (false, format!(
-            "Target world '{}' (level {}) cannot run modules compiled for '{}' (level {}). The module requires more capabilities than the target world provides.",
-            target_world_normalized, target_level, module_world_normalized, module_level
-        ))
+        (
+            false,
+            format!(
+                "Target world '{target_world_normalized}' cannot run modules compiled for \
+                 '{module_world_normalized}': the module requires capabilities the target world \
+                 does not provide."
+            ),
+        )
     };
 
     let result = serde_json::json!({

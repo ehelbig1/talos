@@ -439,6 +439,16 @@ pub fn ceiling_permits(ceiling: &str, requested: &str) -> bool {
     }
 }
 
+/// True if `world` names a recognised capability world (short `secrets` or
+/// `-node`-suffixed `secrets-node` form). Lets callers distinguish "unknown
+/// world" from "known-but-incompatible" for clear error messages, while still
+/// routing the actual compatibility decision through [`ceiling_permits`]
+/// (the lattice) rather than a local linear rank.
+#[must_use]
+pub fn is_lattice_world(world: &str) -> bool {
+    lattice_world(world).is_some()
+}
+
 // ============================================================================
 // Capability-world enumeration helpers (extracted from
 // controller/src/mcp/capability_worlds.rs)
@@ -696,6 +706,19 @@ mod ceiling_tests {
         assert!(!ceiling_permits("llm-node", "network-node"));
         assert!(!ceiling_permits("llm-node", "secrets-node"));
         assert!(!ceiling_permits("llm-node", "automation-node"));
+    }
+
+    #[test]
+    fn is_lattice_world_recognises_known_forms_only() {
+        // Both short and -node forms are recognised.
+        assert!(is_lattice_world("secrets"));
+        assert!(is_lattice_world("secrets-node"));
+        assert!(is_lattice_world("governance-node"));
+        assert!(is_lattice_world("minimal"));
+        // Unknown / malformed / legacy → false (so callers can report it).
+        assert!(!is_lattice_world("bogus"));
+        assert!(!is_lattice_world(""));
+        assert!(!is_lattice_world("tier1"));
     }
 
     #[test]
