@@ -713,7 +713,11 @@ pub async fn pubsub_push_handler(
     //    will sit on top in a separate commit.
     let svc = Arc::clone(&state.watch_service);
     let dispatch_ctx_opt = state.dispatch.clone();
-    let email = notification.email_address;
+    // DLP: don't carry the connected account's email (PII) into the WARN-level
+    // push logs below — `user_id` (pseudonymous) is already the identifier
+    // there. Parity with the MCP-1011 recipient-redaction discipline. (The
+    // debug-level "no active watch" log above keeps the email: it has no
+    // user_id resolved and is gated off in production.)
     let mut history_id = row.history_id;
     let channel_uuid = row.id;
     // Defensive: skip pagination entirely when the stored cursor is
@@ -722,7 +726,7 @@ pub async fn pubsub_push_handler(
     // but if a migration / bug / race ever left a 0 in the row,
     // better to silently skip than 401-loop every push.
     if history_id == 0 {
-        tracing::warn!(%user_id, email = %email, "gmail push: stored history_id is 0; skipping");
+        tracing::warn!(%user_id, "gmail push: stored history_id is 0; skipping");
         return StatusCode::OK;
     }
     tokio::spawn(async move {
@@ -780,7 +784,6 @@ pub async fn pubsub_push_handler(
             if pages_processed > MAX_HISTORY_PAGES {
                 tracing::warn!(
                     %user_id,
-                    email = %email,
                     %history_id,
                     pages_processed,
                     "gmail push: hit MAX_HISTORY_PAGES cap; truncating this push. Next push will resume from persisted history_id"
@@ -794,14 +797,13 @@ pub async fn pubsub_push_handler(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(%user_id, %email, error = %e, "gmail push: history.list failed");
+                    tracing::warn!(%user_id, error = %e, "gmail push: history.list failed");
                     return;
                 }
             };
             let message_count: usize = resp.history.iter().map(|h| h.messages_added.len()).sum();
             tracing::info!(
                 %user_id,
-                email = %email,
                 page_history_id = %resp.next_history_id.unwrap_or(history_id),
                 messages_added = message_count,
                 "gmail push: history page synced"
