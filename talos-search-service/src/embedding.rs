@@ -239,34 +239,6 @@ pub async fn generate_embedding(text: &str) -> Result<Vec<f32>, EmbeddingError> 
     Ok(batch.remove(0))
 }
 
-/// Generous upper bound on an embedding provider's success-response body.
-/// A batch of vectors is at most a few MiB; 10 MiB (matching the worker's
-/// `MAX_LLM_BODY_BYTES`) refuses a runaway body with ample headroom.
-const MAX_EMBEDDING_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-
-/// Error bodies are truncated to 512 chars for logging — no reason to buffer
-/// more than a small bound of a provider's error response.
-const MAX_EMBEDDING_ERROR_BODY_BYTES: usize = 64 * 1024;
-
-/// Read a response body into memory, aborting if it exceeds `max` bytes.
-///
-/// Controller-side sibling of the worker's `read_llm_response_body_bounded`
-/// (PR #76) and `talos-memory`'s `read_body_capped`: `resp.json()` /
-/// `resp.text()` buffer the WHOLE body with no size limit, so a compromised /
-/// MITM'd / buggy `EMBEDDING_API_URL` returning a multi-GB body would OOM the
-/// controller. `reqwest::Response::chunk()` streams without the `stream` cargo
-/// feature (not enabled here), so we cap as we accumulate.
-async fn read_body_capped(resp: &mut reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
-    let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        if body.len() + chunk.len() > max {
-            return Err(format!("response exceeded {max}-byte cap"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 /// Generate embeddings for a batch of inputs in a single API request.
 /// Returns vectors in the same order as `texts`. Empty input slice
 /// returns `Ok(vec![])` without making a network call.
@@ -334,7 +306,7 @@ pub async fn generate_embeddings_batch(
         req = req.bearer_auth(key);
     }
 
-    let mut resp = req
+    let resp = req
         .send()
         .await
         .map_err(|e| EmbeddingError::Network(e.to_string()))?;
@@ -343,10 +315,11 @@ pub async fn generate_embeddings_batch(
     if !status.is_success() {
         // Bounded read (NOT unbounded `resp.text()`): only 512 chars are
         // retained for logging, so cap the buffer to a small bound.
-        let body = read_body_capped(&mut resp, MAX_EMBEDDING_ERROR_BODY_BYTES)
-            .await
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_else(|_| "<unreadable or oversized response body>".to_string());
+        let body =
+            talos_http_body::read_body_capped(resp, talos_http_body::DEFAULT_MAX_ERROR_BODY_BYTES)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_else(|_| "<unreadable or oversized response body>".to_string());
         let body_truncated = if body.len() > 512 {
             format!(
                 "{}…",
@@ -379,9 +352,10 @@ pub async fn generate_embeddings_batch(
     }
 
     // Bounded read, NOT unbounded `resp.json()` (OOM defense-in-depth).
-    let bytes = read_body_capped(&mut resp, MAX_EMBEDDING_RESPONSE_BYTES)
-        .await
-        .map_err(EmbeddingError::Network)?;
+    let bytes =
+        talos_http_body::read_body_capped(resp, talos_http_body::DEFAULT_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|e| EmbeddingError::Network(e.to_string()))?;
     let json: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| EmbeddingError::Network(e.to_string()))?;
 
