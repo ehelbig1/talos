@@ -577,7 +577,7 @@ async fn try_v2_catalog(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let catalog: CatalogResponse = resp.json().await.context("Parse /v2/_catalog response")?;
+        let catalog: CatalogResponse = talos_http_body::read_json_capped(resp).await.context("Parse /v2/_catalog response")?;
         all_repos.extend(catalog.repositories);
         pages_walked += 1;
 
@@ -614,7 +614,7 @@ async fn try_v2_catalog(
         if !tags_resp.status().is_success() {
             continue;
         }
-        let Ok(tags) = tags_resp.json::<TagsResponse>().await else {
+        let Ok(tags) = talos_http_body::read_json_capped::<TagsResponse>(tags_resp).await else {
             continue;
         };
         for tag in tags.tags.unwrap_or_default() {
