@@ -1024,6 +1024,51 @@ fn is_placeholder_key(k: &str) -> bool {
 pub static GRAPH_SERVICE: std::sync::OnceLock<GraphRagService> = std::sync::OnceLock::new();
 
 #[cfg(test)]
+mod sanitize_label_tests {
+    use super::sanitize_label;
+
+    // `sanitize_label` is the ONLY guard between LLM-extracted (user-content-
+    // derived) entity/relationship labels and the un-parameterizable Cypher
+    // label/reltype position in `upsert_triple`. Cypher labels can't be bound
+    // as `$params`, so a breakout here is graph injection (DETACH DELETE the
+    // actor's whole subgraph, etc.). This pins the two layers of defense:
+    // (1) the charset filter drops every Cypher-significant char, and
+    // (2) the output is always an allowlisted label or a hardcoded default —
+    // never the raw input.
+    const CYPHER_BREAKOUT: &[&str] = &[
+        "Person) DETACH DELETE n //",
+        "Concept`) MATCH (x) DELETE x //",
+        "Foo {actor_id: 1}) RETURN 1 //",
+        "a-b; DROP",
+        "rel]->(x)<-[:OWNS",
+        "  spaces and (parens) ",
+        "",
+    ];
+
+    #[test]
+    fn sanitized_labels_carry_no_cypher_significant_chars() {
+        for &raw in CYPHER_BREAKOUT {
+            let out = sanitize_label(raw);
+            assert!(
+                out.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "sanitize_label({raw:?}) = {out:?} leaked a Cypher-significant char"
+            );
+            assert!(!out.is_empty(), "sanitize_label({raw:?}) must not be empty");
+        }
+    }
+
+    #[test]
+    fn unknown_labels_map_to_a_safe_default_not_the_raw_value() {
+        // Node-shaped unknown → Concept; edge-shaped (ALL_CAPS_WITH_UNDERSCORE)
+        // unknown → RELATED_TO. Either way, a fixed safe token — not user input.
+        assert_eq!(sanitize_label("Person) DETACH DELETE n //"), "Concept");
+        // Filters to "OWNS_RELDETACHDELETE" — all-caps with an underscore, so the
+        // edge-shape heuristic maps it to RELATED_TO (still a fixed safe token).
+        assert_eq!(sanitize_label("OWNS_REL DETACH DELETE"), "RELATED_TO");
+    }
+}
+
+#[cfg(test)]
 mod placeholder_tests {
     use super::is_placeholder_key;
 
