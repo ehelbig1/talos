@@ -27,5 +27,11 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.8"
 
+[dev-dependencies]
+# Real AES-256-GCM for the integration-test MemoryCryptoHook — lets the
+# live-Postgres suite exercise the genuine encrypt→store→read→decrypt round
+# trip AND the MCP-S2 AAD-binding property, instead of stubbing crypto out.
+aes-gcm = "0.10"
+
 [lints]
 workspace = true
