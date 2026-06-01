@@ -19,7 +19,7 @@
 //! | `DLP_WEBHOOK_URL` | Required when `DLP_PROVIDER=external` |
 //! | `DLP_WEBHOOK_TOKEN` | Optional `Authorization: Bearer` token for external provider |
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde_json::Value;
 use std::sync::{Arc, LazyLock};
 
@@ -235,12 +235,15 @@ fn redact_credit_cards(input: &str) -> String {
     output_str // was: `output` (original input) — dead code, redaction never applied
 }
 
-/// Compiled regex patterns: (regex, replacement_token).
-/// These are compiled once at startup and reused for all redaction operations.
-/// The patterns are ordered by specificity (more specific patterns first) to
-/// minimize false positives and unnecessary allocations.
-static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
-    let specs: &[(&str, &str)] = &[
+/// Source-of-truth `(pattern, replacement_token)` pairs. Both [`PATTERNS`]
+/// (compiled regexes for per-match replacement) and [`PATTERN_SET`] (a single
+/// combined automaton for the cheap "does anything match" gate) derive from
+/// this ONE list, so the detection set and the replacement set can never
+/// drift apart.
+///
+/// Ordered by specificity (more specific patterns first) to minimize false
+/// positives and unnecessary allocations.
+const PATTERN_SPECS: &[(&str, &str)] = &[
         // Talos platform API keys — most specific pattern first to avoid partial matches.
         // Format: talos_sk_ + 8 hex (prefix) + 64 hex (secret) = 72 hex chars total.
         (r"\btalos_sk_[0-9a-f]{72}\b", "[REDACTED:TALOS_API_KEY]"),
@@ -390,8 +393,11 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             r"-----BEGIN (?:RSA |EC |ED25519 |DSA |ENCRYPTED |OPENSSH |PGP )?PRIVATE KEY(?: BLOCK)?-----",
             "[REDACTED:PRIVATE_KEY]",
         ),
-    ];
+];
 
+/// Compiled per-pattern regexes used for replacement, built once at startup
+/// from [`PATTERN_SPECS`].
+static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     // MCP-1141 (2026-05-16): the pre-fix `.filter_map(|(p, t)|
     // Regex::new(p).ok().map(...))` silently dropped any pattern that
     // failed to compile. A regression in any one of the DLP patterns
@@ -406,7 +412,7 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     // panic at first use surfaces the deployment-time regression
     // instead of silently dropping a DLP control. The patterns above
     // are hardcoded; a compile failure can only mean a code-edit bug.
-    specs
+    PATTERN_SPECS
         .iter()
         .map(|(pattern, tag)| {
             let re = Regex::new(pattern).unwrap_or_else(|e| {
@@ -421,6 +427,37 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         .collect()
 });
 
+/// Single combined automaton over every pattern in [`PATTERN_SPECS`].
+/// `is_match` answers "does ANY pattern match?" in ONE pass over the input
+/// instead of the N separate `Regex::is_match` scans the fast path used to
+/// pay — an ~Nx reduction in scan work on the common no-secret input that
+/// dominates the hot broadcast/log scrubber path. Semantically identical to
+/// `PATTERNS.iter().any(|(re, _)| re.is_match(input))`, pinned by the
+/// `regexset_fastpath_matches_per_pattern_any` test.
+///
+/// Same fail-closed discipline as [`PATTERNS`] / `CARD_PATTERN`: a compile
+/// failure panics at first use rather than silently disabling detection.
+static PATTERN_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new(PATTERN_SPECS.iter().map(|(p, _)| *p)).unwrap_or_else(|e| {
+        panic!(
+            "BUG: DLP RegexSet failed to compile from PATTERN_SPECS: {e} \
+             — fail-closed rather than silently disable secret detection"
+        )
+    })
+});
+
+/// True when `input` contains anything any DLP rule would redact — the
+/// combined pattern set OR the Luhn-gated card pattern. A single
+/// combined-automaton pass plus one card scan; this is the cheap gate that
+/// lets both redactors skip the full per-pattern replacement walk (and its
+/// ~N allocations) on the common no-secret input. Conservative for cards:
+/// `CARD_PATTERN` matching without a valid Luhn check still routes to the
+/// full walk (which then correctly leaves the value unredacted), so the
+/// gate never skips real redaction.
+fn input_needs_redaction(input: &str) -> bool {
+    PATTERN_SET.is_match(input) || CARD_PATTERN.is_match(input)
+}
+
 /// Regex-based PII redaction — the default provider.
 pub struct BuiltinDlpProvider;
 
@@ -434,12 +471,9 @@ impl BuiltinDlpProvider {
     /// where the typical message has zero matches and the trait method
     /// burns CPU on dead allocations.
     pub fn redact_str_optimized<'a>(&self, input: &'a str) -> std::borrow::Cow<'a, str> {
-        // Fast path: check if any pattern matches before allocating
-        let card_pattern = &*CARD_PATTERN;
-        let needs_redaction =
-            PATTERNS.iter().any(|(re, _)| re.is_match(input)) || card_pattern.find(input).is_some();
-
-        if !needs_redaction {
+        // Fast path: one combined-automaton pass (+ one card scan) decides
+        // whether anything needs redacting before we allocate.
+        if !input_needs_redaction(input) {
             return std::borrow::Cow::Borrowed(input);
         }
 
@@ -450,6 +484,15 @@ impl BuiltinDlpProvider {
 
 impl DlpProvider for BuiltinDlpProvider {
     fn redact_str(&self, input: &str) -> String {
+        // Fast path: skip the per-pattern replacement walk (and its ~N
+        // `replace_all` allocations) when a single combined-automaton pass
+        // proves nothing matches — the common case on most
+        // persistence-boundary writes. Behaviourally identical to the walk,
+        // which would leave a no-match input unchanged anyway.
+        if !input_needs_redaction(input) {
+            return input.to_owned();
+        }
+
         // First apply credit card validation with Luhn check
         let mut result = redact_credit_cards(input);
 
@@ -831,6 +874,55 @@ pub fn redact_json_bounded(v: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SAFETY PIN for the fast-path optimization: the combined `PATTERN_SET`
+    /// automaton must be EXACTLY equivalent to "any individual pattern
+    /// matches". `redact_str` / `redact_str_optimized` skip the full
+    /// redaction walk when `input_needs_redaction` is false, so any input
+    /// where the RegexSet says "no match" but some individual pattern WOULD
+    /// match is a fail-open hole (a secret passes through unredacted). This
+    /// battery — no-match strings plus a real-shaped instance of each pattern
+    /// family — pins the equivalence so a future RegexSet/Regex divergence is
+    /// caught at PR time.
+    #[test]
+    fn regexset_fastpath_matches_per_pattern_any() {
+        let inputs = [
+            // no-match
+            "nothing sensitive here",
+            "order-1234567890 has shipped",
+            "just some prose with numbers 42 and words",
+            // one real-shaped instance per pattern family
+            "contact alice@example.com for details",
+            "key AKIAIOSFODNN7EXAMPLE in env",
+            "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQabcdef",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "dsn postgres://user:secret@db.host:5432/app",
+            "call 800-555-1234 now",
+            "ssn 123-45-6789 on file",
+            "talos_sk_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+        ];
+        for input in inputs {
+            let via_set = PATTERN_SET.is_match(input);
+            let via_any = PATTERNS.iter().any(|(re, _)| re.is_match(input));
+            assert_eq!(
+                via_set, via_any,
+                "RegexSet fast-path disagreed with per-pattern OR on {input:?} \
+                 (set={via_set}, any={via_any}) — fast path would skip redaction"
+            );
+        }
+    }
+
+    /// The gate must also recognise Luhn-valid card numbers (handled by the
+    /// separate `CARD_PATTERN`, NOT in `PATTERN_SET`) so the fast path never
+    /// skips card redaction; and it must return false on benign input.
+    #[test]
+    fn input_needs_redaction_gates_cards_and_clean_input() {
+        assert!(!input_needs_redaction("totally benign text"));
+        assert!(
+            input_needs_redaction("card 4111 1111 1111 1111 on file"),
+            "Luhn-valid card must route through the full redaction walk"
+        );
+    }
 
     #[test]
     fn redacts_ssn() {
