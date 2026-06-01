@@ -84,8 +84,9 @@ async fn main() -> Result<()> {
             // MCP-S2: backfill writes v1 with AAD = exec_id so the
             // resulting rows match the production write path's
             // ciphertext shape.
-            let (key_id, ciphertext, format_version) =
-                secrets.encrypt_value_aad_v1(&plaintext, id.as_bytes()).await?;
+            let (key_id, ciphertext, format_version) = secrets
+                .encrypt_value_aad_v1(&plaintext, id.as_bytes())
+                .await?;
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET output_data = NULL, output_data_enc = $1, output_enc_key_id = $2, \

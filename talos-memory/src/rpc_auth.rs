@@ -1011,7 +1011,11 @@ mod canonical_nonce_tests {
         let actor = Uuid::new_v4();
 
         // Non-canonical shape: rejected.
-        assert!(!check_and_record_nonce("memory_rpc", actor, "not-canonical"));
+        assert!(!check_and_record_nonce(
+            "memory_rpc",
+            actor,
+            "not-canonical"
+        ));
         assert!(!check_and_record_nonce(
             "memory_rpc",
             actor,

@@ -80,9 +80,9 @@ impl ManifestError {
     pub fn user_facing_message(&self) -> String {
         match self {
             Self::InvalidArg(msg) => msg.clone(),
-            Self::UnsupportedVersion(_)
-            | Self::TooManyWorkflows
-            | Self::TooManySecretRefs => self.to_string(),
+            Self::UnsupportedVersion(_) | Self::TooManyWorkflows | Self::TooManySecretRefs => {
+                self.to_string()
+            }
             Self::Internal(_) => "Database error".to_string(),
         }
     }
@@ -175,7 +175,8 @@ impl WorkflowManifestService {
         // Workflow fetch is required; secrets fetch is best-effort
         // (matches pre-extraction behavior).
         let (wf_rows_res, secret_refs_res) = tokio::join!(
-            self.workflow_repo.list_user_workflows_with_schedule(user_id),
+            self.workflow_repo
+                .list_user_workflows_with_schedule(user_id),
             self.secrets_manager.list_secret_refs_for_export(user_id),
         );
 
@@ -249,10 +250,7 @@ impl WorkflowManifestService {
     /// map; per-workflow upsert errors are surfaced as warnings rather
     /// than aborting the whole import (consistent with pre-extraction
     /// behaviour).
-    pub async fn import(
-        &self,
-        input: ImportInput<'_>,
-    ) -> Result<ImportOutcome, ManifestError> {
+    pub async fn import(&self, input: ImportInput<'_>) -> Result<ImportOutcome, ManifestError> {
         let ImportInput {
             manifest,
             dry_run,
@@ -589,7 +587,8 @@ mod tests {
 
     #[test]
     fn user_facing_message_internal_is_generic() {
-        let e: ManifestError = anyhow::anyhow!("postgres connection refused: leaking schema details").into();
+        let e: ManifestError =
+            anyhow::anyhow!("postgres connection refused: leaking schema details").into();
         // Internal errors must NOT leak details to API clients.
         assert_eq!(e.user_facing_message(), "Database error");
     }

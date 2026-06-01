@@ -80,9 +80,11 @@ fn load_master_key_bytes() -> Option<Vec<u8>> {
 /// `(ciphertext, nonce)` for the `auth_headers_encrypted` / `auth_headers_nonce`
 /// columns. Called by the GraphQL write path. Errors (opaque string — never the
 /// plaintext) if `TALOS_MASTER_KEY` is unavailable or encryption fails.
-pub fn encrypt_otlp_auth_headers(plaintext: &str, user_id: Uuid) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let master_key =
-        load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
+pub fn encrypt_otlp_auth_headers(
+    plaintext: &str,
+    user_id: Uuid,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let master_key = load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
     encrypt_otlp_auth_headers_with_master_key(plaintext, user_id, &master_key)
 }
 
@@ -94,8 +96,7 @@ pub fn decrypt_otlp_auth_headers(
     nonce: &[u8],
     user_id: Uuid,
 ) -> Result<String, String> {
-    let master_key =
-        load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
+    let master_key = load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
     decrypt_otlp_auth_headers_with_master_key(ciphertext, nonce, user_id, &master_key)
 }
 
@@ -133,7 +134,10 @@ fn decrypt_otlp_auth_headers_with_master_key(
     master_key: &[u8],
 ) -> Result<String, String> {
     if nonce.len() != 12 {
-        return Err(format!("nonce wrong length (expected 12, got {})", nonce.len()));
+        return Err(format!(
+            "nonce wrong length (expected 12, got {})",
+            nonce.len()
+        ));
     }
     let subkey = derive_otlp_header_key(master_key);
     let cipher = Aes256Gcm::new_from_slice(&subkey).map_err(|e| format!("cipher init: {e}"))?;
@@ -146,7 +150,9 @@ fn decrypt_otlp_auth_headers_with_master_key(
                 aad: &aad,
             },
         )
-        .map_err(|_| "decrypt failed — wrong key, corrupted data, or tenant (AAD) mismatch".to_string())?;
+        .map_err(|_| {
+            "decrypt failed — wrong key, corrupted data, or tenant (AAD) mismatch".to_string()
+        })?;
     String::from_utf8(plaintext).map_err(|_| "decrypted bytes are not valid UTF-8".to_string())
 }
 
@@ -195,15 +201,24 @@ mod otlp_header_crypto_tests {
     fn derived_subkey_differs_from_raw_master_key() {
         let mk = master_key();
         let subkey = derive_otlp_header_key(&mk);
-        assert_ne!(&subkey[..], &mk[..], "subkey must not equal the raw master key");
-        assert_eq!(subkey, derive_otlp_header_key(&mk), "derivation is deterministic");
+        assert_ne!(
+            &subkey[..],
+            &mk[..],
+            "subkey must not equal the raw master key"
+        );
+        assert_eq!(
+            subkey,
+            derive_otlp_header_key(&mk),
+            "derivation is deterministic"
+        );
     }
 
     #[test]
     fn rejects_wrong_nonce_length() {
         let user = Uuid::new_v4();
-        let err = decrypt_otlp_auth_headers_with_master_key(&[1, 2, 3], &[0u8; 11], user, &master_key())
-            .unwrap_err();
+        let err =
+            decrypt_otlp_auth_headers_with_master_key(&[1, 2, 3], &[0u8; 11], user, &master_key())
+                .unwrap_err();
         assert!(err.contains("nonce wrong length"), "got {err}");
     }
 }
@@ -820,17 +835,14 @@ async fn process_batch(
                 }
             }
             Err(_) => {
-                tracing::warn!(
-                    "Received unparseable audit ledger message. Dropping poison pill."
-                );
+                tracing::warn!("Received unparseable audit ledger message. Dropping poison pill.");
                 invalid_messages.push(idx);
             }
         }
     }
 
     // Phase 2: batch-resolve user_ids for distinct workflow_ids in this batch.
-    let distinct_wids: HashSet<Uuid> =
-        parsed.iter().filter_map(|p| p.workflow_uuid).collect();
+    let distinct_wids: HashSet<Uuid> = parsed.iter().filter_map(|p| p.workflow_uuid).collect();
     let mut user_id_map: HashMap<Uuid, Uuid> = HashMap::new();
     if !distinct_wids.is_empty() {
         let wids_vec: Vec<Uuid> = distinct_wids.iter().copied().collect();
@@ -902,10 +914,7 @@ async fn process_batch(
             if let Some(tracer) = otlp_cache.get_tracer(user_id, db_pool).await {
                 let mut span = tracer.start("audit_event");
                 span.set_attribute(KeyValue::new("talos.workflow.id", workflow_id.clone()));
-                span.set_attribute(KeyValue::new(
-                    "talos.execution.id",
-                    execution_id.clone(),
-                ));
+                span.set_attribute(KeyValue::new("talos.execution.id", execution_id.clone()));
                 span.set_attribute(KeyValue::new(
                     "talos.crypto.sequence",
                     event["sequence_num"].as_u64().unwrap_or(0) as i64,
@@ -919,10 +928,7 @@ async fn process_batch(
                     event["action"].as_str().unwrap_or("unknown").to_string(),
                 ));
                 if let Some(hash) = wrapper.get("hash").and_then(|h| h.as_str()) {
-                    span.set_attribute(KeyValue::new(
-                        "talos.crypto.hash",
-                        hash.to_string(),
-                    ));
+                    span.set_attribute(KeyValue::new("talos.crypto.hash", hash.to_string()));
                 }
                 if let Some(prev) = event.get("previous_hash").and_then(|h| h.as_str()) {
                     span.set_attribute(KeyValue::new(
@@ -951,7 +957,8 @@ async fn process_batch(
                 // boundary.
                 const MAX_OTLP_PAYLOAD_PREVIEW_BYTES: usize = 4096;
                 let payload_str = event["payload"].as_str().unwrap_or("");
-                let truncated_preview: &str = if payload_str.len() > MAX_OTLP_PAYLOAD_PREVIEW_BYTES {
+                let truncated_preview: &str = if payload_str.len() > MAX_OTLP_PAYLOAD_PREVIEW_BYTES
+                {
                     talos_text_util::truncate_at_char_boundary(
                         payload_str,
                         MAX_OTLP_PAYLOAD_PREVIEW_BYTES,

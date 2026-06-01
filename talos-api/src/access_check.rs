@@ -122,9 +122,7 @@ pub(crate) async fn authorize_execution_subscription(
         async_graphql::Error::new("Execution not found").extend_safe()
     })?;
 
-    let row = row.ok_or_else(|| {
-        async_graphql::Error::new("Execution not found").extend_safe()
-    })?;
+    let row = row.ok_or_else(|| async_graphql::Error::new("Execution not found").extend_safe())?;
 
     if row.user_id == caller_user_id {
         return Ok(());

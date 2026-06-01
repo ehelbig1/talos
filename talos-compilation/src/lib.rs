@@ -75,9 +75,7 @@ pub(crate) fn nonzero_env_or_default(var: &str, default: usize) -> usize {
 /// threshold (must be a positive integer). Use this for operators
 /// who genuinely cannot rebuild monthly (air-gapped environments)
 /// and have a compensating control elsewhere.
-pub(crate) fn check_advisory_db_age(
-    db_path: &str,
-) -> Result<()> {
+pub(crate) fn check_advisory_db_age(db_path: &str) -> Result<()> {
     use std::time::SystemTime;
     let meta = match std::fs::metadata(db_path) {
         Ok(m) => m,
@@ -685,7 +683,8 @@ impl CompilationService {
                              permitted in compile-time substitution values, and \
                              quote (U+0022) / backslash (U+005C) are excluded to \
                              prevent string-literal escape injection.",
-                            idx, code
+                            idx,
+                            code
                         );
                     }
                 }
@@ -737,7 +736,8 @@ impl CompilationService {
         // nothing useful — and `cargo component build` would likely OOM
         // before producing an error. WASM_MAX_SOURCE_BYTES overrides the
         // default cap.
-        let max_source_bytes = nonzero_env_or_default("WASM_MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES);
+        let max_source_bytes =
+            nonzero_env_or_default("WASM_MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES);
         if source_code.len() > max_source_bytes {
             return Ok(CompilationResult {
                 success: false,
@@ -1087,7 +1087,11 @@ impl CompilationService {
                         Some(format!(
                             "Audit failed: {} vulnerabilit{} found",
                             summary.blocking_count,
-                            if summary.blocking_count == 1 { "y" } else { "ies" },
+                            if summary.blocking_count == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            },
                         )),
                         Some(1.0),
                     );
@@ -1174,7 +1178,11 @@ impl CompilationService {
                         Some(format!(
                             "Audit failed: {} vulnerabilit{} found",
                             summary.blocking_count,
-                            if summary.blocking_count == 1 { "y" } else { "ies" },
+                            if summary.blocking_count == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            },
                         )),
                         Some(1.0),
                     );
@@ -1557,9 +1565,8 @@ impl CompilationService {
         // are incomparable) is a compile error.
         let detected_world_str = inspection.capability_world.to_string();
         if !declared_world.is_empty() && !detected_world_str.eq_ignore_ascii_case(declared_world) {
-            let declared_enum: CapabilityWorld = declared_world
-                .parse()
-                .unwrap_or(CapabilityWorld::Unknown);
+            let declared_enum: CapabilityWorld =
+                declared_world.parse().unwrap_or(CapabilityWorld::Unknown);
             // `is_subset_of` returns false when either side is
             // `Unknown`, so an unparseable declared string falls into
             // the fail-closed branch alongside genuine privilege
@@ -2567,10 +2574,9 @@ impl CompilationService {
                 // production unless the operator opted into host
                 // fallback. Non-production stays on the legacy direct
                 // cargo path.
-                if talos_config::is_production()
-                    && !container::host_fallback_allowed()
-                {
-                    return Err(e).context("Lint check requires container compilation in production");
+                if talos_config::is_production() && !container::host_fallback_allowed() {
+                    return Err(e)
+                        .context("Lint check requires container compilation in production");
                 }
                 tokio::time::timeout(
                     std::time::Duration::from_secs(30),
@@ -2945,10 +2951,7 @@ fn parse_audit_summary(stdout: &[u8]) -> AuditSummary {
             // Snippet — first 256 bytes — so the operator can spot the
             // offending output without flooding logs. Don't include the
             // whole stdout (could be MB if cargo dumped a stack trace).
-            let snippet: String = String::from_utf8_lossy(stdout)
-                .chars()
-                .take(256)
-                .collect();
+            let snippet: String = String::from_utf8_lossy(stdout).chars().take(256).collect();
             tracing::warn!(
                 target: "talos_compilation",
                 event_kind = "audit_parse_failure",
@@ -2965,10 +2968,7 @@ fn parse_audit_summary(stdout: &[u8]) -> AuditSummary {
         // Valid JSON but no vulnerabilities key → schema may have moved.
         // Distinct from the missing-count case below (where the key
         // exists but the count is absent or zero).
-        let snippet: String = String::from_utf8_lossy(stdout)
-            .chars()
-            .take(256)
-            .collect();
+        let snippet: String = String::from_utf8_lossy(stdout).chars().take(256).collect();
         tracing::warn!(
             target: "talos_compilation",
             event_kind = "audit_parse_failure",
@@ -2982,7 +2982,10 @@ fn parse_audit_summary(stdout: &[u8]) -> AuditSummary {
     let mut blocking_names: Vec<String> = Vec::new();
     let mut informational_names: Vec<String> = Vec::new();
 
-    if let Some(list) = v.pointer("/vulnerabilities/list").and_then(|l| l.as_array()) {
+    if let Some(list) = v
+        .pointer("/vulnerabilities/list")
+        .and_then(|l| l.as_array())
+    {
         for entry in list {
             let id = entry.pointer("/advisory/id").and_then(|v| v.as_str());
             let pkg = entry.pointer("/advisory/package").and_then(|v| v.as_str());
@@ -3286,10 +3289,7 @@ let url = "https://example.com/world: \"minimal-node\""; #[talos_node(world = "n
         // Without RUST_ENV or TALOS_DEFAULT_WIT_WORLD set, default
         // is "minimal-node" (least-privilege).
         std::env::remove_var("TALOS_DEFAULT_WIT_WORLD");
-        assert_eq!(
-            extract_wit_world("pub fn run() {}"),
-            "minimal-node"
-        );
+        assert_eq!(extract_wit_world("pub fn run() {}"), "minimal-node");
     }
 
     /// wasm-security-review (2026-05-22): block comment containing

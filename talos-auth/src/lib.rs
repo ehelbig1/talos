@@ -186,9 +186,7 @@ pub(crate) fn validate_user_display_name(name: &str) -> Result<Option<String>> {
     if trimmed.len() > 255 {
         return Err(anyhow!("Name must be ≤ 255 characters"));
     }
-    if name.contains('\0')
-        || name.chars().any(|c| c.is_control() && c != '\t')
-    {
+    if name.contains('\0') || name.chars().any(|c| c.is_control() && c != '\t') {
         return Err(anyhow!(
             "Name cannot contain control characters or null bytes"
         ));
@@ -472,8 +470,9 @@ impl AuthService {
         // path. Failure here would be a deployment failure (same
         // bcrypt-init invariant as MCP-1077's cost validation), so
         // bubble as `anyhow::bail!`.
-        let dummy_password_hash = hash("_talos_dummy_", bcrypt_cost)
-            .map_err(|e| anyhow::anyhow!("Failed to compute dummy bcrypt hash at startup: {}", e))?;
+        let dummy_password_hash = hash("_talos_dummy_", bcrypt_cost).map_err(|e| {
+            anyhow::anyhow!("Failed to compute dummy bcrypt hash at startup: {}", e)
+        })?;
 
         Ok(Self {
             db_pool,

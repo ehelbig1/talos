@@ -180,7 +180,9 @@ impl AuthMutations {
         let cookies = ctx.data::<Cookies>()?;
         let refresh_token = cookies
             .get("talos_refresh_token")
-            .ok_or_else(|| async_graphql::Error::new("No refresh token found in cookies").extend_safe())?
+            .ok_or_else(|| {
+                async_graphql::Error::new("No refresh token found in cookies").extend_safe()
+            })?
             .value()
             .to_string();
 
@@ -217,7 +219,9 @@ impl AuthMutations {
         let cookies = ctx.data::<Cookies>()?;
         let refresh_token = cookies
             .get("talos_refresh_token")
-            .ok_or_else(|| async_graphql::Error::new("No refresh token found in cookies").extend_safe())?
+            .ok_or_else(|| {
+                async_graphql::Error::new("No refresh token found in cookies").extend_safe()
+            })?
             .value()
             .to_string();
 
@@ -413,7 +417,8 @@ impl AuthMutations {
                 // to "Internal server error" was actively misleading.
                 return Err(async_graphql::Error::new(
                     "Too many 2FA attempts. Please try again later.",
-                ).extend_safe());
+                )
+                .extend_safe());
             }
         }
 

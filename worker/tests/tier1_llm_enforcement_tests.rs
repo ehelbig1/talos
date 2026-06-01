@@ -249,10 +249,7 @@ async fn tier1_blocks_http_stream_to_external_llm() {
     // `http-stream::connect` is `func(url: string, headers: list<tuple<string, string>>)`
     // — no Request record. Pass URL + empty headers directly.
     let result = ctx
-        .connect(
-            "https://api.anthropic.com/v1/events".to_string(),
-            vec![],
-        )
+        .connect("https://api.anthropic.com/v1/events".to_string(), vec![])
         .await;
     assert!(
         result.is_err(),

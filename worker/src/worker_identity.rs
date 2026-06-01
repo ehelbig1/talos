@@ -115,6 +115,10 @@ mod tests {
     fn cached_across_calls() {
         let a: &'static str = worker_identity();
         let b: &'static str = worker_identity();
-        assert_eq!(a.as_ptr(), b.as_ptr(), "OnceLock should cache the same allocation");
+        assert_eq!(
+            a.as_ptr(),
+            b.as_ptr(),
+            "OnceLock should cache the same allocation"
+        );
     }
 }

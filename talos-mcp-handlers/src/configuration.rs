@@ -42,7 +42,10 @@ pub async fn dispatch(
 /// can iterate that map cleanly. Idempotent: a world without any
 /// placeholders gets no `inherits_from_worlds` field added.
 fn promote_inherited_world_keys(world_value: &mut serde_json::Value) {
-    let interfaces = match world_value.get_mut("interfaces").and_then(|v| v.as_object_mut()) {
+    let interfaces = match world_value
+        .get_mut("interfaces")
+        .and_then(|v| v.as_object_mut())
+    {
         Some(m) => m,
         None => return,
     };
@@ -146,7 +149,12 @@ async fn handle_describe_capability_world(
         None => {
             let available: Vec<&str> = worlds
                 .as_object()
-                .map(|m| m.keys().map(|k| k.as_str()).filter(|k| !k.starts_with('_')).collect())
+                .map(|m| {
+                    m.keys()
+                        .map(|k| k.as_str())
+                        .filter(|k| !k.starts_with('_'))
+                        .collect()
+                })
                 .unwrap_or_default();
             mcp_error(
                 req_id,
@@ -504,9 +512,7 @@ async fn handle_set_workflow_priority(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "priority must be a string ('high', 'normal', or 'low'), got {kind}"
-                    ),
+                    &format!("priority must be a string ('high', 'normal', or 'low'), got {kind}"),
                 );
             }
         },
@@ -600,7 +606,9 @@ async fn handle_get_workflow_input_schema(
         state
             .workflow_repo
             .list_recent_completed_outputs(wf_id, user_id, 10),
-        state.workflow_repo.count_completed_executions(wf_id, user_id),
+        state
+            .workflow_repo
+            .count_completed_executions(wf_id, user_id),
     );
     let rows = rows.unwrap_or_default();
     let total_completed = total_completed.unwrap_or(0);
@@ -710,15 +718,12 @@ async fn handle_get_workflow_input_schema(
     // silently became false; caller asked for the schema to be applied
     // and got back schema_applied: false with no signal that the
     // confirmation was malformed. Same MCP-189 / MCP-245 family.
-    let confirm = match crate::utils::validate_optional_bool(
-        args,
-        "confirm_inferred_schema",
-        false,
-        &req_id,
-    ) {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
+    let confirm =
+        match crate::utils::validate_optional_bool(args, "confirm_inferred_schema", false, &req_id)
+        {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
 
     let schema_applied = if confirm {
         match state
@@ -918,12 +923,7 @@ async fn handle_get_session_context(
         let words: Vec<String> = task
             .split_whitespace()
             .filter(|w| w.len() > 2)
-            .map(|w| {
-                format!(
-                    "%{}%",
-                    talos_search_service::escape_like(&w.to_lowercase())
-                )
-            })
+            .map(|w| format!("%{}%", talos_search_service::escape_like(&w.to_lowercase())))
             .collect();
 
         if !words.is_empty() {

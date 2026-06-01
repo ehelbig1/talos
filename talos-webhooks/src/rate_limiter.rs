@@ -530,9 +530,11 @@ mod tests {
 
         // ONE more failure must trip the breaker — proving the 9 prior
         // failures were preserved across the intervening success.
-        let opened =
-            cb.record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
-        assert!(opened, "10th failure must open the breaker even after a success");
+        let opened = cb.record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
+        assert!(
+            opened,
+            "10th failure must open the breaker even after a success"
+        );
         assert!(cb.is_blocked(ip), "IP must now be blocked");
     }
 
@@ -570,8 +572,7 @@ mod tests {
 
         // The very next failure must re-trip the breaker — pre-fix
         // this stayed silent and the IP kept failing freely.
-        let opened =
-            cb.record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
+        let opened = cb.record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
         assert!(
             opened,
             "the first failure after block expiry must re-open the breaker"

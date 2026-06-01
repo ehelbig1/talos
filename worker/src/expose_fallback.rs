@@ -71,7 +71,12 @@ impl ExposeFallback {
     /// "is the date today? if not, reset" check is atomic against
     /// other writers to the same `user_id`. Reads for OTHER users
     /// proceed in parallel.
-    pub fn check_and_increment(&self, user_id: Uuid, today: NaiveDate, cap: u64) -> FallbackVerdict {
+    pub fn check_and_increment(
+        &self,
+        user_id: Uuid,
+        today: NaiveDate,
+        cap: u64,
+    ) -> FallbackVerdict {
         // Common case: slot already exists for today. One read-only
         // DashMap probe + one atomic increment, no allocation.
         if let Some(slot) = self.inner.get(&user_id) {

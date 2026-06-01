@@ -242,9 +242,7 @@ pub async fn generate_embedding(text: &str) -> Result<Vec<f32>, EmbeddingError> 
 /// Generate embeddings for a batch of inputs in a single API request.
 /// Returns vectors in the same order as `texts`. Empty input slice
 /// returns `Ok(vec![])` without making a network call.
-pub async fn generate_embeddings_batch(
-    texts: &[String],
-) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+pub async fn generate_embeddings_batch(texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
@@ -457,11 +455,7 @@ pub fn vec_to_pgvector_literal(v: &[f32]) -> String {
 /// scaffold. Provider-misconfiguration cases stay quiet (boot WARN
 /// already covers them); transient errors log at DEBUG so per-row
 /// fan-out doesn't spam.
-pub async fn auto_embed_workflow(
-    workflow_id: Uuid,
-    user_id: Uuid,
-    pool: &sqlx::PgPool,
-) {
+pub async fn auto_embed_workflow(workflow_id: Uuid, user_id: Uuid, pool: &sqlx::PgPool) {
     let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
     let src = match repo
         .get_workflow_embedding_source(workflow_id, user_id)

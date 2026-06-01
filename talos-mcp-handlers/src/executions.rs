@@ -759,14 +759,7 @@ async fn handle_list_executions(
     // table scan. Use `validate_range_i64` for upfront wrong-type
     // rejection and an explicit cap of 1_000_000 (well past any
     // realistic pagination need given the 200-row LIMIT).
-    let offset = match crate::utils::validate_range_i64(
-        args,
-        "offset",
-        0,
-        1_000_000,
-        0,
-        &req_id,
-    ) {
+    let offset = match crate::utils::validate_range_i64(args, "offset", 0, 1_000_000, 0, &req_id) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -898,7 +891,14 @@ async fn handle_list_recent_executions(
         // accepted/stored set.
         if !matches!(
             s.as_str(),
-            "queued" | "running" | "completed" | "failed" | "cancelled" | "waiting" | "timed_out" | "suspended"
+            "queued"
+                | "running"
+                | "completed"
+                | "failed"
+                | "cancelled"
+                | "waiting"
+                | "timed_out"
+                | "suspended"
         ) {
             // MCP-1030: cap reflected status at 64 chars.
             let preview = talos_text_util::bounded_preview(s.as_str(), 64);
@@ -1422,9 +1422,7 @@ async fn handle_tail_worker_logs(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "since must be an RFC 3339 timestamp string, got {kind}"
-                    ),
+                    &format!("since must be an RFC 3339 timestamp string, got {kind}"),
                 );
             }
         },
@@ -1656,10 +1654,7 @@ const MAX_INLINE_VALUE_CAP_BYTES: usize = 64 * 1024;
 /// Read `max_bytes_per_value` from `args`. MCP-10: convert silent clamp
 /// to N-J explicit -32602 — out-of-range values now fail fast rather
 /// than silently coercing to the boundary.
-fn parse_inline_value_cap(
-    args: &Value,
-    req_id: &Option<Value>,
-) -> Result<usize, JsonRpcResponse> {
+fn parse_inline_value_cap(args: &Value, req_id: &Option<Value>) -> Result<usize, JsonRpcResponse> {
     let v = crate::utils::validate_range_u64(
         args,
         "max_bytes_per_value",
@@ -1736,8 +1731,14 @@ async fn handle_compare_executions(
 
     // get_executions_by_ids returns rows in DB-default order, not input
     // order — re-bind by id so exec_a / exec_b stay deterministic.
-    let exec_a = rows.iter().position(|r| r.id == exec_id_a).map(|i| rows.swap_remove(i));
-    let exec_b = rows.iter().position(|r| r.id == exec_id_b).map(|i| rows.swap_remove(i));
+    let exec_a = rows
+        .iter()
+        .position(|r| r.id == exec_id_a)
+        .map(|i| rows.swap_remove(i));
+    let exec_b = rows
+        .iter()
+        .position(|r| r.id == exec_id_b)
+        .map(|i| rows.swap_remove(i));
     let (exec_a, exec_b) = match (exec_a, exec_b) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -2572,12 +2573,9 @@ async fn handle_enqueue_workflow(
         // implicit batch_size=1 budget check passes for an actor with
         // 1 unit of remaining quota, but the batch may need N > 1.
         let batch_size = inputs.len() as i64;
-        if let Err(msg) = crate::actor::check_execution_allowed_for_batch(
-            &state.db_pool,
-            agent_id,
-            batch_size,
-        )
-        .await
+        if let Err(msg) =
+            crate::actor::check_execution_allowed_for_batch(&state.db_pool, agent_id, batch_size)
+                .await
         {
             return mcp_error(req_id, -32000, &msg);
         }
@@ -2721,9 +2719,7 @@ async fn handle_enqueue_workflow(
                     // MCP-450: DLP-redact engine build error before
                     // persistence. Same secret-leak class as MCP-447.
                     let redacted = talos_dlp_provider::redact_str(&e.to_string());
-                    let _ = repo
-                        .mark_execution_failed(exec_id, &redacted, None)
-                        .await;
+                    let _ = repo.mark_execution_failed(exec_id, &redacted, None).await;
                     if idx + 1 < inputs.len() {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
@@ -2758,10 +2754,7 @@ async fn handle_enqueue_workflow(
                     // MCP-776 (scheduler failure-marking). WARN with
                     // `target: "talos_audit"` so dashboards can
                     // correlate "stuck running" reports to DB health.
-                    if let Err(ue) = repo
-                        .mark_execution_completed(exec_id, &output_data)
-                        .await
-                    {
+                    if let Err(ue) = repo.mark_execution_completed(exec_id, &output_data).await {
                         tracing::warn!(
                             target: "talos_audit",
                             execution_id = %exec_id,
@@ -2782,10 +2775,7 @@ async fn handle_enqueue_workflow(
                     // failure-marking UPDATE also fails the row sits in
                     // 'running' state masking the real failure. Same
                     // WARN+target shape as above.
-                    if let Err(ue) = repo
-                        .mark_execution_failed(exec_id, &redacted, None)
-                        .await
-                    {
+                    if let Err(ue) = repo.mark_execution_failed(exec_id, &redacted, None).await {
                         tracing::warn!(
                             target: "talos_audit",
                             execution_id = %exec_id,
@@ -2985,9 +2975,7 @@ async fn handle_watch_execution(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "since must be an RFC 3339 timestamp string, got {kind}"
-                    ),
+                    &format!("since must be an RFC 3339 timestamp string, got {kind}"),
                 );
             }
         },
@@ -3257,8 +3245,7 @@ async fn handle_get_execution_output(
             let key_uuid = key.parse::<Uuid>().ok();
             let label = key_uuid.and_then(|u| node_label_map.get(&u).cloned());
             let is_unknown_uuid = key_uuid.is_some() && label.is_none();
-            let is_empty_object =
-                value.as_object().map(|o| o.is_empty()).unwrap_or(false);
+            let is_empty_object = value.as_object().map(|o| o.is_empty()).unwrap_or(false);
             if is_unknown_uuid && is_empty_object {
                 continue;
             }
@@ -3326,8 +3313,14 @@ async fn handle_get_execution_diff(
             return mcp_error(req_id, -32000, "Failed to load executions");
         }
     };
-    let exec_a = rows.iter().position(|r| r.id == exec_id_a).map(|i| rows.swap_remove(i));
-    let exec_b = rows.iter().position(|r| r.id == exec_id_b).map(|i| rows.swap_remove(i));
+    let exec_a = rows
+        .iter()
+        .position(|r| r.id == exec_id_a)
+        .map(|i| rows.swap_remove(i));
+    let exec_b = rows
+        .iter()
+        .position(|r| r.id == exec_id_b)
+        .map(|i| rows.swap_remove(i));
     let (exec_a, exec_b) = match (exec_a, exec_b) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -3393,47 +3386,44 @@ async fn handle_get_execution_diff(
     // (already-friendly rf_ids like "compute-context") are themselves
     // the operator-readable label — tagging them as synthetic was
     // misleading.
-    let make_diff_entry = |key: &str,
-                           extra: serde_json::Map<String, serde_json::Value>|
-     -> serde_json::Value {
-        let label = resolve_label(key);
-        let label_string = label.clone().unwrap_or_else(|| key.to_string());
-        let mut obj = serde_json::Map::new();
-        obj.insert(
-            "node_label".to_string(),
-            serde_json::Value::String(label_string),
-        );
-        if label.is_none() && uuid::Uuid::parse_str(key).is_ok() {
+    let make_diff_entry =
+        |key: &str, extra: serde_json::Map<String, serde_json::Value>| -> serde_json::Value {
+            let label = resolve_label(key);
+            let label_string = label.clone().unwrap_or_else(|| key.to_string());
+            let mut obj = serde_json::Map::new();
             obj.insert(
-                "synthetic_node_id".to_string(),
-                serde_json::Value::String(key.to_string()),
+                "node_label".to_string(),
+                serde_json::Value::String(label_string),
             );
-        }
-        for (k, v) in extra {
-            obj.insert(k, v);
-        }
-        serde_json::Value::Object(obj)
-    };
+            if label.is_none() && uuid::Uuid::parse_str(key).is_ok() {
+                obj.insert(
+                    "synthetic_node_id".to_string(),
+                    serde_json::Value::String(key.to_string()),
+                );
+            }
+            for (k, v) in extra {
+                obj.insert(k, v);
+            }
+            serde_json::Value::Object(obj)
+        };
 
     // MCP-18: same synthetic-placeholder filter as compare_executions.
     // Skip rows whose UUID doesn't resolve AND whose values are empty
     // objects — those are engine-internal trace placeholders, not real nodes.
-    let is_synthetic_placeholder = |key: &str,
-                                    va: Option<&serde_json::Value>,
-                                    vb: Option<&serde_json::Value>|
-     -> bool {
-        if resolve_label(key).is_some() {
-            return false;
-        }
-        match (va, vb) {
-            (Some(serde_json::Value::Object(a)), None) => a.is_empty(),
-            (None, Some(serde_json::Value::Object(b))) => b.is_empty(),
-            (Some(serde_json::Value::Object(a)), Some(serde_json::Value::Object(b))) => {
-                a.is_empty() && b.is_empty()
+    let is_synthetic_placeholder =
+        |key: &str, va: Option<&serde_json::Value>, vb: Option<&serde_json::Value>| -> bool {
+            if resolve_label(key).is_some() {
+                return false;
             }
-            _ => false,
-        }
-    };
+            match (va, vb) {
+                (Some(serde_json::Value::Object(a)), None) => a.is_empty(),
+                (None, Some(serde_json::Value::Object(b))) => b.is_empty(),
+                (Some(serde_json::Value::Object(a)), Some(serde_json::Value::Object(b))) => {
+                    a.is_empty() && b.is_empty()
+                }
+                _ => false,
+            }
+        };
 
     let mut node_diffs: Vec<serde_json::Value> = Vec::new();
     let mut truncated_count: usize = 0;
@@ -3497,10 +3487,8 @@ async fn handle_get_execution_diff(
                         match (fa, fb) {
                             (Some(va), Some(vb)) if va == vb => {} // identical field, skip
                             (Some(va), Some(vb)) => {
-                                let (capped_a, t_a) =
-                                    cap_value_for_inline_response(va, inline_cap);
-                                let (capped_b, t_b) =
-                                    cap_value_for_inline_response(vb, inline_cap);
+                                let (capped_a, t_a) = cap_value_for_inline_response(va, inline_cap);
+                                let (capped_b, t_b) = cap_value_for_inline_response(vb, inline_cap);
                                 if t_a {
                                     truncated_count += 1;
                                 }
@@ -3515,8 +3503,7 @@ async fn handle_get_execution_diff(
                                 }));
                             }
                             (Some(va), None) => {
-                                let (capped, t) =
-                                    cap_value_for_inline_response(va, inline_cap);
+                                let (capped, t) = cap_value_for_inline_response(va, inline_cap);
                                 if t {
                                     truncated_count += 1;
                                 }
@@ -3527,8 +3514,7 @@ async fn handle_get_execution_diff(
                                 }));
                             }
                             (None, Some(vb)) => {
-                                let (capped, t) =
-                                    cap_value_for_inline_response(vb, inline_cap);
+                                let (capped, t) = cap_value_for_inline_response(vb, inline_cap);
                                 if t {
                                     truncated_count += 1;
                                 }
@@ -3875,9 +3861,7 @@ async fn handle_get_node_execution_history(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        tracing::error!(
-                            "get_node_execution_history retry query failed: {}", e
-                        );
+                        tracing::error!("get_node_execution_history retry query failed: {}", e);
                     }
                 }
             }
@@ -3901,10 +3885,7 @@ async fn handle_get_node_execution_history(
                             &redacted,
                             NODE_HISTORY_LOG_CAP,
                         );
-                        (
-                            serde_json::Value::String(format!("{}...", cut)),
-                            true,
-                        )
+                        (serde_json::Value::String(format!("{}...", cut)), true)
                     } else {
                         (serde_json::Value::String(redacted), false)
                     }
@@ -4113,10 +4094,8 @@ async fn handle_get_execution_cost(
             .ok()
             .flatten();
         let uuid_to_label = build_node_display_label_map(graph_str);
-        let mut node_starts: std::collections::HashMap<
-            uuid::Uuid,
-            chrono::DateTime<chrono::Utc>,
-        > = std::collections::HashMap::new();
+        let mut node_starts: std::collections::HashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> =
+            std::collections::HashMap::new();
         for ev in &events {
             if let Some(nid) = ev.node_id {
                 match ev.event_type.as_str() {
@@ -4176,7 +4155,13 @@ async fn handle_get_execution_cost(
     // MCP-19: emit numeric values directly rather than format!-strings.
     // Round to 2 decimals via the same shape format_percent uses (×100 for
     // 2-decimal precision).
-    let round_2dp = |v: f64| if v.is_finite() { (v * 100.0).round() / 100.0 } else { 0.0 };
+    let round_2dp = |v: f64| {
+        if v.is_finite() {
+            (v * 100.0).round() / 100.0
+        } else {
+            0.0
+        }
+    };
     let result = serde_json::json!({
         "execution_id": exec_id.to_string(),
         "total_duration_ms": total_duration_ms,
@@ -4903,15 +4888,11 @@ pub async fn build_execution_trace_json(
             if key.starts_with("__") {
                 continue;
             }
-            let termination_reason = val
-                .get("termination_reason")
-                .and_then(|v| v.as_str());
+            let termination_reason = val.get("termination_reason").and_then(|v| v.as_str());
             if termination_reason != Some("max_iterations") {
                 continue;
             }
-            let iterations = val
-                .get("iterations")
-                .and_then(|v| v.as_i64());
+            let iterations = val.get("iterations").and_then(|v| v.as_i64());
             // Try to resolve a friendly label from the graph's node-label
             // map (keyed by Uuid). The output_data key is normally the
             // per-execution node UUID; for graph nodes whose id is a
@@ -5050,11 +5031,11 @@ async fn handle_analyze_execution_failure(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let auto_retry =
-        match crate::utils::validate_optional_bool(args, "auto_retry", false, &req_id) {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let auto_retry = match crate::utils::validate_optional_bool(args, "auto_retry", false, &req_id)
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     // ── Fetch execution record ───────────────────────────────────────────────
     let exec = match state.execution_repo.get_execution(exec_id, user_id).await {

@@ -244,155 +244,155 @@ fn redact_credit_cards(input: &str) -> String {
 /// Ordered by specificity (more specific patterns first) to minimize false
 /// positives and unnecessary allocations.
 const PATTERN_SPECS: &[(&str, &str)] = &[
-        // Talos platform API keys — most specific pattern first to avoid partial matches.
-        // Format: talos_sk_ + 8 hex (prefix) + 64 hex (secret) = 72 hex chars total.
-        (r"\btalos_sk_[0-9a-f]{72}\b", "[REDACTED:TALOS_API_KEY]"),
-        // Email addresses (checked before phone to avoid partial matches)
-        (
-            r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
-            "[REDACTED:EMAIL]",
-        ),
-        // US Social Security Number  123-45-6789
-        (r"\b\d{3}-\d{2}-\d{4}\b", "[REDACTED:SSN]"),
-        // Credit/debit card — two complementary patterns:
-        //
-        // Pattern A (grouped format): 4-4-4-4 or 4-4-4-4-3 with mandatory space/dash
-        // separators. Requires at least one separator between groups so that bare
-        // long numeric strings (Twitter/X snowflake IDs, transaction IDs, Unix
-        // timestamps) are NOT matched. Real card numbers typed or printed by users
-        // almost always appear with group separators.
-        (
-            r"\b\d{4}[ \-]\d{4}[ \-]\d{4}[ \-]\d{4,7}\b",
-            "[REDACTED:CARD]",
-        ),
-        // Pattern B (keyword-prefixed bare number): matches card numbers preceded by
-        // card-related keywords even without separators (e.g. JSON field "card_number":
-        // 4111111111111111). The keyword requirement prevents false positives on raw
-        // numeric IDs found in URLs, API responses, or log lines.
-        (
-            r#"(?i)(?:card[\s_]?(?:number|num|no)?|credit[\s_]card|debit[\s_]card|cc[\s_]?(?:number|num)?|pan)\s*[=:"\s]\s*\d{13,19}"#,
-            "[REDACTED:CARD]",
-        ),
-        // Bearer / API key header values  (Bearer xyz, token=xyz, api_key=xyz)
-        (
-            r"(?i)(?:bearer|token|api[_-]?key)\s*[=:\s]\s*[A-Za-z0-9\-._~+/]{8,}",
-            "[REDACTED:TOKEN]",
-        ),
-        // Google API keys  AIza + 35 alphanumeric chars
-        (r"\bAIza[0-9A-Za-z\-_]{35}\b", "[REDACTED:GOOGLE_API_KEY]"),
-        // Google OAuth 2.0 access tokens  ya29.<long string>
-        (
-            r"\bya29\.[0-9A-Za-z\-_]{40,}\b",
-            "[REDACTED:GOOGLE_OAUTH_TOKEN]",
-        ),
-        // HashiCorp Vault tokens  hvs_... / hvb_...
-        (
-            r"\b(?:hvs_|hvb_)[A-Za-z0-9_\.]{20,}\b",
-            "[REDACTED:VAULT_TOKEN]",
-        ),
-        // Slack app-level tokens  xoxs-...
-        (r"\bxoxs-[0-9A-Za-z\-]{40,}\b", "[REDACTED:SLACK_TOKEN]"),
-        // Prefixed secret keys  sk-..., ghp_..., xoxb-..., glpat-...
-        //
-        // IMPORTANT: `sk` requires a separator char (`-` or `_`) to avoid false-positives
-        // on common English words that start with "sk" (e.g. "skepticism", "skeleton").
-        // Real OpenAI keys are `sk-proj-...` / `sk-...`; Stripe keys are `sk_live_...` /
-        // `sk_test_...` — both always have a separator immediately after the prefix.
-        //
-        // MCP-575 (2026-05-12): GitHub OAuth (`gho_`) + user-to-server
-        // (`ghu_`) + refresh-token (`ghr_`) prefixes added. `ghp_`
-        // (PAT) and `ghs_` (server-to-server) were already covered;
-        // missing the OAuth-flow variants was a real gap (we have an
-        // OAuth integration that returns these). Also added Slack
-        // `xoxa-` (app-level token used by `apps.manifest.create`)
-        // and `xoxr-` (refresh token), plus Stripe restricted keys
-        // (`rk_test_` / `rk_live_`) — distinct from regular `sk_*`
-        // and represent scoped credentials operators use to limit
-        // blast radius on automation flows.
-        //
-        // MCP-1134 (2026-05-16): added `hf_` (Hugging Face access
-        // tokens — common in LLM/embedding workflows that route
-        // through huggingface_hub) and `xai-` (xAI / Grok API keys
-        // — listed as `xai-...` in xAI's `Authorization: Bearer`
-        // docs). Same canonical-format-coverage class as MCP-575
-        // and MCP-1001 (PEM block variants). Real-world copy/paste
-        // exfiltration: `hf_AbCd1234...` in a workflow input
-        // accidentally pasted by an operator, or `xai-...` in a
-        // module config. Both prefixes are short alphabetic +
-        // delimiter so the existing `[A-Za-z0-9\-_]{6,}` body
-        // suffix covers the token tail.
-        (
-            r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|xapp-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.)[A-Za-z0-9\-_]{6,}",
-            "[REDACTED:API_KEY]",
-        ),
-        // MCP-521: AWS Access Key IDs. Real AWS access key IDs are
-        // EXACTLY 20 characters: `AKIA` (long-term IAM user) or
-        // `ASIA` (STS temporary credential) followed by exactly 16
-        // uppercase alphanumeric chars. The previous pattern lumped
-        // these into the `sk-/ghp_/…` alternation and required 6+
-        // additional trailing chars via `[A-Za-z0-9\-_]{6,}` — so a
-        // standalone `AKIAIOSFODNN7EXAMPLE` (20 chars, no trailing)
-        // matched nothing and passed through DLP unscrubbed. The
-        // canonical exfiltration shape is a 20-char value in an env
-        // file or terminal copy/paste, which is exactly what this
-        // gap let through.
-        //
-        // Anchor with word boundaries on both ends so `AKIA…20chars`
-        // followed by ANY non-word char (newline, space, quote, `=`,
-        // comma) still matches.
-        (r"\bA[KS]IA[0-9A-Z]{16}\b", "[REDACTED:AWS_ACCESS_KEY]"),
-        // Database connection URLs with embedded credentials.
-        // Matches postgresql://, postgres://, mysql://, mongodb://, mongodb+srv:// etc.
-        // where a user:password@ component is present.
-        (
-            r"(?i)(?:postgresql|postgres|mysql|mariadb|mongodb(?:\+srv)?|redis|amqp(?:s)?|clickhouse)://[^:@\s]+:[^@\s]+@[^\s]+",
-            "[REDACTED:DB_CONNECTION]",
-        ),
-        // US/international phone numbers  +1-800-555-1234 | (800) 555-1234 | 800.555.1234
-        //
-        // IMPORTANT: at least ONE separator (space, dash, or dot) is required somewhere
-        // in the number.  Making all separators optional caused false positives on bare
-        // digit strings embedded in URLs (e.g. Twitter/X status IDs, transaction IDs).
-        // Requires at least TWO separators to further reduce false positives on
-        // numeric identifiers that happen to contain one dash (e.g., "order-1234567890").
-        // Three accepted sub-forms:
-        //   1. Country-code prefix with separator: +1-800-555-1234
-        //   2. Parenthesised area code: (800) 555-1234  or  (800)555-1234
-        //   3. Plain format with mandatory separators: 800-555-1234 (both separators required)
-        (
-            r"(?:\+\d{1,3}[\s\-.]\(?\d{3}\)?[\s\-.]\d{3}[\s\-.]\d{4}|\(\d{3}\)[\s\-.]?\d{3}[\s\-.]\d{4}|\b\d{3}[\s\-.]\d{3}[\s\-.]\d{4})\b",
-            "[REDACTED:PHONE]",
-        ),
-        // JWT tokens — three base64url segments separated by dots (header.payload.signature).
-        // Requires the header to start with "eyJ" (base64 of `{"`) which is true for all
-        // valid JWTs. This catches tokens that appear outside Bearer/Authorization headers.
-        (
-            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
-            "[REDACTED:JWT]",
-        ),
-        // Private key PEM blocks — prevents accidental logging of key material.
-        //
-        // MCP-1001 (2026-05-15): extended the variant list to cover the
-        // formats actually emitted by mainstream tooling. Pre-fix pattern
-        // `(?:RSA |EC |ED25519 )?` covered only PKCS#1, SEC1, and the
-        // (rare) explicit-ed25519 PEM tag — but missed:
-        //   * `-----BEGIN OPENSSH PRIVATE KEY-----` — the default
-        //     `ssh-keygen` output since OpenSSH 7.8 (2018). The most
-        //     common copy/paste exfil shape today.
-        //   * `-----BEGIN DSA PRIVATE KEY-----` — legacy, still in
-        //     circulation on old systems.
-        //   * `-----BEGIN ENCRYPTED PRIVATE KEY-----` — PKCS#8 encrypted
-        //     variant.
-        //   * `-----BEGIN PGP PRIVATE KEY BLOCK-----` — GPG export, the
-        //     `BLOCK` suffix distinguishes it from the X.509 family.
-        // The `(?: BLOCK)?` suffix lets the PGP variant share the same
-        // alternation. Word-level enumeration is explicit so false
-        // positives on user prose (`"BEGIN VAULTING PRIVATE KEYSTORE"`)
-        // are impossible.
-        (
-            r"-----BEGIN (?:RSA |EC |ED25519 |DSA |ENCRYPTED |OPENSSH |PGP )?PRIVATE KEY(?: BLOCK)?-----",
-            "[REDACTED:PRIVATE_KEY]",
-        ),
+    // Talos platform API keys — most specific pattern first to avoid partial matches.
+    // Format: talos_sk_ + 8 hex (prefix) + 64 hex (secret) = 72 hex chars total.
+    (r"\btalos_sk_[0-9a-f]{72}\b", "[REDACTED:TALOS_API_KEY]"),
+    // Email addresses (checked before phone to avoid partial matches)
+    (
+        r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
+        "[REDACTED:EMAIL]",
+    ),
+    // US Social Security Number  123-45-6789
+    (r"\b\d{3}-\d{2}-\d{4}\b", "[REDACTED:SSN]"),
+    // Credit/debit card — two complementary patterns:
+    //
+    // Pattern A (grouped format): 4-4-4-4 or 4-4-4-4-3 with mandatory space/dash
+    // separators. Requires at least one separator between groups so that bare
+    // long numeric strings (Twitter/X snowflake IDs, transaction IDs, Unix
+    // timestamps) are NOT matched. Real card numbers typed or printed by users
+    // almost always appear with group separators.
+    (
+        r"\b\d{4}[ \-]\d{4}[ \-]\d{4}[ \-]\d{4,7}\b",
+        "[REDACTED:CARD]",
+    ),
+    // Pattern B (keyword-prefixed bare number): matches card numbers preceded by
+    // card-related keywords even without separators (e.g. JSON field "card_number":
+    // 4111111111111111). The keyword requirement prevents false positives on raw
+    // numeric IDs found in URLs, API responses, or log lines.
+    (
+        r#"(?i)(?:card[\s_]?(?:number|num|no)?|credit[\s_]card|debit[\s_]card|cc[\s_]?(?:number|num)?|pan)\s*[=:"\s]\s*\d{13,19}"#,
+        "[REDACTED:CARD]",
+    ),
+    // Bearer / API key header values  (Bearer xyz, token=xyz, api_key=xyz)
+    (
+        r"(?i)(?:bearer|token|api[_-]?key)\s*[=:\s]\s*[A-Za-z0-9\-._~+/]{8,}",
+        "[REDACTED:TOKEN]",
+    ),
+    // Google API keys  AIza + 35 alphanumeric chars
+    (r"\bAIza[0-9A-Za-z\-_]{35}\b", "[REDACTED:GOOGLE_API_KEY]"),
+    // Google OAuth 2.0 access tokens  ya29.<long string>
+    (
+        r"\bya29\.[0-9A-Za-z\-_]{40,}\b",
+        "[REDACTED:GOOGLE_OAUTH_TOKEN]",
+    ),
+    // HashiCorp Vault tokens  hvs_... / hvb_...
+    (
+        r"\b(?:hvs_|hvb_)[A-Za-z0-9_\.]{20,}\b",
+        "[REDACTED:VAULT_TOKEN]",
+    ),
+    // Slack app-level tokens  xoxs-...
+    (r"\bxoxs-[0-9A-Za-z\-]{40,}\b", "[REDACTED:SLACK_TOKEN]"),
+    // Prefixed secret keys  sk-..., ghp_..., xoxb-..., glpat-...
+    //
+    // IMPORTANT: `sk` requires a separator char (`-` or `_`) to avoid false-positives
+    // on common English words that start with "sk" (e.g. "skepticism", "skeleton").
+    // Real OpenAI keys are `sk-proj-...` / `sk-...`; Stripe keys are `sk_live_...` /
+    // `sk_test_...` — both always have a separator immediately after the prefix.
+    //
+    // MCP-575 (2026-05-12): GitHub OAuth (`gho_`) + user-to-server
+    // (`ghu_`) + refresh-token (`ghr_`) prefixes added. `ghp_`
+    // (PAT) and `ghs_` (server-to-server) were already covered;
+    // missing the OAuth-flow variants was a real gap (we have an
+    // OAuth integration that returns these). Also added Slack
+    // `xoxa-` (app-level token used by `apps.manifest.create`)
+    // and `xoxr-` (refresh token), plus Stripe restricted keys
+    // (`rk_test_` / `rk_live_`) — distinct from regular `sk_*`
+    // and represent scoped credentials operators use to limit
+    // blast radius on automation flows.
+    //
+    // MCP-1134 (2026-05-16): added `hf_` (Hugging Face access
+    // tokens — common in LLM/embedding workflows that route
+    // through huggingface_hub) and `xai-` (xAI / Grok API keys
+    // — listed as `xai-...` in xAI's `Authorization: Bearer`
+    // docs). Same canonical-format-coverage class as MCP-575
+    // and MCP-1001 (PEM block variants). Real-world copy/paste
+    // exfiltration: `hf_AbCd1234...` in a workflow input
+    // accidentally pasted by an operator, or `xai-...` in a
+    // module config. Both prefixes are short alphabetic +
+    // delimiter so the existing `[A-Za-z0-9\-_]{6,}` body
+    // suffix covers the token tail.
+    (
+        r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|xapp-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.)[A-Za-z0-9\-_]{6,}",
+        "[REDACTED:API_KEY]",
+    ),
+    // MCP-521: AWS Access Key IDs. Real AWS access key IDs are
+    // EXACTLY 20 characters: `AKIA` (long-term IAM user) or
+    // `ASIA` (STS temporary credential) followed by exactly 16
+    // uppercase alphanumeric chars. The previous pattern lumped
+    // these into the `sk-/ghp_/…` alternation and required 6+
+    // additional trailing chars via `[A-Za-z0-9\-_]{6,}` — so a
+    // standalone `AKIAIOSFODNN7EXAMPLE` (20 chars, no trailing)
+    // matched nothing and passed through DLP unscrubbed. The
+    // canonical exfiltration shape is a 20-char value in an env
+    // file or terminal copy/paste, which is exactly what this
+    // gap let through.
+    //
+    // Anchor with word boundaries on both ends so `AKIA…20chars`
+    // followed by ANY non-word char (newline, space, quote, `=`,
+    // comma) still matches.
+    (r"\bA[KS]IA[0-9A-Z]{16}\b", "[REDACTED:AWS_ACCESS_KEY]"),
+    // Database connection URLs with embedded credentials.
+    // Matches postgresql://, postgres://, mysql://, mongodb://, mongodb+srv:// etc.
+    // where a user:password@ component is present.
+    (
+        r"(?i)(?:postgresql|postgres|mysql|mariadb|mongodb(?:\+srv)?|redis|amqp(?:s)?|clickhouse)://[^:@\s]+:[^@\s]+@[^\s]+",
+        "[REDACTED:DB_CONNECTION]",
+    ),
+    // US/international phone numbers  +1-800-555-1234 | (800) 555-1234 | 800.555.1234
+    //
+    // IMPORTANT: at least ONE separator (space, dash, or dot) is required somewhere
+    // in the number.  Making all separators optional caused false positives on bare
+    // digit strings embedded in URLs (e.g. Twitter/X status IDs, transaction IDs).
+    // Requires at least TWO separators to further reduce false positives on
+    // numeric identifiers that happen to contain one dash (e.g., "order-1234567890").
+    // Three accepted sub-forms:
+    //   1. Country-code prefix with separator: +1-800-555-1234
+    //   2. Parenthesised area code: (800) 555-1234  or  (800)555-1234
+    //   3. Plain format with mandatory separators: 800-555-1234 (both separators required)
+    (
+        r"(?:\+\d{1,3}[\s\-.]\(?\d{3}\)?[\s\-.]\d{3}[\s\-.]\d{4}|\(\d{3}\)[\s\-.]?\d{3}[\s\-.]\d{4}|\b\d{3}[\s\-.]\d{3}[\s\-.]\d{4})\b",
+        "[REDACTED:PHONE]",
+    ),
+    // JWT tokens — three base64url segments separated by dots (header.payload.signature).
+    // Requires the header to start with "eyJ" (base64 of `{"`) which is true for all
+    // valid JWTs. This catches tokens that appear outside Bearer/Authorization headers.
+    (
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        "[REDACTED:JWT]",
+    ),
+    // Private key PEM blocks — prevents accidental logging of key material.
+    //
+    // MCP-1001 (2026-05-15): extended the variant list to cover the
+    // formats actually emitted by mainstream tooling. Pre-fix pattern
+    // `(?:RSA |EC |ED25519 )?` covered only PKCS#1, SEC1, and the
+    // (rare) explicit-ed25519 PEM tag — but missed:
+    //   * `-----BEGIN OPENSSH PRIVATE KEY-----` — the default
+    //     `ssh-keygen` output since OpenSSH 7.8 (2018). The most
+    //     common copy/paste exfil shape today.
+    //   * `-----BEGIN DSA PRIVATE KEY-----` — legacy, still in
+    //     circulation on old systems.
+    //   * `-----BEGIN ENCRYPTED PRIVATE KEY-----` — PKCS#8 encrypted
+    //     variant.
+    //   * `-----BEGIN PGP PRIVATE KEY BLOCK-----` — GPG export, the
+    //     `BLOCK` suffix distinguishes it from the X.509 family.
+    // The `(?: BLOCK)?` suffix lets the PGP variant share the same
+    // alternation. Word-level enumeration is explicit so false
+    // positives on user prose (`"BEGIN VAULTING PRIVATE KEYSTORE"`)
+    // are impossible.
+    (
+        r"-----BEGIN (?:RSA |EC |ED25519 |DSA |ENCRYPTED |OPENSSH |PGP )?PRIVATE KEY(?: BLOCK)?-----",
+        "[REDACTED:PRIVATE_KEY]",
+    ),
 ];
 
 /// Compiled per-pattern regexes used for replacement, built once at startup
@@ -1110,7 +1110,8 @@ mod tests {
 
     #[test]
     fn redacts_rsa_private_key_pem() {
-        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
+        let pem =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
         assert!(redact_str(pem).contains("[REDACTED:PRIVATE_KEY]"));
     }
 
@@ -1167,7 +1168,8 @@ mod tests {
     fn private_key_pattern_no_false_positive_on_public_key() {
         // The pattern must NOT eat public-key PEM blocks (operators
         // legitimately paste these in workflow configs for verification).
-        let pubkey = "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEF...\n-----END PUBLIC KEY-----";
+        let pubkey =
+            "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEF...\n-----END PUBLIC KEY-----";
         let result = redact_str(pubkey);
         assert!(
             !result.contains("[REDACTED:PRIVATE_KEY]"),
@@ -1177,7 +1179,8 @@ mod tests {
 
     #[test]
     fn private_key_pattern_no_false_positive_on_certificate() {
-        let cert = "-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIE...\n-----END CERTIFICATE-----";
+        let cert =
+            "-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIE...\n-----END CERTIFICATE-----";
         let result = redact_str(cert);
         assert!(
             !result.contains("[REDACTED:PRIVATE_KEY]"),
@@ -1336,8 +1339,14 @@ mod tests {
         });
         let out = redact_json(&shallow);
         let out_str = out.to_string();
-        assert!(out_str.contains("[REDACTED:SSN]"), "shallow SSN should redact: {out_str}");
-        assert!(out_str.contains("[REDACTED:CARD]"), "shallow CARD should redact: {out_str}");
+        assert!(
+            out_str.contains("[REDACTED:SSN]"),
+            "shallow SSN should redact: {out_str}"
+        );
+        assert!(
+            out_str.contains("[REDACTED:CARD]"),
+            "shallow CARD should redact: {out_str}"
+        );
     }
 
     // MCP-575: token-prefix gap fixes. Pre-fix the PATTERNS list only
@@ -1490,7 +1499,10 @@ mod tests {
         });
         let result = redact_json_bounded(&input).expect("under cap should return Some");
         let s = serde_json::to_string(&result).expect("serialise");
-        assert!(s.contains("[REDACTED"), "secrets must still be redacted: {s}");
+        assert!(
+            s.contains("[REDACTED"),
+            "secrets must still be redacted: {s}"
+        );
         assert!(s.contains("abc-123"), "non-secret fields preserved: {s}");
     }
 

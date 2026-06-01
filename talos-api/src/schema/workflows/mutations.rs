@@ -9,13 +9,10 @@ use uuid::Uuid;
 
 use crate::schema::types::*;
 use crate::schema::{
-    require_2fa, require_scope, sync_workflow_module_refs,
-    validate_max_concurrent_executions, validate_payload_size, validate_resource_name,
-    SafeErrorExtensions,
+    require_2fa, require_scope, sync_workflow_module_refs, validate_max_concurrent_executions,
+    validate_payload_size, validate_resource_name, SafeErrorExtensions,
 };
-use talos_engine::checkpoint_store::{
-    load_checkpoint_for_full, ControllerCheckpointStore,
-};
+use talos_engine::checkpoint_store::{load_checkpoint_for_full, ControllerCheckpointStore};
 use talos_engine::events::{ExecutionEvent, ExecutionStatus};
 use talos_registry::ModuleRegistry;
 use talos_workflow_engine_core::WorkerSharedKey;
@@ -99,9 +96,9 @@ impl WorkflowsMutations {
         if !workflow_exists {
             // MCP-918: .extend_safe() — lowercase "not found" doesn't
             // match the case-sensitive scrubber whitelist "Not found".
-            return Err(async_graphql::Error::new(
-                "Workflow not found or access denied",
-            ).extend_safe());
+            return Err(
+                async_graphql::Error::new("Workflow not found or access denied").extend_safe(),
+            );
         }
 
         // Pre-load the graph_json synchronously so trigger-time
@@ -142,10 +139,8 @@ impl WorkflowsMutations {
         // surface; this is the trigger-side parity fix.
         if let Some((ref graph_json_for_auth, _version_id)) = pre_loaded_graph {
             use talos_workflow_authorization::{authorize_workflow_trigger, TriggerAuthError};
-            let workflow_repo =
-                talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-            let actor_repo_for_auth =
-                talos_actor_repository::ActorRepository::new(db_pool.clone());
+            let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+            let actor_repo_for_auth = talos_actor_repository::ActorRepository::new(db_pool.clone());
             match authorize_workflow_trigger(
                 &workflow_repo,
                 &actor_repo_for_auth,
@@ -172,19 +167,21 @@ impl WorkflowsMutations {
                 // server-side and the generic outer message is correct
                 // for the client.
                 Err(TriggerAuthError::ActorNotFoundOrInactive) => {
-                    return Err(async_graphql::Error::new(
-                        "Actor not found or access denied",
-                    ).extend_safe());
+                    return Err(
+                        async_graphql::Error::new("Actor not found or access denied").extend_safe(),
+                    );
                 }
                 Err(TriggerAuthError::ActorArchived) => {
                     return Err(async_graphql::Error::new(
                         "Actor is archived — terminal state, cannot dispatch executions.",
-                    ).extend_safe());
+                    )
+                    .extend_safe());
                 }
                 Err(TriggerAuthError::ActorTerminated) => {
                     return Err(async_graphql::Error::new(
                         "Actor is terminated — terminal state, cannot dispatch executions.",
-                    ).extend_safe());
+                    )
+                    .extend_safe());
                 }
                 Err(TriggerAuthError::ExecutionDenied(msg)) => {
                     // user-facing message from check_execution_allowed
@@ -201,13 +198,12 @@ impl WorkflowsMutations {
                          ceiling: module requires `{module_world}`, actor max is `{max_world}`. \
                          Lower the workflow's capability requirement or grant the actor a \
                          higher ceiling via `grant_capability_ceiling`."
-                    )).extend_safe());
+                    ))
+                    .extend_safe());
                 }
                 Err(TriggerAuthError::Database(e)) => {
                     tracing::error!("Trigger authorization DB error: {}", e);
-                    return Err(
-                        async_graphql::Error::new("Internal database error").extend_safe()
-                    );
+                    return Err(async_graphql::Error::new("Internal database error").extend_safe());
                 }
             }
         }
@@ -252,9 +248,7 @@ impl WorkflowsMutations {
             }
             Err(e) => {
                 tracing::error!("Failed to create execution: {}", e);
-                return Err(
-                    async_graphql::Error::new("Internal database error").extend_safe()
-                );
+                return Err(async_graphql::Error::new("Internal database error").extend_safe());
             }
         }
 
@@ -817,7 +811,8 @@ impl WorkflowsMutations {
             return Err(async_graphql::Error::new(format!(
                 "Execution is in status '{}', not 'waiting'",
                 exec_info.status
-            )).extend_safe());
+            ))
+            .extend_safe());
         }
 
         // MCP-652: actor-status/budget gate. While the execution was
@@ -847,10 +842,8 @@ impl WorkflowsMutations {
         // returns rich error types; we map them to user-facing strings
         // matching the existing GraphQL convention.
         if let Some(actor_id) = exec_info.actor_id {
-            let workflow_repo =
-                talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-            let actor_repo_for_gate =
-                talos_actor_repository::ActorRepository::new(db_pool.clone());
+            let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+            let actor_repo_for_gate = talos_actor_repository::ActorRepository::new(db_pool.clone());
 
             let graph_json = match workflow_repo
                 .get_active_version_graph(exec_info.workflow_id, *user_id)
@@ -905,12 +898,14 @@ impl WorkflowsMutations {
                 Err(talos_workflow_authorization::TriggerAuthError::ExecutionDenied(msg)) => {
                     return Err(async_graphql::Error::new(msg).extend_safe());
                 }
-                Err(talos_workflow_authorization::TriggerAuthError::CapabilityCeilingViolation {
-                    module_id,
-                    module_world,
-                    max_world,
-                    ..
-                }) => {
+                Err(
+                    talos_workflow_authorization::TriggerAuthError::CapabilityCeilingViolation {
+                        module_id,
+                        module_world,
+                        max_world,
+                        ..
+                    },
+                ) => {
                     tracing::warn!(
                         execution_id = %execution_id,
                         actor_id = %actor_id,
@@ -1456,7 +1451,9 @@ impl WorkflowsMutations {
         .bind(org_id)
         .fetch_one(&mut *tx)
         .await?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         // Maintain workflow_module_refs junction table.
         sync_workflow_module_refs(db_pool, workflow_id, &input.graph_json).await;
@@ -1498,7 +1495,9 @@ impl WorkflowsMutations {
 
         let service = ctx
             .data::<Arc<talos_workflow_creation::WorkflowCreationService>>()
-            .map_err(|_| async_graphql::Error::new("WorkflowCreationService not available").extend_safe())?;
+            .map_err(|_| {
+                async_graphql::Error::new("WorkflowCreationService not available").extend_safe()
+            })?;
 
         // Validate input shape using the service's own validator —
         // single source of truth for rules like description length.
@@ -1601,13 +1600,16 @@ impl WorkflowsMutations {
         .bind(&scope.accessible_org_ids)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         if result.rows_affected() == 0 {
             // MCP-918: .extend_safe()
             return Err(async_graphql::Error::new(
                 "Workflow not found or you don't have permission to update it",
-            ).extend_safe());
+            )
+            .extend_safe());
         }
 
         // Maintain workflow_module_refs junction table.
@@ -1680,7 +1682,9 @@ impl WorkflowsMutations {
         .bind(&scope.accessible_org_ids)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         if result.rows_affected() == 0 {
             // Distinguish "not found / access denied" from "blocked by
@@ -1739,12 +1743,14 @@ impl WorkflowsMutations {
                     return Err(async_graphql::Error::new(
                         "Workflow has running / queued / pending executions. \
                          Cancel them before deleting, or use force-delete via MCP.",
-                    ).extend_safe());
+                    )
+                    .extend_safe());
                 }
                 Ok(_) => {
                     return Err(async_graphql::Error::new(
                         "Workflow not found or you don't have permission to delete it",
-                    ).extend_safe());
+                    )
+                    .extend_safe());
                 }
                 Err(e) => {
                     tracing::error!(workflow_id = %id, error = %e, "delete_workflow: blocked-state probe failed");
@@ -1895,10 +1901,9 @@ impl WorkflowsMutations {
         // 256-char cap covers every legitimate cron expression; trim
         // ensures the stored value matches what readers see.
         if cron_expression.len() > 256 {
-            return Err(async_graphql::Error::new(
-                "cron_expression must be ≤ 256 characters",
-            )
-            .extend_safe());
+            return Err(
+                async_graphql::Error::new("cron_expression must be ≤ 256 characters").extend_safe(),
+            );
         }
         let cron_expression = cron_expression.trim().to_string();
         if cron_expression.is_empty() {
@@ -2084,10 +2089,9 @@ impl WorkflowsMutations {
         // a no-op then. Caller-supplied new value gets the same
         // boundary normalization.
         if new_cron.len() > 256 {
-            return Err(async_graphql::Error::new(
-                "cron_expression must be ≤ 256 characters",
-            )
-            .extend_safe());
+            return Err(
+                async_graphql::Error::new("cron_expression must be ≤ 256 characters").extend_safe(),
+            );
         }
         let new_cron = new_cron.trim().to_string();
         if new_cron.is_empty() {
@@ -2338,10 +2342,8 @@ impl WorkflowsMutations {
         // actor's current ceiling. The graph_json variable above
         // already holds the workflow's current graph.
         if let Some(actor_id) = wf_for_test.actor_id {
-            let workflow_repo =
-                talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-            let actor_repo_for_gate =
-                talos_actor_repository::ActorRepository::new(db_pool.clone());
+            let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+            let actor_repo_for_gate = talos_actor_repository::ActorRepository::new(db_pool.clone());
             if let Err(e) = talos_workflow_authorization::authorize_workflow_trigger(
                 &workflow_repo,
                 &actor_repo_for_gate,
@@ -2564,10 +2566,7 @@ impl WorkflowsMutations {
     // ── Organization mutations ─────────────────────────────────────────
 }
 
-async fn release_advisory_lock(
-    mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
-    lock_id: i64,
-) {
+async fn release_advisory_lock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, lock_id: i64) {
     // MCP-702 (2026-05-13): the pre-fix design took `&mut conn` and
     // commented "Advisory locks auto-release on connection close, so a
     // failure here is recoverable." That assumption is wrong for sqlx

@@ -65,7 +65,9 @@ async fn connect(url: &str) -> Pool<Postgres> {
 
 #[tokio::test]
 async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
 
@@ -101,11 +103,9 @@ async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
     su.execute(format!("GRANT SELECT, INSERT ON rls_probe TO {APP_ROLE};").as_str())
         .await
         .expect("grant table");
-    su.execute(
-        format!("GRANT USAGE, SELECT ON SEQUENCE rls_probe_id_seq TO {APP_ROLE};").as_str(),
-    )
-    .await
-    .expect("grant seq");
+    su.execute(format!("GRANT USAGE, SELECT ON SEQUENCE rls_probe_id_seq TO {APP_ROLE};").as_str())
+        .await
+        .expect("grant seq");
 
     sqlx::query("INSERT INTO rls_probe (org_id, val) VALUES ($1,'A'), ($2,'B')")
         .bind(org_a)
@@ -153,7 +153,10 @@ async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
         .fetch_one(&app)
         .await
         .expect("unscoped count");
-    assert_eq!(unscoped, 0, "without the GUC, RLS must hide every row (fail-closed)");
+    assert_eq!(
+        unscoped, 0,
+        "without the GUC, RLS must hide every row (fail-closed)"
+    );
 
     // The RLS-role guard correctly classifies both roles: the superuser
     // setup connection bypasses RLS; the plain app role enforces it.
@@ -187,7 +190,9 @@ fn union_app_url(superuser: &str) -> String {
 
 #[tokio::test]
 async fn membership_union_rls_shows_owned_and_member_orgs_only() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
 
@@ -294,7 +299,9 @@ const PERM_ROLE: &str = "talos_rls_perm_app";
 /// 1-connection pool to force that connection reuse.
 #[tokio::test]
 async fn permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let user = Uuid::new_v4();
@@ -369,7 +376,10 @@ async fn permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set() {
         .fetch_one(&app)
         .await
         .unwrap();
-    assert_eq!(unset, 3, "unset GUC must be permissive so un-wired paths don't break");
+    assert_eq!(
+        unset, 3,
+        "unset GUC must be permissive so un-wired paths don't break"
+    );
 
     // (2) Scoped (wired path): ENFORCED union → in-A + owned-in-C, not in-C-other.
     let scope = TenantReadScope::new(user, vec![org_a]);
@@ -413,7 +423,9 @@ const WF_ROLE: &str = "talos_wf_rls_app";
 /// role.
 #[tokio::test]
 async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let user_a = Uuid::new_v4();
@@ -460,14 +472,16 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
     let app = connect(&format!("postgres://{WF_ROLE}:{APP_PW}@{after_at}")).await;
 
     // Un-wired path (no GUC) → permissive → sees BOTH (non-breaking).
-    let unscoped: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM workflows WHERE name IN ($1, $2)")
-            .bind(&name_a)
-            .bind(&name_b)
-            .fetch_one(&app)
-            .await
-            .unwrap();
-    assert_eq!(unscoped, 2, "un-wired path must be permissive (engine/scheduler don't break)");
+    let unscoped: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE name IN ($1, $2)")
+        .bind(&name_a)
+        .bind(&name_b)
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    assert_eq!(
+        unscoped, 2,
+        "un-wired path must be permissive (engine/scheduler don't break)"
+    );
 
     // Wired/scoped to user A → enforced → sees only A's.
     let mut tx = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_a, vec![]))
@@ -481,7 +495,11 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
             .await
             .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(scoped, vec![name_a.clone()], "scoped read must enforce — only A's workflow");
+    assert_eq!(
+        scoped,
+        vec![name_a.clone()],
+        "scoped read must enforce — only A's workflow"
+    );
 
     // WRITE-side (WITH CHECK): under A's scope, inserting a workflow owned
     // by B is rejected — you can't write a row you don't own. (The wired
@@ -511,9 +529,14 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
         .execute(&su)
         .await;
     for u in [user_a, user_b] {
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
     }
-    let _ = su.execute(format!("DROP ROLE IF EXISTS {WF_ROLE};").as_str()).await;
+    let _ = su
+        .execute(format!("DROP ROLE IF EXISTS {WF_ROLE};").as_str())
+        .await;
 }
 
 const SECRETS_ROLE: &str = "talos_secrets_rls_app";
@@ -524,7 +547,9 @@ const SECRETS_ROLE: &str = "talos_secrets_rls_app";
 /// secrets is owned via owner_user_id/created_by (not a `user_id` column).
 #[tokio::test]
 async fn secrets_permissive_rls_unscoped_sees_all_scoped_enforces() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let user_a = Uuid::new_v4();
@@ -585,7 +610,10 @@ async fn secrets_permissive_rls_unscoped_sees_all_scoped_enforces() {
             .fetch_one(&app)
             .await
             .unwrap();
-    assert_eq!(unscoped, 2, "un-wired secrets read must be permissive (decrypt path)");
+    assert_eq!(
+        unscoped, 2,
+        "un-wired secrets read must be permissive (decrypt path)"
+    );
 
     // Wired/scoped to user A → only A's (owner_user_id clause).
     let mut tx = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_a, vec![]))
@@ -599,18 +627,30 @@ async fn secrets_permissive_rls_unscoped_sees_all_scoped_enforces() {
             .await
             .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(scoped, vec![kp_a.clone()], "scoped secrets read must enforce — only A's");
+    assert_eq!(
+        scoped,
+        vec![kp_a.clone()],
+        "scoped secrets read must enforce — only A's"
+    );
 
     let _ = sqlx::query("DELETE FROM secrets WHERE key_path IN ($1,$2)")
         .bind(&kp_a)
         .bind(&kp_b)
         .execute(&su)
         .await;
-    let _ = sqlx::query("DELETE FROM encryption_keys WHERE id = $1").bind(key_id).execute(&su).await;
+    let _ = sqlx::query("DELETE FROM encryption_keys WHERE id = $1")
+        .bind(key_id)
+        .execute(&su)
+        .await;
     for u in [user_a, user_b] {
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
     }
-    let _ = su.execute(format!("DROP ROLE IF EXISTS {SECRETS_ROLE};").as_str()).await;
+    let _ = su
+        .execute(format!("DROP ROLE IF EXISTS {SECRETS_ROLE};").as_str())
+        .await;
 }
 
 const EXEC_ROLE: &str = "talos_wfexec_rls_app";
@@ -624,7 +664,9 @@ const EXEC_ROLE: &str = "talos_wfexec_rls_app";
 /// non-breaking).
 #[tokio::test]
 async fn workflow_executions_permissive_rls_member_sees_shared_stranger_blocked() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let owner = Uuid::new_v4();
@@ -740,19 +782,33 @@ async fn workflow_executions_permissive_rls_member_sees_shared_stranger_blocked(
             .await
             .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(stranger_sees, 0, "stranger must see no executions (IDOR backstop)");
+    assert_eq!(
+        stranger_sees, 0,
+        "stranger must see no executions (IDOR backstop)"
+    );
 
     let _ = sqlx::query("DELETE FROM workflow_executions WHERE id IN ($1,$2)")
         .bind(exec_owner)
         .bind(exec_mate)
         .execute(&su)
         .await;
-    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf).execute(&su).await;
-    let _ = sqlx::query("DELETE FROM organizations WHERE id = $1").bind(team_org).execute(&su).await;
+    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1")
+        .bind(wf)
+        .execute(&su)
+        .await;
+    let _ = sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(team_org)
+        .execute(&su)
+        .await;
     for u in [owner, teammate, stranger] {
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
     }
-    let _ = su.execute(format!("DROP ROLE IF EXISTS {EXEC_ROLE};").as_str()).await;
+    let _ = su
+        .execute(format!("DROP ROLE IF EXISTS {EXEC_ROLE};").as_str())
+        .await;
 }
 
 const ACTORS_ROLE: &str = "talos_actors_rls_app";
@@ -763,7 +819,9 @@ const ACTORS_ROLE: &str = "talos_actors_rls_app";
 /// match so one user never sees another's actor.
 #[tokio::test]
 async fn actors_permissive_rls_unscoped_sees_all_scoped_enforces() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let _ddl_guard = DDL_LOCK.lock().await;
     let su = connect(&su_url).await;
     let user_a = Uuid::new_v4();
@@ -822,7 +880,11 @@ async fn actors_permissive_rls_unscoped_sees_all_scoped_enforces() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(scoped, vec![actor_a], "scoped actors read must enforce — only A's");
+    assert_eq!(
+        scoped,
+        vec![actor_a],
+        "scoped actors read must enforce — only A's"
+    );
 
     let _ = sqlx::query("DELETE FROM actors WHERE id IN ($1,$2)")
         .bind(actor_a)
@@ -830,9 +892,14 @@ async fn actors_permissive_rls_unscoped_sees_all_scoped_enforces() {
         .execute(&su)
         .await;
     for u in [user_a, user_b] {
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
     }
-    let _ = su.execute(format!("DROP ROLE IF EXISTS {ACTORS_ROLE};").as_str()).await;
+    let _ = su
+        .execute(format!("DROP ROLE IF EXISTS {ACTORS_ROLE};").as_str())
+        .await;
 }
 
 /// RFC 0005 S3 headline: `SET LOCAL ROLE talos_app` activates RLS even
@@ -844,7 +911,9 @@ async fn actors_permissive_rls_unscoped_sees_all_scoped_enforces() {
 /// superuser connection (no SET ROLE) bypasses RLS as expected.
 #[tokio::test]
 async fn set_role_talos_app_enforces_rls_under_superuser_connection() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let su = connect(&su_url).await;
     use sqlx::Executor as _;
 
@@ -930,10 +999,19 @@ async fn set_role_talos_app_enforces_rls_under_superuser_connection() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(a_sees, 1, "owner must see own workflow under SET ROLE talos_app");
+    assert_eq!(
+        a_sees, 1,
+        "owner must see own workflow under SET ROLE talos_app"
+    );
 
-    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf).execute(&su).await;
-    let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_a).execute(&su).await;
+    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1")
+        .bind(wf)
+        .execute(&su)
+        .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_a)
+        .execute(&su)
+        .await;
 }
 
 /// RFC 0005 S3: a [`UnitOfWork`] sets the tenant scope ONCE and shares it
@@ -943,7 +1021,9 @@ async fn set_role_talos_app_enforces_rls_under_superuser_connection() {
 /// not depend on the SET-ROLE flag (enforcement is proven separately).
 #[tokio::test]
 async fn unit_of_work_shares_scope_across_calls() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let pool = connect(&su_url).await;
     let user = Uuid::new_v4();
 
@@ -981,7 +1061,9 @@ async fn unit_of_work_shares_scope_across_calls() {
 /// even though the underlying connection is a superuser.
 #[tokio::test]
 async fn set_role_with_check_gates_cross_tenant_writes() {
-    let Some(su_url) = superuser_url() else { return };
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
     let su = connect(&su_url).await;
     use sqlx::Executor as _;
 
@@ -1050,8 +1132,14 @@ async fn set_role_with_check_gates_cross_tenant_writes() {
     let _ = tx.rollback().await;
 
     // Cleanup (wf_bad never committed).
-    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1").bind(wf_ok).execute(&su).await;
+    let _ = sqlx::query("DELETE FROM workflows WHERE id = $1")
+        .bind(wf_ok)
+        .execute(&su)
+        .await;
     for u in [user_a, user_b] {
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(u).execute(&su).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
     }
 }

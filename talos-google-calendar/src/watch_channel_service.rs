@@ -393,28 +393,20 @@ mod tests {
         let base = row(&Uuid::new_v4().to_string(), "ch", 0, None);
 
         // Field absent.
-        assert!(
-            !project_row(&base, &HashMap::new()).unwrap().has_sync_token
-        );
+        assert!(!project_row(&base, &HashMap::new()).unwrap().has_sync_token);
 
         // Field present but null.
         let mut v = base.clone();
         v["sync_token"] = JsonValue::Null;
-        assert!(
-            !project_row(&v, &HashMap::new()).unwrap().has_sync_token
-        );
+        assert!(!project_row(&v, &HashMap::new()).unwrap().has_sync_token);
 
         // Field present but empty string.
         v["sync_token"] = json!("");
-        assert!(
-            !project_row(&v, &HashMap::new()).unwrap().has_sync_token
-        );
+        assert!(!project_row(&v, &HashMap::new()).unwrap().has_sync_token);
 
         // Field present with a real token.
         v["sync_token"] = json!("CAESBA...");
-        assert!(
-            project_row(&v, &HashMap::new()).unwrap().has_sync_token
-        );
+        assert!(project_row(&v, &HashMap::new()).unwrap().has_sync_token);
     }
 
     #[test]

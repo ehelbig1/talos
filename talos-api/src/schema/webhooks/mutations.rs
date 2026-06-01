@@ -48,9 +48,9 @@ impl WebhooksMutations {
 
         if !module_exists.unwrap_or(false) {
             // MCP-918: .extend_safe()
-            return Err(async_graphql::Error::new(
-                "Module not found or access denied",
-            ).extend_safe());
+            return Err(
+                async_graphql::Error::new("Module not found or access denied").extend_safe(),
+            );
         }
 
         // MCP-832 (2026-05-14): MCP-769 sweep — replace shallow length-only
@@ -60,11 +60,8 @@ impl WebhooksMutations {
         // whitespace and rendered as a blank entry in the webhooks
         // dashboard; `name: "evil\0name"` later crashed UPDATE operations
         // with opaque Postgres errors (MCP-431).
-        let trimmed_name = crate::schema::validate_display_name(
-            "Webhook trigger name",
-            &input.name,
-            255,
-        )?;
+        let trimmed_name =
+            crate::schema::validate_display_name("Webhook trigger name", &input.name, 255)?;
         let name = trimmed_name.to_string();
 
         let enabled = input.enabled.unwrap_or(true);
@@ -253,7 +250,11 @@ impl WebhooksMutations {
                 // No signing secret → no ciphertext to version, but we
                 // persist v1 anyway so the column's invariant ("v1 means
                 // the row was written by post-MCP-S2 code") is uniform.
-                (None, None, talos_secrets_manager::SecretsManager::AAD_FORMAT_V1)
+                (
+                    None,
+                    None,
+                    talos_secrets_manager::SecretsManager::AAD_FORMAT_V1,
+                )
             };
 
         let listener_id = sqlx::query_scalar::<_, Uuid>(
@@ -448,9 +449,7 @@ impl WebhooksMutations {
             .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
 
         if row.replayed_at.is_some() {
-            return Err(
-                async_graphql::Error::new("Entry has already been replayed").extend_safe(),
-            );
+            return Err(async_graphql::Error::new("Entry has already been replayed").extend_safe());
         }
 
         // Dispatch the real replay via the shared service. Same Arc

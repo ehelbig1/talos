@@ -223,17 +223,24 @@ async fn handle_graph_stats(
             // already gated). The 'empty' vs 'available' split is purely
             // count-driven so callers can render a "no data yet" state
             // without inferring from array lengths.
-            let stats_value =
-                serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
+            let stats_value = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
             let total_nodes = stats_value
                 .get("nodes")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().fold(0i64, |acc, n| acc + n.get("count").and_then(|c| c.as_i64()).unwrap_or(0)))
+                .map(|a| {
+                    a.iter().fold(0i64, |acc, n| {
+                        acc + n.get("count").and_then(|c| c.as_i64()).unwrap_or(0)
+                    })
+                })
                 .unwrap_or(0);
             let total_edges = stats_value
                 .get("edges")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().fold(0i64, |acc, n| acc + n.get("count").and_then(|c| c.as_i64()).unwrap_or(0)))
+                .map(|a| {
+                    a.iter().fold(0i64, |acc, n| {
+                        acc + n.get("count").and_then(|c| c.as_i64()).unwrap_or(0)
+                    })
+                })
                 .unwrap_or(0);
             let graph_status = if total_nodes == 0 && total_edges == 0 {
                 "empty"

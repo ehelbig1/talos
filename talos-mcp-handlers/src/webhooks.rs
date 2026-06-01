@@ -166,11 +166,7 @@ async fn handle_create_webhook(
                     );
                 }
                 if trimmed.len() > 255 {
-                    return mcp_error(
-                        req_id,
-                        -32602,
-                        "Webhook name must be 1–255 characters",
-                    );
+                    return mcp_error(req_id, -32602, "Webhook name must be 1–255 characters");
                 }
                 // MCP-406/410 (2026-05-11): name-field control-char
                 // check via the canonical helper. See
@@ -250,17 +246,11 @@ async fn handle_create_webhook(
             Ok(v) => v,
             Err(resp) => return resp,
         };
-    let sync_timeout_secs = match crate::utils::validate_range_i64(
-        args,
-        "sync_timeout_secs",
-        1,
-        120,
-        30,
-        &req_id,
-    ) {
-        Ok(v) => v as i32,
-        Err(resp) => return resp,
-    };
+    let sync_timeout_secs =
+        match crate::utils::validate_range_i64(args, "sync_timeout_secs", 1, 120, 30, &req_id) {
+            Ok(v) => v as i32,
+            Err(resp) => return resp,
+        };
 
     // MCP-202 (2026-05-08): enforce minimum entropy on signing_secret.
     // Pre-fix the only check was `!s.is_empty()` — `signing_secret: "x"`
@@ -480,8 +470,7 @@ async fn handle_list_webhooks(
 
     match rows {
         Ok(rows) => {
-            let base_url =
-                talos_config::get_base_url();
+            let base_url = talos_config::get_base_url();
             let webhooks: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {
@@ -672,8 +661,7 @@ async fn handle_list_workflow_webhooks(
 
     match rows {
         Ok(rows) => {
-            let base_url =
-                talos_config::get_base_url();
+            let base_url = talos_config::get_base_url();
             let webhooks: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {

@@ -136,11 +136,8 @@ pub async fn build_dispatch_encrypted_secrets(
     // `JobRequest.workflow_execution_id`. Empty secrets_map still
     // returns `EncryptedSecrets::default()` (empty ciphertext +
     // empty nonce) — that path bypasses AAD entirely on both sides.
-    match EncryptedSecrets::encrypt_with_aad(
-        &secrets_map,
-        key.as_bytes(),
-        execution_id.as_bytes(),
-    ) {
+    match EncryptedSecrets::encrypt_with_aad(&secrets_map, key.as_bytes(), execution_id.as_bytes())
+    {
         Ok(es) => es,
         Err(e) => {
             tracing::warn!(
@@ -232,5 +229,4 @@ mod tests {
             );
         }
     }
-
 }

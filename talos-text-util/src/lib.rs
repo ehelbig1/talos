@@ -133,10 +133,7 @@ mod decode_rhai_in_graph_tests {
         });
         let sites = decode_rhai_in_graph(&mut g);
         assert_eq!(sites, 1);
-        assert_eq!(
-            g["edges"][0]["condition"].as_str().unwrap(),
-            "score >= 80"
-        );
+        assert_eq!(g["edges"][0]["condition"].as_str().unwrap(), "score >= 80");
     }
 
     #[test]
@@ -331,7 +328,10 @@ mod decode_html_entities_tests {
 
     #[test]
     fn decodes_lt_and_gt() {
-        assert_eq!(decode_html_entities("a &lt; b &gt; c").as_ref(), "a < b > c");
+        assert_eq!(
+            decode_html_entities("a &lt; b &gt; c").as_ref(),
+            "a < b > c"
+        );
     }
 
     #[test]

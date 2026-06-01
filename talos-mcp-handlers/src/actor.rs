@@ -1369,7 +1369,6 @@ mod actor_name_validation_tests {
         assert!(err.contains("working, episodic, semantic, scratchpad"));
     }
 
-
     #[test]
     fn rejects_empty() {
         assert!(validate_actor_name("").is_err());
@@ -1491,9 +1490,7 @@ async fn handle_create_actor(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "max_capability_world must be a string, got {kind}"
-                    ),
+                    &format!("max_capability_world must be a string, got {kind}"),
                 );
             }
         },
@@ -1702,9 +1699,7 @@ async fn handle_scaffold_actor(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "max_capability_world must be a string, got {kind}"
-                    ),
+                    &format!("max_capability_world must be a string, got {kind}"),
                 );
             }
         },
@@ -1746,9 +1741,7 @@ async fn handle_scaffold_actor(
     let budget = if let Some(o) = budget_obj_opt {
         let get_i32 = |k: &str| -> Result<Option<i32>, JsonRpcResponse> {
             match o.get(k).and_then(|v| v.as_i64()) {
-                Some(n) if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => {
-                    Ok(Some(n as i32))
-                }
+                Some(n) if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => Ok(Some(n as i32)),
                 Some(n) => Err(mcp_error(
                     req_id.clone(),
                     -32602,
@@ -1815,8 +1808,7 @@ async fn handle_scaffold_actor(
             Ok(v) => v,
             Err(resp) => return resp,
         };
-        let max_outbound_requests_per_hour = match get_i32("max_outbound_requests_per_hour")
-        {
+        let max_outbound_requests_per_hour = match get_i32("max_outbound_requests_per_hour") {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -1841,7 +1833,10 @@ async fn handle_scaffold_actor(
         // budget knob (a zero-fuel budget means no WASM execution
         // can complete; a negative count is semantically meaningless).
         let field_checks: [(&str, Option<i64>); 8] = [
-            ("max_executions_per_hour", max_executions_per_hour.map(i64::from)),
+            (
+                "max_executions_per_hour",
+                max_executions_per_hour.map(i64::from),
+            ),
             ("max_executions_total", max_executions_total),
             ("max_fuel_per_execution", max_fuel_per_execution),
             ("max_fuel_per_hour", max_fuel_per_hour),
@@ -1896,9 +1891,8 @@ async fn handle_scaffold_actor(
     // -50 quietly persisted the seed as a permanent memory when the
     // operator wanted a 168-hour TTL. Mirror MCP-208 / MCP-256 / MCP-257
     // — distinguish absent / null / wrong-type / NaN-Inf / out-of-range.
-    let seed_memories: Vec<SeedMemorySpec> = if let Some(map) = args
-        .get("seed_memories")
-        .and_then(|v| v.as_object())
+    let seed_memories: Vec<SeedMemorySpec> = if let Some(map) =
+        args.get("seed_memories").and_then(|v| v.as_object())
     {
         let mut out: Vec<SeedMemorySpec> = Vec::with_capacity(map.len());
         for (key, entry) in map {
@@ -1992,9 +1986,7 @@ async fn handle_scaffold_actor(
                         return mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "seed_memories['{key}'].ttl_hours must be a finite number"
-                            ),
+                            &format!("seed_memories['{key}'].ttl_hours must be a finite number"),
                         )
                     }
                     Some(h) if !(1.0..=8760.0).contains(&h) => {
@@ -2002,8 +1994,8 @@ async fn handle_scaffold_actor(
                             req_id,
                             -32602,
                             &format!(
-                                "seed_memories['{key}'].ttl_hours must be between 1 and 8760, got {h}"
-                            ),
+                            "seed_memories['{key}'].ttl_hours must be between 1 and 8760, got {h}"
+                        ),
                         )
                     }
                     Some(h) => Some(h),
@@ -2111,9 +2103,7 @@ async fn handle_scaffold_actor(
                         return mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "starter_workflow.max_tokens must be in [1, 16384], got {n}"
-                            ),
+                            &format!("starter_workflow.max_tokens must be in [1, 16384], got {n}"),
                         )
                     }
                     None => {
@@ -2147,9 +2137,7 @@ async fn handle_scaffold_actor(
                         return mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "starter_workflow.provider must be a string, got {kind}"
-                            ),
+                            &format!("starter_workflow.provider must be a string, got {kind}"),
                         );
                     }
                 },
@@ -2227,7 +2215,7 @@ async fn handle_list_actors(
                     &format!(
                         "Invalid status filter '{preview}'. Valid values: active, suspended, terminated, archived",
                     ),
-                )
+                );
             }
             None => {
                 let kind = crate::utils::json_type_name(v);
@@ -2249,14 +2237,7 @@ async fn handle_list_actors(
     let inactive_days: Option<i64> = match args.get("inactive_days") {
         None | Some(serde_json::Value::Null) => None,
         Some(_) => Some(
-            match crate::utils::validate_range_i64(
-                args,
-                "inactive_days",
-                1,
-                3650,
-                30,
-                &req_id,
-            ) {
+            match crate::utils::validate_range_i64(args, "inactive_days", 1, 3650, 30, &req_id) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             },
@@ -2669,9 +2650,7 @@ async fn handle_update_actor_status(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "status must be a string ('active' or 'suspended'), got {kind}"
-                    ),
+                    &format!("status must be a string ('active' or 'suspended'), got {kind}"),
                 );
             }
         },
@@ -2943,21 +2922,12 @@ async fn handle_set_actor_budget(
         Err(resp) => return resp,
     };
     let field_checks: [(&str, Option<i64>); 8] = [
-        (
-            "max_executions_per_hour",
-            eph.map(|n| n as i64),
-        ),
+        ("max_executions_per_hour", eph.map(|n| n as i64)),
         ("max_executions_total", get_i64("max_executions_total")),
         ("max_fuel_per_execution", get_i64("max_fuel_per_execution")),
         ("max_fuel_per_hour", get_i64("max_fuel_per_hour")),
-        (
-            "max_outbound_requests_per_hour",
-            orph.map(|n| n as i64),
-        ),
-        (
-            "max_workflow_count",
-            mwc.map(|n| n as i64),
-        ),
+        ("max_outbound_requests_per_hour", orph.map(|n| n as i64)),
+        ("max_workflow_count", mwc.map(|n| n as i64)),
         ("max_workflows_per_minute", wpm_explicit.map(|n| n as i64)),
         ("max_compilations_per_hour", cph_explicit.map(|n| n as i64)),
     ];
@@ -3092,9 +3062,7 @@ async fn handle_set_actor_llm_tier_ceiling(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "tier must be a string ('tier1' or 'tier2'), got {kind}"
-                    ),
+                    &format!("tier must be a string ('tier1' or 'tier2'), got {kind}"),
                 );
             }
         },
@@ -3349,9 +3317,7 @@ async fn handle_add_approval_policy(
                         return mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "approvers[{i}] must be a string (UUID or email), got {kind}"
-                            ),
+                            &format!("approvers[{i}] must be a string (UUID or email), got {kind}"),
                         );
                     }
                 }
@@ -3363,9 +3329,7 @@ async fn handle_add_approval_policy(
             return mcp_error(
                 req_id,
                 -32602,
-                &format!(
-                    "approvers must be an array of strings (UUIDs or emails), got {kind}"
-                ),
+                &format!("approvers must be an array of strings (UUIDs or emails), got {kind}"),
             );
         }
     };
@@ -3692,22 +3656,20 @@ async fn handle_get_action_log(
     // caller assumed were filtered out. Reject malformed timestamps
     // upfront with the actionable error message instead of silently
     // dropping the filter.
-    let since: Option<chrono::DateTime<chrono::Utc>> = match args
-        .get("since")
-        .and_then(|v| v.as_str())
-    {
-        Some(s) => match s.parse::<chrono::DateTime<chrono::Utc>>() {
-            Ok(t) => Some(t),
-            Err(_) => {
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    "since must be an ISO 8601 timestamp (e.g. '2026-05-08T00:00:00Z')",
-                )
-            }
-        },
-        None => None,
-    };
+    let since: Option<chrono::DateTime<chrono::Utc>> =
+        match args.get("since").and_then(|v| v.as_str()) {
+            Some(s) => match s.parse::<chrono::DateTime<chrono::Utc>>() {
+                Ok(t) => Some(t),
+                Err(_) => {
+                    return mcp_error(
+                        req_id,
+                        -32602,
+                        "since must be an ISO 8601 timestamp (e.g. '2026-05-08T00:00:00Z')",
+                    )
+                }
+            },
+            None => None,
+        };
 
     // MCP-224: trim action_type filter — pre-fix `action_type: "   "`
     // ran SQL `WHERE action_type = '   '` matching nothing.
@@ -3879,11 +3841,8 @@ async fn handle_actor_remember(
         }
     };
     if !key_exists {
-        let mem_count = match talos_actor_memory_service::count_memories(
-            &state.db_pool,
-            actor_id,
-        )
-        .await
+        let mem_count = match talos_actor_memory_service::count_memories(&state.db_pool, actor_id)
+            .await
         {
             Ok(n) => n,
             Err(e) => {
@@ -3964,8 +3923,7 @@ async fn handle_actor_remember(
     {
         Ok(outcome) => {
             let expires_at = talos_actor_memory_service::default_expires_at(memory_type, ttl_hours);
-            let expires_iso = expires_at
-                .map(|e| e.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+            let expires_iso = expires_at.map(|e| e.format("%Y-%m-%dT%H:%M:%SZ").to_string());
             let expires_msg = expires_iso
                 .as_ref()
                 .map(|e| format!(", expires at {}", e))
@@ -4500,19 +4458,16 @@ pub async fn load_actor_budget(
     actor_id: Uuid,
 ) -> Result<Option<ActorBudget>, String> {
     let repo = talos_actor_repository::ActorRepository::new(pool.clone());
-    let policy = repo
-        .get_actor_budget_policy(actor_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                actor_id = %actor_id,
-                error = %e,
-                "load_actor_budget: get_actor_budget_policy failed"
-            );
-            "Failed to load actor budget (database error). Retry the request; \
+    let policy = repo.get_actor_budget_policy(actor_id).await.map_err(|e| {
+        tracing::error!(
+            actor_id = %actor_id,
+            error = %e,
+            "load_actor_budget: get_actor_budget_policy failed"
+        );
+        "Failed to load actor budget (database error). Retry the request; \
              if the issue persists, check controller logs."
-                .to_string()
-        })?;
+            .to_string()
+    })?;
     Ok(policy.map(|p| ActorBudget {
         max_executions_per_hour: p.max_executions_per_hour,
         max_executions_total: p.max_executions_total,
@@ -4542,11 +4497,9 @@ pub async fn check_actor_status(pool: &sqlx::PgPool, actor_id: Uuid) -> Result<(
                 error = %e,
                 "check_actor_status: get_actor_status failed"
             );
-            return Err(
-                "Failed to verify actor status (database error). \
+            return Err("Failed to verify actor status (database error). \
                  Retry the request; if the issue persists, check controller logs."
-                    .to_string(),
-            );
+                .to_string());
         }
     };
     match status.as_deref() {
@@ -6292,11 +6245,7 @@ async fn handle_suggest_actor_for_task(
         Some(t) => {
             let trimmed = t.trim();
             if trimmed.is_empty() {
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    "task must be non-empty and non-whitespace",
-                );
+                return mcp_error(req_id, -32602, "task must be non-empty and non-whitespace");
             }
             trimmed.to_string()
         }
@@ -6481,9 +6430,7 @@ async fn handle_consolidate_actor_memory(
     let semantic_key = match args.get("semantic_key").and_then(|v| v.as_str()) {
         Some(k) => match validate_memory_key(k) {
             Ok(()) => k,
-            Err(msg) => {
-                return mcp_error(req_id, -32602, &format!("semantic_key: {msg}"))
-            }
+            Err(msg) => return mcp_error(req_id, -32602, &format!("semantic_key: {msg}")),
         },
         None => return mcp_error(req_id, -32602, "Missing required field: semantic_key"),
     };
@@ -6528,9 +6475,7 @@ async fn handle_consolidate_actor_memory(
                         return mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "source_episodic_keys[{i}] must be a string, got {kind}"
-                            ),
+                            &format!("source_episodic_keys[{i}] must be a string, got {kind}"),
                         );
                     }
                 };
@@ -6539,9 +6484,7 @@ async fn handle_consolidate_actor_memory(
                     return mcp_error(
                         req_id,
                         -32602,
-                        &format!(
-                            "source_episodic_keys[{i}] must be non-empty and non-whitespace"
-                        ),
+                        &format!("source_episodic_keys[{i}] must be non-empty and non-whitespace"),
                     );
                 }
                 out.push(trimmed.to_string());
@@ -6553,9 +6496,7 @@ async fn handle_consolidate_actor_memory(
             return mcp_error(
                 req_id,
                 -32602,
-                &format!(
-                    "source_episodic_keys must be an array of strings, got {kind}"
-                ),
+                &format!("source_episodic_keys must be an array of strings, got {kind}"),
             );
         }
     };
@@ -6753,9 +6694,7 @@ async fn handle_compress_actor_context(
                     return mcp_error(
                         req_id,
                         -32602,
-                        &format!(
-                            "archive_keys[{i}] must be non-empty and non-whitespace"
-                        ),
+                        &format!("archive_keys[{i}] must be non-empty and non-whitespace"),
                     );
                 }
                 out.push(trimmed.to_string());
@@ -7021,11 +6960,7 @@ async fn handle_actor_recall_semantic(
             return mcp_error(req_id, -32602, "query must be ≤ 1000 characters")
         }
         Some(q) if q.trim().is_empty() => {
-            return mcp_error(
-                req_id,
-                -32602,
-                "query must be non-empty and non-whitespace",
-            )
+            return mcp_error(req_id, -32602, "query must be non-empty and non-whitespace")
         }
         Some(q) => q,
         _ => return mcp_error(req_id, -32602, "Missing required field: query"),
@@ -7174,8 +7109,7 @@ fn render_recall_response(
             keyword_note_no_embedding
         };
         payload["search_method_note"] = serde_json::Value::String(note.to_string());
-        payload["embedding_attempted"] =
-            serde_json::Value::Bool(embedding_attempted);
+        payload["embedding_attempted"] = serde_json::Value::Bool(embedding_attempted);
     }
 
     mcp_text(
@@ -7208,11 +7142,7 @@ async fn handle_actor_recall_hyde(
             return mcp_error(req_id, -32602, "query must be ≤ 1000 characters")
         }
         Some(q) if q.trim().is_empty() => {
-            return mcp_error(
-                req_id,
-                -32602,
-                "query must be non-empty and non-whitespace",
-            )
+            return mcp_error(req_id, -32602, "query must be non-empty and non-whitespace")
         }
         Some(q) => q,
         _ => return mcp_error(req_id, -32602, "Missing required field: query"),
@@ -7316,13 +7246,7 @@ async fn handle_get_few_shot_examples(
                     "Field 'task_description' must not be empty or whitespace",
                 )
             }
-            None => {
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    "Field 'task_description' must be a string",
-                )
-            }
+            None => return mcp_error(req_id, -32602, "Field 'task_description' must be a string"),
         },
     };
 
@@ -7434,9 +7358,7 @@ async fn handle_get_few_shot_examples(
                         return mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "exclude_kinds[{i}] must be a string, got {kind}"
-                            ),
+                            &format!("exclude_kinds[{i}] must be a string, got {kind}"),
                         );
                     }
                 }

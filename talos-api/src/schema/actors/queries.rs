@@ -49,7 +49,9 @@ impl ActorsQueries {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         let actors = rows
             .into_iter()
@@ -113,7 +115,9 @@ impl ActorsQueries {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
-        tx.commit().await.map_err(|e: sqlx::Error| e.extend_safe())?;
+        tx.commit()
+            .await
+            .map_err(|e: sqlx::Error| e.extend_safe())?;
 
         Ok(row.map(|r| {
             let metadata: Option<String> = r
@@ -348,8 +352,7 @@ impl ActorsQueries {
         &self,
         ctx: &Context<'_>,
         actor_id: Uuid,
-        #[graphql(desc = "Max rows to return (default 1000, max 1000)")]
-        limit: Option<i32>,
+        #[graphql(desc = "Max rows to return (default 1000, max 1000)")] limit: Option<i32>,
     ) -> Result<Vec<ActorWorkflowItem>> {
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
         let user_id = ctx
@@ -442,8 +445,7 @@ impl ActorsQueries {
         actor_id: Uuid,
         #[graphql(desc = "Filter by type: working | episodic | semantic | scratchpad")]
         memory_type: Option<String>,
-        #[graphql(desc = "Max rows to return (default 1000, max 1000)")]
-        limit: Option<i32>,
+        #[graphql(desc = "Max rows to return (default 1000, max 1000)")] limit: Option<i32>,
     ) -> Result<Vec<ActorMemoryEntry>> {
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
         let user_id = ctx
@@ -551,8 +553,7 @@ impl ActorsQueries {
     async fn mcp_agents(
         &self,
         ctx: &Context<'_>,
-        #[graphql(desc = "Max rows to return (default 100, max 1000)")]
-        limit: Option<i32>,
+        #[graphql(desc = "Max rows to return (default 100, max 1000)")] limit: Option<i32>,
     ) -> Result<Vec<McpAgent>> {
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
         let user_id = ctx

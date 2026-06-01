@@ -44,8 +44,7 @@ impl talos_memory::MemoryCryptoHook for SecretsManagerMemoryCrypto {
         &self,
         plaintext: String,
         aad: Vec<u8>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(Uuid, Vec<u8>, i16)>> + Send>>
-    {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(Uuid, Vec<u8>, i16)>> + Send>> {
         let secrets = self.secrets.clone();
         Box::pin(async move { secrets.encrypt_value_aad_v1(&plaintext, &aad).await })
     }
@@ -56,9 +55,7 @@ impl talos_memory::MemoryCryptoHook for SecretsManagerMemoryCrypto {
         ciphertext: Vec<u8>,
         aad: Vec<u8>,
         format_version: i16,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = Result<zeroize::Zeroizing<String>>> + Send>,
-    > {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<zeroize::Zeroizing<String>>> + Send>> {
         let secrets = self.secrets.clone();
         Box::pin(async move {
             secrets

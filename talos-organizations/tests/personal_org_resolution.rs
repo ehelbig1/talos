@@ -72,7 +72,9 @@ async fn cleanup(pool: &Pool<Postgres>, user_ids: &[Uuid]) {
 
 #[tokio::test]
 async fn create_personal_org_is_idempotent_and_owner_member() {
-    let Some(pool) = pool_or_skip().await else { return };
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
     let uid = make_user(&pool, "carol").await;
 
     let org1 = OrganizationService::create_personal_org(&pool, uid, Some("Carol"))
@@ -90,14 +92,19 @@ async fn create_personal_org_is_idempotent_and_owner_member() {
     let role = OrganizationService::get_member_role(&pool, org1.id, uid)
         .await
         .expect("role lookup");
-    assert!(role.is_some(), "creator must be an owner member of their personal org");
+    assert!(
+        role.is_some(),
+        "creator must be an owner member of their personal org"
+    );
 
     cleanup(&pool, &[uid]).await;
 }
 
 #[tokio::test]
 async fn resolve_active_org_honours_membership_else_falls_back_to_personal() {
-    let Some(pool) = pool_or_skip().await else { return };
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
     let alice = make_user(&pool, "alice").await;
     let bob = make_user(&pool, "bob").await;
 
@@ -129,11 +136,17 @@ async fn resolve_active_org_honours_membership_else_falls_back_to_personal() {
     let r_nonmember = OrganizationService::resolve_active_org(&pool, bob, Some(shared.id))
         .await
         .unwrap();
-    assert_ne!(r_nonmember, shared.id, "non-member must NOT resolve to requested org");
+    assert_ne!(
+        r_nonmember, shared.id,
+        "non-member must NOT resolve to requested org"
+    );
     let bob_personal = OrganizationService::create_personal_org(&pool, bob, None)
         .await
         .unwrap();
-    assert_eq!(r_nonmember, bob_personal.id, "non-member → own personal org");
+    assert_eq!(
+        r_nonmember, bob_personal.id,
+        "non-member → own personal org"
+    );
 
     // cleanup (shared org owned by alice is removed by alice's cleanup)
     let _ = sqlx::query("DELETE FROM organization_members WHERE org_id = $1")
@@ -152,7 +165,9 @@ async fn resolve_active_org_honours_membership_else_falls_back_to_personal() {
 /// personal org, and an explicit org_id is preserved.
 #[tokio::test]
 async fn org_id_autostamp_trigger_on_actors() {
-    let Some(pool) = pool_or_skip().await else { return };
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
     let user = make_user(&pool, "trig").await;
     let personal = OrganizationService::create_personal_org(&pool, user, None)
         .await
@@ -171,7 +186,11 @@ async fn org_id_autostamp_trigger_on_actors() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(stamped, Some(personal.id), "trigger must stamp the personal org");
+    assert_eq!(
+        stamped,
+        Some(personal.id),
+        "trigger must stamp the personal org"
+    );
 
     // (2) explicit org_id → preserved (trigger is a no-op).
     let team = OrganizationService::create_org(&pool, "Team", "team-autostamp-test", user)
@@ -190,11 +209,24 @@ async fn org_id_autostamp_trigger_on_actors() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(preserved, Some(team.id), "explicit org_id must be preserved");
+    assert_eq!(
+        preserved,
+        Some(team.id),
+        "explicit org_id must be preserved"
+    );
 
-    let _ = sqlx::query("DELETE FROM actors WHERE user_id = $1").bind(user).execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM organization_members WHERE org_id = $1").bind(team.id).execute(&pool).await;
-    let _ = sqlx::query("DELETE FROM organizations WHERE id = $1").bind(team.id).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM actors WHERE user_id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM organization_members WHERE org_id = $1")
+        .bind(team.id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(team.id)
+        .execute(&pool)
+        .await;
     cleanup(&pool, &[user]).await;
 }
 
@@ -202,7 +234,9 @@ async fn org_id_autostamp_trigger_on_actors() {
 /// only Member+ (not Viewer) may create resources in a shared org.
 #[tokio::test]
 async fn org_write_access_excludes_viewers() {
-    let Some(pool) = pool_or_skip().await else { return };
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
     let owner = make_user(&pool, "owner").await;
     let member = make_user(&pool, "member").await;
     let viewer = make_user(&pool, "viewer").await;

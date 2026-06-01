@@ -138,7 +138,9 @@ pub fn run_with_seed_via_nats(
     // L-28: gate has to live INSIDE the returned Future since the function
     // signature returns a boxed future, not a `Result`. Build a future that
     // checks the gate first and short-circuits on failure.
-    if let Err(e) = ensure_signing_key_present_in_production(worker_shared_key.as_ref(), execution_id) {
+    if let Err(e) =
+        ensure_signing_key_present_in_production(worker_shared_key.as_ref(), execution_id)
+    {
         return Box::pin(async move { Err(e) });
     }
     let dispatcher = build_nats_dispatcher(engine, nats_client, worker_shared_key.clone());

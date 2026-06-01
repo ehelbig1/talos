@@ -112,9 +112,9 @@ impl ExecutionsMutations {
         // the UPDATE with an opaque "invalid input syntax for type
         // text"). Canonical helper from MCP-837 normalises here.
         let reason = match reason.as_deref() {
-            Some(s) if !s.trim().is_empty() => Some(
-                validate_description_content("approval reason", s, 1000)?.to_string(),
-            ),
+            Some(s) if !s.trim().is_empty() => {
+                Some(validate_description_content("approval reason", s, 1000)?.to_string())
+            }
             _ => None,
         };
 
@@ -167,9 +167,9 @@ impl ExecutionsMutations {
         // MCP-867 (2026-05-14): same content-discipline normalization
         // as approve_execution above. Sibling site.
         let reason = match reason.as_deref() {
-            Some(s) if !s.trim().is_empty() => Some(
-                validate_description_content("denial reason", s, 1000)?.to_string(),
-            ),
+            Some(s) if !s.trim().is_empty() => {
+                Some(validate_description_content("denial reason", s, 1000)?.to_string())
+            }
             _ => None,
         };
 

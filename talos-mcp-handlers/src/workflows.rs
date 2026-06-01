@@ -1696,17 +1696,11 @@ async fn handle_create_workflow(
     let timeout_present = args.get("timeout_secs").is_some()
         && !matches!(args.get("timeout_secs"), Some(serde_json::Value::Null));
     if timeout_present {
-        let timeout = match crate::utils::validate_range_u64(
-            args,
-            "timeout_secs",
-            1,
-            3600,
-            300,
-            &req_id,
-        ) {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+        let timeout =
+            match crate::utils::validate_range_u64(args, "timeout_secs", 1, 3600, 300, &req_id) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
         if let Some(obj) = graph_json_value.as_object_mut() {
             obj.insert(
                 "execution_timeout_secs".to_string(),
@@ -1724,14 +1718,11 @@ async fn handle_create_workflow(
     // capability-search discoverability AND publish_version's
     // capability_grants snapshot, so silent narrowing has downstream
     // consequences. Same family as MCP-285/MCP-313.
-    let capabilities = match crate::utils::json_string_array_field_strict(
-        args,
-        "capabilities",
-        &req_id,
-    ) {
-        Ok(opt) => opt.unwrap_or_default(),
-        Err(resp) => return resp,
-    };
+    let capabilities =
+        match crate::utils::json_string_array_field_strict(args, "capabilities", &req_id) {
+            Ok(opt) => opt.unwrap_or_default(),
+            Err(resp) => return resp,
+        };
     if let Err(msg) = talos_workflow_creation_helpers::validate_capabilities(&capabilities) {
         return mcp_error(req_id, -32602, &msg);
     }
@@ -1849,11 +1840,15 @@ async fn handle_create_workflow(
             // available, request suggested values for each node's missing required fields.
             // The service no-ops when LLM is unavailable or the response isn't valid JSON.
             // MCP-270 (2026-05-10): direction-class — default true.
-            let include_suggestions =
-                match crate::utils::validate_optional_bool(args, "include_config_suggestions", true, &req_id) {
-                    Ok(v) => v,
-                    Err(resp) => return resp,
-                };
+            let include_suggestions = match crate::utils::validate_optional_bool(
+                args,
+                "include_config_suggestions",
+                true,
+                &req_id,
+            ) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             if include_suggestions {
                 state
                     .workflow_creation_service
@@ -2340,9 +2335,7 @@ async fn handle_add_node_to_workflow(
                 retry_count: args.get("retry_count"),
                 retry_backoff_ms: args.get("retry_backoff_ms"),
                 retry_condition: args.get("retry_condition").and_then(|v| v.as_str()),
-                retry_delay_expression: args
-                    .get("retry_delay_expression")
-                    .and_then(|v| v.as_str()),
+                retry_delay_expression: args.get("retry_delay_expression").and_then(|v| v.as_str()),
                 skip_condition: args.get("skip_condition").and_then(|v| v.as_str()),
                 continue_on_error: args.get("continue_on_error"),
                 template_max_retries,
@@ -2613,7 +2606,10 @@ async fn handle_trigger_workflow(
                     "note": "No input schema is set for this workflow. Use set_workflow_input_schema to declare one. Any input is accepted.",
                 }),
             };
-            mcp_text(req_id, &serde_json::to_string_pretty(&body).unwrap_or_default())
+            mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&body).unwrap_or_default(),
+            )
         }
         talos_execution_orchestration::TriggerOutcome::Dispatched(exec) => {
             // Sync-wait was requested AND the row reached terminal status —
@@ -2664,7 +2660,6 @@ async fn handle_trigger_workflow(
         }
     }
 }
-
 
 /// dispatch_to_actor — convenience wrapper over `handle_trigger_workflow` that
 /// resolves the actor's workflow when there's exactly one, and delegates all
@@ -2901,19 +2896,29 @@ async fn handle_test_workflow_draft(
     // injected. Must happen BEFORE we lift __actor_context__ for the engine.
     {
         // MCP-268 (2026-05-10): direction-class wrong-type rejection.
-        let inject_context =
-            match crate::utils::validate_optional_bool(args, "inject_memory_context", false, &req_id) {
-                Ok(v) => v,
-                Err(resp) => return resp,
-            };
+        let inject_context = match crate::utils::validate_optional_bool(
+            args,
+            "inject_memory_context",
+            false,
+            &req_id,
+        ) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         // MCP-114 (2026-05-08): same N-J validation as handle_test_workflow.
         // test_workflow_draft returns JsonRpcResponse (not Option), so the
         // error returns directly here.
-        let max_memories =
-            match crate::utils::validate_range_u64(args, "max_context_memories", 1, 50, 10, &req_id) {
-                Ok(v) => v as usize,
-                Err(resp) => return resp,
-            };
+        let max_memories = match crate::utils::validate_range_u64(
+            args,
+            "max_context_memories",
+            1,
+            50,
+            10,
+            &req_id,
+        ) {
+            Ok(v) => v as usize,
+            Err(resp) => return resp,
+        };
         talos_actor_memory_service::inject_actor_context_into_input(
             &state.workflow_repo,
             &mut input_payload,
@@ -3100,10 +3105,7 @@ async fn handle_cleanup_workflows(
                     "workflows_bulk_cleanup",
                     "workflow",
                     None,
-                    format!(
-                        "{} workflow(s) bulk-deleted via cleanup_workflows",
-                        n
-                    ),
+                    format!("{} workflow(s) bulk-deleted via cleanup_workflows", n),
                     Some(serde_json::json!({
                         "deleted_count": n,
                         "prefix": prefix,
@@ -3237,11 +3239,9 @@ async fn handle_rename_workflow(
         return mcp_error(req_id, -32602, "Name must be 1-200 characters");
     }
     // MCP-410: migrated to canonical helper.
-    if let Err(resp) = crate::utils::validate_name_no_control_chars(
-        "Workflow name",
-        new_name,
-        req_id.clone(),
-    ) {
+    if let Err(resp) =
+        crate::utils::validate_name_no_control_chars("Workflow name", new_name, req_id.clone())
+    {
         return resp;
     }
     match state
@@ -3741,11 +3741,8 @@ async fn handle_validate_workflow(
             .map(|s| !s.is_empty())
             .unwrap_or(false)
     });
-    let documentation = talos_analytics_repository::compute_documentation_score(
-        has_desc,
-        has_node_desc,
-        has_caps,
-    );
+    let documentation =
+        talos_analytics_repository::compute_documentation_score(has_desc, has_node_desc, has_caps);
 
     // Reliability (50 pts) — shared formula with get_readiness_breakdown.
     let reliability = talos_analytics_repository::compute_reliability_score(
@@ -4039,17 +4036,11 @@ async fn handle_call_workflow(
     // historically said max: 600 — sync MCP responses must not tie
     // up the connection for 10 minutes; for longer workflows use
     // trigger_workflow (async).
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        120,
-        30,
-        &req_id.clone(),
-    ) {
-        Ok(v) => v,
-        Err(resp) => return Some(resp),
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 120, 30, &req_id.clone()) {
+            Ok(v) => v,
+            Err(resp) => return Some(resp),
+        };
 
     let (graph_json, version_id) = match state
         .workflow_repo
@@ -4488,11 +4479,9 @@ async fn handle_import_workflow(
     // import path is an attractive carrier for hostile names
     // because export_workflow → operator-shares-bundle → import is
     // a common workflow.
-    if let Err(resp) = crate::utils::validate_name_no_control_chars(
-        "Workflow name",
-        wf_name,
-        req_id.clone(),
-    ) {
+    if let Err(resp) =
+        crate::utils::validate_name_no_control_chars("Workflow name", wf_name, req_id.clone())
+    {
         return Some(resp);
     }
 
@@ -4700,8 +4689,7 @@ async fn handle_batch_delete_workflows(
     let workflow_ids: Vec<uuid::Uuid> = match args.get("workflow_ids").and_then(|v| v.as_array()) {
         Some(arr) => {
             let mut ids = Vec::new();
-            let mut seen: std::collections::HashSet<uuid::Uuid> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
             for item in arr {
                 match item.as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
                     Some(id) => {
@@ -4781,8 +4769,7 @@ async fn handle_batch_delete_workflows(
     // `resource_id` is left None because no single workflow is the
     // primary target; the detail array carries the deleted ids.
     if !deleted_ids.is_empty() {
-        let deleted_id_strs: Vec<String> =
-            deleted_ids.iter().map(|id| id.to_string()).collect();
+        let deleted_id_strs: Vec<String> = deleted_ids.iter().map(|id| id.to_string()).collect();
         let details = serde_json::json!({
             "deleted_workflow_ids": deleted_id_strs,
             "deleted_count": deleted_ids.len(),
@@ -4952,7 +4939,10 @@ async fn handle_bulk_trigger_workflow(
             .await
         {
             Ok(talos_workflow_repository::ConcurrencyAdmission::Created) => {}
-            Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running }) => {
+            Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached {
+                limit,
+                running,
+            }) => {
                 results.push(serde_json::json!({
                     "input_index": idx,
                     "execution_id": serde_json::Value::Null,
@@ -5104,9 +5094,7 @@ async fn handle_trigger_workflow_as_actors(
                         return Some(mcp_error(
                             req_id.clone(),
                             -32602,
-                            &format!(
-                                "actor_ids[{i}] must be a string, got {kind}"
-                            ),
+                            &format!("actor_ids[{i}] must be a string, got {kind}"),
                         ));
                     }
                 }
@@ -5320,7 +5308,10 @@ async fn handle_trigger_workflow_as_actors(
             .await
         {
             Ok(talos_workflow_repository::ConcurrencyAdmission::Created) => {}
-            Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running }) => {
+            Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached {
+                limit,
+                running,
+            }) => {
                 results.push(serde_json::json!({
                     "actor_id": actor_id.to_string(),
                     "execution_id": serde_json::Value::Null,
@@ -5613,14 +5604,8 @@ async fn handle_set_workflow_actor_id(
                 "workflow",
                 Some(wf_id),
                 match actor_id {
-                    Some(aid) => format!(
-                        "Workflow {} bound to actor {}",
-                        wf_id, aid
-                    ),
-                    None => format!(
-                        "Workflow {} actor binding cleared (shared mode)",
-                        wf_id
-                    ),
+                    Some(aid) => format!("Workflow {} bound to actor {}", wf_id, aid),
+                    None => format!("Workflow {} actor binding cleared (shared mode)", wf_id),
                 },
                 Some(serde_json::json!({
                     "new_actor_id": actor_id.map(|a| a.to_string()),
@@ -5943,17 +5928,11 @@ async fn handle_test_workflow(
     // rewrote 0 to 1. validate_range_u64 catches every wrong-input
     // mode upfront. Cap stays at 600 to accommodate orchestrator-
     // style workflows with many nested sub-workflow hops.
-    let timeout_secs = match crate::utils::validate_range_u64(
-        args,
-        "timeout_secs",
-        1,
-        600,
-        30,
-        &req_id.clone(),
-    ) {
-        Ok(v) => v,
-        Err(resp) => return Some(resp),
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 600, 30, &req_id.clone()) {
+            Ok(v) => v,
+            Err(resp) => return Some(resp),
+        };
     // MCP-318 (2026-05-11): strict-parse assert_status — companion to
     // MCP-303's strict-parse of assert_max_duration_ms / assert_output_
     // contains in the same handler. Pre-fix `.as_str().unwrap_or("
@@ -5993,9 +5972,7 @@ async fn handle_test_workflow(
                 return Some(mcp_error(
                     req_id.clone(),
                     -32602,
-                    &format!(
-                        "assert_max_duration_ms must be a non-negative integer, got {kind}"
-                    ),
+                    &format!("assert_max_duration_ms must be a non-negative integer, got {kind}"),
                 ));
             }
         },
@@ -6088,19 +6065,29 @@ async fn handle_test_workflow(
     // flow into for_workflow's EngineOpts.with_actor_context.
     {
         // MCP-269 (2026-05-10): direction-class wrong-type rejection.
-        let inject_context =
-            match crate::utils::validate_optional_bool(args, "inject_memory_context", false, &req_id) {
-                Ok(v) => v,
-                Err(resp) => return Some(resp),
-            };
+        let inject_context = match crate::utils::validate_optional_bool(
+            args,
+            "inject_memory_context",
+            false,
+            &req_id,
+        ) {
+            Ok(v) => v,
+            Err(resp) => return Some(resp),
+        };
         // MCP-114 (2026-05-08): replace silent clamp at 50 with N-J
         // explicit validation. Pre-fix passing 100 silently clamped to
         // 50 — operator got 50% of what they asked for with no signal.
-        let max_memories =
-            match crate::utils::validate_range_u64(args, "max_context_memories", 1, 50, 10, &req_id) {
-                Ok(v) => v as usize,
-                Err(resp) => return Some(resp),
-            };
+        let max_memories = match crate::utils::validate_range_u64(
+            args,
+            "max_context_memories",
+            1,
+            50,
+            10,
+            &req_id,
+        ) {
+            Ok(v) => v as usize,
+            Err(resp) => return Some(resp),
+        };
         talos_actor_memory_service::inject_actor_context_into_input(
             &state.workflow_repo,
             &mut input_payload,
@@ -6703,14 +6690,11 @@ async fn handle_create_workflow_from_description(
     // fix above. An operator passing `modules: ["pa-recall", 42,
     // "pa-capture"]` saw the scaffold proceed with two modules instead
     // of three, and the typo entry was invisibly lost.
-    let explicit_modules = match crate::utils::json_string_array_field_strict(
-        args,
-        "modules",
-        &req_id,
-    ) {
-        Ok(opt) => opt.unwrap_or_default(),
-        Err(resp) => return Some(resp),
-    };
+    let explicit_modules =
+        match crate::utils::json_string_array_field_strict(args, "modules", &req_id) {
+            Ok(opt) => opt.unwrap_or_default(),
+            Err(resp) => return Some(resp),
+        };
 
     let outcome = match state
         .workflow_creation_service
@@ -7100,9 +7084,7 @@ fn spawn_llm_auto_fill_task(
             // handle in a background task), so log-and-skip the write
             // instead — operator's next edit through any chokepointed
             // surface will surface the cap violation properly.
-            if let Err(cap_msg) =
-                talos_workflow_types::validate_graph_timeouts(&updated_json)
-            {
+            if let Err(cap_msg) = talos_workflow_types::validate_graph_timeouts(&updated_json) {
                 tracing::warn!(
                     workflow_id = %workflow_id,
                     user_id = %user_id,
@@ -8828,10 +8810,7 @@ async fn handle_set_workflow_input_schema(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "Invalid JSON Schema: {}",
-                        schema_errs.join("; ")
-                    ),
+                    &format!("Invalid JSON Schema: {}", schema_errs.join("; ")),
                 );
             }
             s.clone()
@@ -8848,11 +8827,11 @@ async fn handle_set_workflow_input_schema(
     // MCP-269 (2026-05-10): direction-class — default true; pre-fix
     // `strict_mode: "false"` string silently re-enabled strict mode
     // when the operator wanted to allow additionalProperties.
-    let strict_mode =
-        match crate::utils::validate_optional_bool(args, "strict_mode", true, &req_id) {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let strict_mode = match crate::utils::validate_optional_bool(args, "strict_mode", true, &req_id)
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let mut schema_val = schema_arg.clone();
     if strict_mode {
         if let Some(obj) = schema_val.as_object_mut() {
@@ -9270,9 +9249,7 @@ async fn handle_set_workflow_execution_timeout(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "timeout_seconds must be an integer (no fractional part), got {t}"
-                    ),
+                    &format!("timeout_seconds must be an integer (no fractional part), got {t}"),
                 )
             }
             Some(t) if (1.0..=3600.0).contains(&t) => t as i64,
@@ -9922,7 +9899,14 @@ async fn handle_check_semantic_cache(
         }
         None => return mcp_error(req_id, -32602, "Missing required field: input"),
     };
-    let threshold = match crate::utils::validate_range_f64(args, "similarity_threshold", 0.0, 1.0, 0.85, &req_id) {
+    let threshold = match crate::utils::validate_range_f64(
+        args,
+        "similarity_threshold",
+        0.0,
+        1.0,
+        0.85,
+        &req_id,
+    ) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -10050,9 +10034,7 @@ async fn handle_write_semantic_cache(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "ttl_hours must be between 1 and 8760 (1 year), got {h}"
-                    ),
+                    &format!("ttl_hours must be between 1 and 8760 (1 year), got {h}"),
                 )
             }
             None => {
@@ -10061,9 +10043,7 @@ async fn handle_write_semantic_cache(
                     return mcp_error(
                         req_id,
                         -32602,
-                        &format!(
-                            "ttl_hours must be between 1 and 8760 (1 year), got {neg}"
-                        ),
+                        &format!("ttl_hours must be between 1 and 8760 (1 year), got {neg}"),
                     );
                 }
                 let kind = crate::utils::json_type_name(v);
@@ -10192,10 +10172,11 @@ async fn handle_create_tree_of_thoughts_workflow(
             Ok(id) => id,
             Err(resp) => return resp,
         };
-    let num_branches = match crate::utils::validate_range_u64(args, "num_branches", 2, 5, 3, &req_id) {
-        Ok(v) => v as u32,
-        Err(resp) => return resp,
-    };
+    let num_branches =
+        match crate::utils::validate_range_u64(args, "num_branches", 2, 5, 3, &req_id) {
+            Ok(v) => v as u32,
+            Err(resp) => return resp,
+        };
     let evaluation_rubric = match args.get("evaluation_rubric").and_then(|v| v.as_str()) {
         Some(r) if r.len() > 2000 => return mcp_error(req_id, -32602, "evaluation_rubric must be 2000 characters or fewer"),
         Some(r) if r.trim().is_empty() => {
@@ -10537,7 +10518,7 @@ async fn handle_export_yaml_workflow(
 
 #[cfg(test)]
 mod tests {
-    
+
     use talos_workflow_creation_helpers::detect_tool_call_xml_leak;
 
     /// Exact prod-incident artifact from discovery-call-synthesizer (2026-04-29).

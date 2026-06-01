@@ -693,19 +693,31 @@ impl OAuthCredentialService {
             // client_id and Google returns 400 "invalid_client".
             "atlassian" => (
                 "https://auth.atlassian.com/oauth/token",
-                std::env::var("ATLASSIAN_CLIENT_ID").ok().filter(|v| !v.is_empty()),
-                std::env::var("ATLASSIAN_CLIENT_SECRET").ok().filter(|v| !v.is_empty()),
+                std::env::var("ATLASSIAN_CLIENT_ID")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+                std::env::var("ATLASSIAN_CLIENT_SECRET")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
             ),
             "gmail" | "google_calendar" => (
                 "https://oauth2.googleapis.com/token",
                 std::env::var("GOOGLE_CLIENT_ID")
                     .ok()
                     .filter(|v| !v.is_empty())
-                    .or_else(|| std::env::var("GMAIL_CLIENT_ID").ok().filter(|v| !v.is_empty())),
+                    .or_else(|| {
+                        std::env::var("GMAIL_CLIENT_ID")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                    }),
                 std::env::var("GOOGLE_CLIENT_SECRET")
                     .ok()
                     .filter(|v| !v.is_empty())
-                    .or_else(|| std::env::var("GMAIL_CLIENT_SECRET").ok().filter(|v| !v.is_empty())),
+                    .or_else(|| {
+                        std::env::var("GMAIL_CLIENT_SECRET")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                    }),
             ),
             "slack" => {
                 // Slack bot tokens don't expire. If the proactive refresh task

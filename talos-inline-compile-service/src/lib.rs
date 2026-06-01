@@ -403,8 +403,7 @@ impl InlineCompileService {
             }
         };
         if !res.success {
-            let error_msgs: Vec<String> =
-                res.errors.iter().map(|e| e.message.clone()).collect();
+            let error_msgs: Vec<String> = res.errors.iter().map(|e| e.message.clone()).collect();
             return Err(InlineCompileError::CompilationFailed(format!(
                 "Inline code compilation failed:\n{}",
                 error_msgs.join("\n"),
@@ -419,7 +418,8 @@ impl InlineCompileService {
         );
         // Caller's allowed_secrets list (when not passed, empty — matches
         // pre-extraction behaviour for the persistence write).
-        let allowed_secrets: Vec<String> = input.explicit_allowed_secrets.clone().unwrap_or_default();
+        let allowed_secrets: Vec<String> =
+            input.explicit_allowed_secrets.clone().unwrap_or_default();
 
         // 7. Find existing module by name + user (drives upsert).
         let existing_id = self
@@ -544,9 +544,7 @@ impl InlineCompileService {
         let max_fuel: i64 = input
             .fuel_budget
             .map(|f| f as i64)
-            .unwrap_or_else(|| {
-                talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64
-            });
+            .unwrap_or_else(|| talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64);
 
         use sha2::{Digest, Sha256};
         let content_hash = format!("{:x}", Sha256::digest(&wasm_bytes));

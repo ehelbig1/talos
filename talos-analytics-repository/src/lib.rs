@@ -106,7 +106,9 @@ pub fn fingerprint_error_message(msg: &str) -> String {
     let result = RE_UUID.replace_all(msg, "<UUID>");
     let result = RE_TS.replace_all(&result, "<TIMESTAMP>");
     let result = RE_NUM.replace_all(&result, "$1 N");
-    RE_LONG_QUOTE.replace_all(&result, r#""<QUOTED>""#).to_string()
+    RE_LONG_QUOTE
+        .replace_all(&result, r#""<QUOTED>""#)
+        .to_string()
 }
 
 #[derive(Debug)]
@@ -2308,7 +2310,10 @@ impl AnalyticsRepository {
         .await?;
         let mut out = Vec::with_capacity(raw.len());
         for (id, plaintext, enc_bytes, key_id, fmt) in raw {
-            if let Some(v) = self.decode_output_row(id, plaintext, enc_bytes, key_id, fmt).await {
+            if let Some(v) = self
+                .decode_output_row(id, plaintext, enc_bytes, key_id, fmt)
+                .await
+            {
                 out.push(v);
             }
         }
@@ -2347,7 +2352,10 @@ impl AnalyticsRepository {
         .await?;
         let mut out = Vec::with_capacity(raw.len());
         for (id, plaintext, enc_bytes, key_id, fmt) in raw {
-            if let Some(v) = self.decode_output_row(id, plaintext, enc_bytes, key_id, fmt).await {
+            if let Some(v) = self
+                .decode_output_row(id, plaintext, enc_bytes, key_id, fmt)
+                .await
+            {
                 out.push(v);
             }
         }
@@ -2613,11 +2621,7 @@ impl AnalyticsRepository {
     /// UPDATE` then `UPDATE`) so the read+write is atomic — no race
     /// where two concurrent acks both observe `false` and both
     /// claim "fresh."
-    pub async fn acknowledge_alert(
-        &self,
-        alert_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<AckOutcome> {
+    pub async fn acknowledge_alert(&self, alert_id: Uuid, user_id: Uuid) -> Result<AckOutcome> {
         let mut tx = self.db_pool.begin().await?;
         let prev: Option<bool> = sqlx::query_scalar(
             "SELECT acknowledged FROM workflow_alerts \

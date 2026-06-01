@@ -72,7 +72,9 @@ pub async fn proactive_token_refresh_task(cred_service: Arc<OAuthCredentialServi
             let redacted_path = redact_oauth_path_for_log(path);
             match cred_service.refresh_oauth_token_if_needed(path).await {
                 Ok(true) => tracing::info!(path = %redacted_path, "Token refresh task: refreshed"),
-                Ok(false) => tracing::debug!(path = %redacted_path, "Token refresh task: still valid"),
+                Ok(false) => {
+                    tracing::debug!(path = %redacted_path, "Token refresh task: still valid")
+                }
                 Err(e) => {
                     tracing::warn!(path = %redacted_path, error = %e, "Token refresh task: refresh failed")
                 }
@@ -150,6 +152,9 @@ mod redact_tests {
         let b = redact_oauth_path_for_log(
             "oauth/gmail/00000000-0000-0000-0000-000000000000/bob@example.com/access_token",
         );
-        assert_ne!(a, b, "different provider_keys must produce different log strings");
+        assert_ne!(
+            a, b,
+            "different provider_keys must produce different log strings"
+        );
     }
 }

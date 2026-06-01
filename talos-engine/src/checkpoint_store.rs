@@ -112,7 +112,11 @@ impl fmt::Debug for ControllerCheckpointStore {
             )
             .field(
                 "secrets_manager",
-                &self.secrets_manager.as_ref().map(|_| "<wired>").unwrap_or("None"),
+                &self
+                    .secrets_manager
+                    .as_ref()
+                    .map(|_| "<wired>")
+                    .unwrap_or("None"),
             )
             .finish()
     }
@@ -210,8 +214,9 @@ pub async fn load_checkpoint_for_resume(
     secrets_manager: Option<std::sync::Arc<talos_secrets_manager::SecretsManager>>,
     execution_id: Uuid,
 ) -> HashMap<Uuid, JsonValue> {
-    let mut store = ControllerCheckpointStore::new(pool.clone(), worker_shared_key.map(<[u8]>::to_vec))
-        .with_resume_statuses();
+    let mut store =
+        ControllerCheckpointStore::new(pool.clone(), worker_shared_key.map(<[u8]>::to_vec))
+            .with_resume_statuses();
     if let Some(sm) = secrets_manager {
         store = store.with_secrets_manager(sm);
     }
@@ -242,9 +247,8 @@ impl CheckpointStore for ControllerCheckpointStore {
         // AAD binds the ciphertext to this execution_id so a DB-write
         // attacker can't transpose a checkpoint blob from one execution
         // into another and have it decrypt cleanly.
-        let (ciphertext, nonce) =
-            encrypt_checkpoint(snapshot, key, execution_id.as_bytes())
-                .map_err(|e| -> BoxError { e.into() })?;
+        let (ciphertext, nonce) = encrypt_checkpoint(snapshot, key, execution_id.as_bytes())
+            .map_err(|e| -> BoxError { e.into() })?;
         sqlx::query(
             "UPDATE workflow_executions \
              SET checkpoint_encrypted = $1, checkpoint_nonce = $2 \
@@ -292,8 +296,9 @@ impl CheckpointStore for ControllerCheckpointStore {
             .await?;
 
             if let Some((ciphertext, nonce)) = enc_row {
-                let decrypted = decrypt_checkpoint(&ciphertext, &nonce, key, execution_id.as_bytes())
-                    .map_err(|e| -> BoxError { e.into() })?;
+                let decrypted =
+                    decrypt_checkpoint(&ciphertext, &nonce, key, execution_id.as_bytes())
+                        .map_err(|e| -> BoxError { e.into() })?;
                 return Ok(decrypted
                     .as_object()
                     .map(uuid_keyed_map)

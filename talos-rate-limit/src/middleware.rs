@@ -32,8 +32,7 @@ fn rate_limit_env() -> &'static RateLimitEnvConfig {
         // got the FALSE branch. OnceLock-cached so the env read is
         // once-per-process; canonical truthy/falsy tokens now agree
         // with the workspace-wide pattern.
-        let enforce_in_dev =
-            talos_config::bool_env_or_default("ENFORCE_RATE_LIMITS_IN_DEV", false);
+        let enforce_in_dev = talos_config::bool_env_or_default("ENFORCE_RATE_LIMITS_IN_DEV", false);
         RateLimitEnvConfig {
             is_production,
             enforce_in_dev,
@@ -966,7 +965,9 @@ mod tests {
         // real-untrusted at position 61 (within the 64-entry window) →
         // returns real-untrusted. The 5000 left-side fakes never get
         // touched.
-        let mut parts: Vec<String> = (0..5000).map(|i| format!("10.42.{}.{}", (i / 256) % 256, i % 256)).collect();
+        let mut parts: Vec<String> = (0..5000)
+            .map(|i| format!("10.42.{}.{}", (i / 256) % 256, i % 256))
+            .collect();
         parts.push("203.0.113.99".to_string());
         for _ in 0..60 {
             parts.push("10.42.0.5".to_string());

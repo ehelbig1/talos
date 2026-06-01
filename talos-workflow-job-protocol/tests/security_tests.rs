@@ -603,7 +603,9 @@ fn primary_verify_then_secondary_verify_no_replay_both_succeed() {
     let result = signed_job_result(&key);
 
     // Primary verifier records the nonce in the cache.
-    result.verify(&key, 300).expect("primary verify must succeed");
+    result
+        .verify(&key, 300)
+        .expect("primary verify must succeed");
 
     // Secondary verifier (passive observer) must succeed even though
     // the nonce is already in the cache — that is the whole point.
@@ -726,7 +728,9 @@ fn pipeline_primary_verify_then_secondary_verify_no_replay_both_succeed() {
     let key = test_key();
     let result = signed_pipeline_result(&key);
 
-    result.verify(&key, 300).expect("primary verify must succeed");
+    result
+        .verify(&key, 300)
+        .expect("primary verify must succeed");
     result
         .verify_no_replay(&key, 300)
         .expect("verify_no_replay must succeed after primary verify");

@@ -202,13 +202,12 @@ pub(crate) fn scan_forbidden_patterns(source: &str) -> Vec<CompilationError> {
                     column: None,
                     end_line: None,
                     end_column: None,
-                    message:
-                        "forbidden-unsafe: `unsafe` blocks/items are not permitted in WASM \
+                    message: "forbidden-unsafe: `unsafe` blocks/items are not permitted in WASM \
                          modules. There is no FFI, no raw-pointer escape, and no syscall \
                          surface that requires `unsafe` from guest code. If you have a \
                          documented justification, add `// lint-allow: unsafe-code` to \
                          this line."
-                            .to_string(),
+                        .to_string(),
                     severity: "error".to_string(),
                 });
             }
@@ -224,13 +223,12 @@ pub(crate) fn scan_forbidden_patterns(source: &str) -> Vec<CompilationError> {
                     column: None,
                     end_line: None,
                     end_column: None,
-                    message:
-                        "forbidden-extern: `extern \"...\"` FFI declarations are not \
+                    message: "forbidden-extern: `extern \"...\"` FFI declarations are not \
                          permitted in WASM modules. Host functions are reached through \
                          the typed WIT interfaces (talos::core::*), not raw FFI. If you \
                          have a documented justification, add `// lint-allow: extern-c` \
                          to this line."
-                            .to_string(),
+                        .to_string(),
                     severity: "error".to_string(),
                 });
             }
@@ -245,15 +243,14 @@ pub(crate) fn scan_forbidden_patterns(source: &str) -> Vec<CompilationError> {
                 column: None,
                 end_line: None,
                 end_column: None,
-                message:
-                    "forbidden-process: `std::process::*` is not available in WASM \
+                message: "forbidden-process: `std::process::*` is not available in WASM \
                      modules — there is no fork/exec/spawn surface in WASIp2 and the \
                      talos worker does not bind any process-control host functions. \
                      If you need to invoke another module, use the workflow engine's \
                      subworkflow / chain-dispatch primitives instead. If you have a \
                      documented justification, add `// lint-allow: std-process` to \
                      this line."
-                        .to_string(),
+                    .to_string(),
                 severity: "error".to_string(),
             });
         }
@@ -290,8 +287,8 @@ fn find_keyword_outside_string(line: &str, keyword: &str) -> Option<usize> {
         if &bytes[i..i + kbytes.len()] == kbytes {
             // Require word boundary on the LEFT (so `is_unsafe`
             // doesn't fire). Right-side context is up to the caller.
-            let left_is_word = i > 0
-                && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let left_is_word =
+                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             if !left_is_word {
                 return Some(i);
             }
@@ -523,8 +520,7 @@ mod forbidden_pattern_tests {
 
     #[test]
     fn honours_extern_opt_out() {
-        let errs =
-            err_msgs(r#"extern "C" { fn x(); } // lint-allow: extern-c"#);
+        let errs = err_msgs(r#"extern "C" { fn x(); } // lint-allow: extern-c"#);
         assert!(errs.iter().all(|m| !m.contains("forbidden-extern")));
     }
 
@@ -542,9 +538,8 @@ mod forbidden_pattern_tests {
 
     #[test]
     fn honours_std_process_opt_out() {
-        let errs = err_msgs(
-            "let out = std::process::Command::new(\"ls\"); // lint-allow: std-process",
-        );
+        let errs =
+            err_msgs("let out = std::process::Command::new(\"ls\"); // lint-allow: std-process");
         assert!(errs.iter().all(|m| !m.contains("forbidden-process")));
     }
 

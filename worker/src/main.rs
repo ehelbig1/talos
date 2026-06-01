@@ -115,13 +115,13 @@ pub(crate) enum ManifestSizeVerdict {
 /// manifest spec allows i64 but values < 0 are nonsense) are treated
 /// as oversized so a forged manifest can't bypass the gate by claiming
 /// a negative size.
-pub(crate) fn check_manifest_layer_sizes(
-    layer_sizes: &[i64],
-    cap: u64,
-) -> ManifestSizeVerdict {
+pub(crate) fn check_manifest_layer_sizes(layer_sizes: &[i64], cap: u64) -> ManifestSizeVerdict {
     for &size in layer_sizes {
         if size < 0 || (size as u64) > cap {
-            return ManifestSizeVerdict::Oversized { declared: size, cap };
+            return ManifestSizeVerdict::Oversized {
+                declared: size,
+                cap,
+            };
         }
     }
     ManifestSizeVerdict::Ok
@@ -411,11 +411,7 @@ pub(crate) fn validate_sigstore_identity_regexp(
     let github_idx = regexp
         .find("github\\.com/")
         .map(|i| (i, "github\\.com/".len()))
-        .or_else(|| {
-            regexp
-                .find("github.com/")
-                .map(|i| (i, "github.com/".len()))
-        });
+        .or_else(|| regexp.find("github.com/").map(|i| (i, "github.com/".len())));
     if let Some((idx, prefix_len)) = github_idx {
         // 1. Pattern must reference a workflow path. Without it, every
         //    OIDC identity from any GitHub repo would satisfy the
@@ -440,8 +436,7 @@ pub(crate) fn validate_sigstore_identity_regexp(
                 .replace("\\_", "");
             // Any of these tokens between host and workflows path
             // indicates a wildcard.
-            let suspicious_tokens =
-                [".*", ".+", "[^", "\\w", "\\S", "\\d", "(?", ".{", "()"];
+            let suspicious_tokens = [".*", ".+", "[^", "\\w", "\\S", "\\d", "(?", ".{", "()"];
             if suspicious_tokens.iter().any(|t| scan.contains(t)) {
                 return Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo);
             }
@@ -580,7 +575,10 @@ pub(crate) fn parse_semver_triple(s: &str) -> Option<(u32, u32, u32)> {
     let min: u32 = parts.next()?.parse().ok()?;
     // PATCH may carry a `-suffix`; truncate at the first non-digit.
     let patch_raw = parts.next()?;
-    let patch_str: String = patch_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let patch_str: String = patch_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if patch_str.is_empty() {
         return None;
     }
@@ -881,9 +879,7 @@ mod is_metadata_service_host_tests {
         // Public registries.
         assert!(!is_metadata_service_host("docker.io"));
         assert!(!is_metadata_service_host("quay.io"));
-        assert!(!is_metadata_service_host(
-            "us-docker.pkg.dev"
-        ));
+        assert!(!is_metadata_service_host("us-docker.pkg.dev"));
     }
 
     #[test]
@@ -1272,13 +1268,8 @@ async fn publish_result_with_retry(
         // controller's audit log records which pod emitted the
         // truncated-replacement result. See `worker_identity` for the
         // resolution chain.
-        if let Err(e) = replacement.sign_with_worker_id(
-            shared_key.as_bytes(),
-            worker_identity(),
-        ) {
-            return Err(format!(
-                "Failed to sign oversized-result replacement: {e}"
-            ));
+        if let Err(e) = replacement.sign_with_worker_id(shared_key.as_bytes(), worker_identity()) {
+            return Err(format!("Failed to sign oversized-result replacement: {e}"));
         }
         match serde_json::to_vec(&replacement) {
             Ok(v) => bytes::Bytes::from(v),
@@ -1507,7 +1498,8 @@ async fn execute_job(
             // closed BEFORE making the network round-trip.
             if is_metadata_service_host(reference.registry()) {
                 let err = "registry_host_denied: cloud metadata service host \
-                     is never a legitimate OCI registry".to_string();
+                     is never a legitimate OCI registry"
+                    .to_string();
                 ::tracing::error!(
                     module_uri = %req.module_uri,
                     registry = %reference.registry(),
@@ -1804,7 +1796,9 @@ async fn execute_job(
             // `bytes_attested_in_this_run` accordingly so the
             // downstream `expected_wasm_hash` fallback doesn't kick in
             // and re-fail for cached-but-no-hash-provided jobs.
-            let redis_key = expected_layer_digest.as_ref().map(|d| format!("oci_cache:{}", d));
+            let redis_key = expected_layer_digest
+                .as_ref()
+                .map(|d| format!("oci_cache:{}", d));
             if let (Some(digest), Some(key)) = (&expected_layer_digest, &redis_key) {
                 if let Some(redis_client) = runtime.redis_client() {
                     if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
@@ -1871,140 +1865,36 @@ async fn execute_job(
             // the expensive part (network + decompression); on cache
             // hit we already have validated bytes and skip it.
             if found_bytes.is_none() {
-            match client.pull(&reference, &auth, accepted_media_types).await {
-                Ok(image) => {
-                    // The WASM binary is typically the first layer in a Wasm OCI artifact.
-                    // Cross-check the layer's actual sha256 against the manifest's
-                    // declared digest before trusting the bytes — bytes that don't
-                    // match the manifest indicate registry corruption, MITM during
-                    // pull (HTTP only — gated to localhost-dev above), or a bug in
-                    // the publish pipeline. Verification logic lives in the pure
-                    // helper `verify_oci_layer` so the security-critical decision
-                    // is unit-testable.
-                    if let Some(layer) = image.layers.into_iter().next() {
-                        // H-3 defense in depth: even if the manifest
-                        // claimed a small layer (pre-pull check passed)
-                        // OR the registry skipped the manifest's size
-                        // field, refuse if the actual decompressed
-                        // bytes exceed the cap. Reject WITHOUT caching
-                        // so a poisoned layer doesn't persist in Redis
-                        // to OOM the next worker.
-                        if (layer.data.len() as u64) > layer_cap {
-                            let err = format!(
-                                "oci_layer_too_large_post_pull: actual layer is {} bytes, \
-                                 cap is {} (manifest may have lied about declared size)",
-                                layer.data.len(),
-                                layer_cap
-                            );
-                            ::tracing::error!(
-                                module_uri = %req.module_uri,
-                                actual_size = layer.data.len(),
-                                cap_bytes = layer_cap,
-                                "OCI layer exceeds cap post-pull — refusing to execute or cache"
-                            );
-                            _span.end_error(&err);
-                            return JobResult {
-                                job_id: req.job_id,
-                                status: JobStatus::Failed,
-                                output_payload: serde_json::json!({"error": err}),
-                                logs: vec![],
-                                execution_time_ms: start.elapsed().as_millis() as u64,
-                                signature: vec![],
-                                result_nonce: String::new(),
-                                worker_id: String::new(),
-                            };
-                        }
-                        // H1: prefer the digest we already learned from
-                        // the pre-pull manifest fetch (`expected_layer_digest`,
-                        // captured in the outer scope). Falling back to the
-                        // pull-response's `image.manifest.layers[0].digest`
-                        // covers the (rare) path where the pre-fetch failed
-                        // but the full pull succeeded; both shapes flow
-                        // through the same `verify_oci_layer` check.
-                        let pull_response_digest = image
-                            .manifest
-                            .as_ref()
-                            .and_then(|m| m.layers.first())
-                            .map(|d| d.digest.clone());
-                        let effective_digest = expected_layer_digest
-                            .clone()
-                            .or(pull_response_digest);
-                        match verify_oci_layer(&layer.data, effective_digest.as_deref()) {
-                            LayerVerdict::Verified { digest } => {
-                                _span.set_attribute("oci_layer_digest", digest);
-                                _span.add_event("oci_pull_success");
-
-                                // Populate the Redis cache so the next pull of
-                                // this layer-digest short-circuits the registry
-                                // round-trip. TTL bounds growth — without it,
-                                // cache size scales monotonically with distinct
-                                // digests ever seen. Tag repoints produce new
-                                // digests and new cache entries; old entries
-                                // expire on their own TTL.
-                                //
-                                // SECURITY: only cache when both layers
-                                // of attestation passed in THIS pull —
-                                // sigstore signature AND layer digest.
-                                // The digest check is already a
-                                // precondition of this `Verified` arm;
-                                // the sigstore check is gated below.
-                                // Caching on a sigstore-Audit failure
-                                // would poison the cache so future
-                                // pulls bypass verification entirely
-                                // (cache hits short-circuit the OCI
-                                // path). Skipping the SET keeps the
-                                // bytes from being served to *other*
-                                // jobs while still honouring the
-                                // operator-chosen Audit-mode intent
-                                // for THIS execution.
-                                //
-                                // The cache write only happens when we
-                                // actually have a digest-keyed `redis_key`
-                                // (set above). Without one, there's no
-                                // canonical key for future re-verification —
-                                // skipping the write is correct.
-                                if sigstore_pass_in_this_run {
-                                    if let Some(key) = redis_key.as_deref() {
-                                        if let Some(redis_client) = runtime.redis_client() {
-                                            if let Ok(mut conn) = redis_client
-                                                .get_multiplexed_async_connection()
-                                                .await
-                                            {
-                                                let _: Result<(), _> = redis::cmd("SET")
-                                                    .arg(key)
-                                                    .arg(&layer.data)
-                                                    .arg("EX")
-                                                    .arg(OCI_CACHE_TTL_SECS)
-                                                    .query_async(&mut conn)
-                                                    .await;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    ::tracing::info!(
-                                        module_uri = %req.module_uri,
-                                        "OCI bytes attested by digest only \
-                                         (sigstore failed in audit mode) — \
-                                         skipping cache write so future pulls \
-                                         re-verify against the registry"
-                                    );
-                                }
-
-                                // Fresh pull with Sigstore + digest checks both
-                                // passed in THIS run — attested.
-                                bytes_attested_in_this_run = true;
-                                found_bytes = Some(layer.data);
-                            }
-                            LayerVerdict::DigestMismatch { expected, computed } => {
+                match client.pull(&reference, &auth, accepted_media_types).await {
+                    Ok(image) => {
+                        // The WASM binary is typically the first layer in a Wasm OCI artifact.
+                        // Cross-check the layer's actual sha256 against the manifest's
+                        // declared digest before trusting the bytes — bytes that don't
+                        // match the manifest indicate registry corruption, MITM during
+                        // pull (HTTP only — gated to localhost-dev above), or a bug in
+                        // the publish pipeline. Verification logic lives in the pure
+                        // helper `verify_oci_layer` so the security-critical decision
+                        // is unit-testable.
+                        if let Some(layer) = image.layers.into_iter().next() {
+                            // H-3 defense in depth: even if the manifest
+                            // claimed a small layer (pre-pull check passed)
+                            // OR the registry skipped the manifest's size
+                            // field, refuse if the actual decompressed
+                            // bytes exceed the cap. Reject WITHOUT caching
+                            // so a poisoned layer doesn't persist in Redis
+                            // to OOM the next worker.
+                            if (layer.data.len() as u64) > layer_cap {
                                 let err = format!(
-                                    "oci_digest_mismatch: manifest declared {}, computed {}",
-                                    expected, computed
+                                    "oci_layer_too_large_post_pull: actual layer is {} bytes, \
+                                 cap is {} (manifest may have lied about declared size)",
+                                    layer.data.len(),
+                                    layer_cap
                                 );
                                 ::tracing::error!(
                                     module_uri = %req.module_uri,
-                                    expected = %expected,
-                                    computed = %computed,
-                                    "OCI layer digest mismatch — refusing to execute"
+                                    actual_size = layer.data.len(),
+                                    cap_bytes = layer_cap,
+                                    "OCI layer exceeds cap post-pull — refusing to execute or cache"
                                 );
                                 _span.end_error(&err);
                                 return JobResult {
@@ -2018,97 +1908,98 @@ async fn execute_job(
                                     worker_id: String::new(),
                                 };
                             }
-                            LayerVerdict::AcceptedUnverified => {
-                                // M2 (2026-05-22): refuse to execute
-                                // bytes that lack a manifest layer
-                                // descriptor by default. Previously
-                                // accepted with a WARN; that meant a
-                                // compromised registry could serve a
-                                // malformed manifest with arbitrary
-                                // bytes and the worker would run them
-                                // (the sigstore + size caps still
-                                // ran, but no content-addressable
-                                // attestation tied the bytes to the
-                                // registry's claim about them).
-                                //
-                                // Operators with legacy registries
-                                // that genuinely produce manifests
-                                // without layer descriptors can set
-                                // `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1`
-                                // to restore the old behaviour, at the
-                                // cost of accepting unverified bytes.
-                                //
-                                // H-5 (2026-05-23, wasm-security review):
-                                // the env var was a single-knob bypass
-                                // of the entire layer-digest gate. Even
-                                // with `TALOS_SIGSTORE_REQUIRED=required`
-                                // and `is_production() == true`, an
-                                // operator who toggled this on rendered
-                                // the integrity contract void with no
-                                // safety net. Defense-in-depth fix: the
-                                // env override is now refused whenever
-                                // Sigstore is `Required` OR the process
-                                // is in production. Operators on legacy
-                                // registries must downgrade Sigstore
-                                // policy AND/OR move out of production
-                                // mode to use it — making the trade-off
-                                // explicit rather than hiding it behind
-                                // one toggle.
-                                let accept_env =
-                                    std::env::var("TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS")
-                                        .ok()
-                                        .as_deref()
-                                        == Some("1");
-                                let prod = talos_config::is_production();
-                                let sigstore_required = matches!(
-                                    SigstorePolicy::from_env(),
-                                    SigstorePolicy::Required
-                                );
-                                if accept_env && !prod && !sigstore_required {
-                                    ::tracing::warn!(
-                                        module_uri = %req.module_uri,
-                                        "OCI manifest had no layer descriptor — \
-                                         accepting bytes unverified \
-                                         (TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1, \
-                                         dev mode, sigstore not Required)"
-                                    );
-                                    _span.add_event("oci_pull_success_unverified");
-                                    found_bytes = Some(layer.data);
-                                } else {
-                                    let err = if accept_env && (prod || sigstore_required) {
-                                        // Operator tried to use the bypass in an
-                                        // environment that disallows it — call out
-                                        // the conflict explicitly so the operator
-                                        // can choose to downgrade Sigstore policy
-                                        // or move out of production mode if the
-                                        // legacy-registry path is genuinely needed.
-                                        ::tracing::error!(
-                                            module_uri = %req.module_uri,
-                                            prod, sigstore_required,
-                                            "OCI manifest had no layer descriptor AND \
-                                             TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 was \
-                                             set in a stricter context — refusing the bypass"
-                                        );
-                                        "oci_manifest_missing_layer_descriptor: \
-                                         registry returned a manifest with no \
-                                         layer digest. TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
-                                         is REFUSED in production and when sigstore \
-                                         policy is Required — fix the registry or \
-                                         relax both gates before using the bypass."
+                            // H1: prefer the digest we already learned from
+                            // the pre-pull manifest fetch (`expected_layer_digest`,
+                            // captured in the outer scope). Falling back to the
+                            // pull-response's `image.manifest.layers[0].digest`
+                            // covers the (rare) path where the pre-fetch failed
+                            // but the full pull succeeded; both shapes flow
+                            // through the same `verify_oci_layer` check.
+                            let pull_response_digest = image
+                                .manifest
+                                .as_ref()
+                                .and_then(|m| m.layers.first())
+                                .map(|d| d.digest.clone());
+                            let effective_digest =
+                                expected_layer_digest.clone().or(pull_response_digest);
+                            match verify_oci_layer(&layer.data, effective_digest.as_deref()) {
+                                LayerVerdict::Verified { digest } => {
+                                    _span.set_attribute("oci_layer_digest", digest);
+                                    _span.add_event("oci_pull_success");
+
+                                    // Populate the Redis cache so the next pull of
+                                    // this layer-digest short-circuits the registry
+                                    // round-trip. TTL bounds growth — without it,
+                                    // cache size scales monotonically with distinct
+                                    // digests ever seen. Tag repoints produce new
+                                    // digests and new cache entries; old entries
+                                    // expire on their own TTL.
+                                    //
+                                    // SECURITY: only cache when both layers
+                                    // of attestation passed in THIS pull —
+                                    // sigstore signature AND layer digest.
+                                    // The digest check is already a
+                                    // precondition of this `Verified` arm;
+                                    // the sigstore check is gated below.
+                                    // Caching on a sigstore-Audit failure
+                                    // would poison the cache so future
+                                    // pulls bypass verification entirely
+                                    // (cache hits short-circuit the OCI
+                                    // path). Skipping the SET keeps the
+                                    // bytes from being served to *other*
+                                    // jobs while still honouring the
+                                    // operator-chosen Audit-mode intent
+                                    // for THIS execution.
+                                    //
+                                    // The cache write only happens when we
+                                    // actually have a digest-keyed `redis_key`
+                                    // (set above). Without one, there's no
+                                    // canonical key for future re-verification —
+                                    // skipping the write is correct.
+                                    if sigstore_pass_in_this_run {
+                                        if let Some(key) = redis_key.as_deref() {
+                                            if let Some(redis_client) = runtime.redis_client() {
+                                                if let Ok(mut conn) = redis_client
+                                                    .get_multiplexed_async_connection()
+                                                    .await
+                                                {
+                                                    let _: Result<(), _> = redis::cmd("SET")
+                                                        .arg(key)
+                                                        .arg(&layer.data)
+                                                        .arg("EX")
+                                                        .arg(OCI_CACHE_TTL_SECS)
+                                                        .query_async(&mut conn)
+                                                        .await;
+                                                }
+                                            }
+                                        }
                                     } else {
-                                        ::tracing::error!(
+                                        ::tracing::info!(
                                             module_uri = %req.module_uri,
-                                            "OCI manifest had no layer descriptor — \
-                                             refusing to execute (M2 hardening)"
+                                            "OCI bytes attested by digest only \
+                                             (sigstore failed in audit mode) — \
+                                             skipping cache write so future pulls \
+                                             re-verify against the registry"
                                         );
-                                        "oci_manifest_missing_layer_descriptor: \
-                                         registry returned a manifest with no \
-                                         layer digest — refusing to execute. Set \
-                                         TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
-                                         to allow legacy registries (dev only, \
-                                         sigstore not Required)."
-                                    };
-                                    _span.end_error(err);
+                                    }
+
+                                    // Fresh pull with Sigstore + digest checks both
+                                    // passed in THIS run — attested.
+                                    bytes_attested_in_this_run = true;
+                                    found_bytes = Some(layer.data);
+                                }
+                                LayerVerdict::DigestMismatch { expected, computed } => {
+                                    let err = format!(
+                                        "oci_digest_mismatch: manifest declared {}, computed {}",
+                                        expected, computed
+                                    );
+                                    ::tracing::error!(
+                                        module_uri = %req.module_uri,
+                                        expected = %expected,
+                                        computed = %computed,
+                                        "OCI layer digest mismatch — refusing to execute"
+                                    );
+                                    _span.end_error(&err);
                                     return JobResult {
                                         job_id: req.job_id,
                                         status: JobStatus::Failed,
@@ -2120,17 +2011,119 @@ async fn execute_job(
                                         worker_id: String::new(),
                                     };
                                 }
+                                LayerVerdict::AcceptedUnverified => {
+                                    // M2 (2026-05-22): refuse to execute
+                                    // bytes that lack a manifest layer
+                                    // descriptor by default. Previously
+                                    // accepted with a WARN; that meant a
+                                    // compromised registry could serve a
+                                    // malformed manifest with arbitrary
+                                    // bytes and the worker would run them
+                                    // (the sigstore + size caps still
+                                    // ran, but no content-addressable
+                                    // attestation tied the bytes to the
+                                    // registry's claim about them).
+                                    //
+                                    // Operators with legacy registries
+                                    // that genuinely produce manifests
+                                    // without layer descriptors can set
+                                    // `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1`
+                                    // to restore the old behaviour, at the
+                                    // cost of accepting unverified bytes.
+                                    //
+                                    // H-5 (2026-05-23, wasm-security review):
+                                    // the env var was a single-knob bypass
+                                    // of the entire layer-digest gate. Even
+                                    // with `TALOS_SIGSTORE_REQUIRED=required`
+                                    // and `is_production() == true`, an
+                                    // operator who toggled this on rendered
+                                    // the integrity contract void with no
+                                    // safety net. Defense-in-depth fix: the
+                                    // env override is now refused whenever
+                                    // Sigstore is `Required` OR the process
+                                    // is in production. Operators on legacy
+                                    // registries must downgrade Sigstore
+                                    // policy AND/OR move out of production
+                                    // mode to use it — making the trade-off
+                                    // explicit rather than hiding it behind
+                                    // one toggle.
+                                    let accept_env =
+                                        std::env::var("TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS")
+                                            .ok()
+                                            .as_deref()
+                                            == Some("1");
+                                    let prod = talos_config::is_production();
+                                    let sigstore_required = matches!(
+                                        SigstorePolicy::from_env(),
+                                        SigstorePolicy::Required
+                                    );
+                                    if accept_env && !prod && !sigstore_required {
+                                        ::tracing::warn!(
+                                            module_uri = %req.module_uri,
+                                            "OCI manifest had no layer descriptor — \
+                                             accepting bytes unverified \
+                                             (TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1, \
+                                             dev mode, sigstore not Required)"
+                                        );
+                                        _span.add_event("oci_pull_success_unverified");
+                                        found_bytes = Some(layer.data);
+                                    } else {
+                                        let err = if accept_env && (prod || sigstore_required) {
+                                            // Operator tried to use the bypass in an
+                                            // environment that disallows it — call out
+                                            // the conflict explicitly so the operator
+                                            // can choose to downgrade Sigstore policy
+                                            // or move out of production mode if the
+                                            // legacy-registry path is genuinely needed.
+                                            ::tracing::error!(
+                                                module_uri = %req.module_uri,
+                                                prod, sigstore_required,
+                                                "OCI manifest had no layer descriptor AND \
+                                                 TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 was \
+                                                 set in a stricter context — refusing the bypass"
+                                            );
+                                            "oci_manifest_missing_layer_descriptor: \
+                                         registry returned a manifest with no \
+                                         layer digest. TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
+                                         is REFUSED in production and when sigstore \
+                                         policy is Required — fix the registry or \
+                                         relax both gates before using the bypass."
+                                        } else {
+                                            ::tracing::error!(
+                                                module_uri = %req.module_uri,
+                                                "OCI manifest had no layer descriptor — \
+                                                 refusing to execute (M2 hardening)"
+                                            );
+                                            "oci_manifest_missing_layer_descriptor: \
+                                         registry returned a manifest with no \
+                                         layer digest — refusing to execute. Set \
+                                         TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
+                                         to allow legacy registries (dev only, \
+                                         sigstore not Required)."
+                                        };
+                                        _span.end_error(err);
+                                        return JobResult {
+                                            job_id: req.job_id,
+                                            status: JobStatus::Failed,
+                                            output_payload: serde_json::json!({"error": err}),
+                                            logs: vec![],
+                                            execution_time_ms: start.elapsed().as_millis() as u64,
+                                            signature: vec![],
+                                            result_nonce: String::new(),
+                                            worker_id: String::new(),
+                                        };
+                                    }
+                                }
                             }
                         }
                     }
+                    Err(e) => {
+                        ::tracing::warn!(module_uri = %req.module_uri, error = %e, "Failed to pull WASM artifact from OCI registry");
+                        let err_msg = format!("oci_pull_error: {}", e);
+                        let sanitized_error = sanitize_error_message(&err_msg);
+                        _span.add_event(&sanitized_error);
+                    }
                 }
-                Err(e) => {
-                    ::tracing::warn!(module_uri = %req.module_uri, error = %e, "Failed to pull WASM artifact from OCI registry");
-                    let err_msg = format!("oci_pull_error: {}", e);
-                    let sanitized_error = sanitize_error_message(&err_msg);
-                    _span.add_event(&sanitized_error);
-                }
-            }
             } // end `if found_bytes.is_none()` cache-miss block
         }
 
@@ -2757,11 +2750,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                    let version_line = stdout
-                        .lines()
-                        .next()
-                        .unwrap_or("(unknown)")
-                        .to_string();
+                    let version_line = stdout.lines().next().unwrap_or("(unknown)").to_string();
 
                     // M5 (2026-05-22): version-pin cosign so a swapped-in
                     // older binary (predating critical CVE fixes) or a
@@ -2786,8 +2775,7 @@ async fn main() -> anyhow::Result<()> {
                     match parse_cosign_version(&stdout) {
                         Some((maj, min, patch)) => {
                             let parsed_observed = (maj, min, patch);
-                            let parsed_min = parse_semver_triple(&min_version)
-                                .unwrap_or((2, 0, 0));
+                            let parsed_min = parse_semver_triple(&min_version).unwrap_or((2, 0, 0));
                             if parsed_observed < parsed_min {
                                 let msg = format!(
                                     "cosign version {}.{}.{} is below required minimum {} \
@@ -2945,8 +2933,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let sigstore_policy_at_startup = SigstorePolicy::from_env();
         if sigstore_policy_at_startup != SigstorePolicy::Disabled {
-            let regexp = std::env::var("TALOS_SIGSTORE_IDENTITY_REGEXP")
-                .unwrap_or_default();
+            let regexp = std::env::var("TALOS_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
             match validate_sigstore_identity_regexp(&regexp) {
                 Ok(()) => {
                     ::tracing::info!(
@@ -3675,7 +3662,7 @@ mod sanitize_error_message_tests {
         // many cloud default subnets. Pre-MCP-530 these leaked.
         for ip in &[
             "172.16.0.1",
-            "172.17.0.1",  // docker0 default
+            "172.17.0.1", // docker0 default
             "172.20.5.10",
             "172.28.0.42",
             "172.31.255.254",
@@ -3722,10 +3709,7 @@ mod sanitize_error_message_tests {
         // 100.64.0.0/10 (100.64.0.0 – 100.127.255.255)
         for ip in &["100.64.0.1", "100.100.5.7", "100.127.255.254"] {
             let s = sanitize_error_message(&format!("origin {} ", ip));
-            assert!(
-                s.contains("[INTERNAL_IP]"),
-                "CGNAT {ip} must be redacted"
-            );
+            assert!(s.contains("[INTERNAL_IP]"), "CGNAT {ip} must be redacted");
         }
         // Boundary: 100.63.x.x and 100.128.x.x are OUTSIDE CGNAT.
         for ip in &["100.63.0.1", "100.128.0.1"] {
@@ -3745,10 +3729,7 @@ mod sanitize_error_message_tests {
         // loopback.
         for ip in &["127.0.0.1", "127.0.0.53", "127.0.1.1", "127.255.255.254"] {
             let s = sanitize_error_message(&format!("connect {} refused", ip));
-            assert!(
-                s.contains("[INTERNAL_IP]"),
-                "127/8 {ip} must be redacted"
-            );
+            assert!(s.contains("[INTERNAL_IP]"), "127/8 {ip} must be redacted");
         }
     }
 
@@ -3903,10 +3884,22 @@ mod oci_layer_tests {
         // sometimes add whitespace or uppercase. The pure parser
         // normalises both. Pre-fix, `Required` was case-sensitive and
         // " REQUIRED" silently mapped to Disabled.
-        assert_eq!(SigstorePolicy::from_env_str("REQUIRED"), SigstorePolicy::Required);
-        assert_eq!(SigstorePolicy::from_env_str("Required"), SigstorePolicy::Required);
-        assert_eq!(SigstorePolicy::from_env_str("  audit  "), SigstorePolicy::Audit);
-        assert_eq!(SigstorePolicy::from_env_str("\tDISABLED\n"), SigstorePolicy::Disabled);
+        assert_eq!(
+            SigstorePolicy::from_env_str("REQUIRED"),
+            SigstorePolicy::Required
+        );
+        assert_eq!(
+            SigstorePolicy::from_env_str("Required"),
+            SigstorePolicy::Required
+        );
+        assert_eq!(
+            SigstorePolicy::from_env_str("  audit  "),
+            SigstorePolicy::Audit
+        );
+        assert_eq!(
+            SigstorePolicy::from_env_str("\tDISABLED\n"),
+            SigstorePolicy::Disabled
+        );
     }
 
     #[test]
@@ -3915,9 +3908,16 @@ mod oci_layer_tests {
         // is ambiguous (empty / unrecognised). Every recognised value —
         // including the Disabled aliases — counts as explicit.
         for v in [
-            "required", "true", "1",
-            "audit", "warn",
-            "disabled", "off", "0", "false", "no",
+            "required",
+            "true",
+            "1",
+            "audit",
+            "warn",
+            "disabled",
+            "off",
+            "0",
+            "false",
+            "no",
             "  REQUIRED  ", // case + whitespace normalisation
         ] {
             assert!(
@@ -3928,7 +3928,15 @@ mod oci_layer_tests {
 
         // The silent-default footgun cases the production-gate
         // protects against.
-        for v in ["", "  ", "\t\n", "yes-please", "true-ish", "maybe", "off-ish"] {
+        for v in [
+            "",
+            "  ",
+            "\t\n",
+            "yes-please",
+            "true-ish",
+            "maybe",
+            "off-ish",
+        ] {
             assert!(
                 !SigstorePolicy::raw_env_is_explicit(v),
                 "`{v}` must be considered NOT explicit (production-gate target)"
@@ -3960,7 +3968,10 @@ mod oci_layer_tests {
         for v in ["required", "audit", "disabled"] {
             std::env::set_var("TALOS_SIGSTORE_REQUIRED", v);
             let result = enforce_production_sigstore_policy_explicit();
-            assert!(result.is_ok(), "explicit `{v}` must pass the gate — got {result:?}");
+            assert!(
+                result.is_ok(),
+                "explicit `{v}` must pass the gate — got {result:?}"
+            );
         }
         std::env::remove_var("TALOS_SIGSTORE_REQUIRED");
     }
@@ -3994,9 +4005,18 @@ mod oci_layer_tests {
                 "error message must name the env var so operators find the fix — got `{err_msg}`"
             );
             // Actionable error: must mention all three remediation paths.
-            assert!(err_msg.contains("required"), "error must mention `required` option");
-            assert!(err_msg.contains("audit"), "error must mention `audit` option");
-            assert!(err_msg.contains("disabled"), "error must mention `disabled` option");
+            assert!(
+                err_msg.contains("required"),
+                "error must mention `required` option"
+            );
+            assert!(
+                err_msg.contains("audit"),
+                "error must mention `audit` option"
+            );
+            assert!(
+                err_msg.contains("disabled"),
+                "error must mention `disabled` option"
+            );
         }
 
         // And the converse: setting an explicit value in production
@@ -4116,7 +4136,8 @@ mod oci_layer_tests {
         // The CLAUDE.md guidance is explicit: a workflow-URL pattern
         // missing the trailing `@` is spoofable via a fork repo named
         // `workflow.yml-evil.yml`. This test guards that policy.
-        let pattern = "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml";
+        let pattern =
+            "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml";
         assert_eq!(
             validate_sigstore_identity_regexp(pattern),
             Err(SigstoreRegexpRejection::MissingWorkflowAnchor)
@@ -4125,7 +4146,8 @@ mod oci_layer_tests {
 
     #[test]
     fn sigstore_regexp_workflow_pattern_with_at_anchor_is_accepted() {
-        let pattern = "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml@";
+        let pattern =
+            "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml@";
         assert!(
             validate_sigstore_identity_regexp(pattern).is_ok(),
             "well-formed workflow pattern with @ anchor should pass: got {:?}",
@@ -4152,9 +4174,7 @@ mod oci_layer_tests {
         // providers, or other identity formats are out of scope for
         // that specific check — they get the regex-validity and
         // catchall checks only.
-        assert!(
-            validate_sigstore_identity_regexp("^https://gitlab\\.com/owner/talos/").is_ok()
-        );
+        assert!(validate_sigstore_identity_regexp("^https://gitlab\\.com/owner/talos/").is_ok());
     }
 
     // ─── L-14: github.com permissive-pattern anchoring ─────────────────────
@@ -4206,8 +4226,7 @@ mod oci_layer_tests {
         // Some orgs/repos legitimately contain `.` — `my.org` or
         // `my-tool.io`. Escaped `\.` is a literal dot and should NOT
         // trip the unpinned-wildcard check.
-        let pattern =
-            "^https://github\\.com/my\\.org/my\\.repo/\\.github/workflows/publish\\.yml@";
+        let pattern = "^https://github\\.com/my\\.org/my\\.repo/\\.github/workflows/publish\\.yml@";
         assert!(
             validate_sigstore_identity_regexp(pattern).is_ok(),
             "escaped literal dot in owner/repo should pass: {:?}",
@@ -4248,8 +4267,7 @@ mod oci_layer_tests {
     // drift hole.
     #[test]
     fn sigstore_regexp_unanchored_https_pattern_is_rejected() {
-        let pattern =
-            "https://github\\.com/owner/talos/\\.github/workflows/publish\\.yml@";
+        let pattern = "https://github\\.com/owner/talos/\\.github/workflows/publish\\.yml@";
         assert_eq!(
             validate_sigstore_identity_regexp(pattern),
             Err(SigstoreRegexpRejection::MissingStartAnchor),
@@ -4260,8 +4278,7 @@ mod oci_layer_tests {
     #[test]
     fn sigstore_regexp_anchored_https_pattern_is_accepted() {
         // Confirm the canonical form still passes after the new check.
-        let pattern =
-            "^https://github\\.com/owner/talos/\\.github/workflows/publish\\.yml@";
+        let pattern = "^https://github\\.com/owner/talos/\\.github/workflows/publish\\.yml@";
         assert!(
             validate_sigstore_identity_regexp(pattern).is_ok(),
             "anchored https:// pattern must pass: {:?}",
@@ -4304,8 +4321,7 @@ mod oci_layer_tests {
 
     #[test]
     fn manifest_size_one_byte_over_cap_is_rejected() {
-        let verdict =
-            check_manifest_layer_sizes(&[64 * 1024 * 1024 + 1], 64 * 1024 * 1024);
+        let verdict = check_manifest_layer_sizes(&[64 * 1024 * 1024 + 1], 64 * 1024 * 1024);
         assert!(
             matches!(verdict, ManifestSizeVerdict::Oversized { .. }),
             "should reject when 1 byte over cap; got {verdict:?}"
@@ -4470,11 +4486,7 @@ mod oci_layer_tests {
         // SECURITY: an attacker substituted `msg.reply` — the worker
         // MUST publish to the signed value, not the wire value.
         let jid = uuid::Uuid::new_v4();
-        let r = pick_trusted_reply_topic(
-            jid,
-            Some("_INBOX.legit"),
-            Some("talos.admin.commands"),
-        );
+        let r = pick_trusted_reply_topic(jid, Some("_INBOX.legit"), Some("talos.admin.commands"));
         assert_eq!(
             r.as_deref(),
             Some("_INBOX.legit"),

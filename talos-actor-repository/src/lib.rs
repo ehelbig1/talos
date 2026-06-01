@@ -875,11 +875,10 @@ impl ActorRepository {
     /// satisfy the L T4-2 SQL ownership gate without inlining a raw
     /// `SELECT user_id FROM actors` (which the structural lint flags).
     pub async fn get_actor_owner_user_id(&self, actor_id: Uuid) -> Result<Option<Uuid>> {
-        let owner: Option<Uuid> =
-            sqlx::query_scalar("SELECT user_id FROM actors WHERE id = $1")
-                .bind(actor_id)
-                .fetch_optional(&self.db_pool)
-                .await?;
+        let owner: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM actors WHERE id = $1")
+            .bind(actor_id)
+            .fetch_optional(&self.db_pool)
+            .await?;
         Ok(owner)
     }
 
@@ -1196,8 +1195,8 @@ impl ActorRepository {
         .await?;
 
         Ok(match parent_root {
-            Some((Some(root),)) => Some(root),  // parent has an explicit root → inherit it
-            _ => Some(parent_exec_id),          // parent row missing or root col NULL → parent IS the root
+            Some((Some(root),)) => Some(root), // parent has an explicit root → inherit it
+            _ => Some(parent_exec_id), // parent row missing or root col NULL → parent IS the root
         })
     }
 
@@ -1977,13 +1976,12 @@ impl ActorRepository {
         new_actor_id: Uuid,
         source_actor_id: Uuid,
     ) -> Result<i64> {
-        let owners: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM actors WHERE id = ANY($1) AND user_id = $2",
-        )
-        .bind([new_actor_id, source_actor_id].as_slice())
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await?;
+        let owners: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM actors WHERE id = ANY($1) AND user_id = $2")
+                .bind([new_actor_id, source_actor_id].as_slice())
+                .bind(user_id)
+                .fetch_all(&self.db_pool)
+                .await?;
         if owners.len() != 2 {
             anyhow::bail!(
                 "clone_actor_memories: both actors (source={source_actor_id}, target={new_actor_id}) \

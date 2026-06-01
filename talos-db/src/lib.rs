@@ -167,10 +167,7 @@ impl<'a> UnitOfWork<'a> {
     /// (same scoping + `SET LOCAL ROLE` semantics as
     /// [`begin_tenant_read_scoped`]). Pass the user's accessible org ids
     /// in the scope so org-shared rows remain visible.
-    pub async fn begin(
-        pool: &'a Pool<Postgres>,
-        scope: &TenantReadScope,
-    ) -> anyhow::Result<Self> {
+    pub async fn begin(pool: &'a Pool<Postgres>, scope: &TenantReadScope) -> anyhow::Result<Self> {
         Ok(Self {
             tx: begin_tenant_read_scoped(pool, scope).await?,
         })
@@ -230,12 +227,11 @@ impl RlsRoleStatus {
 /// expected* (RFC 0004 M4). Cheap — one catalog lookup against
 /// `pg_roles` for `current_user`.
 pub async fn check_rls_role(pool: &Pool<Postgres>) -> anyhow::Result<RlsRoleStatus> {
-    let row: (bool, bool) = sqlx::query_as(
-        "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
-    )
-    .fetch_one(pool)
-    .await
-    .context("query current_user RLS attributes")?;
+    let row: (bool, bool) =
+        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
+            .fetch_one(pool)
+            .await
+            .context("query current_user RLS attributes")?;
     Ok(RlsRoleStatus {
         is_superuser: row.0,
         bypass_rls: row.1,
@@ -510,7 +506,6 @@ pub async fn init_read_replica_pool() -> Option<Pool<Postgres>> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod rls_role_prefix_tests {

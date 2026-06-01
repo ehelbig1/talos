@@ -164,9 +164,7 @@ impl SecretsQueries {
             Err(_) => {
                 // MCP-918: .extend_safe() — generic outer message is
                 // correct (underlying error logged server-side).
-                return Err(
-                    async_graphql::Error::new("Failed to fetch audit log").extend_safe(),
-                );
+                return Err(async_graphql::Error::new("Failed to fetch audit log").extend_safe());
             }
         };
 

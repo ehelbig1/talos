@@ -265,6 +265,9 @@ mod redaction_tests {
             !dbg.contains("ya29.LIVE_ACCESS_TOKEN_ABCDEF"),
             "access_token leaked: {dbg}"
         );
-        assert!(dbg.contains("[REDACTED]"), "redaction marker missing: {dbg}");
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "redaction marker missing: {dbg}"
+        );
     }
 }

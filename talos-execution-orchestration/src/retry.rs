@@ -36,10 +36,7 @@ impl ExecutionOrchestrationService {
     /// The execution row's terminal status is updated by the spawned
     /// task once the run completes; callers poll
     /// `get_execution_status` to observe the result.
-    pub async fn retry(
-        &self,
-        input: RetryInput,
-    ) -> Result<ExecutionOutcome, OrchestrationError> {
+    pub async fn retry(&self, input: RetryInput) -> Result<ExecutionOutcome, OrchestrationError> {
         let RetryInput {
             execution_id,
             user_id,
@@ -278,4 +275,3 @@ impl ExecutionOrchestrationService {
         })
     }
 }
-

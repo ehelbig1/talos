@@ -689,9 +689,7 @@ async fn handle_generate_typed_scaffold(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "capability_world must be a string (e.g. 'agent-node'), got {kind}"
-                    ),
+                    &format!("capability_world must be a string (e.g. 'agent-node'), got {kind}"),
                 );
             }
         },
@@ -800,7 +798,11 @@ async fn handle_generate_typed_scaffold(
                     "generate_typed_scaffold module ownership check failed: {:#}",
                     e
                 );
-                return mcp_error(req_id, -32000, "Failed to verify source_module_id ownership");
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Failed to verify source_module_id ownership",
+                );
             }
         }
         match capture_scrubbed_samples(state, uid, src_id).await {
@@ -905,9 +907,7 @@ async fn handle_compile_custom_sandbox(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "capability_world must be a string (e.g. 'agent-node'), got {kind}"
-                    ),
+                    &format!("capability_world must be a string (e.g. 'agent-node'), got {kind}"),
                 );
             }
         },
@@ -969,8 +969,7 @@ async fn handle_compile_custom_sandbox(
             // rank lookup; unknown ceilings pin to rank 0 so this
             // compile-time gate also fails closed on legacy/malformed
             // actor.max_capability_world.
-            let max_rank = talos_capability_world::actor_world_rank_strict(&max_world)
-                .unwrap_or(0);
+            let max_rank = talos_capability_world::actor_world_rank_strict(&max_world).unwrap_or(0);
             let req_rank = crate::actor::world_rank(capability_world);
             // Wasm-security review 2026-05-28 (HIGH): gate on the partial-order
             // lattice via the canonical `ceiling_permits` helper, not the linear
@@ -1051,7 +1050,8 @@ async fn handle_compile_custom_sandbox(
     // MCP-243: use trimmed variant so `allowed_secrets: ["   "]` doesn't
     // silently satisfy the "non-empty allowlist" check while persisting
     // a no-match allowlist entry.
-    let pre_allowed_secrets = crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
+    let pre_allowed_secrets =
+        crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
     if pre_allowed_secrets.is_empty() && inner_rust_code.contains("vault://") {
         return mcp_error(
             req_id,
@@ -1156,10 +1156,12 @@ async fn handle_compile_custom_sandbox(
 
             // Extract allowed_secrets, allowed_hosts, and allowed_methods from args
             // MCP-243: trimmed variant — security allowlist.
-            let allowed_secrets = crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
+            let allowed_secrets =
+                crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
             // deny-all by default — modules must declare hosts
             // MCP-243: trimmed variant — security allowlist.
-            let allowed_hosts = crate::utils::json_string_array_field_trimmed(args, "allowed_hosts");
+            let allowed_hosts =
+                crate::utils::json_string_array_field_trimmed(args, "allowed_hosts");
             let allowed_methods = crate::utils::json_string_array_field(args, "allowed_methods");
 
             // Guard: if the user supplied an explicit name, check for a name collision
@@ -1399,10 +1401,7 @@ async fn handle_run_sandbox(
     // (loud reject with kind named). Same MCP-291 family applied to
     // run_sandbox; matches the scaffold_actor / create_actor strict
     // parse for `max_capability_world`.
-    let capability_world = match args
-        .get("capability_world")
-        .or_else(|| args.get("world"))
-    {
+    let capability_world = match args.get("capability_world").or_else(|| args.get("world")) {
         None | Some(serde_json::Value::Null) => "minimal-node",
         Some(v) => match v.as_str() {
             Some(s) => s,
@@ -1411,9 +1410,7 @@ async fn handle_run_sandbox(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "capability_world must be a string (e.g. 'agent-node'), got {kind}"
-                    ),
+                    &format!("capability_world must be a string (e.g. 'agent-node'), got {kind}"),
                 );
             }
         },
@@ -1474,8 +1471,7 @@ async fn handle_run_sandbox(
             // MCP-462: actor-side strict rank lookup — same fix as
             // the compile path above (and MCP-461 in
             // workflow-authorization).
-            let max_rank = talos_capability_world::actor_world_rank_strict(&max_world)
-                .unwrap_or(0);
+            let max_rank = talos_capability_world::actor_world_rank_strict(&max_world).unwrap_or(0);
             let req_rank = crate::actor::world_rank(capability_world);
             // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate
             // (see `handle_compile_custom_sandbox` above).
@@ -1486,10 +1482,7 @@ async fn handle_run_sandbox(
                     &format!(
                         "Actor capability ceiling exceeded: actor's max world is '{}' (rank {}), \
                      but '{}' (rank {}) was requested.",
-                        max_world,
-                        max_rank,
-                        capability_world,
-                        req_rank,
+                        max_world, max_rank, capability_world, req_rank,
                     ),
                 );
             }
@@ -1833,11 +1826,9 @@ async fn handle_compile_template(
             if trimmed.len() > 200 {
                 return mcp_error(req_id, -32602, "name must be ≤ 200 characters");
             }
-            if let Err(resp) = crate::utils::validate_name_no_control_chars(
-                "name",
-                trimmed,
-                req_id.clone(),
-            ) {
+            if let Err(resp) =
+                crate::utils::validate_name_no_control_chars("name", trimmed, req_id.clone())
+            {
                 return resp;
             }
             Some(trimmed)
@@ -2086,10 +2077,7 @@ async fn handle_lint_sandbox(
     // `http::*` etc. failed lint with "use of undeclared crate"
     // — confusing when they thought they had requested a permissive
     // world.
-    let world = match args
-        .get("capability_world")
-        .or_else(|| args.get("world"))
-    {
+    let world = match args.get("capability_world").or_else(|| args.get("world")) {
         None | Some(serde_json::Value::Null) => "minimal",
         Some(v) => match v.as_str() {
             Some(s) => s,
@@ -2098,9 +2086,7 @@ async fn handle_lint_sandbox(
                 return Some(mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "capability_world must be a string (e.g. 'agent-node'), got {kind}"
-                    ),
+                    &format!("capability_world must be a string (e.g. 'agent-node'), got {kind}"),
                 ));
             }
         },
@@ -2338,9 +2324,7 @@ async fn handle_update_module_secrets(
                         return Some(mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "allowed_secrets[{i}] must be a string, got {kind}"
-                            ),
+                            &format!("allowed_secrets[{i}] must be a string, got {kind}"),
                         ));
                     }
                 }
@@ -2359,10 +2343,7 @@ async fn handle_update_module_secrets(
     // Validate paths: no empty (post-trim) strings, no path traversal,
     // no internal whitespace (vault paths are ASCII slug-style).
     for path in &allowed_secrets {
-        if path.is_empty()
-            || path.contains("..")
-            || path.chars().any(|c| c.is_whitespace())
-        {
+        if path.is_empty() || path.contains("..") || path.chars().any(|c| c.is_whitespace()) {
             return Some(mcp_error(
                 req_id,
                 -32602,
@@ -2501,9 +2482,7 @@ async fn handle_update_module_hosts(
                         return Some(mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "allowed_hosts[{i}] must be a string, got {kind}"
-                            ),
+                            &format!("allowed_hosts[{i}] must be a string, got {kind}"),
                         ));
                     }
                 }
@@ -2522,7 +2501,10 @@ async fn handle_update_module_hosts(
     // Validate: non-empty (post-trim), no path traversal, no scheme
     // prefix (must be a bare hostname). '*' is the only accepted wildcard.
     for host in &allowed_hosts {
-        if host.is_empty() || host.contains("..") || host.contains("://") || host.contains('/')
+        if host.is_empty()
+            || host.contains("..")
+            || host.contains("://")
+            || host.contains('/')
             || host.chars().any(|c| c.is_whitespace())
         {
             return Some(mcp_error(
@@ -2644,9 +2626,7 @@ async fn handle_update_module_methods(
                         return Some(mcp_error(
                             req_id,
                             -32602,
-                            &format!(
-                                "allowed_methods[{i}] must be a string, got {kind}"
-                            ),
+                            &format!("allowed_methods[{i}] must be a string, got {kind}"),
                         ));
                     }
                 }
@@ -3330,10 +3310,11 @@ async fn handle_replay_workflow_mode(
         Ok(v) => v,
         Err(resp) => return Some(resp),
     };
-    let timeout_secs = match crate::utils::validate_range_u64(args, "timeout_secs", 1, 120, 30, &req_id) {
-        Ok(v) => v,
-        Err(resp) => return Some(resp),
-    };
+    let timeout_secs =
+        match crate::utils::validate_range_u64(args, "timeout_secs", 1, 120, 30, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return Some(resp),
+        };
 
     let outcome = match state
         .replay_service
@@ -3418,9 +3399,7 @@ fn handle_get_rust_scaffold(req_id: Option<serde_json::Value>, args: &Value) -> 
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "capability_world must be a string (e.g. 'agent-node'), got {kind}"
-                    ),
+                    &format!("capability_world must be a string (e.g. 'agent-node'), got {kind}"),
                 );
             }
         },

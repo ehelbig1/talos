@@ -407,8 +407,16 @@ async fn handle_list_templates(
     //     platform-first) and drop subsequent duplicates by name. The
     //     `duplicate_count` field tells operators how many entries were
     //     collapsed so they can detect drift in the underlying registry.
-    const PLATFORM_CATEGORIES: &[&str] =
-        &["platform", "core", "io", "ai", "data", "monitoring", "communication", "integration"];
+    const PLATFORM_CATEGORIES: &[&str] = &[
+        "platform",
+        "core",
+        "io",
+        "ai",
+        "data",
+        "monitoring",
+        "communication",
+        "integration",
+    ];
 
     let is_platform = |cat: &str| -> bool { PLATFORM_CATEGORIES.contains(&cat) };
 
@@ -1566,8 +1574,7 @@ async fn handle_batch_delete_modules(
     let module_ids: Vec<uuid::Uuid> = match args.get("module_ids").and_then(|v| v.as_array()) {
         Some(arr) => {
             let mut ids = Vec::new();
-            let mut seen: std::collections::HashSet<uuid::Uuid> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
             for item in arr {
                 match item.as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
                     Some(id) => {
@@ -1795,11 +1802,9 @@ async fn handle_rename_module(
         Some(n) => n.trim(),
         None => return mcp_error(req_id, -32602, "Missing 'name' parameter"),
     };
-    if let Err(resp) = crate::utils::validate_name_no_control_chars(
-        "Module name",
-        new_name,
-        req_id.clone(),
-    ) {
+    if let Err(resp) =
+        crate::utils::validate_name_no_control_chars("Module name", new_name, req_id.clone())
+    {
         return resp;
     }
 
@@ -1995,10 +2000,8 @@ async fn handle_get_module_dependents(
     // workflows so the indirect projection can hydrate
     // `references_workflow` to `{id, name}` instead of a bare UUID.
     // Same MCP-44/66 pattern.
-    let direct_names: std::collections::HashMap<uuid::Uuid, String> = direct_rows
-        .iter()
-        .map(|r| (r.id, r.name.clone()))
-        .collect();
+    let direct_names: std::collections::HashMap<uuid::Uuid, String> =
+        direct_rows.iter().map(|r| (r.id, r.name.clone())).collect();
     let mut indirect_workflows: Vec<serde_json::Value> = Vec::new();
     let mut seen_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
     if let Ok(triples) = state
@@ -2107,8 +2110,9 @@ async fn handle_get_module_compatibility(
     // are NOT mutually compatible even though a linear rank would say so —
     // route through the canonical ceiling_permits, the same helper the
     // capability-grant gates use.
-    let (compatible, reason) = if !talos_capability_world::is_lattice_world(&module_world_normalized)
-    {
+    let (compatible, reason) = if !talos_capability_world::is_lattice_world(
+        &module_world_normalized,
+    ) {
         (
             false,
             format!("Unknown module world '{module_world_normalized}'. {known_worlds_msg}"),
@@ -2422,17 +2426,12 @@ async fn handle_list_module_catalog(
     // Server-side ceiling guards against pathological limit values.
     const MAX_LIMIT: u64 = 200;
     const DEFAULT_LIMIT: u64 = 50;
-    let limit = match crate::utils::validate_range_u64(
-        args,
-        "limit",
-        1,
-        MAX_LIMIT,
-        DEFAULT_LIMIT,
-        &req_id,
-    ) {
-        Ok(v) => v as usize,
-        Err(resp) => return resp,
-    };
+    let limit =
+        match crate::utils::validate_range_u64(args, "limit", 1, MAX_LIMIT, DEFAULT_LIMIT, &req_id)
+        {
+            Ok(v) => v as usize,
+            Err(resp) => return resp,
+        };
     // MCP-339 (2026-05-11): strict-parse `offset`. Pre-fix
     // `.and_then(|v| v.as_u64()).unwrap_or(0)` silently collapsed
     // wrong-type (`offset: "10"` string), fractional floats
@@ -2442,14 +2441,7 @@ async fn handle_list_module_catalog(
     // bound is needed; just reject malformed values loudly with the
     // observed kind named. Same direction-class as MCP-209 (list_
     // executions.offset).
-    let offset = match crate::utils::validate_range_u64(
-        args,
-        "offset",
-        0,
-        10_000,
-        0,
-        &req_id,
-    ) {
+    let offset = match crate::utils::validate_range_u64(args, "offset", 0, 10_000, 0, &req_id) {
         Ok(v) => v as usize,
         Err(resp) => return resp,
     };
@@ -2482,94 +2474,93 @@ async fn handle_list_module_catalog(
         CATALOG_CACHE
             .get_or_init(|| async move {
                 tokio::task::spawn_blocking(move || {
-            let mut items: Vec<serde_json::Value> = Vec::new();
-            if let Ok(read_dir) = std::fs::read_dir(&catalog_dir_owned) {
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let dir_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if dir_name.is_empty() {
-                        continue;
-                    }
+                    let mut items: Vec<serde_json::Value> = Vec::new();
+                    if let Ok(read_dir) = std::fs::read_dir(&catalog_dir_owned) {
+                        for entry in read_dir.flatten() {
+                            let path = entry.path();
+                            if !path.is_dir() {
+                                continue;
+                            }
+                            let dir_name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if dir_name.is_empty() {
+                                continue;
+                            }
 
-                    // Modules must have template.rs to be installable.
-                    let template_path = path.join("template.rs");
-                    if !template_path.exists() {
-                        continue;
-                    }
+                            // Modules must have template.rs to be installable.
+                            let template_path = path.join("template.rs");
+                            if !template_path.exists() {
+                                continue;
+                            }
 
-                    // talos.json is required for catalog entries. Directories that
-                    // only contain template.rs (e.g. example-node dev placeholders)
-                    // are intentionally excluded: without metadata they would appear
-                    // as null entries and inflate the catalog count inconsistently
-                    // with the node_templates DB count.
-                    let meta_path = path.join("talos.json");
-                    let meta_bytes = match std::fs::read(&meta_path) {
-                        Ok(b) => b,
-                        Err(_) => continue, // Skip dirs without talos.json
-                    };
-                    let mut item =
-                        serde_json::from_slice::<serde_json::Value>(&meta_bytes)
-                            .unwrap_or(serde_json::json!({}));
+                            // talos.json is required for catalog entries. Directories that
+                            // only contain template.rs (e.g. example-node dev placeholders)
+                            // are intentionally excluded: without metadata they would appear
+                            // as null entries and inflate the catalog count inconsistently
+                            // with the node_templates DB count.
+                            let meta_path = path.join("talos.json");
+                            let meta_bytes = match std::fs::read(&meta_path) {
+                                Ok(b) => b,
+                                Err(_) => continue, // Skip dirs without talos.json
+                            };
+                            let mut item = serde_json::from_slice::<serde_json::Value>(&meta_bytes)
+                                .unwrap_or(serde_json::json!({}));
 
-                    // Ensure the `name` field matches the directory (source of truth).
-                    if item.get("name").and_then(|v| v.as_str()).is_none() {
-                        if let Some(obj) = item.as_object_mut() {
-                            obj.insert("name".to_string(), serde_json::json!(dir_name));
-                        }
-                    }
-
-                    // If capability_world is missing from talos.json, read it from template.rs.
-                    if item.get("capability_world").is_none() {
-                        if let Ok(src) = std::fs::read_to_string(&template_path) {
-                            if let Some(world) = extract_world_from_source(&src) {
+                            // Ensure the `name` field matches the directory (source of truth).
+                            if item.get("name").and_then(|v| v.as_str()).is_none() {
                                 if let Some(obj) = item.as_object_mut() {
-                                    obj.insert(
-                                        "capability_world".to_string(),
-                                        serde_json::json!(world),
-                                    );
+                                    obj.insert("name".to_string(), serde_json::json!(dir_name));
                                 }
-                                // Also derive allowed_hosts if not set.
-                                if item.get("allowed_hosts").is_none() {
-                                    let hosts = default_allowed_hosts_for_world(&world);
-                                    if let Some(obj) = item.as_object_mut() {
-                                        obj.insert(
-                                            "allowed_hosts".to_string(),
-                                            serde_json::json!(hosts),
-                                        );
+                            }
+
+                            // If capability_world is missing from talos.json, read it from template.rs.
+                            if item.get("capability_world").is_none() {
+                                if let Ok(src) = std::fs::read_to_string(&template_path) {
+                                    if let Some(world) = extract_world_from_source(&src) {
+                                        if let Some(obj) = item.as_object_mut() {
+                                            obj.insert(
+                                                "capability_world".to_string(),
+                                                serde_json::json!(world),
+                                            );
+                                        }
+                                        // Also derive allowed_hosts if not set.
+                                        if item.get("allowed_hosts").is_none() {
+                                            let hosts = default_allowed_hosts_for_world(&world);
+                                            if let Some(obj) = item.as_object_mut() {
+                                                obj.insert(
+                                                    "allowed_hosts".to_string(),
+                                                    serde_json::json!(hosts),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
+
+                            items.push(item);
                         }
                     }
-
-                    items.push(item);
-                }
-            }
-            // Sort by category then name for stable output
-            items.sort_by(|a, b| {
-                let cat_a = a
-                    .get("category")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Uncategorized");
-                let cat_b = b
-                    .get("category")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Uncategorized");
-                let name_a = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let name_b = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                cat_a.cmp(cat_b).then(name_a.cmp(name_b))
-            });
-            items
-        })
-        .await
-        .unwrap_or_default()
+                    // Sort by category then name for stable output
+                    items.sort_by(|a, b| {
+                        let cat_a = a
+                            .get("category")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Uncategorized");
+                        let cat_b = b
+                            .get("category")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Uncategorized");
+                        let name_a = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let name_b = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        cat_a.cmp(cat_b).then(name_a.cmp(name_b))
+                    });
+                    items
+                })
+                .await
+                .unwrap_or_default()
             })
             .await
             .clone()
@@ -3375,11 +3366,7 @@ async fn handle_find_module_alternatives(
         .filter(|s| !s.is_empty())
     {
         Some(s) if s.chars().count() > 200 => {
-            return mcp_error(
-                req_id,
-                -32602,
-                "module_name must be ≤ 200 characters",
-            )
+            return mcp_error(req_id, -32602, "module_name must be ≤ 200 characters")
         }
         Some(s) => Some(s.to_string()),
         None => None,
@@ -3392,11 +3379,7 @@ async fn handle_find_module_alternatives(
         .filter(|s| !s.is_empty())
     {
         Some(s) if s.chars().count() > 500 => {
-            return mcp_error(
-                req_id,
-                -32602,
-                "capability must be ≤ 500 characters",
-            )
+            return mcp_error(req_id, -32602, "capability must be ≤ 500 characters")
         }
         Some(s) => Some(s.to_string()),
         None => None,
@@ -3439,9 +3422,7 @@ async fn handle_find_module_alternatives(
                         .to_string();
                     let meta_path = path.join("talos.json");
                     if let Ok(bytes) = std::fs::read(&meta_path) {
-                        if let Ok(meta) =
-                            serde_json::from_slice::<serde_json::Value>(&bytes)
-                        {
+                        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                             // Seeder uses display_name preferentially as node_templates.name
                             let dn = meta
                                 .get("display_name")
@@ -3660,9 +3641,7 @@ mod host_managed_access_tests {
     fn llm_node_world_surfaces_vault_keys() {
         let v = host_managed_access_for_world(Some("llm-node"));
         let keys = v.get("vault_keys").and_then(|x| x.as_array()).unwrap();
-        assert!(keys
-            .iter()
-            .any(|k| k.as_str() == Some("anthropic/api_key")));
+        assert!(keys.iter().any(|k| k.as_str() == Some("anthropic/api_key")));
     }
 
     #[test]
@@ -3701,4 +3680,3 @@ mod host_managed_access_tests {
         assert_eq!(a.get("external_hosts"), b.get("external_hosts"));
     }
 }
-

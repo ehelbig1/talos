@@ -101,8 +101,7 @@ pub fn validate_display_name<'a>(
     // Canonical single-line-name rule lives in `talos-validation`
     // (shared with the MCP surface). MCP-1151's newline rejection is
     // enforced there via `LineMode::SingleLine`.
-    talos_validation::validate_display_name(field_name, name, max_len)
-        .map_err(safe_validation_err)
+    talos_validation::validate_display_name(field_name, name, max_len).map_err(safe_validation_err)
 }
 
 /// Validates multi-line description content with focused 4-step discipline.
@@ -174,9 +173,7 @@ pub fn validate_safe_identifier(id: &str) -> Result<()> {
 
     // Cannot start or end with hyphen
     if id.starts_with('-') || id.ends_with('-') {
-        return Err(safe_err(
-            "Identifier cannot start or end with a hyphen",
-        ));
+        return Err(safe_err("Identifier cannot start or end with a hyphen"));
     }
 
     Ok(())
@@ -396,10 +393,7 @@ pub fn validate_json_field(field_name: &str, value: &str) -> Result<()> {
 
     // Validate JSON depth to prevent nested DoS attacks
     if let Err(e) = validate_json_depth(value) {
-        return Err(safe_err(format!(
-            "{}: {:?}",
-            field_name, e
-        )));
+        return Err(safe_err(format!("{}: {:?}", field_name, e)));
     }
 
     Ok(())
@@ -479,9 +473,7 @@ pub fn validate_safe_url(url: &str) -> Result<()> {
     }
 
     if url.len() > 2048 {
-        return Err(safe_err(
-            "URL exceeds maximum length of 2048 characters",
-        ));
+        return Err(safe_err("URL exceeds maximum length of 2048 characters"));
     }
 
     // Block dangerous URL schemes
@@ -713,7 +705,8 @@ mod additional_tests {
         for bad in ["/anthropic/api_key", "anthropic/api_key/", "/"] {
             let err = validate_vault_key_path(bad).unwrap_err();
             assert!(
-                err.message.contains("start or end with '/'") || err.message.contains("consecutive"),
+                err.message.contains("start or end with '/'")
+                    || err.message.contains("consecutive"),
                 "rejected {bad} for wrong reason: {}",
                 err.message
             );

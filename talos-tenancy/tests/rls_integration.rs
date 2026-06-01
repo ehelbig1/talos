@@ -41,7 +41,16 @@ macro_rules! pool_or_skip {
 /// Fresh minimal schema + the real policy + a non-superuser role (RLS only
 /// enforces for non-superusers / under SET ROLE). Returns (orgA, userA, exec_a,
 /// orgB, userB, exec_b).
-async fn setup(pool: &PgPool) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+async fn setup(
+    pool: &PgPool,
+) -> (
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+) {
     // Idempotent teardown so reruns start clean.
     pool.execute(
         "DROP TABLE IF EXISTS workflow_executions CASCADE; \
@@ -63,7 +72,9 @@ async fn setup(pool: &PgPool) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid
     sqlx::raw_sql(POLICY_MIGRATION).execute(pool).await.unwrap();
 
     // Non-superuser role for RLS enforcement (DROP first in case of a prior run).
-    let _ = pool.execute("DROP OWNED BY rls_test_user; DROP ROLE IF EXISTS rls_test_user;").await;
+    let _ = pool
+        .execute("DROP OWNED BY rls_test_user; DROP ROLE IF EXISTS rls_test_user;")
+        .await;
     pool.execute(
         "CREATE ROLE rls_test_user NOSUPERUSER; \
          GRANT USAGE ON SCHEMA public TO rls_test_user; \
@@ -72,15 +83,28 @@ async fn setup(pool: &PgPool) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid
     .await
     .unwrap();
 
-    let (org_a, user_a, exec_a) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-    let (org_b, user_b, exec_b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (org_a, user_a, exec_a) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
+    let (org_b, user_b, exec_b) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
     let wf_a = uuid::Uuid::new_v4();
     let wf_b = uuid::Uuid::new_v4();
 
     // Seeded as superuser (RLS bypassed for the writer).
     for (wf, org, user) in [(wf_a, org_a, user_a), (wf_b, org_b, user_b)] {
         sqlx::query("INSERT INTO workflows (id, org_id, user_id) VALUES ($1, $2, $3)")
-            .bind(wf).bind(org).bind(user).execute(pool).await.unwrap();
+            .bind(wf)
+            .bind(org)
+            .bind(user)
+            .execute(pool)
+            .await
+            .unwrap();
     }
     for (exec, wf, user, org) in [(exec_a, wf_a, user_a, org_a), (exec_b, wf_b, user_b, org_b)] {
         sqlx::query(
@@ -94,16 +118,16 @@ async fn setup(pool: &PgPool) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid
 
 /// Run a SELECT of all visible workflow_executions ids under the given read
 /// scope, as the non-superuser role so RLS is enforced.
-async fn visible_executions(
-    pool: &PgPool,
-    user_id: &str,
-    org_ids: &str,
-) -> Vec<uuid::Uuid> {
+async fn visible_executions(pool: &PgPool, user_id: &str, org_ids: &str) -> Vec<uuid::Uuid> {
     // One connection/tx: set the read-scope GUCs, SET ROLE to the non-superuser
     // (RLS enforced), query, then unwind.
     let mut conn = pool.acquire().await.unwrap();
-    conn.execute(format!("SET {READ_USER_GUC} = '{user_id}'").as_str()).await.unwrap();
-    conn.execute(format!("SET {READ_ORGS_GUC} = '{org_ids}'").as_str()).await.unwrap();
+    conn.execute(format!("SET {READ_USER_GUC} = '{user_id}'").as_str())
+        .await
+        .unwrap();
+    conn.execute(format!("SET {READ_ORGS_GUC} = '{org_ids}'").as_str())
+        .await
+        .unwrap();
     conn.execute("SET ROLE rls_test_user").await.unwrap();
 
     let rows = sqlx::query("SELECT id FROM workflow_executions ORDER BY id")
@@ -112,7 +136,9 @@ async fn visible_executions(
         .unwrap();
 
     conn.execute("RESET ROLE").await.unwrap();
-    rows.into_iter().map(|r| r.get::<uuid::Uuid, _>("id")).collect()
+    rows.into_iter()
+        .map(|r| r.get::<uuid::Uuid, _>("id"))
+        .collect()
 }
 
 #[tokio::test]
@@ -122,16 +148,26 @@ async fn rls_tenant_isolation_end_to_end() {
 
     // 1. Caller in org A sees ONLY org-A's execution — never org B's.
     let a = visible_executions(&pool, &user_a.to_string(), &org_a.to_string()).await;
-    assert!(a.contains(&exec_a), "caller A must see their org's execution");
+    assert!(
+        a.contains(&exec_a),
+        "caller A must see their org's execution"
+    );
     assert!(
         !a.contains(&exec_b),
         "TENANT LEAK: caller A saw org B's execution {exec_b}"
     );
-    assert_eq!(a.len(), 1, "caller A must see exactly their org's one execution");
+    assert_eq!(
+        a.len(),
+        1,
+        "caller A must see exactly their org's one execution"
+    );
 
     // 2. A caller scoped to org B sees ONLY org-B's execution (symmetry).
     let b = visible_executions(&pool, &uuid::Uuid::new_v4().to_string(), &org_b.to_string()).await;
-    assert!(b.contains(&exec_b) && !b.contains(&exec_a), "TENANT LEAK across orgs");
+    assert!(
+        b.contains(&exec_b) && !b.contains(&exec_a),
+        "TENANT LEAK across orgs"
+    );
 
     // 3. Permissive-when-unset: empty read scope (engine/analytics path) →
     //    the policy's `current_user_id IS NULL` clause makes it permissive, so

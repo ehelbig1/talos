@@ -78,9 +78,7 @@ impl SecurityMutations {
             // MCP-916 cont.: .extend_safe() — actionable validation error
             // would otherwise be scrubbed to "Internal server error" in
             // production.
-            return Err(async_graphql::Error::new(
-                "At least one scope is required",
-            ).extend_safe());
+            return Err(async_graphql::Error::new("At least one scope is required").extend_safe());
         }
 
         // MCP-769 (2026-05-13): canonical content discipline matching
@@ -104,12 +102,13 @@ impl SecurityMutations {
         if trimmed_name.is_empty() {
             return Err(async_graphql::Error::new(
                 "API key name must be 1–255 characters (non-whitespace)",
-            ).extend_safe());
+            )
+            .extend_safe());
         }
         if trimmed_name.len() > 255 {
-            return Err(async_graphql::Error::new(
-                "API key name must be 1–255 characters",
-            ).extend_safe());
+            return Err(
+                async_graphql::Error::new("API key name must be 1–255 characters").extend_safe(),
+            );
         }
         talos_validation::reject_control_chars(
             "API key name",
@@ -344,7 +343,10 @@ impl SecurityMutations {
         // response. Pre-fix the operator would see "N secrets re-encrypted"
         // and miss any failures buried in server logs.
         let message = if stats.failed == 0 {
-            format!("{} secrets re-encrypted with active DEK", stats.re_encrypted)
+            format!(
+                "{} secrets re-encrypted with active DEK",
+                stats.re_encrypted
+            )
         } else {
             format!(
                 "{} re-encrypted, {} failed (still wrapped with non-active DEK). \
@@ -391,12 +393,12 @@ impl SecurityMutations {
         // plaintext is wiped from this stack frame after `rotate_master_key`
         // moves the inner Vec into the new EnvKekProvider (which itself
         // stores the bytes in a `Zeroizing<Vec<u8>>` field).
-        let new_key_bytes = talos_secrets_manager::Zeroizing::new(
-            hex::decode(&new_master_key).map_err(|_| {
-                async_graphql::Error::new("New master key must be a valid hex string").extend_safe()
+        let new_key_bytes =
+            talos_secrets_manager::Zeroizing::new(hex::decode(&new_master_key).map_err(|_| {
+                async_graphql::Error::new("New master key must be a valid hex string")
                     .extend_safe()
-            })?,
-        );
+                    .extend_safe()
+            })?);
 
         let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
 
@@ -458,13 +460,10 @@ impl SecurityMutations {
         // MCP-700: deactivates current DEK, inserts new active DEK,
         // logs `DEK_ROTATED` audit row, invalidates the in-memory
         // cache). Passes `Some(user_id)` for audit attribution.
-        let new_dek_id = secrets_manager
-            .rotate_dek(user_id)
-            .await
-            .map_err(|e| {
-                tracing::error!("DEK rotation failed: {}", e);
-                async_graphql::Error::new("Key rotation failed").extend_safe()
-            })?;
+        let new_dek_id = secrets_manager.rotate_dek(user_id).await.map_err(|e| {
+            tracing::error!("DEK rotation failed: {}", e);
+            async_graphql::Error::new("Key rotation failed").extend_safe()
+        })?;
 
         // The frontend's `SecretsManager.tsx` toast displays the
         // returned integer as "Key rotated to version N". Use the
@@ -529,9 +528,10 @@ impl SecurityMutations {
 
         if let Some(ref ep) = otlp_endpoint {
             if ep.len() > 2048 {
-                return Err(async_graphql::Error::new(
-                    "otlp_endpoint must be ≤ 2048 characters",
-                ).extend_safe());
+                return Err(
+                    async_graphql::Error::new("otlp_endpoint must be ≤ 2048 characters")
+                        .extend_safe(),
+                );
             }
             // MCP-773 (2026-05-13): SSRF check on the caller-supplied
             // OTLP endpoint. Pre-fix the only validation was length.
@@ -568,7 +568,8 @@ impl SecurityMutations {
                 if let Err(reason) = talos_http_utils::ssrf::check_outbound_url_no_ssrf(ep) {
                     return Err(async_graphql::Error::new(format!(
                         "otlp_endpoint rejected: {reason}"
-                    )).extend_safe());
+                    ))
+                    .extend_safe());
                 }
             }
         }
@@ -581,7 +582,7 @@ impl SecurityMutations {
                 // MCP-916: extend_safe so the size-cap message survives
                 // the production scrubber (no whitelist-substring match).
                 return Err(
-                    async_graphql::Error::new("auth_headers must be ≤ 100 KB").extend_safe(),
+                    async_graphql::Error::new("auth_headers must be ≤ 100 KB").extend_safe()
                 );
             }
             if !headers.is_empty() {
@@ -594,16 +595,16 @@ impl SecurityMutations {
                 // trip ALWAYS failed and the (silently-swallowed) result was
                 // that authenticated audit streaming never worked. Both ends now
                 // share one helper so they cannot drift.
-                let (ciphertext, nonce) =
-                    talos_audit_ledger::encrypt_otlp_auth_headers(&headers, *user_id).map_err(
-                        |_| {
-                            // Opaque message — never leak crypto/internal detail.
-                            async_graphql::Error::new(
-                                "Failed to encrypt audit auth headers (is TALOS_MASTER_KEY configured?)",
-                            )
-                            .extend_safe()
-                        },
-                    )?;
+                let (ciphertext, nonce) = talos_audit_ledger::encrypt_otlp_auth_headers(
+                    &headers, *user_id,
+                )
+                .map_err(|_| {
+                    // Opaque message — never leak crypto/internal detail.
+                    async_graphql::Error::new(
+                        "Failed to encrypt audit auth headers (is TALOS_MASTER_KEY configured?)",
+                    )
+                    .extend_safe()
+                })?;
                 encrypted_headers = Some(ciphertext);
                 headers_nonce = Some(nonce);
             }

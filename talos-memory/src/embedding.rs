@@ -64,8 +64,8 @@ impl EmbeddingConfig {
         if api_key.is_none() && !explicit_url {
             return None;
         }
-        let model = env_nonempty("EMBEDDING_MODEL")
-            .unwrap_or_else(|| "text-embedding-3-small".to_string());
+        let model =
+            env_nonempty("EMBEDDING_MODEL").unwrap_or_else(|| "text-embedding-3-small".to_string());
         let dimensions = env_nonempty("EMBEDDING_DIMENSIONS")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(768);
@@ -335,15 +335,14 @@ pub async fn generate_embedding(text: &str) -> Option<Vec<f32>> {
 /// `request_timeout_secs()` is itself OnceLock-cached (see fn at
 /// line ~126) so reading it inside the LazyLock initialiser is
 /// equivalent to reading it once at first embed call.
-static EMBED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(request_timeout_secs()))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("talos-memory: failed to build embedding HTTP client (TLS init)")
-    });
+static EMBED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(request_timeout_secs()))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("talos-memory: failed to build embedding HTTP client (TLS init)")
+});
 
 async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Option<Vec<f32>> {
     // MCP-520: same Mode-B credential-leak class as the sibling

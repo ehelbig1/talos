@@ -40,10 +40,9 @@ static APPROVAL_GATE_NOTIFY_CLIENT: std::sync::LazyLock<reqwest::Client> =
         // L4: built via the shared helper so it carries the connect-time
         // ControllerSsrfResolver (DNS-rebinding TOCTOU close) alongside the
         // existing timeout / connect-timeout / no-redirect posture.
-        crate::ssrf_resolver::build_outbound_webhook_client("talos-approval-gate/1.0")
-            .expect(
-                "talos-mcp-handlers: failed to build approval-gate notification HTTP client (TLS init)",
-            )
+        crate::ssrf_resolver::build_outbound_webhook_client("talos-approval-gate/1.0").expect(
+            "talos-mcp-handlers: failed to build approval-gate notification HTTP client (TLS init)",
+        )
     });
 
 /// MCP-1002 (2026-05-15): single source of truth for the
@@ -95,7 +94,10 @@ fn is_plausible_semver(s: &str) -> bool {
     if parts.len() != 3 {
         return false;
     }
-    if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+    if !parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
         return false;
     }
     // Tail (pre-release / build metadata) — alphanumerics, hyphens, dots, plus.
@@ -857,9 +859,7 @@ pub async fn dispatch(
             Some(handle_delete_scratch_session(req_id, args, state, user_id).await)
         }
         "get_archive_policy" => Some(handle_get_archive_policy(req_id, state).await),
-        "set_archive_policy" => {
-            Some(handle_set_archive_policy(req_id, args, state, user_id).await)
-        }
+        "set_archive_policy" => Some(handle_set_archive_policy(req_id, args, state, user_id).await),
         "archive_executions" => Some(handle_archive_executions(req_id, args, state, user_id).await),
         "list_archived_executions" => {
             Some(handle_list_archived_executions(req_id, args, state, user_id).await)
@@ -886,8 +886,12 @@ pub async fn dispatch(
         }
         "list_published_modules" => Some(handle_list_published_modules(req_id, args, state).await),
         "archive_workflow" => Some(handle_archive_workflow(req_id, args, state, user_id).await),
-        "enable_workflow" => Some(handle_set_workflow_enabled(req_id, args, state, user_id, true).await),
-        "disable_workflow" => Some(handle_set_workflow_enabled(req_id, args, state, user_id, false).await),
+        "enable_workflow" => {
+            Some(handle_set_workflow_enabled(req_id, args, state, user_id, true).await)
+        }
+        "disable_workflow" => {
+            Some(handle_set_workflow_enabled(req_id, args, state, user_id, false).await)
+        }
         "star_module" => Some(handle_star_module(req_id, args, state, user_id).await),
         "get_config_suggestions" => {
             Some(handle_get_config_suggestions(req_id, args, state, user_id).await)
@@ -1074,8 +1078,7 @@ async fn handle_query_paginated(
             BLOCKED_TABLES_LIST
                 .iter()
                 .map(|t| {
-                    let pattern =
-                        format!(r"(?:^|[^a-z0-9_]){}(?:$|[^a-z0-9_])", regex::escape(t));
+                    let pattern = format!(r"(?:^|[^a-z0-9_]){}(?:$|[^a-z0-9_])", regex::escape(t));
                     let re = regex::Regex::new(&pattern)
                         .expect("BUG: BLOCKED_TABLES word-boundary regex must compile");
                     (*t, re)
@@ -1113,7 +1116,8 @@ async fn handle_query_paginated(
         }
     }
 
-    let page_size = match crate::utils::validate_range_i64(args, "page_size", 1, 1000, 100, &req_id) {
+    let page_size = match crate::utils::validate_range_i64(args, "page_size", 1, 1000, 100, &req_id)
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1383,11 +1387,9 @@ async fn handle_create_scratch_session(
     }
     // MCP-409/410 (2026-05-11): name-field control-char check via
     // the canonical helper. See utils::validate_name_no_control_chars.
-    if let Err(resp) = crate::utils::validate_name_no_control_chars(
-        "Session name",
-        session_name,
-        req_id.clone(),
-    ) {
+    if let Err(resp) =
+        crate::utils::validate_name_no_control_chars("Session name", session_name, req_id.clone())
+    {
         return resp;
     }
     // MCP-214 (2026-05-08): pre-fix `!c.is_empty()` accepted
@@ -1397,11 +1399,7 @@ async fn handle_create_scratch_session(
     // the same pattern as MCP-209 lint_sandbox.
     let code = match args.get("code").and_then(|v| v.as_str()) {
         Some(c) if c.trim().is_empty() => {
-            return mcp_error(
-                req_id,
-                -32602,
-                "code must be non-empty and non-whitespace",
-            )
+            return mcp_error(req_id, -32602, "code must be non-empty and non-whitespace")
         }
         Some(c) => c,
         _ => return mcp_error(req_id, -32602, "Missing or empty 'code' parameter"),
@@ -1412,10 +1410,7 @@ async fn handle_create_scratch_session(
     // MCP-379 (2026-05-11): strict-parse sibling. Pre-fix wrong-type
     // silently became "minimal-node" — see MCP-377/378 for the
     // direction-class rationale on capability_world surfaces.
-    let world = match args
-        .get("capability_world")
-        .or_else(|| args.get("world"))
-    {
+    let world = match args.get("capability_world").or_else(|| args.get("world")) {
         None | Some(serde_json::Value::Null) => "minimal-node",
         Some(v) => match v.as_str() {
             Some(s) => s,
@@ -1424,9 +1419,7 @@ async fn handle_create_scratch_session(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "capability_world must be a string (e.g. 'agent-node'), got {kind}"
-                    ),
+                    &format!("capability_world must be a string (e.g. 'agent-node'), got {kind}"),
                 );
             }
         },
@@ -1801,8 +1794,7 @@ async fn handle_get_archive_policy(
     // used 30 (via the canonical helper's positive-substitute) — a
     // confusing display/reality drift on the same env var. Sibling to
     // the broader `=0`/empty-env footgun sweep (MCP-643/665/670/671).
-    let env_default: i32 =
-        talos_config::positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30);
+    let env_default: i32 = talos_config::positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30);
 
     // MCP-961 sibling: saturating i64→i32 conversion. The value
     // originates from the `system_config` DB row's `value` column
@@ -1912,14 +1904,8 @@ async fn handle_archive_executions(
     // explicit [7, 3650] window (10 years past covers every realistic
     // archive cadence; nothing older than that should ever be active
     // and a typo'd 999999 should be caught).
-    let days = match crate::utils::validate_range_i64(
-        args,
-        "older_than_days",
-        7,
-        3650,
-        30,
-        &req_id,
-    ) {
+    let days = match crate::utils::validate_range_i64(args, "older_than_days", 7, 3650, 30, &req_id)
+    {
         Ok(v) => v as i32,
         Err(resp) => return resp,
     };
@@ -1960,14 +1946,11 @@ async fn handle_list_archived_executions(
     // gate catches the valid-UUID-but-not-owned case; this catches
     // the wrong-type case at the same boundary. Same MCP-309
     // family.
-    let workflow_filter: Option<uuid::Uuid> = match crate::utils::parse_optional_uuid_strict(
-        args,
-        "workflow_id",
-        &req_id,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let workflow_filter: Option<uuid::Uuid> =
+        match crate::utils::parse_optional_uuid_strict(args, "workflow_id", &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     // MCP-157 (2026-05-08): when workflow_id is provided, validate it
     // resolves to a workflow this user owns. Pre-fix the surface
     // returned `count: 0, executions: []` for fake/cross-tenant UUIDs
@@ -2261,10 +2244,10 @@ async fn handle_search_marketplace(
         .or_else(|| args.get("world")) // legacy alias
         .and_then(|v| v.as_str())
         .map(talos_capability_world::world_short); // normalize to short form for DB match
-    // MCP-222 (2026-05-08): trim before length check, treat empty
-    // trimmed as no filter. Pre-fix `tag: "   "` was passed verbatim
-    // to the marketplace search filter and silently returned no
-    // matches. Same family as MCP-210 / MCP-221.
+                                                   // MCP-222 (2026-05-08): trim before length check, treat empty
+                                                   // trimmed as no filter. Pre-fix `tag: "   "` was passed verbatim
+                                                   // to the marketplace search filter and silently returned no
+                                                   // matches. Same family as MCP-210 / MCP-221.
     let tag_filter_owned: Option<String> = match args.get("tag").and_then(|v| v.as_str()) {
         Some(t) if t.len() > 100 => {
             return mcp_error(req_id, -32602, "tag must be ≤ 100 characters")
@@ -3121,9 +3104,7 @@ async fn handle_agent_session_start(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "Invalid 'auto_archive_stale_days' value {n}: must be in [1, 365]"
-                    ),
+                    &format!("Invalid 'auto_archive_stale_days' value {n}: must be in [1, 365]"),
                 );
             }
             Some(n) => Some(n),
@@ -3132,9 +3113,7 @@ async fn handle_agent_session_start(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "auto_archive_stale_days must be an integer in [1, 365], got {kind}"
-                    ),
+                    &format!("auto_archive_stale_days must be an integer in [1, 365], got {kind}"),
                 );
             }
         },
@@ -3883,11 +3862,8 @@ async fn handle_create_approval_gate(
         None => return mcp_error(req_id, -32602, "Missing required 'title' parameter"),
     };
     // MCP-410: migrated to canonical helper.
-    if let Err(resp) = crate::utils::validate_name_no_control_chars(
-        "Title",
-        title,
-        req_id.clone(),
-    ) {
+    if let Err(resp) = crate::utils::validate_name_no_control_chars("Title", title, req_id.clone())
+    {
         return resp;
     }
     // MCP-263 (2026-05-10): reject whitespace-only descriptions on
@@ -3929,11 +3905,7 @@ async fn handle_create_approval_gate(
     // gate was created without a continuation, the reviewer approved it,
     // and the operator only noticed when nothing fired downstream.
     let continuation_workflow_id: Option<uuid::Uuid> =
-        match crate::utils::parse_optional_uuid_strict(
-            args,
-            "continuation_workflow_id",
-            &req_id,
-        ) {
+        match crate::utils::parse_optional_uuid_strict(args, "continuation_workflow_id", &req_id) {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -3998,9 +3970,7 @@ async fn handle_create_approval_gate(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "notification_webhook must be a string (URL), got {kind}"
-                    ),
+                    &format!("notification_webhook must be a string (URL), got {kind}"),
                 );
             }
         },
@@ -4039,8 +4009,7 @@ async fn handle_create_approval_gate(
         return mcp_error(req_id, -32000, "Failed to create approval gate");
     }
 
-    let base_url =
-        talos_config::get_base_url();
+    let base_url = talos_config::get_base_url();
     let approve_url = format!("{}/approvals/{}/approve", base_url, token);
     let reject_url = format!("{}/approvals/{}/reject", base_url, token);
 
@@ -4132,7 +4101,12 @@ async fn handle_list_approval_gates(
     let status_filter: Option<&str> = match args.get("status") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v.as_str() {
-            Some(s) if matches!(s, "pending" | "approved" | "rejected" | "expired" | "cancelled") => {
+            Some(s)
+                if matches!(
+                    s,
+                    "pending" | "approved" | "rejected" | "expired" | "cancelled"
+                ) =>
+            {
                 Some(s)
             }
             Some(s) => {
@@ -4144,7 +4118,7 @@ async fn handle_list_approval_gates(
                     &format!(
                         "Invalid status filter '{preview}'. Valid values: pending, approved, rejected, expired, cancelled",
                     ),
-                )
+                );
             }
             None => {
                 let kind = crate::utils::json_type_name(v);
@@ -4456,12 +4430,11 @@ async fn handle_deploy_workflow(
         },
     };
 
-    let timezone = match crate::utils::validate_optional_string(
-        args, "timezone", "UTC", None, &req_id,
-    ) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let timezone =
+        match crate::utils::validate_optional_string(args, "timezone", "UTC", None, &req_id) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
 
     let version_description: Option<String> = match args.get("version_description") {
         None | Some(serde_json::Value::Null) => None,
@@ -4732,12 +4705,11 @@ async fn handle_promote_workflow(
     // surface. Default to UTC for backward compatibility with
     // callers who omit the field; reject invalid IANA strings via
     // validate_timezone the same way create_schedule does.
-    let timezone = match crate::utils::validate_optional_string(
-        args, "timezone", "UTC", None, &req_id,
-    ) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let timezone =
+        match crate::utils::validate_optional_string(args, "timezone", "UTC", None, &req_id) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
     if let Err(e) = talos_scheduler::validate_timezone(&timezone) {
         return mcp_error(
             req_id,
@@ -5018,9 +4990,7 @@ async fn handle_set_workflow_sla_threshold(
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "notification_webhook must be a string (URL), got {kind}"
-                    ),
+                    &format!("notification_webhook must be a string (URL), got {kind}"),
                 );
             }
         },
@@ -5041,19 +5011,13 @@ async fn handle_set_workflow_sla_threshold(
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v.as_f64() {
             Some(f) if f.is_nan() || f.is_infinite() => {
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    "p95_latency_ms must be a finite integer",
-                )
+                return mcp_error(req_id, -32602, "p95_latency_ms must be a finite integer")
             }
             Some(f) if f.fract() != 0.0 => {
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!(
-                        "p95_latency_ms must be an integer (no fractional part), got {f}"
-                    ),
+                    &format!("p95_latency_ms must be an integer (no fractional part), got {f}"),
                 )
             }
             _ => match v.as_i64() {
@@ -5539,8 +5503,7 @@ async fn handle_test_approval_webhook(
         );
     }
 
-    let base_url =
-        talos_config::get_base_url();
+    let base_url = talos_config::get_base_url();
 
     // Build a synthetic approval_required payload identical to what create_approval_gate fires
     let payload = serde_json::json!({
@@ -5701,11 +5664,7 @@ async fn handle_create_workflow_suspension(
     // creating a suspension whose resume does nothing. See
     // `handle_create_approval_gate` above for the rationale.
     let continuation_workflow_id: Option<Uuid> =
-        match crate::utils::parse_optional_uuid_strict(
-            args,
-            "continuation_workflow_id",
-            &req_id,
-        ) {
+        match crate::utils::parse_optional_uuid_strict(args, "continuation_workflow_id", &req_id) {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -5762,8 +5721,7 @@ async fn handle_create_workflow_suspension(
         },
     };
 
-    let base_url =
-        talos_config::get_base_url();
+    let base_url = talos_config::get_base_url();
     let callback_url = format!("{}/api/callbacks/{}", base_url, correlation_id);
 
     let suspension_id: Uuid = match state
@@ -5831,7 +5789,7 @@ async fn handle_list_workflow_suspensions(
                     &format!(
                         "Invalid status filter '{preview}'. Valid values: waiting, resumed, expired, cancelled",
                     ),
-                )
+                );
             }
             None => {
                 let kind = crate::utils::json_type_name(v);

@@ -151,9 +151,7 @@ pub async fn handle_websocket_auth(
                         break;
                     } else {
                         // Authentication failed
-                        tracing::warn!(
-                            "WebSocket connection_init received but not authenticated"
-                        );
+                        tracing::warn!("WebSocket connection_init received but not authenticated");
                         let error = serde_json::json!({
                             "type": "connection_error",
                             "payload": {

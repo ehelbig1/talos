@@ -530,9 +530,7 @@ mod refresh_rate_limiter_cap_tests {
         }
 
         let new_id = Uuid::new_v4();
-        let existing_id = *wedge_keys
-            .first()
-            .expect("wedge inserted at least one key");
+        let existing_id = *wedge_keys.first().expect("wedge inserted at least one key");
 
         let map = lim.lock().unwrap();
         // Cap gate: len >= cap AND key absent → reject.

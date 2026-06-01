@@ -363,10 +363,7 @@ impl SchedulerService {
 
             if rows.is_empty() {
                 if total_processed > 0 {
-                    tracing::info!(
-                        total = total_processed,
-                        "Scheduler backfill: complete"
-                    );
+                    tracing::info!(total = total_processed, "Scheduler backfill: complete");
                 }
                 return;
             }
@@ -835,8 +832,7 @@ async fn run_scheduled_execution(
     if workflow.actor_id.is_some() {
         let workflow_repo_for_auth =
             talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-        let actor_repo_for_auth =
-            talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let actor_repo_for_auth = talos_actor_repository::ActorRepository::new(db_pool.clone());
         match talos_workflow_authorization::authorize_workflow_trigger(
             &workflow_repo_for_auth,
             &actor_repo_for_auth,

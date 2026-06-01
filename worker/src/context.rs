@@ -419,7 +419,8 @@ impl AsyncWrite for BufferWriter {
         // this, a malicious module could fill the buffer with forged
         // "verified by" lines to displace real diagnostic output and
         // the silent truncation would leave no trace.
-        const TRUNCATION_MARKER: &[u8] = b"\n[stderr truncated by host at MAX_STDERR_CAPTURE_BYTES]\n";
+        const TRUNCATION_MARKER: &[u8] =
+            b"\n[stderr truncated by host at MAX_STDERR_CAPTURE_BYTES]\n";
         if let Ok(mut guard) = self.buffer.lock() {
             // MCP-593: cap host-side allocation. Returning `buf.len()`
             // even when we silently drop the tail keeps the WASM guest
@@ -439,8 +440,8 @@ impl AsyncWrite for BufferWriter {
                     // Reserve marker space at the tail by trimming if
                     // necessary. This ensures the marker is always at
                     // the END so it's easy to grep for.
-                    let target_len = MAX_STDERR_CAPTURE_BYTES
-                        .saturating_sub(TRUNCATION_MARKER.len());
+                    let target_len =
+                        MAX_STDERR_CAPTURE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
                     if guard.len() > target_len {
                         guard.truncate(target_len);
                     }
@@ -900,9 +901,7 @@ impl TalosContext {
             //
             // Same empty-env-var-bypass class as MCP-590..631 /
             // MCP-934 / MCP-935 / MCP-936.
-            s3_endpoint: std::env::var("S3_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty()),
+            s3_endpoint: std::env::var("S3_ENDPOINT").ok().filter(|v| !v.is_empty()),
             s3_access_key: std::env::var("S3_ACCESS_KEY_ID")
                 .ok()
                 .filter(|v| !v.is_empty()),
@@ -1239,19 +1238,19 @@ impl TalosContext {
     /// * `Err(limit)` where limit is the max size if exceeded
     pub fn validate_json_size(&self, payload: &str, operation: &str) -> Result<(), usize> {
         const DEFAULT_MAX_JSON: usize = 1024 * 1024; // 1 MiB default
-        // MCP-495: cache the env-driven cap on first use. Every JSON
-        // parse/serialize ran `std::env::var("WASM_MAX_JSON_SIZE")` —
-        // a Mutex<HashMap> lookup inside libstd — and re-parsed the
-        // string on every call. WASM_MAX_JSON_SIZE is set at process
-        // start and doesn't change at runtime; OnceLock locks it in.
-        //
-        // MCP-772 (2026-05-13): route through `nonzero_env_or_default`
-        // (sibling to MCP-639 which fixed the WASM_MAX_OUTPUT_BYTES /
-        // WASM_MAX_INPUT_BYTES variants). `WASM_MAX_JSON_SIZE=0`
-        // previously parsed as a valid value and produced
-        // `payload.len() > 0 → true` for any non-empty JSON, rejecting
-        // every parse/serialize at the boundary. Helper substitutes
-        // the default + emits a structured WARN at first use.
+                                                     // MCP-495: cache the env-driven cap on first use. Every JSON
+                                                     // parse/serialize ran `std::env::var("WASM_MAX_JSON_SIZE")` —
+                                                     // a Mutex<HashMap> lookup inside libstd — and re-parsed the
+                                                     // string on every call. WASM_MAX_JSON_SIZE is set at process
+                                                     // start and doesn't change at runtime; OnceLock locks it in.
+                                                     //
+                                                     // MCP-772 (2026-05-13): route through `nonzero_env_or_default`
+                                                     // (sibling to MCP-639 which fixed the WASM_MAX_OUTPUT_BYTES /
+                                                     // WASM_MAX_INPUT_BYTES variants). `WASM_MAX_JSON_SIZE=0`
+                                                     // previously parsed as a valid value and produced
+                                                     // `payload.len() > 0 → true` for any non-empty JSON, rejecting
+                                                     // every parse/serialize at the boundary. Helper substitutes
+                                                     // the default + emits a structured WARN at first use.
         use std::sync::OnceLock;
         static MAX_JSON: OnceLock<usize> = OnceLock::new();
         let max_json = *MAX_JSON.get_or_init(|| {
@@ -1439,7 +1438,6 @@ impl TalosContext {
 // (`spawn_state_write_through`) and reads are in-memory only during
 // an execution. Deleted 2026-04-14.
 
-
 /// Pure-function core of `TalosContext::check_per_host_rate_limit`,
 /// extracted so the per-host rate-limit algorithm is unit-testable
 /// without constructing a full TalosContext. Lowercases the host
@@ -1475,7 +1473,10 @@ mod per_host_rate_limit_tests {
         for _ in 0..10_000 {
             assert!(per_host_check_and_bump(&counts, "example.com:443", 0));
         }
-        assert!(counts.is_empty(), "counter must not be touched when limit=0");
+        assert!(
+            counts.is_empty(),
+            "counter must not be touched when limit=0"
+        );
     }
 
     #[test]
@@ -1533,4 +1534,3 @@ mod per_host_rate_limit_tests {
         assert_eq!(*counts.get("a:80").unwrap(), 2);
     }
 }
-

@@ -177,11 +177,7 @@ async fn handle_create_schedule(
     // exceed 80 chars.
     let cron_expression = match args.get("cron_expression").and_then(|v| v.as_str()) {
         Some(c) if c.len() > 256 => {
-            return mcp_error(
-                req_id,
-                -32602,
-                "cron_expression must be ≤ 256 characters",
-            )
+            return mcp_error(req_id, -32602, "cron_expression must be ≤ 256 characters")
         }
         Some(c) if !c.trim().is_empty() => c.trim().to_string(),
         _ => return mcp_error(req_id, -32602, "Missing or empty 'cron_expression'"),

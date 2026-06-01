@@ -419,9 +419,8 @@ pub async fn scaffold_actor(
                     %actor_id,
                     "scaffold_actor: upsert_actor_budget returned 0 rows — actor ownership mismatch"
                 );
-                outcome.budget_warning = Some(
-                    "Failed to set budget: actor ownership mismatch".to_string(),
-                );
+                outcome.budget_warning =
+                    Some("Failed to set budget: actor ownership mismatch".to_string());
             }
             Err(e) => {
                 tracing::warn!(%actor_id, error = %e, "scaffold_actor: upsert_actor_budget failed");
@@ -862,7 +861,10 @@ mod tests {
         // this failed; post-fix it passes.
         let cjk_name: String = "京".repeat(50);
         assert_eq!(cjk_name.chars().count(), 50);
-        assert!(cjk_name.len() > 100, "byte length must exceed 100 for this to be a useful test");
+        assert!(
+            cjk_name.len() > 100,
+            "byte length must exceed 100 for this to be a useful test"
+        );
         assert!(validate_name(&cjk_name).is_ok());
     }
 
@@ -1167,10 +1169,7 @@ mod tests {
         for p in &["anthropic", "openai", "gemini", "ollama"] {
             let mut sw = good_starter();
             sw.provider = (*p).to_string();
-            assert!(
-                validate_starter_workflow(&sw).is_ok(),
-                "should accept {p}"
-            );
+            assert!(validate_starter_workflow(&sw).is_ok(), "should accept {p}");
         }
     }
 

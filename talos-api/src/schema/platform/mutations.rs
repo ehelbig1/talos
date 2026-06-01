@@ -199,10 +199,13 @@ impl PlatformMutations {
         // `graphql_must_mirror_mcp_rbac_checks.md` flags.
         if input.user_id != granter_id {
             let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-            let is_admin = actor_repo.is_platform_admin(granter_id).await.map_err(|e| {
-                tracing::error!("grant_capability_ceiling admin check failed: {}", e);
-                async_graphql::Error::new("Database error").extend_safe()
-            })?;
+            let is_admin = actor_repo
+                .is_platform_admin(granter_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("grant_capability_ceiling admin check failed: {}", e);
+                    async_graphql::Error::new("Database error").extend_safe()
+                })?;
             if !is_admin {
                 return Err(async_graphql::Error::new(
                     "Only platform admins can grant capability ceilings to other users",
@@ -326,10 +329,13 @@ impl PlatformMutations {
             require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
 
             let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-            let is_admin = actor_repo.is_platform_admin(revoker_id).await.map_err(|e| {
-                tracing::error!("revoke_capability_ceiling admin check failed: {}", e);
-                async_graphql::Error::new("Database error").extend_safe()
-            })?;
+            let is_admin = actor_repo
+                .is_platform_admin(revoker_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("revoke_capability_ceiling admin check failed: {}", e);
+                    async_graphql::Error::new("Database error").extend_safe()
+                })?;
 
             if !is_admin {
                 return Err(async_graphql::Error::new(

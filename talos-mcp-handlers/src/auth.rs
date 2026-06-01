@@ -436,8 +436,8 @@ pub async fn mcp_auth_middleware(
     // LazyLock so each request pays only a hashmap lookup.
     static TRUSTED_PROXIES: std::sync::LazyLock<talos_rate_limit::TrustedProxies> =
         std::sync::LazyLock::new(talos_rate_limit::TrustedProxies::from_env);
-    let ip = talos_rate_limit::extract_client_ip(addr.ip(), req.headers(), &TRUSTED_PROXIES)
-        .to_string();
+    let ip =
+        talos_rate_limit::extract_client_ip(addr.ip(), req.headers(), &TRUSTED_PROXIES).to_string();
     if check_mcp_auth_rate_limit(&ip).is_err() {
         tracing::warn!(ip = %ip, "MCP auth rate limit exceeded");
         return Err(StatusCode::TOO_MANY_REQUESTS);

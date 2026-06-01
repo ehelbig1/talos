@@ -179,9 +179,7 @@ async fn handle_publish_version(
                             return mcp_error(
                                 req_id,
                                 -32602,
-                                &format!(
-                                    "capabilities[{i}] must be a string, got {kind}"
-                                ),
+                                &format!("capabilities[{i}] must be a string, got {kind}"),
                             );
                         }
                     }
@@ -387,22 +385,21 @@ async fn handle_rollback_workflow(
     // accepted 0, negative, or i32::MAX-overflowing values (silent
     // `as i32` truncation), then surfaced "Version N not found" from
     // the DB miss — masking malformed input as a real lookup gap.
-    let version_number = match crate::utils::require_int_range_i32(
-        args,
-        "version_number",
-        1,
-        i32::MAX,
-        &req_id,
-    ) {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let version_number =
+        match crate::utils::require_int_range_i32(args, "version_number", 1, i32::MAX, &req_id) {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
 
     // MCP-206: check workflow ownership upfront so a non-existent or
     // unauthorised workflow returns "Workflow not found" instead of the
     // misleading "Version N not found" (matches diff_versions, list_versions,
     // and get_version_diff_summary which already do this).
-    if !state.workflow_repo.workflow_exists(workflow_id, user_id).await {
+    if !state
+        .workflow_repo
+        .workflow_exists(workflow_id, user_id)
+        .await
+    {
         return crate::utils::workflow_not_found_error(req_id);
     }
 
@@ -489,26 +486,16 @@ async fn handle_diff_versions(
     // MCP-206 (2026-05-08): version_a/version_b are 1-indexed.
     // Pre-fix `as i32` accepted -1, 0, and i64-overflowing values
     // and the DB miss masked them as "Version N not found".
-    let version_a = match crate::utils::require_int_range_i32(
-        args,
-        "version_a",
-        1,
-        i32::MAX,
-        &req_id,
-    ) {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
-    let version_b = match crate::utils::require_int_range_i32(
-        args,
-        "version_b",
-        1,
-        i32::MAX,
-        &req_id,
-    ) {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let version_a =
+        match crate::utils::require_int_range_i32(args, "version_a", 1, i32::MAX, &req_id) {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+    let version_b =
+        match crate::utils::require_int_range_i32(args, "version_b", 1, i32::MAX, &req_id) {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
 
     // Verify workflow ownership
     let wf_exists: bool = state

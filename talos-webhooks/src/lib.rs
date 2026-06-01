@@ -944,9 +944,7 @@ impl WebhookRouter {
                         CircuitBreakerFailureType::InvalidVerificationToken,
                     );
                 }
-                return Ok(
-                    (StatusCode::UNAUTHORIZED, "Invalid verification token").into_response()
-                );
+                return Ok((StatusCode::UNAUTHORIZED, "Invalid verification token").into_response());
             }
             if expected_token
                 .as_bytes()
@@ -1355,9 +1353,7 @@ impl WebhookRouter {
                                 "Webhook job result signature verification failed: {}",
                                 e
                             );
-                            return Err(anyhow::anyhow!(
-                                "Job result verification failed"
-                            ));
+                            return Err(anyhow::anyhow!("Job result verification failed"));
                         }
                     }
 
@@ -1379,8 +1375,8 @@ impl WebhookRouter {
             // The webhook timeout bounds practical exposure, but the
             // column type is i32 — saturating keeps the column
             // monotonic under any future timeout policy change.
-            let wasm_duration_ms = i32::try_from(wasm_start.elapsed().as_millis())
-                .unwrap_or(i32::MAX);
+            let wasm_duration_ms =
+                i32::try_from(wasm_start.elapsed().as_millis()).unwrap_or(i32::MAX);
 
             let (response_body, success, error_msg) = match result {
                 Ok(Ok(output)) => {
@@ -1411,8 +1407,8 @@ impl WebhookRouter {
             // MCP-961 sibling: see wasm_duration_ms above — saturating
             // u128→i32 conversion bounds the column under any future
             // timeout policy change.
-            let total_duration_ms = i32::try_from(start_time.elapsed().as_millis())
-                .unwrap_or(i32::MAX);
+            let total_duration_ms =
+                i32::try_from(start_time.elapsed().as_millis()).unwrap_or(i32::MAX);
 
             // Decoupled Write Path: Async Logging & State Updates
             let status_code = if success {
@@ -1512,11 +1508,10 @@ impl WebhookRouter {
                     // `webhook_request_log` via `log_request` —
                     // operators and the trigger owner have full
                     // detail through both paths.
-                    Ok((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Internal server error",
+                    Ok(
+                        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                            .into_response(),
                     )
-                        .into_response())
                 }
             } else {
                 Ok((StatusCode::OK, "OK").into_response())
@@ -1779,8 +1774,7 @@ impl WebhookRouter {
                 // logs containing worker/WASM-adjacent error chains
                 // need the same DLP discipline as the persistence
                 // path that follows (MCP-449 line ~1534).
-                let redacted_for_log =
-                    talos_dlp_provider::redact_str(&format!("{:?}", e));
+                let redacted_for_log = talos_dlp_provider::redact_str(&format!("{:?}", e));
                 tracing::error!(
                     workflow_id = %workflow_id,
                     error = %redacted_for_log,
@@ -1890,10 +1884,9 @@ impl WebhookRouter {
                     // in `output_data_enc` on Phase A deployments. Pre-fix
                     // the raw UPDATE wrote plaintext only, bypassing the
                     // encryption-at-rest guarantee.
-                    let wf_repo = talos_workflow_repository::WorkflowRepository::new(
-                        db_pool.clone(),
-                    )
-                    .with_encryption(self.secrets_manager.clone());
+                    let wf_repo =
+                        talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
+                            .with_encryption(self.secrets_manager.clone());
                     if let Err(e) = wf_repo
                         .mark_execution_completed(execution_id, &scrubbed_for_storage)
                         .await
@@ -2366,9 +2359,7 @@ impl WebhookRouter {
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
             .map(|ua| {
-                talos_dlp_provider::redact_str(
-                    talos_text_util::truncate_at_char_boundary(ua, 1024),
-                )
+                talos_dlp_provider::redact_str(talos_text_util::truncate_at_char_boundary(ua, 1024))
             });
         // MCP-977 (2026-05-15): redact the standalone user_agent
         // column. The full header map is already redacted via
@@ -2579,17 +2570,16 @@ impl WebhookRouter {
                     // so neither site can drift from the other in the
                     // future. Module-declared secrets PLUS host-reserved
                     // LLM keys; MCP-589 user-scoping.
-                    encrypted_secrets:
-                        talos_integration_helpers::build_dispatch_encrypted_secrets(
-                            Some(&secrets_manager),
-                            module_id,
-                            user_id,
-                            // L-1: AAD = job_id (= workflow_execution_id
-                            // above). DLQ replay reuses the same id
-                            // shape as the live path.
-                            job_id,
-                        )
-                        .await,
+                    encrypted_secrets: talos_integration_helpers::build_dispatch_encrypted_secrets(
+                        Some(&secrets_manager),
+                        module_id,
+                        user_id,
+                        // L-1: AAD = job_id (= workflow_execution_id
+                        // above). DLQ replay reuses the same id
+                        // shape as the live path.
+                        job_id,
+                    )
+                    .await,
                     timeout_ms: 3_000,
                     allowed_hosts: exec_info.allowed_hosts,
                     allowed_methods: exec_info.allowed_methods,
@@ -3461,8 +3451,14 @@ mod timestamp_skew_tests {
     // `> 300` check silently passes a stale request). abs_diff is overflow-free.
     #[test]
     fn normal_skew_is_exact() {
-        assert_eq!(webhook_timestamp_skew_secs(1_700_000_300, 1_700_000_000), 300);
-        assert_eq!(webhook_timestamp_skew_secs(1_700_000_000, 1_700_000_300), 300);
+        assert_eq!(
+            webhook_timestamp_skew_secs(1_700_000_300, 1_700_000_000),
+            300
+        );
+        assert_eq!(
+            webhook_timestamp_skew_secs(1_700_000_000, 1_700_000_300),
+            300
+        );
         assert_eq!(webhook_timestamp_skew_secs(1_700_000_000, 1_700_000_000), 0);
     }
 

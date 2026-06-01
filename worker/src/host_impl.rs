@@ -53,8 +53,7 @@ const MAX_MESSAGING_PUBLISHES_PER_EXECUTION: u64 = 1000;
 /// keep them from accidentally matching legitimate user subjects (e.g.
 /// `talos_app.*` doesn't match `talos.`).
 const RESERVED_PUBLISH_PREFIXES: &[&str] = &[
-    "talos.",
-    "wasm.", // wasm.log.* — controller WASM-log subscriber
+    "talos.", "wasm.", // wasm.log.* — controller WASM-log subscriber
 ];
 
 /// Returns `true` when `topic` is on the platform-reserved prefix
@@ -157,10 +156,12 @@ fn top_level_root_selection_has_introspection(stripped: &str) -> bool {
             // Entered a nested selection — primary scan ends here.
             return false;
         }
-        if b == b'_' && bytes.get(i + 1).copied() == Some(b'_')
-            && has_introspection_token_at(after_brace, i) {
-                return true;
-            }
+        if b == b'_'
+            && bytes.get(i + 1).copied() == Some(b'_')
+            && has_introspection_token_at(after_brace, i)
+        {
+            return true;
+        }
         i += 1;
     }
     false
@@ -256,10 +257,12 @@ fn root_selection_imports_introspection(body: &str) -> bool {
             // on a non-Query type isn't introspection).
             return false;
         }
-        if bytes[i] == b'_' && bytes.get(i + 1).copied() == Some(b'_')
-            && has_introspection_token_at(body, i) {
-                return true;
-            }
+        if bytes[i] == b'_'
+            && bytes.get(i + 1).copied() == Some(b'_')
+            && has_introspection_token_at(body, i)
+        {
+            return true;
+        }
         i += 1;
     }
     false
@@ -441,9 +444,7 @@ mod strip_string_literals_tests {
 
     #[test]
     fn strips_block_string_content() {
-        let s = strip_graphql_string_literals(
-            r#"f(desc: """fragment X on Q { __schema }""") {}"#,
-        );
+        let s = strip_graphql_string_literals(r#"f(desc: """fragment X on Q { __schema }""") {}"#);
         assert!(!s.contains("fragment"));
         assert!(!s.contains("__schema"));
     }
@@ -469,12 +470,16 @@ mod introspection_detector_tests {
 
     #[test]
     fn detects_top_level_schema_query() {
-        assert!(looks_like_graphql_introspection("{ __schema { types { name } } }"));
+        assert!(looks_like_graphql_introspection(
+            "{ __schema { types { name } } }"
+        ));
     }
 
     #[test]
     fn detects_top_level_type_query() {
-        assert!(looks_like_graphql_introspection("{ __type(name: \"User\") { name } }"));
+        assert!(looks_like_graphql_introspection(
+            "{ __type(name: \"User\") { name } }"
+        ));
     }
 
     #[test]
@@ -1061,38 +1066,36 @@ pub(crate) const MAX_INBOUND_HEADER_VALUE_BYTES: usize = 16 * 1024;
 // negation, which is a strict-superset behaviour change (operators
 // who set `=off` previously got `false` via the no-match arm; same
 // result now via the recognised-falsy arm).
-static ALLOW_PRIVATE_HOST_TARGETS: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| {
-        let raw_enabled =
-            talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
-        // wasm-security-review (2026-05-22): refuse to honour the flag
-        // in production. The flag is a dev-only convenience (reaching
-        // `host.docker.internal` etc.) and shouldn't widen the SSRF
-        // blast radius on a production deployment. Matches the
-        // `ssrf_resolver` production gate so the two layers agree on
-        // when the bypass is actually live.
-        let is_prod = talos_config::is_production();
-        let enabled = raw_enabled && !is_prod;
-        if raw_enabled && is_prod {
-            tracing::warn!(
-                "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true is ignored in production. \
+static ALLOW_PRIVATE_HOST_TARGETS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    let raw_enabled = talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
+    // wasm-security-review (2026-05-22): refuse to honour the flag
+    // in production. The flag is a dev-only convenience (reaching
+    // `host.docker.internal` etc.) and shouldn't widen the SSRF
+    // blast radius on a production deployment. Matches the
+    // `ssrf_resolver` production gate so the two layers agree on
+    // when the bypass is actually live.
+    let is_prod = talos_config::is_production();
+    let enabled = raw_enabled && !is_prod;
+    if raw_enabled && is_prod {
+        tracing::warn!(
+            "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true is ignored in production. \
                  The env toggle is dev-only — unset it on this deployment, or \
                  unset RUST_ENV=production if this is a single-pod dev cluster."
-            );
-        } else if enabled {
-            // L-2: structured WARN at first lookup so operators see in
-            // dev logs that the SSRF defense is relaxed. The flag is a
-            // "trust me, I know what I'm doing" escape hatch — it
-            // should be visible at runtime, not silent.
-            tracing::warn!(
-                "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true — \
+        );
+    } else if enabled {
+        // L-2: structured WARN at first lookup so operators see in
+        // dev logs that the SSRF defense is relaxed. The flag is a
+        // "trust me, I know what I'm doing" escape hatch — it
+        // should be visible at runtime, not silent.
+        tracing::warn!(
+            "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true — \
                  SSRF defense relaxed for hostnames in allowed_hosts. \
                  IP literals to private ranges remain blocked. \
                  Dev-only — production deployments ignore this flag."
-            );
-        }
-        enabled
-    });
+        );
+    }
+    enabled
+});
 
 // ============================================================================
 // SSRF private-IP classification
@@ -1617,7 +1620,7 @@ mod reserved_topic_prefix_tests {
             "app.orders.created",
             "team_a.events.user_signed_up",
             "talos_app.notifications", // no trailing dot match
-            "wasmer.something",         // no trailing dot match
+            "wasmer.something",        // no trailing dot match
             "my-org.module-a.event",
             "events.payment.captured",
         ] {
@@ -2116,7 +2119,8 @@ mod vault_path_redaction_tests {
         let h = vault_path_short_hash("anthropic/api_key");
         assert_eq!(h.len(), 16, "hash must be exactly 16 hex chars");
         assert!(
-            h.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_lowercase())),
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_lowercase())),
             "hash must be lowercase hex digits only — got `{h}`"
         );
     }
@@ -2255,21 +2259,21 @@ mod s3_identifier_validation_tests {
     #[test]
     fn bucket_url_injection_rejected() {
         for b in [
-            "",                 // empty
-            "Bucket",           // uppercase
-            "my_bucket",        // underscore
-            "my bucket",        // space
-            ".bucket",          // leading dot
-            "bucket.",          // trailing dot
-            "-bucket",          // leading hyphen
-            "bucket-",          // trailing hyphen
-            "my..bucket",       // consecutive dots
-            "my/other-bucket",  // slash
-            "../private",       // traversal
-            "bucket?acl=x",     // query injection
-            "bucket#frag",      // fragment
-            "bucket\r\nX:1",    // CRLF
-            "bucket\x00null",   // NUL
+            "",                // empty
+            "Bucket",          // uppercase
+            "my_bucket",       // underscore
+            "my bucket",       // space
+            ".bucket",         // leading dot
+            "bucket.",         // trailing dot
+            "-bucket",         // leading hyphen
+            "bucket-",         // trailing hyphen
+            "my..bucket",      // consecutive dots
+            "my/other-bucket", // slash
+            "../private",      // traversal
+            "bucket?acl=x",    // query injection
+            "bucket#frag",     // fragment
+            "bucket\r\nX:1",   // CRLF
+            "bucket\x00null",  // NUL
         ] {
             assert!(
                 validate_s3_bucket(b).is_err(),
@@ -2729,9 +2733,7 @@ impl TalosContext {
         let _ = self.provider.release(handle).await;
         // L-4: unwrap Zeroizing → owned String at the immediate point of
         // use. The wrapper wipes when it drops at end of expression.
-        value
-            .filter(|v| !v.is_empty())
-            .map(|v| (*v).clone())
+        value.filter(|v| !v.is_empty()).map(|v| (*v).clone())
     }
 
     /// Resolve a vault path to its raw plaintext (no Bearer/Basic prefix).
@@ -2779,9 +2781,7 @@ impl TalosContext {
         };
         let _ = self.provider.release(handle).await;
         // L-4: same unwrap pattern as get_host_secret.
-        value
-            .filter(|v| !v.is_empty())
-            .map(|v| (*v).clone())
+        value.filter(|v| !v.is_empty()).map(|v| (*v).clone())
     }
 
     /// Resolve an LLM provider API key via the vault first, env var second.
@@ -3733,10 +3733,9 @@ impl wit_http::Host for TalosContext {
                 Some(port) => format!("{host}:{port}"),
                 None => host.to_string(),
             };
-            if !self.check_per_host_rate_limit(
-                &host_for_limit,
-                MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION,
-            ) {
+            if !self
+                .check_per_host_rate_limit(&host_for_limit, MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION)
+            {
                 self.record_capability_denied(
                     "http-fetch-all",
                     "per-host-rate-limit",
@@ -4002,7 +4001,8 @@ impl wit_http::Host for TalosContext {
                     return Err(wit_http::Error::Networkerror);
                 }
                 let resp_headers: Vec<(String, String)> = {
-                    let mut out: Vec<(String, String)> = Vec::with_capacity(response.headers().len());
+                    let mut out: Vec<(String, String)> =
+                        Vec::with_capacity(response.headers().len());
                     for (k, v) in response.headers().iter() {
                         if v.as_bytes().len() > MAX_INBOUND_HEADER_VALUE_BYTES {
                             tracing::warn!(
@@ -4072,8 +4072,7 @@ impl wit_http::Host for TalosContext {
         header.push_str("Bearer ");
         header.push_str(auth_value.as_str());
         drop(auth_value);
-        req.headers
-            .insert(0, ("Authorization".to_string(), header));
+        req.headers.insert(0, ("Authorization".to_string(), header));
         // Dispatch through the standard fetch path; all security checks apply.
         self.fetch(req).await
     }
@@ -5272,7 +5271,10 @@ impl wit_json::Host for TalosContext {
 
     async fn prettify(&mut self, json_str: String) -> Result<String, wit_json::Error> {
         // MCP-1049: canonical `validate_json_size` helper.
-        if self.validate_json_size(&json_str, "json::prettify").is_err() {
+        if self
+            .validate_json_size(&json_str, "json::prettify")
+            .is_err()
+        {
             return Err(wit_json::Error::Parseerror);
         }
         let value: serde_json::Value =
@@ -5676,7 +5678,10 @@ mod namespaced_cache_key_tests {
     fn user_scoped_key_has_user_id_prefix() {
         let uid = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
         let got = build_namespaced_cache_key(Some(uid), "foo");
-        assert_eq!(got, "talos_cache:u=00000000-0000-4000-8000-000000000001:foo");
+        assert_eq!(
+            got,
+            "talos_cache:u=00000000-0000-4000-8000-000000000001:foo"
+        );
     }
 
     #[test]
@@ -6469,12 +6474,8 @@ impl wit_messaging::Host for TalosContext {
         // DoS vector MCP-524 closed for publish; the request variant
         // was missed in that sweep.
         if reject_reserved_topic_prefix(&topic) {
-            self.record_capability_denied(
-                "messaging-request",
-                "reserved-subject-prefix",
-                &topic,
-            )
-            .await;
+            self.record_capability_denied("messaging-request", "reserved-subject-prefix", &topic)
+                .await;
             tracing::warn!(
                 module_id = ?self.module_id,
                 topic = %topic,
@@ -6672,10 +6673,7 @@ impl TalosContext {
         }
         // MCP-584: clamp caller-supplied timeout in GraphQL exactly
         // as in http::fetch — `option<u32>` is unbounded otherwise.
-        let timeout_ms = req
-            .timeout_ms
-            .unwrap_or(30_000)
-            .min(MAX_HTTP_TIMEOUT_MS) as u64;
+        let timeout_ms = req.timeout_ms.unwrap_or(30_000).min(MAX_HTTP_TIMEOUT_MS) as u64;
 
         // Reject oversized queries and variable payloads to prevent sending
         // multi-GB requests to the remote server (OOM + bandwidth abuse).
@@ -6721,8 +6719,7 @@ impl TalosContext {
         // `async-graphql-parser`) on the worker's WASM execution
         // hot path — not justified for a defense-in-depth check.
         if looks_like_graphql_introspection(&query) {
-            let actor_tier =
-                self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
+            let actor_tier = self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
             let env_block = std::env::var("TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION")
                 .ok()
                 .as_deref()
@@ -6756,7 +6753,11 @@ impl TalosContext {
             if blocked {
                 self.record_capability_denied(
                     "graphql-execute",
-                    if actor_tier { "tier1-introspection" } else { "env-introspection-block" },
+                    if actor_tier {
+                        "tier1-introspection"
+                    } else {
+                        "env-introspection-block"
+                    },
                     &url,
                 )
                 .await;
@@ -6888,10 +6889,7 @@ impl TalosContext {
         // MCP-537 (rate limit + cancellation): now charged AFTER all pure
         // validation has passed — see MCP-787 reorder comment at top of
         // this function.
-        if !self.check_rate_limit(
-            &self.graphql_query_count,
-            MAX_GRAPHQL_QUERIES_PER_EXECUTION,
-        ) {
+        if !self.check_rate_limit(&self.graphql_query_count, MAX_GRAPHQL_QUERIES_PER_EXECUTION) {
             tracing::warn!(module_id = ?self.module_id, "GraphQL query rate limit exceeded");
             if let Some(ref m) = self.metrics {
                 m.record_rate_limit_exceeded("graphql");
@@ -9360,16 +9358,11 @@ impl wit_llm::Host for TalosContext {
                     // MCP-1008: saturate-on-overflow to surface
                     // malicious / corrupted provider responses as
                     // visible spikes.
-                    input_tokens: u32::try_from(u.prompt_tokens.unwrap_or(0))
-                        .unwrap_or(u32::MAX),
+                    input_tokens: u32::try_from(u.prompt_tokens.unwrap_or(0)).unwrap_or(u32::MAX),
                     output_tokens: u32::try_from(u.completion_tokens.unwrap_or(0))
                         .unwrap_or(u32::MAX),
                 });
-                let stop_reason = r
-                    .choices
-                    .into_iter()
-                    .next()
-                    .and_then(|c| c.finish_reason);
+                let stop_reason = r.choices.into_iter().next().and_then(|c| c.finish_reason);
                 (text, usage, stop_reason)
             }
             LlmResponse::Anthropic(r) => {
@@ -9382,10 +9375,8 @@ impl wit_llm::Host for TalosContext {
                     .join("");
                 let usage = r.usage.map(|u| wit_llm::TokenUsage {
                     // MCP-1008: saturate-on-overflow.
-                    input_tokens: u32::try_from(u.input_tokens.unwrap_or(0))
-                        .unwrap_or(u32::MAX),
-                    output_tokens: u32::try_from(u.output_tokens.unwrap_or(0))
-                        .unwrap_or(u32::MAX),
+                    input_tokens: u32::try_from(u.input_tokens.unwrap_or(0)).unwrap_or(u32::MAX),
+                    output_tokens: u32::try_from(u.output_tokens.unwrap_or(0)).unwrap_or(u32::MAX),
                 });
                 (text, usage, r.stop_reason)
             }
@@ -9708,12 +9699,8 @@ impl wit_agent_memory::Host for TalosContext {
         // should not learn raw search-query strings.
         if require_agent_memory_capability(&self.capability_world).is_err() {
             let query_hash = format!("{:x}", Sha256::digest(query.as_bytes()));
-            self.record_capability_denied(
-                "agent-memory-search",
-                "capability-world",
-                &query_hash,
-            )
-            .await;
+            self.record_capability_denied("agent-memory-search", "capability-world", &query_hash)
+                .await;
             return Err(wit_agent_memory::Error::NotAvailable);
         }
         let __start = std::time::Instant::now();
@@ -10108,8 +10095,7 @@ fn build_signed_agent_envelope(
         "payload": payload,
         "correlation_id": correlation_id,
     });
-    let canonical_body = serde_json::to_vec(&envelope)
-        .map_err(|_| "envelope serialise failed")?;
+    let canonical_body = serde_json::to_vec(&envelope).map_err(|_| "envelope serialise failed")?;
 
     // `rpc_auth::sign` returns None when the worker's HMAC key isn't
     // registered — that happens in unit tests and in pre-startup paths.
@@ -10247,8 +10233,7 @@ mod signed_agent_envelope_tests {
         )
         .expect("build envelope");
 
-        let verified =
-            verify_signed_agent_envelope(subject, &bytes).expect("verify must succeed");
+        let verified = verify_signed_agent_envelope(subject, &bytes).expect("verify must succeed");
         assert_eq!(verified, payload);
     }
 
@@ -10727,12 +10712,8 @@ impl wit_object_storage::Host for TalosContext {
             crate::wit_inspector::CapabilityWorld::Trusted
         ) {
             let target = format!("{}/{}", req.bucket, req.key);
-            self.record_capability_denied(
-                "wit_object_storage::put",
-                "capability-world",
-                &target,
-            )
-            .await;
+            self.record_capability_denied("wit_object_storage::put", "capability-world", &target)
+                .await;
         }
         require_object_storage_capability(&self.capability_world)?;
         // MCP-1098: bucket/key URL-injection guard.
@@ -10795,10 +10776,7 @@ impl wit_object_storage::Host for TalosContext {
         )
         .await
         .map_err(|_| {
-            tracing::warn!(
-                timeout_ms = OBJECT_STORAGE_TIMEOUT_MS,
-                "S3 PUT timed out"
-            );
+            tracing::warn!(timeout_ms = OBJECT_STORAGE_TIMEOUT_MS, "S3 PUT timed out");
             wit_object_storage::Error::OperationFailed
         })?
         .map_err(|e| {
@@ -10825,12 +10803,8 @@ impl wit_object_storage::Host for TalosContext {
             crate::wit_inspector::CapabilityWorld::Trusted
         ) {
             let target = format!("{}/{}", bucket, key);
-            self.record_capability_denied(
-                "wit_object_storage::get",
-                "capability-world",
-                &target,
-            )
-            .await;
+            self.record_capability_denied("wit_object_storage::get", "capability-world", &target)
+                .await;
         }
         require_object_storage_capability(&self.capability_world)?;
         // MCP-1098: bucket/key URL-injection guard.
@@ -10878,10 +10852,7 @@ impl wit_object_storage::Host for TalosContext {
         )
         .await
         .map_err(|_| {
-            tracing::warn!(
-                timeout_ms = OBJECT_STORAGE_TIMEOUT_MS,
-                "S3 GET timed out"
-            );
+            tracing::warn!(timeout_ms = OBJECT_STORAGE_TIMEOUT_MS, "S3 GET timed out");
             wit_object_storage::Error::OperationFailed
         })?
         .map_err(|e| {
@@ -11122,10 +11093,7 @@ impl wit_object_storage::Host for TalosContext {
         )
         .await
         .map_err(|_| {
-            tracing::warn!(
-                timeout_ms = OBJECT_STORAGE_TIMEOUT_MS,
-                "S3 LIST timed out"
-            );
+            tracing::warn!(timeout_ms = OBJECT_STORAGE_TIMEOUT_MS, "S3 LIST timed out");
             wit_object_storage::Error::OperationFailed
         })?
         .map_err(|e| {
@@ -11456,14 +11424,10 @@ impl wit_llm_tools::Host for TalosContext {
         let resp_body: serde_json::Value = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs_tools),
             async move {
-                let response = http_req_tools
-                    .body(body_bytes)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(error = %e, "LLM tool-use API request failed");
-                        wit_llm_tools::Error::ApiError(format!("Network error: {e}"))
-                    })?;
+                let response = http_req_tools.body(body_bytes).send().await.map_err(|e| {
+                    tracing::error!(error = %e, "LLM tool-use API request failed");
+                    wit_llm_tools::Error::ApiError(format!("Network error: {e}"))
+                })?;
 
                 if !response.status().is_success() {
                     let status = response.status().as_u16();
@@ -11471,17 +11435,13 @@ impl wit_llm_tools::Host for TalosContext {
                     if status == 429 {
                         return Err(wit_llm_tools::Error::RateLimited);
                     }
-                    let preview_bytes = read_llm_response_body_bounded(
-                        response,
-                        MAX_LLM_BODY_BYTES,
-                    )
-                    .await
-                    .unwrap_or_default();
+                    let preview_bytes =
+                        read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                            .await
+                            .unwrap_or_default();
                     let body_preview = String::from_utf8_lossy(&preview_bytes);
-                    let preview_truncated: String =
-                        body_preview.chars().take(500).collect();
-                    let preview_redacted =
-                        talos_dlp_provider::redact_str(&preview_truncated);
+                    let preview_truncated: String = body_preview.chars().take(500).collect();
+                    let preview_redacted = talos_dlp_provider::redact_str(&preview_truncated);
                     tracing::warn!(
                         status,
                         body_len = preview_bytes.len(),
@@ -11493,21 +11453,16 @@ impl wit_llm_tools::Host for TalosContext {
                     )));
                 }
 
-                let body_bytes = read_llm_response_body_bounded(
-                    response,
-                    MAX_LLM_BODY_BYTES,
-                )
-                .await
-                .ok_or_else(|| {
-                    wit_llm_tools::Error::ApiError(format!(
-                        "LLM tool-use response exceeded {} bytes; aborted body read",
-                        MAX_LLM_BODY_BYTES
-                    ))
-                })?;
+                let body_bytes = read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                    .await
+                    .ok_or_else(|| {
+                        wit_llm_tools::Error::ApiError(format!(
+                            "LLM tool-use response exceeded {} bytes; aborted body read",
+                            MAX_LLM_BODY_BYTES
+                        ))
+                    })?;
                 serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|e| {
-                    wit_llm_tools::Error::ApiError(format!(
-                        "Failed to parse response JSON: {e}"
-                    ))
+                    wit_llm_tools::Error::ApiError(format!("Failed to parse response JSON: {e}"))
                 })
             },
         )
@@ -11705,8 +11660,7 @@ impl TalosContext {
             // `ping` ~15s, OpenAI continuous chunks); 60s silence
             // means the stream is dead. Without this the loop
             // blocks on `next().await` until the node timeout fires.
-            let idle_timeout =
-                std::time::Duration::from_secs(LLM_STREAM_IDLE_TIMEOUT_SECS);
+            let idle_timeout = std::time::Duration::from_secs(LLM_STREAM_IDLE_TIMEOUT_SECS);
             loop {
                 let chunk = match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
                     Ok(Some(Ok(c))) => c,
@@ -13225,12 +13179,8 @@ impl wit_integration_state::Host for TalosContext {
             crate::wit_inspector::CapabilityWorld::Agent
                 | crate::wit_inspector::CapabilityWorld::Trusted
         ) {
-            self.record_capability_denied(
-                "wit_integration_state::get",
-                "capability-world",
-                &key,
-            )
-            .await;
+            self.record_capability_denied("wit_integration_state::get", "capability-world", &key)
+                .await;
         }
         require_integration_state_capability(&self.capability_world)?;
         let __start = std::time::Instant::now();

@@ -172,10 +172,7 @@ impl ExecutionOrchestrationService {
     /// schema returns `DryRun` with `schema = None` and empty errors,
     /// matching the pre-extraction "operator hint" behaviour.
     #[allow(clippy::too_many_lines)]
-    pub async fn trigger(
-        &self,
-        input: TriggerInput,
-    ) -> Result<TriggerOutcome, OrchestrationError> {
+    pub async fn trigger(&self, input: TriggerInput) -> Result<TriggerOutcome, OrchestrationError> {
         let TriggerInput {
             workflow_id,
             user_id,
@@ -297,11 +294,9 @@ impl ExecutionOrchestrationService {
         // resolve the canonical default ("manual" with no actor,
         // "actor_dispatch" with one) — explicit caller-supplied
         // values aren't part of our public input today.
-        let trigger_type_str = talos_workflow_authorization::resolve_trigger_type(
-            None,
-            trigger_agent_id.is_some(),
-        )
-        .map_err(OrchestrationError::InvalidArgument)?;
+        let trigger_type_str =
+            talos_workflow_authorization::resolve_trigger_type(None, trigger_agent_id.is_some())
+                .map_err(OrchestrationError::InvalidArgument)?;
 
         // 10. Lineage resolution: parent → root walk lives in the
         // execution repo, with migration-safe fallback. Callers
@@ -570,11 +565,7 @@ impl ExecutionOrchestrationService {
                     };
                     let redacted_err = talos_dlp_provider::redact_str(raw_err);
                     if let Err(db_err) = workflow_repo_for_task
-                        .mark_execution_failed(
-                            execution_id,
-                            &redacted_err,
-                            Some(&fail_output),
-                        )
+                        .mark_execution_failed(execution_id, &redacted_err, Some(&fail_output))
                         .await
                     {
                         tracing::error!(

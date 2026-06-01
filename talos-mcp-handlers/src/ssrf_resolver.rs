@@ -55,19 +55,21 @@ impl Resolve for ControllerSsrfResolver {
 
             let filtered: Vec<SocketAddr> = addrs
                 .into_iter()
-                .filter(|sa| match talos_http_utils::ssrf::classify_private_ip(sa.ip()) {
-                    None => true,
-                    Some(policy) => {
-                        tracing::warn!(
-                            host = %host,
-                            ip = %sa.ip(),
-                            policy,
-                            "controller SSRF resolver: filtered private/metadata IP from DNS \
-                             result for an outbound webhook (possible DNS-rebinding attempt)"
-                        );
-                        false
-                    }
-                })
+                .filter(
+                    |sa| match talos_http_utils::ssrf::classify_private_ip(sa.ip()) {
+                        None => true,
+                        Some(policy) => {
+                            tracing::warn!(
+                                host = %host,
+                                ip = %sa.ip(),
+                                policy,
+                                "controller SSRF resolver: filtered private/metadata IP from DNS \
+                                 result for an outbound webhook (possible DNS-rebinding attempt)"
+                            );
+                            false
+                        }
+                    },
+                )
                 .collect();
 
             if filtered.is_empty() {

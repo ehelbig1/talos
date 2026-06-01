@@ -118,9 +118,7 @@ impl SsrfFilteringResolver {
         env_toggle_on: bool,
         production: bool,
     ) -> bool {
-        env_toggle_on
-            && !production
-            && self.explicit_private_host_allowed.contains(host_lower)
+        env_toggle_on && !production && self.explicit_private_host_allowed.contains(host_lower)
     }
 }
 
@@ -161,9 +159,7 @@ impl Resolve for SsrfFilteringResolver {
             // execution's explicit allowed-hosts (no `*`). Same shape
             // as `bypass_allowed_with_prod` so the unit-test pure
             // function agrees with this runtime path.
-            let bypass = env_toggle
-                && !production
-                && explicit_allowed.contains(&host_lower);
+            let bypass = env_toggle && !production && explicit_allowed.contains(&host_lower);
 
             let lookup = tokio::net::lookup_host(format!("{}:80", host)).await;
             let addrs = match lookup {
@@ -178,20 +174,18 @@ impl Resolve for SsrfFilteringResolver {
             } else {
                 addrs
                     .into_iter()
-                    .filter(|sa| {
-                        match crate::host_impl::classify_private_ip(sa.ip()) {
-                            None => true,
-                            Some(policy) => {
-                                tracing::warn!(
-                                    host = %host,
-                                    ip = %sa.ip(),
-                                    policy,
-                                    env_toggle,
-                                    explicit_scoped = explicit_allowed.contains(&host_lower),
-                                    "SSRF resolver: filtered private IP from DNS result"
-                                );
-                                false
-                            }
+                    .filter(|sa| match crate::host_impl::classify_private_ip(sa.ip()) {
+                        None => true,
+                        Some(policy) => {
+                            tracing::warn!(
+                                host = %host,
+                                ip = %sa.ip(),
+                                policy,
+                                env_toggle,
+                                explicit_scoped = explicit_allowed.contains(&host_lower),
+                                "SSRF resolver: filtered private IP from DNS result"
+                            );
+                            false
                         }
                     })
                     .collect()

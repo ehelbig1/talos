@@ -46,8 +46,7 @@ static SYNTHETIC_PASSWORD_HASH: OnceLock<String> = OnceLock::new();
 fn synthetic_password_hash() -> &'static str {
     SYNTHETIC_PASSWORD_HASH.get_or_init(|| {
         let seed = Uuid::new_v4().to_string();
-        bcrypt::hash(&seed, bcrypt::DEFAULT_COST)
-            .expect("bcrypt::hash of random UUID cannot fail")
+        bcrypt::hash(&seed, bcrypt::DEFAULT_COST).expect("bcrypt::hash of random UUID cannot fail")
     })
 }
 
@@ -257,7 +256,12 @@ mod synthetic_hash_tests {
     #[test]
     fn synthetic_hash_is_structurally_valid_bcrypt() {
         let h = synthetic_password_hash();
-        assert_eq!(h.len(), 60, "bcrypt hash must be exactly 60 chars; got {}", h.len());
+        assert_eq!(
+            h.len(),
+            60,
+            "bcrypt hash must be exactly 60 chars; got {}",
+            h.len()
+        );
         assert!(
             h.starts_with("$2b$") || h.starts_with("$2a$") || h.starts_with("$2y$"),
             "bcrypt hash must start with $2b$/$2a$/$2y$; got {}",

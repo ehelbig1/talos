@@ -273,22 +273,19 @@ impl SubscriptionRoot {
         // Subscriber-facing message stays generic — exposing the raw
         // NATS error would leak subject patterns and connection state
         // to the GraphQL caller.
-        let mut subscriber = nats_client
-            .subscribe(topic.clone())
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    execution_id = %execution_id,
-                    topic = %topic,
-                    error = %e,
-                    "LLM stream subscription failed"
-                );
-                // MCP-1048: .extend_safe() — "Failed to subscribe" doesn't
-                // match the scrubber whitelist substrings, so without
-                // the explicit marker the client sees "Internal server
-                // error" instead.
-                async_graphql::Error::new("Failed to subscribe").extend_safe()
-            })?;
+        let mut subscriber = nats_client.subscribe(topic.clone()).await.map_err(|e| {
+            tracing::error!(
+                execution_id = %execution_id,
+                topic = %topic,
+                error = %e,
+                "LLM stream subscription failed"
+            );
+            // MCP-1048: .extend_safe() — "Failed to subscribe" doesn't
+            // match the scrubber whitelist substrings, so without
+            // the explicit marker the client sees "Internal server
+            // error" instead.
+            async_graphql::Error::new("Failed to subscribe").extend_safe()
+        })?;
 
         Ok(async_stream::stream! {
             while let Some(msg) = subscriber.next().await {
@@ -353,16 +350,14 @@ impl SubscriptionRoot {
             // Admins bypass the filter entirely; no need to load.
             Vec::new()
         } else {
-            sqlx::query_scalar(
-                "SELECT org_id FROM organization_members WHERE user_id = $1",
-            )
-            .bind(user_id)
-            .fetch_all(&db_pool)
-            .await
-            .map_err(|e| {
-                tracing::error!("dlq_updates org membership lookup failed: {}", e);
-                async_graphql::Error::new("Database error").extend_safe()
-            })?
+            sqlx::query_scalar("SELECT org_id FROM organization_members WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_all(&db_pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("dlq_updates org membership lookup failed: {}", e);
+                    async_graphql::Error::new("Database error").extend_safe()
+                })?
         };
 
         let sender =

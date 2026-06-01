@@ -327,7 +327,10 @@ async fn handle_list_secret_usage(
     // dependent workflows.
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(modules.len());
     for m in &modules {
-        let wf_rows = match sm.find_workflows_using_module(user_id, m.module_id, 50).await {
+        let wf_rows = match sm
+            .find_workflows_using_module(user_id, m.module_id, 50)
+            .await
+        {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::error!(
@@ -597,9 +600,7 @@ async fn handle_get_unused_secrets(
     let unused: Vec<serde_json::Value> = secrets
         .iter()
         .filter(|s| !referenced.contains(&s.name))
-        .filter(|s| {
-            !talos_workflow_job_protocol::is_controller_internal_vault_path(&s.key_path)
-        })
+        .filter(|s| !talos_workflow_job_protocol::is_controller_internal_vault_path(&s.key_path))
         .map(|s| {
             serde_json::json!({
                 "name": s.name,

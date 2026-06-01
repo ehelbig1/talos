@@ -4,7 +4,7 @@
 /// `new(db_pool)`, all methods `pub async fn`, return `anyhow::Result<T>`.
 /// Handlers in `mcp/advanced.rs` should be thin wrappers that call these
 /// methods and format the JSON-RPC response.
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use talos_tenancy::TenantReadScope;
@@ -253,9 +253,12 @@ impl AdvancedRepository {
     /// so the scratch_sessions RLS policy enforces. Caller runs its query on
     /// the returned tx and commits.
     async fn user_scoped_tx(&self, user_id: Uuid) -> Result<Transaction<'_, Postgres>> {
-        talos_db::begin_tenant_read_scoped(&self.db_pool, &TenantReadScope::new(user_id, Vec::new()))
-            .await
-            .map_err(|e| anyhow!("open user-scoped tx: {e}"))
+        talos_db::begin_tenant_read_scoped(
+            &self.db_pool,
+            &TenantReadScope::new(user_id, Vec::new()),
+        )
+        .await
+        .map_err(|e| anyhow!("open user-scoped tx: {e}"))
     }
 
     /// Create or update a scratch session (UPSERT by user_id + name).
@@ -1867,11 +1870,7 @@ impl AdvancedRepository {
     /// approval-resolve path was the last unguarded dispatch surface
     /// after the MCP-555/MCP-557 sweep covered scheduler / engine chains
     /// / retry.
-    pub async fn get_workflow_actor_id(
-        &self,
-        wf_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<Uuid>> {
+    pub async fn get_workflow_actor_id(&self, wf_id: Uuid, user_id: Uuid) -> Result<Option<Uuid>> {
         let row: Option<(Option<Uuid>,)> =
             sqlx::query_as("SELECT actor_id FROM workflows WHERE id = $1 AND user_id = $2")
                 .bind(wf_id)
