@@ -2,52 +2,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Max bytes buffered from a Google Calendar API success response. Calendar
-/// and event payloads are at most a few hundred KiB; 10 MiB (matching the
-/// worker's `MAX_LLM_BODY_BYTES`, PR #76) refuses a runaway body with ample
-/// headroom.
-const MAX_GCAL_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-
-/// Error bodies are only surfaced in error messages / logs, so buffer at most
-/// a small bound of a provider's error response.
-const MAX_GCAL_ERROR_BODY_BYTES: usize = 64 * 1024;
-
-/// Read a response body into memory, aborting if it exceeds `max` bytes.
-///
-/// Controller-side sibling of the worker's `read_llm_response_body_bounded`
-/// (PR #76) and the embedding / LLM caps (PRs #78, #79): `resp.json()` /
-/// `resp.text()` buffer the WHOLE body with no size limit, so a compromised /
-/// MITM'd / buggy upstream returning a multi-GB body would OOM the controller.
-/// `reqwest` here lacks the `stream` feature, so `Response::chunk()` (always
-/// available) streams the body and we cap as we accumulate.
-async fn read_body_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await? {
-        if body.len() + chunk.len() > max {
-            anyhow::bail!("Google Calendar response exceeded {}-byte cap", max);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-/// Bounded equivalent of `resp.json().await?` — caps at
-/// [`MAX_GCAL_RESPONSE_BYTES`] before parsing. Takes the response by value
-/// (the body read consumes it anyway), so call sites need no `mut`.
-async fn read_json_capped<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
-    let bytes = read_body_capped(resp, MAX_GCAL_RESPONSE_BYTES).await?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-/// Bounded, infallible equivalent of `resp.text().await?` for error bodies —
-/// caps at [`MAX_GCAL_ERROR_BODY_BYTES`] and returns lossy UTF-8.
-async fn read_error_text_capped(resp: reqwest::Response) -> String {
-    match read_body_capped(resp, MAX_GCAL_ERROR_BODY_BYTES).await {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-        Err(_) => "<unreadable or oversized response body>".to_string(),
-    }
-}
-
 /// Google Calendar API client
 pub struct GoogleCalendarApiClient {
     client: reqwest::Client,
@@ -162,7 +116,7 @@ impl GoogleCalendarApiClient {
         tracing::debug!("Google Calendar API response status: {}", status);
 
         if !status.is_success() {
-            let error_text = read_error_text_capped(response).await;
+            let error_text = talos_http_body::read_error_text_capped(response).await;
             tracing::warn!(
                 "Google Calendar API error listing calendars: {}",
                 error_text
@@ -170,7 +124,7 @@ impl GoogleCalendarApiClient {
             anyhow::bail!("Calendar list failed: {}", error_text);
         }
 
-        let data: Value = read_json_capped(response).await?;
+        let data: Value = talos_http_body::read_json_capped(response).await?;
 
         let calendars: Vec<CalendarListEntry> = data["items"]
             .as_array()
@@ -223,11 +177,11 @@ impl GoogleCalendarApiClient {
         }
 
         if !response.status().is_success() {
-            let error_text = read_error_text_capped(response).await;
+            let error_text = talos_http_body::read_error_text_capped(response).await;
             anyhow::bail!("Event list failed: {}", error_text);
         }
 
-        let data: Value = read_json_capped(response).await?;
+        let data: Value = talos_http_body::read_json_capped(response).await?;
 
         let events = data["items"]
             .as_array()
@@ -263,11 +217,11 @@ impl GoogleCalendarApiClient {
             .context("Failed to get event")?;
 
         if !response.status().is_success() {
-            let error_text = read_error_text_capped(response).await;
+            let error_text = talos_http_body::read_error_text_capped(response).await;
             anyhow::bail!("Get event failed: {}", error_text);
         }
 
-        let event: Event = read_json_capped(response).await?;
+        let event: Event = talos_http_body::read_json_capped(response).await?;
         Ok(event)
     }
 
@@ -303,11 +257,11 @@ impl GoogleCalendarApiClient {
             .context("Failed to create watch channel")?;
 
         if !response.status().is_success() {
-            let error_text = read_error_text_capped(response).await;
+            let error_text = talos_http_body::read_error_text_capped(response).await;
             anyhow::bail!("Watch creation failed: {}", error_text);
         }
 
-        let watch_response: WatchResponse = read_json_capped(response).await?;
+        let watch_response: WatchResponse = talos_http_body::read_json_capped(response).await?;
         Ok(watch_response)
     }
 
@@ -335,7 +289,7 @@ impl GoogleCalendarApiClient {
             .context("Failed to stop watch channel")?;
 
         if !response.status().is_success() {
-            let error_text = read_error_text_capped(response).await;
+            let error_text = talos_http_body::read_error_text_capped(response).await;
             anyhow::bail!("Stop watch failed: {}", error_text);
         }
 

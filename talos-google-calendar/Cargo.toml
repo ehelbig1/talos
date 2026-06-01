@@ -26,6 +26,7 @@ subtle = "2.4"
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-engine = { path = "../talos-engine" }
+talos-http-body = { path = "../talos-http-body" }
 talos-integration-helpers = { path = "../talos-integration-helpers" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
