@@ -2370,6 +2370,76 @@ else
 fi
 echo
 
+# ── 31. No unbounded outbound HTTP response-body reads ───────────────
+bold "▶ check 31: outbound HTTP response bodies must be read through talos-http-body"
+
+# `reqwest::Response::json()` / `::text()` / `::bytes()` buffer the WHOLE
+# response with no size limit. A compromised / MITM'd / buggy upstream — or,
+# worse, a caller-supplied endpoint (the call_a2a_agent case) — returning a
+# multi-GB body OOMs the controller, the credential-holding host. PRs #76–#88
+# routed every outbound read through `talos_http_body::read_{body,json,error_text}_capped`
+# (Response::chunk() stream-and-cap, 10 MiB / 64 KiB defaults). This freezes
+# that: any NEW `.json()/.text()/.bytes().await` (incl. turbofish
+# `.json::<T>().await`) on a response is a regression.
+#
+# Exempt:
+#   * talos-http-body/ — the canonical capped impl (uses chunk(), not these).
+#   * the worker — its read_llm_response_body_bounded uses bytes_stream() +
+#     stream.next(), which does NOT match this pattern, so no exclusion needed.
+#   * tests, and full-line comments.
+# Opt out (a genuinely bounded internal response) with
+# `// allow-unbounded-response: <reason>` within 4 lines above.
+
+UNBOUNDED_READ_VIOLATIONS=0
+if [ -n "$RG_BIN" ]; then
+    ur_matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' \
+        -g '!talos-http-body/**' \
+        -g '!**/tests/**' -g '!**/*_tests.rs' \
+        -e '\.(json|text|bytes)\(\)\.await' \
+        -e '\.json::<.+>\(\)\.await' \
+        . 2>/dev/null || true)
+else
+    ur_matches=$(grep -rnE --include='*.rs' \
+        -e '\.(json|text|bytes)\(\)\.await' \
+        -e '\.json::<.+>\(\)\.await' \
+        talos-* worker controller 2>/dev/null \
+        | grep -vE 'talos-http-body/|/tests/|_tests\.rs' || true)
+fi
+
+if [ -n "$ur_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Skip full-line comments / doc comments.
+        if echo "$body" | grep -qE '^\s*//|^\s*\*|//!'; then
+            continue
+        fi
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-unbounded-response:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        UNBOUNDED_READ_VIOLATIONS=$((UNBOUNDED_READ_VIOLATIONS + 1))
+    done <<< "$ur_matches"
+fi
+
+if [ "$UNBOUNDED_READ_VIOLATIONS" -gt 0 ]; then
+    red "✗ $UNBOUNDED_READ_VIOLATIONS unbounded outbound response read(s) — these OOM the controller on a giant body"
+    yellow "  → use talos_http_body::read_json_capped(resp) / read_error_text_capped(resp) /"
+    yellow "    read_body_capped(resp, max) — Response::chunk() stream-and-cap (no \`stream\` feature needed)."
+    yellow "  → Opt out (response is provably bounded): // allow-unbounded-response: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ outbound response bodies read through the bounded talos-http-body path"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
