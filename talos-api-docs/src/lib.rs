@@ -120,6 +120,7 @@ pub struct ApiDocumentation {
     pub graphql: GraphQlDoc,
     pub rest_endpoints: Vec<EndpointDoc>,
     pub rate_limits: RateLimitDoc,
+    pub idempotency: IdempotencyDoc,
     pub authentication: AuthDoc,
 }
 
@@ -142,6 +143,16 @@ pub struct RateLimitDoc {
     pub general_per_minute: u32,
     pub burst_allowance: u32,
     pub header_description: String,
+}
+
+/// Idempotency Documentation — the opt-in `Idempotency-Key` contract.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IdempotencyDoc {
+    pub header: String,
+    pub applies_to: String,
+    pub key_format: String,
+    pub behavior: String,
+    pub replay_header: String,
 }
 
 /// Authentication Documentation
@@ -340,6 +351,13 @@ pub fn generate_api_documentation() -> ApiDocumentation {
             burst_allowance: 20,
             header_description: "Rate limit headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset. Per-IP limits enforced; defaults above are CODE defaults — overridable via API_RATE_LIMIT / WEBHOOK_RATE_LIMIT / GLOBAL_RATE_LIMIT envs (the Helm chart at deploy/helm/talos/values.yaml sets API_RATE_LIMIT=1000, WEBHOOK_RATE_LIMIT=500, GLOBAL_RATE_LIMIT=10000 by default). Burst is `(limit/5).max(10)` for API, `(limit/6).max(5)` for webhooks, `(limit/2).max(500)` for global. /health, /live, /ready are exempt.".to_string(),
         },
+        idempotency: IdempotencyDoc {
+            header: "Idempotency-Key".to_string(),
+            applies_to: "Opt-in on GraphQL mutations (POST /graphql). Send a unique key per logical operation to make retries safe (exactly-once). Requires Redis; requests WITHOUT the header are unaffected.".to_string(),
+            key_format: "1–255 printable-ASCII characters (no spaces or control chars); a UUID per operation is recommended.".to_string(),
+            behavior: "The first request with a given key executes and its response is cached. A retry with the SAME key + SAME body replays the cached response (status + body + Content-Type) instead of re-executing. A concurrent duplicate (same key still in flight) returns 409 Conflict. Reusing a key with a DIFFERENT request body returns 422. A malformed key returns 400. Responses are cached for 24h; 5xx responses are NOT cached so the operation can be safely retried.".to_string(),
+            replay_header: "idempotent-replayed: true (present only on replayed cache-hit responses)".to_string(),
+        },
         authentication: AuthDoc {
             methods: vec![
                 "JWT Session (HTTP-only cookies)".to_string(),
@@ -501,6 +519,13 @@ pub async fn api_docs_html_handler() -> Html<String> {
                 <div class="endpoint"><span class="method get">GET</span><a href="/health">/health</a></div>
                 <div class="endpoint"><span class="method get">GET</span><a href="/health/redis">/health/redis</a></div>
                 <div class="endpoint"><span class="method get">GET</span><a href="/health/nats">/health/nats</a></div>
+            </div>
+            <div class="card">
+                <h2>&#128260; Idempotency</h2>
+                <p>Make retried mutations safe (exactly-once) by sending an <code>Idempotency-Key</code> header. Opt-in &mdash; requests without the header are unaffected.</p>
+                <h3>Usage</h3>
+                <div class="endpoint"><span class="method post">POST</span>/graphql + <code>Idempotency-Key: &lt;uuid&gt;</code></div>
+                <p>A retry with the same key + same body replays the cached response (stamped <code>idempotent-replayed: true</code>). Concurrent duplicate &rarr; <code>409</code>; key reused with a different body &rarr; <code>422</code>; malformed key &rarr; <code>400</code>. Cached 24h; 5xx responses are not cached so they stay retryable.</p>
             </div>
         </div>
         <div class="section">
