@@ -609,7 +609,8 @@ pub fn is_controller_internal_vault_path(path: &str) -> bool {
 #[cfg(test)]
 mod llm_provider_path_tests {
     use super::{
-        is_controller_internal_vault_path, is_llm_provider_vault_path, LLM_PROVIDER_VAULT_PATHS,
+        is_controller_internal_vault_path, is_external_llm_host, is_llm_provider_vault_path,
+        EXTERNAL_LLM_HOSTS, LLM_PROVIDER_VAULT_PATHS,
     };
 
     #[test]
@@ -620,6 +621,62 @@ mod llm_provider_path_tests {
                 "canonical path {} not recognised",
                 p
             );
+        }
+    }
+
+    /// Tier-1 (local-Ollama-only) actors are blocked from external LLM egress
+    /// by the worker's HTTP-host gate, which keys on `EXTERNAL_LLM_HOSTS`. Key
+    /// resolution keys on `LLM_PROVIDER_VAULT_PATHS`. If a provider is added to
+    /// the latter but its API host(s) are NOT added to the former, a tier-1
+    /// actor can reach the new provider by raw host and exfiltrate data — the
+    /// drift CLAUDE.md warns about under "Adding a new LLM provider".
+    ///
+    /// This is the forcing function: a new provider must be mapped here AND its
+    /// host(s) must be present in `EXTERNAL_LLM_HOSTS`, or this test fails at PR
+    /// time instead of the gap shipping silently.
+    #[test]
+    fn every_llm_provider_has_its_egress_host_in_the_deny_list() {
+        // provider segment -> API host(s) the provider's traffic uses.
+        let provider_hosts: &[(&str, &[&str])] = &[
+            ("anthropic", &["api.anthropic.com"]),
+            ("openai", &["api.openai.com"]),
+            (
+                "gemini",
+                &[
+                    "generativelanguage.googleapis.com",
+                    "aiplatform.googleapis.com",
+                ],
+            ),
+        ];
+
+        // 1. Every vault-path provider must be mapped above.
+        for path in LLM_PROVIDER_VAULT_PATHS {
+            let provider = path
+                .split('/')
+                .next()
+                .expect("vault path has a provider segment");
+            assert!(
+                provider_hosts.iter().any(|(p, _)| *p == provider),
+                "LLM provider `{provider}` (in LLM_PROVIDER_VAULT_PATHS) is unmapped here — add it \
+                 + its API host(s) to EXTERNAL_LLM_HOSTS, else a tier-1 actor can reach it by raw \
+                 host (CLAUDE.md tier-1 egress invariant)."
+            );
+        }
+
+        // 2. Every mapped host must be in the tier-1 egress deny-list AND
+        //    recognised by the matcher the worker gate actually calls.
+        for (provider, hosts) in provider_hosts {
+            for host in *hosts {
+                assert!(
+                    EXTERNAL_LLM_HOSTS.contains(host),
+                    "egress host `{host}` for provider `{provider}` is missing from \
+                     EXTERNAL_LLM_HOSTS — the tier-1 HTTP-host gate won't deny it."
+                );
+                assert!(
+                    is_external_llm_host(host),
+                    "is_external_llm_host(`{host}`) is false despite the deny-list entry."
+                );
+            }
         }
     }
 
