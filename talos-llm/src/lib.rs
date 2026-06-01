@@ -58,6 +58,59 @@ enum KeySource {
     },
 }
 
+/// Max bytes buffered from an LLM provider success response. A completion
+/// body is at most a few hundred KiB; 10 MiB (matching the worker's
+/// `MAX_LLM_BODY_BYTES`, PR #76) refuses a runaway body with ample headroom.
+const MAX_LLM_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Error bodies are only surfaced in error messages / logs (and truncated
+/// there), so buffer at most a small bound of a provider's error response.
+const MAX_LLM_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Read a response body into memory, aborting if it exceeds `max` bytes.
+///
+/// Controller-side sibling of the worker's `read_llm_response_body_bounded`
+/// (PR #76) and the embedding caps in `talos-memory` / `talos-search-service`
+/// (PR #78): `resp.json()` / `resp.text()` buffer the WHOLE body with no size
+/// limit, so a compromised / MITM'd / buggy LLM endpoint returning a multi-GB
+/// body would OOM the controller — the credential-holding host. `reqwest`
+/// here lacks the `stream` feature, so `Response::chunk()` (always available)
+/// streams the body and we cap as we accumulate.
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > max {
+            return Err(format!("LLM response exceeded {max}-byte cap"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Bounded equivalent of `resp.json().await?` for success bodies — caps at
+/// [`MAX_LLM_RESPONSE_BYTES`] before parsing. Takes the response by value
+/// (the body read consumes it anyway), so call sites need no `mut`. Every
+/// caller here parses into `serde_json::Value`, so the return is concrete.
+async fn read_json_capped(resp: reqwest::Response) -> Result<serde_json::Value> {
+    let bytes = read_body_capped(resp, MAX_LLM_RESPONSE_BYTES)
+        .await
+        .map_err(|e| anyhow!("LLM response body read failed: {e}"))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Bounded, infallible equivalent of `resp.text().await.unwrap_or_default()`
+/// for error bodies — caps at [`MAX_LLM_ERROR_BODY_BYTES`] and returns lossy
+/// UTF-8 (empty string on read error / oversize).
+async fn read_error_text_capped(resp: reqwest::Response) -> String {
+    match read_body_capped(resp, MAX_LLM_ERROR_BODY_BYTES).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     client: Client,
@@ -245,7 +298,7 @@ impl LlmClient {
                     // is an MCP handler whose error surfaces to the
                     // operator, that body could leak. Same pattern as
                     // OllamaClient::complete just below.
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = read_error_text_capped(resp).await;
                     let redacted = talos_dlp_provider::redact_str(&text);
                     error!(
                         status = %status,
@@ -272,7 +325,7 @@ impl LlmClient {
 
             // Non-retriable error — same redaction posture as the
             // retry-exhausted branch above (MCP-454).
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_error_text_capped(resp).await;
             let redacted = talos_dlp_provider::redact_str(&text);
             error!(
                 status = %status,
@@ -286,7 +339,7 @@ impl LlmClient {
             ));
         };
 
-        let body: serde_json::Value = response.json().await?;
+        let body: serde_json::Value = read_json_capped(response).await?;
 
         let mut text = body["content"][0]["text"]
             .as_str()
@@ -351,7 +404,7 @@ impl LlmClient {
             // (including embedded secrets a user pasted into a workflow
             // description). Log aggregators downstream are often shared
             // surfaces; full echo would leak via that path.
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_error_text_capped(resp).await;
             let redacted = talos_dlp_provider::redact_str(&text);
             error!(
                 status = %status,
@@ -362,7 +415,7 @@ impl LlmClient {
             return Err(anyhow!("LLM API error: HTTP {}", status));
         };
 
-        let body: serde_json::Value = response.json().await?;
+        let body: serde_json::Value = read_json_capped(response).await?;
         let mut text = body["content"][0]["text"]
             .as_str()
             .unwrap_or("")
@@ -453,7 +506,7 @@ impl LlmClient {
                 if retries >= max_retries {
                     // MCP-454: log full body server-side, return status to caller.
                     // MCP-527: DLP-redact before tracing — see generate_text.
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = read_error_text_capped(resp).await;
                     let redacted = talos_dlp_provider::redact_str(&text);
                     error!(
                         status = %status,
@@ -476,7 +529,7 @@ impl LlmClient {
 
             // MCP-454: log full body server-side, return status to caller.
             // MCP-527: DLP-redact before tracing — see generate_text.
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_error_text_capped(resp).await;
             let redacted = talos_dlp_provider::redact_str(&text);
             error!(
                 status = %status,
@@ -487,7 +540,7 @@ impl LlmClient {
             return Err(anyhow!("LLM API error: HTTP {}", status));
         };
 
-        let body: serde_json::Value = response.json().await?;
+        let body: serde_json::Value = read_json_capped(response).await?;
         let mut text = body["content"][0]["text"]
             .as_str()
             .unwrap_or("")
@@ -573,13 +626,13 @@ impl OllamaClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_error_text_capped(resp).await;
             // SECURITY: don't leak full response to caller — log server-side only
             error!(status = %status, body_len = text.len(), "Ollama API error");
             return Err(anyhow!("Ollama returned HTTP {}", status));
         }
 
-        let body: serde_json::Value = resp.json().await?;
+        let body: serde_json::Value = read_json_capped(resp).await?;
         let text = body
             .get("choices")
             .and_then(|c| c.get(0))
@@ -603,7 +656,7 @@ impl OllamaClient {
         if !resp.status().is_success() {
             return Err(anyhow!("Ollama list models failed: HTTP {}", resp.status()));
         }
-        Ok(resp.json().await?)
+        read_json_capped(resp).await
     }
 
     /// Pull a model from the Ollama registry.
@@ -618,7 +671,7 @@ impl OllamaClient {
         if !resp.status().is_success() {
             return Err(anyhow!("Ollama pull failed: HTTP {}", resp.status()));
         }
-        let body: serde_json::Value = resp.json().await?;
+        let body: serde_json::Value = read_json_capped(resp).await?;
         Ok(body
             .get("status")
             .and_then(|v| v.as_str())
@@ -651,6 +704,6 @@ impl OllamaClient {
         if !resp.status().is_success() {
             return Err(anyhow!("Ollama show failed: HTTP {}", resp.status()));
         }
-        Ok(resp.json().await?)
+        read_json_capped(resp).await
     }
 }
