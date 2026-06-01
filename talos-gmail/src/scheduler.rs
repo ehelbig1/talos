@@ -54,7 +54,6 @@ pub async fn gmail_renewal_task(
                 for (user_id, row) in rows {
                     tracing::info!(
                         channel_uuid = %row.id,
-                        email = %row.email_address,
                         %user_id,
                         "🔁 Renewing gmail watch"
                     );

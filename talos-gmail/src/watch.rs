@@ -467,9 +467,11 @@ impl GmailWatchService {
             return Err(e);
         }
 
+        // DLP: `channel_uuid` is the pseudonymous identifier; the connected
+        // account's email (PII) is redundant in operational logs. Parity with
+        // the gmail-push-handler redaction + MCP-1011/1012.
         tracing::info!(
             channel_uuid = %row.id,
-            email = %row.email_address,
             topic = %row.topic_name,
             history_id = %row.history_id,
             "✅ Created gmail watch"
