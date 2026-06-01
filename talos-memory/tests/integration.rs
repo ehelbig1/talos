@@ -22,7 +22,7 @@ use sqlx::{Pool, Postgres};
 use talos_memory as mem;
 use uuid::Uuid;
 
-fn test_pool_or_skip() -> Option<(Pool<Postgres>, Uuid)> {
+async fn test_pool_or_skip() -> Option<(Pool<Postgres>, Uuid)> {
     let url = match std::env::var("TALOS_TEST_DATABASE_URL") {
         Ok(u) if !u.is_empty() => u,
         _ => {
@@ -38,19 +38,16 @@ fn test_pool_or_skip() -> Option<(Pool<Postgres>, Uuid)> {
         .and_then(|s| Uuid::parse_str(&s).ok())
         .unwrap_or_else(Uuid::new_v4);
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let pool = rt.block_on(async {
-        PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(5))
-            .connect(&url)
-            .await
-            .expect("TALOS_TEST_DATABASE_URL connect")
-    });
-    // Leak the runtime intentionally — we don't shut it down between
-    // tests because sqlx pool futures expect a live one. This process
-    // exits cleanly regardless.
-    std::mem::forget(rt);
+    // Connect on the test's OWN runtime. The previous version built a nested
+    // `tokio::runtime::Runtime` and `block_on`'d the connect, which panics with
+    // "Cannot start a runtime from within a runtime" when called from a
+    // `#[tokio::test]` async context — so this whole suite never actually ran.
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&url)
+        .await
+        .expect("TALOS_TEST_DATABASE_URL connect");
     Some((pool, actor_id))
 }
 
@@ -60,7 +57,7 @@ async fn cleanup_prefix(pool: &Pool<Postgres>, actor_id: Uuid, prefix: &str) {
 
 #[tokio::test]
 async fn persist_recall_forget_roundtrip() {
-    let Some((pool, actor_id)) = test_pool_or_skip() else {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
         return;
     };
     let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
@@ -122,7 +119,7 @@ async fn persist_recall_forget_roundtrip() {
 
 #[tokio::test]
 async fn persist_rejects_oversized_value() {
-    let Some((pool, actor_id)) = test_pool_or_skip() else {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
         return;
     };
     // A 70 KiB value — over the 64 KiB cap enforced by persist_memory.
@@ -140,7 +137,7 @@ async fn persist_rejects_oversized_value() {
 
 #[tokio::test]
 async fn persist_rejects_empty_key() {
-    let Some((pool, actor_id)) = test_pool_or_skip() else {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
         return;
     };
     let err = mem::persist_memory(&pool, actor_id, "", &serde_json::json!({}), "working", None)
@@ -151,7 +148,7 @@ async fn persist_rejects_empty_key() {
 
 #[tokio::test]
 async fn recall_semantic_filtered_excludes_by_metadata_kind() {
-    let Some((pool, actor_id)) = test_pool_or_skip() else {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
         return;
     };
     let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
@@ -267,7 +264,7 @@ async fn recall_semantic_filtered_excludes_by_metadata_kind() {
 
 #[tokio::test]
 async fn recall_recent_by_types_filters_and_orders() {
-    let Some((pool, actor_id)) = test_pool_or_skip() else {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
         return;
     };
     let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
@@ -346,7 +343,7 @@ async fn recall_recent_by_types_filters_and_orders() {
 
 #[tokio::test]
 async fn recall_recent_excluding_types_drops_match_keeps_rest() {
-    let Some((pool, actor_id)) = test_pool_or_skip() else {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
         return;
     };
     let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
@@ -404,7 +401,7 @@ async fn recall_recent_excluding_types_drops_match_keeps_rest() {
 
 #[tokio::test]
 async fn semantic_recall_returns_keyword_fallback_when_no_embedding() {
-    let Some((pool, actor_id)) = test_pool_or_skip() else {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
         return;
     };
     let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
