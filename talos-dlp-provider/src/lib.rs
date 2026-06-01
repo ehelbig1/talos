@@ -319,7 +319,7 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         // delimiter so the existing `[A-Za-z0-9\-_]{6,}` body
         // suffix covers the token tail.
         (
-            r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.)[A-Za-z0-9\-_]{6,}",
+            r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|xapp-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.)[A-Za-z0-9\-_]{6,}",
             "[REDACTED:API_KEY]",
         ),
         // MCP-521: AWS Access Key IDs. Real AWS access key IDs are
@@ -1295,6 +1295,19 @@ mod tests {
         assert!(
             result.contains("[REDACTED:API_KEY]"),
             "Slack xoxa- token must redact: {result}"
+        );
+    }
+
+    #[test]
+    fn redacts_slack_socket_mode_app_token() {
+        // `xapp-` is the Slack app-level token (Socket Mode) — distinct from the
+        // `xoxa-` app config token above. It was the one prefix missing from the
+        // Slack family in the redaction alternation.
+        let input = "xapp-1-A01234567-1234567890-abcdefABCDEF1234567890";
+        let result = redact_str(input);
+        assert!(
+            result.contains("[REDACTED:API_KEY]"),
+            "Slack xapp- app-level token must redact: {result}"
         );
     }
 
