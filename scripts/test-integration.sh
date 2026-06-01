@@ -60,6 +60,7 @@ export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 # crate : integration-test-binary : datastore (redis | migrated | selfcontained)
 TESTS=(
     "talos-idempotency:redis_integration:redis"
+    "talos-idempotency:middleware_integration:redis"
     "talos-tenancy:rls_integration:selfcontained"
     "talos-actor-repository:budget_guard_integration:selfcontained"
     "talos-db:rls_helper_enforcement:migrated"
