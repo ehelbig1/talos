@@ -8387,6 +8387,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "talos-dlp-provider",
+ "talos-http-body",
  "talos-secrets-manager",
  "talos-text-util",
  "talos-workflow-engine-core",
