@@ -8736,6 +8736,7 @@ name = "talos-tenancy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "sqlx",
  "tokio",
  "tracing",
  "uuid",
