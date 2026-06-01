@@ -287,7 +287,7 @@ impl KekProvider for VaultTransitProvider {
                 .context("Vault transit encrypt: HTTP send failed")?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = talos_http_body::read_error_text_capped(resp).await;
                 // Body may include the requested cipher op but never
                 // the plaintext — Vault doesn't echo it back. Still log
                 // bounded length to keep error messages reasonable.
@@ -351,7 +351,7 @@ impl KekProvider for VaultTransitProvider {
                 .context("Vault transit decrypt: HTTP send failed")?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = talos_http_body::read_error_text_capped(resp).await;
                 let truncated = body.chars().take(500).collect::<String>();
                 return Err(anyhow!(
                     "Vault transit decrypt failed: HTTP {} — {}",

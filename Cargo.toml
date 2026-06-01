@@ -4,6 +4,7 @@ members = [
     "talos-dlp",
     "talos-secrets",
     "talos-ssrf-classify",
+    "talos-http-body",
     "talos-memory",
     "talos-mcp",
     "talos-auth-types",
