@@ -46,6 +46,20 @@ pub enum VaultResolverError {
         /// The vault path (prefix stripped) that failed to resolve.
         vault_path: String,
     },
+    /// A `vault://<path>` reference targeted a host-internal path that must
+    /// never be substituted into a module payload — currently OAuth refresh
+    /// tokens (`oauth/.../refresh_token`). Controller-side mirror of the
+    /// worker's reserved-path deny-list (PR #118): refresh tokens are
+    /// consumed only by the controller's token-refresh loop; modules use the
+    /// sibling `access_token`. LLM provider keys are intentionally NOT
+    /// rejected here — declaring `vault://anthropic/api_key` as a header is the
+    /// documented BYO-key pattern, gated per-tier by the worker.
+    ReservedHostPath {
+        /// The config key whose value referenced the reserved path.
+        config_key: String,
+        /// The reserved vault path (prefix stripped).
+        vault_path: String,
+    },
 }
 
 impl fmt::Display for VaultResolverError {
@@ -59,6 +73,15 @@ impl fmt::Display for VaultResolverError {
                 "Config key '{config_key}' references vault://{vault_path} but the secret \
                  could not be resolved. Ensure the secret exists (set_secret) and the path \
                  is correct."
+            ),
+            Self::ReservedHostPath {
+                config_key,
+                vault_path,
+            } => write!(
+                f,
+                "Config key '{config_key}' references vault://{vault_path}, a host-internal \
+                 path that cannot be substituted into a module payload. OAuth refresh tokens \
+                 are controller-only; use the sibling access_token instead."
             ),
         }
     }
@@ -103,6 +126,22 @@ pub fn replace_vault_values(
     refs: &[VaultRef],
 ) -> Result<(), VaultResolverError> {
     for (config_key, vault_path) in refs {
+        // #118 controller-side mirror: refuse to substitute a host-internal
+        // OAuth refresh token into the payload. `is_controller_internal &&
+        // !is_llm` isolates the refresh-token case — LLM provider keys stay
+        // substitutable (the documented `vault://anthropic/api_key` BYO-key
+        // header pattern; the tier ceiling is enforced by the worker's
+        // resolve_vault_header + HTTP-host gate, not here). Closes the
+        // sandbox/replay path where a `["*"]`-resolved refresh token could be
+        // written into a module's input plaintext, bypassing the worker gate.
+        if talos_workflow_job_protocol::is_controller_internal_vault_path(vault_path)
+            && !talos_workflow_job_protocol::is_llm_provider_vault_path(vault_path)
+        {
+            return Err(VaultResolverError::ReservedHostPath {
+                config_key: config_key.clone(),
+                vault_path: vault_path.clone(),
+            });
+        }
         let plaintext = resolved.get(vault_path.as_str()).ok_or_else(|| {
             VaultResolverError::SecretNotResolved {
                 config_key: config_key.clone(),
@@ -264,11 +303,71 @@ mod tests {
                 assert_eq!(config_key, "AUTH_HEADER");
                 assert_eq!(vault_path, "missing/path");
             }
+            other => panic!("expected SecretNotResolved, got {other}"),
         }
         // Display still carries both fields for human-readable logs.
         let rendered = format!("{err}");
         assert!(rendered.contains("AUTH_HEADER"));
         assert!(rendered.contains("missing/path"));
+    }
+
+    #[test]
+    fn refuses_to_substitute_oauth_refresh_token() {
+        // #118 controller-side mirror: a config referencing a host-internal
+        // OAuth refresh token must be rejected, NOT substituted into the
+        // payload — even if the secret was resolved (e.g. via a `["*"]` grant).
+        let mut payload = json!({
+            "config": { "RT": "vault://oauth/gmail/u1/primary/refresh_token" }
+        });
+        let refs = vec![(
+            "RT".to_string(),
+            "oauth/gmail/u1/primary/refresh_token".to_string(),
+        )];
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            "oauth/gmail/u1/primary/refresh_token".to_string(),
+            "super-secret-refresh-token".to_string(),
+        );
+
+        let err = replace_vault_values(&mut payload, &resolved, &refs)
+            .expect_err("refresh-token substitution must be refused");
+        assert!(matches!(err, VaultResolverError::ReservedHostPath { .. }));
+        // The plaintext must NOT have leaked into the payload.
+        assert_eq!(
+            payload["config"]["RT"].as_str().unwrap(),
+            "vault://oauth/gmail/u1/primary/refresh_token",
+            "payload must be left untouched — no refresh token written in"
+        );
+    }
+
+    #[test]
+    fn still_substitutes_llm_byo_key_and_oauth_access_token() {
+        // LLM provider keys (documented BYO-key header pattern) and OAuth
+        // ACCESS tokens are legitimate substitutions — the guard must only
+        // catch refresh tokens, nothing else.
+        let mut payload = json!({
+            "config": {
+                "AUTH": "vault://anthropic/api_key",
+                "AT": "vault://oauth/gmail/u1/primary/access_token"
+            }
+        });
+        let refs = vec![
+            ("AUTH".to_string(), "anthropic/api_key".to_string()),
+            (
+                "AT".to_string(),
+                "oauth/gmail/u1/primary/access_token".to_string(),
+            ),
+        ];
+        let mut resolved = HashMap::new();
+        resolved.insert("anthropic/api_key".to_string(), "sk-ant-xxx".to_string());
+        resolved.insert(
+            "oauth/gmail/u1/primary/access_token".to_string(),
+            "ya29.at".to_string(),
+        );
+
+        replace_vault_values(&mut payload, &resolved, &refs).expect("must substitute");
+        assert_eq!(payload["config"]["AUTH"].as_str().unwrap(), "sk-ant-xxx");
+        assert_eq!(payload["config"]["AT"].as_str().unwrap(), "ya29.at");
     }
 
     #[test]
