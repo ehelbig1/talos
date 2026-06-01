@@ -64,7 +64,7 @@ pub fn clear_session_cookies(cookies: &Cookies) {
 
 #[cfg(test)]
 mod cookie_security_tests {
-    use super::{set_session_cookies, Cookies};
+    use super::{clear_session_cookies, set_session_cookies, Cookies};
     use tower_cookies::cookie::SameSite;
 
     /// CLAUDE.md security rule: auth cookies MUST be HttpOnly + Secure +
@@ -107,5 +107,38 @@ mod cookie_security_tests {
                 "{label} cookie Secure flag must follow is_production()"
             );
         }
+    }
+
+    /// MCP-1041 logout-completeness: [`clear_session_cookies`] must remove
+    /// EVERY cookie [`set_session_cookies`] adds. The documented drift hazard
+    /// is "if the setter ever adds a third cookie, the removal path MUST stay
+    /// in sync or sessions partially linger" — a real hole (the user appears
+    /// logged-in client-side after a successful server-side logout). This
+    /// drives set→clear and asserts no live auth cookie survives, so a setter
+    /// that gains a cookie without a matching remover fails at PR time.
+    #[test]
+    fn clear_removes_every_cookie_the_setter_adds() {
+        let cookies = Cookies::default();
+        set_session_cookies(&cookies, "access-tok-value", "refresh-tok-value");
+        assert!(
+            !cookies.list().is_empty(),
+            "precondition: setter must add cookies"
+        );
+
+        clear_session_cookies(&cookies);
+
+        // tower_cookies' delta-`remove` drops a delta-added cookie entirely;
+        // any auth cookie left with a live (non-empty) value means the remover
+        // did not clear what the setter added — set/clear drifted.
+        let survivors: Vec<String> = cookies
+            .list()
+            .iter()
+            .filter(|c| c.name().starts_with("talos_") && !c.value().is_empty())
+            .map(|c| c.name().to_string())
+            .collect();
+        assert!(
+            survivors.is_empty(),
+            "clear_session_cookies left auth cookies behind (set/clear drift, MCP-1041): {survivors:?}"
+        );
     }
 }
