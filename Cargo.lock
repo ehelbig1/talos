@@ -8209,6 +8209,7 @@ dependencies = [
  "talos-execution-result-collector",
  "talos-graph-rag",
  "talos-hot-update-service",
+ "talos-http-body",
  "talos-http-utils",
  "talos-inline-compile-service",
  "talos-llm",
