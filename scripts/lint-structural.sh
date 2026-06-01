@@ -2585,6 +2585,38 @@ else
 fi
 echo
 
+# ── 34. actor_memory value_format reads must fail LOUD ───────────────
+bold "▶ check 34: actor_memory value_format reads must fail loud (MCP-S2 AAD dispatch)"
+
+# `value_format` is the per-row column that drives v0-vs-v1 AAD dispatch when
+# decrypting actor_memory ciphertext. It is NOT NULL in the schema, so the
+# only way `try_get("value_format")` yields None/Err is a SELECT-projection
+# drift — the caller forgot to project it (exactly the Phase-B `value`-column
+# bug class, PR #108). Reading it with `.unwrap_or(0)` / `.ok()` silently
+# defaults to format 0 (legacy no-AAD), mis-dispatching EVERY v1 ciphertext to
+# empty-AAD decryption → a generic "AES-GCM tag mismatch" that buries the real
+# cause. Every read MUST be `.context(...)?` so projection drift trips loudly
+# at the first row (the integration suite then catches it). Freezes the MCP-S2
+# loud-fail discipline applied to decrypt_row_value / rows_to_memory_hits /
+# recall_exact / recall_semantic_filtered.
+VF_VIOLATIONS=0
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    printf '  %s\n' "$line"
+    VF_VIOLATIONS=$((VF_VIOLATIONS + 1))
+done < <(grep -rnE 'try_get\("value_format"\)[[:space:]]*\.[[:space:]]*(unwrap_or|unwrap|ok)\b' \
+            --include='*.rs' --exclude-dir=target \
+            talos-memory 2>/dev/null | grep -v '/tests/' || true)
+
+if [ "$VF_VIOLATIONS" -gt 0 ]; then
+    red "✗ $VF_VIOLATIONS value_format read(s) that swallow projection drift"
+    yellow "  → use .context(\"… must project \\\`value_format\\\` (MCP-S2 AAD dispatch)\")? so drift fails loud"
+    EXIT_CODE=1
+else
+    green "✓ all actor_memory value_format reads fail loud on projection drift"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
