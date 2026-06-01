@@ -1518,6 +1518,57 @@ mod tests {
     }
 
     #[test]
+    fn set_config_blocked_as_function_form_of_set() {
+        // `set_config(name, value, is_local)` is the FUNCTION equivalent of the
+        // statement-level-blocked `SET` — it performs the same session-state
+        // mutation (search_path / role / statement_timeout) "for the rest of
+        // the connection" that the SET deny-list exists to prevent, but as a
+        // plain function call inside a SELECT. Must be denied for parity.
+        for sql in [
+            "SELECT set_config('statement_timeout', '0', false)",
+            "SELECT set_config('search_path', 'attacker, public', false)",
+            "SELECT set_config('role', 'postgres', false)",
+        ] {
+            let err = validate_sql(sql, &[]).unwrap_err();
+            match err {
+                SqlValidationError::DisallowedFunction(name) => assert!(
+                    name.contains("set_config"),
+                    "error must reference set_config, got `{name}` for `{sql}`"
+                ),
+                other => panic!("expected DisallowedFunction for `{sql}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_config_blocked_pg_catalog_qualified() {
+        // The canonical search-path-bypass form must be caught too.
+        let err = validate_sql(
+            "SELECT pg_catalog.set_config('search_path', 'x', false)",
+            &[],
+        )
+        .unwrap_err();
+        match err {
+            SqlValidationError::DisallowedFunction(name) => {
+                assert!(name.contains("set_config"), "got `{name}`")
+            }
+            other => panic!("expected DisallowedFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_setting_is_not_over_blocked() {
+        // Negative control: `current_setting` is READ-only — it mutates
+        // nothing, so it is intentionally NOT on the deny-list. Blocking it
+        // would be over-reach (legitimate reads of GUCs like server_version).
+        let ok = validate_sql("SELECT current_setting('server_version')", &[]);
+        assert!(
+            ok.is_ok(),
+            "current_setting (read-only) must not be blocked, got {ok:?}"
+        );
+    }
+
+    #[test]
     fn pg_read_server_files_blocked() {
         // Arbitrary host-filesystem read.
         let err = validate_sql(
