@@ -359,6 +359,10 @@ pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) {
     // TLS-init failure surfaces immediately instead of silently
     // falling back to `Client::new()` and re-enabling unbounded
     // timeouts.
+    // allow-default-redirect: OCI registries legitimately 3xx /v2/_catalog
+    // toward blob storage; reqwest strips Authorization on cross-origin
+    // redirects, so the Basic-auth header only travels same-host. See the
+    // block comment above.
     let http_client = HttpClient::builder()
         .timeout(Duration::from_secs(60))
         .connect_timeout(Duration::from_secs(10))

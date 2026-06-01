@@ -2440,6 +2440,74 @@ else
 fi
 echo
 
+# ── 32. Outbound reqwest clients must set an explicit redirect policy ──
+bold "▶ check 32: reqwest Client::builder() must set an explicit .redirect() policy"
+
+# Credential-bearing outbound clients that follow redirects can leak the auth
+# header / be turned into a secret oracle. reqwest's DEFAULT policy follows up
+# to 10 redirects; the convention (paid for four times: MCP-471/496/533/534)
+# is `.redirect(reqwest::redirect::Policy::none())` on every client. This
+# freezes it: a NEW `Client::builder()` without an explicit `.redirect(...)`
+# in its chain is a regression.
+#
+# Exempt: tests and full-line comments. The worker's per-execution client and
+# every controller client already set Policy::none(). The ONE legitimate
+# follow-redirects client (talos-registry sync — registries 3xx to blob
+# storage, reqwest strips cross-origin auth) carries an explicit opt-out.
+# Opt out with `// allow-default-redirect: <reason>` within 12 lines above.
+
+REDIRECT_VIOLATIONS=0
+if [ -n "$RG_BIN" ]; then
+    rd_matches=$("$RG_BIN" -n --no-heading \
+        -g '*.rs' \
+        -g '!**/tests/**' -g '!**/*_tests.rs' \
+        -e 'Client::builder\(\)' -e 'ClientBuilder::new\(\)' \
+        . 2>/dev/null || true)
+else
+    rd_matches=$(grep -rnE --include='*.rs' \
+        -e 'Client::builder\(\)|ClientBuilder::new\(\)' \
+        talos-* worker controller 2>/dev/null \
+        | grep -vE '/tests/|_tests\.rs' || true)
+fi
+
+if [ -n "$rd_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Skip full-line comments / doc references.
+        if echo "$body" | grep -qE '^\s*//|^\s*///|^\s*\*|//!'; then
+            continue
+        fi
+        # Look at the builder chain (this line + next 12) for an explicit redirect.
+        chain=$(sed -n "${lineno},$((lineno + 12))p" "$file" 2>/dev/null || true)
+        if echo "$chain" | grep -qE '\.redirect\('; then
+            continue
+        fi
+        # Opt-out marker within 12 lines above.
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 12 ? lineno - 12 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-default-redirect:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        REDIRECT_VIOLATIONS=$((REDIRECT_VIOLATIONS + 1))
+    done <<< "$rd_matches"
+fi
+
+if [ "$REDIRECT_VIOLATIONS" -gt 0 ]; then
+    red "✗ $REDIRECT_VIOLATIONS reqwest client(s) with no explicit redirect policy — credential-leak surface"
+    yellow "  → add .redirect(reqwest::redirect::Policy::none()) to the builder chain (MCP-471/496/533/534)."
+    yellow "  → Opt out (must follow redirects, e.g. OCI blob storage): // allow-default-redirect: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ every outbound reqwest client sets an explicit redirect policy"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
