@@ -756,7 +756,7 @@ impl OAuthCredentialService {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = talos_http_body::read_error_text_capped(resp).await;
             // SECURITY: Log body length only — error bodies may echo client_secret or refresh_token.
             tracing::error!(provider, %status, body_len = body.len(), "OAuth token refresh failed");
             anyhow::bail!("Token refresh failed (HTTP {})", status);

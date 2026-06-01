@@ -146,7 +146,7 @@ pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bo
             if status.is_success() || status == reqwest::StatusCode::BAD_REQUEST {
                 Ok(true)
             } else {
-                let body_len = resp.text().await.map(|b| b.len()).unwrap_or(0);
+                let body_len = talos_http_body::read_error_text_capped(resp).await.len();
                 anyhow::bail!(
                     "Google revoke returned HTTP {} (body_len={})",
                     status,
@@ -167,7 +167,7 @@ pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bo
                 .context("Slack revoke request failed")?;
             let status = resp.status();
             if !status.is_success() {
-                let body_len = resp.text().await.map(|b| b.len()).unwrap_or(0);
+                let body_len = talos_http_body::read_error_text_capped(resp).await.len();
                 anyhow::bail!(
                     "Slack revoke returned HTTP {} (body_len={})",
                     status,
@@ -175,7 +175,7 @@ pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bo
                 );
             }
             // Best-effort parse: tolerate non-JSON bodies (network proxy injecting HTML, etc).
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let body: serde_json::Value = talos_http_body::read_json_capped::<serde_json::Value>(resp).await.unwrap_or_default();
             let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             // Slack returns {ok:false,error:"invalid_auth"} when token is already dead — accept that.
             let already_dead = !ok
@@ -904,8 +904,7 @@ impl OAuthService {
                 tracing::error!(error = %e, "Failed to request token endpoint");
                 anyhow!("Failed to exchange authorization code for token: {}", e)
             })?;
-        let token_response = token_resp
-            .json::<oauth2::basic::BasicTokenResponse>()
+        let token_response = talos_http_body::read_json_capped::<oauth2::basic::BasicTokenResponse>(token_resp)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to parse token response");
@@ -914,13 +913,12 @@ impl OAuthService {
 
         // Get user info from Google
         let user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo";
-        let user_info = oauth_http_client()
+        let resp = oauth_http_client()
             .get(user_info_url)
             .bearer_auth(token_response.access_token().secret())
             .send()
-            .await?
-            .json::<serde_json::Value>()
             .await?;
+        let user_info: serde_json::Value = talos_http_body::read_json_capped(resp).await?;
 
         Ok(OAuthUserInfo {
             provider_user_id: user_info["id"]
@@ -1001,13 +999,12 @@ impl OAuthService {
 
         // Retrieve userinfo via Okta's userinfo endpoint
         let userinfo_endpoint = format!("https://{domain}/oauth2/v1/userinfo");
-        let user_info = oauth_http_client()
+        let resp = oauth_http_client()
             .get(&userinfo_endpoint)
             .bearer_auth(token_response.access_token().secret())
             .send()
-            .await?
-            .json::<serde_json::Value>()
             .await?;
+        let user_info: serde_json::Value = talos_http_body::read_json_capped(resp).await?;
 
         Ok(OAuthUserInfo {
             provider_user_id: user_info["sub"]
@@ -1071,13 +1068,12 @@ impl OAuthService {
 
         // Get user info from Snyk API
         let user_info_url = "https://api.snyk.io/rest/self?version=2024-01-04";
-        let user_info = oauth_http_client()
+        let resp = oauth_http_client()
             .get(user_info_url)
             .bearer_auth(token_response.access_token().secret())
             .send()
-            .await?
-            .json::<serde_json::Value>()
             .await?;
+        let user_info: serde_json::Value = talos_http_body::read_json_capped(resp).await?;
 
         // Snyk API returns: { "data": { "id": "...", "attributes": { "email": "...", "name": "...", "username": "..." } } }
         let data = user_info["data"]
