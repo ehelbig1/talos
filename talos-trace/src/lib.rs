@@ -47,6 +47,52 @@ use std::time::Instant;
 /// must be kept explicitly. Set once at `init_tracing`.
 static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = OnceLock::new();
 
+/// Resolve the trace [`Sampler`] from the standard OpenTelemetry environment
+/// variables `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`, falling back to
+/// the SDK default (`parentbased_always_on`) when unset — so leaving them unset
+/// preserves the prior always-sample behaviour exactly.
+///
+/// [`Sampler`]: opentelemetry_sdk::trace::Sampler
+fn sampler_from_env() -> opentelemetry_sdk::trace::Sampler {
+    parse_sampler(
+        std::env::var("OTEL_TRACES_SAMPLER").ok().as_deref(),
+        std::env::var("OTEL_TRACES_SAMPLER_ARG").ok().as_deref(),
+    )
+}
+
+/// Pure mapping from the OTEL sampler env values to a [`Sampler`], factored out
+/// so it can be unit-tested without touching process env. Recognises the spec
+/// sampler names; the `*_traceidratio` variants read `arg` as a ratio in `[0, 1]`
+/// (clamped; defaults to `1.0` if missing/unparseable). An unrecognised
+/// `OTEL_TRACES_SAMPLER` falls back to the default with a stderr warning so an
+/// operator typo is visible rather than silently sampling everything.
+///
+/// [`Sampler`]: opentelemetry_sdk::trace::Sampler
+fn parse_sampler(kind: Option<&str>, arg: Option<&str>) -> opentelemetry_sdk::trace::Sampler {
+    use opentelemetry_sdk::trace::Sampler;
+    let ratio = || {
+        arg.and_then(|s| s.trim().parse::<f64>().ok())
+            .map(|r| r.clamp(0.0, 1.0))
+            .unwrap_or(1.0)
+    };
+    match kind.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("parentbased_always_on") => Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
+        Some("always_on") => Sampler::AlwaysOn,
+        Some("always_off") => Sampler::AlwaysOff,
+        Some("traceidratio") => Sampler::TraceIdRatioBased(ratio()),
+        Some("parentbased_always_off") => Sampler::ParentBased(Box::new(Sampler::AlwaysOff)),
+        Some("parentbased_traceidratio") => {
+            Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio())))
+        }
+        Some(other) => {
+            eprintln!(
+                "[TRACING] unrecognised OTEL_TRACES_SAMPLER='{other}'; using parentbased_always_on"
+            );
+            Sampler::ParentBased(Box::new(Sampler::AlwaysOn))
+        }
+    }
+}
+
 /// Initialize OpenTelemetry tracing
 /// Sets up the global tracer provider with OTLP exporter (for Jaeger)
 ///
@@ -91,12 +137,17 @@ pub fn init_tracing(
         .with_endpoint(endpoint)
         .build()?;
 
-    // Sampler configuration omitted for simplicity – defaults to always_on.
+    // Sampler from the standard OTEL env vars (default = parentbased_always_on,
+    // the SDK default and prior behaviour). This is the production knob for
+    // bounding span volume on the worker's hot path, e.g.
+    // `OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1`.
+    let sampler = sampler_from_env();
 
     // otel 0.28+: the batch span processor is runtime-agnostic (dedicated
     // background thread), so `with_batch_exporter` no longer takes a runtime
     // argument; `Resource` is built via the builder (`Resource::new` was removed).
     let tracer_provider = SdkTracerProvider::builder()
+        .with_sampler(sampler)
         .with_batch_exporter(exporter)
         .with_resource(
             Resource::builder()
@@ -594,6 +645,59 @@ mod tests {
             root.span.span_context().trace_id(),
             parent_trace_id,
             "a root span must not inherit an unrelated trace_id"
+        );
+    }
+
+    #[test]
+    fn parse_sampler_defaults_to_parentbased_always_on() {
+        // Unset env preserves the prior always-sample behaviour exactly.
+        let s = format!("{:?}", parse_sampler(None, None));
+        assert!(
+            s.contains("ParentBased"),
+            "default should be ParentBased: {s}"
+        );
+        assert!(
+            s.contains("AlwaysOn"),
+            "default inner should be AlwaysOn: {s}"
+        );
+    }
+
+    #[test]
+    fn parse_sampler_recognises_spec_names() {
+        assert!(format!("{:?}", parse_sampler(Some("always_off"), None)).contains("AlwaysOff"));
+        assert!(format!("{:?}", parse_sampler(Some("always_on"), None)).contains("AlwaysOn"));
+
+        let ratio = format!("{:?}", parse_sampler(Some("traceidratio"), Some("0.25")));
+        assert!(ratio.contains("TraceIdRatioBased"), "{ratio}");
+        assert!(
+            ratio.contains("0.25"),
+            "ratio arg must be honoured: {ratio}"
+        );
+
+        let pbr = format!(
+            "{:?}",
+            parse_sampler(Some("parentbased_traceidratio"), Some("0.1"))
+        );
+        assert!(
+            pbr.contains("ParentBased") && pbr.contains("TraceIdRatioBased") && pbr.contains("0.1"),
+            "{pbr}"
+        );
+    }
+
+    #[test]
+    fn parse_sampler_clamps_ratio_and_handles_bad_input() {
+        // Out-of-range ratios clamp to [0, 1].
+        assert!(format!("{:?}", parse_sampler(Some("traceidratio"), Some("5.0"))).contains("1.0"));
+        assert!(format!("{:?}", parse_sampler(Some("traceidratio"), Some("-1"))).contains("0.0"));
+        // Unparseable arg → default ratio 1.0.
+        assert!(format!("{:?}", parse_sampler(Some("traceidratio"), Some("abc"))).contains("1.0"));
+        // Case-insensitive.
+        assert!(format!("{:?}", parse_sampler(Some("ALWAYS_OFF"), None)).contains("AlwaysOff"));
+        // Unknown sampler name → safe default (NOT always-off, NOT a panic).
+        let unk = format!("{:?}", parse_sampler(Some("bogus"), None));
+        assert!(
+            unk.contains("ParentBased") && unk.contains("AlwaysOn"),
+            "{unk}"
         );
     }
 }
