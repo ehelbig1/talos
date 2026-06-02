@@ -701,96 +701,37 @@ impl TalosContext {
             // we actively block connections to private, loopback, and link-local IP addresses.
             builder.socket_addr_check(|addr, _use| {
                 Box::pin(async move {
-                    let ip = addr.ip();
-
-                    // SECURITY: Canonicalize IPv4-mapped IPv6 addresses (::ffff:A.B.C.D)
-                    // before checking. Without this, an attacker can bypass IPv4 private
-                    // range checks by using the mapped form (e.g., ::ffff:127.0.0.1).
-                    let ip = match ip {
-                        std::net::IpAddr::V6(v6) => {
-                            let segs = v6.segments();
-                            // IPv4-mapped: ::ffff:A.B.C.D → segments [0,0,0,0,0,0xffff,hi,lo]
-                            if segs[0] == 0 && segs[1] == 0 && segs[2] == 0
-                                && segs[3] == 0 && segs[4] == 0 && segs[5] == 0xffff
-                            {
-                                let mapped = std::net::Ipv4Addr::new(
-                                    (segs[6] >> 8) as u8,
-                                    segs[6] as u8,
-                                    (segs[7] >> 8) as u8,
-                                    segs[7] as u8,
-                                );
-                                tracing::debug!("Canonicalized IPv4-mapped IPv6 {} → {}", v6, mapped);
-                                std::net::IpAddr::V4(mapped)
-                            } else {
-                                std::net::IpAddr::V6(v6)
-                            }
-                        }
-                        other => other,
-                    };
-
-                    // Block loopback (127.0.0.0/8), unspecified (0.0.0.0), and multicast
+                    // Route raw WASI sockets through the SAME shared SSRF
+                    // classifier the WIT-http literal-IP gate and the controller
+                    // pre-validation use (`talos_ssrf_classify::classify_private_ip`),
+                    // so all three egress surfaces agree BY CONSTRUCTION. This
+                    // replaces ~90 lines of hand-maintained range checks that the
+                    // MCP-1067..1070 comments had to keep "byte-for-byte" in sync
+                    // — exactly the drift hazard the literal-IP chokepoint (PR #116)
+                    // removed on the http side.
                     //
-                    // MCP-1070 (2026-05-15): widen `is_unspecified()` to the
-                    // full 0.0.0.0/8 RFC-1122 "this network" range. Pre-fix
-                    // `is_unspecified()` matched only the exact `0.0.0.0`
-                    // address, leaving `0.x.y.z` (kernel-substituted to
-                    // loopback on some Linux versions per the
-                    // `talos_http_utils::ssrf` comment) reachable from WASI
-                    // sockets. Sibling of MCP-1067/1068 (ssrf.rs guard) and
-                    // MCP-1069 (worker WIT-http classifier). Bringing the
-                    // THREE SSRF classifier surfaces (controller pre-validation,
-                    // worker WIT-http, worker WASI sockets) into byte-for-byte
-                    // agreement on the /8 deny.
-                    let v4_in_unspecified_subnet = match ip {
-                        std::net::IpAddr::V4(v4) => v4.octets()[0] == 0,
-                        std::net::IpAddr::V6(_) => false,
-                    };
-                    if ip.is_loopback()
-                        || ip.is_unspecified()
-                        || v4_in_unspecified_subnet
-                        || ip.is_multicast()
-                    {
-                        tracing::warn!("SECURITY: Blocked WASI socket connection to loopback/multicast/unspecified IP: {}", ip);
-                        return false;
+                    // Two behaviour deltas vs. the old inline copy, both correct:
+                    //   * It now blocks EVERY IPv4-in-IPv6 transition form
+                    //     (IPv4-mapped AND IPv4-compat / NAT64 / 6to4) — the old
+                    //     copy canonicalized only IPv4-mapped, so `::169.254.169.254`
+                    //     (compat), 6to4, and NAT64 spellings of an internal target
+                    //     were a latent socket-SSRF bypass. Now closed.
+                    //   * It no longer special-cases RFC-5737 documentation ranges
+                    //     (192.0.2/24, …). Those are reserved-unassigned, not
+                    //     internal, and the other two surfaces already treat them
+                    //     as public (see talos_http_utils::ssrf). Aligning removes
+                    //     the lone divergence.
+                    let ip = addr.ip();
+                    if let Some(policy) = talos_ssrf_classify::classify_private_ip(ip) {
+                        tracing::warn!(
+                            %ip,
+                            policy,
+                            "SECURITY: blocked WASI socket connection to a non-public IP"
+                        );
+                        return false; // deny
                     }
-
-                    match ip {
-                        std::net::IpAddr::V4(ipv4) => {
-                            // Block RFC 1918 private networks (10.x, 172.16.x, 192.168.x)
-                            // and RFC 3927 link-local networks (169.254.x.x - AWS Metadata)
-                            if ipv4.is_private() || ipv4.is_link_local() || ipv4.is_broadcast() || ipv4.is_documentation() {
-                                tracing::warn!("SECURITY: Blocked WASI socket connection to private/internal IP: {}", ipv4);
-                                return false;
-                            }
-                            // Block RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
-                            // Commonly used in cloud provider internal ranges (AWS 100.64/10)
-                            let addr_u32 = u32::from(ipv4);
-                            if (addr_u32 >> 22) == (0x64400000u32 >> 22) {
-                                tracing::warn!("SECURITY: Blocked WASI socket connection to CGN range (100.64/10): {}", ipv4);
-                                return false;
-                            }
-                        }
-                        std::net::IpAddr::V6(ipv6) => {
-                            // Block Unique Local Addresses (fc00::/7) — IPv6 RFC 1918 equivalent
-                            if (ipv6.segments()[0] & 0xfe00) == 0xfc00 {
-                                tracing::warn!("SECURITY: Blocked WASI socket connection to private IPv6: {}", ipv6);
-                                return false;
-                            }
-                            // Block IPv6 link-local (fe80::/10) — already caught by is_loopback
-                            // but check explicitly for clarity
-                            if (ipv6.segments()[0] & 0xffc0) == 0xfe80 {
-                                tracing::warn!("SECURITY: Blocked WASI socket connection to IPv6 link-local: {}", ipv6);
-                                return false;
-                            }
-                            // Block IPv6 site-local (fec0::/10) — deprecated but still used
-                            if (ipv6.segments()[0] & 0xffc0) == 0xfec0 {
-                                tracing::warn!("SECURITY: Blocked WASI socket connection to IPv6 site-local (fec0::/10): {}", ipv6);
-                                return false;
-                            }
-                        }
-                    }
-
-                    // Allow public external internet connections
+                    // Public destination — allowed (the http host fn's
+                    // `allowed_hosts` list still governs `talos:core/http`).
                     true
                 })
             });
