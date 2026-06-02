@@ -877,6 +877,12 @@ impl AdapterSet {
         engine.secret_envelope = self.secret_envelope;
         engine.user_id = self.user_id;
         engine.actor_id = self.actor_id;
+        // The per-actor LLM-tier ceiling MUST travel with the sub-engine, in
+        // lockstep with `actor_id`. Omitting it silently reset every
+        // sub-workflow to `ParallelWorkflowEngine::new()`'s `Tier1` default
+        // (fail-closed, but it strips external-LLM access from every judge /
+        // ensemble / sub-workflow a tier-2 actor legitimately runs).
+        engine.max_llm_tier = self.max_llm_tier;
         engine.dry_run = self.dry_run;
         engine.sandbox_root = self.sandbox_root;
         engine.agent_loop_max_history = self.agent_loop_max_history;
