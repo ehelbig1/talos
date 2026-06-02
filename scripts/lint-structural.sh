@@ -2671,6 +2671,54 @@ else
 fi
 echo
 
+# ── 37. structs holding plaintext secrets must not derive Debug ──────
+bold "▶ check 37: secret-holding structs must redact in Debug (no derive(Debug))"
+
+# PR #124 swept six structs that `derive(Debug)` while holding a plaintext
+# secret field (api_key / client_secret / signing_secret / verification_token /
+# bot_token / …). No active leak existed, but a future `tracing::debug!("{:?}",
+# x)` would print the secret — the class the `talos_auth::User` custom redacting
+# Debug guards against. This freezes the sweep: a NEW struct that derives Debug
+# with a plaintext-secret String field is flagged; write a hand-rolled `Debug`
+# that renders the secret as "[REDACTED]" instead (see PR #124 for the shape).
+#
+# Precise field match (`name:` exactly) so `signing_secret_enc` (ciphertext),
+# `*_hash`, `*_id`, `*_expires_at` don't false-positive. Zeroizing/Secret<>
+# fields are already self-redacting and exempt. Opt out a genuine non-secret
+# with `// allow-debug-secret-struct: <reason>` on the struct or derive line.
+DEBUG_SECRET_VIOLATIONS=0
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    printf '  %s\n' "$line"
+    DEBUG_SECRET_VIOLATIONS=$((DEBUG_SECRET_VIOLATIONS + 1))
+done < <(
+    for rsf in $(grep -rlE 'derive\([^)]*\bDebug\b' --include='*.rs' \
+                    --exclude-dir=target talos-* worker controller 2>/dev/null \
+                 | grep -v '/tests/' | sort -u); do
+        perl -0777 -ne '
+            while (/#\[derive\(([^)]*)\)\][^\n]*\n\s*(?:pub\s+)?struct\s+(\w+)\s*\{(.*?)\n\}/gs) {
+                my ($d, $name, $body) = ($1, $2, $3);
+                next unless $d =~ /\bDebug\b/;
+                next if $body =~ /allow-debug-secret-struct/;
+                next if $body =~ /Zeroizing|Secret</;
+                if ($body =~ /\b(api_key|client_secret|signing_secret|verification_token|bot_token|access_token|refresh_token|private_key|secret_key|password)\s*:\s*(?:Option<\s*)?String/) {
+                    print "$ARGV: struct $name derives Debug with a plaintext secret field\n";
+                }
+            }
+        ' "$rsf"
+    done 2>/dev/null
+)
+
+if [ "$DEBUG_SECRET_VIOLATIONS" -gt 0 ]; then
+    red "✗ $DEBUG_SECRET_VIOLATIONS struct(s) derive Debug while holding a plaintext secret"
+    yellow "  → write a hand-rolled \`impl Debug\` that renders the secret as \"[REDACTED]\" (see PR #124)"
+    yellow "  → or // allow-debug-secret-struct: <reason> if the field is genuinely not a secret"
+    EXIT_CODE=1
+else
+    green "✓ no Debug-deriving structs expose a plaintext secret field"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
