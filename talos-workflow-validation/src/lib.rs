@@ -234,6 +234,10 @@ impl WorkflowValidationService {
             }
         }
 
+        // Durability advisory (crash-recovery audit): collected inside the
+        // template block below, surfaced as a Warning after it.
+        let mut side_effecting_node_ids: Vec<String> = Vec::new();
+
         // ── Config completeness + vault permission check ─────────────────
         if !module_ids.is_empty() {
             let (template_rows, installed_secrets) = tokio::join!(
@@ -243,6 +247,28 @@ impl WorkflowValidationService {
             let template_rows: Vec<NodeTemplateRow> = template_rows.unwrap_or_default();
             let installed_secrets: HashMap<Uuid, Vec<String>> =
                 installed_secrets.unwrap_or_default();
+
+            // A node whose template declares any `allowed_hosts` makes an external
+            // call → potential side effect / cost. On crash-recovery resume an
+            // in-flight node is RE-DISPATCHED (at-least-once), so these are the
+            // nodes an author must make idempotent.
+            let side_effecting_ids: std::collections::HashSet<Uuid> = template_rows
+                .iter()
+                .filter(|r| !r.allowed_hosts.is_empty())
+                .map(|r| r.id)
+                .collect();
+            side_effecting_node_ids = nodes
+                .iter()
+                .filter_map(|node| {
+                    let tid: Uuid = node.get("type")?.as_str()?.parse().ok()?;
+                    side_effecting_ids.contains(&tid).then(|| {
+                        node.get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                })
+                .collect();
 
             let template_schemas: HashMap<Uuid, (String, serde_json::Value, Vec<String>)> =
                 template_rows
@@ -375,6 +401,28 @@ impl WorkflowValidationService {
                     }
                 }
             }
+        }
+
+        // ── Crash-recovery at-least-once advisory (Warning) ─────────────
+        // Surfaces the durability contract to workflow authors: a controller
+        // restart mid-execution re-dispatches in-flight nodes (at-least-once),
+        // so side-effecting nodes can double-fire on a crash-recovery resume.
+        if !side_effecting_node_ids.is_empty() {
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                message: format!(
+                    "{} node(s) make external calls (declared allowed_hosts): {}. \
+                     Crash-recovery resume is AT-LEAST-ONCE — if the controller \
+                     restarts while one of these nodes is in flight, it is re-dispatched \
+                     and re-runs. Make side-effecting nodes idempotent (e.g. an \
+                     idempotency key / dedup guard) so a resume can't double-fire them \
+                     (double charge / duplicate message).",
+                    side_effecting_node_ids.len(),
+                    side_effecting_node_ids.join(", ")
+                ),
+                node_id: None,
+                category: "durability".into(),
+            });
         }
 
         // ── LLM I/O enforcement-key advisory (Warning) ──────────────────

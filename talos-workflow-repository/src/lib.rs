@@ -2521,7 +2521,7 @@ impl WorkflowRepository {
             return Ok(vec![]);
         }
         let rows = sqlx::query(
-            "SELECT id, name, config_schema, allowed_secrets, max_retries \
+            "SELECT id, name, config_schema, allowed_secrets, allowed_hosts, max_retries \
              FROM modules \
              WHERE id = ANY($1)",
         )
@@ -2538,6 +2538,7 @@ impl WorkflowRepository {
                     name: r.get("name"),
                     config_schema: r.try_get("config_schema").unwrap_or(serde_json::json!({})),
                     allowed_secrets: decode_allowed_secrets_row(&r, Some(id)),
+                    allowed_hosts: r.try_get("allowed_hosts").unwrap_or_default(),
                     max_retries: r.try_get("max_retries").unwrap_or(0),
                 }
             })
@@ -2577,6 +2578,8 @@ impl WorkflowRepository {
                 name: r.get("name"),
                 config_schema: r.try_get("config_schema").unwrap_or(serde_json::json!({})),
                 allowed_secrets: decode_allowed_secrets_row(&r, Some(id)),
+                // Not selected on this path (swap_node_module doesn't need egress hosts).
+                allowed_hosts: Vec::new(),
                 max_retries: r.try_get("max_retries").unwrap_or(0),
             }
         }))
@@ -3094,6 +3097,10 @@ pub struct NodeTemplateRow {
     pub name: String,
     pub config_schema: serde_json::Value,
     pub allowed_secrets: Vec<String>,
+    /// Egress allowlist — a non-empty value means the module makes external
+    /// calls (side-effecting). Used by `validate_workflow` to surface the
+    /// at-least-once crash-recovery contract for these nodes.
+    pub allowed_hosts: Vec<String>,
     /// Default max retries for nodes using this template (0 = no retries).
     /// Applied by add_node_to_workflow when the caller doesn't provide retry_count.
     pub max_retries: i32,
