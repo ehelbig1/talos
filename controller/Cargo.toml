@@ -194,10 +194,15 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # negotiation by hand.
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 urlencoding = "2.1"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "reqwest-client", "http-proto"] }
-tracing-opentelemetry = "0.28"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+# Only the gRPC/tonic exporter is used (`SpanExporter::builder().with_tonic()`).
+# `default-features = false` drops otlp 0.32's default `http-proto` +
+# `reqwest-blocking-client`, which pull opentelemetry-http + reqwest 0.13 (a
+# duplicate of the workspace's reqwest 0.12) for an HTTP exporter path we never
+# take. `grpc-tonic` + `trace` are all the tonic SpanExporter needs.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33"
 tower_governor = "0.8.0"
 
 # S3 client for immutable audit ledger storage (MinIO).
@@ -216,16 +221,16 @@ aws-sdk-s3 = { version = "1.30", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-tonic = "0.12.3"
+tonic = "0.14"
 rhai = { version = "1.19", features = ["serde"] }
 zeroize = "1.8"
 dirs-next = "2.0"  # Locate CARGO_HOME for container registry cache mounts
 thiserror = "2.0"
 croner = "2.0"
 chrono-tz = "0.10"
-prometheus = "0.13" # Blocked at 0.13: opentelemetry-prometheus 0.27 requires prometheus 0.13.x.
-                    # RUSTSEC-2024-0437 (protobuf recursion crash) unfixable until opentelemetry-prometheus
-                    # releases a 0.28+ that supports prometheus 0.14. Track: open-telemetry/opentelemetry-rust.
+prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
+                    # vulnerable protobuf 2.x dependency (prometheus 0.14 uses protobuf 3.x, optional),
+                    # clearing RUSTSEC-2024-0437 (protobuf recursion crash) — deny.toml exemption removed.
 
 [dev-dependencies]
 testcontainers = "0.23"

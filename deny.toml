@@ -56,16 +56,14 @@ ignore = [
     # upstream for a real fix. Re-review quarterly — silent suppressions
     # are forbidden.
 
-    { id = "RUSTSEC-2024-0437", reason = """
-protobuf 2.x uncontrolled-recursion crash. Pulled by `prometheus` 0.13.x
-(and via `opentelemetry-prometheus`). Attack vector: crafted protobuf
-POSTed to a metrics endpoint. Our `/metrics` endpoint is bound to
-internal network only — not exposed to the internet or guest WASM
-code. Impact is DoS (crash), not code exec. Tracking: rust-prometheus
-hasn't migrated to protobuf 3.x; `prometheus-client` (official WG) is
-the long-term swap target. Upstream tracking issue:
-https://github.com/tikv/rust-prometheus/issues/494
-""" },
+    # NOTE (2026-06-02): the RUSTSEC-2024-0437 exemption (protobuf 2.x
+    # uncontrolled-recursion crash) was REMOVED. It was pulled by `prometheus`
+    # 0.13.x, which `opentelemetry-prometheus` 0.27 pinned. The otel stack is now
+    # at 0.32, whose `opentelemetry-prometheus` 0.32 supports `prometheus` 0.14 —
+    # and prometheus 0.14 drops protobuf 2.x (it uses protobuf 3.x as an optional,
+    # non-default feature we don't enable). protobuf 2.28 is no longer in the tree,
+    # so the advisory no longer applies. See controller/worker/talos-metrics
+    # Cargo.toml (prometheus = "0.14").
 
     { id = "RUSTSEC-2023-0071", reason = """
 Marvin Attack timing sidechannel in `rsa` crate. Pulled by
