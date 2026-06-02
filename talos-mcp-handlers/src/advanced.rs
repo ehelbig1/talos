@@ -4262,14 +4262,29 @@ async fn handle_resolve_approval_gate(
     let cwf_id = gate.continuation_workflow_id;
     let payload = gate.payload;
 
-    // Update the gate status
-    if let Err(e) = state
+    // Update the gate status. The UPDATE is guarded `AND status = 'pending'`, so
+    // `rows_affected == 0` means a concurrent caller resolved/cancelled/expired
+    // this gate between our read above and this write (TOCTOU). Bail WITHOUT
+    // firing the continuation — otherwise two concurrent approvals would both
+    // pass the read-side `status != "pending"` check and both trigger the
+    // continuation workflow (e.g. a payment runs twice).
+    match state
         .advanced_repo
         .resolve_approval_gate(gate_id, user_id, resolution, note)
         .await
     {
-        tracing::error!("resolve_approval_gate update failed: {}", e);
-        return mcp_error(req_id, -32000, "Failed to resolve approval gate");
+        Ok(0) => {
+            return mcp_error(
+                req_id,
+                -32000,
+                "Gate was resolved by another request — not resolving again",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("resolve_approval_gate update failed: {}", e);
+            return mcp_error(req_id, -32000, "Failed to resolve approval gate");
+        }
     }
 
     // Reflects the gate's configuration, not whether the trigger

@@ -1073,7 +1073,40 @@ impl WebhookRouter {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    // Dedup unavailable — log and continue rather than blocking the request.
+                    // Dedup backend errored (e.g. Redis down). For GitHub-format
+                    // webhooks this is NOT safe to continue through: the GitHub
+                    // HMAC signs the body only — no timestamp is bound, so there
+                    // is no freshness window and dedup is the *sole* replay
+                    // defense. Continuing would let a captured valid delivery be
+                    // replayed for the whole outage (the exact gap the MCP-1100
+                    // `dedup.is_none()` guard above closes for the not-configured
+                    // case). Fail closed (401) so GitHub re-delivers once dedup
+                    // recovers. We do NOT record a circuit-breaker failure here —
+                    // this is our infra outage, not the sender's bad signature,
+                    // and penalising legitimate senders would mass-trip the
+                    // breaker across a Redis blip. Slack/generic bind a timestamp
+                    // into the HMAC (±5-min window), so continuing is safe there.
+                    if headers.contains_key("x-hub-signature-256") {
+                        tracing::warn!(
+                            trigger_id = %trigger_id,
+                            "GitHub-format webhook: deduplication backend unavailable ({e}) — \
+                             failing closed (body-only HMAC has no replay window without dedup)"
+                        );
+                        self.log_request(
+                            trigger_id,
+                            headers,
+                            &body,
+                            source_ip,
+                            StatusCode::UNAUTHORIZED.as_u16() as i32,
+                            None,
+                            0,
+                            0,
+                            false,
+                            Some("Invalid signature"),
+                        )
+                        .await;
+                        return Ok((StatusCode::UNAUTHORIZED, "Invalid signature").into_response());
+                    }
                     tracing::warn!(
                         trigger_id = %trigger_id,
                         "Webhook deduplication check failed (non-fatal): {}",

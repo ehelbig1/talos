@@ -1720,19 +1720,29 @@ impl AdvancedRepository {
         }))
     }
 
-    /// Update the status/resolution fields on an approval gate.
+    /// Resolve a PENDING approval gate (approve/reject). Returns rows affected —
+    /// `0` means the gate was no longer `pending` (already resolved/cancelled/
+    /// expired by a concurrent caller), so the caller MUST NOT fire the
+    /// continuation workflow.
+    ///
+    /// The `AND status = 'pending'` guard makes resolution single-use at the DB
+    /// layer, closing a TOCTOU window: the MCP handler reads the gate, checks
+    /// `status == "pending"` in Rust, then calls this. Without the guard two
+    /// concurrent approvals both pass the Rust check and both UPDATE + both fire
+    /// the continuation (e.g. a payment runs twice). Mirrors the atomic guard the
+    /// public webhook path and `cancel_approval_gate` already use.
     pub async fn resolve_approval_gate(
         &self,
         gate_id: Uuid,
         user_id: Uuid,
         status: &str,
         note: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         sqlx::query(
             "UPDATE workflow_approval_gates \
              SET status = $1, resolved_at = NOW(), resolved_by_type = 'mcp_agent', \
                  resolved_by_note = $2 \
-             WHERE id = $3 AND user_id = $4",
+             WHERE id = $3 AND user_id = $4 AND status = 'pending'",
         )
         .bind(status)
         .bind(note)
@@ -1740,7 +1750,7 @@ impl AdvancedRepository {
         .bind(user_id)
         .execute(&self.db_pool)
         .await
-        .map(|_| ())
+        .map(|r| r.rows_affected())
         .context("resolve_approval_gate")
     }
 
