@@ -80,6 +80,27 @@ pub struct EnvKekProvider {
     master_key: Zeroizing<Vec<u8>>,
 }
 
+/// Reject a degenerate (all-zero) master key. A 32-byte all-zero `TALOS_MASTER_KEY`
+/// is length- and hex-valid, so the prior checks accepted it — but it is almost
+/// always an operator misconfiguration (an unset/empty secret rendered then
+/// zero-padded, a templating bug, an uninitialised KMS field). It would silently
+/// become a fully-functional AES-256-GCM KEK that an attacker who guesses "they
+/// never set it" can reproduce offline against a database dump, defeating envelope
+/// encryption entirely. Fail closed at construction instead.
+///
+/// Only all-zero is rejected (not a general entropy floor): it's the
+/// overwhelmingly common misconfiguration and is false-positive-free — a real
+/// 32-byte random key is all-zero with probability 2^-256.
+fn reject_degenerate_master_key(bytes: &[u8]) -> Result<()> {
+    if bytes.iter().all(|&b| b == 0) {
+        return Err(anyhow!(
+            "master key must not be all-zero — this is almost always an unset / empty / \
+             mis-templated TALOS_MASTER_KEY. Generate a real key with `openssl rand -hex 32`."
+        ));
+    }
+    Ok(())
+}
+
 impl EnvKekProvider {
     /// Build from a hex-encoded 32-byte key (the value of
     /// `TALOS_MASTER_KEY`). Validates length + hex shape; never logs
@@ -93,6 +114,7 @@ impl EnvKekProvider {
                 bytes.len()
             ));
         }
+        reject_degenerate_master_key(&bytes)?;
         Ok(Self {
             master_key: Zeroizing::new(bytes),
         })
@@ -120,6 +142,7 @@ impl EnvKekProvider {
                 bytes.len()
             ));
         }
+        reject_degenerate_master_key(&bytes)?;
         Ok(Self {
             master_key: Zeroizing::new(bytes),
         })
@@ -251,5 +274,22 @@ mod tests {
     #[test]
     fn from_hex_rejects_non_hex() {
         assert!(EnvKekProvider::from_hex(&"z".repeat(64)).is_err());
+    }
+    #[test]
+    fn from_hex_rejects_all_zero_master_key() {
+        // 64 hex zeros = a valid-length, valid-hex, but degenerate key. The prior
+        // length+hex checks accepted it; it must now fail closed.
+        assert!(EnvKekProvider::from_hex(&"0".repeat(64)).is_err());
+        // A real key is accepted.
+        let real = "11".repeat(32); // 32 bytes, not all-zero
+        assert!(EnvKekProvider::from_hex(&real).is_ok());
+    }
+
+    #[test]
+    fn from_raw_bytes_owned_rejects_all_zero() {
+        assert!(EnvKekProvider::from_raw_bytes_owned(vec![0u8; 32]).is_err());
+        let mut ok = vec![0u8; 32];
+        ok[0] = 1;
+        assert!(EnvKekProvider::from_raw_bytes_owned(ok).is_ok());
     }
 }

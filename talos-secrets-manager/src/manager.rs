@@ -64,24 +64,29 @@ pub struct SecretsManager {
     /// guard hold, no contention with concurrent readers. Writes happen
     /// only during master-key rotation.
     kek: std::sync::RwLock<Arc<dyn kek_provider::KekProvider>>,
-    /// Optional legacy KEK provider — used during the Phase 4 dual-wrap
-    /// soak window AND as the partial-failure safety belt in
-    /// `rotate_master_key`. When `Some`, every read prefers
-    /// `encrypted_key_v2` (unwrapped via `kek`) but falls back to
-    /// `encrypted_key` (unwrapped via `kek_legacy`) for any row that
-    /// hasn't been rewrapped yet. Every write dual-writes both columns
-    /// so a rollback to the legacy provider is just a config flip.
-    /// `None` outside the migration window — Phase 5 retires this
-    /// field along with the legacy column.
+    /// Optional legacy KEK provider — the partial-failure safety belt for
+    /// `rotate_master_key`. When `Some`, `decrypt_dek` unwraps each row's
+    /// `encrypted_key` with the active `kek` first and falls back to this
+    /// legacy provider, so a rotation interrupted partway (some rows rewrapped
+    /// under the new KEK, some still under the old) is recoverable rather than
+    /// catastrophic. Installed BEFORE the rewrap loop, cleared after a
+    /// successful rotation. `None` outside a rotation. (H-1 fix from the
+    /// encryption-cluster review.)
     ///
-    /// Wrapped in a sync `RwLock` (mirroring `kek`) so
-    /// `rotate_master_key` can install the OLD provider here BEFORE the
-    /// rewrap loop. If the loop fails partway through, the existing
-    /// fallback path in `decrypt_dek` automatically unwraps any-
-    /// already-rewrapped rows via the new `kek` and any-not-yet-
-    /// rewrapped rows via this legacy provider — so a partial-failure
-    /// rotation is recoverable rather than catastrophic. Cleared after
-    /// successful rotation. (H-1 fix from the encryption-cluster review.)
+    /// ⚠️ This fallback operates ENTIRELY on the `encrypted_key` column. The
+    /// `encrypted_key_v2` column is written ONLY by the manual
+    /// `rewrap_all_deks_to_v2` migration tool and is **not read by any runtime
+    /// path**: `get_active_dek` / `get_dek` SELECT `encrypted_key`, and
+    /// `create_new_dek` / `rotate_dek` write only `encrypted_key`. The planned
+    /// v2 dual-read / dual-write env→Vault migration was never wired up. DO NOT
+    /// drop the `encrypted_key` column on the strength of a green
+    /// `verify_v2_decryptable` — the runtime would have no readable DEK source
+    /// and every secret / OAuth token / `actor_memory.value_enc` under it would
+    /// become permanently unrecoverable. Completing or retiring the v2 column is
+    /// tracked separately.
+    ///
+    /// Wrapped in a sync `RwLock` (mirroring `kek`) so `rotate_master_key` can
+    /// install the OLD provider here before the rewrap loop.
     kek_legacy: std::sync::RwLock<Option<Arc<dyn kek_provider::KekProvider>>>,
     /// In-memory cache for decrypted DEKs (UUID -> CachedDek)
     /// TTL: 5 minutes (configurable via DEK_CACHE_TTL_SECS env var)
@@ -427,18 +432,22 @@ impl SecretsManager {
         Self::with_kek_providers(db_pool, kek, None)
     }
 
-    /// Create with both an active KEK provider and an optional legacy
-    /// provider for the Phase 4 dual-wrap soak window.
+    /// Create with both an active KEK provider and an optional legacy provider.
     ///
-    /// When `kek_legacy` is `Some`, this manager:
-    ///   - Reads prefer `encrypted_key_v2` via `kek`; fall back to
-    ///     `encrypted_key` via `kek_legacy` if v2 is NULL (race window).
-    ///   - Writes populate BOTH `encrypted_key` (via legacy) and
-    ///     `encrypted_key_v2` (via active) so a rollback is just a
-    ///     config flip.
+    /// When `kek_legacy` is `Some`, `decrypt_dek` unwraps each row's
+    /// `encrypted_key` with the active `kek` first and falls back to
+    /// `kek_legacy` — the partial-failure safety belt for `rotate_master_key`
+    /// (see the `kek_legacy` field doc). Both providers operate on the SAME
+    /// `encrypted_key` column.
+    ///
+    /// ⚠️ This does NOT implement a dual-column (`encrypted_key` +
+    /// `encrypted_key_v2`) read/write scheme: reads do not consult
+    /// `encrypted_key_v2` and writes do not populate it. The v2 column is
+    /// migration-tool-only and not read at runtime — see the `kek_legacy` field
+    /// doc before relying on it or dropping `encrypted_key`.
     ///
     /// `kek` MUST be the new (target) provider; `kek_legacy` MUST be the
-    /// previous (source) provider that wrapped existing v1 ciphertexts.
+    /// previous (source) provider that wrapped existing ciphertexts.
     /// Reversing the two would silently corrupt every new DEK.
     pub fn with_kek_providers(
         db_pool: Pool<Postgres>,
