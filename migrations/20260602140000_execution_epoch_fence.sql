@@ -1,0 +1,23 @@
+-- Split-brain fencing: per-execution ownership epoch (crash-recovery, F4).
+--
+-- The crash-recovery claim (`claim_stuck_execution_for_resume`) uses
+-- `FOR UPDATE SKIP LOCKED` so two sweeps can't double-claim a row, but it does
+-- NOT stop a live-but-slow ORIGINAL controller (GC pause / partition / a run
+-- longer than the stale window) from continuing to drive an execution that a
+-- restarting controller's sweep then reclaims. Both then dispatch the same
+-- execution's nodes.
+--
+-- The terminal-status writes are already fenced (`WHERE status = 'running'` on
+-- completed/failed/waiting), so a superseded controller can't corrupt the final
+-- state. `epoch` adds the missing piece: a monotonic ownership token bumped on
+-- every claim/reclaim. The controller currently driving an execution holds the
+-- epoch it observed; a lightweight heartbeat (`WHERE id = $1 AND epoch = $mine`)
+-- lets it DETECT that it has been superseded (the DB epoch moved on) and abort
+-- its engine via the existing cancellation token, so it stops dispatching new
+-- nodes instead of running to completion against a row another controller owns.
+--
+-- DEFAULT 0: every existing and freshly-created execution starts at epoch 0, so
+-- a mixed-version fleet degrades to today's behavior rather than fencing
+-- everything. See docs/split-brain-fencing-design.md.
+ALTER TABLE workflow_executions
+    ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAULT 0;

@@ -5,6 +5,7 @@ pub mod error;
 pub mod event_sink;
 pub mod events;
 pub mod expression_evaluator;
+pub mod fence;
 pub mod module_execution_store;
 pub mod module_fetcher;
 pub mod nats_run;

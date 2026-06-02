@@ -92,6 +92,14 @@ async fn status_of(pool: &Pool<Postgres>, id: Uuid) -> String {
         .unwrap()
 }
 
+async fn epoch_of(pool: &Pool<Postgres>, id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT epoch FROM workflow_executions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn cleanup(pool: &Pool<Postgres>, user_id: Uuid, wf_id: Uuid) {
     let _ = sqlx::query("DELETE FROM workflow_executions WHERE workflow_id = $1")
         .bind(wf_id)
@@ -239,4 +247,69 @@ async fn fail_and_reclaim_are_status_guarded() {
 
     cleanup(&pool, user_id, wf_id).await;
     cleanup(&pool, user2, wf2).await;
+}
+
+/// F4 split-brain fence: `claim` and `reclaim` bump the ownership `epoch` so a
+/// superseded controller's heartbeat detects it lost the row. The bumped value
+/// is returned from `claim` (the resumer heartbeats against it) and readable via
+/// `current_execution_epoch` (what the heartbeat polls).
+#[tokio::test]
+async fn claim_and_reclaim_bump_epoch() {
+    let Some(url) = db_url() else { return };
+    let _g = SERIAL.lock().await;
+    let pool = connect(&url).await;
+    let (exec_id, wf_id, user_id) = seed_running_exec(&pool, 60).await;
+    make_only_claimable(&pool, exec_id).await;
+    let repo = ExecutionRepository::new(pool.clone());
+
+    // Fresh execution starts at epoch 0.
+    assert_eq!(epoch_of(&pool, exec_id).await, 0);
+
+    // Claim bumps 0 -> 1 and RETURNs the bumped value for the resumer.
+    let claimed = repo
+        .claim_stuck_execution_for_resume(5)
+        .await
+        .unwrap()
+        .expect("the only stale row must be claimed");
+    assert_eq!(claimed.id, exec_id);
+    assert_eq!(
+        claimed.epoch, 1,
+        "claim must bump epoch and return the bumped value"
+    );
+    assert_eq!(epoch_of(&pool, exec_id).await, 1);
+    assert_eq!(
+        repo.current_execution_epoch(exec_id).await.unwrap(),
+        Some(1),
+        "the heartbeat's epoch read must see the bumped value"
+    );
+
+    // A slow resumer holds epoch 1. The next restart's reclaim fails the stale
+    // `resuming` row AND bumps epoch 1 -> 2, so that resumer's heartbeat sees
+    // 2 != 1 and fences itself. Re-INSERT to set a stale updated_at (the
+    // BEFORE-UPDATE trigger would reset it on a plain UPDATE).
+    sqlx::query("DELETE FROM workflow_executions WHERE id = $1")
+        .bind(exec_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workflow_executions (id,workflow_id,user_id,status,epoch,started_at,updated_at) \
+         VALUES ($1,$2,$3,'resuming',1, NOW()-make_interval(mins=>60), NOW()-make_interval(mins=>30))",
+    )
+    .bind(exec_id)
+    .bind(wf_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let n = repo.reclaim_orphaned_resuming(10).await.unwrap();
+    assert!(n >= 1);
+    assert_eq!(status_of(&pool, exec_id).await, "failed");
+    assert_eq!(
+        epoch_of(&pool, exec_id).await,
+        2,
+        "reclaim must bump epoch so a still-running resumer holding epoch 1 fences"
+    );
+
+    cleanup(&pool, user_id, wf_id).await;
 }

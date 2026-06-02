@@ -1295,7 +1295,20 @@ impl ExecutionRepository {
         exec_id: Uuid,
         output: &serde_json::Value,
     ) -> Result<()> {
-        if self.output_encryption_enabled() {
+        // Split-brain guard: `AND status = 'running'`, matching the
+        // `mark_execution_completed` / `mark_execution_failed` siblings
+        // (and the workflow-repository `mark_execution_waiting`). Pre-fix
+        // this was the lone bare `WHERE id = $1` terminal-state writer —
+        // the MCP-975 sweep added the DLP redaction here but missed the
+        // status guard. Without it, a controller that has been superseded
+        // (its row claimed `running -> resuming` by another controller's
+        // crash-recovery sweep, or already finalized) could still write
+        // 'waiting' and RESURRECT a terminal/claimed execution back into
+        // the active/resumable set. The guard makes the superseded write a
+        // clean no-op. Safe at every call site: each one's `else` branch
+        // calls `mark_execution_completed` (already `status = 'running'`)
+        // on the same row, so the row is provably 'running' here.
+        let res = if self.output_encryption_enabled() {
             // MCP-S2: encrypt_output binds AAD = exec_id so a swap of
             // output_data_enc across rows is detected on read.
             let (key_id, enc_bytes, format_version) = self.encrypt_output(exec_id, output).await?;
@@ -1304,14 +1317,14 @@ impl ExecutionRepository {
                  SET status = 'waiting', output_data = NULL, \
                      output_data_enc = $1, output_enc_key_id = $2, \
                      output_data_format = $3 \
-                 WHERE id = $4",
+                 WHERE id = $4 AND status = 'running'",
             )
             .bind(&enc_bytes)
             .bind(key_id)
             .bind(format_version)
             .bind(exec_id)
             .execute(&self.db_pool)
-            .await?;
+            .await?
         } else {
             // MCP-975 (2026-05-15): same plaintext-fallback DLP fix
             // as the MCP-971/972 sweep (sibling repository's
@@ -1320,12 +1333,24 @@ impl ExecutionRepository {
             // from upstream services; same arbitrary-text class.
             let redacted = talos_dlp_provider::redact_json(output);
             sqlx::query(
-                "UPDATE workflow_executions SET status = 'waiting', output_data = $2 WHERE id = $1",
+                "UPDATE workflow_executions SET status = 'waiting', output_data = $2 \
+                 WHERE id = $1 AND status = 'running'",
             )
             .bind(exec_id)
             .bind(&redacted)
             .execute(&self.db_pool)
-            .await?;
+            .await?
+        };
+        if res.rows_affected() == 0 {
+            // The row was no longer 'running' — already terminal, or claimed
+            // for resume by another controller (split-brain). The suspend is
+            // correctly dropped; surface it so a superseded controller is
+            // observable rather than silently no-op'ing.
+            tracing::warn!(
+                execution_id = %exec_id,
+                "mark_execution_waiting no-op: row not in 'running' (already terminal \
+                 or claimed for crash-recovery resume) — suspend write dropped"
+            );
         }
         Ok(())
     }
@@ -1695,6 +1720,10 @@ impl ExecutionRepository {
             );
             return Ok(None);
         }
+        // `epoch = epoch + 1` fences the original controller (F4): if it was
+        // alive-but-slow, the epoch it holds (the pre-claim value) no longer
+        // matches the row, so its fence heartbeat sees the mismatch and aborts.
+        // The bumped value is returned so the resumer can heartbeat against it.
         let row = sqlx::query_as::<_, StuckExecutionForResume>(
             "WITH claimed AS ( \
                  SELECT id FROM workflow_executions \
@@ -1705,10 +1734,10 @@ impl ExecutionRepository {
                  FOR UPDATE SKIP LOCKED \
              ) \
              UPDATE workflow_executions e \
-             SET status = 'resuming', updated_at = NOW() \
+             SET status = 'resuming', updated_at = NOW(), epoch = e.epoch + 1 \
              FROM claimed c \
              WHERE e.id = c.id AND e.status = 'running' \
-             RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, \
+             RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, e.epoch, \
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
                        (SELECT w.graph_json FROM workflows w WHERE w.id = e.workflow_id) \
@@ -1737,6 +1766,20 @@ impl ExecutionRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Read the current ownership `epoch` for an execution, or `None` if the
+    /// row is gone. The fence heartbeat polls this: when the value moves past
+    /// the epoch the running controller holds, that controller has been
+    /// superseded (another claim/reclaim bumped it) and must abort. Cheap
+    /// single-column primary-key lookup.
+    pub async fn current_execution_epoch(&self, id: Uuid) -> Result<Option<i64>> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT epoch FROM workflow_executions WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
     /// Reclaim executions wedged in `resuming` (a replica crashed *during*
     /// recovery, before the engine took over). Older than `grace_minutes` →
     /// `failed`, so they never get stuck. Run once at startup before the main
@@ -1750,11 +1793,15 @@ impl ExecutionRepository {
             );
             return Ok(0);
         }
+        // `epoch = epoch + 1` fences a resumer that itself went slow: when this
+        // reclaim fails its `resuming` row, the bump invalidates the epoch that
+        // resumer holds, so its fence heartbeat sees the mismatch and aborts
+        // rather than continuing to drive a now-`failed` row.
         let result = sqlx::query(
             "UPDATE workflow_executions \
              SET status = 'failed', \
                  error_message = 'resume interrupted (controller restarted during recovery)', \
-                 completed_at = NOW() \
+                 completed_at = NOW(), epoch = epoch + 1 \
              WHERE status = 'resuming' \
                AND updated_at < NOW() - make_interval(mins => $1::int)",
         )
@@ -2473,6 +2520,10 @@ pub struct StuckExecutionForResume {
     pub checkpoint_data: Option<serde_json::Value>,
     /// The actor that originally triggered this execution (NULL = anonymous).
     pub actor_id: Option<Uuid>,
+    /// The ownership epoch AFTER this claim's `epoch + 1` bump. The resumer
+    /// heartbeats against this value; if the DB epoch later moves past it
+    /// (another claim/reclaim), the resumer has been superseded and aborts.
+    pub epoch: i64,
     /// The workflow's bound default actor — fallback when `actor_id` is
     /// NULL (LEFT-JOINed; NULL if the workflow row was deleted between
     /// trigger and resume).

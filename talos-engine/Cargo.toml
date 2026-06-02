@@ -52,6 +52,9 @@ talos-workflow-engine-nats = { path = "../talos-workflow-engine-nats" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+# Only the `CancellationToken` (sync) is used — for the crash-recovery fence
+# heartbeat in `fence.rs`. Matches the version the engine crate pins.
+tokio-util = { version = "0.7", default-features = false }
 tracing.workspace = true
 uuid.workspace = true
 

@@ -38,7 +38,6 @@ use uuid::Uuid;
 use talos_actor_repository::ActorRepository;
 use talos_engine::builder::{for_workflow, EngineOpts};
 use talos_engine::checkpoint_store::load_checkpoint_for_resume;
-use talos_engine::nats_run::run_with_seed_via_nats;
 use talos_execution_repository::{ExecutionRepository, StuckExecutionForResume};
 use talos_registry::ModuleRegistry;
 use talos_secrets_manager::SecretsManager;
@@ -177,7 +176,7 @@ async fn resume_one(deps: RecoveryDeps, row: StuckExecutionForResume) {
     let opts = EngineOpts::for_run(row.workflow_id, graph_json)
         .with_effective_actor(row.actor_id, row.workflow_default_actor_id);
 
-    let engine = match for_workflow(
+    let mut engine = match for_workflow(
         deps.registry.clone(),
         deps.secrets_manager.clone(),
         deps.actor_repo.clone(),
@@ -227,15 +226,23 @@ async fn resume_one(deps: RecoveryDeps, row: StuckExecutionForResume) {
         );
     }
 
-    // ALWAYS the seed path — `run_with_seed_via_nats` resumes from the
+    // ALWAYS the seed path — `run_with_seed_fenced` resumes from the
     // checkpointed node set. A trigger-input path would inject a synthetic
     // `__trigger__` and re-seed the roots, double-executing completed nodes.
-    match run_with_seed_via_nats(
-        &engine,
+    //
+    // The run is wrapped in an epoch fence (F4): a heartbeat aborts it if the
+    // execution's `epoch` advances past `row.epoch` (this claim's bumped value),
+    // which means another controller has claimed/reclaimed the row out from
+    // under us. `engine` must be `mut` so the fence can set its cancellation
+    // token.
+    match talos_engine::fence::run_with_seed_fenced(
+        &mut engine,
         deps.nats_client.clone(),
         deps.worker_shared_key.clone(),
         initial_results,
         exec_id,
+        deps.db_pool.clone(),
+        row.epoch,
     )
     .await
     {
@@ -244,6 +251,18 @@ async fn resume_one(deps: RecoveryDeps, row: StuckExecutionForResume) {
         Ok(_ctx) => {
             record_outcome("resumed", 1);
             tracing::info!(execution_id = %exec_id, "crash-recovery: execution resumed");
+        }
+        // Fenced: another controller superseded this resume (epoch advanced).
+        // Do NOT mark the row failed — it now belongs to the new owner, or a
+        // reclaim already failed it. Failing here would clobber the new owner's
+        // `resuming` row. Just count it and move on.
+        Err(ref e) if talos_engine::fence::was_fenced(e) => {
+            record_outcome("fenced", 1);
+            tracing::warn!(
+                execution_id = %exec_id,
+                held_epoch = row.epoch,
+                "crash-recovery: resume fenced — superseded by another controller; leaving the row to its new owner"
+            );
         }
         Err(e) => {
             let redacted = talos_dlp_provider::redact_str(&e.to_string());
