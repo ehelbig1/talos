@@ -8508,6 +8508,7 @@ dependencies = [
  "sqlx",
  "talos-config",
  "talos-dlp-provider",
+ "talos-http-body",
  "talos-oauth",
  "talos-secrets-manager",
  "talos-text-util",

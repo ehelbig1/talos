@@ -941,7 +941,12 @@ impl OAuthService {
             refresh_token: token_response
                 .refresh_token()
                 .map(|t| t.secret().to_string()),
-            expires_in: token_response.expires_in().map(|d| d.as_secs() as i64),
+            // Saturate the u64→i64 conversion (MCP-960..962 integer-cast class):
+            // a malicious/buggy provider returning an absurd `expires_in` would
+            // otherwise wrap to a negative i64 and corrupt downstream expiry math.
+            expires_in: token_response
+                .expires_in()
+                .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
             // `scopes()` returns an Option<&[Scope]>. Annotate the slice type so Rust can infer
             // the closure parameter.
             // `scopes()` returns `Option<&Vec<Scope>>`; map over the Vec reference.
@@ -1102,7 +1107,12 @@ impl OAuthService {
             refresh_token: token_response
                 .refresh_token()
                 .map(|t| t.secret().to_string()),
-            expires_in: token_response.expires_in().map(|d| d.as_secs() as i64),
+            // Saturate the u64→i64 conversion (MCP-960..962 integer-cast class):
+            // a malicious/buggy provider returning an absurd `expires_in` would
+            // otherwise wrap to a negative i64 and corrupt downstream expiry math.
+            expires_in: token_response
+                .expires_in()
+                .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
             // Annotate slice type for `scopes()` as above.
             // Convert the list of scopes into a space‑separated string.
             scope: token_response.scopes().map(|scopes| {
