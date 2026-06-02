@@ -11115,6 +11115,7 @@ dependencies = [
  "talos-shutdown",
  "talos-ssrf-classify",
  "talos-text-util",
+ "talos-trace",
  "talos-trace-nats",
  "talos-wit-inspector",
  "talos-workflow-engine-core",

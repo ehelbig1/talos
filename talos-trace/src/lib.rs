@@ -15,7 +15,7 @@
 /// ```rust
 /// // Doctests run in an isolated crate, so we import the public API and
 /// // return a `Result`.
-/// use worker::tracing::{init_tracing, ExecutionSpan};
+/// use talos_trace::{init_tracing, ExecutionSpan};
 ///
 /// fn example() -> Result<(), Box<dyn std::error::Error>> {
 ///     // Initialize tracing (endpoint optional)
@@ -57,7 +57,7 @@ static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = 
 /// # Example
 /// ```rust
 /// // Send traces to Jaeger via OTLP
-/// use worker::tracing::init_tracing;
+/// use talos_trace::init_tracing;
 /// fn example() -> Result<(), Box<dyn std::error::Error>> {
 ///     init_tracing("talos-worker", Some("http://localhost:4317"))?;
 ///     Ok(())
@@ -150,7 +150,7 @@ impl ExecutionSpan {
     ///
     /// # Example
     /// ```rust
-    /// use worker::tracing::ExecutionSpan;
+    /// use talos_trace::ExecutionSpan;
     /// let span = ExecutionSpan::new("workflow-step", "exec-123");
     /// ```
     pub fn new(name: &str, execution_id: &str) -> Self {
@@ -181,7 +181,7 @@ impl ExecutionSpan {
     /// # Example
     /// ```rust
     /// // Import the type for doctest
-    /// use worker::tracing::ExecutionSpan;
+    /// use talos_trace::ExecutionSpan;
     ///
     /// fn example() -> Result<(), Box<dyn std::error::Error>> {
     ///     let parent = ExecutionSpan::new("workflow", "exec-123");
@@ -215,7 +215,7 @@ impl ExecutionSpan {
     ///
     /// # Example
     /// ```rust
-    /// use worker::tracing::ExecutionSpan;
+    /// use talos_trace::ExecutionSpan;
     ///
     /// fn example() -> Result<(), Box<dyn std::error::Error>> {
     ///     let mut span = ExecutionSpan::new("example", "id-1");
@@ -246,7 +246,7 @@ impl ExecutionSpan {
     ///
     /// # Example
     /// ```rust
-    /// use worker::tracing::ExecutionSpan;
+    /// use talos_trace::ExecutionSpan;
     ///
     /// fn example() -> Result<(), Box<dyn std::error::Error>> {
     ///     let mut span = ExecutionSpan::new("example", "id-1");
@@ -264,7 +264,7 @@ impl ExecutionSpan {
     ///
     /// # Example
     /// ```rust
-    /// use worker::tracing::ExecutionSpan;
+    /// use talos_trace::ExecutionSpan;
     ///
     /// fn example() -> Result<(), Box<dyn std::error::Error>> {
     ///     let mut span = ExecutionSpan::new("example", "id-1");
@@ -293,7 +293,7 @@ impl ExecutionSpan {
     ///
     /// # Example
     /// ```rust
-    /// use worker::tracing::ExecutionSpan;
+    /// use talos_trace::ExecutionSpan;
     /// fn example() -> Result<(), Box<dyn std::error::Error>> {
     ///     let span = ExecutionSpan::new("execution", "exec-123");
     ///     // ... do work ...
@@ -318,7 +318,7 @@ impl ExecutionSpan {
     ///
     /// # Example
     /// ```rust
-    /// use worker::tracing::ExecutionSpan;
+    /// use talos_trace::ExecutionSpan;
     /// fn example() -> Result<(), Box<dyn std::error::Error>> {
     ///     let span = ExecutionSpan::new("execution", "exec-123");
     ///     // ... error occurs ...
@@ -353,7 +353,7 @@ impl ExecutionSpan {
 /// # Example
 /// ```rust
 /// {
-///     use worker::tracing::SpanGuard;
+///     use talos_trace::SpanGuard;
 ///     let _guard = SpanGuard::new("operation", "exec-123");
 /// } // Span automatically closed with correct status
 /// ```
@@ -422,7 +422,7 @@ impl Drop for SpanGuard {
 ///
 /// # Example
 /// ```rust
-/// use worker::tracing::{extract_trace_id, ExecutionSpan};
+/// use talos_trace::{extract_trace_id, ExecutionSpan};
 ///
 /// fn example() -> Result<(), Box<dyn std::error::Error>> {
 ///     let headers = vec![
@@ -450,7 +450,7 @@ pub fn extract_trace_id(headers: &[(String, String)]) -> Option<String> {
 ///
 /// # Example
 /// ```rust
-/// use worker::tracing::{ExecutionSpan, create_trace_context};
+/// use talos_trace::{ExecutionSpan, create_trace_context};
 ///
 /// fn example() -> Result<(), Box<dyn std::error::Error>> {
 ///     let span = ExecutionSpan::new("execution", "exec-123");
@@ -464,6 +464,17 @@ pub fn create_trace_context(span: &ExecutionSpan) -> Vec<(String, String)> {
         ("x-trace-id".to_string(), span.execution_id.clone()),
         ("x-span-name".to_string(), span.name.clone()),
     ]
+}
+
+impl ExecutionSpan {
+    /// Create a span that continues a propagated parent trace context. The
+    /// context is currently accepted for API compatibility with the worker's
+    /// job-dispatch call sites (which pass the extracted `opentelemetry::Context`
+    /// from inbound NATS headers) and reserved for true parent-linking; the span
+    /// is created as a fresh root for now.
+    pub fn new_with_parent(name: &str, execution_id: &str, _cx: &opentelemetry::Context) -> Self {
+        Self::new(name, execution_id)
+    }
 }
 
 #[cfg(test)]
