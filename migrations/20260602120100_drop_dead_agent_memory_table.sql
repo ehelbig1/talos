@@ -1,0 +1,19 @@
+-- Drop the dead `agent_memory` table.
+--
+-- AUDIT (2026-06-02 RLS coverage review): `agent_memory` (created in migration
+-- 20260312000500) stores `value` as PLAINTEXT `TEXT` and has NO RLS policy. It is
+-- the pre-refactor predecessor of `actor_memory` — the live, AES-256-GCM-encrypted,
+-- AAD-bound memory store (29 SQL references in talos-memory, accessed exclusively
+-- through `talos_memory::*` over signed NATS-RPC).
+--
+-- Verified DEAD before dropping:
+--   * ZERO runtime SQL references the `agent_memory` table (the `wit_agent_memory`
+--     WIT guest interface is a backward-compat name that routes to `actor_memory`;
+--     `grep "INTO|FROM|UPDATE agent_memory"` across the workspace is empty).
+--   * No foreign-key dependents (nothing REFERENCES it).
+--
+-- Any rows it still holds are orphaned, unreadable PLAINTEXT memory values — a
+-- pure at-rest liability sitting next to the encrypted live table, and a footgun
+-- (a future stray write to `agent_memory` would silently store plaintext). Drop
+-- it; `CASCADE` removes its indexes (idx_agent_memory_*).
+DROP TABLE IF EXISTS agent_memory CASCADE;
