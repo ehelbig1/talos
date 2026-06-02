@@ -321,8 +321,21 @@ const PATTERN_SPECS: &[(&str, &str)] = &[
     // module config. Both prefixes are short alphabetic +
     // delimiter so the existing `[A-Za-z0-9\-_]{6,}` body
     // suffix covers the token tail.
+    //
+    // 2026-06-02: two FIRST-CLASS-integration secret formats that
+    // slipped the prior sweeps:
+    //   * `whsec_` — Stripe webhook SIGNING secret. Stripe is a
+    //     built-in template integration (Create_Checkout_Session,
+    //     Create_Subscription, …); the `sk_`/`rk_` API keys were
+    //     covered but the webhook-signing secret (distinct prefix,
+    //     lives in module config to verify inbound events) was not.
+    //   * `ATATT` — Atlassian API token (id.atlassian.com), used by
+    //     the talos-atlassian Jira/Confluence integration. Uppercase
+    //     `ATATT` doesn't occur in prose (the pattern is
+    //     case-sensitive, so lowercase "attachment" etc. can't match),
+    //     so the shared `{6,}` body is safe.
     (
-        r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|xapp-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.)[A-Za-z0-9\-_]{6,}",
+        r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|xapp-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.|whsec_|ATATT)[A-Za-z0-9\-_]{6,}",
         "[REDACTED:API_KEY]",
     ),
     // MCP-521: AWS Access Key IDs. Real AWS access key IDs are
@@ -1025,6 +1038,27 @@ mod tests {
         // Real keys with separator MUST be redacted.
         assert!(redact_str("sk-proj-abc123DEFGHIJKLMNOP").contains("[REDACTED:API_KEY]"));
         assert!(redact_str("sk_live_abcdefghijklmno").contains("[REDACTED:API_KEY]"));
+    }
+
+    #[test]
+    fn redacts_stripe_webhook_signing_secret() {
+        // Stripe `whsec_` webhook signing secret (first-class integration) —
+        // distinct from the `sk_`/`rk_` API keys, lives in module config.
+        assert!(redact_str("whsec_AbCd1234EfGh5678IjKl9012MnOp").contains("[REDACTED:API_KEY]"));
+        assert!(redact_str("STRIPE_WEBHOOK_SECRET=whsec_xY9zAbCdEfGhIjKl")
+            .contains("[REDACTED:API_KEY]"));
+        // The original secret must not survive.
+        assert!(!redact_str("whsec_AbCd1234EfGh5678IjKl9012MnOp").contains("AbCd1234EfGh"));
+    }
+
+    #[test]
+    fn redacts_atlassian_api_token() {
+        // Atlassian `ATATT...` API token (talos-atlassian Jira/Confluence).
+        assert!(redact_str("ATATT3xFfGF0abcDEF123ghiJKL456").contains("[REDACTED:API_KEY]"));
+        // Case-sensitive prefix: lowercase prose like "attachment" / "attatt"
+        // must NOT match (no false positive).
+        assert_eq!(redact_str("attachment list"), "attachment list");
+        assert_eq!(redact_str("the attribute value"), "the attribute value");
     }
 
     #[test]
