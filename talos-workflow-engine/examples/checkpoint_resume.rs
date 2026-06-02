@@ -247,7 +247,12 @@ impl CheckpointStore for InMemoryCheckpointStore {
         Ok(runs.get(&execution_id).cloned().unwrap_or_default())
     }
 
-    async fn save(&self, execution_id: Uuid, snapshot: &JsonValue) -> Result<(), BoxError> {
+    async fn save(
+        &self,
+        execution_id: Uuid,
+        snapshot: &JsonValue,
+        _seq: i64,
+    ) -> Result<(), BoxError> {
         let object = snapshot
             .as_object()
             .ok_or_else(|| -> BoxError { "snapshot must be a JSON object".into() })?;
@@ -307,10 +312,12 @@ impl NodeLifecycleHook for CheckpointingHook {
             snap.clone()
         };
         let blob = JsonValue::Object(next.into_iter().map(|(k, v)| (k.to_string(), v)).collect());
+        // Snapshot cardinality = monotonic checkpoint sequence number.
+        let seq = blob.as_object().map(|o| o.len()).unwrap_or(0) as i64;
         let store = Arc::clone(&self.store);
         let execution_id = self.execution_id;
         let handle = tokio::spawn(async move {
-            if let Err(e) = store.save(execution_id, &blob).await {
+            if let Err(e) = store.save(execution_id, &blob, seq).await {
                 eprintln!("checkpoint save failed: {e}");
             }
         });

@@ -1139,10 +1139,18 @@ async fn run_scheduled_execution(
                     db_pool.clone(),
                     wsk_for_checkpoint.as_ref().map(|k| k.as_bytes().to_vec()),
                 );
+                // Monotonic seq = node-keyed snapshot cardinality (same scale
+                // the engine's per-node saves use). This suspend-time write
+                // carries the complete set of completed nodes, so its seq is
+                // >= any racing interim per-node save and won't be rejected;
+                // a later resume's saves continue above it.
+                let checkpoint_seq =
+                    aggregated_json.as_object().map(|o| o.len()).unwrap_or(0) as i64;
                 if let Err(e) = talos_workflow_engine_core::CheckpointStore::save(
                     &store,
                     execution_id,
                     &aggregated_json,
+                    checkpoint_seq,
                 )
                 .await
                 {

@@ -643,10 +643,18 @@ impl WorkflowsMutations {
                             db_pool.clone(),
                             wsk_for_checkpoint.as_ref().map(|k| k.as_bytes().to_vec()),
                         );
+                        // Monotonic seq = node-keyed snapshot cardinality (same
+                        // scale the engine's per-node saves use). The suspend-time
+                        // write holds the complete completed-node set, so its seq
+                        // is >= any racing interim save and a later resume's saves
+                        // continue above it.
+                        let checkpoint_seq =
+                            aggregated_json.as_object().map(|o| o.len()).unwrap_or(0) as i64;
                         if let Err(e) = talos_workflow_engine_core::CheckpointStore::save(
                             &store,
                             execution_id,
                             &aggregated_json,
+                            checkpoint_seq,
                         )
                         .await
                         {
@@ -1278,10 +1286,18 @@ impl WorkflowsMutations {
                             db_pool.clone(),
                             wsk_for_checkpoint.as_ref().map(|k| k.as_bytes().to_vec()),
                         );
+                        // Monotonic seq = node-keyed snapshot cardinality (same
+                        // scale the engine's per-node saves use). The suspend-time
+                        // write holds the complete completed-node set, so its seq
+                        // is >= any racing interim save and a later resume's saves
+                        // continue above it.
+                        let checkpoint_seq =
+                            aggregated_json.as_object().map(|o| o.len()).unwrap_or(0) as i64;
                         if let Err(e) = talos_workflow_engine_core::CheckpointStore::save(
                             &store,
                             execution_id,
                             &aggregated_json,
+                            checkpoint_seq,
                         )
                         .await
                         {

@@ -235,7 +235,12 @@ pub async fn load_checkpoint_for_resume(
 
 #[async_trait]
 impl CheckpointStore for ControllerCheckpointStore {
-    async fn save(&self, execution_id: Uuid, snapshot: &JsonValue) -> Result<(), BoxError> {
+    async fn save(
+        &self,
+        execution_id: Uuid,
+        snapshot: &JsonValue,
+        seq: i64,
+    ) -> Result<(), BoxError> {
         // Silently no-op when no key is configured. Save paths run on
         // happy-path workflow completion; aborting the workflow because
         // the operator hasn't wired up `WORKER_SHARED_KEY` would be a
@@ -249,22 +254,32 @@ impl CheckpointStore for ControllerCheckpointStore {
         // into another and have it decrypt cleanly.
         let (ciphertext, nonce) = encrypt_checkpoint(snapshot, key, execution_id.as_bytes())
             .map_err(|e| -> BoxError { e.into() })?;
-        // Status guard: never write a checkpoint to a TERMINAL execution. The
-        // per-node save is fire-and-forget (`tokio::spawn`), so a save spawned
-        // just before the execution is marked completed/failed/cancelled could
-        // otherwise land afterward and leave stale resume material on a finished
-        // row. Today that's inert only because `load` filters to
-        // `waiting`/`resuming`; this makes the racing save a clean no-op so the
-        // load-side filter isn't the sole protection against resurrecting a
-        // finished execution.
+        // Two WHERE guards on the fire-and-forget per-node save:
+        //
+        // 1. Status: never write a checkpoint to a TERMINAL execution. A
+        //    save spawned just before the execution is marked
+        //    completed/failed/cancelled could otherwise land afterward and
+        //    leave stale resume material on a finished row. (`load` also
+        //    filters to waiting/resuming, so this is defence in depth.)
+        //
+        // 2. Monotonicity (`$4 >= checkpoint_seq`): saves race — a write
+        //    capturing N completed nodes can land AFTER one capturing N+k.
+        //    `seq` is the snapshot's node count (monotone over the
+        //    execution's life, continuing across a resume because the
+        //    resumed engine re-seeds its result map from the loaded
+        //    checkpoint). Dropping a strictly-smaller seq means a reordered
+        //    stale snapshot can never clobber a newer one and lose progress.
+        //    Equal seq is idempotent (same node set ⇒ same snapshot).
         sqlx::query(
             "UPDATE workflow_executions \
-             SET checkpoint_encrypted = $1, checkpoint_nonce = $2 \
-             WHERE id = $3 AND status NOT IN ('completed', 'failed', 'cancelled')",
+             SET checkpoint_encrypted = $1, checkpoint_nonce = $2, checkpoint_seq = $4 \
+             WHERE id = $3 AND status NOT IN ('completed', 'failed', 'cancelled') \
+               AND $4 >= checkpoint_seq",
         )
         .bind(&ciphertext)
         .bind(&nonce)
         .bind(execution_id)
+        .bind(seq)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -304,13 +319,39 @@ impl CheckpointStore for ControllerCheckpointStore {
             .await?;
 
             if let Some((ciphertext, nonce)) = enc_row {
-                let decrypted =
-                    decrypt_checkpoint(&ciphertext, &nonce, key, execution_id.as_bytes())
-                        .map_err(|e| -> BoxError { e.into() })?;
-                return Ok(decrypted
-                    .as_object()
-                    .map(uuid_keyed_map)
-                    .unwrap_or_default());
+                match decrypt_checkpoint(&ciphertext, &nonce, key, execution_id.as_bytes()) {
+                    Ok(decrypted) => {
+                        return Ok(decrypted
+                            .as_object()
+                            .map(uuid_keyed_map)
+                            .unwrap_or_default());
+                    }
+                    Err(e) => {
+                        // A checkpoint blob is PRESENT but won't decrypt under
+                        // the current WORKER_SHARED_KEY. The dominant cause is
+                        // a WSK rotation: the checkpoint AEAD key is derived
+                        // from the WSK, so rotating it strands every in-flight
+                        // checkpoint. Surface this LOUDLY and specifically —
+                        // without it the only signal is a generic "treating as
+                        // fresh run" warning, indistinguishable from a clean
+                        // no-checkpoint resume, and operators silently lose
+                        // mid-execution progress (re-running already-completed
+                        // side-effecting nodes, at-least-once) on every
+                        // rotation. Mitigation: drain in-flight executions
+                        // before rotating WORKER_SHARED_KEY. The error carries
+                        // no plaintext (decrypt failed) so it is safe to log.
+                        tracing::error!(
+                            %execution_id,
+                            error = %e,
+                            "CRASH-RECOVERY: checkpoint present but failed to decrypt — \
+                             almost certainly a WORKER_SHARED_KEY rotation stranded it. \
+                             This execution will resume FROM SCRATCH, re-running any \
+                             already-completed side-effecting nodes (at-least-once). Drain \
+                             in-flight executions before rotating WORKER_SHARED_KEY."
+                        );
+                        return Err(e.into());
+                    }
+                }
             }
         }
 

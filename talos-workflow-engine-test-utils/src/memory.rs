@@ -100,6 +100,10 @@ impl ModuleFetcher for InMemoryModuleFetcher {
 #[derive(Clone, Default)]
 pub struct InMemoryCheckpointStore {
     snapshots: Arc<DashMap<Uuid, JsonValue>>,
+    /// Highest `seq` written per execution. Mirrors the production
+    /// `checkpoint_seq` column so the monotonicity guard is exercised in
+    /// DB-free tests.
+    seqs: Arc<DashMap<Uuid, i64>>,
 }
 
 impl InMemoryCheckpointStore {
@@ -148,8 +152,20 @@ impl CheckpointStore for InMemoryCheckpointStore {
             .collect())
     }
 
-    async fn save(&self, execution_id: Uuid, snapshot: &JsonValue) -> Result<(), BoxError> {
-        self.snapshots.insert(execution_id, snapshot.clone());
+    async fn save(
+        &self,
+        execution_id: Uuid,
+        snapshot: &JsonValue,
+        seq: i64,
+    ) -> Result<(), BoxError> {
+        // Mirror the production guard: drop a save whose seq is strictly
+        // less than the seq already stored, so a reordered stale snapshot
+        // can't clobber a newer one. Equal seq overwrites idempotently.
+        let mut entry = self.seqs.entry(execution_id).or_insert(i64::MIN);
+        if seq >= *entry {
+            *entry = seq;
+            self.snapshots.insert(execution_id, snapshot.clone());
+        }
         Ok(())
     }
 }
@@ -400,11 +416,45 @@ mod tests {
 
         let node = Uuid::new_v4();
         let snapshot = serde_json::json!({ node.to_string(): { "ok": true } });
-        store.save(exec, &snapshot).await.unwrap();
+        store.save(exec, &snapshot, 1).await.unwrap();
 
         let loaded = store.load(exec).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[&node], serde_json::json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_is_monotonic() {
+        // A reordered stale save (older seq landing after a newer one) must
+        // not clobber the newer snapshot — the production `checkpoint_seq`
+        // guard, modelled here in-memory.
+        let exec = Uuid::new_v4();
+        let store = InMemoryCheckpointStore::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        // Newer snapshot (2 nodes, seq=2) lands first.
+        let newer = serde_json::json!({
+            a.to_string(): { "n": 1 },
+            b.to_string(): { "n": 2 },
+        });
+        store.save(exec, &newer, 2).await.unwrap();
+
+        // Older snapshot (1 node, seq=1) arrives late — must be dropped.
+        let older = serde_json::json!({ a.to_string(): { "n": 1 } });
+        store.save(exec, &older, 1).await.unwrap();
+
+        let loaded = store.load(exec).await.unwrap();
+        assert_eq!(loaded.len(), 2, "stale seq=1 save must not clobber seq=2");
+
+        // A genuinely newer save (seq=3) is accepted.
+        let newest = serde_json::json!({
+            a.to_string(): { "n": 1 },
+            b.to_string(): { "n": 2 },
+            Uuid::new_v4().to_string(): { "n": 3 },
+        });
+        store.save(exec, &newest, 3).await.unwrap();
+        assert_eq!(store.load(exec).await.unwrap().len(), 3);
     }
 
     #[tokio::test]
