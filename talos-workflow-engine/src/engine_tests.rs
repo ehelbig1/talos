@@ -585,3 +585,30 @@ fn add_node_respects_configured_max_workflow_nodes() {
     );
     assert_eq!(engine.graph().node_count(), 2);
 }
+
+#[test]
+fn into_engine_preserves_max_llm_tier() {
+    use talos_workflow_engine_core::LlmTier;
+
+    // Tier2 (external LLMs allowed) must survive sub-engine hydration. Regression:
+    // `into_engine` dropped `max_llm_tier`, so every sub-workflow fell back to
+    // `ParallelWorkflowEngine::new()`'s Tier1 default and lost external-LLM access
+    // (judges / ensembles / sub-workflows broke for legitimately-tier-2 actors).
+    let mut parent = ParallelWorkflowEngine::new();
+    parent.set_max_llm_tier(LlmTier::Tier2);
+    let child = parent.adapter_set().into_engine();
+    assert_eq!(
+        child.max_llm_tier,
+        LlmTier::Tier2,
+        "sub-engine must inherit the parent's Tier2 ceiling"
+    );
+
+    // Tier1 round-trips too — no accidental escalation to Tier2.
+    let mut parent1 = ParallelWorkflowEngine::new();
+    parent1.set_max_llm_tier(LlmTier::Tier1);
+    assert_eq!(
+        parent1.adapter_set().into_engine().max_llm_tier,
+        LlmTier::Tier1,
+        "sub-engine must inherit the parent's Tier1 ceiling"
+    );
+}
