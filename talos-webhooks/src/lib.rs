@@ -312,7 +312,7 @@ pub struct WebhookRouter {
     dedup: Option<std::sync::Arc<talos_idempotency::WebhookDeduplication>>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct WebhookTrigger {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -341,6 +341,39 @@ pub struct WebhookTrigger {
     /// Maximum seconds to wait for workflow completion in sync mode.
     /// Returns HTTP 504 Gateway Timeout if exceeded.
     pub sync_timeout_secs: i32,
+}
+
+// Custom Debug so a stray `{:?}` never prints the trigger's auth material:
+// `verification_token` (static bearer token) and `signing_secret_enc` (HMAC
+// signing-secret ciphertext — logging raw ciphertext bytes is noise at best and
+// a sensitivity-signal leak at worst). Both show presence only.
+impl std::fmt::Debug for WebhookTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookTrigger")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("name", &self.name)
+            .field("module_id", &self.module_id)
+            .field("workflow_id", &self.workflow_id)
+            .field(
+                "verification_token",
+                &self.verification_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "signing_secret_enc",
+                &self.signing_secret_enc.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("signing_key_id", &self.signing_key_id)
+            .field("signing_secret_format", &self.signing_secret_format)
+            .field("allowed_ips", &self.allowed_ips)
+            .field("enabled", &self.enabled)
+            .field("auto_respond", &self.auto_respond)
+            .field("queue_events", &self.queue_events)
+            .field("max_requests_per_minute", &self.max_requests_per_minute)
+            .field("sync_response", &self.sync_response)
+            .field("sync_timeout_secs", &self.sync_timeout_secs)
+            .finish()
+    }
 }
 
 /// Auth-downgrade guard predicate (MEDIUM finding).

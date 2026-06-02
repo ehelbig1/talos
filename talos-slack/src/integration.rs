@@ -33,7 +33,7 @@ use uuid::Uuid;
 /// `integration_credentials` table and are accessed via the
 /// `OAuthCredentialService` / `SecretsManager`. This matches the
 /// Atlassian integration pattern.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct SlackIntegration {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -48,6 +48,31 @@ pub struct SlackIntegration {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
+}
+
+// Custom Debug so a stray `{:?}` never prints the Slack verification token
+// (used to authenticate inbound Slack events). All other fields are non-secret.
+impl std::fmt::Debug for SlackIntegration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlackIntegration")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("team_id", &self.team_id)
+            .field("team_name", &self.team_name)
+            .field("team_domain", &self.team_domain)
+            .field("bot_user_id", &self.bot_user_id)
+            .field("app_id", &self.app_id)
+            .field("scope", &self.scope)
+            .field(
+                "verification_token",
+                &self.verification_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("is_active", &self.is_active)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("last_used_at", &self.last_used_at)
+            .finish()
+    }
 }
 
 /// Simplified version for API responses (without sensitive tokens)

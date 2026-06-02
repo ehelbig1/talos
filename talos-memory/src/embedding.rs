@@ -20,12 +20,26 @@
 //! eviction — fine for our workloads (repeat semantic queries during
 //! a workflow run) and cheap to implement without an LRU crate.
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EmbeddingConfig {
     pub api_url: String,
     pub api_key: Option<String>,
     pub model: String,
     pub dimensions: usize,
+}
+
+// Custom Debug so a stray `{:?}` (e.g. "loaded embedding config: {config:?}")
+// never prints the provider API key. Mirrors the redacting Debug on
+// `talos_auth::User`; `api_key` shows only presence.
+impl std::fmt::Debug for EmbeddingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingConfig")
+            .field("api_url", &self.api_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("model", &self.model)
+            .field("dimensions", &self.dimensions)
+            .finish()
+    }
 }
 
 impl EmbeddingConfig {

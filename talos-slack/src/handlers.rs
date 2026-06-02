@@ -321,7 +321,7 @@ pub struct CreateAppRequest {
     pub user_token: String, // User OAuth token with apps:write scope
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct CreateAppResponse {
     pub success: bool,
     pub app_id: Option<String>,
@@ -331,6 +331,25 @@ pub struct CreateAppResponse {
     pub verification_token: Option<String>,
     pub bot_user_id: Option<String>,
     pub error: Option<String>,
+}
+
+// Custom Debug so a stray `{:?}` never prints the Slack app secrets. The JSON
+// `Serialize` (intentional — the one-time create response returns these to the
+// user) is unaffected; only Debug-formatting redacts.
+impl std::fmt::Debug for CreateAppResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let red = |o: &Option<String>| o.as_ref().map(|_| "[REDACTED]");
+        f.debug_struct("CreateAppResponse")
+            .field("success", &self.success)
+            .field("app_id", &self.app_id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &red(&self.client_secret))
+            .field("signing_secret", &red(&self.signing_secret))
+            .field("verification_token", &red(&self.verification_token))
+            .field("bot_user_id", &self.bot_user_id)
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 pub async fn create_app_handler(

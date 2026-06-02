@@ -33,10 +33,20 @@ impl Default for SlackApiClient {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct SlackApiParams {
     pub bot_token: String,
     pub endpoint: Option<String>,
+}
+
+// Custom Debug so a stray `{:?}` never prints the Slack bot OAuth token.
+impl std::fmt::Debug for SlackApiParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlackApiParams")
+            .field("bot_token", &"[REDACTED]")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
