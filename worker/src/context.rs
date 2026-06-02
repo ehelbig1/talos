@@ -521,6 +521,39 @@ fn build_per_execution_http_client(allowed_hosts: &[String]) -> reqwest::Client 
         .expect("worker: failed to build hardened reqwest client with no-redirect policy")
 }
 
+/// Filesystem-preopen policy for a capability world.
+///
+/// Returns `true` ONLY for the two worlds that get a full read/write WASI
+/// preopen AND the policy-enforcing `talos:core/files` host interface
+/// (Filesystem, Trusted). Every other world — including Database and Agent —
+/// gets NO WASI preopen, so a guest's only filesystem surface is a raw WASI
+/// syscall that errors at the capability boundary.
+///
+/// Exhaustive match on purpose: a NEW `CapabilityWorld` variant is a compile
+/// error here, forcing an explicit fs-preopen decision rather than silently
+/// inheriting a (potentially wrong) default. See the call site in
+/// `TalosContext::new` for why Database/Agent are no-preopen (the read-only
+/// preopen they used to get was an empty, unpopulated dir whose only guard was
+/// WASI `FilePerms` — the surface RUSTSEC-2026-0149 bypassed).
+pub(crate) fn capability_world_has_fs_preopen(
+    world: &crate::wit_inspector::CapabilityWorld,
+) -> bool {
+    use crate::wit_inspector::CapabilityWorld;
+    match world {
+        CapabilityWorld::Filesystem | CapabilityWorld::Trusted => true,
+        CapabilityWorld::Database
+        | CapabilityWorld::Agent
+        | CapabilityWorld::Minimal
+        | CapabilityWorld::Http
+        | CapabilityWorld::Network
+        | CapabilityWorld::Secrets
+        | CapabilityWorld::Messaging
+        | CapabilityWorld::Cache
+        | CapabilityWorld::Governance
+        | CapabilityWorld::Unknown => false,
+    }
+}
+
 impl TalosContext {
     /// Create a new execution context with an ephemeral file-system sandbox.
     ///
@@ -609,63 +642,43 @@ impl TalosContext {
         // attack surface (path-resolution bugs, symlink-following
         // tricks against cap-std, etc.).
         //
-        // Three tiers of preopen:
-        //   * Filesystem / Trusted (Automation) — full read/write,
-        //     matches the linker-tier design. Modules in these worlds
-        //     genuinely need filesystem access for their host fns.
-        //   * Database / Agent — read-only preopen so std::fs::read
-        //     of operator-mounted lookup tables works, but no writes.
-        //     The `files-node` write surface is NOT linked in for
-        //     these worlds anyway; read-only is the right ceiling.
-        //   * Everything else (Minimal/Http/Network/Secrets/Messaging/
-        //     Cache/Governance/Unknown) — NO preopen. Guest std::fs
-        //     calls fail with "Capability denied".
+        // TWO tiers of preopen:
+        //   * Filesystem / Trusted (Automation) — full read/write. These
+        //     worlds also have the `talos:core/files` host interface linked
+        //     (build_filesystem_linker / build_trusted_linker), so the WASI
+        //     preopen and the policy-enforcing custom interface back the same
+        //     per-execution dir; a module legitimately needs scratch I/O.
+        //   * EVERYTHING ELSE — NO preopen. Guest `std::fs::*` fails at the
+        //     capability boundary ("Capability denied").
         //
-        // Defense-in-depth fact-check: the `files-node` host functions
-        // (read/write/delete/list_dir) are linked ONLY in the
-        // Filesystem and Trusted tiers (see `build_filesystem_linker`,
-        // `build_trusted_linker`). So a minimal-node module that
-        // somehow imports `talos:core/files` already fails to link.
-        // This L1 fix closes the lower-level surface — raw WASI
-        // file-syscalls via the preopen.
-        use crate::wit_inspector::CapabilityWorld;
-        match capability_world {
-            CapabilityWorld::Filesystem | CapabilityWorld::Trusted => {
-                builder.preopened_dir(
-                    ephemeral_dir.path(),
-                    "/",
-                    DirPerms::all(),
-                    FilePerms::all(),
-                )?;
-            }
-            CapabilityWorld::Database | CapabilityWorld::Agent => {
-                // Read-only: these worlds may legitimately read
-                // operator-mounted config files but never need to
-                // write into the per-execution tempdir.
-                builder.preopened_dir(
-                    ephemeral_dir.path(),
-                    "/",
-                    DirPerms::READ,
-                    FilePerms::READ,
-                )?;
-            }
-            // Worlds without any filesystem capability: no preopen.
-            // Guest `std::fs::*` calls return "Capability denied".
-            CapabilityWorld::Minimal
-            | CapabilityWorld::Http
-            | CapabilityWorld::Network
-            | CapabilityWorld::Secrets
-            | CapabilityWorld::Messaging
-            | CapabilityWorld::Cache
-            | CapabilityWorld::Governance
-            | CapabilityWorld::Unknown => {
-                // No preopened directory. The `files` host functions
-                // are also unlinked for these worlds (see
-                // `build_*_linker` in runtime.rs) so the only
-                // filesystem surface a guest can attempt is via raw
-                // WASI syscalls — which now error out at the
-                // capability boundary.
-            }
+        // 2026-06-02 architectural change: Database / Agent previously got a
+        // READ-ONLY preopen (DirPerms::READ / FilePerms::READ), justified as
+        // "read operator-mounted lookup tables." That mount was never wired —
+        // the dir is a FRESH EMPTY `tempfile::tempdir()` (line above), the
+        // `execution_fs_dir` staging param is unused, and the `files`
+        // interface (the only thing that writes the dir) is NOT linked for
+        // these worlds. So the read-only preopen was an EMPTY, unpopulated,
+        // functionally-inert dir — pure attack surface with no benefit.
+        //
+        // Worse, its read-only enforcement rode entirely on WASI `FilePerms`,
+        // which is exactly what RUSTSEC-2026-0149 (wasmtime-wasi
+        // `path_open(TRUNCATE)`) bypassed. Patched in wasmtime 44 (PR #121),
+        // but the architectural lesson stands: a world WITHOUT the custom
+        // `files` interface should not have a raw WASI preopen whose only
+        // guard is the host's permission model. Collapsing Database / Agent
+        // into the no-preopen tier removes the surface entirely and makes the
+        // FilePerms-bypass class structurally unreachable for them. If these
+        // worlds ever genuinely need to read staged files, route it through a
+        // READ-ONLY `files` host interface (policy-enforcing), not a preopen.
+        //
+        // Defense-in-depth fact-check: the `files` host functions
+        // (read/write/delete/list_dir) are linked ONLY in the Filesystem and
+        // Trusted tiers, so a non-fs world that somehow imports
+        // `talos:core/files` already fails to link. This closes the lower
+        // raw-WASI-syscall surface to match.
+        // Single, named, exhaustive policy (see `capability_world_has_fs_preopen`).
+        if capability_world_has_fs_preopen(&capability_world) {
+            builder.preopened_dir(ephemeral_dir.path(), "/", DirPerms::all(), FilePerms::all())?;
         }
 
         // Network access for wasi:sockets (WASIP2) — only granted when the
@@ -1458,6 +1471,49 @@ pub(crate) fn per_host_check_and_bump(
     }
     *entry += 1;
     true
+}
+
+#[cfg(test)]
+mod fs_preopen_policy_tests {
+    use super::capability_world_has_fs_preopen;
+    use crate::wit_inspector::CapabilityWorld;
+
+    #[test]
+    fn only_filesystem_and_trusted_get_a_preopen() {
+        assert!(capability_world_has_fs_preopen(
+            &CapabilityWorld::Filesystem
+        ));
+        assert!(capability_world_has_fs_preopen(&CapabilityWorld::Trusted));
+    }
+
+    #[test]
+    fn database_and_agent_get_no_preopen() {
+        // The architectural change: Database/Agent no longer get a raw WASI
+        // preopen (the read-only one was empty/unpopulated and its only guard
+        // was bypassable WASI FilePerms — RUSTSEC-2026-0149). A regression
+        // re-granting them a preopen must fail here.
+        assert!(!capability_world_has_fs_preopen(&CapabilityWorld::Database));
+        assert!(!capability_world_has_fs_preopen(&CapabilityWorld::Agent));
+    }
+
+    #[test]
+    fn non_filesystem_worlds_get_no_preopen() {
+        for w in [
+            CapabilityWorld::Minimal,
+            CapabilityWorld::Http,
+            CapabilityWorld::Network,
+            CapabilityWorld::Secrets,
+            CapabilityWorld::Messaging,
+            CapabilityWorld::Cache,
+            CapabilityWorld::Governance,
+            CapabilityWorld::Unknown,
+        ] {
+            assert!(
+                !capability_world_has_fs_preopen(&w),
+                "{w:?} must not get a filesystem preopen"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
