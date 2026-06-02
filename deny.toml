@@ -79,37 +79,15 @@ Mitigation: enforce HS256-only via a boot-time check before removing
 this exemption's scope assumption.
 """ },
 
-    { id = "RUSTSEC-2026-0098", reason = """
-rustls-webpki 0.101.x — URI name-constraints accepted. Pulled by
-aws-smithy-http-client's `legacy-rustls` feature (rustls 0.21.x).
-Our AWS SDK talks to: (a) AWS STS for auth, (b) MinIO (we control
-the cert). No attacker-controlled certificates in scope. The attack
-requires a misissued certificate — implausible against our endpoint
-set. Tracking: aws-sdk-rust issue for migration off legacy-rustls:
-https://github.com/awslabs/aws-sdk-rust/issues (search 'rustls 0.21').
-""" },
-
-    { id = "RUSTSEC-2026-0099", reason = """
-rustls-webpki 0.101.x — wildcard name-constraint bypass. Same
-aws-smithy-http-client legacy-rustls chain as RUSTSEC-2026-0098.
-Same non-exploitability reasoning (no attacker-controlled certs in
-AWS SDK scope).
-""" },
-
-    { id = "RUSTSEC-2026-0104", reason = """
-rustls-webpki 0.101.x — panic on empty onlySomeReasons in CRL
-parsing. Reachable only when parsing CRLs, which neither the AWS SDK
-nor any Talos code path does. Same legacy-rustls chain.
-""" },
-
-    { id = "RUSTSEC-2026-0049", reason = """
-rustls-webpki 0.102.x — CRL not consulted due to faulty
-DistributionPoint matching. Our cert-verification path uses the
-default `UnknownStatusPolicy::Deny`, which makes this a safe
-"reject unknown revocation" rather than unsafe accept. Advisory
-itself notes impact is "limited". Same legacy-rustls chain waiting
-on aws-sdk migration.
-""" },
+    # NOTE (2026-06-02): the four rustls-webpki 0.101/0.102 exemptions
+    # (RUSTSEC-2026-0098/0099/0104/0049) were REMOVED. They covered the
+    # aws-smithy-http-client `legacy-rustls` chain (rustls 0.21 + rustls-webpki
+    # 0.101). aws-sdk-s3 is now pinned `default-features = false` WITHOUT its
+    # default `rustls` feature, so it uses only the modern `default-https-client`
+    # TLS stack (rustls 0.23 + rustls-webpki 0.103 + aws-lc-rs). rustls 0.21 and
+    # rustls-webpki 0.101/0.102 are no longer in the tree, so the advisories no
+    # longer apply and the exemptions are unnecessary. See controller/Cargo.toml
+    # + talos-audit-ledger/Cargo.toml.
 
     # --- Unmaintained crates (supply-chain risk, no current exploit) ---
 
