@@ -316,7 +316,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
 - **Tests that hit async code** need `#[tokio::test]`, not `#[test]`. `sqlx::PgPoolOptions::connect_lazy` panics outside a Tokio runtime.
 
 ## Pre-deploy validation
-- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 20 checks today, each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
+- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 37 checks today (the authoritative, inline-documented list lives in the script), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
   1. raw `actor_memory` writes + legacy `value`-column projections outside `talos-memory/`
   2. bidirectional `controller/src/main.rs` route ↔ `deploy/helm/talos/templates/frontend/configmap.yaml` location alignment (opt-outs: `// no-nginx-route`, `# no-controller-route`)
   3. legacy `__agent_context__` key regressions (canonical is `__actor_context__`; opt-out `// allow-agent-context-key`)
@@ -337,6 +337,23 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
   18. `JobResult.sign()` in worker must use `sign_with_worker_id`
   19. worker must single-publish each `JobResult` (no dual NATS publish)
   20. every wasmtime WASM proposal must be explicitly opted in/out
+  21. integer-cast wraparound (`.as_u64()…as u32` / `map(|i| i as i32)`)
+  22. GraphQL queries with sibling mutations must have a scope gate
+  23. `encrypt_value()`/`decrypt_value_by_key()` without AAD outside the secrets table
+  24. inline control-char predicate in a write surface (use `talos_validation`)
+  25. bare-pool queries on RLS tables in `talos-api/src/schema` (must be tenant-scoped tx)
+  26. in-flight status literal must include `'resuming'`
+  27. `make_interval(<int arg> => $N)` must cast `$N::int` (int4-only pg arg)
+  28. OFFSET pagination needs a unique `ORDER BY` tiebreaker
+  29. no bare `engine.set_actor_id()` outside the actor-application path
+  30. no `CONCURRENTLY` in migrations (sqlx runs them in a transaction)
+  31. outbound HTTP response bodies must be read through `talos-http-body` (cap OOM)
+  32. `reqwest Client::builder()` must set an explicit `.redirect()` policy
+  33. capability-world ranking must use `talos-capability-world`, not a local re-impl
+  34. `actor_memory` `value_format` reads must fail loud (MCP-S2 AAD dispatch)
+  35. `cargo fmt --all -- --check` (rustfmt drift) — runs by default
+  36. `cargo audit` (RustSec advisories) — env-gated `TALOS_LINT_AUDIT=1`
+  37. secret-holding structs must redact in `Debug` (no `derive(Debug)` over a plaintext secret)
 - **`scripts/smoke.sh` end-to-end probe.** Runs every public path against a deployed cluster (`/health`, `/auth/csrf` cookie seeding, `/graphql` with full CSRF round-trip, `/ws` handshake, `/mcp`); optional Phase-B encryption write→read round-trip with `SMOKE_AGENT_TOKEN` + `SMOKE_ACTOR_ID`. `deploy/k3s/install.sh` invokes it as §9.1 at the tail of every deploy — a failed smoke warns but doesn't abort install. Run manually any time with `make smoke BASE_URL=https://…`.
 - **When introducing a new top-level path on the controller**: add a matching `location` block to the chart's nginx ConfigMap, OR mark the route `// no-nginx-route: <reason>` (kubelet probes, in-cluster scrape, etc.). The lint check 2 catches drift either way; the smoke test fails fast in production if the path is supposed to be public but nginx routes it to the SPA.
 
