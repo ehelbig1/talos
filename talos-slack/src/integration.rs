@@ -324,13 +324,16 @@ impl SlackIntegrationService {
         // at module scope — TLS context + connection pool stay shared
         // across all OAuth callbacks. See the module-level static for
         // the security-rationale doc-comment.
-        let oauth_response: serde_json::Value = OAUTH_HTTP_CLIENT
+        // Cap the response body (lint-31 / unbounded-read class). slack.com is a
+        // fixed trusted host, but every other OAuth callback reads through the
+        // shared capped-body crate; this brings the Slack token exchange to parity.
+        let token_resp = OAUTH_HTTP_CLIENT
             .post("https://slack.com/api/oauth.v2.access")
             .form(&token_params)
             .send()
-            .await?
-            .json()
             .await?;
+        let oauth_response: serde_json::Value =
+            talos_http_body::read_json_capped(token_resp).await?;
 
         if !oauth_response["ok"].as_bool().unwrap_or(false) {
             let error = oauth_response["error"].as_str().unwrap_or("unknown");

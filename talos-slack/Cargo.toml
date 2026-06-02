@@ -18,6 +18,7 @@ serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-http-body = { path = "../talos-http-body" }
 talos-oauth = { path = "../talos-oauth" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 # MCP-1028: truncate-then-redact discipline on audit log error_message.
