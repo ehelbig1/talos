@@ -53,9 +53,19 @@ impl std::fmt::Debug for NatsTransport {
 #[async_trait]
 impl JobTransport for NatsTransport {
     async fn request(&self, topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+        // Inject the current W3C trace context so the worker can link its
+        // job span to the controller's `workflow` span. Empty (no-op) when no
+        // span/propagator is active — never an error.
+        let mut headers = async_nats::HeaderMap::new();
+        talos_trace_nats::inject_trace_context(&mut headers);
         let reply = self
             .client
-            .request(topic.to_string(), payload.into())
+            .send_request(
+                topic.to_string(),
+                async_nats::Request::new()
+                    .headers(headers)
+                    .payload(payload.into()),
+            )
             .await
             .map_err(|e| -> BoxError { e.to_string().into() })?;
         Ok(reply.payload.to_vec())
@@ -92,8 +102,19 @@ impl JobTransport for NatsTransport {
             .subscribe(reply_inbox.to_string())
             .await
             .map_err(|e| -> BoxError { format!("inbox subscribe: {e}").into() })?;
+        // Inject the current W3C trace context (controller `workflow` span) into
+        // the job headers so the worker links its job span to it. The HMAC is
+        // over the JobRequest payload, not NATS headers, so this does not affect
+        // signature verification. No-op when no span/propagator is active.
+        let mut headers = async_nats::HeaderMap::new();
+        talos_trace_nats::inject_trace_context(&mut headers);
         self.client
-            .publish_with_reply(topic.to_string(), reply_inbox.to_string(), payload.into())
+            .publish_with_reply_and_headers(
+                topic.to_string(),
+                reply_inbox.to_string(),
+                headers,
+                payload.into(),
+            )
             .await
             .map_err(|e| -> BoxError { format!("publish_with_reply: {e}").into() })?;
         // Best-effort flush so the publish doesn't sit in the local
