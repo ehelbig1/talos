@@ -1238,6 +1238,7 @@ mod tests {
             name: name.to_string(),
             config_schema: json!({}),
             allowed_secrets: defaults.iter().map(|s| s.to_string()).collect(),
+            allowed_hosts: Vec::new(),
             max_retries: 0,
         }
     }
