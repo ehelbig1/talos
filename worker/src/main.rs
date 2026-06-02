@@ -1287,12 +1287,67 @@ async fn publish_result_with_retry(
     }
 }
 
+/// Per-job span adapter backed by the current `#[::tracing::instrument]` span.
+///
+/// Presents the same surface the job/pipeline handlers already use
+/// (`set_attribute` / `set_attribute_int` / `add_event` / `end_error` /
+/// `end_success`) but routes everything through the `tracing` span via
+/// [`tracing_opentelemetry::OpenTelemetrySpanExt`], so attributes/events/status
+/// flow through the otel bridge layer (and host-function child spans nest under
+/// it). This replaces the manual-otel `ExecutionSpan` for the per-job span now
+/// that the worker exports `tracing` spans to OTLP; `ExecutionSpan` remains for
+/// the standalone `wasm-execution` span in `runtime.rs`.
+struct JobSpan {
+    span: ::tracing::Span,
+}
+
+impl JobSpan {
+    /// Wrap the current instrument span and link it to the propagated controller
+    /// trace context, so the worker job span nests under the controller
+    /// `workflow` span rather than starting a fresh root trace.
+    fn current_with_parent(cx: &opentelemetry::Context) -> Self {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let span = ::tracing::Span::current();
+        // `set_parent` only errors if the context carries no span; ignore — a
+        // missing parent simply yields a root job span (e.g. module-bound jobs).
+        let _ = span.set_parent(cx.clone());
+        Self { span }
+    }
+
+    fn set_attribute(&mut self, key: &str, value: &str) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        self.span.set_attribute(key.to_string(), value.to_string());
+    }
+
+    fn set_attribute_int(&mut self, key: &str, value: i64) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        self.span.set_attribute(key.to_string(), value);
+    }
+
+    fn add_event(&mut self, name: &str) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        self.span.add_event(name.to_string(), Vec::new());
+    }
+
+    fn end_error(self, message: &str) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        self.span
+            .set_status(opentelemetry::trace::Status::error(message.to_string()));
+    }
+
+    fn end_success(self) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        self.span.set_status(opentelemetry::trace::Status::Ok);
+    }
+}
+
 /// Execute the Wasm module for a given job with observability.
 ///
 /// * Verifies the HMAC signature before executing.
 /// * Decrypts secrets from `req.encrypted_secrets` using the shared key.
 /// * Passes decrypted secrets to the runtime so WASM modules can access them
 ///   via the `secrets::get-secret` host function.
+#[::tracing::instrument(name = "job-execution", skip_all)]
 async fn execute_job(
     cx: &opentelemetry::Context,
     req: JobRequest,
@@ -1301,9 +1356,10 @@ async fn execute_job(
 ) -> JobResult {
     let start = std::time::Instant::now();
 
-    // Create distributed tracing span
-    let mut _span =
-        tracing::ExecutionSpan::new_with_parent("job-execution", &req.job_id.to_string(), cx);
+    // The `#[instrument]` span above is THE job span; wrap it and link it to the
+    // propagated controller trace context. All `_span.*` calls below set
+    // attributes / events / status on it, exported via the otel bridge layer.
+    let mut _span = JobSpan::current_with_parent(cx);
     _span.set_attribute("job_id", &req.job_id.to_string());
     _span.set_attribute("module_uri", &req.module_uri);
 
@@ -2513,6 +2569,7 @@ async fn execute_job(
 /// * Decrypts per-step secrets.
 /// * Runs `execute_pipeline()` on the runtime.
 /// * Signs and publishes the `PipelineJobResult`.
+#[::tracing::instrument(name = "pipeline-execution", skip_all)]
 async fn execute_pipeline_job(
     cx: &opentelemetry::Context,
     req: PipelineJobRequest,
@@ -2522,11 +2579,9 @@ async fn execute_pipeline_job(
     use talos_workflow_job_protocol::JobStatus;
 
     let start = std::time::Instant::now();
-    let mut _span = tracing::ExecutionSpan::new_with_parent(
-        "pipeline-execution",
-        &req.workflow_execution_id.to_string(),
-        cx,
-    );
+    // The `#[instrument]` span above is THE pipeline span; wrap + link it to the
+    // propagated controller trace context (see `execute_job` for the rationale).
+    let mut _span = JobSpan::current_with_parent(cx);
 
     // SECURITY: Verify HMAC-SHA256 signature + nonce freshness (300 s window).
     if let Err(e) = req.verify(shared_key.as_bytes(), 300) {
@@ -3011,25 +3066,10 @@ async fn main() -> anyhow::Result<()> {
         println!("      Metrics initialized");
     }
 
-    // Install a console tracing subscriber so `tracing::warn!`, `tracing::info!`,
-    // etc. in host_impl.rs (security checks, vault allowlist, SSRF blocks, rate
-    // limits) appear in `docker logs` alongside the [TRACE] span output. Without
-    // this, those log lines only went to Jaeger — silently dropped if Jaeger was
-    // unreachable or nobody was watching the traces.
-    //
-    // The fmt layer respects RUST_LOG (default: info for the worker crate, warn
-    // for everything else). The OTel tracing layer is initialized separately
-    // below and coexists via the tracing-subscriber registry.
-    {
-        use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("worker=info,warn"));
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer().with_target(true).with_thread_ids(false))
-            .init();
-    }
-
+    // Initialise OTel tracing FIRST — `init_tracing` installs the SDK provider
+    // (+ the W3C propagator used by `extract_trace_context`). The otel bridge
+    // layer in the subscriber below pulls a tracer from that provider, so the
+    // provider must exist before the subscriber is built.
     let jaeger_endpoint = std::env::var("JAEGER_ENDPOINT")
         .ok()
         .or_else(|| Some("http://localhost:4317".to_string()));
@@ -3042,6 +3082,34 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("    Continuing without tracing...");
             }
         }
+    }
+
+    // Install the tracing subscriber. The fmt layer keeps host_impl.rs
+    // `tracing::warn!`/`info!` (security checks, vault allowlist, SSRF blocks,
+    // rate limits) in `docker logs` (RUST_LOG, default: worker=info,warn). The
+    // optional OTel bridge layer — present only when `init_tracing` installed a
+    // provider above (OTLP endpoint configured) — exports the worker's `tracing`
+    // spans to OTLP so each `job-execution` span (and the host-function spans
+    // nested under it) appears in the trace backend, linked to the controller's
+    // `workflow` span via the propagated context.
+    //
+    // PERF: the worker is the hot WASM-execution path. Span volume is bounded by
+    // the global EnvFilter (info/warn) AND the otel sampler: the SDK default is
+    // ParentBased(AlwaysOn), so jobs that carry a sampled controller context
+    // inherit its decision; root jobs (e.g. module-bound gmail/gcal dispatch with
+    // no controller span) sample at AlwaysOn. High-throughput deployments should
+    // configure a ratio sampler on the controller (the parent) to bound export.
+    {
+        use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("worker=info,warn"));
+        let otel_layer = tracing::sdk_tracer("talos-worker")
+            .map(|tracer| tracing_opentelemetry::layer().with_tracer(tracer));
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_target(true).with_thread_ids(false))
+            .with(otel_layer)
+            .init();
     }
 
     // MCP-580: spawn the circuit-breaker periodic cleanup task so the
