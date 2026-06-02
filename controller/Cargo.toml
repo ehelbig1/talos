@@ -200,9 +200,22 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "reqwest-clie
 tracing-opentelemetry = "0.28"
 tower_governor = "0.8.0"
 
-# S3 client for immutable audit ledger storage (MinIO)
+# S3 client for immutable audit ledger storage (MinIO).
+# `default-features = false` + explicit features DROPS aws-sdk-s3's default
+# `rustls` feature, which selects the LEGACY TLS stack
+# (aws-smithy-http-client/legacy-rustls-ring → rustls 0.21 + rustls-webpki
+# 0.101). The retained `default-https-client` already provides the MODERN TLS
+# stack (aws-smithy-http-client/rustls-aws-lc → rustls 0.23 + aws-lc-rs, which
+# the rest of the workspace already builds). Dropping the legacy feature
+# removes rustls 0.21 / rustls-webpki 0.101 from the tree entirely and with it
+# the RUSTSEC-2026-0098/0099/0104 advisory exemptions. aws-config's default is
+# already modern-only (default-https-client, no `rustls`), so it is unchanged.
 aws-config = "1.5"
-aws-sdk-s3 = "1.30"
+aws-sdk-s3 = { version = "1.30", default-features = false, features = [
+    "sigv4a",
+    "default-https-client",
+    "rt-tokio",
+] }
 tonic = "0.12.3"
 rhai = { version = "1.19", features = ["serde"] }
 zeroize = "1.8"

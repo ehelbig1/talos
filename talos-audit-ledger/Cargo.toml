@@ -15,8 +15,17 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "reqwest-client", "http-proto"] }
 tonic = "0.12.3"
 async-nats = "0.47"
+# `default-features = false` drops aws-sdk-s3's legacy `rustls` feature
+# (rustls 0.21 / rustls-webpki 0.101); the retained `default-https-client`
+# keeps the modern rustls-aws-lc (rustls 0.23) stack. Must stay in lockstep
+# with controller/Cargo.toml — both pull aws-sdk-s3, so a divergence would
+# re-introduce the legacy feature via feature unification.
 aws-config = "1.5"
-aws-sdk-s3 = "1.30"
+aws-sdk-s3 = { version = "1.30", default-features = false, features = [
+    "sigv4a",
+    "default-https-client",
+    "rt-tokio",
+] }
 chrono.workspace = true
 futures = "0.3"
 hex = "0.4"
