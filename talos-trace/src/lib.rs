@@ -154,14 +154,27 @@ impl ExecutionSpan {
     /// let span = ExecutionSpan::new("workflow-step", "exec-123");
     /// ```
     pub fn new(name: &str, execution_id: &str) -> Self {
-        // Get the global tracer provider and create a concrete span
+        // A fresh root span (parent taken from the thread-local context, which
+        // is empty in the worker's per-job task — so effectively a root).
+        Self::build(name, execution_id, None)
+    }
+
+    /// Build the underlying span, optionally as a child of a propagated parent
+    /// trace context. When `parent` is `Some`, the span is started with
+    /// `start_with_context` so it inherits the parent's `trace_id` and links to
+    /// its `span_id` — this is what stitches the worker's execution span into the
+    /// controller's distributed trace across the NATS job boundary.
+    fn build(name: &str, execution_id: &str, parent: Option<&opentelemetry::Context>) -> Self {
         let provider = global::tracer_provider();
         let tracer = provider.tracer("talos-wasm-runtime");
 
-        let mut span = tracer
+        let builder = tracer
             .span_builder(name.to_string())
-            .with_kind(SpanKind::Internal)
-            .start(&tracer);
+            .with_kind(SpanKind::Internal);
+        let mut span = match parent {
+            Some(cx) => builder.start_with_context(&tracer, cx),
+            None => builder.start(&tracer),
+        };
 
         // Add standard attributes
         span.set_attribute(KeyValue::new("execution.id", execution_id.to_string()));
@@ -467,13 +480,16 @@ pub fn create_trace_context(span: &ExecutionSpan) -> Vec<(String, String)> {
 }
 
 impl ExecutionSpan {
-    /// Create a span that continues a propagated parent trace context. The
-    /// context is currently accepted for API compatibility with the worker's
-    /// job-dispatch call sites (which pass the extracted `opentelemetry::Context`
-    /// from inbound NATS headers) and reserved for true parent-linking; the span
-    /// is created as a fresh root for now.
-    pub fn new_with_parent(name: &str, execution_id: &str, _cx: &opentelemetry::Context) -> Self {
-        Self::new(name, execution_id)
+    /// Create a span that continues a propagated parent trace context.
+    ///
+    /// The worker's NATS job/pipeline subscribers extract the W3C trace context
+    /// from inbound message headers (`talos_trace_nats::extract_trace_context`)
+    /// and pass it here. The span is started as a child of that context so the
+    /// worker's `job-execution` / `pipeline-execution` span shares the
+    /// originating controller trace's `trace_id` and links to its parent span,
+    /// instead of appearing as a disconnected root in the trace backend.
+    pub fn new_with_parent(name: &str, execution_id: &str, cx: &opentelemetry::Context) -> Self {
+        Self::build(name, execution_id, Some(cx))
     }
 }
 
@@ -512,5 +528,49 @@ mod tests {
 
         let trace_id = extract_trace_id(&headers);
         assert_eq!(trace_id, Some("trace-123".to_string()));
+    }
+
+    /// Regression test for the distributed-tracing link across the NATS job
+    /// boundary: `new_with_parent` must start its span as a CHILD of the
+    /// propagated context so it inherits the parent `trace_id`. Previously the
+    /// context was discarded and the worker's job span became a disconnected
+    /// root in the trace backend.
+    #[test]
+    fn new_with_parent_inherits_parent_trace_id() {
+        use opentelemetry::trace::{
+            Span, SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+        };
+        use opentelemetry::Context;
+
+        // A concrete SDK provider is required — the global no-op tracer yields
+        // an all-zero span context, so parent propagation is only observable
+        // against a real provider.
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        global::set_tracer_provider(provider);
+
+        let parent_trace_id = TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap();
+        let parent_sc = SpanContext::new(
+            parent_trace_id,
+            SpanId::from_hex("b7ad6b7169203331").unwrap(),
+            TraceFlags::SAMPLED,
+            true, // remote (as produced by the W3C propagator extractor)
+            TraceState::default(),
+        );
+        let parent_cx = Context::new().with_remote_span_context(parent_sc);
+
+        let child = ExecutionSpan::new_with_parent("job-execution", "exec-1", &parent_cx);
+        assert_eq!(
+            child.span.span_context().trace_id(),
+            parent_trace_id,
+            "new_with_parent must inherit the propagated parent trace_id"
+        );
+
+        // A fresh root span must NOT share the parent trace_id.
+        let root = ExecutionSpan::new("root", "exec-2");
+        assert_ne!(
+            root.span.span_context().trace_id(),
+            parent_trace_id,
+            "a root span must not inherit an unrelated trace_id"
+        );
     }
 }
