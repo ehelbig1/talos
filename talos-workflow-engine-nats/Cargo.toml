@@ -20,6 +20,10 @@ async-trait = "0.1"
 # pre-allocation path in `transport.rs`.
 futures = "0.3"
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
+# W3C trace-context injection into the outbound job NATS headers so worker
+# job/pipeline spans link to the controller's `workflow` span. No talos-* deps
+# of its own, so no dependency cycle.
+talos-trace-nats = { path = "../talos-trace-nats" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"

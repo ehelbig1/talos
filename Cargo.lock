@@ -8808,6 +8808,7 @@ dependencies = [
  "async-trait",
  "futures",
  "serde_json",
+ "talos-trace-nats",
  "talos-workflow-engine",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
