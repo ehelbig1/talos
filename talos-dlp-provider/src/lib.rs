@@ -334,8 +334,21 @@ const PATTERN_SPECS: &[(&str, &str)] = &[
     //     `ATATT` doesn't occur in prose (the pattern is
     //     case-sensitive, so lowercase "attachment" etc. can't match),
     //     so the shared `{6,}` body is safe.
+    //
+    // 2026-06-02 (b): common EXTERNAL automation-provider token prefixes a
+    // module might handle (modules are arbitrary WASM that can call any API; a
+    // failed call echoing an auth header or a config dumped in an error would
+    // otherwise persist the secret to the DB). All are DISTINCTIVE prefixes
+    // with no English-prose collision, so the shared `{6,}` body is safe and
+    // false-positive-free:
+    //   * `shpat_`/`shpss_`/`shpca_`/`shppa_` — Shopify admin/storefront/
+    //     custom-app/private-app access tokens (e-commerce automation).
+    //   * `dop_v1_` — DigitalOcean personal access token (infra automation).
+    //   * `sq0atp-`/`sq0csp-` — Square access / OAuth-app secret (payments).
+    //   * `lin_api_` — Linear API key (issue-tracker automation).
+    //   * `PMAK-` — Postman API key (uppercase, distinctive).
     (
-        r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|xapp-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.|whsec_|ATATT)[A-Za-z0-9\-_]{6,}",
+        r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|xapp-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.|whsec_|ATATT|shpat_|shpss_|shpca_|shppa_|dop_v1_|sq0atp-|sq0csp-|lin_api_|PMAK-)[A-Za-z0-9\-_]{6,}",
         "[REDACTED:API_KEY]",
     ),
     // MCP-521: AWS Access Key IDs. Real AWS access key IDs are
@@ -1059,6 +1072,41 @@ mod tests {
         // must NOT match (no false positive).
         assert_eq!(redact_str("attachment list"), "attachment list");
         assert_eq!(redact_str("the attribute value"), "the attribute value");
+    }
+
+    #[test]
+    fn redacts_common_external_provider_tokens() {
+        // Distinctive-prefix tokens for common automation providers.
+        for tok in [
+            "shpat_abc123DEF456ghi789",      // Shopify admin
+            "shpss_0123456789abcdefABCDEF",  // Shopify storefront
+            "dop_v1_abcdef0123456789abcdef", // DigitalOcean PAT
+            "sq0atp-AbCdEf0123456789xyz",    // Square access token
+            "sq0csp-AbCdEf0123456789xyz",    // Square app secret
+            "lin_api_abcDEF123ghiJKL456mno", // Linear
+            "PMAK-abcdef0123456789ABCDEF",   // Postman
+        ] {
+            assert!(
+                redact_str(tok).contains("[REDACTED:API_KEY]"),
+                "must redact provider token {tok}"
+            );
+            // The token's trailing body must not survive verbatim.
+            assert!(!redact_str(tok).contains(&tok[tok.len() - 12..]));
+        }
+    }
+
+    #[test]
+    fn external_provider_prefixes_no_prose_false_positive() {
+        // None of the prefixes collide with English prose / common identifiers.
+        for clean in [
+            "shopping cart total",
+            "linear regression model",
+            "dropbox sync status",
+            "the square root function",
+            "postmaster general",
+        ] {
+            assert_eq!(redact_str(clean), clean, "must not redact prose: {clean}");
+        }
     }
 
     #[test]
