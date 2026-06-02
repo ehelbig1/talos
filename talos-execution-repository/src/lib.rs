@@ -1295,7 +1295,20 @@ impl ExecutionRepository {
         exec_id: Uuid,
         output: &serde_json::Value,
     ) -> Result<()> {
-        if self.output_encryption_enabled() {
+        // Split-brain guard: `AND status = 'running'`, matching the
+        // `mark_execution_completed` / `mark_execution_failed` siblings
+        // (and the workflow-repository `mark_execution_waiting`). Pre-fix
+        // this was the lone bare `WHERE id = $1` terminal-state writer —
+        // the MCP-975 sweep added the DLP redaction here but missed the
+        // status guard. Without it, a controller that has been superseded
+        // (its row claimed `running -> resuming` by another controller's
+        // crash-recovery sweep, or already finalized) could still write
+        // 'waiting' and RESURRECT a terminal/claimed execution back into
+        // the active/resumable set. The guard makes the superseded write a
+        // clean no-op. Safe at every call site: each one's `else` branch
+        // calls `mark_execution_completed` (already `status = 'running'`)
+        // on the same row, so the row is provably 'running' here.
+        let res = if self.output_encryption_enabled() {
             // MCP-S2: encrypt_output binds AAD = exec_id so a swap of
             // output_data_enc across rows is detected on read.
             let (key_id, enc_bytes, format_version) = self.encrypt_output(exec_id, output).await?;
@@ -1304,14 +1317,14 @@ impl ExecutionRepository {
                  SET status = 'waiting', output_data = NULL, \
                      output_data_enc = $1, output_enc_key_id = $2, \
                      output_data_format = $3 \
-                 WHERE id = $4",
+                 WHERE id = $4 AND status = 'running'",
             )
             .bind(&enc_bytes)
             .bind(key_id)
             .bind(format_version)
             .bind(exec_id)
             .execute(&self.db_pool)
-            .await?;
+            .await?
         } else {
             // MCP-975 (2026-05-15): same plaintext-fallback DLP fix
             // as the MCP-971/972 sweep (sibling repository's
@@ -1320,12 +1333,24 @@ impl ExecutionRepository {
             // from upstream services; same arbitrary-text class.
             let redacted = talos_dlp_provider::redact_json(output);
             sqlx::query(
-                "UPDATE workflow_executions SET status = 'waiting', output_data = $2 WHERE id = $1",
+                "UPDATE workflow_executions SET status = 'waiting', output_data = $2 \
+                 WHERE id = $1 AND status = 'running'",
             )
             .bind(exec_id)
             .bind(&redacted)
             .execute(&self.db_pool)
-            .await?;
+            .await?
+        };
+        if res.rows_affected() == 0 {
+            // The row was no longer 'running' — already terminal, or claimed
+            // for resume by another controller (split-brain). The suspend is
+            // correctly dropped; surface it so a superseded controller is
+            // observable rather than silently no-op'ing.
+            tracing::warn!(
+                execution_id = %exec_id,
+                "mark_execution_waiting no-op: row not in 'running' (already terminal \
+                 or claimed for crash-recovery resume) — suspend write dropped"
+            );
         }
         Ok(())
     }
