@@ -10,10 +10,13 @@ publish.workspace = true
 aes-gcm = "0.10"
 anyhow.workspace = true
 lru = "0.16"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "reqwest-client", "http-proto"] }
-tonic = "0.12.3"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+# Only the gRPC/tonic exporter is used. `default-features = false` drops otlp's
+# default http-proto + reqwest-blocking-client (opentelemetry-http + reqwest 0.13,
+# a duplicate of the workspace's reqwest 0.12) for an HTTP path we never take.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tonic = "0.14"
 async-nats = "0.47"
 # `default-features = false` drops aws-sdk-s3's legacy `rustls` feature
 # (rustls 0.21 / rustls-webpki 0.101); the retained `default-https-client`

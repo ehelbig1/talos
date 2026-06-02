@@ -344,14 +344,14 @@ use opentelemetry::{
     KeyValue,
 };
 use opentelemetry_otlp::{WithExportConfig, WithTonicConfig};
-use opentelemetry_sdk::{trace::TracerProvider, Resource};
+use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Cache of OTLP Exporters per Tenant
 struct OTLPCache {
-    providers: Mutex<LruCache<Uuid, TracerProvider>>,
+    providers: Mutex<LruCache<Uuid, SdkTracerProvider>>,
 }
 
 impl OTLPCache {
@@ -489,12 +489,18 @@ impl OTLPCache {
             .build()
             .ok()?;
 
-        let provider = TracerProvider::builder()
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-            .with_resource(Resource::new(vec![
-                KeyValue::new("service.name", "talos-audit-stream"),
-                KeyValue::new("tenant.id", user_id.to_string()),
-            ]))
+        // otel 0.28+: runtime-agnostic batch processor (no runtime arg) and
+        // builder-based `Resource` (`Resource::new` was removed).
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                Resource::builder()
+                    .with_attributes(vec![
+                        KeyValue::new("service.name", "talos-audit-stream"),
+                        KeyValue::new("tenant.id", user_id.to_string()),
+                    ])
+                    .build(),
+            )
             .build();
 
         let tracer = provider.tracer("talos-audit-exporter");

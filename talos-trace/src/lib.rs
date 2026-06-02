@@ -39,7 +39,13 @@ use opentelemetry::{
 };
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Retains the SDK tracer provider so `shutdown_tracing` can flush + shut it
+/// down. otel 0.28+ removed `global::shutdown_tracer_provider`, so the handle
+/// must be kept explicitly. Set once at `init_tracing`.
+static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = OnceLock::new();
 
 /// Initialize OpenTelemetry tracing
 /// Sets up the global tracer provider with OTLP exporter (for Jaeger)
@@ -78,7 +84,7 @@ pub fn init_tracing(
 
     // Build tracer provider with OTLP exporter
     use opentelemetry_otlp::SpanExporter;
-    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
 
     let exporter = SpanExporter::builder()
         .with_tonic()
@@ -87,15 +93,24 @@ pub fn init_tracing(
 
     // Sampler configuration omitted for simplicity – defaults to always_on.
 
-    let tracer_provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(Resource::new(vec![
-            KeyValue::new("service.name", service_name.to_string()),
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_string()),
-        ]))
+    // otel 0.28+: the batch span processor is runtime-agnostic (dedicated
+    // background thread), so `with_batch_exporter` no longer takes a runtime
+    // argument; `Resource` is built via the builder (`Resource::new` was removed).
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            Resource::builder()
+                .with_attributes(vec![
+                    KeyValue::new("service.name", service_name.to_string()),
+                    KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_string()),
+                ])
+                .build(),
+        )
         .build();
 
-    // Set as global tracer provider
+    // Set as global tracer provider, retaining a handle so `shutdown_tracing`
+    // can flush + shut it down (otel 0.28+ removed `global::shutdown_tracer_provider`).
+    let _ = TRACER_PROVIDER.set(tracer_provider.clone());
     global::set_tracer_provider(tracer_provider);
 
     println!("[TRACING] ✅ OpenTelemetry tracing initialized successfully");
@@ -108,7 +123,11 @@ pub fn init_tracing(
 /// Call this before application exit to flush remaining traces
 pub fn shutdown_tracing() {
     println!("[TRACING] Shutting down tracing, flushing remaining spans...");
-    global::shutdown_tracer_provider();
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("[TRACING] shutdown error while flushing spans: {e}");
+        }
+    }
     println!("[TRACING] ✅ Tracing shutdown complete");
 }
 

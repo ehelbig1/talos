@@ -8,7 +8,10 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-prometheus = "0.13"
+# 0.14 drops the default `protobuf` (2.x) feature, clearing RUSTSEC-2024-0437.
+# talos-metrics only uses the text-exposition API (Registry/Counter/Opts), so no
+# protobuf feature is needed. Kept in lockstep with controller/worker prometheus 0.14.
+prometheus = "0.14"
 
 [lints]
 workspace = true
