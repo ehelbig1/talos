@@ -249,10 +249,18 @@ impl CheckpointStore for ControllerCheckpointStore {
         // into another and have it decrypt cleanly.
         let (ciphertext, nonce) = encrypt_checkpoint(snapshot, key, execution_id.as_bytes())
             .map_err(|e| -> BoxError { e.into() })?;
+        // Status guard: never write a checkpoint to a TERMINAL execution. The
+        // per-node save is fire-and-forget (`tokio::spawn`), so a save spawned
+        // just before the execution is marked completed/failed/cancelled could
+        // otherwise land afterward and leave stale resume material on a finished
+        // row. Today that's inert only because `load` filters to
+        // `waiting`/`resuming`; this makes the racing save a clean no-op so the
+        // load-side filter isn't the sole protection against resurrecting a
+        // finished execution.
         sqlx::query(
             "UPDATE workflow_executions \
              SET checkpoint_encrypted = $1, checkpoint_nonce = $2 \
-             WHERE id = $3",
+             WHERE id = $3 AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(&ciphertext)
         .bind(&nonce)
