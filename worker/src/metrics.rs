@@ -146,8 +146,6 @@ pub struct RuntimeMetrics {
     cache_hits: Counter<u64>,
     /// Component cache misses
     cache_misses: Counter<u64>,
-    /// Memory usage in bytes
-    memory_used: Gauge<u64>,
     /// Number of active instances
     active_instances: UpDownCounter<i64>,
     /// Total executions counter (cumulative)
@@ -179,14 +177,6 @@ pub struct RuntimeMetrics {
     pub approval_requested: Counter<u64>,
     /// Approval gate decisions by decision (approved, denied)
     pub approval_decided: Counter<u64>,
-
-    /// Messages enqueued to the dead-letter queue
-    pub dlq_enqueued: Counter<u64>,
-
-    /// Duration of state flush operations (milliseconds)
-    pub state_flush_duration: Histogram<f64>,
-    /// Number of keys per state flush
-    pub state_flush_keys: Histogram<f64>,
 
     /// LLM API requests by provider (anthropic, openai, gemini)
     pub llm_requests: Counter<u64>,
@@ -243,11 +233,6 @@ impl RuntimeMetrics {
             cache_misses: meter
                 .u64_counter("wasm.cache.misses")
                 .with_description("Component cache misses")
-                .build(),
-
-            memory_used: meter
-                .u64_gauge("wasm.memory.used_bytes")
-                .with_description("Memory used by WASM instances (bytes)")
                 .build(),
 
             active_instances: meter
@@ -320,20 +305,6 @@ impl RuntimeMetrics {
             approval_decided: meter
                 .u64_counter("wasm.approval.decided")
                 .with_description("Approval gate decisions")
-                .build(),
-
-            dlq_enqueued: meter
-                .u64_counter("wasm.dlq.enqueued")
-                .with_description("Messages enqueued to the dead-letter queue")
-                .build(),
-
-            state_flush_duration: meter
-                .f64_histogram("wasm.state.flush_duration_ms")
-                .with_description("State flush duration in milliseconds")
-                .build(),
-            state_flush_keys: meter
-                .f64_histogram("wasm.state.flush_keys")
-                .with_description("Number of keys per state flush")
                 .build(),
 
             llm_requests: meter
@@ -446,11 +417,6 @@ impl RuntimeMetrics {
         }
     }
 
-    /// Update memory usage gauge
-    pub fn update_memory_usage(&self, bytes: u64) {
-        self.memory_used.record(bytes, &[]);
-    }
-
     // ── New feature metric recording methods ────────────────────────────
 
     /// Record a rate limit exceeded event.
@@ -491,17 +457,6 @@ impl RuntimeMetrics {
         let normalized = normalize_approval_decision(decision);
         self.approval_decided
             .add(1, &[KeyValue::new("decision", normalized)]);
-    }
-
-    /// Record a dead-letter queue enqueue event.
-    pub fn record_dlq_enqueued(&self) {
-        self.dlq_enqueued.add(1, &[]);
-    }
-
-    /// Record a state flush operation with duration and key count.
-    pub fn record_state_flush(&self, duration_ms: f64, key_count: usize) {
-        self.state_flush_duration.record(duration_ms, &[]);
-        self.state_flush_keys.record(key_count as f64, &[]);
     }
 
     /// Record an LLM API request.
