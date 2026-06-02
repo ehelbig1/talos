@@ -113,10 +113,33 @@ pub fn init_tracing(
     let _ = TRACER_PROVIDER.set(tracer_provider.clone());
     global::set_tracer_provider(tracer_provider);
 
+    // Install the W3C TraceContext propagator. Without a registered propagator
+    // the global default is a NO-OP, so `talos_trace_nats::inject_trace_context`
+    // / `extract_trace_context` silently serialise/parse nothing and every
+    // cross-process (NATS) trace link is dropped. Installing it here means both
+    // binaries that call `init_tracing` (controller + worker) propagate the same
+    // `traceparent` wire format. Done after `set_tracer_provider` so the whole
+    // tracing stack is live in one place.
+    global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
+
     println!("[TRACING] ✅ OpenTelemetry tracing initialized successfully");
     println!("[TRACING] Traces will be exported to: {}", endpoint);
 
     Ok(())
+}
+
+/// A concrete SDK tracer from the globally-installed provider, suitable for
+/// building a `tracing_opentelemetry` layer via `.with_tracer(...)`.
+///
+/// Returns `None` if [`init_tracing`] has not installed a provider (e.g. no OTLP
+/// endpoint configured). This accessor exists because the bridge layer requires
+/// a tracer implementing `PreSampledTracer` — the concrete
+/// `opentelemetry_sdk::trace::Tracer` does, but the boxed tracer returned by
+/// `opentelemetry::global::tracer_provider().tracer(..)` does not.
+#[must_use]
+pub fn sdk_tracer(scope: &'static str) -> Option<opentelemetry_sdk::trace::Tracer> {
+    use opentelemetry::trace::TracerProvider as _;
+    TRACER_PROVIDER.get().map(|provider| provider.tracer(scope))
 }
 
 /// Shutdown tracing gracefully

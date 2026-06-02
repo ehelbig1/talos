@@ -12,5 +12,11 @@ opentelemetry = "0.32"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 
+[dev-dependencies]
+# Provides the concrete W3C `TraceContextPropagator` used to exercise the
+# inject/extract round-trip in tests (in production `talos_trace::init_tracing`
+# installs it as the global propagator).
+opentelemetry_sdk = "0.32"
+
 [lints]
 workspace = true
