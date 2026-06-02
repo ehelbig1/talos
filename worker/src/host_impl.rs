@@ -7831,6 +7831,7 @@ impl wit_email::Host for TalosContext {
 // ============================================================================
 
 impl wit_database::Host for TalosContext {
+    #[::tracing::instrument(name = "database.query", skip_all, fields(param_count = params.len()))]
     async fn execute_query(
         &mut self,
         sql: String,
@@ -9230,6 +9231,7 @@ struct AnthropicUsage {
 }
 
 impl wit_llm::Host for TalosContext {
+    #[::tracing::instrument(name = "llm.complete", skip_all)]
     async fn complete(
         &mut self,
         req: wit_llm::CompletionRequest,
@@ -9999,6 +10001,10 @@ fn mem_rpc_prereqs_owned(
 
 /// Dispatch a signed memory-RPC request and wait for the reply. All
 /// arguments are owned so the future is `Send`.
+// Child span under the per-job `job-execution` span (worker otel bridge). Signed
+// RPC to the controller's memory service. `skip_all` keeps the actor's memory
+// payloads out of the span; only the pseudonymous actor_id is recorded.
+#[::tracing::instrument(name = "memory.rpc", skip_all, fields(actor_id = %actor_id))]
 async fn call_memory_op(
     actor_id: uuid::Uuid,
     nats: std::sync::Arc<async_nats::Client>,
@@ -10052,6 +10058,7 @@ fn map_mem_err(e: talos_memory::memory_rpc::MemoryRpcError) -> wit_agent_memory:
 // ============================================================================
 
 impl wit_graph_memory::Host for TalosContext {
+    #[::tracing::instrument(name = "graph.search", skip_all, fields(max_depth = max_depth, limit = limit))]
     async fn graph_search(
         &mut self,
         query: String,
@@ -11326,6 +11333,7 @@ impl wit_object_storage::Host for TalosContext {
 // ============================================================================
 
 impl wit_llm_tools::Host for TalosContext {
+    #[::tracing::instrument(name = "llm.complete_with_tools", skip_all)]
     async fn complete_with_tools(
         &mut self,
         req: wit_llm_tools::ToolCompletionRequest,
