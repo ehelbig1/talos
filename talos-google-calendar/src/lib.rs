@@ -35,7 +35,7 @@ pub struct GoogleCalendarIntegration {
 }
 
 /// Watch channel for a calendar
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WatchChannel {
     pub id: Uuid,
     pub integration_id: Uuid,
@@ -50,6 +50,29 @@ pub struct WatchChannel {
     pub module_id: Option<Uuid>, // WASM module to execute when webhook arrives
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+// Custom Debug so a stray `{:?}` never prints `verification_token` — the
+// X-Goog-Channel-Token shared secret used to authenticate inbound Google
+// Calendar webhooks. The Serialize impl (DB/API round-trips) is unaffected.
+impl std::fmt::Debug for WatchChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchChannel")
+            .field("id", &self.id)
+            .field("integration_id", &self.integration_id)
+            .field("calendar_id", &self.calendar_id)
+            .field("channel_id", &self.channel_id)
+            .field("resource_id", &self.resource_id)
+            .field("webhook_url", &self.webhook_url)
+            .field("expiration", &self.expiration)
+            .field("sync_token", &self.sync_token)
+            .field("verification_token", &"[REDACTED]")
+            .field("is_active", &self.is_active)
+            .field("module_id", &self.module_id)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// Service for managing Google Calendar integrations
