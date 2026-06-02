@@ -163,6 +163,20 @@ mod tests {
     }
 
     #[test]
+    fn documentation_ranges_are_treated_as_public() {
+        // RFC-5737 documentation ranges (192.0.2/24, 198.51.100/24,
+        // 203.0.113/24) are reserved-UNASSIGNED, not internal/private — a
+        // connection to one just fails to route, it can't reach an internal
+        // service. So they are deliberately NOT SSRF targets, consistent with
+        // talos_http_utils::ssrf and the WIT-http gate. (The worker's WASI
+        // socket check used to block them as the lone divergence; consolidating
+        // it onto this classifier removed that inconsistency — pin it here.)
+        assert!(classify_private_ip(ip("192.0.2.1")).is_none());
+        assert!(classify_private_ip(ip("198.51.100.42")).is_none());
+        assert!(classify_private_ip(ip("203.0.113.5")).is_none());
+    }
+
+    #[test]
     fn rejects_v4_private_ranges() {
         for s in [
             "127.0.0.1",
