@@ -156,6 +156,32 @@ ok "Services: ${SERVICES[*]}"
 ok "Platform: ${PLATFORM}"
 echo
 
+# ── RustSec advisory pre-flight ───────────────────────────────────────
+# A vulnerable dependency reaching production is the real harm `cargo audit`
+# prevents, and the publish step is the last point before it ships. This is the
+# same advisory scan `make audit` (cargo-deny) and lint check 36 run; surfacing
+# it HERE catches a vulnerable dep — or a freshly-published advisory against an
+# existing one (e.g. RUSTSEC-2026-0149 in wasmtime, fixed 2026-06-01) — at the
+# ship boundary. WARN-only by default to honour the operator-responsibility
+# model (the dirty-tree check above warns rather than blocks). Set
+# TALOS_PUBLISH_REQUIRE_AUDIT=1 to make a vulnerability abort the publish.
+if command -v cargo-audit >/dev/null 2>&1; then
+    if cargo audit >/dev/null 2>&1; then
+        ok "cargo audit: no RustSec advisories"
+    elif [ "${TALOS_PUBLISH_REQUIRE_AUDIT:-0}" = "1" ]; then
+        die "cargo audit found a vulnerable dependency (TALOS_PUBLISH_REQUIRE_AUDIT=1). \
+Run \`cargo audit\` for details; fix or downgrade before publishing."
+    else
+        warn "cargo audit found a vulnerable dependency — building/pushing anyway."
+        warn "  Run \`cargo audit\` for the advisory + fixed-version range, or set"
+        warn "  TALOS_PUBLISH_REQUIRE_AUDIT=1 to make this abort the publish."
+    fi
+else
+    warn "cargo-audit not installed — skipping the RustSec advisory pre-flight."
+    warn "  Install: cargo install cargo-audit --locked (or run \`make audit\`)."
+fi
+echo
+
 # ── Build ─────────────────────────────────────────────────────────────
 log "Building ${#SERVICES[@]} image(s) for ${PLATFORM}"
 
