@@ -332,13 +332,29 @@ impl ParallelWorkflowEngine {
                 continue;
             }
             if let Some(cnt) = pending.get_mut(&child) {
-                *cnt -= 1;
+                // Guard the decrement: under early-ready join modes the counter
+                // may already be 0 when a parent completes (see the removal note
+                // below), and an unguarded `*cnt -= 1` on 0 underflows — a panic
+                // in debug, a wrap to usize::MAX in release.
+                if *cnt > 0 {
+                    *cnt -= 1;
+                }
 
                 // FanIn early-ready logic: some join modes don't
                 // require ALL parents to complete.
                 self.apply_fan_in_early_ready(child, pending);
 
                 if pending.get(&child).copied().unwrap_or(1) == 0 {
+                    // The join is satisfied — this child's fate is decided
+                    // exactly once here. Remove its `pending` entry so a parent
+                    // that completes LATER (possible under the `Any`/`N`/
+                    // `Majority` join modes, which zero the counter before every
+                    // parent finishes) can't re-enter this block: without the
+                    // removal that late parent would underflow the counter and
+                    // re-enqueue the child, double-dispatching its entire
+                    // downstream subgraph. Termination keys on `ready`/`executing`,
+                    // not `pending`, so early removal is safe.
+                    pending.remove(&child);
                     // Check edge conditions before enqueuing.
                     let child_node_id = self.graph[child];
                     let mut condition_failed = false;

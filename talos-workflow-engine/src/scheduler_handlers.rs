@@ -100,10 +100,17 @@ impl ParallelWorkflowEngine {
     ) {
         for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
             if let Some(cnt) = pending.get_mut(&child) {
-                if *cnt > 0 {
+                let was_positive = *cnt > 0;
+                if was_positive {
                     *cnt -= 1;
                 }
-                if *cnt == 0 {
+                // Enqueue only on the TRANSITION to zero, and remove the entry so
+                // a parent completing later (possible under early-ready fan-in)
+                // can't re-enter and double-enqueue this child. Mirrors the
+                // removal in `handle_node_success`. Pre-fix, an unconditional
+                // `if *cnt == 0` re-enqueued a child whose counter was already 0.
+                if was_positive && *cnt == 0 {
+                    pending.remove(&child);
                     ready.push_back(child);
                 }
             }

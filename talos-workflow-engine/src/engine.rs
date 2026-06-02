@@ -4116,7 +4116,10 @@ impl ParallelWorkflowEngine {
             .neighbors_directed(child, Direction::Incoming)
             .count();
         let cnt = *pending.get(&child).unwrap_or(&0);
-        let completed_parents = total_parents - cnt;
+        // `saturating_sub`: defence-in-depth against a stale/underflowed counter
+        // so the completed-parent count can never wrap (the removal in
+        // `handle_node_success` is the primary guard).
+        let completed_parents = total_parents.saturating_sub(cnt);
         match join_mode {
             JoinMode::Any => {
                 if cnt > 0 {
