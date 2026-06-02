@@ -223,18 +223,32 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(endpoint) = jaeger_endpoint.as_ref() {
         match crate::trace::init_tracing("talos-controller", Some(endpoint)) {
-            Ok(_) => {
-                println!("      Tracing initialized (endpoint: {})", endpoint);
-                tracing_subscriber::fmt::init();
-            }
+            Ok(_) => println!("      Tracing initialized (endpoint: {})", endpoint),
             Err(e) => {
                 eprintln!("Warning: Failed to initialize tracing: {}", e);
                 eprintln!("    Continuing without tracing...");
-                tracing_subscriber::fmt::init();
             }
         }
-    } else {
-        tracing_subscriber::fmt::init();
+    }
+
+    // Install the log/trace subscriber. The `fmt` layer preserves the previous
+    // console output (RUST_LOG via EnvFilter, default `info`). The optional
+    // OpenTelemetry bridge layer converts controller `tracing` spans into OTLP
+    // spans AND — crucially — makes `tracing::Span::current().context()` carry a
+    // real otel SpanContext, which is what `inject_trace_context` propagates into
+    // worker job NATS headers. The bridge is present only when `init_tracing`
+    // installed an SDK provider (OTLP endpoint configured); otherwise this is a
+    // plain fmt subscriber, identical to before.
+    {
+        use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let otel_layer = crate::trace::sdk_tracer("talos-controller")
+            .map(|tracer| tracing_opentelemetry::layer().with_tracer(tracer));
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer())
+            .with(otel_layer)
+            .init();
     }
 
     // ---------------------------------------------------------------------

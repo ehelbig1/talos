@@ -68,3 +68,77 @@ pub fn extract_trace_context(headers: &async_nats::HeaderMap) -> opentelemetry::
     let extractor = NatsHeaderExtractor::new(headers);
     opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::propagation::TextMapPropagator;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
+    use opentelemetry::Context;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+    fn known_remote_context(trace_id: TraceId) -> Context {
+        let sc = SpanContext::new(
+            trace_id,
+            SpanId::from_hex("b7ad6b7169203331").unwrap(),
+            TraceFlags::SAMPLED,
+            true, // remote
+            TraceState::default(),
+        );
+        Context::new().with_remote_span_context(sc)
+    }
+
+    /// The W3C `traceparent` must survive an inject → NATS-header → extract
+    /// round-trip once the propagator is installed. This is what
+    /// `talos_trace::init_tracing` wires up globally; without the propagator the
+    /// global default is a no-op and the header is never written, which silently
+    /// breaks controller→worker trace continuity.
+    #[test]
+    fn traceparent_round_trips_over_nats_headers() {
+        let propagator = TraceContextPropagator::new();
+        let trace_id = TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap();
+
+        // Inject a known context into NATS headers via our Injector.
+        let mut headers = async_nats::HeaderMap::new();
+        propagator.inject_context(
+            &known_remote_context(trace_id),
+            &mut NatsHeaderInjector::new(&mut headers),
+        );
+        assert!(
+            headers.get("traceparent").is_some(),
+            "traceparent header must be injected into the NATS HeaderMap"
+        );
+
+        // Extract it back via our Extractor and confirm the trace_id survived.
+        let extracted = propagator.extract(&NatsHeaderExtractor::new(&headers));
+        assert_eq!(
+            extracted.span().span_context().trace_id(),
+            trace_id,
+            "extracted trace_id must match the injected one"
+        );
+    }
+
+    /// `extract_trace_context` (the worker-side consume path) must read the
+    /// traceparent when the global propagator is installed — pinning the
+    /// behaviour the worker relies on to link job spans to the controller trace.
+    #[test]
+    fn extract_trace_context_reads_traceparent_with_global_propagator() {
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let trace_id = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        let mut headers = async_nats::HeaderMap::new();
+        TraceContextPropagator::new().inject_context(
+            &known_remote_context(trace_id),
+            &mut NatsHeaderInjector::new(&mut headers),
+        );
+
+        let cx = extract_trace_context(&headers);
+        assert_eq!(
+            cx.span().span_context().trace_id(),
+            trace_id,
+            "extract_trace_context must recover the propagated trace_id"
+        );
+    }
+}
