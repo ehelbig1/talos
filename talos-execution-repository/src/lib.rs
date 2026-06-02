@@ -1720,6 +1720,10 @@ impl ExecutionRepository {
             );
             return Ok(None);
         }
+        // `epoch = epoch + 1` fences the original controller (F4): if it was
+        // alive-but-slow, the epoch it holds (the pre-claim value) no longer
+        // matches the row, so its fence heartbeat sees the mismatch and aborts.
+        // The bumped value is returned so the resumer can heartbeat against it.
         let row = sqlx::query_as::<_, StuckExecutionForResume>(
             "WITH claimed AS ( \
                  SELECT id FROM workflow_executions \
@@ -1730,10 +1734,10 @@ impl ExecutionRepository {
                  FOR UPDATE SKIP LOCKED \
              ) \
              UPDATE workflow_executions e \
-             SET status = 'resuming', updated_at = NOW() \
+             SET status = 'resuming', updated_at = NOW(), epoch = e.epoch + 1 \
              FROM claimed c \
              WHERE e.id = c.id AND e.status = 'running' \
-             RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, \
+             RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, e.epoch, \
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
                        (SELECT w.graph_json FROM workflows w WHERE w.id = e.workflow_id) \
@@ -1762,6 +1766,20 @@ impl ExecutionRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Read the current ownership `epoch` for an execution, or `None` if the
+    /// row is gone. The fence heartbeat polls this: when the value moves past
+    /// the epoch the running controller holds, that controller has been
+    /// superseded (another claim/reclaim bumped it) and must abort. Cheap
+    /// single-column primary-key lookup.
+    pub async fn current_execution_epoch(&self, id: Uuid) -> Result<Option<i64>> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT epoch FROM workflow_executions WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
     /// Reclaim executions wedged in `resuming` (a replica crashed *during*
     /// recovery, before the engine took over). Older than `grace_minutes` →
     /// `failed`, so they never get stuck. Run once at startup before the main
@@ -1775,11 +1793,15 @@ impl ExecutionRepository {
             );
             return Ok(0);
         }
+        // `epoch = epoch + 1` fences a resumer that itself went slow: when this
+        // reclaim fails its `resuming` row, the bump invalidates the epoch that
+        // resumer holds, so its fence heartbeat sees the mismatch and aborts
+        // rather than continuing to drive a now-`failed` row.
         let result = sqlx::query(
             "UPDATE workflow_executions \
              SET status = 'failed', \
                  error_message = 'resume interrupted (controller restarted during recovery)', \
-                 completed_at = NOW() \
+                 completed_at = NOW(), epoch = epoch + 1 \
              WHERE status = 'resuming' \
                AND updated_at < NOW() - make_interval(mins => $1::int)",
         )
@@ -2498,6 +2520,10 @@ pub struct StuckExecutionForResume {
     pub checkpoint_data: Option<serde_json::Value>,
     /// The actor that originally triggered this execution (NULL = anonymous).
     pub actor_id: Option<Uuid>,
+    /// The ownership epoch AFTER this claim's `epoch + 1` bump. The resumer
+    /// heartbeats against this value; if the DB epoch later moves past it
+    /// (another claim/reclaim), the resumer has been superseded and aborts.
+    pub epoch: i64,
     /// The workflow's bound default actor — fallback when `actor_id` is
     /// NULL (LEFT-JOINed; NULL if the workflow row was deleted between
     /// trigger and resume).

@@ -1,8 +1,46 @@
 # Split-brain fencing design (crash-recovery durability, F4)
 
-Status: **design** — the cheap, unambiguous guards are landed; the epoch fence
-below is the remaining work. This doc is the implementation plan so the next
-pass doesn't have to re-derive the threat model.
+Status: **epoch fence landed for the resume path; fresh-run-path heartbeat is the
+remaining wiring.** The cheap unambiguous guards (terminal-write status guards,
+#148 monotonic checkpoint seq) shipped first; the `epoch` ownership token, the
+claim/reclaim bump, and the heartbeat-abort wired into the crash-recovery resume
+path shipped next (this doc's "The fence" section, steps 1–4 + 5-on-resume). The
+remaining work is extending the heartbeat to the **fresh-run** dispatch paths so
+a superseded *original* controller also stops dispatching (its terminal write is
+already fenced by `status = 'running'`; only its continued node dispatch is not).
+
+## Implemented (steps 1–4 + resume-path step 5)
+
+- `workflow_executions.epoch BIGINT NOT NULL DEFAULT 0` (migration
+  `20260602140000`).
+- `claim_stuck_execution_for_resume` sets `epoch = epoch + 1` and RETURNs it on
+  `StuckExecutionForResume.epoch`; `reclaim_orphaned_resuming` bumps too.
+- `ExecutionRepository::current_execution_epoch(id)` — the heartbeat's poll read.
+- `talos_engine::fence::run_with_seed_fenced(...)` — sets the engine's
+  `CancellationToken`, spawns `epoch_fence_heartbeat` (polls every 10 s, cancels
+  on epoch-advance / row-vanish), runs the seed path, reaps the heartbeat.
+  `was_fenced(&err)` lets `crash_recovery::resume_one` skip the terminal-fail on
+  a fenced abort (the row belongs to its new owner). Outcome counted as `fenced`
+  on `talos_crash_recovery_total`.
+- Integration test `claim_and_reclaim_bump_epoch` (DB-gated): fresh = 0, claim
+  bumps 0→1 and returns it, `current_execution_epoch` reads it, reclaim bumps
+  1→2.
+
+## Remaining (fresh-run-path heartbeat)
+
+Wrap the fresh-run engine dispatch (the `trigger.rs` / scheduler / GraphQL
+trigger / webhook paths) in the same fence with `my_epoch = 0`, so a superseded
+*original* controller (whose row was just claimed → epoch 1) aborts promptly
+instead of dispatching duplicate nodes until it naturally finishes. Use the same
+`run_with_*_fenced` shape; the only new input each site needs is the pool (it
+already has it) and the constant epoch 0. Lower urgency than the resume path
+because the original's terminal write is already `status='running'`-fenced — this
+only bounds duplicate side effects, which the at-least-once contract (F2) already
+tells authors to make idempotent.
+
+---
+
+The original threat model and rationale follow.
 
 ## Threat
 
