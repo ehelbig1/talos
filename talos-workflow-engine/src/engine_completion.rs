@@ -290,9 +290,17 @@ impl ParallelWorkflowEngine {
                         .map(|(k, v)| (k.to_string(), v.clone()))
                         .collect(),
                 );
+                // The snapshot's cardinality (count of completed nodes) is the
+                // monotonic sequence number: it only grows over the execution's
+                // life and continues across a resume (the resumed engine seeds
+                // `results` from the loaded checkpoint). The store drops a save
+                // whose seq is below the stored one, so a reordered stale write
+                // can't clobber newer resume material. `as i64` is safe — node
+                // counts are far below i64::MAX.
+                let seq = results.len() as i64;
                 let store = cp.store.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = store.save(execution_id, &snapshot).await {
+                    if let Err(e) = store.save(execution_id, &snapshot, seq).await {
                         tracing::warn!(
                             %execution_id,
                             error = %e,

@@ -39,5 +39,21 @@ pub trait CheckpointStore: Send + Sync {
     /// back. Impls that encrypt at rest (reference implementations
     /// typically do, with AES-256-GCM) own the key material and never
     /// expose it through this trait.
-    async fn save(&self, execution_id: Uuid, snapshot: &JsonValue) -> Result<(), BoxError>;
+    ///
+    /// `seq` is a per-execution monotonically-increasing sequence number
+    /// (the executor passes the cardinality of the snapshot — i.e. the
+    /// count of completed nodes, which only grows over an execution's
+    /// lifetime and continues across a resume boundary). Saves race:
+    /// each node completion spawns an independent write, so a write
+    /// carrying an *older* (smaller) `seq` can land after a *newer* one.
+    /// Impls MUST drop a save whose `seq` is strictly less than the seq
+    /// already stored, so a reordered stale snapshot can never clobber a
+    /// newer one and lose resume progress. Equal `seq` is idempotent
+    /// (same node set ⇒ same snapshot).
+    async fn save(
+        &self,
+        execution_id: Uuid,
+        snapshot: &JsonValue,
+        seq: i64,
+    ) -> Result<(), BoxError>;
 }
