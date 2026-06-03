@@ -26,17 +26,37 @@ already fenced by `status = 'running'`; only its continued node dispatch is not)
   bumps 0→1 and returns it, `current_execution_epoch` reads it, reclaim bumps
   1→2.
 
-## Remaining (fresh-run-path heartbeat)
+## Remaining (fresh-run-path heartbeat) — needs a performance-aware design
 
-Wrap the fresh-run engine dispatch (the `trigger.rs` / scheduler / GraphQL
-trigger / webhook paths) in the same fence with `my_epoch = 0`, so a superseded
-*original* controller (whose row was just claimed → epoch 1) aborts promptly
-instead of dispatching duplicate nodes until it naturally finishes. Use the same
-`run_with_*_fenced` shape; the only new input each site needs is the pool (it
-already has it) and the constant epoch 0. Lower urgency than the resume path
-because the original's terminal write is already `status='running'`-fenced — this
-only bounds duplicate side effects, which the at-least-once contract (F2) already
-tells authors to make idempotent.
+Goal: a superseded *original* controller (whose row was just claimed → epoch 1)
+aborts promptly instead of dispatching duplicate nodes until it naturally
+finishes. Lower urgency than the resume path because the original's terminal
+write is already `status='running'`-fenced — this only bounds duplicate side
+effects, which the at-least-once contract (F2) already tells authors to make
+idempotent.
+
+**Do NOT just wrap every fresh run in `run_with_seed_fenced`.** The resume
+heartbeat is cheap because resumes are rare; fresh runs are EVERY execution. A
+naive per-execution 10s epoch poll adds one DB round-trip per execution per 10s
+across the whole platform — a real throughput/DB-load regression for the common
+case, to defend against a rare rolling-deploy collision window. That trade is
+backwards. Pick a design that doesn't poll on the hot path:
+
+- **LISTEN/NOTIFY**: the claim/reclaim fires `pg_notify('execution_fenced', id)`;
+  each running controller holds one `LISTEN` connection and cancels the matching
+  in-flight engine on notify. One shared connection, zero per-execution polling.
+- **Threshold-gated**: only attach the heartbeat to runs whose expected duration
+  exceeds the stale window (the only ones a sweep can reclaim mid-flight). Short
+  runs — the overwhelming majority — finish well inside the window and can never
+  be reclaimed, so they need no fence.
+- **Claim-time check only**: cheapest — accept that the original keeps dispatching
+  until it finishes, and rely solely on the already-landed terminal-write status
+  guards (no continued-dispatch fence at all). Document the residual duplicate-
+  dispatch exposure as covered by F2 idempotency. This may be the right answer:
+  the continued-dispatch fence might not be worth ANY hot-path cost.
+
+Decide which (or none) before wiring — the resume-path `run_with_seed_fenced`
+poll is acceptable only because resumes are rare.
 
 ---
 
