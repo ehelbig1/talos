@@ -657,7 +657,7 @@ async fn run_single_workflow_chain(
         // that forgets to redact doesn't open a leak.
         let redacted = talos_dlp_provider::redact_str(&err_msg);
         if let Err(db_err) = sqlx::query(
-            "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $1 WHERE id = $2"
+            "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $1 WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
         )
         .bind(&redacted)
         .bind(execution_id)
@@ -707,7 +707,7 @@ async fn run_single_workflow_chain(
             // uses redact_json above (line ~475).
             let redacted = talos_dlp_provider::redact_str(&e.to_string());
             if let Err(db_err) = sqlx::query(
-                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $1 WHERE id = $2"
+                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $1 WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
             )
             .bind(&redacted)
             .bind(execution_id)

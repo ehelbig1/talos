@@ -1269,7 +1269,7 @@ impl ActorRepository {
     /// Mark a running execution as failed with a fixed 'NATS client not available' message.
     pub async fn fail_execution_nats_unavailable(&self, exec_id: Uuid) -> Result<()> {
         sqlx::query(
-            "UPDATE workflow_executions SET status = 'failed', error_message = 'NATS client not available', completed_at = NOW() WHERE id = $1",
+            "UPDATE workflow_executions SET status = 'failed', error_message = 'NATS client not available', completed_at = NOW() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
         )
         .bind(exec_id)
         .execute(&self.db_pool)

@@ -1858,7 +1858,7 @@ impl WebhookRouter {
                 // never moved past queued and no log signal explaining
                 // why. Same operator-visibility class as MCP-733..742.
                 if let Err(db_err) = sqlx::query(
-                    "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1",
+                    "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
                 )
                 .bind(execution_id)
                 .bind(format!("Failed to load graph: {}", redacted))
@@ -2002,7 +2002,7 @@ impl WebhookRouter {
                     // otherwise be stuck in 'queued' even though the
                     // caller saw 500 + the redacted error in the body.
                     if let Err(db_err) = sqlx::query(
-                        "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1",
+                        "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
                     )
                     .bind(execution_id)
                     .bind(&err_msg)
@@ -2055,7 +2055,7 @@ impl WebhookRouter {
                     // explanation, indistinguishable from a stuck
                     // dispatcher.
                     if let Err(db_err) = sqlx::query(
-                        "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1",
+                        "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
                     )
                     .bind(execution_id)
                     .bind(&err_msg)
