@@ -939,16 +939,32 @@ impl WorkflowsMutations {
             }
         }
 
-        // 2. Update status to 'pending' to allow resumption
-        sqlx::query("UPDATE workflow_executions SET status = 'pending' WHERE id = $1")
-            .bind(execution_id)
-            .execute(&db_pool)
-            .await
-            .map_err(|e: sqlx::Error| {
-                // Added type annotation
-                tracing::error!("Failed to update execution status: {}", e);
-                async_graphql::Error::new("Failed to resume execution").extend_safe()
-            })?;
+        // 2. Atomically flip 'waiting' → 'pending'. The status check in step 1
+        //    reads a NON-locking `fetch_optional`, so it is advisory only — this
+        //    write is the authoritative gate via `AND status = 'waiting'`.
+        //    Without it (bare `WHERE id = $1`) two concurrent resume_workflow
+        //    calls both pass the step-1 check and both write 'pending' + both
+        //    spawn a resumption task — the advisory lock below can't prevent the
+        //    double-spawn because it's acquired INSIDE the spawned task, AFTER
+        //    this write — and a row that left 'waiting' between the read and here
+        //    (a completion landing, another resume) would be RESURRECTED from a
+        //    terminal state. `rows_affected() == 0` ⇒ no longer resumable; bail
+        //    before spawning.
+        let resume_flip =
+            sqlx::query("UPDATE workflow_executions SET status = 'pending' WHERE id = $1 AND status = 'waiting'")
+                .bind(execution_id)
+                .execute(&db_pool)
+                .await
+                .map_err(|e: sqlx::Error| {
+                    tracing::error!("Failed to update execution status: {}", e);
+                    async_graphql::Error::new("Failed to resume execution").extend_safe()
+                })?;
+        if resume_flip.rows_affected() == 0 {
+            return Err(async_graphql::Error::new(
+                "Execution is no longer resumable (its status changed since it was checked)",
+            )
+            .extend_safe());
+        }
 
         // 3. Spawn background resumption (similar to trigger_workflow)
         let user_id = *user_id;
