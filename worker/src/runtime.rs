@@ -2431,10 +2431,23 @@ impl TalosRuntime {
         // for Wizer-snapshotted sandbox modules that have lost embedded WIT world-name strings.
         let cap = capability_world;
         // Only specific worlds are granted raw WASI network access (TCP/UDP sockets).
-        let allow_wasi_network = matches!(
-            cap,
-            CapabilityWorld::Network | CapabilityWorld::Database | CapabilityWorld::Trusted
-        );
+        //
+        // SECURITY (tier-1 egress ceiling): a tier-1 actor ("data must not leave
+        // the host") is NEVER granted raw sockets. The `socket_addr_check` SSRF
+        // gate already blocks private/loopback/link-local IPs, so a raw socket can
+        // only reach PUBLIC hosts — which for a tier-1 actor IS the off-host data
+        // egress the ceiling forbids, and which the five HTTP/GraphQL/webhook/stream
+        // host-fn paths all deny via `tier1_egress_deny_reason`. Raw `wasi:sockets`
+        // bypass BOTH the per-module `allowed_hosts` list AND the host-fn tier gate,
+        // so without this a tier-1 `network-node`/`database`/`trusted` module could
+        // exfiltrate to any public IP over raw TCP. There is no legitimate tier-1
+        // raw-socket use: local Ollama goes through the native `llm::*` path, and
+        // loopback/private targets are SSRF-blocked regardless.
+        let allow_wasi_network =
+            matches!(
+                cap,
+                CapabilityWorld::Network | CapabilityWorld::Database | CapabilityWorld::Trusted
+            ) && !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1);
 
         // Select the correct linker + cache for this tier.
         let (linker, cache) = self.select_tier(&cap)?;
@@ -3124,8 +3137,13 @@ impl TalosRuntime {
             // Inspect capability world → tiered linker + cache.
             let cap = crate::wit_inspector::inspect_component(&step.wasm_bytes).capability_world;
             // All worlds except Minimal and Unknown allow outbound network access.
+            // Tier-1 actors get NO raw sockets — same egress-ceiling rationale as
+            // the main `execute_job` path: raw `wasi:sockets` bypass both
+            // `allowed_hosts` and the host-fn tier gate, so a privacy-ceiled actor
+            // could otherwise exfiltrate to any public IP over raw TCP.
             let allow_wasi_network =
-                !matches!(cap, CapabilityWorld::Minimal | CapabilityWorld::Unknown);
+                !matches!(cap, CapabilityWorld::Minimal | CapabilityWorld::Unknown)
+                    && !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1);
             let (linker, cache) = self.select_tier(&cap)?;
 
             // Get or compile InstancePre.

@@ -12486,14 +12486,20 @@ impl wit_resource_quotas::Host for TalosContext {
             return Err(wit_resource_quotas::Error::NotConfigured);
         }
         let entry = store.entry(metric.clone()).or_insert((0, 0));
-        // If a limit is set (> 0), enforce it.
-        if entry.1 > 0 && entry.0 + amount > entry.1 {
+        // If a limit is set (> 0), enforce it. `saturating_add` on the
+        // guest-supplied `amount`: an unchecked `+` panics in debug (poisoning
+        // this per-execution Mutex → aborting the run) and silently wraps in
+        // release (a wrong self-reported counter) when a guest passes a value
+        // near u64::MAX. Saturating to u64::MAX is correct here — it still trips
+        // the `> entry.1` limit. Sibling of the MCP-1007/1008 integer-overflow
+        // hardening; blast radius is self-only (per-execution quota map).
+        if entry.1 > 0 && entry.0.saturating_add(amount) > entry.1 {
             if let Some(ref m) = self.metrics {
                 m.record_quota_exceeded(&metric);
             }
             return Err(wit_resource_quotas::Error::QuotaExceeded);
         }
-        entry.0 += amount;
+        entry.0 = entry.0.saturating_add(amount);
         Ok(wit_resource_quotas::UsageInfo {
             metric,
             used: entry.0,
