@@ -274,9 +274,34 @@ const PATTERN_SPECS: &[(&str, &str)] = &[
         "[REDACTED:CARD]",
     ),
     // Bearer / API key header values  (Bearer xyz, token=xyz, api_key=xyz)
+    //
+    // 2026-06-03: optional `"?` around the keyword/separator so the JSON-object
+    // form — `"api_key":"<value>"`, the DOMINANT shape in workflow outputs — is
+    // covered, not just the header/env form. Pre-fix, a generic token WITHOUT a
+    // distinctive prefix (e.g. `{"api_key":"a1b2c3d4e5f6..."}`) slipped this
+    // rule entirely (the closing quote after the key broke the `[=:\s]` match)
+    // and, lacking an `sk-`/`ghp_`/… prefix, matched no other rule either —
+    // persisting to the DB unredacted. The value charset excludes `"`, so the
+    // closing quote bounds the match; the optional quotes add JSON coverage
+    // without broadening the value (no new false-positive surface).
     (
-        r"(?i)(?:bearer|token|api[_-]?key)\s*[=:\s]\s*[A-Za-z0-9\-._~+/]{8,}",
+        r#"(?i)(?:bearer|token|api[_-]?key)"?\s*[=:\s]\s*"?[A-Za-z0-9\-._~+/]{8,}"#,
         "[REDACTED:TOKEN]",
+    ),
+    // Password / client-secret assignments  (password=…, "client_secret":"…")
+    //
+    // 2026-06-03: separate from the token rule because it REQUIRES an `=`/`:`
+    // separator (NOT bare whitespace). `password` precedes English prose far
+    // more often than `bearer`/`token` do — allowing a whitespace separator
+    // here would over-redact "password protected", "password requirements",
+    // etc. The `[=:]` anchor restricts matches to actual assignments
+    // (`password=hunter2`, `password: hunter2`, `"client_secret":"…"`). The
+    // optional `"?` around the separator covers the JSON-object form. `pwd` is
+    // the common abbreviation; `client_secret` is the OAuth-flow credential
+    // that the callback paths handle.
+    (
+        r#"(?i)(?:password|passwd|pwd|client[_-]?secret)"?\s*[=:]\s*"?[A-Za-z0-9\-._~+/!@#$%^&*]{6,}"#,
+        "[REDACTED:SECRET]",
     ),
     // Google API keys  AIza + 35 alphanumeric chars
     (r"\bAIza[0-9A-Za-z\-_]{35}\b", "[REDACTED:GOOGLE_API_KEY]"),
@@ -367,6 +392,25 @@ const PATTERN_SPECS: &[(&str, &str)] = &[
     // followed by ANY non-word char (newline, space, quote, `=`,
     // comma) still matches.
     (r"\bA[KS]IA[0-9A-Z]{16}\b", "[REDACTED:AWS_ACCESS_KEY]"),
+    // AWS SECRET access key (the 40-char secret half). MCP-521 added the
+    // access-key ID (AKIA…, the public half) above; the secret — the half that
+    // actually grants access — is an unprefixed 40-char base64 string, which
+    // cannot be matched bare without massive false positives (hashes, base64
+    // blobs). Anchor on the keyword instead, mirroring the card "Pattern B"
+    // approach: `aws_secret_access_key = <40 base64>` (and the JSON form). The
+    // `{40}` is exact — AWS secret keys are always exactly 40 chars.
+    (
+        r#"(?i)aws_?secret_?access_?key"?\s*[=:]\s*"?[A-Za-z0-9/+]{40}"#,
+        "[REDACTED:AWS_SECRET_KEY]",
+    ),
+    // Azure Storage account key / connection-string secret. The
+    // `AccountKey=<base64>` component of a `DefaultEndpointsProtocol=…;
+    // AccountKey=…;` connection string is a full credential. Keyword-anchored
+    // (`AccountKey=`) so the 40+ base64 value can't false-positive on prose.
+    (
+        r"(?i)AccountKey\s*=\s*[A-Za-z0-9+/]{40,}={0,2}",
+        "[REDACTED:AZURE_KEY]",
+    ),
     // Database connection URLs with embedded credentials.
     // Matches postgresql://, postgres://, mysql://, mongodb://, mongodb+srv:// etc.
     // where a user:password@ component is present.
@@ -926,6 +970,10 @@ mod tests {
             "call 800-555-1234 now",
             "ssn 123-45-6789 on file",
             "talos_sk_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+            r#"{"api_key":"a1b2c3d4e5f6g7h8i9j0"}"#,
+            "password=Hunter2Horse!",
+            "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz==",
         ];
         for input in inputs {
             let via_set = PATTERN_SET.is_match(input);
@@ -1072,6 +1120,72 @@ mod tests {
         // must NOT match (no false positive).
         assert_eq!(redact_str("attachment list"), "attachment list");
         assert_eq!(redact_str("the attribute value"), "the attribute value");
+    }
+
+    #[test]
+    fn redacts_generic_token_in_json_form() {
+        // 2026-06-03: the JSON-object form — the dominant shape in workflow
+        // outputs — must be redacted even when the value has no distinctive
+        // prefix (so no other rule would catch it).
+        let json = r#"{"api_key":"a1b2c3d4e5f6g7h8i9j0"}"#;
+        let out = redact_str(json);
+        assert!(out.contains("[REDACTED:TOKEN]"), "got: {out}");
+        assert!(!out.contains("a1b2c3d4e5f6"), "raw token survived: {out}");
+        // The header/env forms still work.
+        assert!(redact_str("api_key=a1b2c3d4e5f6g7h8").contains("[REDACTED:TOKEN]"));
+        assert!(redact_str("Authorization: Bearer abcdefgh12345678").contains("[REDACTED:TOKEN]"));
+    }
+
+    #[test]
+    fn redacts_password_and_client_secret_assignments() {
+        // Assignment forms (=, :, JSON) must redact.
+        assert!(redact_str("password=Hunter2Horse!").contains("[REDACTED:SECRET]"));
+        assert!(redact_str("pwd: s3cr3tValue99").contains("[REDACTED:SECRET]"));
+        assert!(
+            redact_str(r#"{"client_secret":"oauthSecretABC123"}"#).contains("[REDACTED:SECRET]")
+        );
+        assert!(!redact_str("password=Hunter2Horse!").contains("Hunter2Horse"));
+    }
+
+    #[test]
+    fn password_prose_is_not_over_redacted() {
+        // The `[=:]` anchor (no bare-whitespace separator) must NOT redact
+        // common English prose that merely follows the word "password".
+        assert_eq!(
+            redact_str("password protected document"),
+            "password protected document"
+        );
+        assert_eq!(
+            redact_str("review the password requirements"),
+            "review the password requirements"
+        );
+        assert_eq!(
+            redact_str("your password incorrect again"),
+            "your password incorrect again"
+        );
+    }
+
+    #[test]
+    fn redacts_aws_secret_access_key() {
+        // The 40-char secret half (MCP-521 covered only the AKIA… public half).
+        let s = "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        assert!(redact_str(s).contains("[REDACTED:AWS_SECRET_KEY]"));
+        assert!(!redact_str(s).contains("wJalrXUtnFEMI"));
+        assert!(redact_str(
+            r#"{"aws_secret_access_key":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}"#
+        )
+        .contains("[REDACTED:AWS_SECRET_KEY]"));
+    }
+
+    #[test]
+    fn redacts_azure_account_key() {
+        let s = "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;";
+        let out = redact_str(s);
+        assert!(out.contains("[REDACTED:AZURE_KEY]"), "got: {out}");
+        assert!(
+            !out.contains("Eby8vdM02xNOcqF"),
+            "raw Azure key survived: {out}"
+        );
     }
 
     #[test]
