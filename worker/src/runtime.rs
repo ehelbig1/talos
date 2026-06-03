@@ -2908,6 +2908,9 @@ impl TalosRuntime {
         // Inspect capability world so we use the correct tiered linker + cache.
         let cap = crate::wit_inspector::inspect_component(wasm_bytes).capability_world;
         // Only specific worlds are granted raw WASI network access (TCP/UDP sockets).
+        // allow-wasi-network-no-tier: run_sandbox / test_module path — operator-invoked,
+        // actor-less, runs Tier2-default (no max_llm_tier param). Not a tier-1 actor
+        // execution path; raw sockets are still SSRF-gated by socket_addr_check.
         let allow_wasi_network = matches!(
             cap,
             CapabilityWorld::Network | CapabilityWorld::Database | CapabilityWorld::Trusted
@@ -3863,6 +3866,10 @@ impl TalosRuntime {
                 Ok(component) => {
                     tracing::info!("AOT: Using pre-compiled module");
                     // All worlds except Minimal and Unknown allow outbound network access.
+                    // allow-wasi-network-no-tier: execute_hybrid is dead code (zero callers)
+                    // routing through the tier-blind execute_component_internal (Tier2-default).
+                    // If ever wired into a tier-bearing path, thread max_llm_tier through and
+                    // remove this marker so the tier-1 raw-socket gate applies.
                     let allow_wasi_network =
                         !matches!(cap, CapabilityWorld::Minimal | CapabilityWorld::Unknown);
                     return self
