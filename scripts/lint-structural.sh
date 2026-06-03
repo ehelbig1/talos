@@ -2719,6 +2719,69 @@ else
 fi
 echo
 
+# ── 38. allow_wasi_network grants must gate on the tier-1 egress ceiling ──
+bold "▶ check 38: allow_wasi_network grants must gate on max_llm_tier (tier-1 egress)"
+
+# The tier-1 data-egress ceiling (tier1 = local Ollama only, "data must not leave
+# the host") is enforced on the five HTTP/GraphQL/webhook/stream host-fn paths.
+# Raw `wasi:sockets` are a PARALLEL egress channel that bypasses BOTH the
+# per-module `allowed_hosts` list AND those host-fn tier gates — `socket_addr_check`
+# blocks only private IPs (anti-SSRF), not egress — so granting raw network to a
+# tier-1 actor lets it exfiltrate to any public IP over raw TCP. PR #156 fixed the
+# live execute_job / execute_pipeline paths by adding
+# `&& !matches!(max_llm_tier, ...LlmTier::Tier1)` to the `allow_wasi_network` grant.
+# This freezes it: every `allow_wasi_network = ...` grant must reference
+# `max_llm_tier`, or carry an `allow-wasi-network-no-tier:` opt-out within 5 lines
+# above (the Tier2-default sandbox / test / dead-code paths that have no actor tier
+# param — run_sandbox, test_module, execute_hybrid).
+
+WASI_TIER_VIOLATIONS=0
+if [ -n "$RG_BIN" ]; then
+    wn_matches=$("$RG_BIN" -n --no-heading -g '*.rs' \
+        -e 'allow_wasi_network[[:space:]]*=' worker/ 2>/dev/null || true)
+else
+    wn_matches=$(grep -rnE --include='*.rs' 'allow_wasi_network[[:space:]]*=' worker/ 2>/dev/null || true)
+fi
+
+if [ -n "$wn_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Skip comment lines and equality comparisons (not assignments).
+        if echo "$body" | grep -qE '^[[:space:]]*//|=='; then
+            continue
+        fi
+        # Read the assignment block (match line through the terminating ';').
+        end=$((lineno + 8))
+        block=$(sed -n "${lineno},${end}p" "$file" 2>/dev/null | awk '{print} /;/{exit}')
+        if echo "$block" | grep -q 'max_llm_tier'; then
+            continue
+        fi
+        # Opt-out marker within 5 lines above (or inside the block).
+        start=$((lineno > 5 ? lineno - 5 : 1))
+        ctx=$(sed -n "${start},${end}p" "$file" 2>/dev/null || true)
+        if echo "$ctx" | grep -q 'allow-wasi-network-no-tier'; then
+            continue
+        fi
+        printf '  %s\n' "$line"
+        WASI_TIER_VIOLATIONS=$((WASI_TIER_VIOLATIONS + 1))
+    done <<< "$wn_matches"
+fi
+
+if [ "$WASI_TIER_VIOLATIONS" -gt 0 ]; then
+    red "✗ $WASI_TIER_VIOLATIONS allow_wasi_network grant(s) that ignore max_llm_tier"
+    yellow "  → a tier-1 actor granted raw wasi:sockets bypasses allowed_hosts AND the host-fn"
+    yellow "    tier gate and can exfiltrate to any public IP (see PR #156). Add"
+    yellow "    \`&& !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1)\`."
+    yellow "  → or // allow-wasi-network-no-tier: <reason> for a Tier2-default actor-less path."
+    EXIT_CODE=1
+else
+    green "✓ all allow_wasi_network grants gate on the tier-1 egress ceiling"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
