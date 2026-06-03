@@ -5717,8 +5717,21 @@ async fn graphql_handler(
 ) -> GraphQLResponse {
     let mut req = req.into_inner();
 
-    // Extract IP address
-    let ip_address = Some(addr.ip().to_string());
+    // Extract the REAL client IP via the RFC-7239 trusted-proxy walk — NOT the
+    // raw socket peer. Behind the chart's nginx frontend, `addr.ip()` is the
+    // proxy pod IP for every request; using it here collapses ALL login/signup/
+    // refresh/2FA traffic onto a single shared auth-limiter bucket (the auth
+    // limiter is a hardcoded 5/min keyed on this `ip_address`), so 6 attempts a
+    // minute from anywhere would 429 the entire platform's login surface — a
+    // trivial unauthenticated DoS — and every audit-log row would record the
+    // proxy IP instead of the attacker. Mirrors the MCP-1097 fix in
+    // `mcp_auth_middleware`. `extract_client_ip` rejects XFF spoofing and, when
+    // the peer is NOT a trusted proxy (direct-connection deploys), returns the
+    // peer IP unchanged — so this is regression-free outside a proxy topology.
+    static TRUSTED_PROXIES: std::sync::LazyLock<rate_limit::TrustedProxies> =
+        std::sync::LazyLock::new(rate_limit::TrustedProxies::from_env);
+    let ip_address =
+        Some(rate_limit::extract_client_ip(addr.ip(), &headers, &TRUSTED_PROXIES).to_string());
 
     // Extract user agent
     let user_agent = headers
