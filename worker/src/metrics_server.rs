@@ -287,7 +287,22 @@ fn validate_bearer_token(auth_header: Option<&str>) -> bool {
             if token.is_empty() {
                 return false;
             }
-            return allowed_tokens.contains(token);
+            // Constant-time membership test. `HashSet::contains` hashes the
+            // input and byte-compares against the matching bucket — timing-
+            // variable, leaking partial-match information about the operator
+            // token (`METRICS_AUTH_TOKENS` has no enforced entropy floor, so it
+            // may be guessable). OR-accumulate `ct_eq` over the whole set with
+            // NO early exit, so the comparison time depends only on the
+            // (non-secret) set size — matching the `subtle::ConstantTimeEq`
+            // discipline the controller already uses for its admin / Prometheus
+            // scrape secrets. `ct_eq` returns `Choice(0)` on length mismatch and
+            // runs constant-time over equal-length contents.
+            use subtle::ConstantTimeEq;
+            let mut matched = subtle::Choice::from(0u8);
+            for allowed in allowed_tokens.iter() {
+                matched |= allowed.as_bytes().ct_eq(token.as_bytes());
+            }
+            return bool::from(matched);
         }
     }
 
@@ -568,5 +583,23 @@ mod tests {
         let result = validate_bearer_token(Some("Bearer    "));
         std::env::remove_var("METRICS_AUTH_TOKENS");
         assert!(!result, "whitespace-only bearer must not authenticate");
+    }
+
+    #[test]
+    fn wrong_non_empty_token_does_not_authenticate() {
+        let _g = env_var_lock();
+        // Pins the constant-time membership loop directly: a NON-EMPTY token
+        // that isn't in the set bypasses the empty/whitespace short-circuits
+        // and must be rejected by the `ct_eq` accumulation (a loop bug that
+        // ignored content would slip past the existing empty-token tests).
+        std::env::set_var("METRICS_AUTH_TOKENS", "correct-token-abc123");
+        let wrong = validate_bearer_token(Some("Bearer wrong-token-xyz789"));
+        let right = validate_bearer_token(Some("Bearer correct-token-abc123"));
+        // A token sharing a prefix with the real one must also be rejected.
+        let prefix = validate_bearer_token(Some("Bearer correct-token-abc"));
+        std::env::remove_var("METRICS_AUTH_TOKENS");
+        assert!(!wrong, "a non-matching token must not authenticate");
+        assert!(right, "the configured token must authenticate");
+        assert!(!prefix, "a prefix of the real token must not authenticate");
     }
 }
