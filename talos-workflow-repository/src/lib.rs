@@ -1677,7 +1677,18 @@ impl WorkflowRepository {
         // MCP-1204: bound the optional output before both branches —
         // sibling to mark_execution_failed above.
         let bounded_output = output.map(bound_execution_payload);
-        let output: Option<&serde_json::Value> = bounded_output.as_ref().map(|c| c.as_ref());
+        // Redact the output ONCE, up front, so BOTH branches store the scrubbed
+        // value. The encrypted branch previously fed `output` straight to
+        // `maybe_encrypt_execution_output` with no `redact_json` — contradicting
+        // this method's own docstring — so a secret-bearing output was encrypted
+        // UNREDACTED and decrypted back to clients on read. Encryption-at-rest
+        // is not a substitute for DLP (it protects a DB dump, not the
+        // decrypt-on-read path). This method currently has no callers; the fix
+        // keeps the latent path honest before one is added.
+        let redacted_output: Option<serde_json::Value> = bounded_output
+            .as_ref()
+            .map(|c| talos_dlp_provider::redact_json(c.as_ref()));
+        let output: Option<&serde_json::Value> = redacted_output.as_ref();
         let encrypted = match (self.secrets_manager.as_ref(), output) {
             (Some(_), Some(out)) => {
                 self.maybe_encrypt_execution_output(execution_id, out)
@@ -1711,7 +1722,7 @@ impl WorkflowRepository {
             .execute(&self.db_pool)
             .await?;
         } else {
-            let redacted_output = output.map(talos_dlp_provider::redact_json);
+            // `output` is already DLP-redacted above (shared by both branches).
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = $1, output_data = $2, \
@@ -1720,7 +1731,7 @@ impl WorkflowRepository {
                  WHERE id = $4 AND status = 'running'",
             )
             .bind(status)
-            .bind(redacted_output.as_ref())
+            .bind(output)
             .bind(redacted_error.as_deref())
             .bind(execution_id)
             .execute(&self.db_pool)

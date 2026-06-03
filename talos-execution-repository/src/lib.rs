@@ -1500,7 +1500,15 @@ impl ExecutionRepository {
                         user_id: r.user_id,
                         status: "failed".to_string(),
                         started_at: r.started_at.to_rfc3339(),
-                        error_message: Some(error.to_string()),
+                        // Broadcast the SAME DLP-redacted+truncated string the DB
+                        // row stores (`redacted_error`, computed above), NOT the
+                        // raw `error`. This event flows to the `workflow_execution_updates`
+                        // GraphQL subscription, so a raw engine error echoing an
+                        // upstream `Bearer`/`sk-`/… token would leak to subscribers
+                        // even though the persisted row is clean. Keeping the live
+                        // channel in lockstep with the persisted row is the same
+                        // discipline as MCP-1011's `scrub_wasm_log_for_broadcast`.
+                        error_message: Some(redacted_error.clone()),
                     });
                 }
             }
