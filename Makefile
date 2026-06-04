@@ -24,7 +24,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help up down rebuild restart logs ps shell \
-        check build lint test test-integration coverage-html audit check-catalog ci \
+        check build lint hooks test test-integration coverage-html audit check-catalog ci \
         drill clean nuke _wait-healthy
 
 ## ──── Dev ──────────────────────────────────────────────────────────
@@ -91,6 +91,13 @@ lint: ## Rustfmt + WIT drift + structural rules + clippy (--no-deps, -D warnings
 	@cargo fmt --all -- --check
 	@printf '▶ structural lints (incl. clippy --workspace --no-deps -D warnings)\n'
 	@TALOS_LINT_CLIPPY=1 bash scripts/lint-structural.sh
+
+hooks: ## Install git hooks (.githooks) — activates pre-commit + pre-push gates
+	@git config core.hooksPath .githooks
+	@printf '\033[1;32m✓ git hooks installed\033[0m (core.hooksPath=.githooks)\n'
+	@printf '  pre-commit: secret/migration/compile checks (every commit)\n'
+	@printf '  pre-push:   make lint — fmt + structural + clippy -D warnings (every push)\n'
+	@printf '  bypass a push gate in an emergency with: git push --no-verify\n'
 
 test: ## Run the full test suite with cargo-nextest (fast local)
 	@command -v cargo-nextest >/dev/null 2>&1 \

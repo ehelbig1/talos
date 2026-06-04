@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Pre-push gate — runs `make lint` so the CI-parity quality gates can't
+# silently regress between manual runs.
+#
+# `make lint` covers: rustfmt --check, WIT drift, the 40 structural lints,
+# and `cargo clippy --workspace --no-deps -- -D warnings` (TALOS_LINT_CLIPPY=1).
+# It is the single source of truth for "the gate" — this hook deliberately
+# does NOT re-spell the checks so it can't drift from `make lint`.
+#
+# Why pre-push (not pre-commit): a cold clippy build is 60-90s. Running it on
+# every commit is too heavy; running it once before a push is the right
+# trade-off. The existing `.githooks/pre-commit` keeps the fast checks
+# (secret/migration/compile) on every commit.
+#
+# Install with `make hooks` (sets core.hooksPath=.githooks).
+# Emergency bypass for a WIP/docs push: `git push --no-verify`,
+# or `SKIP_LINT=1 git push`.
+set -euo pipefail
+
+if [ "${SKIP_LINT:-0}" = "1" ]; then
+    echo "pre-push: SKIP_LINT=1 set — skipping the make lint gate."
+    exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+echo "pre-push: running 'make lint' (CI-parity gate; bypass with --no-verify)…"
+if ! make -C "$repo_root" lint; then
+    echo
+    echo "✗ pre-push: 'make lint' failed — push blocked."
+    echo "  Fix the reported issues, or for an emergency push bypass with:"
+    echo "      git push --no-verify"
+    exit 1
+fi
