@@ -12,10 +12,12 @@
 //!   for any URL that originated from caller input — webhooks, approval
 //!   notifications, SLA alerts. Write-time validation alone leaves a
 //!   gap when SSRF rules tighten between write and fire.
-//!
-//! All three are re-exported at the crate root so existing call sites
-//! continue to resolve through thin shims.
+//! * [`outbound`] — SSRF-safe outbound reqwest client builder. The
+//!   connect-time DNS-rebinding resolver that complements the call-time
+//!   [`ssrf`] check; every controller outbound-webhook fire site builds
+//!   its client here so the resolver is reachable from every crate.
 
+pub mod outbound;
 pub mod request_id;
 pub mod sanitization;
 pub mod ssrf;

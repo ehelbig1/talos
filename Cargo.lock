@@ -7864,6 +7864,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "regex",
+ "reqwest 0.12.28",
  "talos-ssrf-classify",
  "tokio",
  "tower",
