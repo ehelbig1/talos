@@ -827,9 +827,34 @@ fn strip_scheme(url: &str) -> &str {
 }
 
 fn client_protocol_for(url: &str) -> ClientProtocol {
-    if url.starts_with("http://") {
+    if !url.starts_with("http://") {
+        return ClientProtocol::Https;
+    }
+    // Plaintext `http://` is permitted ONLY for a local/in-cluster registry AND
+    // only outside production — mirroring the worker's OCI-fetch prod guard
+    // (worker/src/main.rs). A non-local plaintext catalog sync is MITM-able: a
+    // network attacker could serve a forged `_index` / template name→tag map
+    // that the controller persists into the modules table. (It can't lead to
+    // unverified WASM EXECUTION — the worker re-verifies digest + Sigstore over
+    // HTTPS at run time — but the controller must not trust a plaintext channel.)
+    // For a non-local or production `http://` URL we force HTTPS so the sync
+    // fails loudly against a plaintext registry rather than downgrading.
+    let authority = strip_scheme(url).split('/').next().unwrap_or("");
+    let hostname = authority.split(':').next().unwrap_or("");
+    let is_local = hostname == "localhost"
+        || hostname == "127.0.0.1"
+        || authority.starts_with("registry:5000");
+    if is_local && !talos_config::is_production() {
         ClientProtocol::Http
     } else {
+        tracing::warn!(
+            target: "talos_audit",
+            authority = %authority,
+            is_production = talos_config::is_production(),
+            "OCI registry sync: refusing HTTP downgrade (non-local registry, or production) — \
+             forcing HTTPS. A plaintext sync from a non-local registry is MITM-able. \
+             Set TALOS_REGISTRY_URL to an https:// endpoint."
+        );
         ClientProtocol::Https
     }
 }
@@ -930,6 +955,24 @@ mod tests {
             client_protocol_for("https://ghcr.io"),
             ClientProtocol::Https
         ));
+    }
+
+    #[test]
+    fn client_protocol_refuses_nonlocal_http_downgrade() {
+        // A NON-local plaintext registry is MITM-able → forced to HTTPS
+        // regardless of environment (is_local is false, so the prod check is
+        // moot). Mirrors the worker's OCI-fetch guard.
+        for url in [
+            "http://evil.example.com/v2",
+            "http://ghcr.io",
+            "http://localhostevil.com:5000", // NOT localhost — must not match
+            "http://127.0.0.1.evil.com:5000",
+        ] {
+            assert!(
+                matches!(client_protocol_for(url), ClientProtocol::Https),
+                "non-local http must be forced to HTTPS: {url}"
+            );
+        }
     }
 
     #[test]
