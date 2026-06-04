@@ -664,7 +664,7 @@ impl SchedulerService {
                 // Same class as MCP-743 (talos-webhooks). WARN with
                 // `target: "talos_audit"` for dashboard alerting.
                 if let Err(ue) = sqlx::query(
-                    "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1",
+                    "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
                 )
                 .bind(execution_id)
                 .bind(format!("Execution timed out after {} seconds", timeout_secs))
@@ -1029,7 +1029,7 @@ async fn run_scheduled_execution(
             tracing::error!(execution_id = %execution_id, "{}", error_msg);
             // MCP-776 (2026-05-13): see timeout-arm above.
             if let Err(ue) = sqlx::query(
-                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1",
+                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
             )
             .bind(execution_id)
             .bind(&error_msg)
@@ -1200,7 +1200,7 @@ async fn run_scheduled_execution(
             let error_msg = format!("Scheduled workflow failed: {}", redacted_err);
             // MCP-776 (2026-05-13): see timeout-arm earlier in this function.
             if let Err(ue) = sqlx::query(
-                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1",
+                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
             )
             .bind(execution_id)
             .bind(&error_msg)

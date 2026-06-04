@@ -457,7 +457,7 @@ impl WorkflowsMutations {
                             tracing::error!(execution_id = %execution_id, "Failed to load workflow: {}", e);
                             let error_msg = "Workflow execution failed".to_string();
                             if let Err(db_err) = sqlx::query(
-                                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1"
+                                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
                             )
                             .bind(execution_id)
                             .bind(&error_msg)
@@ -545,7 +545,7 @@ impl WorkflowsMutations {
                     tracing::error!(execution_id = %execution_id, "Failed to build engine: {}", e);
                     let error_msg = "Workflow execution failed".to_string();
                     if let Err(db_err) = sqlx::query(
-                        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1"
+                        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
                     )
                     .bind(execution_id)
                     .bind(&error_msg)
@@ -604,7 +604,7 @@ impl WorkflowsMutations {
                                 "Workflow output exceeds 50 MB limit"
                             );
                             if let Err(e) = sqlx::query(
-                                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1"
+                                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
                             )
                             .bind(execution_id)
                             .bind("Workflow output exceeds size limit")
@@ -697,7 +697,7 @@ impl WorkflowsMutations {
                     let redacted_e = talos_dlp_provider::redact_str(&e.to_string());
                     let error_msg = format!("Workflow failed: {}", redacted_e);
                     if let Err(db_err) = sqlx::query(
-                        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1"
+                        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
                     )
                     .bind(execution_id)
                     .bind(&error_msg)
@@ -1137,7 +1137,7 @@ impl WorkflowsMutations {
                         "resume_workflow: failed to load pinned workflow_version_id — refusing to fall back to draft graph (would drift execution topology)"
                     );
                     if let Err(db_err) = sqlx::query(
-                        "UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1"
+                        "UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
                     )
                     .bind(execution_id)
                     .bind("Workflow execution failed")
@@ -1169,7 +1169,7 @@ impl WorkflowsMutations {
                             Ok(w) => w.graph_json,
                             Err(e) => {
                                 tracing::error!(execution_id = %execution_id, "Failed to load workflow: {}", e);
-                                if let Err(db_err) = sqlx::query("UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1")
+                                if let Err(db_err) = sqlx::query("UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')")
                                     .bind(execution_id).bind("Workflow execution failed").execute(&db_pool).await {
                                     tracing::error!(
                                         execution_id = %execution_id,
@@ -1197,7 +1197,7 @@ impl WorkflowsMutations {
                             Ok(w) => w.graph_json,
                             Err(e) => {
                                 tracing::error!(execution_id = %execution_id, "Failed to load workflow: {}", e);
-                                if let Err(db_err) = sqlx::query("UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1")
+                                if let Err(db_err) = sqlx::query("UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')")
                                     .bind(execution_id).bind("Workflow execution failed").execute(&db_pool).await {
                                     tracing::error!(
                                         execution_id = %execution_id,
@@ -1236,7 +1236,7 @@ impl WorkflowsMutations {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!(execution_id = %execution_id, "Failed to build engine for resume: {}", e);
-                    if let Err(db_err) = sqlx::query("UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1")
+                    if let Err(db_err) = sqlx::query("UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')")
                         .bind(execution_id).bind("Workflow execution failed").execute(&db_pool).await {
                         tracing::error!(
                             execution_id = %execution_id,
@@ -1354,7 +1354,7 @@ impl WorkflowsMutations {
                     // bind path on the resume side.
                     let redacted_e = talos_dlp_provider::redact_str(&e.to_string());
                     let error_msg = format!("Resumed workflow failed: {}", redacted_e);
-                    if let Err(db_err) = sqlx::query("UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1")
+                    if let Err(db_err) = sqlx::query("UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')")
                         .bind(execution_id).bind(&error_msg).execute(&db_pool).await {
                         tracing::error!(
                             execution_id = %execution_id,

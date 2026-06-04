@@ -1921,7 +1921,7 @@ impl AdvancedRepository {
         sqlx::query(
             "UPDATE workflow_executions \
              SET status = 'failed', error_message = $1, completed_at = NOW() \
-             WHERE id = $2",
+             WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
         )
         .bind(&redacted_error)
         .bind(exec_id)
