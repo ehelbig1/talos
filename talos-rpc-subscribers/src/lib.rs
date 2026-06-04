@@ -123,6 +123,28 @@ fn controller_side_denied_function(stmt: &sqlparser::ast::Statement) -> Option<S
     }
 }
 
+/// Controller-side fail-closed allow-list mirroring the worker's posture:
+/// permit ONLY the data statements a database node legitimately issues
+/// (SELECT / INSERT / UPDATE / DELETE / MERGE). Everything else — DDL
+/// (CREATE/DROP/ALTER/TRUNCATE/GRANT/REVOKE), ATTACH, CALL, and any NEW
+/// sqlparser `Statement` variant — returns false and is rejected before
+/// execution. The blocked_label + function deny-lists are DENY lists (a
+/// statement they don't name falls through and runs on the controller's
+/// full-privilege pool); this is the fail-closed complement that catches a
+/// compromised worker bypassing its own `is_ddl`/`UNKNOWN` gate.
+///
+/// EXPLAIN is intentionally NOT permitted (stricter than the worker, which
+/// always allows it): `EXPLAIN ANALYZE <stmt>` EXECUTES its inner statement
+/// (e.g. `EXPLAIN ANALYZE CREATE TABLE … AS SELECT` runs the CTAS), so
+/// admitting it would reopen the DDL/mutation bypass this gate closes.
+fn controller_permits_data_statement(stmt: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::Statement as S;
+    matches!(
+        stmt,
+        S::Query(_) | S::Insert(_) | S::Update { .. } | S::Delete(_) | S::Merge { .. }
+    )
+}
+
 /// Wasm-security review 2026-05-22 (MEDIUM-2): resolve the operator-
 /// configured guest role for per-query `SET LOCAL ROLE`.
 ///
@@ -1527,6 +1549,52 @@ pub fn spawn_database_rpc_subscriber(
                         );
                         return;
                     }
+
+                    // Fail-closed allow-list — the worker's posture, mirrored.
+                    // The blocked_label + function deny-lists above are DENY
+                    // lists: a DDL statement (DROP / ALTER … DISABLE ROW LEVEL
+                    // SECURITY / GRANT / REVOKE / TRUNCATE / CREATE), an
+                    // ATTACH/CALL, or ANY new sqlparser variant falls through
+                    // them as `None` and would reach `execute_guest_query` on
+                    // the controller's full-privilege pool. The worker's
+                    // `is_ddl` + fail-closed `UNKNOWN` gate is the only fence
+                    // today; a COMPROMISED worker (the entire reason this
+                    // handler re-validates) that skipped it could run arbitrary
+                    // DDL — DROP a table, disable RLS, GRANT privileges. Permit
+                    // ONLY the data statements a database node legitimately
+                    // issues; reject everything else.
+                    //
+                    // EXPLAIN is deliberately EXCLUDED (stricter than the
+                    // worker, which always permits it): `EXPLAIN ANALYZE <stmt>`
+                    // EXECUTES its inner statement (e.g. `EXPLAIN ANALYZE CREATE
+                    // TABLE … AS SELECT` runs the CTAS), so admitting Explain
+                    // here would reopen the DDL/mutation bypass this gate
+                    // closes. DML is admitted: the per-actor
+                    // `allowed_sql_operations` allowlist isn't on the RPC wire,
+                    // and the `talos_guest` role grant is its privilege fence.
+                    if !controller_permits_data_statement(&stmts[0]) {
+                        tracing::warn!(
+                            target: "talos_rpc",
+                            event_kind = "database_rpc_statement_not_permitted",
+                            actor_id = %req.actor_id,
+                            "database RPC: rejecting non-data statement (DDL / CALL / ATTACH / \
+                             EXPLAIN / unknown) — possible worker bypass (worker should already \
+                             have refused)"
+                        );
+                        send(Err(DatabaseRpcError::InvalidQuery(
+                            "only data statements (SELECT/INSERT/UPDATE/DELETE/MERGE) are permitted"
+                                .to_string(),
+                        )))
+                        .await;
+                        record_rpc_metric(
+                            SUBJECT_DATABASE_QUERY,
+                            req.actor_id,
+                            "statement_not_permitted",
+                            start.elapsed().as_millis() as u64,
+                            0,
+                        );
+                        return;
+                    }
                 }
 
                 let _permit = sem.acquire_owned().await;
@@ -2243,6 +2311,69 @@ mod helper_tests {
 // for a function, the controller-side mirror is the next gate; tests here
 // pin that the mirror catches the cases the worker is documented to catch.
 // ============================================================================
+#[cfg(test)]
+mod controller_statement_allowlist_tests {
+    use super::controller_permits_data_statement;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse1(sql: &str) -> sqlparser::ast::Statement {
+        let mut s = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .unwrap_or_else(|e| panic!("parse failed for `{sql}`: {e}"));
+        s.pop().unwrap()
+    }
+
+    #[test]
+    fn data_statements_are_permitted() {
+        for sql in [
+            "SELECT * FROM t WHERE id = $1",
+            "INSERT INTO t (a) VALUES ($1)",
+            "UPDATE t SET a = $1 WHERE id = $2",
+            "DELETE FROM t WHERE id = $1",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+        ] {
+            assert!(
+                controller_permits_data_statement(&parse1(sql)),
+                "should permit: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn ddl_and_escalation_statements_are_rejected() {
+        // The compromised-worker class: these fall through the deny-lists and
+        // would run on the controller's full-privilege pool without this gate.
+        for sql in [
+            "DROP TABLE secrets",
+            "ALTER TABLE actor_memory DISABLE ROW LEVEL SECURITY",
+            "GRANT ALL ON ALL TABLES IN SCHEMA public TO PUBLIC",
+            "REVOKE SELECT ON t FROM PUBLIC",
+            "TRUNCATE workflow_executions",
+            "CREATE TABLE x (a int)",
+            "CREATE TABLE x AS SELECT * FROM secrets",
+        ] {
+            assert!(
+                !controller_permits_data_statement(&parse1(sql)),
+                "should reject: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_is_rejected_to_block_analyze_execution() {
+        // EXPLAIN ANALYZE executes its inner statement (CTAS / DML), so the
+        // controller is deliberately stricter than the worker and rejects all
+        // EXPLAIN forms.
+        assert!(!controller_permits_data_statement(&parse1(
+            "EXPLAIN SELECT 1"
+        )));
+        assert!(!controller_permits_data_statement(&parse1(
+            "EXPLAIN ANALYZE DELETE FROM t"
+        )));
+    }
+}
+
 #[cfg(test)]
 mod controller_function_deny_tests {
     use super::controller_side_denied_function;
