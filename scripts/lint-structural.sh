@@ -2846,6 +2846,55 @@ else
 fi
 echo
 
+# ── 40. SSRF-checked outbound URLs must use the shared safe HTTP client ──
+bold "▶ check 40: SSRF-checked outbound URLs must use the shared safe HTTP client"
+
+# A file that calls `check_outbound_url_no_ssrf` is BY DEFINITION firing a
+# user/operator-supplied outbound URL, so it MUST build its reqwest client via
+# `talos_http_utils::outbound::build_outbound_webhook_client[_with_timeout]` —
+# which installs the connect-time ControllerSsrfResolver that closes the
+# DNS-rebinding TOCTOU the call-time check CANNOT (PR #162: an attacker
+# controlling the host's DNS returns a public IP at validation, a
+# private/metadata IP at connect). A raw `reqwest::Client::builder()`/`::new()`
+# in such a file is the regression shape (the gap that hit A2A / approval-gate /
+# failure-webhook / policy-notify / SLA-monitor across 6 sites). Fixed-provider
+# clients (LLM / Slack / OAuth / Vault — platform-fixed hosts) never call
+# check_outbound_url_no_ssrf, so they are not flagged. Opt-out
+# `// allow-raw-reqwest-ssrf-checked: <reason>` within 4 lines above (a
+# non-webhook fixed-host client that happens to share a file with the check).
+
+SSRF_CLIENT_VIOLATIONS=0
+ssrf_files=$(grep -rlE "check_outbound_url_no_ssrf" --include='*.rs' talos-* controller 2>/dev/null \
+    | grep -vE '/tests/|talos-http-utils/' || true)
+for f in $ssrf_files; do
+    [ -f "$f" ] || continue
+    while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        lineno=$(echo "$m" | cut -d: -f1)
+        body=$(echo "$m" | cut -d: -f2-)
+        # Skip comment-line references (e.g. a `// … reqwest::Client::builder() …`
+        # explanatory comment is not a real client construction).
+        echo "$body" | grep -qE '^[[:space:]]*//' && continue
+        # Opt-out within 4 lines above.
+        start=$((lineno > 4 ? lineno - 4 : 1))
+        ctx=$(sed -n "${start},${lineno}p" "$f" 2>/dev/null || true)
+        echo "$ctx" | grep -q 'allow-raw-reqwest-ssrf-checked' && continue
+        printf '  %s:%s\n' "$f" "$lineno"
+        SSRF_CLIENT_VIOLATIONS=$((SSRF_CLIENT_VIOLATIONS + 1))
+    done <<< "$(grep -nE 'reqwest::Client::(builder|new)\(\)' "$f" 2>/dev/null)"
+done
+
+if [ "$SSRF_CLIENT_VIOLATIONS" -gt 0 ]; then
+    red "✗ $SSRF_CLIENT_VIOLATIONS raw reqwest client(s) in a file that SSRF-checks an outbound URL"
+    yellow "  → build via talos_http_utils::outbound::build_outbound_webhook_client[_with_timeout]"
+    yellow "    so the client gets the connect-time ControllerSsrfResolver (DNS-rebinding gate, PR #162)."
+    yellow "  → or // allow-raw-reqwest-ssrf-checked: <reason> for a fixed-host client sharing the file."
+    EXIT_CODE=1
+else
+    green "✓ outbound clients for SSRF-checked URLs all use the shared safe builder"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
