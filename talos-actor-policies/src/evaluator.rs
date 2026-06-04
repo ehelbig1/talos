@@ -157,12 +157,17 @@ impl PolicyEvaluator {
         // value (MCP-1034 sweep). Same sibling-drift class as the rest
         // of MCP-1034 — three sites slipped through that sweep
         // (this one, talos-engine/approval_gate, talos-graph-rag).
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("reqwest client build — no custom TLS config");
+        // Built via the shared SSRF-safe builder: redirect(none) + the
+        // connect-time ControllerSsrfResolver. The `notification_webhook`
+        // (operator env `TALOS_POLICY_NOTIFICATION_WEBHOOK`) is SSRF-checked at
+        // construction above, but that call-time check can't stop DNS rebinding
+        // — exactly the gap PR #162 closed for the sibling A2A / approval-gate /
+        // failure-webhook fire sites. This site shipped a plain client for the
+        // same root cause (the resolver was unreachable from this crate before
+        // it was hoisted into talos-http-utils).
+        let http =
+            talos_http_utils::outbound::build_outbound_webhook_client("talos-policy-webhook/1.0")
+                .expect("reqwest client build — no custom TLS config");
 
         Arc::new(Self {
             pool,

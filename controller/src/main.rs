@@ -2619,12 +2619,16 @@ async fn main() -> anyhow::Result<()> {
                                                                                        // MCP-1034: explicit connect_timeout (2s on 5s budget) so a
                                                                                        // black-holed SLA-webhook endpoint fails on connect rather than
                                                                                        // burning the whole loop tick.
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .connect_timeout(std::time::Duration::from_secs(2))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("SLA monitor: failed to build HTTP client with no-redirect policy");
+                                                                                       // Built via the shared SSRF-safe builder: redirect(none) + the
+                                                                                       // connect-time ControllerSsrfResolver. The SLA-alert webhook URL is
+                                                                                       // user/workflow-supplied (SLA threshold config) and SSRF-checked at fire
+                                                                                       // time, but that call-time check can't stop DNS rebinding — the same gap
+                                                                                       // PR #162 closed for the sibling fire sites.
+        let http_client = talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
+            "talos-sla-webhook/1.0",
+            std::time::Duration::from_secs(5),
+        )
+        .expect("SLA monitor: failed to build HTTP client with no-redirect policy");
         let analytics_repo = analytics_repository::AnalyticsRepository::new(sla_pool.clone());
 
         loop {
@@ -4508,12 +4512,12 @@ async fn main() -> anyhow::Result<()> {
                                                                                        // the SSRF re-check load-bearing.
                                                                                        // MCP-1034: explicit connect_timeout — fast-fail on black-holed
                                                                                        // SLA-alert endpoint.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("SLA monitor: failed to build hardened reqwest client");
+                                                                                       // Built via the shared SSRF-safe builder (redirect(none) + connect-time
+                                                                                       // ControllerSsrfResolver) — same user-supplied SLA-webhook + DNS-rebinding
+                                                                                       // rationale as the sibling SLA-monitor client above (PR #162).
+        let client =
+            talos_http_utils::outbound::build_outbound_webhook_client("talos-sla-webhook/1.0")
+                .expect("SLA monitor: failed to build hardened reqwest client");
         loop {
             let should_proceed = tokio::select! {
                 _ = interval.tick() => true,
