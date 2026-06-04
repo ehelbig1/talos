@@ -64,6 +64,19 @@ const MAX_MESSAGING_PUBLISHES_PER_EXECUTION: u64 = 1000;
 /// delete a JetStream stream. `$` has no trailing dot on purpose: the whole
 /// prefix is reserved, so the bare marker blocks every current AND future
 /// system namespace in one rule.
+// INVARIANT (2026-06-04 messaging audit). This deny-list is a *publish-side*
+// barrier only, and for the host-only `talos.*` subjects with no HMAC-verifying
+// consumer (`talos.audit.ledger`, `talos.events.*`) it is the SOLE thing keeping
+// guest code from forging messages on them. Two rules the audit confirmed hold
+// and that any future change MUST preserve:
+//   1. Every NEW host-only NATS subject the controller listens on or trusts must
+//      be covered by a prefix here (today all are `talos.`-prefixed → covered).
+//   2. Any NEW controller subscriber on a subject NOT covered by this deny-list
+//      (i.e. one a guest could publish to) MUST HMAC-verify the message before
+//      acting — never trust a guest-publishable subject. (The four data RPCs +
+//      job dispatch already do; see `req.verify()`.)
+// Deny-lists historically drift (PR #114/#115/#117); these two rules are why the
+// surface is currently airtight despite no per-subject NATS ACLs.
 const RESERVED_PUBLISH_PREFIXES: &[&str] = &[
     "talos.", "wasm.",   // wasm.log.* — controller WASM-log subscriber
     "$",       // NATS system subjects: $SYS.*, $JS.API.*, $KV, $OBJ, …
