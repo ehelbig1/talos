@@ -82,7 +82,7 @@ check: ## Fast workspace type-check (no codegen — ~5× faster than full build)
 build: ## Release build of all workspace binaries on the host (Docker uses scripts/release.sh)
 	@cargo build --workspace --release
 
-lint: ## Rustfmt + WIT drift + structural rules + clippy (--no-deps, -D warnings, matches CI)
+lint: ## Rustfmt + WIT drift + structural + clippy (-D warnings) + offline cargo-deny — matches CI
 	@printf '▶ wit sync\n'
 	@diff -q wit/talos.wit module-templates/wit/talos.wit >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ wit/talos.wit and module-templates/wit/talos.wit have drifted\033[0m\n'; \
@@ -91,6 +91,12 @@ lint: ## Rustfmt + WIT drift + structural rules + clippy (--no-deps, -D warnings
 	@cargo fmt --all -- --check
 	@printf '▶ structural lints (incl. clippy --workspace --no-deps -D warnings)\n'
 	@TALOS_LINT_CLIPPY=1 bash scripts/lint-structural.sh
+	@printf '▶ cargo-deny (offline: bans + licenses + sources)\n'
+	@if command -v cargo-deny >/dev/null 2>&1; then \
+	    cargo deny check bans licenses sources; \
+	else \
+	    printf '\033[1;33m⊘ cargo-deny not installed — skipping offline supply-chain check (advisories run in `make audit`)\033[0m\n'; \
+	fi
 
 hooks: ## Install git hooks (.githooks) — activates pre-commit + pre-push gates
 	@git config core.hooksPath .githooks
