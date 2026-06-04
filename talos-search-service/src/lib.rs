@@ -42,8 +42,9 @@ mod provider_health;
 mod sql_helpers;
 
 pub use embedding::{
-    auto_embed_workflow, generate_embedding, generate_embeddings_batch, vec_to_pgvector_literal,
-    workflow_embedding_text, EmbeddingConfig, EmbeddingError, EMBED_BATCH_MAX,
+    auto_embed_workflow, generate_embedding, generate_embeddings_batch, provider_is_external,
+    vec_to_pgvector_literal, workflow_embedding_text, EmbeddingConfig, EmbeddingError,
+    EMBED_BATCH_MAX,
 };
 pub use provider_health::{
     embedding_provider_available, embedding_provider_status, refresh_embedding_provider_health,
