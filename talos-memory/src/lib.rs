@@ -488,6 +488,49 @@ pub async fn persist_memory(
 /// JSONB column. `metadata` is filterable server-side and NEVER mixed into
 /// the `value` payload — read paths (`recall_exact`, etc.) return the value
 /// exactly as it was stored.
+/// Whether an embedding for `actor_id`'s data must stay HOST-LOCAL — the actor's
+/// `max_llm_tier` is `tier1` ("data must not leave the host") AND the configured
+/// embedding provider is external. The result is passed to `generate_embedding`,
+/// which SKIPS the external call in that combination (the memory op proceeds
+/// without a vector; semantic recall degrades to keyword/recency).
+///
+/// Cost: when the provider is host-local (the default in-cluster Ollama) there is
+/// no egress risk, so we return `false` WITHOUT any DB query — the common case
+/// pays nothing. Only an external-provider deployment pays one indexed
+/// `actors.max_llm_tier` lookup per memory op. The tier is read from the
+/// AUTHORITATIVE `actors` table (not a worker-supplied claim), so a compromised
+/// worker cannot downgrade a tier-1 actor to leak its data. Fails CLOSED
+/// (treat as tier-1 → skip external) on a lookup error.
+async fn embed_local_only<'e, E>(executor: E, actor_id: Uuid) -> bool
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    match embedding::EmbeddingConfig::cached() {
+        Some(c) if !c.is_local_provider() => {}
+        // Host-local provider, or none configured → no egress; no gate needed.
+        _ => return false,
+    }
+    match sqlx::query_scalar::<_, String>("SELECT max_llm_tier FROM actors WHERE id = $1")
+        .bind(actor_id)
+        .fetch_optional(executor)
+        .await
+    {
+        Ok(Some(tier)) => tier == "tier1",
+        // No actors row (system / anonymous / non-actor memory) → not tier-1.
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                target: "talos_audit",
+                %actor_id,
+                error = %e,
+                "embedding tier-gate: actors.max_llm_tier lookup failed — failing closed \
+                 (skipping the external embedding to avoid possible tier-1 data egress)"
+            );
+            true
+        }
+    }
+}
+
 pub async fn persist_memory_with_metadata(
     pool: &Pool<Postgres>,
     actor_id: Uuid,
@@ -551,7 +594,8 @@ pub async fn persist_memory_with_metadata(
     let embedding: Option<pgvector::Vector> = if canonical_type != "scratchpad" {
         let truncated: String = serialized.chars().take(4000).collect();
         let text_to_embed = format!("{}: {}", key, truncated);
-        embedding::generate_embedding(&text_to_embed)
+        let local_only = embed_local_only(pool, actor_id).await;
+        embedding::generate_embedding(&text_to_embed, local_only)
             .await
             .map(pgvector::Vector::from)
     } else {
@@ -692,7 +736,8 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     let embedding: Option<pgvector::Vector> = if canonical_type != "scratchpad" {
         let truncated: String = serialized.chars().take(4000).collect();
         let text_to_embed = format!("{}: {}", key, truncated);
-        embedding::generate_embedding(&text_to_embed)
+        let local_only = embed_local_only(&mut **tx, actor_id).await;
+        embedding::generate_embedding(&text_to_embed, local_only)
             .await
             .map(pgvector::Vector::from)
     } else {
@@ -1116,7 +1161,8 @@ pub async fn recall_semantic_filtered(
         ),
     };
 
-    let embedding = embedding::generate_embedding(&embed_input).await;
+    let local_only = embed_local_only(pool, actor_id).await;
+    let embedding = embedding::generate_embedding(&embed_input, local_only).await;
     let embedding_attempted = embedding.is_some();
 
     if let Some(emb) = embedding {
@@ -1911,7 +1957,9 @@ async fn backfill_embeddings_filtered(
         let serialized = serde_json::to_string(&value).unwrap_or_default();
         let truncated: String = serialized.chars().take(4000).collect();
         let text = format!("{}: {}", key, truncated);
-        if let Some(emb) = embedding::generate_embedding(&text).await {
+        let row_actor: Uuid = r.get("actor_id");
+        let local_only = embed_local_only(pool, row_actor).await;
+        if let Some(emb) = embedding::generate_embedding(&text, local_only).await {
             // L-1: UPDATE failures (DB pool exhaustion, FK violation,
             // constraint mismatch) warn + skip without bumping the
             // counter, so "embedded N rows" metrics never lie under
