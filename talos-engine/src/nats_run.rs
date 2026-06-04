@@ -81,13 +81,29 @@ pub fn build_nats_dispatcher(
         .expression_evaluator_arc()
         .unwrap_or_else(|| Arc::new(RhaiEvaluator::new()));
     let event_sink = engine.event_sink_arc();
-    Arc::new(NatsNodeDispatcher::new(
+    let dispatcher = NatsNodeDispatcher::new(
         transport,
         event_sink,
-        worker_shared_key,
+        worker_shared_key.clone(),
         retry_classifier,
         expression_evaluator,
-    ))
+    );
+    // Inject the result verify-ring: the current signing key plus any
+    // WORKER_SHARED_KEY_PREVIOUS staged for a rolling rotation, so a worker
+    // result signed under a previous key still verifies. Signing is unchanged
+    // (always the current key). When no signing key is configured (test
+    // harnesses) the dispatcher keeps its default `None` ring.
+    let dispatcher = match worker_shared_key {
+        Some(signing) => {
+            let previous =
+                talos_workflow_job_protocol::load_worker_shared_key_previous().unwrap_or_default();
+            dispatcher.with_worker_key_ring(talos_workflow_engine_core::WorkerKeyRing::new(
+                signing, previous,
+            ))
+        }
+        None => dispatcher,
+    };
+    Arc::new(dispatcher)
 }
 
 /// Controller-convenience: dispatch via a raw `async_nats::Client`.

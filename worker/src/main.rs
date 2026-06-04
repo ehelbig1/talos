@@ -29,8 +29,8 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use talos_workflow_job_protocol::{
-    load_worker_shared_key, JobRequest, JobResult, JobStatus, PipelineJobRequest,
-    PipelineJobResult, PipelineStepResult,
+    load_worker_key_ring, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
+    PipelineStepResult,
 };
 
 mod audit;
@@ -1238,7 +1238,7 @@ async fn publish_result_with_retry(
     result: &JobResult,
     max_attempts: u32,
     reply_topic: Option<String>,
-    shared_key: &talos_workflow_engine_core::WorkerSharedKey,
+    shared_key: &talos_workflow_engine_core::WorkerKeyRing,
 ) -> Result<(), String> {
     // Serialize once so we can size-check before deciding how to
     // publish. serde_json::to_vec on a JobResult is cheap (single
@@ -1268,7 +1268,9 @@ async fn publish_result_with_retry(
         // controller's audit log records which pod emitted the
         // truncated-replacement result. See `worker_identity` for the
         // resolution chain.
-        if let Err(e) = replacement.sign_with_worker_id(shared_key.as_bytes(), worker_identity()) {
+        if let Err(e) =
+            replacement.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity())
+        {
             return Err(format!("Failed to sign oversized-result replacement: {e}"));
         }
         match serde_json::to_vec(&replacement) {
@@ -1352,7 +1354,7 @@ async fn execute_job(
     cx: &opentelemetry::Context,
     req: JobRequest,
     runtime: Arc<TalosRuntime>,
-    shared_key: talos_workflow_engine_core::WorkerSharedKey,
+    shared_key: talos_workflow_engine_core::WorkerKeyRing,
 ) -> JobResult {
     let start = std::time::Instant::now();
 
@@ -1364,7 +1366,9 @@ async fn execute_job(
     _span.set_attribute("module_uri", &req.module_uri);
 
     // SECURITY: Verify HMAC-SHA256 signature + nonce freshness (300 s window).
-    if let Err(e) = req.verify(shared_key.as_bytes(), 300) {
+    // Ring-aware: accepts the current key OR a staged WORKER_SHARED_KEY_PREVIOUS
+    // so a rolling rotation doesn't reject controller-signed jobs.
+    if let Err(e) = req.verify_with_ring(&shared_key, 300) {
         ::tracing::error!(job_id = %req.job_id, error = %e, "Job signature verification failed");
         _span.set_attribute("error", "signature_verification_failed");
         _span.end_error("Signature verification failed");
@@ -1454,7 +1458,7 @@ async fn execute_job(
     } else {
         match req
             .encrypted_secrets
-            .decrypt_with_aad(shared_key.as_bytes(), req.workflow_execution_id.as_bytes())
+            .decrypt_with_ring(&shared_key, req.workflow_execution_id.as_bytes())
         {
             Ok(s) => s,
             Err(e) => {
@@ -2574,7 +2578,7 @@ async fn execute_pipeline_job(
     cx: &opentelemetry::Context,
     req: PipelineJobRequest,
     runtime: Arc<TalosRuntime>,
-    shared_key: talos_workflow_engine_core::WorkerSharedKey,
+    shared_key: talos_workflow_engine_core::WorkerKeyRing,
 ) -> PipelineJobResult {
     use talos_workflow_job_protocol::JobStatus;
 
@@ -2584,7 +2588,8 @@ async fn execute_pipeline_job(
     let mut _span = JobSpan::current_with_parent(cx);
 
     // SECURITY: Verify HMAC-SHA256 signature + nonce freshness (300 s window).
-    if let Err(e) = req.verify(shared_key.as_bytes(), 300) {
+    // Ring-aware (current OR staged previous key) for rolling rotation.
+    if let Err(e) = req.verify_with_ring(&shared_key, 300) {
         ::tracing::error!(job_id = %req.job_id, error = %e, "Pipeline job signature verification failed");
         _span.set_attribute("error", "signature_verification_failed");
         _span.end_error("Signature verification failed");
@@ -2636,7 +2641,7 @@ async fn execute_pipeline_job(
         } else {
             match step
                 .encrypted_secrets
-                .decrypt_with_aad(shared_key.as_bytes(), req.workflow_execution_id.as_bytes())
+                .decrypt_with_ring(&shared_key, req.workflow_execution_id.as_bytes())
             {
                 Ok(s) => s,
                 Err(e) => {
@@ -2755,8 +2760,12 @@ async fn main() -> anyhow::Result<()> {
     // Fail-fast if the key is absent or malformed — never start with no auth.
     // ========================================================================
 
+    // Load the full verify/decrypt-ring (current + WORKER_SHARED_KEY_PREVIOUS).
+    // The worker SIGNS results + RPC with the current key only; it VERIFIES
+    // controller-signed jobs and DECRYPTS secrets against the whole ring, so a
+    // rolling WORKER_SHARED_KEY rotation doesn't break either side mid-roll.
     let shared_key =
-        load_worker_shared_key().map_err(|e| anyhow::anyhow!("WORKER_SHARED_KEY error: {}", e))?;
+        load_worker_key_ring().map_err(|e| anyhow::anyhow!("WORKER_SHARED_KEY error: {}", e))?;
     // M-3 (partial): log a SHA-256 fingerprint of the shared key at
     // startup so config drift between controller and worker is visible
     // without exposing the key material. Operators can grep both
@@ -2766,14 +2775,25 @@ async fn main() -> anyhow::Result<()> {
     // failed" later. We log only the first 8 hex chars (32 bits) which
     // is enough to detect mismatch with negligible info leak.
     {
-        use sha2::Digest as _;
-        let fp_full = sha2::Sha256::digest(shared_key.as_bytes());
-        let fp_short = hex::encode(&fp_full[..4]);
-        println!("[0/5] Loaded WORKER_SHARED_KEY (32 bytes, fp={fp_short})");
+        let fp_short = talos_workflow_job_protocol::worker_key_fingerprint(
+            shared_key.signing_key().as_bytes(),
+        );
+        let verify_count = shared_key.verify_keys().len();
+        println!(
+            "[0/5] Loaded WORKER_SHARED_KEY (32 bytes, fp={fp_short}, verify_keys={verify_count})"
+        );
         ::tracing::info!(
             worker_shared_key_fp = %fp_short,
+            verify_key_count = verify_count,
             "WORKER_SHARED_KEY loaded; compare this fingerprint against the controller's log line for drift detection"
         );
+        for prev in shared_key.verify_keys().iter().skip(1) {
+            ::tracing::info!(
+                previous_worker_shared_key_fp =
+                    %talos_workflow_job_protocol::worker_key_fingerprint(prev.as_bytes()),
+                "WORKER_SHARED_KEY_PREVIOUS accepted for verify/decrypt (rotation in progress)"
+            );
+        }
     }
 
     // Wasm-security review 2026-05-22 (MEDIUM-4): production gate. In
@@ -3024,7 +3044,11 @@ async fn main() -> anyhow::Result<()> {
     // WIT `agent_memory::*` and `graph_memory::*` host functions can
     // sign their NATS requests. The controller registers the same
     // key on its side for verification (see controller/src/main.rs).
-    talos_memory::rpc_auth::register_hmac_key(Arc::new(shared_key.as_bytes().to_vec()));
+    // Worker only SIGNS its outbound RPC (controller verifies), so the
+    // current/signing key is all rpc_auth needs here.
+    talos_memory::rpc_auth::register_hmac_key(Arc::new(
+        shared_key.signing_key().as_bytes().to_vec(),
+    ));
 
     // M-3 (2026-05-22): log the SQL empty-allowlist policy at startup
     // so operators can confirm the mode they're running. Default is
@@ -3430,7 +3454,7 @@ async fn main() -> anyhow::Result<()> {
 
                                 // L-11: bind worker identity for audit attribution.
                                 if let Err(e) = result.sign_with_worker_id(
-                                    key_clone.as_bytes(),
+                                    key_clone.signing_key().as_bytes(),
                                     worker_identity(),
                                 ) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign job result");
@@ -3536,7 +3560,7 @@ async fn main() -> anyhow::Result<()> {
 
                                 // L-11: bind worker identity for audit attribution.
                                 if let Err(e) = result.sign_with_worker_id(
-                                    key_clone.as_bytes(),
+                                    key_clone.signing_key().as_bytes(),
                                     worker_identity(),
                                 ) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign pipeline result");
@@ -3596,7 +3620,7 @@ async fn main() -> anyhow::Result<()> {
                                     };
                                     // L-11: bind worker identity for audit attribution.
                                     if let Err(e) = replacement.sign_with_worker_id(
-                                        key_clone.as_bytes(),
+                                        key_clone.signing_key().as_bytes(),
                                         worker_identity(),
                                     ) {
                                         ::tracing::error!(

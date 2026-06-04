@@ -1284,6 +1284,17 @@ impl WebhookRouter {
             let nats = self.nats_client.clone();
             let secrets_manager = self.secrets_manager.clone();
             let worker_shared_key_clone = self.worker_shared_key.clone();
+            // Result verify-ring (current + staged WORKER_SHARED_KEY_PREVIOUS)
+            // so this webhook reply-inbox primary verifier accepts a result
+            // signed under a previous key during a rolling rotation. Signing
+            // (below) still uses the current key only.
+            let worker_key_ring_clone = worker_shared_key_clone.clone().map(|signing| {
+                talos_workflow_engine_core::WorkerKeyRing::new(
+                    signing,
+                    talos_workflow_job_protocol::load_worker_shared_key_previous()
+                        .unwrap_or_default(),
+                )
+            });
             let user_id = trigger.user_id;
 
             let result = tokio::spawn({
@@ -1408,9 +1419,9 @@ impl WebhookRouter {
                     // payload). L-4: `Verifier::Primary` makes the role
                     // explicit at the call site — this is the canonical
                     // primary verifier for results on this reply inbox.
-                    if let Some(key) = &worker_shared_key_clone {
-                        if let Err(e) = result.verify_as(
-                            key.as_bytes(),
+                    if let Some(ring) = &worker_key_ring_clone {
+                        if let Err(e) = result.verify_as_with_ring(
+                            ring,
                             300,
                             talos_workflow_job_protocol::Verifier::Primary,
                         ) {

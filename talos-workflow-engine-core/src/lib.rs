@@ -160,7 +160,7 @@ pub use secret_envelope::{
     validate_seal_output, SealValidationError, SecretEnvelope, MIN_SEAL_NONCE_LEN,
 };
 pub use secrets::{BoxError, SecretsResolver};
-pub use shared_key::WorkerSharedKey;
+pub use shared_key::{WorkerKeyRing, WorkerSharedKey};
 pub use sub_actor_context::SubworkflowActorContextResolver;
 pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;

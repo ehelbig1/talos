@@ -244,7 +244,12 @@ pub(crate) async fn execute_job_with_retry(
     timeout_secs: u64,
     max_retries: u32,
     base_backoff_ms: u64,
+    // Signing key used to RE-SIGN the payload on retry (fresh nonce). Always
+    // the current key.
     worker_shared_key: Option<&[u8]>,
+    // Verify-ring for the worker's signed RESULT — current key plus any staged
+    // previous keys. `None` skips result verification (test harnesses).
+    verify_ring: Option<&talos_workflow_engine_core::WorkerKeyRing>,
     retry_condition: Option<&str>,
     retry_delay_expr: Option<&str>,
     // Optional event tracking: when provided, a `node_retrying` / `retry_skipped`
@@ -292,9 +297,9 @@ pub(crate) async fn execute_job_with_retry(
                 // side effect. Any audit observer subscribing to a
                 // separate `talos.results.*` topic uses
                 // `Verifier::Observer` (see controller/src/main.rs).
-                if let Some(key) = worker_shared_key {
-                    if let Err(e) = job_result.verify_as(
-                        key,
+                if let Some(ring) = verify_ring {
+                    if let Err(e) = job_result.verify_as_with_ring(
+                        ring,
                         300,
                         talos_workflow_job_protocol::Verifier::Primary,
                     ) {
@@ -608,10 +613,18 @@ fn resign_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
 pub struct NatsNodeDispatcher {
     transport: Arc<dyn JobTransport>,
     event_sink: Option<Arc<dyn EventSink>>,
-    /// Shared key used for both HMAC signing of the request and
-    /// verification of the response. `None` disables signing — used by
-    /// test harnesses that don't need the round-trip.
+    /// Shared key used for HMAC signing of the request (and re-signing on
+    /// retry). `None` disables signing — used by test harnesses that don't
+    /// need the round-trip. Signing always uses the CURRENT key.
     worker_shared_key: Option<WorkerSharedKey>,
+    /// Verify-ring for the worker's signed RESULT (current + any staged
+    /// `WORKER_SHARED_KEY_PREVIOUS`). Defaults in `new` to a single-key ring
+    /// over `worker_shared_key`, so behavior is unchanged unless the
+    /// construction path injects previous keys via
+    /// [`with_worker_key_ring`](Self::with_worker_key_ring). Lets a worker
+    /// result signed under a staged previous key verify during a rolling
+    /// `WORKER_SHARED_KEY` rotation.
+    worker_key_ring: Option<talos_workflow_engine_core::WorkerKeyRing>,
     /// Policy trait for classifying dispatch errors into
     /// transient-vs-permanent. Drives the "smart retry default" path
     /// (skip retries on auth / fuel / missing-secret errors even when
@@ -639,13 +652,28 @@ impl NatsNodeDispatcher {
         retry_classifier: Arc<dyn RetryClassifier>,
         expression_evaluator: Arc<dyn ExpressionEvaluator>,
     ) -> Self {
+        let worker_key_ring = worker_shared_key
+            .clone()
+            .map(talos_workflow_engine_core::WorkerKeyRing::single);
         Self {
             transport,
             event_sink,
             worker_shared_key,
+            worker_key_ring,
             retry_classifier,
             expression_evaluator,
         }
+    }
+
+    /// Override the result verify-ring (e.g. to add `WORKER_SHARED_KEY_PREVIOUS`
+    /// keys for a rolling rotation). The ring's signing key SHOULD match
+    /// `worker_shared_key`; only the additional previous keys widen what the
+    /// dispatcher will accept when verifying a worker result. Signing is
+    /// unaffected — it always uses `worker_shared_key`.
+    #[must_use]
+    pub fn with_worker_key_ring(mut self, ring: talos_workflow_engine_core::WorkerKeyRing) -> Self {
+        self.worker_key_ring = Some(ring);
+        self
     }
 }
 
@@ -805,6 +833,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             self.worker_shared_key
                 .as_ref()
                 .map(WorkerSharedKey::as_bytes),
+            self.worker_key_ring.as_ref(),
             job.retry_condition.as_deref(),
             job.retry_delay_expr.as_deref(),
             event_sink,
@@ -931,15 +960,11 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // 7. Parse + verify.
         let result: PipelineJobResult = serde_json::from_slice(&response_bytes)
             .map_err(|e| -> BoxError { format!("Failed to parse pipeline result: {e}").into() })?;
-        if let Some(key) = self.worker_shared_key.as_ref() {
+        if let Some(ring) = self.worker_key_ring.as_ref() {
             // L-4: PipelineJobResult Primary verifier — same role as
-            // the JobResult dispatcher above.
+            // the JobResult dispatcher above. Ring-aware for rolling rotation.
             result
-                .verify_as(
-                    key.as_bytes(),
-                    300,
-                    talos_workflow_job_protocol::Verifier::Primary,
-                )
+                .verify_as_with_ring(ring, 300, talos_workflow_job_protocol::Verifier::Primary)
                 .map_err(|e| -> BoxError {
                     format!("Pipeline result signature verification failed: {e}").into()
                 })?;

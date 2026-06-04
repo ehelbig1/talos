@@ -86,6 +86,15 @@ pub struct ControllerCheckpointStore {
     /// `save()` path no-ops without a key and the `load()` path
     /// returned an empty map, so the engine resumed from scratch.
     secrets_manager: Option<std::sync::Arc<talos_secrets_manager::SecretsManager>>,
+    /// Previous `WORKER_SHARED_KEY` roots accepted for checkpoint *decryption*
+    /// only (the decrypt-ring). Empty in steady state. During a rolling
+    /// `WORKER_SHARED_KEY` rotation, the operator stages the old root here so a
+    /// checkpoint written under the old key still resumes — closing the
+    /// "checkpoint present but failed to decrypt → re-run from scratch" window
+    /// the `load` path otherwise logs loudly. `save` never uses these: new
+    /// checkpoints are always written under the current `worker_shared_key`.
+    /// See [`with_previous_worker_shared_keys`](Self::with_previous_worker_shared_keys).
+    previous_worker_shared_keys: Vec<Vec<u8>>,
     /// Execution statuses `load` will read a checkpoint from. Defaults to
     /// `["waiting"]` (the suspend/approval-gate resume path). Crash recovery
     /// sets this to `["waiting", "resuming"]` via [`with_resume_statuses`]
@@ -128,12 +137,37 @@ impl ControllerCheckpointStore {
     /// SecretsManager is also wired via `with_secrets_manager`.
     #[must_use]
     pub fn new(pool: Pool<Postgres>, worker_shared_key: Option<Vec<u8>>) -> Self {
+        // Auto-populate the decrypt-ring from WORKER_SHARED_KEY_PREVIOUS so a
+        // checkpoint written under the old root still resumes during a rolling
+        // rotation — every construction path (load helpers, scheduler, builder,
+        // crash recovery) inherits it without call-site churn. Empty when the
+        // env var is unset (tests/CI), so behavior is unchanged off-rotation.
+        // Use `with_previous_worker_shared_keys` to override explicitly.
+        let previous_worker_shared_keys =
+            talos_workflow_job_protocol::load_worker_shared_key_previous()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|k| k.as_bytes().to_vec())
+                .collect();
         Self {
             pool,
             worker_shared_key,
             secrets_manager: None,
+            previous_worker_shared_keys,
             load_statuses: vec!["waiting".to_string()],
         }
+    }
+
+    /// Stage previous `WORKER_SHARED_KEY` roots for the checkpoint
+    /// decrypt-ring. `load` tries the current key first, then each of these in
+    /// turn; the loud "stranded checkpoint" error only fires when *every* key
+    /// fails. `save` is unaffected — new checkpoints always use the current
+    /// key. Pass the bytes of each previous 32-byte root (e.g. from
+    /// `WorkerKeyRing::verify_keys()` minus the signing key).
+    #[must_use]
+    pub fn with_previous_worker_shared_keys(mut self, previous: Vec<Vec<u8>>) -> Self {
+        self.previous_worker_shared_keys = previous;
+        self
     }
 
     /// Crash recovery (RFC 0003): also read a checkpoint from `resuming`
@@ -319,7 +353,13 @@ impl CheckpointStore for ControllerCheckpointStore {
             .await?;
 
             if let Some((ciphertext, nonce)) = enc_row {
-                match decrypt_checkpoint(&ciphertext, &nonce, key, execution_id.as_bytes()) {
+                match decrypt_checkpoint_ring(
+                    &ciphertext,
+                    &nonce,
+                    key,
+                    &self.previous_worker_shared_keys,
+                    execution_id.as_bytes(),
+                ) {
                     Ok(decrypted) => {
                         return Ok(decrypted
                             .as_object()
@@ -343,11 +383,14 @@ impl CheckpointStore for ControllerCheckpointStore {
                         tracing::error!(
                             %execution_id,
                             error = %e,
-                            "CRASH-RECOVERY: checkpoint present but failed to decrypt — \
-                             almost certainly a WORKER_SHARED_KEY rotation stranded it. \
-                             This execution will resume FROM SCRATCH, re-running any \
-                             already-completed side-effecting nodes (at-least-once). Drain \
-                             in-flight executions before rotating WORKER_SHARED_KEY."
+                            previous_key_count = self.previous_worker_shared_keys.len(),
+                            "CRASH-RECOVERY: checkpoint present but failed to decrypt under \
+                             the current key OR any staged previous key — almost certainly a \
+                             WORKER_SHARED_KEY rotation stranded it. This execution will \
+                             resume FROM SCRATCH, re-running any already-completed \
+                             side-effecting nodes (at-least-once). When rotating \
+                             WORKER_SHARED_KEY, stage the old root in WORKER_SHARED_KEY_PREVIOUS \
+                             (the decrypt-ring) and/or drain in-flight executions first."
                         );
                         return Err(e.into());
                     }
@@ -522,6 +565,93 @@ fn decrypt_checkpoint(
         )
         .map_err(|_| "Checkpoint decryption failed — wrong key or corrupted data".to_string())?;
     serde_json::from_slice(&plaintext).map_err(|e| format!("Failed to deserialize checkpoint: {e}"))
+}
+
+/// Decrypt a checkpoint against a **decrypt-ring**: try `current` first (the
+/// steady-state hit), then each `previous` root in turn. Returns the first
+/// success; if every key fails, returns the *current*-key error (the most
+/// useful diagnostic — `previous` keys are expected to miss for any
+/// checkpoint written after the rotation).
+///
+/// AES-256-GCM's authentication tag makes this safe and unambiguous: a wrong
+/// key cannot produce a passing tag, so trying multiple keys never yields a
+/// false-accept — at most it costs one extra GCM verification per staged key
+/// (the ring is 1–2 entries in practice). This is the AEAD analogue of the
+/// `rpc_auth` HMAC verify-ring: encrypt under one key, accept several.
+fn decrypt_checkpoint_ring(
+    ciphertext: &[u8],
+    nonce: &[u8],
+    current: &[u8],
+    previous: &[Vec<u8>],
+    aad: &[u8],
+) -> Result<JsonValue, String> {
+    let current_err = match decrypt_checkpoint(ciphertext, nonce, current, aad) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    for prev in previous {
+        if let Ok(v) = decrypt_checkpoint(ciphertext, nonce, prev, aad) {
+            return Ok(v);
+        }
+    }
+    Err(current_err)
+}
+
+#[cfg(test)]
+mod decrypt_ring_tests {
+    use super::*;
+
+    fn root(byte: u8) -> Vec<u8> {
+        vec![byte; AES_KEY_LEN]
+    }
+
+    #[test]
+    fn current_key_decrypts_without_consulting_previous() {
+        let cur = root(0x01);
+        let snapshot = serde_json::json!({"node": 1});
+        let (ct, nonce) = encrypt_checkpoint(&snapshot, &cur, b"exec-a").unwrap();
+        // No previous keys needed.
+        let got = decrypt_checkpoint_ring(&ct, &nonce, &cur, &[], b"exec-a").unwrap();
+        assert_eq!(got, snapshot);
+    }
+
+    #[test]
+    fn previous_key_decrypts_after_rotation() {
+        // Checkpoint written under the OLD root; the process has since rotated
+        // so `current` is the NEW root and OLD is staged as previous.
+        let old = root(0x0A);
+        let new = root(0x0B);
+        let snapshot = serde_json::json!({"node": 2, "state": "mid"});
+        let (ct, nonce) = encrypt_checkpoint(&snapshot, &old, b"exec-b").unwrap();
+
+        // Current key alone fails (this is the pre-ring "stranded" case)...
+        assert!(decrypt_checkpoint(&ct, &nonce, &new, b"exec-b").is_err());
+        // ...but the ring recovers it via the staged previous key.
+        let got = decrypt_checkpoint_ring(&ct, &nonce, &new, &[old], b"exec-b").unwrap();
+        assert_eq!(got, snapshot);
+    }
+
+    #[test]
+    fn all_keys_failing_returns_current_key_error() {
+        let cur = root(0x01);
+        let snapshot = serde_json::json!({"node": 3});
+        let (ct, nonce) = encrypt_checkpoint(&snapshot, &root(0xFF), b"exec-c").unwrap();
+        // Neither current nor the staged previous can decrypt a blob written
+        // under a third, unknown key.
+        let err = decrypt_checkpoint_ring(&ct, &nonce, &cur, &[root(0x02)], b"exec-c").unwrap_err();
+        assert!(err.contains("wrong key or corrupted data"), "got {err}");
+    }
+
+    #[test]
+    fn wrong_aad_is_not_rescued_by_the_ring() {
+        // AAD binding still holds across the ring — a checkpoint for exec-d
+        // can't be transposed onto exec-e under any key.
+        let cur = root(0x01);
+        let snapshot = serde_json::json!({"node": 4});
+        let (ct, nonce) = encrypt_checkpoint(&snapshot, &cur, b"exec-d").unwrap();
+        let err = decrypt_checkpoint_ring(&ct, &nonce, &cur, &[root(0x02)], b"exec-e").unwrap_err();
+        assert!(err.contains("wrong key or corrupted data"), "got {err}");
+    }
 }
 
 #[cfg(test)]

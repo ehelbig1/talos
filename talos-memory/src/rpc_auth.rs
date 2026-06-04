@@ -39,12 +39,20 @@
 //!
 //! ## Key rotation
 //!
-//! [`register_hmac_key`] uses `OnceLock::set` and is **idempotent**:
-//! subsequent calls after the first are silently ignored. This means
-//! rotating `WORKER_SHARED_KEY` requires restarting both the
-//! controller and the worker. Live rotation is intentionally not
-//! supported — a rotation that lands on one side but not the other
-//! would break every in-flight RPC.
+//! The registered material is a small **verify-ring**: a single signing
+//! key (used for all outbound signatures) plus zero or more previous keys
+//! accepted for verification only. [`register_hmac_key_ring`] installs the
+//! ring; [`register_hmac_key`] is a single-key convenience that installs a
+//! one-element ring. Both use `OnceLock::set` and are **idempotent** —
+//! subsequent calls after the first are silently ignored (a differing
+//! signing key on a later call is logged loudly via fingerprints).
+//!
+//! Carrying a previous key lets `WORKER_SHARED_KEY` rotate via a rolling
+//! restart (set `WORKER_SHARED_KEY` + `WORKER_SHARED_KEY_PREVIOUS`, roll,
+//! then drop the previous key) instead of a simultaneous controller+worker
+//! restart. This needs no wire-format change and no key-ID negotiation —
+//! [`verify`] simply tries every ring member — and the acceptance of an old
+//! key is explicit, fingerprint-logged, and bounded by the freshness window.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -581,39 +589,64 @@ fn write_canonical(v: &serde_json::Value, out: &mut Vec<u8>, depth: usize) -> bo
 /// Process-wide HMAC key slot. The worker registers it at startup
 /// (from `WORKER_SHARED_KEY`); the controller registers the same
 /// value for subscriber verification.
-static HMAC_KEY: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
-
-/// Install the shared HMAC key. Idempotent — subsequent calls are
-/// silently ignored so live-reload doesn't double-install.
+/// Registered signing/verification material.
 ///
-/// **Conflict diagnostics.** If a second call arrives with a key that
-/// differs from the first, we log a `tracing::error!` event with
-/// SHA-256 fingerprints of both keys (never the raw bytes — the keys
-/// ARE the secret). This catches the operator-config bug class where
-/// two different env vars or two different startup paths register
-/// different keys: the first wins silently and every cross-process
-/// signed RPC then fails with "MAC verification failed", with no
-/// breadcrumb pointing at the dual registration. Comparison itself
-/// is constant-time so the diagnostic doesn't leak key bytes via
-/// timing.
+/// `signing` signs all outbound RPC and is always `verify[0]`; the rest of
+/// `verify` are previous keys accepted during a rolling rotation. The
+/// invariant (`verify[0] == signing`, `verify` non-empty) is established by
+/// the only constructor path, [`register_hmac_key_ring`].
+struct RpcKeyRing {
+    signing: Arc<Vec<u8>>,
+    verify: Vec<Arc<Vec<u8>>>,
+}
+
+static HMAC_KEY: OnceLock<RpcKeyRing> = OnceLock::new();
+
+/// Install a single shared HMAC key (a one-element verify-ring). Convenience
+/// wrapper over [`register_hmac_key_ring`] for callers not doing rotation.
 pub fn register_hmac_key(key: Arc<Vec<u8>>) {
-    if let Err(rejected) = HMAC_KEY.set(key) {
-        // Slot already occupied. Compare against the existing key.
-        // `existing` is the canonical winner; `rejected` is the
-        // call that just lost. If the bytes match this is a benign
-        // re-registration (e.g. two startup paths both calling us
-        // with the same env-derived value). If they differ this is
-        // a config bug we want loud about.
+    register_hmac_key_ring(key, Vec::new());
+}
+
+/// Install the shared HMAC verify-ring: a `signing` key plus zero or more
+/// `previous` keys accepted for verification only. Idempotent — subsequent
+/// calls are silently ignored so live-reload doesn't double-install.
+///
+/// **Conflict diagnostics.** If a second call arrives with a *signing* key
+/// that differs from the first, we log a `tracing::error!` event with
+/// SHA-256 fingerprints of both keys (never the raw bytes — the keys ARE
+/// the secret). This catches the operator-config bug class where two
+/// different env vars or startup paths register different keys: the first
+/// wins silently and every cross-process signed RPC then fails with "MAC
+/// verification failed", with no breadcrumb pointing at the dual
+/// registration. Comparison itself is constant-time so the diagnostic
+/// doesn't leak key bytes via timing.
+pub fn register_hmac_key_ring(signing: Arc<Vec<u8>>, previous: Vec<Arc<Vec<u8>>>) {
+    let mut verify = Vec::with_capacity(1 + previous.len());
+    verify.push(signing.clone());
+    verify.extend(previous);
+    let ring = RpcKeyRing { signing, verify };
+
+    if let Err(rejected) = HMAC_KEY.set(ring) {
+        // Slot already occupied. Compare signing keys: `existing` is the
+        // canonical winner, `rejected` just lost. Matching bytes are a
+        // benign re-registration; differing bytes are a config bug we want
+        // loud about.
         if let Some(existing) = HMAC_KEY.get() {
-            let same = existing.as_slice().ct_eq(rejected.as_slice()).unwrap_u8() == 1;
+            let same = existing
+                .signing
+                .as_slice()
+                .ct_eq(rejected.signing.as_slice())
+                .unwrap_u8()
+                == 1;
             if !same {
                 use sha2::Digest;
-                let cur_fp = format!("{:x}", Sha256::digest(existing.as_slice()));
-                let new_fp = format!("{:x}", Sha256::digest(rejected.as_slice()));
+                let cur_fp = format!("{:x}", Sha256::digest(existing.signing.as_slice()));
+                let new_fp = format!("{:x}", Sha256::digest(rejected.signing.as_slice()));
                 tracing::error!(
                     current_key_fingerprint = %&cur_fp[..16],
                     rejected_key_fingerprint = %&new_fp[..16],
-                    "HMAC key re-registration with a DIFFERENT key — ignored. \
+                    "HMAC key re-registration with a DIFFERENT signing key — ignored. \
                      Only the first registered key takes effect; subsequent \
                      RPC signing/verification will use that key. This is a \
                      process-config bug — verify a single canonical \
@@ -650,27 +683,39 @@ fn signing_payload(subject: &str, actor_id: Uuid, nonce: &str, body: &[u8]) -> V
     out
 }
 
-/// Sign a request. Returns `None` when no key has been registered.
+/// Sign a request with the current signing key. Returns `None` when no key
+/// has been registered.
 pub fn sign(subject: &str, actor_id: Uuid, nonce: &str, body: &[u8]) -> Option<Vec<u8>> {
-    let key = HMAC_KEY.get()?;
-    let mut mac = HmacSha256::new_from_slice(key).ok()?;
+    let ring = HMAC_KEY.get()?;
+    let mut mac = HmacSha256::new_from_slice(ring.signing.as_slice()).ok()?;
     mac.update(&signing_payload(subject, actor_id, nonce, body));
     Some(mac.finalize().into_bytes().to_vec())
 }
 
-/// Constant-time signature verification.
+/// Constant-time signature verification against the full verify-ring.
+///
+/// Accepts the signature if it matches *any* ring member (current signing
+/// key or a staged previous key). Every member is evaluated regardless of
+/// an earlier match — there is no short-circuit — so neither the verdict nor
+/// the timing reveals which key matched or the ring's contents. Per-member
+/// comparison uses `subtle::ConstantTimeEq` to protect the key bytes.
 pub fn verify(subject: &str, actor_id: Uuid, nonce: &str, body: &[u8], signature: &[u8]) -> bool {
-    let Some(key) = HMAC_KEY.get() else {
+    let Some(ring) = HMAC_KEY.get() else {
         // Fail closed — we don't accept unsigned requests even when
         // the subscriber forgot to register.
         return false;
     };
-    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
-        return false;
-    };
-    mac.update(&signing_payload(subject, actor_id, nonce, body));
-    let expected = mac.finalize().into_bytes();
-    expected.as_slice().ct_eq(signature).unwrap_u8() == 1
+    let payload = signing_payload(subject, actor_id, nonce, body);
+    let mut matched = 0u8;
+    for key in &ring.verify {
+        let Ok(mut mac) = HmacSha256::new_from_slice(key.as_slice()) else {
+            continue;
+        };
+        mac.update(&payload);
+        let expected = mac.finalize().into_bytes();
+        matched |= expected.as_slice().ct_eq(signature).unwrap_u8();
+    }
+    matched == 1
 }
 
 /// Generate a fresh 16-byte cryptographically random nonce encoded
