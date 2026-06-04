@@ -10,7 +10,9 @@ if git diff --cached --name-only | grep -q '\.env$'; then
 fi
 
 # 2. Check for credential logging patterns in staged Rust files
-STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -v '_test\|tests/')
+# `|| true`: grep exits 1 when no staged .rs files match, which under `set -e`
+# would abort the hook and wrongly block every non-Rust commit.
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -v '_test\|tests/' || true)
 if [ -n "$STAGED_RS" ]; then
     # Check for raw token/cookie logging
     if echo "$STAGED_RS" | xargs grep -ln 'tracing::debug!.*Cookie.*{:' 2>/dev/null | grep -v 'is_some\|is_none'; then
