@@ -105,6 +105,127 @@ impl AsRef<[u8]> for WorkerSharedKey {
     }
 }
 
+/// An ordered set of [`WorkerSharedKey`]s enabling **restart-free rotation**
+/// of the shared HMAC signing key.
+///
+/// `keys[0]` (the *signing key*) signs every new outbound message; **all**
+/// elements (signing + previous) are accepted candidates when *verifying* an
+/// inbound signature. Holding more than one key is the entire mechanism: it
+/// lets the new key be deployed while signatures made under the old key are
+/// still accepted, so a rolling restart no longer opens a window where every
+/// signed NATS RPC is rejected.
+///
+/// # Relationship to the loader's "intentional" note
+///
+/// The shared-key loader historically documented that rotation *requires a
+/// simultaneous restart*, on two grounds: (1) a "key-ID negotiation protocol
+/// is hard to get right", and (2) "a botched live rotation is a silent
+/// signature bypass." A verify-ring answers both:
+///
+/// * **No negotiation, no wire change.** Verification simply tries each
+///   candidate key. Nothing on the wire carries a key ID; the message format
+///   is byte-for-byte unchanged. This is exactly what the worker's
+///   `AotKeyRing` already does for AOT-blob integrity — a *higher*-stakes key
+///   (its compromise yields native code execution via `Component::deserialize`).
+/// * **Not silent.** Accepting a previous key is explicit, fingerprint-logged
+///   at startup, time-bounded by the operator (remove `*_PREVIOUS` after
+///   rollout), and — for the freshness-gated RPC/job messages — additionally
+///   bounded by the ~60 s replay window. The failure mode of forgetting to
+///   remove the previous key is "an old, deliberately-staged key keeps
+///   working for a while", not "any key passes".
+///
+/// # Rotation workflow
+///
+/// 1. Set `WORKER_SHARED_KEY=<new>` and `WORKER_SHARED_KEY_PREVIOUS=<old>` on
+///    the controller and every worker.
+/// 2. Rolling restart. New messages sign under `<new>`; in-flight messages
+///    signed under `<old>` still verify.
+/// 3. Once the freshness window has elapsed (and, for at-rest material such as
+///    checkpoints, once old-key-encrypted rows have drained — see the separate
+///    decrypt-ring work), remove `WORKER_SHARED_KEY_PREVIOUS`.
+///
+/// # Invariant
+///
+/// A `WorkerKeyRing` is **never empty**; `signing_key()` and `verify_keys()`
+/// therefore never panic and never return an empty slice.
+#[derive(Clone)]
+pub struct WorkerKeyRing {
+    // INVARIANT: non-empty; `keys[0]` is the signing key, the remainder are
+    // verify-only previous keys in the order they were supplied.
+    keys: Vec<WorkerSharedKey>,
+}
+
+impl WorkerKeyRing {
+    /// Build a ring from a signing key plus zero or more previous
+    /// (verify-only) keys. The signing key is always `verify_keys()[0]`.
+    #[must_use]
+    pub fn new(
+        signing: WorkerSharedKey,
+        previous: impl IntoIterator<Item = WorkerSharedKey>,
+    ) -> Self {
+        let mut keys = Vec::with_capacity(1);
+        keys.push(signing);
+        keys.extend(previous);
+        Self { keys }
+    }
+
+    /// A ring with a single key — both the signer and the only accepted
+    /// verifier. The common steady-state (no rotation in progress) and the
+    /// drop-in replacement for a bare `WorkerSharedKey`.
+    #[must_use]
+    pub fn single(signing: WorkerSharedKey) -> Self {
+        Self {
+            keys: vec![signing],
+        }
+    }
+
+    /// The key used to sign new outbound messages.
+    #[must_use]
+    pub fn signing_key(&self) -> &WorkerSharedKey {
+        &self.keys[0] // INVARIANT: non-empty
+    }
+
+    /// All keys accepted when verifying an inbound signature, signing key
+    /// first. Callers verify by trying each in turn (constant-time per
+    /// candidate) and accepting on the first match.
+    #[must_use]
+    pub fn verify_keys(&self) -> &[WorkerSharedKey] {
+        &self.keys
+    }
+
+    /// Number of keys in the ring (always ≥ 1).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Always `false` — a ring is never empty. Present to satisfy clippy's
+    /// `len_without_is_empty`; the invariant makes the answer constant.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl std::fmt::Debug for WorkerKeyRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key bytes; report only the shape so a stray `?ring`
+        // can't leak a secret. Mirrors `WorkerSharedKey`'s redaction.
+        f.debug_struct("WorkerKeyRing")
+            .field(
+                "keys",
+                &format_args!("<{} redacted key(s)>", self.keys.len()),
+            )
+            .finish()
+    }
+}
+
+impl From<WorkerSharedKey> for WorkerKeyRing {
+    fn from(signing: WorkerSharedKey) -> Self {
+        Self::single(signing)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +276,50 @@ mod tests {
         let key = WorkerSharedKey::new(vec![9u8; 8]);
         let via_as_ref: &[u8] = key.as_ref();
         assert_eq!(via_as_ref, key.as_bytes());
+    }
+
+    #[test]
+    fn ring_single_has_one_key_that_is_both_signer_and_verifier() {
+        let ring = WorkerKeyRing::single(WorkerSharedKey::new(vec![0xABu8; 32]));
+        assert_eq!(ring.len(), 1);
+        assert!(!ring.is_empty());
+        assert_eq!(ring.signing_key().as_bytes(), &[0xABu8; 32]);
+        assert_eq!(ring.verify_keys().len(), 1);
+        assert_eq!(ring.verify_keys()[0].as_bytes(), &[0xABu8; 32]);
+    }
+
+    #[test]
+    fn ring_signs_with_first_key_and_verifies_against_all() {
+        let signing = WorkerSharedKey::new(vec![1u8; 32]);
+        let prev_a = WorkerSharedKey::new(vec![2u8; 32]);
+        let prev_b = WorkerSharedKey::new(vec![3u8; 32]);
+        let ring = WorkerKeyRing::new(signing, [prev_a, prev_b]);
+
+        assert_eq!(ring.len(), 3);
+        // Signing key is always the first verify candidate.
+        assert_eq!(ring.signing_key().as_bytes(), &[1u8; 32]);
+        let verify: Vec<&[u8]> = ring.verify_keys().iter().map(|k| k.as_bytes()).collect();
+        assert_eq!(verify, vec![&[1u8; 32][..], &[2u8; 32][..], &[3u8; 32][..]]);
+    }
+
+    #[test]
+    fn ring_from_single_key_matches_single_constructor() {
+        let key = WorkerSharedKey::new(vec![7u8; 32]);
+        let ring: WorkerKeyRing = key.clone().into();
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.signing_key().as_bytes(), key.as_bytes());
+    }
+
+    #[test]
+    fn ring_debug_redacts_bytes_but_reports_count() {
+        let ring = WorkerKeyRing::new(
+            WorkerSharedKey::new(vec![0xFFu8; 32]),
+            [WorkerSharedKey::new(vec![0xEEu8; 32])],
+        );
+        let s = format!("{ring:?}");
+        assert!(s.contains("redacted"));
+        assert!(s.contains('2')); // two keys
+        assert!(!s.contains("FF"));
+        assert!(!s.contains("255"));
     }
 }

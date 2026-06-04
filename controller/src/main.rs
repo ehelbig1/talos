@@ -2235,27 +2235,41 @@ async fn main() -> anyhow::Result<()> {
     // must happen before any subscriber starts accepting messages,
     // otherwise verify() fails closed and every request returns
     // Unauthorized.
-    match talos_workflow_job_protocol::load_worker_shared_key() {
-        Ok(key) => {
-            // M-3 (partial): log the same SHA-256 fingerprint format
-            // the worker emits at startup so operators can grep both
-            // process logs for `worker_shared_key_fp=` and confirm
-            // they match. A mismatch means the controller and worker
-            // were configured with different env values — every signed
-            // RPC will fail verification and the error surfaces as
-            // opaque "signature verification failed" until this log
-            // line reveals the drift.
-            {
-                use sha2::Digest as _;
-                let fp_full = sha2::Sha256::digest(key.as_bytes());
-                let fp_short = hex::encode(&fp_full[..4]);
+    // Load the full verify-ring (current + WORKER_SHARED_KEY_PREVIOUS) so the
+    // RPC subscribers accept signatures made under a staged previous key during
+    // a rolling WORKER_SHARED_KEY rotation. Workers SIGN their RPC requests with
+    // the current key only; the controller VERIFIES, so the ring lives here.
+    match talos_workflow_job_protocol::load_worker_key_ring() {
+        Ok(ring) => {
+            // M-3: log the same fingerprint format the worker emits at startup
+            // so operators can grep both process logs for `worker_shared_key_fp=`
+            // and confirm they agree. A signing-key mismatch means controller
+            // and worker were configured with different env values — every
+            // signed RPC fails verification, opaquely, until this line reveals
+            // the drift. During rotation we also log each accepted previous-key
+            // fingerprint so the staged ring is auditable across the fleet.
+            tracing::info!(
+                worker_shared_key_fp =
+                    %talos_workflow_job_protocol::worker_key_fingerprint(ring.signing_key().as_bytes()),
+                verify_key_count = ring.verify_keys().len(),
+                "WORKER_SHARED_KEY loaded; compare this fingerprint against the worker's log line for drift detection"
+            );
+            for prev in ring.verify_keys().iter().skip(1) {
                 tracing::info!(
-                    worker_shared_key_fp = %fp_short,
-                    "WORKER_SHARED_KEY loaded; compare this fingerprint against the worker's log line for drift detection"
+                    previous_worker_shared_key_fp =
+                        %talos_workflow_job_protocol::worker_key_fingerprint(prev.as_bytes()),
+                    "WORKER_SHARED_KEY_PREVIOUS accepted for RPC verification (rotation in progress)"
                 );
             }
-            talos_memory::rpc_auth::register_hmac_key(std::sync::Arc::new(key.as_bytes().to_vec()));
-            tracing::info!("talos-memory RPC HMAC key registered");
+            let signing = std::sync::Arc::new(ring.signing_key().as_bytes().to_vec());
+            let previous: Vec<std::sync::Arc<Vec<u8>>> = ring
+                .verify_keys()
+                .iter()
+                .skip(1)
+                .map(|k| std::sync::Arc::new(k.as_bytes().to_vec()))
+                .collect();
+            talos_memory::rpc_auth::register_hmac_key_ring(signing, previous);
+            tracing::info!("talos-memory RPC HMAC verify-ring registered");
         }
         Err(e) => {
             tracing::error!(
@@ -3137,9 +3151,18 @@ async fn main() -> anyhow::Result<()> {
         let nats_for_results = nats_client
             .clone()
             .ok_or_else(|| anyhow::anyhow!("NATS client missing"))?;
-        // Clone the shared key so it can be moved into the spawn while the original
-        // is still used later to build the Extension layer.
-        let worker_shared_key_for_results = worker_shared_key.clone();
+        // Clone the shared key into a verify-ring (current + any staged
+        // WORKER_SHARED_KEY_PREVIOUS) so this audit observer accepts results
+        // signed under a previous key during a rolling rotation, consistent
+        // with the primary verifier in the engine dispatcher. Moved into the
+        // spawn; the original `worker_shared_key` is still used later for the
+        // Extension layer.
+        let worker_key_ring_for_results = worker_shared_key.clone().map(|signing| {
+            talos_workflow_engine_core::WorkerKeyRing::new(
+                signing,
+                talos_workflow_job_protocol::load_worker_shared_key_previous().unwrap_or_default(),
+            )
+        });
         tokio::spawn(async move {
             tracing::info!("Starting job result subscriber on topic: talos.results.*");
 
@@ -3219,9 +3242,9 @@ async fn main() -> anyhow::Result<()> {
                             // the type level so a future refactor can't
                             // accidentally convert this site to a primary
                             // verifier and reintroduce the r300 regression.
-                            if let Some(ref key) = worker_shared_key_for_results {
-                                if let Err(e) = result.verify_as(
-                                    key.as_bytes(),
+                            if let Some(ref ring) = worker_key_ring_for_results {
+                                if let Err(e) = result.verify_as_with_ring(
+                                    ring,
                                     300,
                                     talos_workflow_job_protocol::Verifier::Observer,
                                 ) {

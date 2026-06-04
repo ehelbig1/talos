@@ -1257,6 +1257,44 @@ impl EncryptedSecrets {
         serde_json::from_slice(&plaintext).map_err(|e| format!("deserialize secrets: {e}"))
     }
 
+    /// Decrypt against a [`WorkerKeyRing`] (the decrypt-ring), trying the
+    /// signing key first then each staged previous key. Returns the first
+    /// success; if all fail, returns the signing-key error.
+    ///
+    /// This is what the worker should call to decrypt `encrypted_secrets`
+    /// during a rolling `WORKER_SHARED_KEY` rotation: the controller may have
+    /// already flipped to encrypting under the new root while a not-yet-rolled
+    /// worker still treats the old root as current (or vice-versa). Because
+    /// the encryptor (controller) and decryptor (worker) are different
+    /// processes, rotation is a **two-phase** operator procedure — see
+    /// [`WorkerKeyRing`]'s rotation note: first deploy the incoming key as an
+    /// *accepted* (previous) key everywhere, then flip the signing key.
+    ///
+    /// AES-256-GCM's tag makes trial-decryption safe: a wrong key cannot forge
+    /// a passing tag, so the worst case is one extra GCM verification per
+    /// staged key. AAD binding is preserved across every attempt.
+    ///
+    /// [`WorkerKeyRing`]: talos_workflow_engine_core::WorkerKeyRing
+    pub fn decrypt_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        aad: &[u8],
+    ) -> Result<HashMap<String, String>, String> {
+        let mut keys = ring.verify_keys().iter();
+        // INVARIANT: a ring is never empty, so `signing` is always present.
+        let signing = keys.next().expect("WorkerKeyRing is never empty");
+        let signing_err = match self.decrypt_with_aad(signing.as_bytes(), aad) {
+            Ok(map) => return Ok(map),
+            Err(e) => e,
+        };
+        for prev in keys {
+            if let Ok(map) = self.decrypt_with_aad(prev.as_bytes(), aad) {
+                return Ok(map);
+            }
+        }
+        Err(signing_err)
+    }
+
     /// Returns `true` if no secrets are stored.
     pub fn is_empty(&self) -> bool {
         self.ciphertext.is_empty()
@@ -1702,6 +1740,52 @@ impl JobRequest {
         Ok(())
     }
 
+    /// Verify against a [`WorkerKeyRing`] (decrypt/verify-ring), recording the
+    /// nonce exactly once. HMAC+freshness is tried per ring member via
+    /// [`Self::verify_no_replay`] — which never touches the replay cache — so
+    /// the nonce is recorded only after a key matches. This avoids the
+    /// multi-key nonce-cache hazard a naive `for k { self.verify(k) }` loop
+    /// would create. The worker uses this to verify dispatched jobs during a
+    /// rolling `WORKER_SHARED_KEY` rotation.
+    ///
+    /// [`WorkerKeyRing`]: talos_workflow_engine_core::WorkerKeyRing
+    pub fn verify_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        let ts = self.verify_no_replay_with_ring(ring, max_age_secs)?;
+        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "job_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ring variant of [`Self::verify_no_replay`]: HMAC+freshness against the
+    /// signing key first, then each staged previous key; first match wins.
+    /// Returns the signing-key error if all fail. Touches no replay cache.
+    pub fn verify_no_replay_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        let mut keys = ring.verify_keys().iter();
+        let signing = keys.next().expect("WorkerKeyRing is never empty");
+        let signing_err = match self.verify_no_replay(signing.as_bytes(), max_age_secs) {
+            Ok(ts) => return Ok(ts),
+            Err(e) => e,
+        };
+        for prev in keys {
+            if let Ok(ts) = self.verify_no_replay(prev.as_bytes(), max_age_secs) {
+                return Ok(ts);
+            }
+        }
+        Err(signing_err)
+    }
+
     /// Verify HMAC signature and nonce freshness **without** recording
     /// the nonce in the replay cache. Returns the parsed timestamp on
     /// success.
@@ -1927,6 +2011,66 @@ impl JobResult {
             Verifier::Primary => self.verify(key, max_age_secs),
             Verifier::Observer => self.verify_no_replay(key, max_age_secs).map(|_| ()),
         }
+    }
+
+    /// Ring variant of [`Self::verify_as`]. The controller verifies worker
+    /// results here; carrying the verify-ring lets a result signed under a
+    /// staged previous key validate during a rolling `WORKER_SHARED_KEY`
+    /// rotation. `Primary` records the nonce exactly once (after a key
+    /// matches, via [`Self::verify_with_ring`]); `Observer` never touches the
+    /// replay cache.
+    pub fn verify_as_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+        role: Verifier,
+    ) -> Result<(), String> {
+        match role {
+            Verifier::Primary => self.verify_with_ring(ring, max_age_secs),
+            Verifier::Observer => self
+                .verify_no_replay_with_ring(ring, max_age_secs)
+                .map(|_| ()),
+        }
+    }
+
+    /// Ring variant of [`Self::verify`]: HMAC+freshness per ring member,
+    /// nonce recorded exactly once after a match. See
+    /// [`JobRequest::verify_with_ring`] for why this is loop-safe.
+    pub fn verify_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        let ts = self.verify_no_replay_with_ring(ring, max_age_secs)?;
+        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "result_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
+    /// each staged previous key; first match wins, signing-key error if all
+    /// fail. Touches no replay cache.
+    pub fn verify_no_replay_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        let mut keys = ring.verify_keys().iter();
+        let signing = keys.next().expect("WorkerKeyRing is never empty");
+        let signing_err = match self.verify_no_replay(signing.as_bytes(), max_age_secs) {
+            Ok(ts) => return Ok(ts),
+            Err(e) => e,
+        };
+        for prev in keys {
+            if let Ok(ts) = self.verify_no_replay(prev.as_bytes(), max_age_secs) {
+                return Ok(ts);
+            }
+        }
+        Err(signing_err)
     }
 
     /// Verify HMAC signature and nonce freshness **without** recording
@@ -2337,6 +2481,45 @@ impl PipelineJobRequest {
         Ok(())
     }
 
+    /// Ring variant of [`Self::verify`]: HMAC+freshness per ring member,
+    /// `job_nonce` recorded exactly once after a match. See
+    /// [`JobRequest::verify_with_ring`] for the loop-safety rationale.
+    pub fn verify_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        let ts = self.verify_no_replay_with_ring(ring, max_age_secs)?;
+        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "job_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
+    /// each staged previous key; first match wins. Touches no replay cache.
+    pub fn verify_no_replay_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        let mut keys = ring.verify_keys().iter();
+        let signing = keys.next().expect("WorkerKeyRing is never empty");
+        let signing_err = match self.verify_no_replay(signing.as_bytes(), max_age_secs) {
+            Ok(ts) => return Ok(ts),
+            Err(e) => e,
+        };
+        for prev in keys {
+            if let Ok(ts) = self.verify_no_replay(prev.as_bytes(), max_age_secs) {
+                return Ok(ts);
+            }
+        }
+        Err(signing_err)
+    }
+
     /// Verify HMAC + freshness WITHOUT touching the replay cache.
     /// 2026-05-28 audit F5 sibling of `JobRequest::verify_no_replay` —
     /// passive observers (metrics, audit subscribers) MUST use this
@@ -2558,6 +2741,61 @@ impl PipelineJobResult {
         }
     }
 
+    /// Ring variant of [`Self::verify_as`] — see
+    /// [`JobResult::verify_as_with_ring`]. Lets a pipeline result signed
+    /// under a staged previous key validate during a rolling rotation.
+    pub fn verify_as_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+        role: Verifier,
+    ) -> Result<(), String> {
+        match role {
+            Verifier::Primary => self.verify_with_ring(ring, max_age_secs),
+            Verifier::Observer => self
+                .verify_no_replay_with_ring(ring, max_age_secs)
+                .map(|_| ()),
+        }
+    }
+
+    /// Ring variant of [`Self::verify`]: `result_nonce` recorded exactly once
+    /// after a ring member matches.
+    pub fn verify_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        let ts = self.verify_no_replay_with_ring(ring, max_age_secs)?;
+        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "result_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
+    /// each staged previous key. Touches no replay cache.
+    pub fn verify_no_replay_with_ring(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        let mut keys = ring.verify_keys().iter();
+        let signing = keys.next().expect("WorkerKeyRing is never empty");
+        let signing_err = match self.verify_no_replay(signing.as_bytes(), max_age_secs) {
+            Ok(ts) => return Ok(ts),
+            Err(e) => e,
+        };
+        for prev in keys {
+            if let Ok(ts) = self.verify_no_replay(prev.as_bytes(), max_age_secs) {
+                return Ok(ts);
+            }
+        }
+        Err(signing_err)
+    }
+
     /// Verify HMAC signature and nonce freshness without recording the
     /// nonce in the replay cache. Returns the parsed timestamp on
     /// success.
@@ -2730,19 +2968,19 @@ impl WorkerHeartbeat {
 ///
 /// # Key rotation
 ///
-/// The key is loaded once via `OnceLock` on both sides — subsequent calls
-/// return the cached value. **Rotating this key requires restarting both
-/// the controller and all workers simultaneously.** A rolling restart
-/// (workers first, then controller, or vice-versa) creates a window where
-/// HMAC verification fails and all NATS RPC requests are rejected.
+/// This returns only the **signing** key. For restart-free rotation, prefer
+/// [`load_worker_key_ring`], which additionally loads `WORKER_SHARED_KEY_PREVIOUS`
+/// and accepts signatures made under previous keys during a rolling restart.
+/// `load_worker_shared_key` is retained for call sites that only ever *sign*
+/// (they always use the current key) and for backward compatibility.
 ///
-/// This is intentional: live rotation of a symmetric signing key without
-/// a key-ID negotiation protocol is strictly harder to get right than a
-/// coordinated restart, and the failure mode of a botched live rotation
-/// (silent signature bypass) is worse than the failure mode of a staggered
-/// restart (loud, temporary request rejection).
+/// Historically this loader documented that rotation *required a simultaneous
+/// restart*, because a bare single-key `OnceLock` rejects every signature made
+/// under a different key. See [`WorkerKeyRing`] for why a verify-ring lifts
+/// that constraint without a wire-format change or key-ID negotiation.
 ///
 /// [`WorkerSharedKey`]: talos_workflow_engine_core::WorkerSharedKey
+/// [`WorkerKeyRing`]: talos_workflow_engine_core::WorkerKeyRing
 pub fn load_worker_shared_key() -> Result<talos_workflow_engine_core::WorkerSharedKey, String> {
     // Support Docker secrets via WORKER_SHARED_KEY_FILE in addition to direct env var
     let hex_key = std::env::var("WORKER_SHARED_KEY")
@@ -2774,9 +3012,139 @@ pub fn load_worker_shared_key() -> Result<talos_workflow_engine_core::WorkerShar
     Ok(talos_workflow_engine_core::WorkerSharedKey::new(key))
 }
 
+/// Decode one 64-hex-char (`32`-byte) shared key from a raw string, applying
+/// the same length + hex validation as [`load_worker_shared_key`]. Used by
+/// [`load_worker_key_ring`] to parse each comma-separated previous key.
+fn decode_shared_key_hex(
+    hex_key: &str,
+    label: &str,
+) -> Result<talos_workflow_engine_core::WorkerSharedKey, String> {
+    let key = hex::decode(hex_key.trim()).map_err(|e| format!("{label} is not valid hex: {e}"))?;
+    if key.len() != 32 {
+        return Err(format!(
+            "{label} must be 32 bytes (64 hex chars), got {} bytes",
+            key.len()
+        ));
+    }
+    Ok(talos_workflow_engine_core::WorkerSharedKey::new(key))
+}
+
+/// Load the worker-shared **key ring** for restart-free signing-key rotation.
+///
+/// * `WORKER_SHARED_KEY` (or `WORKER_SHARED_KEY_FILE`) — the current signing
+///   key. Required; fail-fast if absent or malformed (delegates to
+///   [`load_worker_shared_key`]).
+/// * `WORKER_SHARED_KEY_PREVIOUS` — optional, comma-separated list of previous
+///   64-hex-char keys accepted **for verification only**. Empty / unset means
+///   a single-key ring identical to the old behavior.
+///
+/// New messages are signed under the current key; inbound messages signed
+/// under any ring member verify successfully. See [`WorkerKeyRing`] for the
+/// rotation workflow and the security rationale (no wire change, no key-ID
+/// negotiation, explicit + freshness-bounded acceptance).
+///
+/// At startup the caller should log [`worker_key_fingerprint`] for each ring
+/// member so an operator can confirm the controller and worker fleet agree —
+/// the same drift-detection pattern the AOT key ring uses.
+///
+/// [`WorkerKeyRing`]: talos_workflow_engine_core::WorkerKeyRing
+pub fn load_worker_key_ring() -> Result<talos_workflow_engine_core::WorkerKeyRing, String> {
+    let signing = load_worker_shared_key()?;
+    let previous = load_worker_shared_key_previous()?;
+    Ok(talos_workflow_engine_core::WorkerKeyRing::new(
+        signing, previous,
+    ))
+}
+
+/// Load just the previous (verify/decrypt-only) keys from
+/// `WORKER_SHARED_KEY_PREVIOUS` — the comma-separated list staged during a
+/// rolling rotation. Empty when unset. Factored out of [`load_worker_key_ring`]
+/// so a consumer that already holds the current signing key (e.g. the engine's
+/// `build_nats_dispatcher`) can build the verify-ring without re-reading
+/// `WORKER_SHARED_KEY`.
+pub fn load_worker_shared_key_previous(
+) -> Result<Vec<talos_workflow_engine_core::WorkerSharedKey>, String> {
+    let mut previous = Vec::new();
+    if let Ok(prev) = std::env::var("WORKER_SHARED_KEY_PREVIOUS") {
+        for (idx, raw) in prev.split(',').enumerate() {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            // Label each entry so a bad previous key points at the right slot
+            // without echoing the (secret) value.
+            previous.push(decode_shared_key_hex(
+                raw,
+                &format!("WORKER_SHARED_KEY_PREVIOUS[{idx}]"),
+            )?);
+        }
+    }
+    Ok(previous)
+}
+
+/// Stable, non-secret fingerprint of a shared key for drift-detection logging.
+///
+/// Returns the first 8 hex chars of `HMAC-SHA256(key, "talos-worker-shared-key-fingerprint-v1")`.
+/// Using an HMAC (rather than a bare hash of the key) keeps the key bytes one
+/// pre-image away from the log line; 32 bits is enough to spot a controller↔
+/// worker mismatch while revealing nothing usable about the key.
+#[must_use]
+pub fn worker_key_fingerprint(key: &[u8]) -> String {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(b"talos-worker-shared-key-fingerprint-v1");
+    let tag = mac.finalize().into_bytes();
+    hex::encode(&tag[..4])
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod decrypt_ring_tests {
+    use super::*;
+    use talos_workflow_engine_core::{WorkerKeyRing, WorkerSharedKey};
+
+    fn secrets() -> HashMap<String, String> {
+        HashMap::from([("api_key".to_string(), "s3cr3t".to_string())])
+    }
+
+    #[test]
+    fn ring_decrypts_with_current_key() {
+        let cur = vec![0x01u8; 32];
+        let enc = EncryptedSecrets::encrypt_with_aad(&secrets(), &cur, b"exec").unwrap();
+        let ring = WorkerKeyRing::single(WorkerSharedKey::new(cur));
+        assert_eq!(enc.decrypt_with_ring(&ring, b"exec").unwrap(), secrets());
+    }
+
+    #[test]
+    fn ring_decrypts_secrets_sealed_under_previous_key() {
+        // Controller (not yet flipped) sealed under OLD; this worker's current
+        // key is NEW, OLD staged as previous.
+        let old = vec![0x0Au8; 32];
+        let new = vec![0x0Bu8; 32];
+        let enc = EncryptedSecrets::encrypt_with_aad(&secrets(), &old, b"exec").unwrap();
+
+        let new_only = WorkerKeyRing::single(WorkerSharedKey::new(new.clone()));
+        assert!(enc.decrypt_with_ring(&new_only, b"exec").is_err());
+
+        let ring = WorkerKeyRing::new(WorkerSharedKey::new(new), [WorkerSharedKey::new(old)]);
+        assert_eq!(enc.decrypt_with_ring(&ring, b"exec").unwrap(), secrets());
+    }
+
+    #[test]
+    fn ring_preserves_aad_binding() {
+        let cur = vec![0x01u8; 32];
+        let enc = EncryptedSecrets::encrypt_with_aad(&secrets(), &cur, b"exec-a").unwrap();
+        let ring = WorkerKeyRing::new(
+            WorkerSharedKey::new(cur),
+            [WorkerSharedKey::new(vec![0x02u8; 32])],
+        );
+        // Right key, wrong AAD — no ring member rescues a transposed ciphertext.
+        assert!(enc.decrypt_with_ring(&ring, b"exec-b").is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {
