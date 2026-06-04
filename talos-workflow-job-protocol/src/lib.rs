@@ -42,6 +42,16 @@ fn derive_envelope_aead_key(root: &[u8]) -> [u8; 32] {
     subkey
 }
 
+/// Length-prefix a variable-width string segment for a canonical signing
+/// payload: `"<byte-len>:<value>"`. Prefixing makes the boundary against the
+/// next segment unambiguous, so two adjacent free-form fields can't be shifted
+/// to forge an identical concatenation (the payload-collision class the
+/// `JobRequest` / `PipelineJobRequest` signing payloads guard against). Shared
+/// by both `signing_payload` impls so the discipline can't drift between them.
+fn lp(s: &str) -> String {
+    format!("{}:{}", s.len(), s)
+}
+
 /// Maximum future-skew tolerance for nonce timestamps (seconds).
 ///
 /// Controller and worker sit on the same NATS cluster and should be
@@ -1581,9 +1591,7 @@ impl JobRequest {
         // header already disambiguates, but an extension that adds a
         // new free-form string field could re-introduce the collision
         // class. The length-prefix discipline is forward-safe.
-        fn lp(s: &str) -> String {
-            format!("{}:{}", s.len(), s)
-        }
+        // (`lp` is the module-level length-prefix helper.)
 
         // H-1: reply_topic. Sentinel `-` for None so absence is
         // tamper-evident (an attacker can't strip the field to
@@ -2326,10 +2334,7 @@ impl PipelineJobRequest {
         // L-9 (pipeline): length-prefix the user-controlled string
         // segments so internal `:` / `,` characters can't cause
         // payload-collisions. Existing fixed-width fields stay
-        // unchanged.
-        fn lp(s: &str) -> String {
-            format!("{}:{}", s.len(), s)
-        }
+        // unchanged. (`lp` is the module-level length-prefix helper.)
         let step_hashes_joined = step_hashes.join(":");
         let step_integrations_joined = step_integrations.join(",");
 
