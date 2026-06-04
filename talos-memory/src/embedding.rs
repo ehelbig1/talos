@@ -113,6 +113,53 @@ impl EmbeddingConfig {
             self.model, self.api_url, self.dimensions
         )
     }
+
+    /// True when the embedding endpoint is HOST-LOCAL — loopback, a
+    /// private/link-local IP literal, or a single-label / `.svc` / `.local` /
+    /// `.internal` / `.cluster.local` Kubernetes service name (the in-cluster
+    /// Ollama default is `http://ollama:11434/...`). Used to enforce the tier-1
+    /// data-egress ceiling: a tier-1 ("data must not leave the host") actor's
+    /// text must never be embedded by an EXTERNAL provider (api.openai.com,
+    /// Voyage, Cohere, …). The classification errs CLOSED — an ambiguous
+    /// public-looking FQDN is treated as EXTERNAL (tier-1 skips it) rather than
+    /// risking egress.
+    pub fn is_local_provider(&self) -> bool {
+        // Extract the host from `scheme://[user@]host[:port]/path`.
+        let after_scheme = self.api_url.split("://").nth(1).unwrap_or(&self.api_url);
+        let authority = after_scheme.split('/').next().unwrap_or("");
+        let host_port = authority.rsplit('@').next().unwrap_or("");
+        // Strip the port (handle `[ipv6]:port` and `host:port`).
+        let host = if let Some(stripped) = host_port.strip_prefix('[') {
+            stripped.split(']').next().unwrap_or("")
+        } else {
+            host_port.split(':').next().unwrap_or("")
+        };
+        if host.is_empty() {
+            return false;
+        }
+        let lower = host.to_ascii_lowercase();
+        if lower == "localhost" {
+            return true;
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return match ip {
+                std::net::IpAddr::V4(v4) => {
+                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                }
+                std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+            };
+        }
+        // Hostname (not an IP literal): single-label k8s service names (no dot)
+        // and internal suffixes are local; anything else (a public FQDN) is
+        // external.
+        if !lower.contains('.') {
+            return true;
+        }
+        lower.ends_with(".local")
+            || lower.ends_with(".svc")
+            || lower.ends_with(".internal")
+            || lower.ends_with(".cluster.local")
+    }
 }
 
 /// Generate an embedding for `text`, or return `None` if the provider
@@ -258,10 +305,30 @@ impl Drop for InFlightGuard<'_> {
     }
 }
 
-pub async fn generate_embedding(text: &str) -> Option<Vec<f32>> {
+pub async fn generate_embedding(text: &str, local_only: bool) -> Option<Vec<f32>> {
     // L-3: serve config from the OnceLock-backed cache. First call pays
     // the env-var read cost; subsequent calls are a single Arc clone.
     let config = EmbeddingConfig::cached()?;
+    // Tier-1 data-egress ceiling. When the caller marks `local_only` (the
+    // requesting actor's `max_llm_tier` is tier1 — "data must not leave the
+    // host") and the configured embedding provider is NOT host-local, SKIP the
+    // embedding entirely rather than egressing the actor's text to an external
+    // provider. The memory op proceeds without a vector (semantic recall
+    // degrades to keyword/recency for that actor); a loud audit WARN tells the
+    // operator to configure a local in-cluster embedder for tier-1. Fail-closed,
+    // matching the worker's 5 LLM surfaces + raw-socket gate (PR #156): the
+    // controller-side embedding path was the unguarded sibling egress channel.
+    if local_only && !config.is_local_provider() {
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "tier1_embedding_skipped_external_provider",
+            endpoint = %config.api_url,
+            "tier-1 embedding SKIPPED: the configured embedding provider is external, \
+             and a tier-1 actor's data must not leave the host. Configure a local \
+             (in-cluster Ollama) EMBEDDING_API_URL to enable semantic memory for tier-1 actors."
+        );
+        return None;
+    }
     // MCP-479: byte-slice at fixed offset 8000 panics when byte 8000 falls
     // inside a multi-byte UTF-8 sequence. `text` is user-supplied actor-
     // memory content; an attacker can store an 8001-byte memory containing
@@ -495,7 +562,8 @@ async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Opti
 /// the caller so controller startup isn't delayed by a slow provider.
 pub async fn warmup() {
     let started = std::time::Instant::now();
-    let result = generate_embedding("talos embedding warmup ping").await;
+    // Warmup ping carries no actor data — never tier-restricted.
+    let result = generate_embedding("talos embedding warmup ping", false).await;
     match result {
         Some(v) => tracing::info!(
             dims = v.len(),
@@ -508,5 +576,50 @@ pub async fn warmup() {
              to no-embedding (searches fall back to keyword). \
              Configure EMBEDDING_API_URL + EMBEDDING_TIMEOUT_SECS or disable."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tier_egress_tests {
+    use super::*;
+
+    fn cfg(url: &str) -> EmbeddingConfig {
+        EmbeddingConfig {
+            api_url: url.to_string(),
+            api_key: None,
+            model: "m".into(),
+            dimensions: 768,
+        }
+    }
+
+    #[test]
+    fn local_providers_classified_local() {
+        // The tier-1 gate allows embedding ONLY when the provider is host-local.
+        for url in [
+            "http://ollama:11434/v1/embeddings",     // k8s short service name
+            "http://localhost:11434/v1/embeddings",  // loopback name
+            "http://127.0.0.1:11434/v1/embeddings",  // loopback v4
+            "http://[::1]:11434/v1/embeddings",      // loopback v6
+            "http://10.0.0.5:8080/embed",            // RFC-1918
+            "http://192.168.1.9/embed",              // RFC-1918
+            "http://embeddings.svc.cluster.local/e", // in-cluster suffix
+            "http://embed.internal/e",               // internal suffix
+        ] {
+            assert!(cfg(url).is_local_provider(), "should be LOCAL: {url}");
+        }
+    }
+
+    #[test]
+    fn external_providers_classified_external() {
+        // These MUST be external so a tier-1 actor's data is never embedded here.
+        for url in [
+            "https://api.openai.com/v1/embeddings",
+            "https://api.voyageai.com/v1/embeddings",
+            "https://api.cohere.ai/v1/embed",
+            "https://embeddings.example.com/e", // public FQDN → errs external
+            "https://8.8.8.8/embed",            // public IP literal
+        ] {
+            assert!(!cfg(url).is_local_provider(), "should be EXTERNAL: {url}");
+        }
     }
 }
