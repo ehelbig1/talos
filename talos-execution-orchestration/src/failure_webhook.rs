@@ -53,14 +53,18 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// signal to operators that alerting itself was broken; loud
 /// first-call panic is the better failure mode.
 static FAILURE_WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(WEBHOOK_TIMEOUT)
-        .connect_timeout(Duration::from_secs(2))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect(
-            "talos-execution-orchestration: failed to build failure-webhook HTTP client (TLS init)",
-        )
+    // Built via the shared SSRF-safe builder: redirect(none) + the connect-time
+    // ControllerSsrfResolver closing the DNS-rebinding TOCTOU the call-time
+    // `check_outbound_url_no_ssrf` (at fire time) can't. The failure-notification
+    // URL is user-supplied (set_failure_notification), so without the resolver an
+    // attacker controlling its DNS could rebind it to 169.254.169.254 / an
+    // internal service after validation. (The connect-timeout is the builder's
+    // shared 5 s rather than the previous 2 s — a negligible fast-fail change.)
+    talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
+        "talos-failure-webhook/1.0",
+        WEBHOOK_TIMEOUT,
+    )
+    .expect("talos-execution-orchestration: failed to build failure-webhook HTTP client (TLS init)")
 });
 
 pub(crate) async fn dispatch_failure_webhook(

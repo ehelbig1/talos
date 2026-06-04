@@ -10,11 +10,19 @@ publish.workspace = true
 talos-ssrf-classify = { path = "../talos-ssrf-classify" }
 axum = { version = "0.8", features = ["json"] }
 regex = "1.12"
+# `outbound`: the connect-time SSRF resolver + the SSRF-safe outbound-webhook
+# client builder live next to the call-time `ssrf` check so all controller
+# outbound-URL SSRF defense is in one crate (reachable by every fire-site crate
+# — talos-engine / talos-execution-orchestration / talos-mcp-handlers — which
+# all already depend on talos-http-utils). `tokio` "net" is for the resolver's
+# `lookup_host`; reqwest matches the workspace feature set.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["net"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "net"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

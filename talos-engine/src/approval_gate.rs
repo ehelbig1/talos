@@ -9,7 +9,6 @@
 use async_trait::async_trait;
 use sqlx::{Pool, Postgres};
 use std::sync::LazyLock;
-use std::time::Duration;
 use talos_workflow_engine_core::{ApprovalGate, ApprovalStatus, BoxError};
 use uuid::Uuid;
 
@@ -39,11 +38,13 @@ use uuid::Uuid;
 /// notification fire was broken; loud first-call panic is the
 /// better failure mode for a deployment-time TLS issue.
 static APPROVAL_WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+    // Built via the shared SSRF-safe builder: redirect(none) + the connect-time
+    // ControllerSsrfResolver closing the DNS-rebinding TOCTOU the call-time
+    // `check_outbound_url_no_ssrf` (at fire time) can't. The `notification_webhook`
+    // URL is user-supplied (approval-gate node config), so without the resolver an
+    // attacker controlling its DNS could rebind it to 169.254.169.254 / an
+    // internal service after validation.
+    talos_http_utils::outbound::build_outbound_webhook_client("talos-approval-webhook/1.0")
         .expect("talos-engine: failed to build approval-gate webhook HTTP client (TLS init)")
 });
 

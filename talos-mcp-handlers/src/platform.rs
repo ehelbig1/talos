@@ -1501,12 +1501,16 @@ async fn handle_call_a2a_agent(
     // MCP-1034: explicit connect_timeout for fast-fail on black-holed
     // A2A endpoint — `timeout_secs` is operator-supplied and may be
     // 60s+, but connect should complete in seconds.
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    // Built via the shared SSRF-safe builder: redirect(none) + the connect-time
+    // ControllerSsrfResolver closing the DNS-rebinding TOCTOU the call-time
+    // `check_outbound_url_no_ssrf` (above) can't. `endpoint_url` is fully
+    // caller-supplied, so without the resolver an attacker controlling its DNS
+    // could rebind it to 169.254.169.254 / the controller's own datastores after
+    // validation. `timeout_secs` is operator-supplied (may be 60s+).
+    let client = match talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
+        "talos-a2a/1.0",
+        std::time::Duration::from_secs(timeout_secs),
+    ) {
         Ok(c) => c,
         Err(e) => {
             // MCP-351 (2026-05-11): reqwest::Error from Client::builder()

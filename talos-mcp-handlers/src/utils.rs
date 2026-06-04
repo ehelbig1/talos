@@ -1513,17 +1513,14 @@ pub async fn dispatch_failure_webhook(
     // MCP-470: prophylactic — this helper is currently unreferenced
     // (the live failure-webhook path moved to
     // `talos-execution-orchestration::failure_webhook`) but is `pub`
-    // and could be re-discovered. Disable redirect-following so a
-    // future caller doesn't reopen the SSRF-pivot bypass closed in
-    // MCP-469 / MCP-470.
-    // MCP-1034: connect_timeout of 2s on a 5s overall budget — connect
-    // must succeed quickly or the call fails fast.
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    // and could be re-discovered. Built via the shared SSRF-safe builder
+    // so a future caller inherits redirect(none) AND the connect-time
+    // ControllerSsrfResolver (DNS-rebinding gate) — not just the
+    // redirect-pivot defense MCP-469/470 added here.
+    let client = match talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
+        "talos-failure-webhook/1.0",
+        std::time::Duration::from_secs(5),
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
