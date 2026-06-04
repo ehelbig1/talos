@@ -19,9 +19,9 @@ use uuid::Uuid;
 // service crate so existing `crate::search::*` callers keep resolving.
 pub use talos_search_service::{
     auto_embed_workflow, embedding_provider_available, embedding_provider_status,
-    generate_embedding, generate_embeddings_batch, refresh_embedding_provider_health,
-    vec_to_pgvector_literal, workflow_embedding_text, EmbeddingConfig, EmbeddingError,
-    EMBED_BATCH_MAX, PROVIDER_PROBE_INTERVAL,
+    generate_embedding, generate_embeddings_batch, provider_is_external,
+    refresh_embedding_provider_health, vec_to_pgvector_literal, workflow_embedding_text,
+    EmbeddingConfig, EmbeddingError, EMBED_BATCH_MAX, PROVIDER_PROBE_INTERVAL,
 };
 
 // Local re-export of the SQL-input safety helper used by the

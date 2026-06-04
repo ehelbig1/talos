@@ -163,6 +163,55 @@ impl EmbeddingConfig {
             self.model, self.api_url, self.dimensions
         )
     }
+
+    /// True when the embedding endpoint is HOST-LOCAL — loopback, a private/
+    /// link-local IP literal, or a single-label / `.svc` / `.local` /
+    /// `.internal` / `.cluster.local` Kubernetes service name. Used to enforce
+    /// the tier-1 data-egress ceiling: a tier-1 actor's text must never be
+    /// embedded by an EXTERNAL provider. Errs CLOSED (ambiguous public-looking
+    /// FQDN → external). KEEP IN LOCKSTEP with
+    /// `talos_memory::embedding::EmbeddingConfig::is_local_provider` (PR #164) —
+    /// the two embedding clients are parallel implementations.
+    pub fn is_local_provider(&self) -> bool {
+        let after_scheme = self.api_url.split("://").nth(1).unwrap_or(&self.api_url);
+        let authority = after_scheme.split('/').next().unwrap_or("");
+        let host_port = authority.rsplit('@').next().unwrap_or("");
+        let host = if let Some(stripped) = host_port.strip_prefix('[') {
+            stripped.split(']').next().unwrap_or("")
+        } else {
+            host_port.split(':').next().unwrap_or("")
+        };
+        if host.is_empty() {
+            return false;
+        }
+        let lower = host.to_ascii_lowercase();
+        if lower == "localhost" {
+            return true;
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return match ip {
+                std::net::IpAddr::V4(v4) => {
+                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                }
+                std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+            };
+        }
+        if !lower.contains('.') {
+            return true;
+        }
+        lower.ends_with(".local")
+            || lower.ends_with(".svc")
+            || lower.ends_with(".internal")
+            || lower.ends_with(".cluster.local")
+    }
+}
+
+/// True when the configured embedding provider is EXTERNAL (off-host) — i.e. a
+/// tier-1 actor's text must not be embedded through it. Returns `false` when no
+/// provider is configured (nothing to leak to). Used by actor-bound callers to
+/// gate the embed against the per-actor `max_llm_tier` ceiling (PR #164 sibling).
+pub fn provider_is_external() -> bool {
+    EmbeddingConfig::from_env().is_some_and(|c| !c.is_local_provider())
 }
 
 /// Read an env var and treat empty strings as unset. Critical for
@@ -600,5 +649,38 @@ mod tests {
     fn workflow_embedding_text_joins_capabilities() {
         let s = workflow_embedding_text("n", None, &["a".into(), "b".into()], Some("intent"));
         assert_eq!(s, "n. a, b. intent");
+    }
+
+    fn cfg(url: &str) -> EmbeddingConfig {
+        EmbeddingConfig {
+            api_url: url.to_string(),
+            api_key: None,
+            model: "m".into(),
+            dimensions: 768,
+        }
+    }
+
+    #[test]
+    fn is_local_provider_classification() {
+        // KEEP IN LOCKSTEP with talos_memory::embedding's equivalent test.
+        for url in [
+            "http://ollama:11434/v1/embeddings",
+            "http://localhost:11434/e",
+            "http://127.0.0.1:11434/e",
+            "http://[::1]:11434/e",
+            "http://10.0.0.5/e",
+            "http://embeddings.svc.cluster.local/e",
+            "http://embed.internal/e",
+        ] {
+            assert!(cfg(url).is_local_provider(), "LOCAL: {url}");
+        }
+        for url in [
+            "https://api.openai.com/v1/embeddings",
+            "https://api.voyageai.com/v1/embeddings",
+            "https://embeddings.example.com/e",
+            "https://8.8.8.8/e",
+        ] {
+            assert!(!cfg(url).is_local_provider(), "EXTERNAL: {url}");
+        }
     }
 }

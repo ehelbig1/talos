@@ -7389,9 +7389,32 @@ async fn handle_get_few_shot_examples(
 
     // Semantic search using the task description embedding. Falls through to
     // keyword path on any embed failure — best-effort.
-    let embedding = crate::search::generate_embedding(task_description)
-        .await
-        .ok();
+    //
+    // Tier-1 data-egress ceiling (PR #164 sibling): `task_description` is
+    // embedded to search THIS actor's memory examples. If the embedding provider
+    // is external and the actor is tier-1 ("data must not leave the host"), skip
+    // the embed — the query text must not egress — and fall through to the
+    // keyword path. Mirrors graph-RAG's `actor_allows_external_llm` posture: only
+    // Tier2 permits the external call; tier-1 / unknown-actor / lookup-error all
+    // fail CLOSED. Authoritative tier (DB, not a worker claim).
+    let external_embed_blocked = crate::search::provider_is_external()
+        && !matches!(
+            state.actor_repo.get_actor_max_llm_tier(actor_id).await,
+            Ok(Some(talos_workflow_job_protocol::LlmTier::Tier2))
+        );
+    let embedding = if external_embed_blocked {
+        tracing::warn!(
+            target: "talos_audit",
+            %actor_id,
+            "get_few_shot_examples: external embedding provider + non-tier2 actor — skipping the \
+             embed to honor the tier-1 data-egress ceiling; using the keyword fallback"
+        );
+        None
+    } else {
+        crate::search::generate_embedding(task_description)
+            .await
+            .ok()
+    };
 
     let rows_opt: Option<Vec<talos_actor_repository::MemoryExample>> = if let Some(emb) = embedding
     {
