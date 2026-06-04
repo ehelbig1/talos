@@ -3494,7 +3494,7 @@ impl TalosRuntime {
     /// Pre‑compile a WASM module to native code (AOT compilation).
     /// Generates a serialized, pre‑compiled module that loads 10‑100× faster.
     ///
-    /// Blob format: `[TALOSV4 (7 bytes)] [HMAC-SHA256 (32 bytes)] [serialized component]`
+    /// Blob format: `[AOT_VERSION_HDR (7 bytes; currently "TALOSV5")] [HMAC-SHA256 (32 bytes)] [serialized component]`
     ///
     /// The HMAC prevents tampered blobs from reaching `unsafe
     /// Component::deserialize`. `cap` is included in the HMAC input
@@ -3604,8 +3604,8 @@ impl TalosRuntime {
         let (hdr, after_hdr) = precompiled_bytes.split_at(VERSION_HDR.len());
         if hdr != VERSION_HDR {
             anyhow::bail!(
-                "Precompiled WASM version mismatch – expected {} (wasmtime 43, \
-                 cap-world + engine-config-bound HMAC). This blob was compiled \
+                "Precompiled WASM version mismatch – expected {} (version-, \
+                 cap-world-, and engine-config-bound HMAC). This blob was compiled \
                  with an older Talos version. Recompile the module.",
                 std::str::from_utf8(VERSION_HDR).unwrap_or("?")
             );
