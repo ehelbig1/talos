@@ -2782,6 +2782,70 @@ else
 fi
 echo
 
+# ── 39. No bare status-clobber writes to workflow_executions ──────────
+bold "▶ check 39: workflow_executions status writes must carry a status guard"
+
+# An `UPDATE workflow_executions SET status='<literal>' ... WHERE id=$N` with NO
+# `AND status ...` precondition can CLOBBER a row another writer owns. The
+# crash-recovery sweep flips a stalled `running` row to `resuming`
+# (claim_stuck_execution_for_resume); a superseded dispatcher's bare failure
+# write then clobbers `resuming -> failed`, defeating recovery (PR #159), and a
+# late/duplicate write can re-clobber an already-terminal row or RESURRECT a
+# finished one (the resume_workflow `pending` TOCTOU, PR #158). The canonical
+# repo methods (mark_execution_completed/failed/waiting, …) all guard
+# `AND status …`; secondary dispatchers must too — the safe uniform guard is
+# `AND status NOT IN ('completed','failed','cancelled','resuming')` (admits every
+# legit non-terminal owned state, fences resuming + terminal). This freezes it:
+# any single-line `UPDATE workflow_executions … SET status='<lit>' … WHERE id=$N`
+# lacking `AND status` fails. (Parameterised `SET status=$N` and multi-line SQL
+# are out of scope — the common regression shape is single-line literal.)
+# Opt-out: `// allow-bare-status-write: <reason>` within 4 lines above.
+
+STATUS_CLOBBER_VIOLATIONS=0
+if [ -n "$RG_BIN" ]; then
+    sc_matches=$("$RG_BIN" -n --no-heading -g '*.rs' -g '!**/tests/**' -g '!**/*_tests.rs' \
+        -e "UPDATE workflow_executions.*SET status = '[a-z]+'.*WHERE id = [\$][0-9]" \
+        . 2>/dev/null || true)
+else
+    sc_matches=$(grep -rnE --include='*.rs' \
+        "UPDATE workflow_executions.*SET status = '[a-z]+'.*WHERE id = [\$][0-9]" \
+        talos-* controller worker 2>/dev/null | grep -vE '/tests/|_tests\.rs' || true)
+fi
+
+if [ -n "$sc_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Guarded (carries a status precondition) → OK.
+        if echo "$body" | grep -q 'AND status'; then
+            continue
+        fi
+        # Opt-out marker within 4 lines above.
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q 'allow-bare-status-write'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        STATUS_CLOBBER_VIOLATIONS=$((STATUS_CLOBBER_VIOLATIONS + 1))
+    done <<< "$sc_matches"
+fi
+
+if [ "$STATUS_CLOBBER_VIOLATIONS" -gt 0 ]; then
+    red "✗ $STATUS_CLOBBER_VIOLATIONS bare workflow_executions status write(s) with no status guard"
+    yellow "  → add a status precondition, e.g. AND status NOT IN ('completed','failed','cancelled','resuming')"
+    yellow "    (PR #158/#159), or route through the guarded WorkflowRepository::mark_execution_* methods."
+    yellow "  → or // allow-bare-status-write: <reason> for an intentional unconditional write."
+    EXIT_CODE=1
+else
+    green "✓ workflow_executions status writes all carry a status guard"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
