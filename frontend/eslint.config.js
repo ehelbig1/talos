@@ -1,6 +1,7 @@
 import js from "@eslint/js";
 import tsPlugin from "@typescript-eslint/eslint-plugin";
 import tsParser from "@typescript-eslint/parser";
+import reactHooks from "eslint-plugin-react-hooks";
 import prettierConfig from "eslint-config-prettier";
 
 export default [
@@ -33,8 +34,17 @@ export default [
         },
         plugins: {
             "@typescript-eslint": tsPlugin,
+            "react-hooks": reactHooks,
         },
         rules: {
+            // React hooks correctness — the two battle-tested baseline rules
+            // (NOT the full v7 React-Compiler `recommended` set, which is a
+            // separate, larger migration tracked in docs/backlog.md).
+            // `rules-of-hooks` catches conditional/loop hook calls (real bugs);
+            // `exhaustive-deps` is a warning (stale-closure hint, non-blocking).
+            "react-hooks/rules-of-hooks": "error",
+            "react-hooks/exhaustive-deps": "warn",
+
             // Use TypeScript-aware rules instead of base ESLint rules
             "no-unused-vars": "off",
             "@typescript-eslint/no-unused-vars": [
