@@ -4162,7 +4162,7 @@ mod tests {
         // which pattern fires first (TOKEN for `token=…`, API_KEY for
         // `sk-…`) — what matters is that the secret value is gone AND
         // a redaction marker took its place.
-        let secret = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let secret = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAA"; // secret-scan-allow: DLP redaction test fixture
         let raw = format!("thread '<unnamed>' panicked at '{secret} leaked', src/lib.rs:7:5\n");
         let redacted = talos_dlp_provider::redact_str(&raw);
         assert!(
@@ -4189,7 +4189,7 @@ mod tests {
     /// look like (`panic!("auth failed: {sk_key}")`).
     #[test]
     fn redact_str_masks_bare_sk_prefix() {
-        let secret = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let secret = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAA"; // secret-scan-allow: DLP redaction test fixture
         let raw = format!("panicked at 'auth failed: {secret}'");
         let redacted = talos_dlp_provider::redact_str(&raw);
         assert!(
@@ -4207,7 +4207,7 @@ mod tests {
     /// refactors that inadvertently double-apply.
     #[test]
     fn redact_str_is_idempotent() {
-        let raw = "panicked at 'sk-AAAAAAAAAAAAAAAAAAAA leaked'";
+        let raw = "panicked at 'sk-AAAAAAAAAAAAAAAAAAAA leaked'"; // secret-scan-allow: DLP redaction test fixture
         let once = talos_dlp_provider::redact_str(raw);
         let twice = talos_dlp_provider::redact_str(&once);
         assert_eq!(once, twice, "redact_str should be idempotent");

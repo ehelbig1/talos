@@ -6668,10 +6668,10 @@ mod scrub_wasm_log_for_broadcast_tests {
 
     #[test]
     fn redacts_github_token() {
-        let raw = "git push uses ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let raw = "git push uses ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // secret-scan-allow: DLP redaction test fixture
         let out = scrub_wasm_log_for_broadcast(raw);
         assert!(
-            !out.contains("ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            !out.contains("ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), // secret-scan-allow: DLP redaction test fixture
             "GitHub PAT must be redacted. Got: {out}"
         );
     }
