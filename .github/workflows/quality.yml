@@ -124,6 +124,17 @@ jobs:
       - name: Run library unit tests
         run: cargo nextest run --workspace --lib --no-fail-fast
 
+      - name: Run module-template catalog tests
+        # An integration binary (so NOT covered by --lib above), but DB-free: it
+        # exercises talos_module_templates::all_templates disk discovery, reading
+        # `module-templates/` straight from the checkout. Brought into CI once the
+        # CARGO_MANIFEST_DIR path-resolution bug was fixed (the discovery fallback
+        # had silently resolved to a non-existent dir since the May-2026 crate move,
+        # so every get_template() returned None). The OTHER tests/-dir binaries are
+        # still excluded here — they need a seeded catalog / built WASM sandbox /
+        # full-app DB harness (tracked in docs/backlog.md).
+        run: cargo nextest run -p controller --test module_template_tests
+
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable
   # pgvector + Redis via Docker (available on ubuntu-latest), applies the full
