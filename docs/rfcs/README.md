@@ -46,6 +46,10 @@ Four-digit, zero-padded, allocated in order. Never reused.
 |---|-------|--------|--------|
 | [0001](0001-multi-tenancy.md) | Multi-tenancy implementation | Draft | Three-phase plan for T1 logical + T2 cryptographic + T3 physical tenant isolation |
 | [0002](0002-extract-compilation-service.md) | Extract the compilation service | Draft | First extraction from the controller monolith; compilation as HTTP service behind a feature flag |
+| [0003](0003-durable-execution.md) | Durable workflow execution | In progress | Controller-restart resume of checkpointed executions; Phase 1 landed, flag-gated default-off |
+| [0004](0004-tenant-equals-organization.md) | Tenant = Organization | In progress | The tenant is the organization; membership-union policy, GUC primitives, permissive rollout (M1 landing) |
+| [0005](0005-tenant-isolation-target-architecture.md) | Tenant-isolation target architecture | Draft | End-state RLS: dual-role via `SET LOCAL ROLE`, request-scoped unit-of-work, fail-closed `WITH CHECK`; executed in stages |
+| [0006](0006-org-scoped-write-isolation-pins-org-not-user.md) | Org-scoped write isolation pins `org_id`, not `user_id` | Draft | Decision record under 0005 §3: org-scoped `WITH CHECK` pins the active org, not the user — intra-org per-user ownership stays app-layer; awaiting sign-off before enforcement flips |
 
 ## Template for new RFCs
 
