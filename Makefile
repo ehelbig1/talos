@@ -134,10 +134,15 @@ audit: ## Supply-chain gates — cargo-deny (advisories + licenses + bans + sour
 	@printf '▶ cargo deny check\n'
 	@cargo deny check
 	@printf '▶ secret-pattern scan\n'
+	@# A line may opt out with a `// secret-scan-allow: <reason>` trailing
+	@# marker — used ONLY for DLP/redaction test fixtures that legitimately
+	@# embed a secret-shaped literal (e.g. `sk-AAAA…`, `ghp_aaaa…`). The
+	@# `grep -v` drops marked lines; any UNmarked match is a real finding.
 	@if grep -rEn "AKIA[0-9A-Z]{16}|sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|glpat-[a-zA-Z0-9_-]{20,}" \
 	    --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' \
 	    --exclude=dlp.rs \
-	    controller/src worker/src frontend/src sdks 2>/dev/null; then \
+	    controller/src worker/src frontend/src sdks 2>/dev/null \
+	    | grep -v 'secret-scan-allow'; then \
 	    printf '\033[1;31m✗ hardcoded secret pattern detected\033[0m\n'; exit 1; \
 	fi
 	@printf '▶ migration idempotency check\n'

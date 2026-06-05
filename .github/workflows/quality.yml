@@ -56,14 +56,13 @@ jobs:
         with:
           tool: cargo-deny
 
-      - name: cargo deny check (incl. networked RUSTSEC advisories)
-        # The networked supply-chain gate: advisories (fetches the RustSec DB)
-        # + bans + licenses + sources. This is the piece the OFFLINE pre-push
-        # gate can't run. NOT the full `make audit` — its secret-pattern scan
-        # currently false-positives on legitimate test fixtures (sk-AAAA… DLP
-        # redaction tests); fixing + relocating that offline check is tracked
-        # in docs/backlog.md.
-        run: cargo deny check
+      - name: make audit
+        # Full supply-chain gate: cargo-deny (networked advisories + bans +
+        # licenses + sources) + the secret-pattern scan + migration-idempotency
+        # check. Single source of truth with the local `make audit`. The scan's
+        # earlier false-positive on DLP test fixtures (sk-AAAA…) is fixed via the
+        # `// secret-scan-allow:` opt-out marker, so the full gate now runs here.
+        run: make audit
 
   # ── Rust unit tests: library unit tests only (cargo nextest --lib) ─────────
   # Scoped to `--lib` (~1.3k DB-free unit tests). The `tests/`-dir integration
