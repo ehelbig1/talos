@@ -203,3 +203,23 @@ deferred:
 `make lint`, so the frontend gates can't silently re-rot. The remaining
 enforcement gap is the same as Rust's: contributors who skip `make hooks` and
 the absence of an auto-triggered CI run — see the CI heavy-gates item above.
+
+---
+
+## Bump remaining Node-20 actions in the dispatch-only publish workflows
+
+**Added:** 2026-06-05. **Priority: low (dispatch-only; GitHub forces Node 24 on June 16).**
+
+The PR-validated workflows (`quality.yml`, `ci.yml`) had their JS actions bumped
+to Node-24 SHAs (`actions/checkout` v6, `actions/setup-node` v6,
+`Swatinem/rust-cache` v2.9.1, `taiki-e/install-action` v2.81.6). The remaining
+Node-20 / older JS actions live only in the **dispatch-only** publish workflows
+(`release.yml`, `main-publish.yml`, `template-publish.yml`), so they don't run on
+PRs and aren't gate-validated:
+`actions/upload-artifact` (v4.4.3 / v4.6.2), `actions/download-artifact` (v4.3.0),
+`docker/{login,setup-buildx,build-push}-action`, `sigstore/cosign-installer`,
+`imjasonh/setup-crane`, `softprops/action-gh-release`. Bump them (latest SHAs)
+before the next image publish; lower urgency since they only run on manual
+dispatch. (Also latent: `actionlint` flags `release.yml` calling `ci.yml` as a
+reusable workflow while `ci.yml` lacks a `workflow_call:` trigger — fix or drop
+that `uses:` when touching release.yml.)
