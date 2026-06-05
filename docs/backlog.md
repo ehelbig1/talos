@@ -58,18 +58,45 @@ Running it on PRs (or nightly) would have caught it immediately.
 
 ---
 
-## Enforce the heavy / networked CI gates (advisory audit + test suite) — DONE (PR pending)
+## Bring the `tests/`-dir integration binaries into CI
+
+**Added:** 2026-06-05. **Priority: medium (coverage gap).**
+
+`quality.yml`'s `test` job is scoped to `cargo nextest --workspace --lib` (the
+~1.3k DB-free library unit tests) because its first real CI runs exposed that
+several `tests/`-dir integration binaries have **never run in CI** and fail on
+unmet environment, not real bugs:
+- `controller/tests/module_template_tests.rs` — `get_template("http-request")`
+  returns `None`; the **template catalog isn't seeded** in the test process.
+- `worker/tests/sandbox_security_tests.rs` (path-traversal, etc.) — needs a
+  built **WASM sandbox context**; `make_context()` behaves differently in CI.
+- `controller/tests/integration_mcp_tests.rs`, `api_auth_integration_test`,
+  `api_key_tests` — **full-app DB harness** (the all-zero `TALOS_MASTER_KEY`
+  was one such blocker, already fixed).
+
+These pass locally (full dev env) but were silently never-in-CI. Bringing them
+in is per-binary work: seed the catalog, build/provide the WASM fixtures, wire
+the full-app harness + DB. The **DB-backed** suite that mattered most (RLS
+isolation, crash-recovery, memory) is already covered by the `integration` job
+(`make test-integration`). Do this as a deliberate follow-up; until then the
+`test` job gates the lib unit suite and the `integration` job gates the curated
+DB suite. (Also: re-confirm `cargo test --workspace --doc` passes in CI before
+re-adding the doctest step that was dropped here.)
+
+---
+
+## Enforce the heavy / networked CI gates (advisory audit + test suite) — DONE
 
 **Added:** 2026-06-04. **DONE:** 2026-06-05 — `.github/workflows/quality.yml`.
 
 **Resolution.** Added `quality.yml`, triggered on `pull_request` to main +
 nightly `schedule` + `workflow_dispatch` (trigger chosen by the operator).
-Jobs: `audit` (`make audit` — networked cargo-deny advisories + bans/licenses/
-sources + secret scan + migration idempotency), `test` (`cargo nextest
---workspace` + Postgres service + migrations), **`integration`
-(`make test-integration` — the env-gated DB suite incl. RLS isolation /
-crash-recovery that `cargo nextest` alone skips)**, and `frontend` (npm lint +
-tsc + vitest). Reuses the `make` targets so CI can't drift from local. Excludes
+Jobs: `audit` (`cargo deny check` — networked advisories + bans/licenses/
+sources), `test` (`cargo nextest --workspace --lib` — DB-free lib unit tests;
+see the scoping note above), **`integration` (`make test-integration` — the
+env-gated DB suite incl. RLS isolation / crash-recovery that `cargo nextest`
+alone skips)**, and `frontend` (npm lint + tsc + vitest). Reuses the `make`
+targets where practical so CI can't drift from local. Excludes
 the expensive image builds (those stay in the dispatch-only `ci.yml`). This is
 the unbypassable backstop that would have caught the RLS suite going red
 (#181/#182) within a PR / 24h. Original task description retained below.
