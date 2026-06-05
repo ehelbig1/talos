@@ -8,6 +8,56 @@ Each entry: what, why it matters, why it's not done yet, and a suggested shape.
 
 ---
 
+## RLS write-isolation tests are RED on `main` (gated suite hid it) — needs owner review
+
+**Added:** 2026-06-05. **Priority: HIGH (security test coverage).**
+
+`make test-integration` → `talos-db :: rls_org_isolation` has **2 failing tests**:
+`workflows_permissive_rls_unscoped_sees_all_scoped_enforces` (`:519`) and
+`set_role_with_check_gates_cross_tenant_writes` (`:1104`). They've been red on
+`main` since **2026-06-02**, undetected because the integration suite is
+Docker-gated and nothing runs it automatically (same rot pattern as the rest of
+this session — but here it's the **tenant-isolation security tests**).
+
+**Root cause — stale tests vs. an intentional policy tightening (NOT a prod
+regression):**
+- The tests (added `fcf2058`, 2026-05-29) assert **user-based** write rejection:
+  under read-scope (`app.current_user_id` + `app.current_org_ids`), inserting a
+  `workflows` row owned by another user must be rejected. They passed when the
+  `workflows` policy was `USING`-only (USING reused as WITH CHECK → user-based).
+- Migration `20260602120000` (`d66d3de`, 2026-06-02, "sec(rls)") **deliberately**
+  added an explicit, **org-based** WITH CHECK keyed on `app.current_org_id` (the
+  *write* GUC set by `begin_org_scoped`), with `org_id IS NULL → permit` and
+  `write-GUC-unset → permit` (rollout-safety). Its documented goal was to
+  *tighten* the org dimension (pin writes to the single ACTIVE org, not the whole
+  membership set).
+- The tests use the **read**-scope helper, which never sets `app.current_org_id`,
+  so the new WITH CHECK hits its `unset → permit` clause and the insert succeeds.
+  Production *write* paths use `begin_org_scoped` (sets the GUC) and DO get the
+  org-based check — so prod write-isolation is enforced (arguably stronger now).
+
+**Two things for the owner to decide:**
+1. **Reconcile the tests to the org-based contract.** Rewrite both to use
+   `begin_org_scoped` (set `app.current_org_id`) and assert **cross-ORG** write
+   rejection (+ same-org / personal permitted). This restores real coverage
+   matching the merged design. I did NOT do this autonomously: it's a security
+   boundary and updating a failing isolation test to match current behavior is
+   the rubber-stamp anti-pattern unless the contract is confirmed. The migration
+   IS documented + intentional, so reconciliation is likely correct — but confirm.
+2. **Confirm the design tradeoff is acceptable:** org-scoped tables (`workflows`,
+   `secrets`, `actors`) pin writes to `org_id`/active-org but **do NOT pin
+   `user_id`** (the migration says pinning user_id "would break org-scoped
+   writes"). So within an active org, RLS does not prevent writing a row with
+   another user's `user_id`; org-level isolation is the boundary, app-layer sets
+   `user_id`. Documented + deliberate, but it's a security-design call worth an
+   explicit sign-off.
+
+**Strong argument for the CI heavy-gates item above:** this is concrete proof
+that gating the integration suite let a *security* test suite sit red for days.
+Running it on PRs (or nightly) would have caught it immediately.
+
+---
+
 ## Enforce the heavy / networked CI gates (advisory audit + test suite)
 
 **Added:** 2026-06-04.
