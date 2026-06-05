@@ -1,4 +1,4 @@
-use controller::api::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
+use controller::api::schema::{IsTwoFactorVerified, MutationRoot, QueryRoot, SubscriptionRoot};
 use controller::auth::AuthService;
 use controller::db::init_pool;
 use sqlx::{Pool, Postgres};
@@ -94,7 +94,9 @@ async fn test_service_integrations_query_and_disconnect() {
         }
     "#;
 
-    let req = async_graphql::Request::new(query).data(user_id);
+    let req = async_graphql::Request::new(query)
+        .data(user_id)
+        .data(IsTwoFactorVerified(true));
     let res = schema.execute(req).await;
     assert!(res.errors.is_empty(), "Query failed: {:?}", res.errors);
 
@@ -120,7 +122,12 @@ async fn test_service_integrations_query_and_disconnect() {
         integration_id
     );
 
-    let req = async_graphql::Request::new(&mutation).data(user_id);
+    let req = async_graphql::Request::new(&mutation)
+        .data(user_id)
+        // The real session/API-key auth paths always inject IsTwoFactorVerified
+        // alongside user_id; these sensitive mutations are 2FA-gated
+        // (require_2fa, MCP-616 fail-closed). Represent a 2FA-verified session.
+        .data(IsTwoFactorVerified(true));
     let res = schema.execute(req).await;
     assert!(res.errors.is_empty(), "Mutation failed: {:?}", res.errors);
     assert!(
@@ -186,7 +193,9 @@ async fn test_mcp_agents_query_and_revoke() {
         }
     "#;
 
-    let req = async_graphql::Request::new(query).data(user_id);
+    let req = async_graphql::Request::new(query)
+        .data(user_id)
+        .data(IsTwoFactorVerified(true));
     let res = schema.execute(req).await;
     assert!(res.errors.is_empty(), "Query failed: {:?}", res.errors);
 
@@ -204,7 +213,12 @@ async fn test_mcp_agents_query_and_revoke() {
         agent_id
     );
 
-    let req = async_graphql::Request::new(&mutation).data(user_id);
+    let req = async_graphql::Request::new(&mutation)
+        .data(user_id)
+        // The real session/API-key auth paths always inject IsTwoFactorVerified
+        // alongside user_id; these sensitive mutations are 2FA-gated
+        // (require_2fa, MCP-616 fail-closed). Represent a 2FA-verified session.
+        .data(IsTwoFactorVerified(true));
     let res = schema.execute(req).await;
     assert!(res.errors.is_empty(), "Mutation failed: {:?}", res.errors);
     assert!(res.data.into_json().unwrap()["revokeMcpAgent"]
