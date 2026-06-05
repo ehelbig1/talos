@@ -206,20 +206,40 @@ the absence of an auto-triggered CI run — see the CI heavy-gates item above.
 
 ---
 
-## Bump remaining Node-20 actions in the dispatch-only publish workflows
+## Bump remaining Node-20 actions in the dispatch-only publish workflows — DONE (2026-06-05)
 
-**Added:** 2026-06-05. **Priority: low (dispatch-only; GitHub forces Node 24 on June 16).**
+**Added:** 2026-06-05. **Resolved:** 2026-06-05 (PR for the dispatch-only bumps).
 
 The PR-validated workflows (`quality.yml`, `ci.yml`) had their JS actions bumped
-to Node-24 SHAs (`actions/checkout` v6, `actions/setup-node` v6,
-`Swatinem/rust-cache` v2.9.1, `taiki-e/install-action` v2.81.6). The remaining
-Node-20 / older JS actions live only in the **dispatch-only** publish workflows
-(`release.yml`, `main-publish.yml`, `template-publish.yml`), so they don't run on
-PRs and aren't gate-validated:
-`actions/upload-artifact` (v4.4.3 / v4.6.2), `actions/download-artifact` (v4.3.0),
-`docker/{login,setup-buildx,build-push}-action`, `sigstore/cosign-installer`,
-`imjasonh/setup-crane`, `softprops/action-gh-release`. Bump them (latest SHAs)
-before the next image publish; lower urgency since they only run on manual
-dispatch. (Also latent: `actionlint` flags `release.yml` calling `ci.yml` as a
-reusable workflow while `ci.yml` lacks a `workflow_call:` trigger — fix or drop
-that `uses:` when touching release.yml.)
+to Node-24 SHAs earlier. This task closed the remaining Node-20 / older JS
+actions in the **dispatch-only** publish workflows (`release.yml`,
+`main-publish.yml`, `template-publish.yml`). Bumped to latest Node-24 SHAs and
+verified each SHA resolves to its release tag via `gh api`:
+`actions/upload-artifact` v4.4.3/v4.6.2 → v7.0.1,
+`actions/download-artifact` v4.3.0 → v8.0.1,
+`docker/login-action` v3.6.0 → v4.2.0,
+`docker/setup-buildx-action` v3.11.1 → v4.1.0,
+`docker/build-push-action` v6.18.0 → v7.2.0,
+`softprops/action-gh-release` v2.1.0 → v3.0.0.
+Also SHA-pinned `template-publish.yml`'s previously floating tags
+(`actions/checkout@v4`, `docker/login-action@v3`, `sigstore/cosign-installer@v3`)
+and added `persist-credentials: false` to its checkout for parity with the rest.
+
+`sigstore/cosign-installer` (v3.8.1) and `imjasonh/setup-crane` (v0.4) are
+**composite** actions (no Node runtime), so the Node-20 deprecation doesn't apply
+— left at their current pins.
+
+**Validation caveat:** these workflows are dispatch-only, so `quality.yml` does
+not exercise them and a live run would publish real images / cut a real release.
+The bumps were validated by (a) `actionlint`, (b) `gh api` SHA→tag resolution,
+and (c) input-compatibility review — our usage is limited to inputs stable across
+all the major jumps (`name`/`path`/`pattern`/`merge-multiple`/`retention-days`/
+`if-no-files-found` for artifacts; `registry`/`username`/`password` for login;
+`context`/`file`/`tags`/`labels`/`cache-from`/`cache-to`/`push`/`provenance`/
+`build-args` for build-push; `generate_release_notes` for gh-release). Confirm on
+the next real publish/release dispatch.
+
+**Still latent (separate item):** `actionlint` flags `release.yml` calling
+`ci.yml` as a reusable workflow while `ci.yml` lacks a `workflow_call:` trigger
+(fallout from the dispatch-only conversion) — fix or drop that `uses:` when next
+touching release.yml.
