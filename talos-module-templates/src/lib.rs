@@ -7,15 +7,24 @@ use talos_registry::NodeTemplate;
 /// This is a synchronous version used primarily for testing and discovery.
 pub fn all_templates() -> Vec<NodeTemplate> {
     let base_path = if Path::new("/app/module-templates").exists() {
+        // Production (Docker image): templates are baked in at /app/module-templates.
         PathBuf::from("/app/module-templates")
     } else {
-        // Fallback for development - assuming we're in controller/ or project root
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        if p.ends_with("controller") {
-            p.pop();
-        }
-        p.push("module-templates");
-        p
+        // Dev / test: locate the workspace-root `module-templates/` directory by
+        // walking up from this crate's compile-time manifest dir until a
+        // `module-templates/` child exists. The old code hard-coded a single
+        // `.ends_with("controller")` pop, which silently broke when this code
+        // was relocated from `controller/` to `talos-module-templates/` in the
+        // May-2026 workspace decomposition (`CARGO_MANIFEST_DIR` then pointed at
+        // `.../talos-module-templates`, so the pop never fired and it resolved
+        // to the non-existent `talos-module-templates/module-templates`).
+        // Walking ancestors is robust to any future relocation.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest
+            .ancestors()
+            .map(|a| a.join("module-templates"))
+            .find(|p| p.is_dir())
+            .unwrap_or_else(|| manifest.join("module-templates"))
     };
 
     let mut templates = Vec::new();

@@ -8,16 +8,28 @@ Each entry: what, why it matters, why it's not done yet, and a suggested shape.
 
 ---
 
-## RLS write-isolation tests are RED on `main` (gated suite hid it) — needs owner review
+## RLS write-isolation: tests reconciled (green) — only the design tradeoff awaits owner sign-off
 
-**Added:** 2026-06-05. **Priority: HIGH (security test coverage).**
+**Added:** 2026-06-05. **Priority: MEDIUM (was HIGH — the test-RED part is fixed).**
 
-`make test-integration` → `talos-db :: rls_org_isolation` has **2 failing tests**:
+> **TEST-RED PART RESOLVED (2026-06-05, commit `3b0e403`).** Both tests
+> (`workflows_permissive_rls_unscoped_sees_all_scoped_enforces` `:425`/`:519` and
+> `set_role_with_check_gates_cross_tenant_writes` `:1112`) were reconciled to the
+> org-based WITH CHECK contract — they now drive writes through `begin_org_scoped`
+> (sets `app.current_org_id`) and assert **cross-ORG** write rejection + same-org/
+> personal permitted. Confirmed green by the `quality.yml` integration job on
+> PRs #188/#189. The Docker-gated rot that let them sit red is itself closed now
+> (the integration suite runs on every PR — see the heavy-gates item below).
+> **What remains is item (2): the deliberate org_id-not-user_id design tradeoff,
+> a security-design sign-off only the owner should make.** Original context kept
+> below.
+
+`make test-integration` → `talos-db :: rls_org_isolation` HAD **2 failing tests**:
 `workflows_permissive_rls_unscoped_sees_all_scoped_enforces` (`:519`) and
-`set_role_with_check_gates_cross_tenant_writes` (`:1104`). They've been red on
-`main` since **2026-06-02**, undetected because the integration suite is
-Docker-gated and nothing runs it automatically (same rot pattern as the rest of
-this session — but here it's the **tenant-isolation security tests**).
+`set_role_with_check_gates_cross_tenant_writes` (`:1104`). They were red on
+`main` from **2026-06-02** until **2026-06-05**, undetected because the integration
+suite was Docker-gated and nothing ran it automatically (same rot pattern as the
+rest of this session — but here it was the **tenant-isolation security tests**).
 
 **Root cause — stale tests vs. an intentional policy tightening (NOT a prod
 regression):**
@@ -66,22 +78,32 @@ Running it on PRs (or nightly) would have caught it immediately.
 ~1.3k DB-free library unit tests) because its first real CI runs exposed that
 several `tests/`-dir integration binaries have **never run in CI** and fail on
 unmet environment, not real bugs:
-- `controller/tests/module_template_tests.rs` — `get_template("http-request")`
-  returns `None`; the **template catalog isn't seeded** in the test process.
+- `controller/tests/module_template_tests.rs` — **DONE (2026-06-05): now in CI.**
+  The failure (`get_template("http-request")` → `None`) was NOT "catalog not
+  seeded" — it was a **real bug**: `talos_module_templates::all_templates()`
+  located `module-templates/` via `env!("CARGO_MANIFEST_DIR")` with a stale
+  `.ends_with("controller")` pop that broke when the crate was relocated out of
+  `controller/` in the May-2026 decomposition, so discovery silently resolved to
+  a non-existent dir and returned empty. Fixed to walk manifest-dir ancestors;
+  the 17 tests now pass and run as a dedicated `test`-job step. (No production
+  impact — the free fn has zero non-test callers; prod seeding goes via
+  `talos-registry`. The Docker `/app/module-templates` path was unaffected.)
 - `worker/tests/sandbox_security_tests.rs` (path-traversal, etc.) — needs a
   built **WASM sandbox context**; `make_context()` behaves differently in CI.
+  Still excluded.
 - `controller/tests/integration_mcp_tests.rs`, `api_auth_integration_test`,
   `api_key_tests` — **full-app DB harness** (the all-zero `TALOS_MASTER_KEY`
-  was one such blocker, already fixed).
+  was one such blocker, already fixed). Still excluded.
 
-These pass locally (full dev env) but were silently never-in-CI. Bringing them
-in is per-binary work: seed the catalog, build/provide the WASM fixtures, wire
-the full-app harness + DB. The **DB-backed** suite that mattered most (RLS
-isolation, crash-recovery, memory) is already covered by the `integration` job
-(`make test-integration`). Do this as a deliberate follow-up; until then the
-`test` job gates the lib unit suite and the `integration` job gates the curated
-DB suite. (Also: re-confirm `cargo test --workspace --doc` passes in CI before
-re-adding the doctest step that was dropped here.)
+The remaining two (WASM sandbox, full-app DB harness) pass locally (full dev env)
+but are still never-in-CI. Bringing them in is per-binary work: build/provide the
+WASM fixtures, wire the full-app harness + DB. The **DB-backed** suite that
+mattered most (RLS isolation, crash-recovery, memory) is already covered by the
+`integration` job (`make test-integration`). Do these as a deliberate follow-up;
+until then the `test` job gates the lib unit suite + the module-template catalog
+tests, and the `integration` job gates the curated DB suite. (Also: re-confirm
+`cargo test --workspace --doc` passes in CI before re-adding the doctest step
+that was dropped here.)
 
 ---
 
@@ -151,26 +173,35 @@ only truly unbypassable enforcement. If/when cost allows, promoting the gates to
 
 ---
 
-## Frontend gates are unenforced and have rotted
+## Frontend gates — now enforced + green; only the react-hooks v7 ruleset migration remains
 
-**Added:** 2026-06-04.
+**Added:** 2026-06-04. **Mostly resolved 2026-06-05.**
 
-A pass over the `frontend/` gates (which nothing runs automatically — same
-root cause as the Rust gates) found accumulated regressions. The eslint *config*
-error (a dangling `react-hooks/exhaustive-deps` disable with the plugin never
-installed) was fixed by adding the `react-hooks` baseline + removing the dead
-`.eslintrc.cjs`; the prettier sweep is its own PR. The rest are sizeable and
-deferred:
+> **ENFORCEMENT + TEST-DRIFT RESOLVED (2026-06-05).** The `frontend/` gates are
+> no longer unenforced: the `quality.yml` `frontend` job (eslint + prettier +
+> `tsc` + vitest) runs on every PR to main, and the pre-push hook runs
+> `make lint-frontend`. The eslint config error and the prettier sweep shipped
+> (#173–#178). The vitest drift below is fixed: the suite is **253 passed / 1
+> skipped / 0 failing** (50 files), confirmed locally and by the green
+> `frontend` job on PRs #188/#189. **Only item (2) — the react-hooks v7
+> `recommended` ruleset migration — remains; it's a human-judgment pass, not a
+> safe autonomous bulk-fix.** Original context kept below.
 
-1. **Test suite red — 62 of 254 vitest tests failing across 20 files.** Triaged
-   as **test drift**, not real bugs: ~52 are `TestingLibraryElementError`
-   ("Unable to find" — components redesigned, tests assert old DOM, e.g.
-   AuthForm's email placeholder), 4 are `act()` warnings, and 1 was a stale CSRF
-   mock (the seed moved from `GET /graphql` → `GET /auth/csrf`; the *code* is
-   correct — see `graphqlClient.ts` — only the test mocked the old endpoint).
-   No real regressions found. Needs case-by-case reconciliation (update
-   assertions to current components) WITHOUT rubber-stamping — verify each
-   component is actually correct, don't just match whatever it now renders.
+A pass over the `frontend/` gates (which at the time nothing ran automatically —
+same root cause as the Rust gates) found accumulated regressions. The eslint
+*config* error (a dangling `react-hooks/exhaustive-deps` disable with the plugin
+never installed) was fixed by adding the `react-hooks` baseline + removing the
+dead `.eslintrc.cjs`; the prettier sweep was its own PR. The rest:
+
+1. **[RESOLVED] Test suite was red — 62 of 254 vitest tests failing across 20
+   files.** Triaged as **test drift**, not real bugs: ~52 were
+   `TestingLibraryElementError` ("Unable to find" — components redesigned, tests
+   asserted old DOM, e.g. AuthForm's email placeholder), 4 were `act()` warnings,
+   and 1 was a stale CSRF mock (the seed moved from `GET /graphql` →
+   `GET /auth/csrf`; the *code* was correct — see `graphqlClient.ts` — only the
+   test mocked the old endpoint). Reconciled case-by-case (assertions updated to
+   the current components after verifying each renders correctly, not
+   rubber-stamped). Suite now 253 passing / 1 skipped / 0 failing.
 
 2. **Full `eslint-plugin-react-hooks` v7 ruleset not adopted.** Only the two
    battle-tested rules are on (`rules-of-hooks` = error, `exhaustive-deps` =
