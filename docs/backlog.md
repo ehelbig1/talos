@@ -225,6 +225,16 @@ Also SHA-pinned `template-publish.yml`'s previously floating tags
 (`actions/checkout@v4`, `docker/login-action@v3`, `sigstore/cosign-installer@v3`)
 and added `persist-credentials: false` to its checkout for parity with the rest.
 
+**Follow-up (same day): full `runs.using` audit found one remaining holdout.**
+Rather than trust version intuition, every pinned action was queried for its
+actual `runs.using` runtime at its exact SHA (`gh api .../contents/action.yml`).
+That surfaced `anchore/sbom-action/download-syft@v0.17.9` in `release.yml` still
+on **node20** — bumped to **v0.24.0** (`e22c389`, node24; no `with:` inputs, so
+zero compat risk). Post-bump audit: **every** JS action across all workflows is
+node24; `dtolnay/rust-toolchain`, `imjasonh/setup-crane`, `sigstore/cosign-installer`
+are composite (no Node runtime); the SLSA generator is a reusable workflow. Lesson:
+a version-number bump is not proof of runtime — verify `runs.using` at the SHA.
+
 `sigstore/cosign-installer` (v3.8.1) and `imjasonh/setup-crane` (v0.4) are
 **composite** actions (no Node runtime), so the Node-20 deprecation doesn't apply
 — left at their current pins.
@@ -239,7 +249,14 @@ all the major jumps (`name`/`path`/`pattern`/`merge-multiple`/`retention-days`/
 `build-args` for build-push; `generate_release_notes` for gh-release). Confirm on
 the next real publish/release dispatch.
 
-**Still latent (separate item):** `actionlint` flags `release.yml` calling
-`ci.yml` as a reusable workflow while `ci.yml` lacks a `workflow_call:` trigger
-(fallout from the dispatch-only conversion) — fix or drop that `uses:` when next
-touching release.yml.
+**Still latent — OWNER DECISION (not a mechanical fix):** `actionlint` flags
+`release.yml`'s `ci:` job calling `ci.yml` as a reusable workflow while `ci.yml`
+has no `workflow_call:` trigger (fallout from the dispatch-only conversion). As-is,
+dispatching `release.yml` fails immediately at the `ci` job. Two paths, and the
+choice is a cost/policy call: **(a)** add `workflow_call:` to `ci.yml`'s `on:` so
+`release.yml` is functional via GHA — but a `release.yml` dispatch would then run
+the full `ci.yml` *including the expensive image-build jobs* the operator
+explicitly disabled to avoid paid GHA; or **(b)** drop the `ci:` job from
+`release.yml` and rely on the local gates (`make ci`) + `scripts/publish-images.sh`
+before a manual release dispatch. Don't fix unilaterally — it reverses or affirms
+the deliberate paid-GHA opt-out.
