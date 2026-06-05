@@ -393,7 +393,12 @@ async fn ssrf_allows_public_ip() {
 #[tokio::test]
 async fn path_traversal_dot_dot_rejected() {
     use worker::bindings::talos::core::files::{self as wit_files, Host};
-    let mut ctx = make_context();
+    // MUST be the Filesystem world: `read` checks the capability gate
+    // (MCP-586) BEFORE `sanitize_path`, so under a non-FS world a traversal
+    // path returns `Permissiondenied` (capability) rather than `Invalidpath`
+    // (path validation). To exercise the traversal protection itself we need
+    // the capability check to pass first.
+    let mut ctx = make_fs_context();
 
     let result = ctx.read("../etc/passwd".to_string()).await;
     assert!(
@@ -405,7 +410,10 @@ async fn path_traversal_dot_dot_rejected() {
 #[tokio::test]
 async fn path_traversal_absolute_path_rejected() {
     use worker::bindings::talos::core::files::{self as wit_files, Host};
-    let mut ctx = make_context();
+    // Filesystem world required — see path_traversal_dot_dot_rejected: the
+    // capability gate runs before sanitize_path, so a non-FS world masks
+    // Invalidpath with Permissiondenied.
+    let mut ctx = make_fs_context();
 
     let result = ctx.read("/etc/passwd".to_string()).await;
     assert!(
@@ -417,12 +425,33 @@ async fn path_traversal_absolute_path_rejected() {
 #[tokio::test]
 async fn path_traversal_embedded_dot_dot_rejected() {
     use worker::bindings::talos::core::files::{self as wit_files, Host};
-    let mut ctx = make_context();
+    // Filesystem world required — see path_traversal_dot_dot_rejected: the
+    // capability gate runs before sanitize_path, so a non-FS world masks
+    // Invalidpath with Permissiondenied.
+    let mut ctx = make_fs_context();
 
     let result = ctx.read("subdir/../../etc/shadow".to_string()).await;
     assert!(
         matches!(result, Err(wit_files::Error::Invalidpath)),
         "path with embedded '..' must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn file_read_denied_without_filesystem_capability() {
+    // MCP-586 capability gate: a module WITHOUT the Filesystem capability must
+    // be denied file reads with `Permissiondenied`, BEFORE any path validation
+    // runs. (The path-traversal tests above run under the Filesystem world so
+    // they reach sanitize_path; this asserts the gate that sits in front of it.)
+    use worker::bindings::talos::core::files::{self as wit_files, Host};
+    let mut ctx = make_context(); // Http world — no Filesystem capability
+
+    // Even a perfectly benign in-sandbox relative path is denied: the gate is
+    // capability-based, not path-based.
+    let result = ctx.read("data.txt".to_string()).await;
+    assert!(
+        matches!(result, Err(wit_files::Error::Permissiondenied)),
+        "file read without the Filesystem capability must be denied with Permissiondenied, got {result:?}"
     );
 }
 
