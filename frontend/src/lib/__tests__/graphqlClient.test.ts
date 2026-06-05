@@ -33,7 +33,9 @@ describe("graphqlClient", () => {
     let seedCalled = false;
 
     server.use(
-      http.get("*/graphql", () => {
+      // seedCsrfCookie() GETs the dedicated /auth/csrf endpoint (not /graphql,
+      // which returns 405 with no Set-Cookie in prod — see graphqlClient.ts).
+      http.get("*/auth/csrf", () => {
         seedCalled = true;
         vi.stubGlobal("document", { cookie: "talos_csrf_token=mock-token" });
         return HttpResponse.text("ok");
