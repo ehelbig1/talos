@@ -85,7 +85,10 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://talos:talos@localhost:5432/talos
-      TALOS_MASTER_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      # Must be NON-zero: SecretsManager::new rejects an all-zero master key
+      # (catches an unset/mis-templated TALOS_MASTER_KEY). Deterministic CI
+      # value; real keys live in Helm secrets. 64 hex chars = 32 bytes.
+      TALOS_MASTER_KEY: "00000000000000000000000000000000000000000000000000000000deadbeef"
       JWT_SECRET: "ci-jwt-secret-32-bytes-of-padding-zzzzz"
       # CI runners have ~14 GB free disk; trim debuginfo so the workspace
       # debug build doesn't exhaust it mid-link (see ci.yml for the rationale).
