@@ -21,8 +21,10 @@ Each entry: what, why it matters, why it's not done yet, and a suggested shape.
 > PRs #188/#189. The Docker-gated rot that let them sit red is itself closed now
 > (the integration suite runs on every PR — see the heavy-gates item below).
 > **What remains is item (2): the deliberate org_id-not-user_id design tradeoff,
-> a security-design sign-off only the owner should make.** Original context kept
-> below.
+> a security-design sign-off only the owner should make — now written up as
+> [RFC 0006](rfcs/0006-org-scoped-write-isolation-pins-org-not-user.md) (Draft,
+> awaiting sign-off before RLS enforcement is flipped on).** Original context
+> kept below.
 
 `make test-integration` → `talos-db :: rls_org_isolation` HAD **2 failing tests**:
 `workflows_permissive_rls_unscoped_sees_all_scoped_enforces` (`:519`) and
