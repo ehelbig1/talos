@@ -249,14 +249,17 @@ all the major jumps (`name`/`path`/`pattern`/`merge-multiple`/`retention-days`/
 `build-args` for build-push; `generate_release_notes` for gh-release). Confirm on
 the next real publish/release dispatch.
 
-**Still latent — OWNER DECISION (not a mechanical fix):** `actionlint` flags
-`release.yml`'s `ci:` job calling `ci.yml` as a reusable workflow while `ci.yml`
-has no `workflow_call:` trigger (fallout from the dispatch-only conversion). As-is,
-dispatching `release.yml` fails immediately at the `ci` job. Two paths, and the
-choice is a cost/policy call: **(a)** add `workflow_call:` to `ci.yml`'s `on:` so
-`release.yml` is functional via GHA — but a `release.yml` dispatch would then run
-the full `ci.yml` *including the expensive image-build jobs* the operator
-explicitly disabled to avoid paid GHA; or **(b)** drop the `ci:` job from
-`release.yml` and rely on the local gates (`make ci`) + `scripts/publish-images.sh`
-before a manual release dispatch. Don't fix unilaterally — it reverses or affirms
-the deliberate paid-GHA opt-out.
+**RESOLVED (2026-06-05) via option (b) — owner-approved.** `actionlint` had
+flagged `release.yml`'s `ci:` job calling `ci.yml` as a reusable workflow while
+`ci.yml` has no `workflow_call:` trigger (fallout from the dispatch-only
+conversion), so dispatching `release.yml` failed immediately at the `ci` job.
+The two paths were a cost/policy call: **(a)** add `workflow_call:` to `ci.yml` —
+but a `release.yml` dispatch would then re-run the full `ci.yml` *including the
+controller/worker/sandbox image builds* the operator disabled to avoid paid GHA;
+or **(b)** drop the `ci:` job from `release.yml`. Chose **(b)**: removed the `ci`
+job + its `needs: [ci]`, with an in-file comment documenting that correctness is
+now gated by `quality.yml` (every PR to main) + local `make ci` (canonical
+pre-publish gate) + the pre-push hook — so a release is always cut from an
+already-green commit without re-incurring CI image builds. `release.yml` is now
+dispatchable and actionlint-clean. Reversible: if releases later move back onto
+paid GHA, re-add a `ci` job + a `workflow_call:` trigger on `ci.yml`.

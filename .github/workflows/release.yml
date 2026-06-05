@@ -45,14 +45,24 @@ permissions:
                           # to Rekor).
 
 jobs:
-  # ── Gate on CI — never release a broken tagged commit ──────────────────
-  ci:
-    uses: ./.github/workflows/ci.yml
-
   # ── Build + push images; emit digests for downstream signing jobs ──────
+  #
+  # Correctness is gated OUTSIDE this workflow, by design:
+  #   * quality.yml runs on every PR to main (cargo-deny advisories, lib +
+  #     DB-integration tests, frontend) — so main is always green before a
+  #     release is cut from it;
+  #   * the canonical pre-publish gate is local `make ci` (lint + audit +
+  #     test + check-catalog), per CLAUDE.md "Image publishing";
+  #   * the pre-push hook runs `make lint` + `make lint-frontend`.
+  # An inline `uses: ./.github/workflows/ci.yml` gate was removed: ci.yml is
+  # workflow_dispatch-only (no `workflow_call:` trigger — paid GHA auto-runs
+  # are disabled for cost) AND it rebuilds the controller/worker/sandbox
+  # container images, which a release dispatch shouldn't re-incur. If GHA
+  # spend is later approved and releases move back onto CI, re-add a `ci`
+  # job here + a `workflow_call:` trigger on ci.yml (bump SHA pins in
+  # lockstep, as the checkout comment below notes).
   release:
     name: Build & Push
-    needs: [ci]
     runs-on: ubuntu-latest
     outputs:
       # Each service's fully-qualified digest flows to the sign/attest
