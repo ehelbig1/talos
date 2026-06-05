@@ -83,15 +83,20 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
     // JSON.parse on a very large string can cause UI stalls or OOM in the browser.
     const MAX_GRAPH_JSON_BYTES = 2 * 1024 * 1024; // 2 MiB
 
+    // Size guard BEFORE the parse try/catch: keep it outside the block so its
+    // specific "exceeds the 2 MiB size limit" message reaches the caller. When
+    // it lived inside the try, the catch below rewrapped it into the generic
+    // "invalid graph data" message, masking the real (size) reason.
+    if (workflow.graphJson.length > MAX_GRAPH_JSON_BYTES) {
+      throw new Error(
+        `Workflow "${workflow.name}" graph data exceeds the 2 MiB size limit and cannot be loaded.`,
+      );
+    }
+
     // Parse the graph JSON — wrap in try/catch so a corrupt graphJson in the
     // database doesn't crash the editor with an unhandled exception.
     let graph: GraphJson;
     try {
-      if (workflow.graphJson.length > MAX_GRAPH_JSON_BYTES) {
-        throw new Error(
-          `Workflow "${workflow.name}" graph data exceeds the 2 MiB size limit and cannot be loaded.`,
-        );
-      }
       graph = JSON.parse(workflow.graphJson);
     } catch (err) {
       throw new Error(
