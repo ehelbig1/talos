@@ -420,11 +420,7 @@ function createSubscription<T>(
       // auth-error message handlers in onmessage already kicked off a
       // refresh-then-connect attempt). 4403 from policy violation,
       // 4401 from missing creds, 1008 from policy violation as well.
-      if (
-        event.code === 4403 ||
-        event.code === 4401 ||
-        event.code === 1008
-      ) {
+      if (event.code === 4403 || event.code === 4401 || event.code === 1008) {
         return;
       }
 

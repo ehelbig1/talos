@@ -38,7 +38,9 @@ const Terminal = () => {
   const terminalState = useUIStore((state) => state.terminalState);
   const setTerminalState = useUIStore((state) => state.setTerminalState);
 
-  const processedLogs = useEphemeralExecutionStore((state) => state.processedLogs);
+  const processedLogs = useEphemeralExecutionStore(
+    (state) => state.processedLogs,
+  );
   const clearEvents = useEphemeralExecutionStore((state) => state.clearEvents);
 
   const cycleTerminalState = () => {
@@ -75,7 +77,6 @@ const Terminal = () => {
     () => processedLogs.filter((e) => e.level === "[WARN]").length,
     [processedLogs],
   );
-
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -204,7 +205,11 @@ const Terminal = () => {
             variant="ghost"
             size="icon"
             onClick={cycleTerminalState}
-            aria-label={terminalState === "compact" ? "Maximize terminal" : "Minimize terminal"}
+            aria-label={
+              terminalState === "compact"
+                ? "Maximize terminal"
+                : "Minimize terminal"
+            }
             className="h-9 w-9 text-muted-foreground/40 hover:text-white hover:bg-white/5 transition-premium rounded-xl active:scale-90"
           >
             {terminalState === "compact" ? (
@@ -312,14 +317,19 @@ const Terminal = () => {
                           </div>
                           <div className="relative">
                             <div className="absolute top-0 right-0 p-2">
-                                <Button 
-                                  variant="ghost" 
-                                  size="icon" 
-                                  className="h-6 w-6 text-muted-foreground/30 hover:text-warning"
-                                  onClick={() => entry.structured?.arguments && navigator.clipboard.writeText(entry.structured.arguments)}
-                                >
-                                    <Copy className="h-3 w-3" />
-                                </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6 text-muted-foreground/30 hover:text-warning"
+                                onClick={() =>
+                                  entry.structured?.arguments &&
+                                  navigator.clipboard.writeText(
+                                    entry.structured.arguments,
+                                  )
+                                }
+                              >
+                                <Copy className="h-3 w-3" />
+                              </Button>
                             </div>
                             <pre className="text-warning/70 p-4 bg-black/40 rounded-xl border border-white/5 overflow-x-auto selection:bg-warning/30 font-mono text-[10px] leading-relaxed custom-scrollbar">
                               {entry.structured.arguments}

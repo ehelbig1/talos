@@ -75,8 +75,8 @@ export default function AuditSettings() {
         <div className="space-y-6">
           <div className="h-32 bg-white/[0.02] border border-white/5 rounded-[2rem]" />
           <div className="grid grid-cols-2 gap-6">
-             <div className="h-20 bg-white/[0.02] border border-white/5 rounded-2xl" />
-             <div className="h-20 bg-white/[0.02] border border-white/5 rounded-2xl" />
+            <div className="h-20 bg-white/[0.02] border border-white/5 rounded-2xl" />
+            <div className="h-20 bg-white/[0.02] border border-white/5 rounded-2xl" />
           </div>
         </div>
       </div>
@@ -113,7 +113,8 @@ export default function AuditSettings() {
         <div className="relative z-10">
           <p className="text-sm text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed mb-10 max-w-2xl">
             Stream zero-trust AI execution logs directly into your existing SIEM
-            using secure OpenTelemetry pipelines. Every execution is signed and non-repudiable.
+            using secure OpenTelemetry pipelines. Every execution is signed and
+            non-repudiable.
           </p>
 
           <div className="bg-black/40 border border-white/5 rounded-[2rem] p-8 transition-premium group/box">
@@ -122,7 +123,9 @@ export default function AuditSettings() {
                 <div
                   className={cn(
                     "w-14 h-14 rounded-2xl flex items-center justify-center transition-premium shadow-2xl",
-                    enabled ? "bg-success/10 border border-success/20 text-success" : "bg-white/5 border border-white/10 text-muted-foreground/20"
+                    enabled
+                      ? "bg-success/10 border border-success/20 text-success"
+                      : "bg-white/5 border border-white/10 text-muted-foreground/20",
                   )}
                 >
                   <CloudUpload className="w-7 h-7" />
@@ -145,13 +148,15 @@ export default function AuditSettings() {
                 onClick={() => setEnabled(!enabled)}
                 className={cn(
                   "relative inline-flex h-8 w-14 items-center rounded-full transition-premium focus:outline-none ring-offset-black",
-                  enabled ? "bg-success shadow-[0_0_20px_hsla(var(--success),0.4)]" : "bg-white/10"
+                  enabled
+                    ? "bg-success shadow-[0_0_20px_hsla(var(--success),0.4)]"
+                    : "bg-white/10",
                 )}
               >
                 <span
                   className={cn(
                     "inline-block h-6 w-6 transform rounded-full bg-white transition-transform shadow-lg",
-                    enabled ? "translate-x-7" : "translate-x-1"
+                    enabled ? "translate-x-7" : "translate-x-1",
                   )}
                 />
               </button>
@@ -268,4 +273,3 @@ export default function AuditSettings() {
     </div>
   );
 }
-

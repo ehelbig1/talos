@@ -148,7 +148,15 @@ export const ConfigForm = React.memo(function ConfigForm({
   }
 
   const allFieldEntries = Object.entries(schema.properties);
-  const commonFields = ["URL", "METHOD", "NAME", "LABEL", "MESSAGE", "TEXT", "CHANNEL"];
+  const commonFields = [
+    "URL",
+    "METHOD",
+    "NAME",
+    "LABEL",
+    "MESSAGE",
+    "TEXT",
+    "CHANNEL",
+  ];
 
   const requiredFields = allFieldEntries.filter(
     ([field]) =>
@@ -189,7 +197,10 @@ export const ConfigForm = React.memo(function ConfigForm({
     <div className="space-y-6">
       {/* Service Integration */}
       {hasServiceIntegration && (
-        <Collapsible defaultOpen={!value || Object.keys(value).length === 0} className="group/collapsible">
+        <Collapsible
+          defaultOpen={!value || Object.keys(value).length === 0}
+          className="group/collapsible"
+        >
           <CollapsibleTrigger asChild>
             <button
               type="button"
@@ -197,7 +208,7 @@ export const ConfigForm = React.memo(function ConfigForm({
             >
               <div className="flex items-center gap-3">
                 <div className="p-1.5 rounded-lg bg-primary/10 text-primary">
-                    <Link className="h-4 w-4" />
+                  <Link className="h-4 w-4" />
                 </div>
                 <span>Configure Unified Integration</span>
               </div>
@@ -207,7 +218,9 @@ export const ConfigForm = React.memo(function ConfigForm({
           <CollapsibleContent className="mt-4 space-y-4 animate-in fade-in slide-in-from-top-2 duration-500">
             {templateName && templateName.toLowerCase().includes("slack") && (
               <SlackAppSelector
-                onSelect={(slackConfig) => onChange({ ...value, ...slackConfig })}
+                onSelect={(slackConfig) =>
+                  onChange({ ...value, ...slackConfig })
+                }
                 currentConfig={value}
               />
             )}
@@ -216,7 +229,9 @@ export const ConfigForm = React.memo(function ConfigForm({
               templateName.toLowerCase().includes("google") &&
               templateName.toLowerCase().includes("calendar") && (
                 <GoogleCalendarSelector
-                  onSelect={(calendarConfig) => onChange({ ...value, ...calendarConfig })}
+                  onSelect={(calendarConfig) =>
+                    onChange({ ...value, ...calendarConfig })
+                  }
                   currentConfig={value}
                 />
               )}
@@ -229,7 +244,8 @@ export const ConfigForm = React.memo(function ConfigForm({
                     <Mail className="h-4 w-4" /> Gmail Integration Vector
                   </div>
                   <p className="m-0 text-[11px] font-bold text-muted-foreground/40 leading-relaxed uppercase tracking-widest">
-                    Direct Gmail binding coming soon. Manually configure labels in primary settings.
+                    Direct Gmail binding coming soon. Manually configure labels
+                    in primary settings.
                   </p>
                 </div>
               )}
@@ -239,201 +255,225 @@ export const ConfigForm = React.memo(function ConfigForm({
 
       {/* Smart Suggestions */}
       {suggestions.length > 0 && (
-        <div className={cn(
+        <div
+          className={cn(
             "relative group/suggestions p-6 rounded-[2rem] border transition-premium overflow-hidden",
-            showSuggestions ? "bg-primary/5 border-primary/20 shadow-2xl" : "bg-primary/5 border-primary/10 hover:border-primary/30"
-        )}>
-            <div className="absolute top-0 right-0 p-4 opacity-10 pointer-events-none">
-                <Lightbulb className="w-12 h-12 text-primary" />
+            showSuggestions
+              ? "bg-primary/5 border-primary/20 shadow-2xl"
+              : "bg-primary/5 border-primary/10 hover:border-primary/30",
+          )}
+        >
+          <div className="absolute top-0 right-0 p-4 opacity-10 pointer-events-none">
+            <Lightbulb className="w-12 h-12 text-primary" />
+          </div>
+          <div className="flex items-center justify-between mb-4 relative z-10">
+            <div className="flex items-center gap-3">
+              <div className="p-1.5 rounded-lg bg-primary/20 text-primary animate-pulse">
+                <Zap className="h-4 w-4" />
+              </div>
+              <span className="text-[10px] font-black text-white uppercase tracking-[0.2em]">
+                {suggestions.length} Structural Insight
+                {suggestions.length > 1 ? "s" : ""} detected
+              </span>
             </div>
-            <div className="flex items-center justify-between mb-4 relative z-10">
-                <div className="flex items-center gap-3">
-                    <div className="p-1.5 rounded-lg bg-primary/20 text-primary animate-pulse">
-                        <Zap className="h-4 w-4" />
-                    </div>
-                    <span className="text-[10px] font-black text-white uppercase tracking-[0.2em]">
-                        {suggestions.length} Structural Insight{suggestions.length > 1 ? "s" : ""} detected
-                    </span>
-                </div>
-                {!showSuggestions ? (
-                    <button
-                        onClick={() => setShowSuggestions(true)}
-                        className="text-[9px] font-black text-primary uppercase tracking-widest hover:text-white transition-premium"
-                    >
-                        Review Analysis
-                    </button>
-                ) : (
-                    <button
-                        onClick={() => setShowSuggestions(false)}
-                        className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/20 hover:text-white transition-premium"
-                    >
-                        <X className="h-4 w-4" />
-                    </button>
-                )}
-            </div>
-
-            {showSuggestions && (
-                <div className="space-y-6 relative z-10 animate-in fade-in slide-in-from-top-2">
-                    <ul className="space-y-3">
-                        {suggestions.map((s) => (
-                            <li key={s.field} className="flex gap-4 items-start group/s">
-                                <div className="mt-1 w-1.5 h-1.5 rounded-full bg-primary/40 group-hover/s:bg-primary transition-premium" />
-                                <div className="space-y-1">
-                                    <p className="text-[11px] font-bold text-white/60">
-                                        Override <span className="text-primary">{s.field}</span> with <code className="px-1.5 py-0.5 bg-white/5 rounded font-mono text-primary/80">{JSON.stringify(s.value)}</code>
-                                    </p>
-                                    <p className="text-[9px] font-black uppercase tracking-widest text-muted-foreground/20">
-                                        Reason: {s.reason}
-                                    </p>
-                                </div>
-                            </li>
-                        ))}
-                    </ul>
-                    <div className="flex items-center gap-3 pt-4 border-t border-white/5">
-                        <button
-                            onClick={applySmartSuggestions}
-                            className="px-6 h-9 bg-primary hover:bg-primary/90 text-white text-[9px] font-black uppercase tracking-widest rounded-xl transition-premium shadow-lg shadow-primary/20"
-                        >
-                            Apply Optimization
-                        </button>
-                        <button
-                            onClick={() => setSuggestions([])}
-                            className="px-6 h-9 bg-surface-3 hover:bg-surface-4 text-muted-foreground/40 hover:text-white text-[9px] font-black uppercase tracking-widest rounded-xl transition-premium border border-white/5"
-                        >
-                            Discard
-                        </button>
-                    </div>
-                </div>
+            {!showSuggestions ? (
+              <button
+                onClick={() => setShowSuggestions(true)}
+                className="text-[9px] font-black text-primary uppercase tracking-widest hover:text-white transition-premium"
+              >
+                Review Analysis
+              </button>
+            ) : (
+              <button
+                onClick={() => setShowSuggestions(false)}
+                className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/20 hover:text-white transition-premium"
+              >
+                <X className="h-4 w-4" />
+              </button>
             )}
+          </div>
+
+          {showSuggestions && (
+            <div className="space-y-6 relative z-10 animate-in fade-in slide-in-from-top-2">
+              <ul className="space-y-3">
+                {suggestions.map((s) => (
+                  <li key={s.field} className="flex gap-4 items-start group/s">
+                    <div className="mt-1 w-1.5 h-1.5 rounded-full bg-primary/40 group-hover/s:bg-primary transition-premium" />
+                    <div className="space-y-1">
+                      <p className="text-[11px] font-bold text-white/60">
+                        Override <span className="text-primary">{s.field}</span>{" "}
+                        with{" "}
+                        <code className="px-1.5 py-0.5 bg-white/5 rounded font-mono text-primary/80">
+                          {JSON.stringify(s.value)}
+                        </code>
+                      </p>
+                      <p className="text-[9px] font-black uppercase tracking-widest text-muted-foreground/20">
+                        Reason: {s.reason}
+                      </p>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+              <div className="flex items-center gap-3 pt-4 border-t border-white/5">
+                <button
+                  onClick={applySmartSuggestions}
+                  className="px-6 h-9 bg-primary hover:bg-primary/90 text-white text-[9px] font-black uppercase tracking-widest rounded-xl transition-premium shadow-lg shadow-primary/20"
+                >
+                  Apply Optimization
+                </button>
+                <button
+                  onClick={() => setSuggestions([])}
+                  className="px-6 h-9 bg-surface-3 hover:bg-surface-4 text-muted-foreground/40 hover:text-white text-[9px] font-black uppercase tracking-widest rounded-xl transition-premium border border-white/5"
+                >
+                  Discard
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
       {/* Form Fields */}
       <div className="space-y-6">
-          {requiredFields
-            .filter(([field, fieldSchema]) => !fieldSchema["x-hidden"] && !fieldSchema.readOnly)
-            .map(([field, fieldSchema]) => (
-              <div key={field} className="space-y-3">
-                <div className="flex items-center justify-between px-1">
-                    <label
-                      htmlFor={`field-${field}`}
-                      className="text-[10px] font-black text-white/40 uppercase tracking-[0.2em]"
-                    >
-                      {fieldSchema.title || field}
-                      {schema.required?.includes(field) && (
-                        <span className="text-primary ml-1.5">*</span>
-                      )}
-                    </label>
-                    {fieldSchema.description && (
-                        <div className="group/info relative">
-                            <AlertTriangle className="h-3.5 w-3.5 text-muted-foreground/20 cursor-help hover:text-primary transition-premium" />
-                            <div className="absolute bottom-full right-0 mb-3 w-64 p-3 bg-surface-4 border border-white/10 rounded-xl shadow-2xl opacity-0 group-hover/info:opacity-100 transition-premium pointer-events-none z-50">
-                                <p className="text-[10px] font-bold text-white/60 leading-relaxed uppercase tracking-widest">
-                                    {fieldSchema.description}
-                                </p>
-                            </div>
-                        </div>
-                    )}
-                </div>
-
-                {renderField(
-                  field,
-                  fieldSchema,
-                  value[field],
-                  (v) => handleChange(field, v),
-                  validationErrors[field]
-                    ? false
-                    : field === "URL" && value[field]
-                      ? true
-                      : undefined,
+        {requiredFields
+          .filter(
+            ([field, fieldSchema]) =>
+              !fieldSchema["x-hidden"] && !fieldSchema.readOnly,
+          )
+          .map(([field, fieldSchema]) => (
+            <div key={field} className="space-y-3">
+              <div className="flex items-center justify-between px-1">
+                <label
+                  htmlFor={`field-${field}`}
+                  className="text-[10px] font-black text-white/40 uppercase tracking-[0.2em]"
+                >
+                  {fieldSchema.title || field}
+                  {schema.required?.includes(field) && (
+                    <span className="text-primary ml-1.5">*</span>
+                  )}
+                </label>
+                {fieldSchema.description && (
+                  <div className="group/info relative">
+                    <AlertTriangle className="h-3.5 w-3.5 text-muted-foreground/20 cursor-help hover:text-primary transition-premium" />
+                    <div className="absolute bottom-full right-0 mb-3 w-64 p-3 bg-surface-4 border border-white/10 rounded-xl shadow-2xl opacity-0 group-hover/info:opacity-100 transition-premium pointer-events-none z-50">
+                      <p className="text-[10px] font-bold text-white/60 leading-relaxed uppercase tracking-widest">
+                        {fieldSchema.description}
+                      </p>
+                    </div>
+                  </div>
                 )}
+              </div>
 
-                {validationErrors[field] && (
-                  <p className="px-2 py-2 bg-destructive/5 border border-destructive/10 rounded-lg text-[9px] font-black text-destructive uppercase tracking-widest flex items-center gap-2 animate-in slide-in-from-top-1">
-                    <AlertTriangle className="h-3.5 w-3.5" />
-                    {validationErrors[field]}
-                  </p>
-                )}
+              {renderField(
+                field,
+                fieldSchema,
+                value[field],
+                (v) => handleChange(field, v),
+                validationErrors[field]
+                  ? false
+                  : field === "URL" && value[field]
+                    ? true
+                    : undefined,
+              )}
 
-                {field === "URL" && !!value[field] && !validationErrors[field] && (
-                    <div className="bg-surface-2 border border-white/5 rounded-2xl p-6 space-y-6 shadow-inner relative overflow-hidden group/http">
-                      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
-                      <div className="flex items-center justify-between relative z-10">
-                        <div className="flex items-center gap-3">
-                            <div className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400">
-                                <CheckCircle className="h-4 w-4" />
-                            </div>
-                            <span className="text-[10px] font-black text-white/40 uppercase tracking-[0.2em]">Protocol Endpoint Authenticated</span>
+              {validationErrors[field] && (
+                <p className="px-2 py-2 bg-destructive/5 border border-destructive/10 rounded-lg text-[9px] font-black text-destructive uppercase tracking-widest flex items-center gap-2 animate-in slide-in-from-top-1">
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  {validationErrors[field]}
+                </p>
+              )}
+
+              {field === "URL" &&
+                !!value[field] &&
+                !validationErrors[field] && (
+                  <div className="bg-surface-2 border border-white/5 rounded-2xl p-6 space-y-6 shadow-inner relative overflow-hidden group/http">
+                    <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
+                    <div className="flex items-center justify-between relative z-10">
+                      <div className="flex items-center gap-3">
+                        <div className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400">
+                          <CheckCircle className="h-4 w-4" />
                         </div>
-                        {suggestions.length > 0 && !showSuggestions && (
-                            <button
-                                onClick={() => setShowSuggestions(true)}
-                                className="text-[9px] font-black text-primary uppercase tracking-widest animate-pulse"
-                            >
-                                {suggestions.length} Optimizations Ready
-                            </button>
-                        )}
+                        <span className="text-[10px] font-black text-white/40 uppercase tracking-[0.2em]">
+                          Protocol Endpoint Authenticated
+                        </span>
                       </div>
-                      
-                      {category === "http" && (
-                        <div className="space-y-4 relative z-10 pt-4 border-t border-white/5">
-                            <p className="text-[9px] font-black text-white/20 uppercase tracking-[0.3em] flex items-center gap-2">
-                                <Target className="h-3.5 w-3.5 text-primary" />
-                                Deep Ingress Configuration
-                            </p>
-                            <div className="flex gap-3 flex-wrap">
-                                <OpenAPIBrowser
-                                    baseUrl={value[field] as string}
-                                    onSelectEndpoint={(endpointConfig) => onChange({ ...value, ...endpointConfig })}
-                                />
-                                <ManualEndpointCreator
-                                    baseUrl={value[field] as string}
-                                    onConfigure={(endpointConfig) => onChange({ ...value, ...endpointConfig })}
-                                />
-                            </div>
-                        </div>
+                      {suggestions.length > 0 && !showSuggestions && (
+                        <button
+                          onClick={() => setShowSuggestions(true)}
+                          className="text-[9px] font-black text-primary uppercase tracking-widest animate-pulse"
+                        >
+                          {suggestions.length} Optimizations Ready
+                        </button>
                       )}
                     </div>
-                  )}
-              </div>
-            ))}
 
-          {/* Advanced Section */}
-          {advancedFields.filter(([f, s]) => !s["x-hidden"] && !s.readOnly).length > 0 && (
-            <Accordion type="single" collapsible className="w-full">
-              <AccordionItem value="advanced" className="border-white/5">
-                <AccordionTrigger className="text-[10px] font-black text-white/40 uppercase tracking-[0.3em] hover:text-white hover:no-underline px-1 transition-premium">
-                  <div className="flex items-center gap-3">
-                    <Settings className="h-3.5 w-3.5" />
-                    Extended Configuration Vector
-                  </div>
-                </AccordionTrigger>
-                <AccordionContent className="pt-8 pb-4 space-y-8 animate-in fade-in slide-in-from-top-4">
-                  {advancedFields
-                    .filter(([field, fieldSchema]) => !fieldSchema["x-hidden"] && !fieldSchema.readOnly)
-                    .map(([field, fieldSchema]) => (
-                      <div key={field} className="space-y-3">
-                        <label className="text-[10px] font-black text-white/20 uppercase tracking-[0.2em] px-1">
-                          {fieldSchema.title || field}
-                        </label>
-                        {renderField(
-                          field,
-                          fieldSchema,
-                          value[field],
-                          (v) => handleChange(field, v),
-                          validationErrors[field] ? false : undefined,
-                        )}
-                        {validationErrors[field] && (
-                          <p className="text-[9px] font-black text-destructive uppercase tracking-widest px-2">
-                            {validationErrors[field]}
-                          </p>
-                        )}
+                    {category === "http" && (
+                      <div className="space-y-4 relative z-10 pt-4 border-t border-white/5">
+                        <p className="text-[9px] font-black text-white/20 uppercase tracking-[0.3em] flex items-center gap-2">
+                          <Target className="h-3.5 w-3.5 text-primary" />
+                          Deep Ingress Configuration
+                        </p>
+                        <div className="flex gap-3 flex-wrap">
+                          <OpenAPIBrowser
+                            baseUrl={value[field] as string}
+                            onSelectEndpoint={(endpointConfig) =>
+                              onChange({ ...value, ...endpointConfig })
+                            }
+                          />
+                          <ManualEndpointCreator
+                            baseUrl={value[field] as string}
+                            onConfigure={(endpointConfig) =>
+                              onChange({ ...value, ...endpointConfig })
+                            }
+                          />
+                        </div>
                       </div>
-                    ))}
-                </AccordionContent>
-              </AccordionItem>
-            </Accordion>
-          )}
+                    )}
+                  </div>
+                )}
+            </div>
+          ))}
+
+        {/* Advanced Section */}
+        {advancedFields.filter(([f, s]) => !s["x-hidden"] && !s.readOnly)
+          .length > 0 && (
+          <Accordion type="single" collapsible className="w-full">
+            <AccordionItem value="advanced" className="border-white/5">
+              <AccordionTrigger className="text-[10px] font-black text-white/40 uppercase tracking-[0.3em] hover:text-white hover:no-underline px-1 transition-premium">
+                <div className="flex items-center gap-3">
+                  <Settings className="h-3.5 w-3.5" />
+                  Extended Configuration Vector
+                </div>
+              </AccordionTrigger>
+              <AccordionContent className="pt-8 pb-4 space-y-8 animate-in fade-in slide-in-from-top-4">
+                {advancedFields
+                  .filter(
+                    ([field, fieldSchema]) =>
+                      !fieldSchema["x-hidden"] && !fieldSchema.readOnly,
+                  )
+                  .map(([field, fieldSchema]) => (
+                    <div key={field} className="space-y-3">
+                      <label className="text-[10px] font-black text-white/20 uppercase tracking-[0.2em] px-1">
+                        {fieldSchema.title || field}
+                      </label>
+                      {renderField(
+                        field,
+                        fieldSchema,
+                        value[field],
+                        (v) => handleChange(field, v),
+                        validationErrors[field] ? false : undefined,
+                      )}
+                      {validationErrors[field] && (
+                        <p className="text-[9px] font-black text-destructive uppercase tracking-widest px-2">
+                          {validationErrors[field]}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+        )}
       </div>
     </div>
   );
@@ -448,9 +488,11 @@ function renderField(
 ) {
   const baseClassName = cn(
     "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-xs font-black uppercase tracking-widest text-white placeholder-white/10 outline-none transition-premium shadow-inner",
-    isValid === false && "border-destructive/40 ring-1 ring-destructive/20 bg-destructive/5 text-destructive",
-    isValid === true && "border-emerald-500/40 ring-1 ring-emerald-500/20 bg-emerald-500/5",
-    "focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:bg-surface-3"
+    isValid === false &&
+      "border-destructive/40 ring-1 ring-destructive/20 bg-destructive/5 text-destructive",
+    isValid === true &&
+      "border-emerald-500/40 ring-1 ring-emerald-500/20 bg-emerald-500/5",
+    "focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:bg-surface-3",
   );
 
   switch (schema.type) {
@@ -463,9 +505,13 @@ function renderField(
             onChange={(e) => onChange(e.target.value)}
             className={baseClassName}
           >
-            <option value="" className="bg-surface-4 text-white/20">SELECT OPTION...</option>
+            <option value="" className="bg-surface-4 text-white/20">
+              SELECT OPTION...
+            </option>
             {schema.enum?.map((opt: string) => (
-              <option key={opt} value={opt} className="bg-surface-4 text-white">{opt.toUpperCase()}</option>
+              <option key={opt} value={opt} className="bg-surface-4 text-white">
+                {opt.toUpperCase()}
+              </option>
             ))}
           </select>
         );
@@ -476,7 +522,10 @@ function renderField(
           type="text"
           value={(value as string) || ""}
           onChange={(e) => onChange(e.target.value)}
-          placeholder={schema.placeholder?.toUpperCase() || (schema.default as string | undefined)?.toUpperCase()}
+          placeholder={
+            schema.placeholder?.toUpperCase() ||
+            (schema.default as string | undefined)?.toUpperCase()
+          }
           className={baseClassName}
         />
       );
@@ -487,7 +536,9 @@ function renderField(
           id={`field-${field}`}
           type="number"
           value={value !== undefined ? (value as number) : ""}
-          onChange={(e) => onChange(e.target.value ? Number(e.target.value) : undefined)}
+          onChange={(e) =>
+            onChange(e.target.value ? Number(e.target.value) : undefined)
+          }
           placeholder={schema.default ? String(schema.default) : undefined}
           className={baseClassName}
         />
@@ -496,16 +547,23 @@ function renderField(
     case "boolean":
       return (
         <div className="flex items-center gap-3 px-1">
-            <input
-              id={`field-${field}`}
-              type="checkbox"
-              checked={value !== undefined ? (value as boolean) : (schema.default as boolean) || false}
-              onChange={(e) => onChange(e.target.checked)}
-              className="w-5 h-5 rounded-lg border-white/10 bg-surface-2 text-primary focus:ring-primary/40 transition-premium cursor-pointer"
-            />
-            <label htmlFor={`field-${field}`} className="text-[10px] font-black text-white/40 uppercase tracking-widest cursor-pointer">
-                Activate {field.replace(/_/g, " ")}
-            </label>
+          <input
+            id={`field-${field}`}
+            type="checkbox"
+            checked={
+              value !== undefined
+                ? (value as boolean)
+                : (schema.default as boolean) || false
+            }
+            onChange={(e) => onChange(e.target.checked)}
+            className="w-5 h-5 rounded-lg border-white/10 bg-surface-2 text-primary focus:ring-primary/40 transition-premium cursor-pointer"
+          />
+          <label
+            htmlFor={`field-${field}`}
+            className="text-[10px] font-black text-white/40 uppercase tracking-widest cursor-pointer"
+          >
+            Activate {field.replace(/_/g, " ")}
+          </label>
         </div>
       );
 
@@ -536,7 +594,9 @@ function renderField(
                 ))}
                 <button
                   type="button"
-                  onClick={() => onChange(arrayValue.filter((_, i) => i !== index))}
+                  onClick={() =>
+                    onChange(arrayValue.filter((_, i) => i !== index))
+                  }
                   className="shrink-0 w-12 h-12 flex items-center justify-center bg-destructive/5 border border-destructive/20 text-destructive rounded-xl hover:bg-destructive/10 transition-premium active:scale-90"
                 >
                   <X className="h-4 w-4" />
@@ -566,26 +626,40 @@ function renderField(
           <div className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               {schema.presets.map((preset) => {
-                const isSelected = JSON.stringify(arrayValue) === JSON.stringify(preset.value);
+                const isSelected =
+                  JSON.stringify(arrayValue) === JSON.stringify(preset.value);
                 return (
                   <button
                     key={preset.label}
                     type="button"
                     onClick={() => onChange(preset.value)}
                     className={cn(
-                        "p-4 rounded-2xl border text-left transition-premium group/preset relative overflow-hidden",
-                        isSelected ? "bg-primary/10 border-primary shadow-xl" : "bg-surface-2 border-white/5 hover:border-white/20 hover:bg-surface-3"
+                      "p-4 rounded-2xl border text-left transition-premium group/preset relative overflow-hidden",
+                      isSelected
+                        ? "bg-primary/10 border-primary shadow-xl"
+                        : "bg-surface-2 border-white/5 hover:border-white/20 hover:bg-surface-3",
                     )}
                   >
                     <div className="flex flex-col relative z-10">
-                        <span className={cn("text-[10px] font-black uppercase tracking-[0.2em] mb-1 transition-premium", isSelected ? "text-white" : "text-white/40 group-hover/preset:text-white")}>
-                            {preset.label}
-                        </span>
-                        <span className="text-[9px] font-bold text-muted-foreground/40 leading-relaxed uppercase tracking-widest">
-                            {preset.description}
-                        </span>
+                      <span
+                        className={cn(
+                          "text-[10px] font-black uppercase tracking-[0.2em] mb-1 transition-premium",
+                          isSelected
+                            ? "text-white"
+                            : "text-white/40 group-hover/preset:text-white",
+                        )}
+                      >
+                        {preset.label}
+                      </span>
+                      <span className="text-[9px] font-bold text-muted-foreground/40 leading-relaxed uppercase tracking-widest">
+                        {preset.description}
+                      </span>
                     </div>
-                    {isSelected && <div className="absolute top-2 right-2"><Check className="w-3 h-3 text-primary" /></div>}
+                    {isSelected && (
+                      <div className="absolute top-2 right-2">
+                        <Check className="w-3 h-3 text-primary" />
+                      </div>
+                    )}
                   </button>
                 );
               })}
@@ -595,14 +669,21 @@ function renderField(
                 Deep Protocol Editor (JSON)
               </CollapsibleTrigger>
               <CollapsibleContent className="mt-3 animate-in fade-in slide-in-from-top-2">
-                  <textarea
-                    value={JSON.stringify(arrayValue, null, 2)}
-                    onChange={(e) => {
-                      try { onChange(JSON.parse(e.target.value)); } catch { /* Ignore invalid JSON */ }
-                    }}
-                    rows={4}
-                    className={cn(baseClassName, "h-auto py-4 font-mono text-[10px] normal-case tracking-normal")}
-                  />
+                <textarea
+                  value={JSON.stringify(arrayValue, null, 2)}
+                  onChange={(e) => {
+                    try {
+                      onChange(JSON.parse(e.target.value));
+                    } catch {
+                      /* Ignore invalid JSON */
+                    }
+                  }}
+                  rows={4}
+                  className={cn(
+                    baseClassName,
+                    "h-auto py-4 font-mono text-[10px] normal-case tracking-normal",
+                  )}
+                />
               </CollapsibleContent>
             </Collapsible>
           </div>
@@ -610,7 +691,8 @@ function renderField(
       }
 
       if (schema.items?.type === "string") {
-        const arrayValue = (value as string[]) || (schema.default as string[]) || [];
+        const arrayValue =
+          (value as string[]) || (schema.default as string[]) || [];
         return (
           <div className="space-y-3">
             {arrayValue.map((item, index: number) => (
@@ -628,7 +710,9 @@ function renderField(
                 />
                 <button
                   type="button"
-                  onClick={() => onChange(arrayValue.filter((_, i) => i !== index))}
+                  onClick={() =>
+                    onChange(arrayValue.filter((_, i) => i !== index))
+                  }
                   className="shrink-0 w-12 h-12 flex items-center justify-center bg-destructive/5 border border-destructive/20 text-destructive rounded-xl hover:bg-destructive/10 transition-premium"
                 >
                   <X className="h-4 w-4" />

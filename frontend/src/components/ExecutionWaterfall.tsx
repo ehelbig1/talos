@@ -32,7 +32,9 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
     const result: NodeBar[] = [];
 
     // Track the absolute start timestamp of the execution
-    const firstTimestamp = new Date(events[0]?.timestamp ?? Date.now()).getTime();
+    const firstTimestamp = new Date(
+      events[0]?.timestamp ?? Date.now(),
+    ).getTime();
 
     for (const ev of events) {
       const nodeId = ev.nodeId;
@@ -59,8 +61,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
         const startMs = nodeStarts.get(nodeId) ?? relativeMs;
         const durationMs =
           (ev as any).durationMs ?? Math.max(1, relativeMs - startMs);
-        const isFailed =
-          ev.status === "NodeFailed" || ev.status === "FAILED";
+        const isFailed = ev.status === "NodeFailed" || ev.status === "FAILED";
 
         result.push({
           nodeId,
@@ -97,9 +98,24 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
     return (
       <div className="flex flex-col items-center justify-center py-12 gap-4 opacity-20 grayscale">
         <div className="p-5 rounded-2xl bg-surface-3/40 border border-white/5">
-           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
+          <svg
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="3" y="3" width="18" height="18" rx="2" />
+            <path d="M3 9h18" />
+            <path d="M9 21V9" />
+          </svg>
         </div>
-        <p className="text-[10px] font-black uppercase tracking-[0.3em]">No Telemetry Data</p>
+        <p className="text-[10px] font-black uppercase tracking-[0.3em]">
+          No Telemetry Data
+        </p>
       </div>
     );
   }
@@ -158,16 +174,18 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
         {/* Bars */}
         {bars.map((bar, i) => {
           const y = i * ROW_HEIGHT + 20;
-          const barX =
-            LABEL_WIDTH + (bar.startMs / maxEndMs) * BAR_AREA_WIDTH;
+          const barX = LABEL_WIDTH + (bar.startMs / maxEndMs) * BAR_AREA_WIDTH;
           const barW = Math.max(
             4,
-            (bar.durationMs / maxEndMs) * BAR_AREA_WIDTH
+            (bar.durationMs / maxEndMs) * BAR_AREA_WIDTH,
           );
           const color = STATUS_COLORS[bar.status];
 
           return (
-            <g key={`${bar.nodeId}-${i}`} className="group/bar transition-premium">
+            <g
+              key={`${bar.nodeId}-${i}`}
+              className="group/bar transition-premium"
+            >
               {/* Row background hover */}
               <rect
                 x={0}
@@ -200,7 +218,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
                 rx={6}
                 fill={color}
                 fillOpacity={0.15}
-                className={cn(bar.status === 'running' && "animate-pulse")}
+                className={cn(bar.status === "running" && "animate-pulse")}
               />
 
               {/* Bar */}
@@ -212,8 +230,8 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
                 rx={6}
                 fill={color}
                 className={cn(
-                    "transition-premium",
-                    bar.status === 'running' && "animate-pulse"
+                  "transition-premium",
+                  bar.status === "running" && "animate-pulse",
                 )}
               />
 

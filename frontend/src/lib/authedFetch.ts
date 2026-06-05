@@ -51,7 +51,12 @@ async function doTokenRefresh(): Promise<boolean> {
       return false;
     }
     const data = json.data;
-    return !json.errors && typeof data === "object" && data !== null && "refreshToken" in data;
+    return (
+      !json.errors &&
+      typeof data === "object" &&
+      data !== null &&
+      "refreshToken" in data
+    );
   } catch {
     return false;
   }

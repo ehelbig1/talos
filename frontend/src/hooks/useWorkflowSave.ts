@@ -20,10 +20,17 @@ interface UseWorkflowSaveOptions {
   onSuccess?: (saved: SaveResult) => void;
 }
 
-export function useWorkflowSave({ workflowId, workflowName, onSuccess }: UseWorkflowSaveOptions) {
+export function useWorkflowSave({
+  workflowId,
+  workflowName,
+  onSuccess,
+}: UseWorkflowSaveOptions) {
   const [isSaving, setIsSaving] = useState(false);
   const { markClean, setWorkflowMeta } = useWorkflowStore(
-    useShallow((s) => ({ markClean: s.markClean, setWorkflowMeta: s.setWorkflowMeta })),
+    useShallow((s) => ({
+      markClean: s.markClean,
+      setWorkflowMeta: s.setWorkflowMeta,
+    })),
   );
 
   const saveMutation = useMutation({
@@ -85,8 +92,23 @@ export function useWorkflowSave({ workflowId, workflowName, onSuccess }: UseWork
           }`;
 
       const variables = workflowId
-        ? { id: workflowId, input: { name: nameToSave, graphJson, maxConcurrentExecutions, intent } }
-        : { input: { name: nameToSave, graphJson, maxConcurrentExecutions, intent } };
+        ? {
+            id: workflowId,
+            input: {
+              name: nameToSave,
+              graphJson,
+              maxConcurrentExecutions,
+              intent,
+            },
+          }
+        : {
+            input: {
+              name: nameToSave,
+              graphJson,
+              maxConcurrentExecutions,
+              intent,
+            },
+          };
 
       const result = await graphqlRequest<{
         updateWorkflow?: { id: string; name: string };

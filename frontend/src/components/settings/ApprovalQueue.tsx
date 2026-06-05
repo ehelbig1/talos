@@ -161,7 +161,9 @@ export function ApprovalQueue() {
             <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-[2.5rem] relative group overflow-hidden">
               <div className="absolute inset-0 bg-success/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
               <CheckCircle2 className="w-16 h-16 text-success/20 mb-6 mx-auto group-hover:text-success/40 transition-premium" />
-              <p className="text-sm text-muted-foreground font-black uppercase tracking-[0.2em]">All Systems Authorized</p>
+              <p className="text-sm text-muted-foreground font-black uppercase tracking-[0.2em]">
+                All Systems Authorized
+              </p>
               <p className="text-[10px] text-muted-foreground/30 font-bold uppercase tracking-widest mt-2">
                 No manual intervention required at this time.
               </p>
@@ -173,7 +175,7 @@ export function ApprovalQueue() {
                 className="bg-white/[0.02] border border-white/5 rounded-[2rem] p-6 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden"
               >
                 <div className="absolute inset-0 bg-gradient-to-r from-warning/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-                
+
                 <div className="flex items-center justify-between mb-5 relative z-10">
                   <div className="flex items-center gap-4">
                     <div className="w-2.5 h-2.5 rounded-full bg-warning animate-status-pulse shadow-[0_0_10px_hsla(var(--warning),0.5)]" />
@@ -225,7 +227,9 @@ export function ApprovalQueue() {
           {decided.length === 0 ? (
             <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-[2.5rem]">
               <History className="w-16 h-16 text-muted-foreground/10 mb-6 mx-auto" />
-              <p className="text-sm text-muted-foreground/40 font-black uppercase tracking-[0.2em]">Archive Empty</p>
+              <p className="text-sm text-muted-foreground/40 font-black uppercase tracking-[0.2em]">
+                Archive Empty
+              </p>
             </div>
           ) : (
             decided.map((approval) => (
@@ -276,7 +280,10 @@ export function ApprovalQueue() {
                 <div className="flex items-center gap-6 pt-4 border-t border-white/5">
                   <div className="flex items-center gap-2 text-[9px] text-muted-foreground/40 font-black uppercase tracking-widest">
                     <User className="w-3.5 h-3.5 opacity-30" />
-                    AUTHORIZED_BY: {approval.decidedBy ? approval.decidedBy.slice(0, 8) : "SYSTEM_CORE"}
+                    AUTHORIZED_BY:{" "}
+                    {approval.decidedBy
+                      ? approval.decidedBy.slice(0, 8)
+                      : "SYSTEM_CORE"}
                   </div>
                   <button className="flex items-center gap-2 text-[9px] text-primary/40 hover:text-primary font-black uppercase tracking-widest transition-premium ml-auto">
                     <ExternalLink className="w-3.5 h-3.5" />
@@ -306,4 +313,3 @@ export function ApprovalQueue() {
     </div>
   );
 }
-

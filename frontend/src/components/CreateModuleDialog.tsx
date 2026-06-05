@@ -4,7 +4,18 @@ import React, { useState, useMemo, memo } from "react";
 import { type NodeTemplate, useTemplates } from "@/lib/useTemplates";
 import { graphqlRequest } from "@/lib/graphqlClient";
 import { ConfigForm, type JSONSchema } from "@/components/builder/ConfigForm";
-import { Search, Globe, Database, Bot, ArrowLeft, Package, Sparkles, Filter, Check, Loader2 } from "lucide-react";
+import {
+  Search,
+  Globe,
+  Database,
+  Bot,
+  ArrowLeft,
+  Package,
+  Sparkles,
+  Filter,
+  Check,
+  Loader2,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getCapabilityVisuals } from "@/lib/capabilityBadge";
 
@@ -150,7 +161,11 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
       );
       onClose();
     } catch (e) {
-      setError(sanitizeErrorMessage(e instanceof Error ? e.message : "Failed to create module"));
+      setError(
+        sanitizeErrorMessage(
+          e instanceof Error ? e.message : "Failed to create module",
+        ),
+      );
     } finally {
       setCreating(false);
     }
@@ -159,24 +174,30 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
   // Step 1: Template selection view
   if (!selectedTemplateId) {
     return (
-      <Dialog open={true} onClose={onClose} title="Initialize Protocol Blueprint">
+      <Dialog
+        open={true}
+        onClose={onClose}
+        title="Initialize Protocol Blueprint"
+      >
         <div className="space-y-8">
           <div className="relative overflow-hidden p-6 bg-primary/5 border border-white/5 rounded-[2.5rem] shadow-inner glass-light">
             <div className="absolute top-0 right-0 p-4 opacity-10">
-                <Sparkles className="w-12 h-12 text-primary" />
+              <Sparkles className="w-12 h-12 text-primary" />
             </div>
             <div className="flex items-start gap-4 relative z-10">
-                <div className="shrink-0 w-10 h-10 rounded-xl bg-primary/20 border border-primary/30 flex items-center justify-center shadow-lg">
-                    <Package className="w-5 h-5 text-primary" />
-                </div>
-                <div className="space-y-1">
-                    <p className="text-sm font-black text-white tracking-tight font-outfit uppercase">
-                        Protocol Synthesis Engine
-                    </p>
-                    <p className="text-[10px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
-                        Select a validated blueprint to initialize a new reusable module. Once synthesized, it will be added to your operational library.
-                    </p>
-                </div>
+              <div className="shrink-0 w-10 h-10 rounded-xl bg-primary/20 border border-primary/30 flex items-center justify-center shadow-lg">
+                <Package className="w-5 h-5 text-primary" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-black text-white tracking-tight font-outfit uppercase">
+                  Protocol Synthesis Engine
+                </p>
+                <p className="text-[10px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
+                  Select a validated blueprint to initialize a new reusable
+                  module. Once synthesized, it will be added to your operational
+                  library.
+                </p>
+              </div>
             </div>
           </div>
 
@@ -196,20 +217,20 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
               />
             </div>
             <div className="relative group">
-                <Filter className="absolute left-4 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/40 group-hover:text-white transition-premium z-10" />
-                <DarkSelect
-                  value={selectedCategory}
-                  onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
-                    setSelectedCategory(e.target.value)
-                  }
-                  className="pl-10 pr-10 h-12 w-48 bg-surface-2/40 border-white/5 text-[10px] font-black uppercase tracking-widest rounded-2xl appearance-none relative z-10 shadow-inner"
-                >
-                  {categories.map((cat) => (
-                    <option key={cat} value={cat}>
-                      {cat === "all" ? "ALL DOMAINS" : cat.toUpperCase()}
-                    </option>
-                  ))}
-                </DarkSelect>
+              <Filter className="absolute left-4 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/40 group-hover:text-white transition-premium z-10" />
+              <DarkSelect
+                value={selectedCategory}
+                onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
+                  setSelectedCategory(e.target.value)
+                }
+                className="pl-10 pr-10 h-12 w-48 bg-surface-2/40 border-white/5 text-[10px] font-black uppercase tracking-widest rounded-2xl appearance-none relative z-10 shadow-inner"
+              >
+                {categories.map((cat) => (
+                  <option key={cat} value={cat}>
+                    {cat === "all" ? "ALL DOMAINS" : cat.toUpperCase()}
+                  </option>
+                ))}
+              </DarkSelect>
             </div>
           </div>
 
@@ -218,7 +239,9 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
             {templatesLoading ? (
               <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/20">
                 <Loader2 className="w-10 h-10 animate-spin text-primary" />
-                <p className="text-[10px] font-black uppercase tracking-[0.3em]">Syncing Library...</p>
+                <p className="text-[10px] font-black uppercase tracking-[0.3em]">
+                  Syncing Library...
+                </p>
               </div>
             ) : filteredTemplates.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-20 px-8 text-center border-2 border-dashed border-white/5 rounded-[2.5rem] bg-surface-1/20 grayscale opacity-20">
@@ -237,12 +260,14 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                   >
                     <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
                     <div className="absolute top-6 right-6 p-2 rounded-xl bg-surface-4/60 border border-white/5 opacity-0 group-hover:opacity-100 transition-premium shadow-xl">
-                        <Sparkles className="w-4 h-4 text-primary" />
+                      <Sparkles className="w-4 h-4 text-primary" />
                     </div>
                     <div className="flex items-start gap-4 mb-5">
                       <div className="flex items-center justify-center w-14 h-14 bg-surface-3 border border-white/10 rounded-2xl group-hover:scale-110 group-hover:border-primary/20 transition-premium shadow-2xl">
                         {template.icon ? (
-                          <span className="text-3xl filter drop-shadow-[0_0_8px_rgba(0,0,0,0.5)]">{template.icon}</span>
+                          <span className="text-3xl filter drop-shadow-[0_0_8px_rgba(0,0,0,0.5)]">
+                            {template.icon}
+                          </span>
                         ) : (
                           <Package className="w-6 h-6 text-primary" />
                         )}
@@ -258,7 +283,8 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                     </div>
 
                     <p className="text-[11px] text-muted-foreground/60 line-clamp-2 mb-6 font-bold leading-relaxed h-[34px]">
-                      {template.description || "Experimental protocol awaiting documentation."}
+                      {template.description ||
+                        "Experimental protocol awaiting documentation."}
                     </p>
 
                     <div className="flex flex-wrap gap-2 mt-auto">
@@ -298,7 +324,8 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           {/* Footer */}
           <div className="flex justify-between items-center pt-6 border-t border-white/5">
             <span className="text-[9px] text-muted-foreground/20 font-black uppercase tracking-[0.3em]">
-              {filteredTemplates.length} BLUEPRINT{filteredTemplates.length !== 1 ? "S" : ""} SYNCHRONIZED
+              {filteredTemplates.length} BLUEPRINT
+              {filteredTemplates.length !== 1 ? "S" : ""} SYNCHRONIZED
             </span>
             <Button
               onClick={onClose}
@@ -334,7 +361,9 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
               <div className="flex items-center justify-center w-14 h-14 bg-surface-3/60 border border-white/10 rounded-[1.25rem] shadow-2xl relative">
                 <div className="absolute -inset-2 bg-primary/10 rounded-full blur-xl opacity-50" />
                 {selectedTemplate?.icon ? (
-                  <span className="text-4xl relative z-10 filter drop-shadow-[0_0_8px_rgba(0,0,0,0.5)]">{selectedTemplate.icon}</span>
+                  <span className="text-4xl relative z-10 filter drop-shadow-[0_0_8px_rgba(0,0,0,0.5)]">
+                    {selectedTemplate.icon}
+                  </span>
                 ) : (
                   <Package className="w-8 h-8 text-primary relative z-10" />
                 )}
@@ -364,19 +393,20 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
               </Label>
             </div>
             <div className="relative group">
-                <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
-                <DarkInput
-                  id="module-name"
-                  value={moduleName}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                    setModuleName(e.target.value)
-                  }
-                  placeholder="E.G. NOTIFY_DISPATCHER_X"
-                  className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-xs font-black uppercase tracking-widest rounded-2xl relative z-10 shadow-inner"
-                />
+              <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
+              <DarkInput
+                id="module-name"
+                value={moduleName}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  setModuleName(e.target.value)
+                }
+                placeholder="E.G. NOTIFY_DISPATCHER_X"
+                className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-xs font-black uppercase tracking-widest rounded-2xl relative z-10 shadow-inner"
+              />
             </div>
             <p className="px-2 text-[9px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest">
-              Assign a unique tactical designation to identify this module in the operational library and across the workflow canvas.
+              Assign a unique tactical designation to identify this module in
+              the operational library and across the workflow canvas.
             </p>
           </div>
 

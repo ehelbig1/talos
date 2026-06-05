@@ -5,7 +5,13 @@ import {
   useEphemeralExecutionStore,
   NodeStatusType,
 } from "@/store/executionStore";
-import { Timer, CheckCircle2, XCircle, ShieldAlert, Search } from "lucide-react";
+import {
+  Timer,
+  CheckCircle2,
+  XCircle,
+  ShieldAlert,
+  Search,
+} from "lucide-react";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useUIStore } from "@/store/uiStore";
 import { getFixSuggestion } from "@/lib/fixSuggestions";
@@ -50,9 +56,10 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
       nodeStatus?.status ?? (data.executionStatus as NodeStatusType) ?? "idle";
     const error = nodeStatus?.error ?? data.lastError;
 
-    const fixSuggestion = useMemo(() => 
-      status === "failed" && error ? getFixSuggestion(error) : undefined,
-      [status, error]
+    const fixSuggestion = useMemo(
+      () =>
+        status === "failed" && error ? getFixSuggestion(error) : undefined,
+      [status, error],
     );
 
     const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(
@@ -63,14 +70,25 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
     const setShowInspector = useUIStore((state) => state.setShowInspector);
     const setDebugNodeId = useUIStore((state) => state.setDebugNodeId);
 
-    const CategoryIcon = useMemo(() => getCategoryIcon(data.category), [data.category]);
-    const categoryColor = useMemo(() => getCategoryColor(data.category), [data.category]);
-    const configCount = useMemo(() => data.config ? Object.keys(data.config).length : 0, [data.config]);
-    const systemStyle = useMemo(() => data.systemNodeKind
-      ? getSystemNodeStyle(data.systemNodeKind)
-      : null, [data.systemNodeKind]);
+    const CategoryIcon = useMemo(
+      () => getCategoryIcon(data.category),
+      [data.category],
+    );
+    const categoryColor = useMemo(
+      () => getCategoryColor(data.category),
+      [data.category],
+    );
+    const configCount = useMemo(
+      () => (data.config ? Object.keys(data.config).length : 0),
+      [data.config],
+    );
+    const systemStyle = useMemo(
+      () =>
+        data.systemNodeKind ? getSystemNodeStyle(data.systemNodeKind) : null,
+      [data.systemNodeKind],
+    );
 
-    const hasResults = nodeResult != null || (status !== "idle");
+    const hasResults = nodeResult != null || status !== "idle";
 
     const handleDoubleClick = React.useCallback(
       (e: React.MouseEvent) => {
@@ -128,7 +146,10 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
     const resultPreview = useMemo(() => {
       if (streamingContent) return streamingContent;
       if (nodeResult == null) return null;
-      const str = typeof nodeResult === "string" ? nodeResult : JSON.stringify(nodeResult);
+      const str =
+        typeof nodeResult === "string"
+          ? nodeResult
+          : JSON.stringify(nodeResult);
       return str.length > 60 ? str.slice(0, 60) + "..." : str;
     }, [streamingContent, nodeResult]);
 
@@ -152,18 +173,25 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
             selected
               ? "ring-2 ring-primary/40 border-y-primary/20 border-r-primary/20 shadow-[0_0_30px_hsla(var(--primary),0.15)]"
               : "hover:border-white/10",
-            status === "failed" && "shadow-[0_0_30px_hsla(var(--destructive),0.1)] ring-1 ring-destructive/20",
-            status === "running" && "shadow-[0_0_30px_hsla(var(--primary),0.1)]",
+            status === "failed" &&
+              "shadow-[0_0_30px_hsla(var(--destructive),0.1)] ring-1 ring-destructive/20",
+            status === "running" &&
+              "shadow-[0_0_30px_hsla(var(--primary),0.1)]",
             systemStyle ? systemStyle.bg : STATUS_BORDER[status],
           )}
         >
           {/* Status Glow Overlay */}
-          <div className={cn(
-            "absolute inset-0 rounded-[inherit] opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none",
-            status === "success" && "bg-success/5 shadow-[inset_0_0_20px_hsla(var(--success),0.1)]",
-            status === "failed" && "bg-destructive/5 shadow-[inset_0_0_20px_hsla(var(--destructive),0.1)]",
-            status === "running" && "bg-primary/5 shadow-[inset_0_0_20px_hsla(var(--primary),0.1)]",
-          )} />
+          <div
+            className={cn(
+              "absolute inset-0 rounded-[inherit] opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none",
+              status === "success" &&
+                "bg-success/5 shadow-[inset_0_0_20px_hsla(var(--success),0.1)]",
+              status === "failed" &&
+                "bg-destructive/5 shadow-[inset_0_0_20px_hsla(var(--destructive),0.1)]",
+              status === "running" &&
+                "bg-primary/5 shadow-[inset_0_0_20px_hsla(var(--primary),0.1)]",
+            )}
+          />
 
           {/* Status dot + name */}
           <div className="flex items-center gap-3 relative z-10">
@@ -219,19 +247,26 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           {/* Compact output preview or streaming content */}
           {resultPreview && (status === "success" || status === "running") && (
             <div className="mt-3 px-3 py-2 rounded-xl bg-surface-4/60 border border-white/5 relative z-10 group/preview hover:bg-surface-4 transition-premium overflow-hidden">
-              <p className={cn(
-                "text-[9px] font-mono tracking-tight",
-                status === "running" ? "text-primary/70" : "text-muted-foreground/50 truncate max-w-[180px]"
-              )}
-                 title={typeof nodeResult === "string" ? nodeResult : JSON.stringify(nodeResult)}>
+              <p
+                className={cn(
+                  "text-[9px] font-mono tracking-tight",
+                  status === "running"
+                    ? "text-primary/70"
+                    : "text-muted-foreground/50 truncate max-w-[180px]",
+                )}
+                title={
+                  typeof nodeResult === "string"
+                    ? nodeResult
+                    : JSON.stringify(nodeResult)
+                }
+              >
                 {resultPreview}
                 {status === "running" && (
-                   <span className="w-1 h-2.5 bg-primary/40 animate-pulse inline-block ml-1 align-middle" />
+                  <span className="w-1 h-2.5 bg-primary/40 animate-pulse inline-block ml-1 align-middle" />
                 )}
               </p>
             </div>
           )}
-
 
           {/* Running progress bar */}
           {status === "running" && (

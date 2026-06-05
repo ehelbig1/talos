@@ -106,7 +106,8 @@ export function IntegrationsManager() {
         }
       } catch {
         // Best-effort — the grid will simply be empty until retry.
-        if (import.meta.env.DEV) console.error("Failed to fetch integration providers");
+        if (import.meta.env.DEV)
+          console.error("Failed to fetch integration providers");
       }
     }
     fetchProviders();
@@ -151,7 +152,11 @@ export function IntegrationsManager() {
 
       const errorVal = params.get(errorKey);
       if (errorVal) {
-        toast.error(sanitizeErrorMessage(`${provider.display_name} connection failed: ${errorVal}`));
+        toast.error(
+          sanitizeErrorMessage(
+            `${provider.display_name} connection failed: ${errorVal}`,
+          ),
+        );
         params.delete(errorKey);
         dirty = true;
       }
@@ -168,7 +173,9 @@ export function IntegrationsManager() {
       const val = params.get(param);
       if (val) {
         if (isError) {
-          toast.error(sanitizeErrorMessage(`${label} connection failed: ${val}`));
+          toast.error(
+            sanitizeErrorMessage(`${label} connection failed: ${val}`),
+          );
         } else {
           toast.success(`${label} connected: ${val}`);
           fetchServiceIntegrations();
@@ -179,7 +186,11 @@ export function IntegrationsManager() {
     }
 
     if (dirty) {
-      window.history.replaceState({}, "", `${window.location.pathname}${params.toString() ? `?${params}` : ""}`);
+      window.history.replaceState(
+        {},
+        "",
+        `${window.location.pathname}${params.toString() ? `?${params}` : ""}`,
+      );
     }
   }, [providers]);
 
@@ -204,7 +215,8 @@ export function IntegrationsManager() {
         toast.error("Failed to disconnect integration.");
       }
     } catch (e) {
-      if (import.meta.env.DEV) console.error("Disconnect integration error:", e);
+      if (import.meta.env.DEV)
+        console.error("Disconnect integration error:", e);
       toast.error("Error disconnecting integration.");
     } finally {
       setDisconnecting(false);
@@ -288,7 +300,11 @@ export function IntegrationsManager() {
           }
           window.location.href = d.data.authorization_url;
         } else {
-          toast.error(sanitizeErrorMessage(`Connect failed: ${d.error || "Unknown error"}`));
+          toast.error(
+            sanitizeErrorMessage(
+              `Connect failed: ${d.error || "Unknown error"}`,
+            ),
+          );
         }
       } else {
         toast.error(`Service error: ${res.status}`);
@@ -328,7 +344,7 @@ export function IntegrationsManager() {
         className="bg-surface-3/30 border border-white/5 rounded-[2rem] p-6 transition-premium hover:border-white/10 hover:shadow-2xl hover:shadow-primary/5 group relative overflow-hidden flex flex-col h-full"
       >
         <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-        
+
         <div className="flex items-start justify-between mb-8 relative z-10">
           <div className="flex items-center gap-5">
             <div
@@ -413,7 +429,7 @@ export function IntegrationsManager() {
     <div className="max-w-6xl mx-auto space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-1000">
       <div className="relative group">
         <div className="absolute -inset-8 bg-primary/5 rounded-[4rem] blur-[80px] opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-        
+
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative z-10">
           <div className="space-y-4">
             <div className="flex items-center gap-5">
@@ -428,7 +444,7 @@ export function IntegrationsManager() {
                   <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full shrink-0">
                     <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
                     <span className="text-[9px] text-primary font-black uppercase tracking-widest leading-none">
-                        Active_Interlink
+                      Active_Interlink
                     </span>
                   </div>
                   <div className="hidden sm:block w-1 h-1 rounded-full bg-white/10 shrink-0" />
@@ -439,8 +455,9 @@ export function IntegrationsManager() {
               </div>
             </div>
             <p className="text-sm text-muted-foreground/60 leading-relaxed max-w-2xl font-medium">
-              Establish secure communication channels with external cognitive frameworks and data silos.
-              Authenticated entities can be leveraged as autonomous triggers or operational endpoints.
+              Establish secure communication channels with external cognitive
+              frameworks and data silos. Authenticated entities can be leveraged
+              as autonomous triggers or operational endpoints.
             </p>
           </div>
         </div>
@@ -508,8 +525,11 @@ export function IntegrationsManager() {
               </p>
               <p className="text-xs text-muted-foreground leading-relaxed font-medium">
                 This will terminate autonomous access to{" "}
-                <span className="text-destructive font-black underline underline-offset-4">{confirmModal.accountIdentifier}</span>. 
-                Downstream protocols depending on this uplink will enter a suspended state.
+                <span className="text-destructive font-black underline underline-offset-4">
+                  {confirmModal.accountIdentifier}
+                </span>
+                . Downstream protocols depending on this uplink will enter a
+                suspended state.
               </p>
             </div>
           </div>
@@ -550,9 +570,13 @@ export function IntegrationsManager() {
             Protocol Expansion Required?
           </h4>
           <p className="text-sm text-muted-foreground/60 leading-relaxed font-medium max-w-3xl">
-            If a native uplink is not listed, utilize the <span className="text-primary font-bold">Webhook Gateway</span> or 
-            the <span className="text-primary font-bold">Generic HTTP Engine</span> to interface with any REST-compliant API endpoint. 
-            New autonomous providers are integrated into the core framework on a recurring cycle.
+            If a native uplink is not listed, utilize the{" "}
+            <span className="text-primary font-bold">Webhook Gateway</span> or
+            the{" "}
+            <span className="text-primary font-bold">Generic HTTP Engine</span>{" "}
+            to interface with any REST-compliant API endpoint. New autonomous
+            providers are integrated into the core framework on a recurring
+            cycle.
           </p>
         </div>
       </div>

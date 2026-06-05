@@ -35,16 +35,18 @@ export function OAuthCallback() {
           // `state` param the controller minted (or can be inferred
           // from a `provider` param if the controller adds one); fall
           // back to a generic phrasing when neither is present.
-          const provider = params.get("provider") || params.get("state")?.split(":")[0] || "";
-          const providerLabel = provider && /^[a-z][a-z0-9_-]{0,32}$/i.test(provider)
-            ? provider
-            : "your OAuth provider";
+          const provider =
+            params.get("provider") || params.get("state")?.split(":")[0] || "";
+          const providerLabel =
+            provider && /^[a-z][a-z0-9_-]{0,32}$/i.test(provider)
+              ? provider
+              : "your OAuth provider";
           setStatus("error");
           setMessage(
             `Configuration error: ${providerLabel} redirected to the frontend instead of the backend. ` +
-            `Check your ${providerLabel} OAuth app settings and ensure the Authorized redirect URI ` +
-            `points to your BACKEND (e.g. https://your-backend/auth/oauth/${provider || "<provider>"}/callback), ` +
-            `not the frontend.`,
+              `Check your ${providerLabel} OAuth app settings and ensure the Authorized redirect URI ` +
+              `points to your BACKEND (e.g. https://your-backend/auth/oauth/${provider || "<provider>"}/callback), ` +
+              `not the frontend.`,
           );
           return;
         }
@@ -75,10 +77,18 @@ export function OAuthCallback() {
           setStatus("success");
           if (window.opener && window.opener !== window) {
             setMessage("Integration successful! You can close this window.");
-            timeouts.push(setTimeout(() => { window.close(); }, 1000));
+            timeouts.push(
+              setTimeout(() => {
+                window.close();
+              }, 1000),
+            );
           } else {
             setMessage("Sign in successful! Redirecting...");
-            timeouts.push(setTimeout(() => { navigate("/"); }, 1500));
+            timeouts.push(
+              setTimeout(() => {
+                navigate("/");
+              }, 1500),
+            );
           }
         } else {
           setStatus("error");
@@ -92,7 +102,9 @@ export function OAuthCallback() {
 
     handleCallback();
 
-    return () => { timeouts.forEach(clearTimeout); };
+    return () => {
+      timeouts.forEach(clearTimeout);
+    };
   }, [navigate]); // login is handled server-side via cookie redirect
 
   return (

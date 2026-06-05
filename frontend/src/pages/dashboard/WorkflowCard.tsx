@@ -90,7 +90,7 @@ export default function WorkflowCard({
     <div
       className={cn(
         "group relative flex flex-col gap-6 p-7 rounded-[2.5rem] bg-surface-3/40 border border-white/10 backdrop-blur-3xl transition-premium hover:border-primary/20 hover:scale-[1.02] active:scale-[0.98] shadow-2xl overflow-hidden glass gpu",
-        isRunning && "ring-1 ring-primary/30"
+        isRunning && "ring-1 ring-primary/30",
       )}
     >
       {/* Decorative background glow */}
@@ -110,15 +110,17 @@ export default function WorkflowCard({
               {workflow.name}
             </h3>
           </div>
-          
+
           <div className="flex items-center gap-2 flex-wrap">
-            <span className={cn(
-              "px-3 py-1 text-[9px] font-black uppercase tracking-[0.2em] rounded-lg border transition-premium",
-              statusColorClass
-            )}>
+            <span
+              className={cn(
+                "px-3 py-1 text-[9px] font-black uppercase tracking-[0.2em] rounded-lg border transition-premium",
+                statusColorClass,
+              )}
+            >
               {statusLabel}
             </span>
-            
+
             {actorName && (
               <div className="flex items-center gap-2 px-3 py-1 text-[9px] font-black uppercase tracking-[0.2em] text-primary/60 bg-primary/5 rounded-lg border border-primary/10 shadow-sm transition-premium hover:border-primary/30">
                 <Bot className="w-3 h-3" />
@@ -129,18 +131,27 @@ export default function WorkflowCard({
         </div>
 
         <button
-          onClick={(e) => { e.stopPropagation(); onRun(); }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onRun();
+          }}
           className={cn(
             "w-12 h-12 flex items-center justify-center rounded-2xl transition-premium shadow-2xl active:scale-90 relative group/run overflow-hidden",
-            isRunning 
-              ? "bg-surface-4/60 text-primary cursor-not-allowed border border-primary/20" 
-              : "bg-primary text-white hover:bg-primary/90 hover:scale-110 border border-white/10"
+            isRunning
+              ? "bg-surface-4/60 text-primary cursor-not-allowed border border-primary/20"
+              : "bg-primary text-white hover:bg-primary/90 hover:scale-110 border border-white/10",
           )}
           disabled={isRunning}
           title="Manual Trigger"
         >
           <div className="absolute inset-0 bg-white/20 opacity-0 group-hover/run:opacity-100 transition-premium pointer-events-none" />
-          <Play className={cn("w-5 h-5 relative z-10", isRunning && "animate-spin-slow")} fill="currentColor" />
+          <Play
+            className={cn(
+              "w-5 h-5 relative z-10",
+              isRunning && "animate-spin-slow",
+            )}
+            fill="currentColor"
+          />
         </button>
       </div>
 
@@ -151,8 +162,12 @@ export default function WorkflowCard({
             <Activity className="w-4 h-4 text-success/60 group-hover/metric:text-success" />
           </div>
           <div className="flex flex-col">
-            <span className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest leading-none mb-1">Nodes</span>
-            <span className="text-sm font-black text-white font-outfit leading-none">{nodes}</span>
+            <span className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest leading-none mb-1">
+              Nodes
+            </span>
+            <span className="text-sm font-black text-white font-outfit leading-none">
+              {nodes}
+            </span>
           </div>
         </div>
         <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-surface-2/40 border border-white/5 shadow-sm group/metric hover:border-primary/30 transition-premium glass-light">
@@ -160,8 +175,12 @@ export default function WorkflowCard({
             <Share2 className="w-4 h-4 text-primary/60 group-hover/metric:text-primary" />
           </div>
           <div className="flex flex-col">
-            <span className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest leading-none mb-1">Edges</span>
-            <span className="text-sm font-black text-white font-outfit leading-none">{edges}</span>
+            <span className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest leading-none mb-1">
+              Edges
+            </span>
+            <span className="text-sm font-black text-white font-outfit leading-none">
+              {edges}
+            </span>
           </div>
         </div>
       </div>
@@ -169,21 +188,25 @@ export default function WorkflowCard({
       {/* Operational State */}
       <div className="space-y-4 relative z-10">
         {schedule && (
-          <div className={cn(
-            "flex items-center gap-4 p-4 rounded-2xl border transition-premium glass-light",
-            schedule.isEnabled 
-              ? "bg-warning/5 border-warning/20 text-warning/80 shadow-lg shadow-warning/5" 
-              : "bg-white/5 border-white/5 text-muted-foreground/30"
-          )}>
+          <div
+            className={cn(
+              "flex items-center gap-4 p-4 rounded-2xl border transition-premium glass-light",
+              schedule.isEnabled
+                ? "bg-warning/5 border-warning/20 text-warning/80 shadow-lg shadow-warning/5"
+                : "bg-white/5 border-white/5 text-muted-foreground/30",
+            )}
+          >
             <div className="p-2 rounded-xl bg-white/5 border border-white/10">
-                <Calendar className="w-4 h-4 shrink-0" />
+              <Calendar className="w-4 h-4 shrink-0" />
             </div>
             <div className="flex flex-col min-w-0">
               <span className="text-[9px] font-black uppercase tracking-[0.2em] leading-tight mb-1 opacity-60">
                 Scheduled Trigger
               </span>
               <div className="flex items-center gap-3 truncate">
-                <span className="text-[11px] font-mono font-black text-white/80">{schedule.cronExpression}</span>
+                <span className="text-[11px] font-mono font-black text-white/80">
+                  {schedule.cronExpression}
+                </span>
                 {schedule.isEnabled && schedule.nextTriggerAt && (
                   <span className="text-[9px] font-bold text-muted-foreground/40 uppercase tracking-widest">
                     Next {relativeTime(schedule.nextTriggerAt)}
@@ -196,9 +219,21 @@ export default function WorkflowCard({
 
         <div className="flex items-center justify-between text-[10px] font-black text-muted-foreground/20 uppercase tracking-[0.2em] px-1">
           <div className="flex items-center gap-3">
-            <div className={cn("w-2 h-2 rounded-full", runStatus ? "bg-primary/40 shadow-[0_0_8px_hsla(var(--primary),0.3)]" : "bg-white/5")} />
+            <div
+              className={cn(
+                "w-2 h-2 rounded-full",
+                runStatus
+                  ? "bg-primary/40 shadow-[0_0_8px_hsla(var(--primary),0.3)]"
+                  : "bg-white/5",
+              )}
+            />
             {runStatus ? (
-              <span className="text-muted-foreground/40">Last active <span className="text-white/40">{relativeTime(runStatus.runAt)}</span></span>
+              <span className="text-muted-foreground/40">
+                Last active{" "}
+                <span className="text-white/40">
+                  {relativeTime(runStatus.runAt)}
+                </span>
+              </span>
             ) : (
               <span>No operational telemetry</span>
             )}
@@ -224,21 +259,31 @@ export default function WorkflowCard({
       {/* Quick Actions Footer */}
       <div className="flex items-center gap-3 mt-auto pt-6 border-t border-white/5 relative z-10">
         <button
-          onClick={(e) => { e.stopPropagation(); onHistory(); }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onHistory();
+          }}
           className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-surface-4/40 border border-white/5 text-muted-foreground/60 hover:text-white hover:bg-surface-4 hover:border-white/20 transition-premium shadow-xl glass-light group/log active:scale-95"
           title="Telemetry History"
         >
           <History className="w-4 h-4 transition-transform group-hover/log:rotate-12" />
-          <span className="text-[10px] font-black uppercase tracking-[0.2em]">Logs</span>
+          <span className="text-[10px] font-black uppercase tracking-[0.2em]">
+            Logs
+          </span>
         </button>
-        
+
         <button
-          onClick={(e) => { e.stopPropagation(); onVersions(); }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onVersions();
+          }}
           className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-surface-4/40 border border-white/5 text-muted-foreground/60 hover:text-white hover:bg-surface-4 hover:border-white/20 transition-premium shadow-xl glass-light group/ver active:scale-95"
           title="Snapshot Registry"
         >
           <GitBranch className="w-4 h-4 transition-transform group-hover/ver:scale-110" />
-          <span className="text-[10px] font-black uppercase tracking-[0.2em]">Snap</span>
+          <span className="text-[10px] font-black uppercase tracking-[0.2em]">
+            Snap
+          </span>
         </button>
 
         <div className="flex gap-2">
@@ -249,9 +294,12 @@ export default function WorkflowCard({
           >
             <Activity className="w-4.5 h-4.5" />
           </button>
-          
+
           <button
-            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
             className="w-10 h-10 flex items-center justify-center rounded-xl text-muted-foreground/40 hover:text-destructive hover:bg-destructive/10 hover:border-destructive/20 border border-transparent transition-premium active:scale-90"
             title="Decommission"
           >

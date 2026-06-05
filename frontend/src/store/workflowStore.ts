@@ -264,19 +264,16 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 }));
 
-
 // ============================================================================
 // Selector hooks for optimized re-renders
 // Use these instead of useWorkflowStore for better performance
 // ============================================================================
 
 /** Hook to get only the nodes - optimized for minimal re-renders */
-export const useWorkflowNodes = () => 
-  useWorkflowStore((state) => state.nodes);
+export const useWorkflowNodes = () => useWorkflowStore((state) => state.nodes);
 
 /** Hook to get only the edges - optimized for minimal re-renders */
-export const useWorkflowEdges = () => 
-  useWorkflowStore((state) => state.edges);
+export const useWorkflowEdges = () => useWorkflowStore((state) => state.edges);
 
 /** Hook to get only the workflow metadata - optimized for minimal re-renders */
 export const useWorkflowMeta = () =>
@@ -284,8 +281,8 @@ export const useWorkflowMeta = () =>
     useShallow((state) => ({
       workflowId: state.workflowId,
       workflowName: state.workflowName,
-      isDirty: state.isDirty
-    }))
+      isDirty: state.isDirty,
+    })),
   );
 
 /** Hook to get only the execution settings */
@@ -295,7 +292,7 @@ export const useWorkflowSettings = () =>
       maxConcurrentExecutions: state.maxConcurrentExecutions,
       priority: state.priority,
       intent: state.intent,
-    }))
+    })),
   );
 
 /** Hook to get node/edge change handlers (stable references) */
@@ -317,5 +314,5 @@ export const useWorkflowCallbacks = () =>
       setPriority: state.setPriority,
       setIntent: state.setIntent,
       markClean: state.markClean,
-    }))
+    })),
   );

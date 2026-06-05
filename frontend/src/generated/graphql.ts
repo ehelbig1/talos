@@ -3357,15 +3357,19 @@ export const useWorkflowVersionsQuery = <
     UseQueryOptions<WorkflowVersionsQuery, TError, TData>,
     "queryKey"
   > & {
-    queryKey?: UseQueryOptions<WorkflowVersionsQuery, TError, TData>["queryKey"];
+    queryKey?: UseQueryOptions<
+      WorkflowVersionsQuery,
+      TError,
+      TData
+    >["queryKey"];
   },
 ) => {
   return useQuery<WorkflowVersionsQuery, TError, TData>({
     queryKey: ["WorkflowVersions", variables],
-    queryFn: graphqlFetcher<WorkflowVersionsQuery, WorkflowVersionsQueryVariables>(
-      WorkflowVersionsDocument,
-      variables,
-    ),
+    queryFn: graphqlFetcher<
+      WorkflowVersionsQuery,
+      WorkflowVersionsQueryVariables
+    >(WorkflowVersionsDocument, variables),
     ...options,
   });
 };
@@ -3980,7 +3984,10 @@ export const UpdateMemberRoleDocument = `
 }
     `;
 
-export const useUpdateMemberRoleMutation = <TError = unknown, TContext = unknown>(
+export const useUpdateMemberRoleMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
   options?: UseMutationOptions<
     UpdateMemberRoleMutation,
     TError,
@@ -4139,10 +4146,10 @@ export const useReEncryptSecretsMutation = <
   >({
     mutationKey: ["ReEncryptSecrets"],
     mutationFn: (variables?: ReEncryptSecretsMutationVariables) =>
-      graphqlFetcher<ReEncryptSecretsMutation, ReEncryptSecretsMutationVariables>(
-        ReEncryptSecretsDocument,
-        variables,
-      )(),
+      graphqlFetcher<
+        ReEncryptSecretsMutation,
+        ReEncryptSecretsMutationVariables
+      >(ReEncryptSecretsDocument, variables)(),
     ...options,
   });
 };
@@ -4199,39 +4206,76 @@ export type SetConcurrencyLimitMutationVariables = Exact<{
   workflowId: Scalars["UUID"]["input"];
   maxConcurrent?: InputMaybe<Scalars["Int"]["input"]>;
 }>;
-export type SetConcurrencyLimitMutation = { __typename?: "MutationRoot"; setConcurrencyLimit: boolean };
+export type SetConcurrencyLimitMutation = {
+  __typename?: "MutationRoot";
+  setConcurrencyLimit: boolean;
+};
 const SetConcurrencyLimitDocument = `
   mutation SetConcurrencyLimit($workflowId: UUID!, $maxConcurrent: Int) {
     setConcurrencyLimit(workflowId: $workflowId, maxConcurrent: $maxConcurrent)
   }
 `;
-export const useSetConcurrencyLimitMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<SetConcurrencyLimitMutation, TError, SetConcurrencyLimitMutationVariables, TContext>,
+export const useSetConcurrencyLimitMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    SetConcurrencyLimitMutation,
+    TError,
+    SetConcurrencyLimitMutationVariables,
+    TContext
+  >,
 ) =>
-  useMutation<SetConcurrencyLimitMutation, TError, SetConcurrencyLimitMutationVariables, TContext>({
+  useMutation<
+    SetConcurrencyLimitMutation,
+    TError,
+    SetConcurrencyLimitMutationVariables,
+    TContext
+  >({
     mutationKey: ["SetConcurrencyLimit"],
     mutationFn: (variables: SetConcurrencyLimitMutationVariables) =>
-      graphqlFetcher<SetConcurrencyLimitMutation, SetConcurrencyLimitMutationVariables>(SetConcurrencyLimitDocument, variables)(),
+      graphqlFetcher<
+        SetConcurrencyLimitMutation,
+        SetConcurrencyLimitMutationVariables
+      >(SetConcurrencyLimitDocument, variables)(),
     ...options,
   });
 
 // ---------------------------------------------------------------------------
 // deleteWorkflow mutation
 // ---------------------------------------------------------------------------
-export type DeleteWorkflowMutationVariables = Exact<{ id: Scalars["UUID"]["input"] }>;
-export type DeleteWorkflowMutation = { __typename?: "MutationRoot"; deleteWorkflow: boolean };
+export type DeleteWorkflowMutationVariables = Exact<{
+  id: Scalars["UUID"]["input"];
+}>;
+export type DeleteWorkflowMutation = {
+  __typename?: "MutationRoot";
+  deleteWorkflow: boolean;
+};
 const DeleteWorkflowDocument = `
   mutation DeleteWorkflow($id: UUID!) {
     deleteWorkflow(id: $id)
   }
 `;
 export const useDeleteWorkflowMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<DeleteWorkflowMutation, TError, DeleteWorkflowMutationVariables, TContext>,
+  options?: UseMutationOptions<
+    DeleteWorkflowMutation,
+    TError,
+    DeleteWorkflowMutationVariables,
+    TContext
+  >,
 ) =>
-  useMutation<DeleteWorkflowMutation, TError, DeleteWorkflowMutationVariables, TContext>({
+  useMutation<
+    DeleteWorkflowMutation,
+    TError,
+    DeleteWorkflowMutationVariables,
+    TContext
+  >({
     mutationKey: ["DeleteWorkflow"],
     mutationFn: (variables: DeleteWorkflowMutationVariables) =>
-      graphqlFetcher<DeleteWorkflowMutation, DeleteWorkflowMutationVariables>(DeleteWorkflowDocument, variables)(),
+      graphqlFetcher<DeleteWorkflowMutation, DeleteWorkflowMutationVariables>(
+        DeleteWorkflowDocument,
+        variables,
+      )(),
     ...options,
   });
 
@@ -4280,12 +4324,25 @@ const TestWorkflowDocument = `
   }
 `;
 export const useTestWorkflowMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<TestWorkflowMutation, TError, TestWorkflowMutationVariables, TContext>,
+  options?: UseMutationOptions<
+    TestWorkflowMutation,
+    TError,
+    TestWorkflowMutationVariables,
+    TContext
+  >,
 ) =>
-  useMutation<TestWorkflowMutation, TError, TestWorkflowMutationVariables, TContext>({
+  useMutation<
+    TestWorkflowMutation,
+    TError,
+    TestWorkflowMutationVariables,
+    TContext
+  >({
     mutationKey: ["TestWorkflow"],
     mutationFn: (variables: TestWorkflowMutationVariables) =>
-      graphqlFetcher<TestWorkflowMutation, TestWorkflowMutationVariables>(TestWorkflowDocument, variables)(),
+      graphqlFetcher<TestWorkflowMutation, TestWorkflowMutationVariables>(
+        TestWorkflowDocument,
+        variables,
+      )(),
     ...options,
   });
 
@@ -4295,7 +4352,15 @@ export const useTestWorkflowMutation = <TError = unknown, TContext = unknown>(
 export type UpdateSecretMutationVariables = Exact<{
   input: UpdateSecretInput;
 }>;
-export type UpdateSecretMutation = { __typename?: "MutationRoot"; updateSecret: { __typename?: "Secret"; id: string; name: string; keyPath: string } };
+export type UpdateSecretMutation = {
+  __typename?: "MutationRoot";
+  updateSecret: {
+    __typename?: "Secret";
+    id: string;
+    name: string;
+    keyPath: string;
+  };
+};
 const UpdateSecretDocument = `
   mutation UpdateSecret($input: UpdateSecretInput!) {
     updateSecret(input: $input) {
@@ -4306,12 +4371,25 @@ const UpdateSecretDocument = `
   }
 `;
 export const useUpdateSecretMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<UpdateSecretMutation, TError, UpdateSecretMutationVariables, TContext>,
+  options?: UseMutationOptions<
+    UpdateSecretMutation,
+    TError,
+    UpdateSecretMutationVariables,
+    TContext
+  >,
 ) =>
-  useMutation<UpdateSecretMutation, TError, UpdateSecretMutationVariables, TContext>({
+  useMutation<
+    UpdateSecretMutation,
+    TError,
+    UpdateSecretMutationVariables,
+    TContext
+  >({
     mutationKey: ["UpdateSecret"],
     mutationFn: (variables: UpdateSecretMutationVariables) =>
-      graphqlFetcher<UpdateSecretMutation, UpdateSecretMutationVariables>(UpdateSecretDocument, variables)(),
+      graphqlFetcher<UpdateSecretMutation, UpdateSecretMutationVariables>(
+        UpdateSecretDocument,
+        variables,
+      )(),
     ...options,
   });
 
@@ -4351,13 +4429,27 @@ const WebhookTriggersDocument = `
     }
   }
 `;
-export const useWebhookTriggersQuery = <TData = WebhookTriggersQuery, TError = unknown>(
+export const useWebhookTriggersQuery = <
+  TData = WebhookTriggersQuery,
+  TError = unknown,
+>(
   variables?: WebhookTriggersQueryVariables,
-  options?: Omit<UseQueryOptions<WebhookTriggersQuery, TError, TData>, "queryKey"> & { queryKey?: UseQueryOptions<WebhookTriggersQuery, TError, TData>["queryKey"] },
+  options?: Omit<
+    UseQueryOptions<WebhookTriggersQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<WebhookTriggersQuery, TError, TData>["queryKey"];
+  },
 ) =>
   useQuery<WebhookTriggersQuery, TError, TData>({
-    queryKey: variables === undefined ? ["WebhookTriggers"] : ["WebhookTriggers", variables],
-    queryFn: graphqlFetcher<WebhookTriggersQuery, WebhookTriggersQueryVariables>(WebhookTriggersDocument, variables),
+    queryKey:
+      variables === undefined
+        ? ["WebhookTriggers"]
+        : ["WebhookTriggers", variables],
+    queryFn: graphqlFetcher<
+      WebhookTriggersQuery,
+      WebhookTriggersQueryVariables
+    >(WebhookTriggersDocument, variables),
     ...options,
   });
 
@@ -4387,13 +4479,29 @@ const CreateWebhookTriggerDocument = `
     }
   }
 `;
-export const useCreateWebhookTriggerMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<CreateWebhookTriggerMutation, TError, CreateWebhookTriggerMutationVariables, TContext>,
+export const useCreateWebhookTriggerMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    CreateWebhookTriggerMutation,
+    TError,
+    CreateWebhookTriggerMutationVariables,
+    TContext
+  >,
 ) =>
-  useMutation<CreateWebhookTriggerMutation, TError, CreateWebhookTriggerMutationVariables, TContext>({
+  useMutation<
+    CreateWebhookTriggerMutation,
+    TError,
+    CreateWebhookTriggerMutationVariables,
+    TContext
+  >({
     mutationKey: ["CreateWebhookTrigger"],
     mutationFn: (variables: CreateWebhookTriggerMutationVariables) =>
-      graphqlFetcher<CreateWebhookTriggerMutation, CreateWebhookTriggerMutationVariables>(CreateWebhookTriggerDocument, variables)(),
+      graphqlFetcher<
+        CreateWebhookTriggerMutation,
+        CreateWebhookTriggerMutationVariables
+      >(CreateWebhookTriggerDocument, variables)(),
     ...options,
   });
 
@@ -4427,13 +4535,27 @@ const NodeTemplatesDocument = `
     }
   }
 `;
-export const useNodeTemplatesQuery = <TData = NodeTemplatesQuery, TError = unknown>(
+export const useNodeTemplatesQuery = <
+  TData = NodeTemplatesQuery,
+  TError = unknown,
+>(
   variables?: NodeTemplatesQueryVariables,
-  options?: Omit<UseQueryOptions<NodeTemplatesQuery, TError, TData>, "queryKey"> & { queryKey?: UseQueryOptions<NodeTemplatesQuery, TError, TData>["queryKey"] },
+  options?: Omit<
+    UseQueryOptions<NodeTemplatesQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<NodeTemplatesQuery, TError, TData>["queryKey"];
+  },
 ) =>
   useQuery<NodeTemplatesQuery, TError, TData>({
-    queryKey: variables === undefined ? ["NodeTemplates"] : ["NodeTemplates", variables],
-    queryFn: graphqlFetcher<NodeTemplatesQuery, NodeTemplatesQueryVariables>(NodeTemplatesDocument, variables),
+    queryKey:
+      variables === undefined
+        ? ["NodeTemplates"]
+        : ["NodeTemplates", variables],
+    queryFn: graphqlFetcher<NodeTemplatesQuery, NodeTemplatesQueryVariables>(
+      NodeTemplatesDocument,
+      variables,
+    ),
     ...options,
   });
 
@@ -4459,13 +4581,29 @@ const CreateModuleFromTemplateDocument = `
     }
   }
 `;
-export const useCreateModuleFromTemplateMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<CreateModuleFromTemplateMutation, TError, CreateModuleFromTemplateMutationVariables, TContext>,
+export const useCreateModuleFromTemplateMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    CreateModuleFromTemplateMutation,
+    TError,
+    CreateModuleFromTemplateMutationVariables,
+    TContext
+  >,
 ) =>
-  useMutation<CreateModuleFromTemplateMutation, TError, CreateModuleFromTemplateMutationVariables, TContext>({
+  useMutation<
+    CreateModuleFromTemplateMutation,
+    TError,
+    CreateModuleFromTemplateMutationVariables,
+    TContext
+  >({
     mutationKey: ["CreateModuleFromTemplate"],
     mutationFn: (variables: CreateModuleFromTemplateMutationVariables) =>
-      graphqlFetcher<CreateModuleFromTemplateMutation, CreateModuleFromTemplateMutationVariables>(CreateModuleFromTemplateDocument, variables)(),
+      graphqlFetcher<
+        CreateModuleFromTemplateMutation,
+        CreateModuleFromTemplateMutationVariables
+      >(CreateModuleFromTemplateDocument, variables)(),
     ...options,
   });
 
@@ -4499,13 +4637,31 @@ const GetAllWorkflowStatsDocument = `
     }
   }
 `;
-export const useGetAllWorkflowStatsQuery = <TData = GetAllWorkflowStatsQuery, TError = unknown>(
+export const useGetAllWorkflowStatsQuery = <
+  TData = GetAllWorkflowStatsQuery,
+  TError = unknown,
+>(
   variables?: GetAllWorkflowStatsQueryVariables,
-  options?: Omit<UseQueryOptions<GetAllWorkflowStatsQuery, TError, TData>, "queryKey"> & { queryKey?: UseQueryOptions<GetAllWorkflowStatsQuery, TError, TData>["queryKey"] },
+  options?: Omit<
+    UseQueryOptions<GetAllWorkflowStatsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetAllWorkflowStatsQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
 ) =>
   useQuery<GetAllWorkflowStatsQuery, TError, TData>({
-    queryKey: variables === undefined ? ["GetAllWorkflowStats"] : ["GetAllWorkflowStats", variables],
-    queryFn: graphqlFetcher<GetAllWorkflowStatsQuery, GetAllWorkflowStatsQueryVariables>(GetAllWorkflowStatsDocument, variables),
+    queryKey:
+      variables === undefined
+        ? ["GetAllWorkflowStats"]
+        : ["GetAllWorkflowStats", variables],
+    queryFn: graphqlFetcher<
+      GetAllWorkflowStatsQuery,
+      GetAllWorkflowStatsQueryVariables
+    >(GetAllWorkflowStatsDocument, variables),
     ...options,
   });
 
@@ -4541,13 +4697,28 @@ const GetVersionDiffSummaryDocument = `
     }
   }
 `;
-export const useGetVersionDiffSummaryQuery = <TData = GetVersionDiffSummaryQuery, TError = unknown>(
+export const useGetVersionDiffSummaryQuery = <
+  TData = GetVersionDiffSummaryQuery,
+  TError = unknown,
+>(
   variables: GetVersionDiffSummaryQueryVariables,
-  options?: Omit<UseQueryOptions<GetVersionDiffSummaryQuery, TError, TData>, "queryKey"> & { queryKey?: UseQueryOptions<GetVersionDiffSummaryQuery, TError, TData>["queryKey"] },
+  options?: Omit<
+    UseQueryOptions<GetVersionDiffSummaryQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetVersionDiffSummaryQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
 ) =>
   useQuery<GetVersionDiffSummaryQuery, TError, TData>({
     queryKey: ["GetVersionDiffSummary", variables],
-    queryFn: graphqlFetcher<GetVersionDiffSummaryQuery, GetVersionDiffSummaryQueryVariables>(GetVersionDiffSummaryDocument, variables),
+    queryFn: graphqlFetcher<
+      GetVersionDiffSummaryQuery,
+      GetVersionDiffSummaryQueryVariables
+    >(GetVersionDiffSummaryDocument, variables),
     ...options,
   });
 
@@ -4577,13 +4748,28 @@ const GetWorkflowChangelogDocument = `
     }
   }
 `;
-export const useGetWorkflowChangelogQuery = <TData = GetWorkflowChangelogQuery, TError = unknown>(
+export const useGetWorkflowChangelogQuery = <
+  TData = GetWorkflowChangelogQuery,
+  TError = unknown,
+>(
   variables: GetWorkflowChangelogQueryVariables,
-  options?: Omit<UseQueryOptions<GetWorkflowChangelogQuery, TError, TData>, "queryKey"> & { queryKey?: UseQueryOptions<GetWorkflowChangelogQuery, TError, TData>["queryKey"] },
+  options?: Omit<
+    UseQueryOptions<GetWorkflowChangelogQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetWorkflowChangelogQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
 ) =>
   useQuery<GetWorkflowChangelogQuery, TError, TData>({
     queryKey: ["GetWorkflowChangelog", variables],
-    queryFn: graphqlFetcher<GetWorkflowChangelogQuery, GetWorkflowChangelogQueryVariables>(GetWorkflowChangelogDocument, variables),
+    queryFn: graphqlFetcher<
+      GetWorkflowChangelogQuery,
+      GetWorkflowChangelogQueryVariables
+    >(GetWorkflowChangelogDocument, variables),
     ...options,
   });
 
@@ -4637,7 +4823,11 @@ export const useMyModulesQuery = <TData = MyModulesQuery, TError = unknown>(
   },
 ) =>
   useQuery<MyModulesQuery, TError, TData>({
-    queryKey: variables === undefined ? ["MyModules"] : ["MyModules", variables],
-    queryFn: graphqlFetcher<MyModulesQuery, MyModulesQueryVariables>(MyModulesDocument, variables),
+    queryKey:
+      variables === undefined ? ["MyModules"] : ["MyModules", variables],
+    queryFn: graphqlFetcher<MyModulesQuery, MyModulesQueryVariables>(
+      MyModulesDocument,
+      variables,
+    ),
     ...options,
   });

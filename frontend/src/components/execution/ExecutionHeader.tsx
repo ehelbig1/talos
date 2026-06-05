@@ -45,7 +45,7 @@ export function ExecutionHeader({
   return (
     <div className="px-6 py-3 border-b border-white/5 bg-surface-2/40 backdrop-blur-xl flex items-center gap-4 flex-wrap shrink-0 relative overflow-hidden">
       <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30" />
-      
+
       <div className="flex items-center gap-6 flex-1 min-w-[300px] relative z-10">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-[0_0_15px_hsla(var(--primary),0.1)]">
@@ -56,7 +56,8 @@ export function ExecutionHeader({
               Mission Profile
             </span>
             <span className="text-sm font-black text-white tracking-tight font-outfit truncate max-w-[150px]">
-              {workflows.find((w) => w.id === workflowId)?.name || "New Protocol"}
+              {workflows.find((w) => w.id === workflowId)?.name ||
+                "New Protocol"}
             </span>
           </div>
         </div>
@@ -97,7 +98,9 @@ export function ExecutionHeader({
             aria-label="Refresh workflows"
             className="h-9 w-9 text-muted-foreground/40 hover:text-white hover:bg-white/5 rounded-xl transition-premium"
           >
-            <RefreshCw className={cn("h-4 w-4", loadingWorkflows && "animate-spin")} />
+            <RefreshCw
+              className={cn("h-4 w-4", loadingWorkflows && "animate-spin")}
+            />
           </Button>
         </div>
 
@@ -106,8 +109,12 @@ export function ExecutionHeader({
             <div className="h-8 w-px bg-white/5 mx-1" />
             <div className="flex items-center gap-3 shrink-0">
               <div className="flex flex-col items-end mr-1">
-                <span className="text-[8px] font-black text-muted-foreground/30 uppercase tracking-widest">Operator</span>
-                <span className="text-[10px] font-bold text-muted-foreground/60">Persona</span>
+                <span className="text-[8px] font-black text-muted-foreground/30 uppercase tracking-widest">
+                  Operator
+                </span>
+                <span className="text-[10px] font-bold text-muted-foreground/60">
+                  Persona
+                </span>
               </div>
               <DarkSelect
                 id="actor-select"

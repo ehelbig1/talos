@@ -22,7 +22,11 @@ function ModulePreloader({ moduleId }: { moduleId: string }) {
     added.current = true;
     const mod = data.wasmModules[0];
     let config: Record<string, unknown> = {};
-    try { config = JSON.parse(mod.config); } catch { /* empty config */ }
+    try {
+      config = JSON.parse(mod.config);
+    } catch {
+      /* empty config */
+    }
     addNode(
       mod.id,
       mod.name,
@@ -33,7 +37,7 @@ function ModulePreloader({ moduleId }: { moduleId: string }) {
       undefined,
       mod.importedInterfaces ?? undefined,
     );
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
 
   return null;
@@ -47,7 +51,8 @@ function EditorPage() {
   useEffect(() => {
     if (id) {
       loadWorkflowById(id).catch((err) => {
-        if (import.meta.env.DEV) console.error("Failed to deep-link workflow:", err);
+        if (import.meta.env.DEV)
+          console.error("Failed to deep-link workflow:", err);
       });
     }
   }, [id]);

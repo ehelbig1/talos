@@ -199,7 +199,10 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
 
     // Update the workflow store
     const store = useWorkflowStore.getState();
-    if (import.meta.env.DEV) console.log(`Loaded workflow: ${workflow.name} (${workflow.id}) with ${nodes.length} nodes`);
+    if (import.meta.env.DEV)
+      console.log(
+        `Loaded workflow: ${workflow.name} (${workflow.id}) with ${nodes.length} nodes`,
+      );
     store.setWorkflowMeta(workflow.id, workflow.name);
     store.setMaxConcurrentExecutions(workflow.maxConcurrentExecutions ?? 1);
     store.setPriority(graph.priority ?? "normal");

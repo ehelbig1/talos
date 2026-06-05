@@ -45,11 +45,7 @@ export const StepIndicator: React.FC<StepIndicatorProps> = ({
                   "bg-white/5 text-muted-foreground/40 border border-white/5",
               )}
             >
-              {isCompleted ? (
-                <Check className="h-3 w-3" />
-              ) : (
-                idx + 1
-              )}
+              {isCompleted ? <Check className="h-3 w-3" /> : idx + 1}
             </div>
             <span
               className={cn(

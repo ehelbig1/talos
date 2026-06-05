@@ -176,7 +176,11 @@ interface SettingsSidebarProps {
   onPrefetch: (value: string) => void;
 }
 
-function SettingsSidebar({ active, onSelect, onPrefetch }: SettingsSidebarProps) {
+function SettingsSidebar({
+  active,
+  onSelect,
+  onPrefetch,
+}: SettingsSidebarProps) {
   const [search, setSearch] = useState("");
 
   const filteredCategories = search.trim()
@@ -233,7 +237,9 @@ function SettingsSidebar({ active, onSelect, onPrefetch }: SettingsSidebarProps)
                       <Icon
                         className={cn(
                           "h-4 w-4 shrink-0 transition-transform",
-                          isActive ? "text-primary scale-110" : "text-muted-foreground/30",
+                          isActive
+                            ? "text-primary scale-110"
+                            : "text-muted-foreground/30",
                         )}
                       />
                       {item.label}
@@ -267,7 +273,9 @@ function PanelLoading() {
         <div className="absolute inset-0 bg-primary/10 animate-pulse" />
         <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin relative z-10" />
       </div>
-      <span className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest animate-status-pulse">Syncing Protocol...</span>
+      <span className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest animate-status-pulse">
+        Syncing Protocol...
+      </span>
     </div>
   );
 }
@@ -314,7 +322,9 @@ export default function Settings() {
             <Shield className="w-6 h-6 text-primary" />
           </div>
           <div>
-            <h1 className="text-3xl md:text-4xl font-black text-white tracking-tighter">Configuration</h1>
+            <h1 className="text-3xl md:text-4xl font-black text-white tracking-tighter">
+              Configuration
+            </h1>
             <p className="text-[11px] font-black text-muted-foreground/40 uppercase tracking-widest mt-1.5 flex items-center gap-2">
               System Parameters &bull; Access Control &bull; Core Protocols
             </p>
@@ -327,23 +337,23 @@ export default function Settings() {
         <div className="absolute left-0 inset-y-0 w-8 bg-gradient-to-r from-background to-transparent z-10 pointer-events-none" />
         <div className="absolute right-0 inset-y-0 w-8 bg-gradient-to-l from-background to-transparent z-10 pointer-events-none" />
         <div className="flex gap-2 overflow-x-auto px-8 py-4 border-b border-white/5 bg-surface-2/40 backdrop-blur-xl custom-scrollbar">
-        {ALL_ITEMS.map((item) => {
-          const isActive = active === item.value;
-          return (
-            <button
-              key={item.value}
-              onClick={() => setActive(item.value)}
-              className={cn(
-                "whitespace-nowrap text-[10px] font-black uppercase tracking-widest px-4 py-2.5 rounded-full border transition-premium shrink-0",
-                isActive
-                  ? "bg-primary/10 text-primary border-primary/20 shadow-lg shadow-primary/5"
-                  : "bg-surface-4/60 text-muted-foreground border-white/5 hover:text-foreground",
-              )}
-            >
-              {item.label}
-            </button>
-          );
-        })}
+          {ALL_ITEMS.map((item) => {
+            const isActive = active === item.value;
+            return (
+              <button
+                key={item.value}
+                onClick={() => setActive(item.value)}
+                className={cn(
+                  "whitespace-nowrap text-[10px] font-black uppercase tracking-widest px-4 py-2.5 rounded-full border transition-premium shrink-0",
+                  isActive
+                    ? "bg-primary/10 text-primary border-primary/20 shadow-lg shadow-primary/5"
+                    : "bg-surface-4/60 text-muted-foreground border-white/5 hover:text-foreground",
+                )}
+              >
+                {item.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -359,89 +369,123 @@ export default function Settings() {
         <main className="flex-1 overflow-y-auto custom-scrollbar">
           <div className="max-w-6xl mx-auto px-8 py-12 animate-in fade-in slide-in-from-bottom-4 duration-700">
             {active === "integrations" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <IntegrationsManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <IntegrationsManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "api-keys" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <ApiKeysManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <ApiKeysManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "secrets" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <SecretsManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <SecretsManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "mcp-server" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <McpServerSettings />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <McpServerSettings />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "audit" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <AuditSettings />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <AuditSettings />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "approvals" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <ApprovalQueue />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <ApprovalQueue />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "dlq" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <DLQViewer />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <DLQViewer />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "quotas" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <ResourceQuotas />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <ResourceQuotas />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "organizations" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <OrganizationsManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <OrganizationsManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "schedules" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <SchedulesManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <SchedulesManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "webhooks" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <WebhookManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <WebhookManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "templates" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <ModuleTemplatesBrowser />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <ModuleTemplatesBrowser />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "capability-ceiling" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <CapabilityCeilingManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <CapabilityCeilingManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "security" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <SecurityManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <SecurityManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "two-factor" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <TwoFactorSettings enabled={user?.twoFactorEnabled || false} />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <TwoFactorSettings
+                    enabled={user?.twoFactorEnabled || false}
+                  />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "oauth" && (
-              <ErrorBoundary><Suspense fallback={<PanelLoading />}>
-                <OAuthManager />
-              </Suspense></ErrorBoundary>
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <OAuthManager />
+                </Suspense>
+              </ErrorBoundary>
             )}
             {active === "account" && (
               <div className="bg-surface-3/40 border border-white/5 rounded-[3rem] p-10 glass relative overflow-hidden group">
                 <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
-                
+
                 <div className="relative z-10 space-y-10">
                   <div className="flex items-center gap-6">
                     <div className="w-20 h-20 bg-surface-4/60 border border-white/10 rounded-[2rem] flex items-center justify-center shadow-2xl relative group/avatar">
@@ -449,7 +493,9 @@ export default function Settings() {
                       <UserIcon className="w-10 h-10 text-primary relative z-10" />
                     </div>
                     <div>
-                      <h2 className="text-4xl font-black text-white tracking-tighter">Identity Profile</h2>
+                      <h2 className="text-4xl font-black text-white tracking-tighter">
+                        Identity Profile
+                      </h2>
                       <p className="text-[10px] font-black text-primary uppercase tracking-[0.2em] mt-1.5">
                         Operational Access & Security
                       </p>
@@ -479,11 +525,14 @@ export default function Settings() {
                         <LockIcon className="w-6 h-6" />
                       </div>
                       <div className="relative z-10 flex-1">
-                        <h4 className="text-lg font-black text-warning tracking-tight">Security Integrity Protocol</h4>
+                        <h4 className="text-lg font-black text-warning tracking-tight">
+                          Security Integrity Protocol
+                        </h4>
                         <p className="text-xs text-warning/60 leading-relaxed mt-2 font-medium">
-                          You are currently using session-based authentication. Advanced 
-                          multi-factor parameters and biometric keys are managed through 
-                          the primary core identity provider.
+                          You are currently using session-based authentication.
+                          Advanced multi-factor parameters and biometric keys
+                          are managed through the primary core identity
+                          provider.
                         </p>
                       </div>
                     </div>

@@ -12,7 +12,14 @@ export const IconButton: React.FC<{
   disabled?: boolean;
   className?: string;
   children: React.ReactNode;
-}> = ({ onClick, title, "aria-label": ariaLabel, disabled, className, children }) => (
+}> = ({
+  onClick,
+  title,
+  "aria-label": ariaLabel,
+  disabled,
+  className,
+  children,
+}) => (
   <button
     type="button"
     onClick={onClick}

@@ -103,12 +103,21 @@ export const Dialog: React.FC<DialogProps> = ({
       onClick={onClose}
       onKeyDown={handleKey}
     >
-      <div ref={contentRef} className="w-full flex justify-center animate-in zoom-in-95 fade-in slide-in-from-bottom-4 duration-500">
-        <DialogWrapper className={className} onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+      <div
+        ref={contentRef}
+        className="w-full flex justify-center animate-in zoom-in-95 fade-in slide-in-from-bottom-4 duration-500"
+      >
+        <DialogWrapper
+          className={className}
+          onClick={(e: React.MouseEvent) => e.stopPropagation()}
+        >
           <div className="flex justify-between items-start mb-8">
             {title && (
               <div className="flex flex-col gap-1.5">
-                <h2 id="dialog-title" className="text-3xl font-black text-white tracking-tighter leading-none">
+                <h2
+                  id="dialog-title"
+                  className="text-3xl font-black text-white tracking-tighter leading-none"
+                >
                   {title}
                 </h2>
                 <div className="h-0.5 w-12 bg-primary rounded-full shadow-[0_0_10px_hsla(var(--primary),0.5)]" />
@@ -120,13 +129,16 @@ export const Dialog: React.FC<DialogProps> = ({
               title="Close"
               aria-label="Close"
             >
-              <X size={20} className="transition-transform group-hover:rotate-90" />
+              <X
+                size={20}
+                className="transition-transform group-hover:rotate-90"
+              />
             </button>
           </div>
           {children}
         </DialogWrapper>
       </div>
     </div>,
-    document.body
+    document.body,
   );
 };

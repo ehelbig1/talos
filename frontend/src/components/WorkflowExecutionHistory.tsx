@@ -55,9 +55,7 @@ function StatusIcon({ status }: { status: string }) {
     case "failed":
       return <XCircle className="w-4 h-4 text-destructive shrink-0" />;
     case "running":
-      return (
-        <Loader2 className="w-4 h-4 text-primary shrink-0 animate-spin" />
-      );
+      return <Loader2 className="w-4 h-4 text-primary shrink-0 animate-spin" />;
     case "awaiting_approval":
       return <Clock className="w-4 h-4 text-warning shrink-0" />;
     default:
@@ -68,10 +66,14 @@ function StatusIcon({ status }: { status: string }) {
 function StatusPill({ status }: { status: string }) {
   const cls =
     {
-      completed: "bg-success/10 text-success border-success/20 shadow-[0_0_15px_hsla(var(--success),0.15)]",
-      failed: "bg-destructive/10 text-destructive border-destructive/20 shadow-[0_0_15px_hsla(var(--destructive),0.15)]",
-      running: "bg-primary/10 text-primary border-primary/20 shadow-[0_0_15px_hsla(var(--primary),0.15)]",
-      awaiting_approval: "bg-warning/10 text-warning border-warning/20 shadow-[0_0_15px_hsla(var(--warning),0.15)]",
+      completed:
+        "bg-success/10 text-success border-success/20 shadow-[0_0_15px_hsla(var(--success),0.15)]",
+      failed:
+        "bg-destructive/10 text-destructive border-destructive/20 shadow-[0_0_15px_hsla(var(--destructive),0.15)]",
+      running:
+        "bg-primary/10 text-primary border-primary/20 shadow-[0_0_15px_hsla(var(--primary),0.15)]",
+      awaiting_approval:
+        "bg-warning/10 text-warning border-warning/20 shadow-[0_0_15px_hsla(var(--warning),0.15)]",
       pending: "bg-warning/10 text-warning border-warning/20",
       timeout: "bg-warning/10 text-warning border-warning/20",
     }[status] ?? "bg-surface-4 text-muted-foreground/40 border-white/5";
@@ -166,13 +168,17 @@ function ExecutionRow({
   }, [exec.outputData]);
 
   return (
-    <div className={cn(
+    <div
+      className={cn(
         "group border border-white/5 bg-surface-3/30 rounded-[2rem] overflow-hidden backdrop-blur-3xl transition-premium shadow-2xl relative",
-        isExpanded ? "border-primary/30 bg-surface-3/60" : "hover:bg-surface-3/50 hover:border-white/10"
-    )}>
-        {isExpanded && (
-            <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-        )}
+        isExpanded
+          ? "border-primary/30 bg-surface-3/60"
+          : "hover:bg-surface-3/50 hover:border-white/10",
+      )}
+    >
+      {isExpanded && (
+        <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
+      )}
       {/* Row header */}
       <button
         className="w-full flex items-center gap-6 text-xs p-6 transition-premium text-left focus:outline-none relative z-10"
@@ -180,39 +186,46 @@ function ExecutionRow({
         aria-expanded={isExpanded}
       >
         <div className="shrink-0 flex items-center justify-center w-12 h-12 rounded-2xl bg-black/20 border border-white/5 group-hover:scale-110 transition-premium shadow-xl relative overflow-hidden">
-            <div className={cn("absolute inset-0 opacity-10 blur-xl", exec.status === "failed" ? "bg-destructive" : "bg-primary")} />
-            <StatusIcon status={exec.status} />
+          <div
+            className={cn(
+              "absolute inset-0 opacity-10 blur-xl",
+              exec.status === "failed" ? "bg-destructive" : "bg-primary",
+            )}
+          />
+          <StatusIcon status={exec.status} />
         </div>
 
         <div className="flex flex-col min-w-0 flex-1 gap-2">
-            <div className="flex items-center gap-3">
-                <StatusPill status={exec.status} />
-                <TriggerBadge triggerType={exec.triggerType} />
-            </div>
-            <div className="flex items-center gap-4 text-muted-foreground/30 text-[10px] font-black uppercase tracking-widest truncate">
-                <span className="flex items-center gap-2">
-                    <Clock size={12} />
-                    {formatDistanceToNow(new Date(exec.startedAt), { addSuffix: true })}
-                </span>
-                {agentName && exec.triggerType === "actor_dispatch" && (
-                  <span className="flex items-center gap-2 text-violet-400/60">
-                    <Bot size={12} />
-                    {agentName}
-                  </span>
-                )}
-            </div>
+          <div className="flex items-center gap-3">
+            <StatusPill status={exec.status} />
+            <TriggerBadge triggerType={exec.triggerType} />
+          </div>
+          <div className="flex items-center gap-4 text-muted-foreground/30 text-[10px] font-black uppercase tracking-widest truncate">
+            <span className="flex items-center gap-2">
+              <Clock size={12} />
+              {formatDistanceToNow(new Date(exec.startedAt), {
+                addSuffix: true,
+              })}
+            </span>
+            {agentName && exec.triggerType === "actor_dispatch" && (
+              <span className="flex items-center gap-2 text-violet-400/60">
+                <Bot size={12} />
+                {agentName}
+              </span>
+            )}
+          </div>
         </div>
 
         <div className="flex flex-col items-end gap-2 shrink-0 pr-2">
-            <span className="text-[11px] text-white/60 font-black uppercase tracking-widest font-outfit">
-              {formatDuration(exec.durationMs)}
-            </span>
-            <ChevronRight
-                className={cn(
-                    "w-5 h-5 text-muted-foreground/20 shrink-0 transition-transform duration-500",
-                    isExpanded && "rotate-90 text-primary"
-                )}
-            />
+          <span className="text-[11px] text-white/60 font-black uppercase tracking-widest font-outfit">
+            {formatDuration(exec.durationMs)}
+          </span>
+          <ChevronRight
+            className={cn(
+              "w-5 h-5 text-muted-foreground/20 shrink-0 transition-transform duration-500",
+              isExpanded && "rotate-90 text-primary",
+            )}
+          />
         </div>
       </button>
 
@@ -225,27 +238,42 @@ function ExecutionRow({
       >
         <div className="px-8 pb-8 space-y-8 animate-in slide-in-from-top-4 duration-500">
           <div className="h-px bg-white/5 mx-[-2rem]" />
-          
+
           {/* Action buttons */}
           {(onRetry || onResume) && (
             <div className="flex items-center gap-4">
-              {onRetry && (exec.status === "failed" || exec.status === "completed") && (
-                <Button
-                  onClick={(e) => { e.stopPropagation(); onRetry(exec.id); }}
-                  disabled={isRetrying}
-                  className="h-11 px-6 text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl bg-violet-500/10 border border-violet-500/20 text-violet-400 hover:bg-violet-500/20 active:scale-95 transition-premium shadow-xl"
-                >
-                  {isRetrying ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
-                  RETRY_EXECUTION
-                </Button>
-              )}
+              {onRetry &&
+                (exec.status === "failed" || exec.status === "completed") && (
+                  <Button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onRetry(exec.id);
+                    }}
+                    disabled={isRetrying}
+                    className="h-11 px-6 text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl bg-violet-500/10 border border-violet-500/20 text-violet-400 hover:bg-violet-500/20 active:scale-95 transition-premium shadow-xl"
+                  >
+                    {isRetrying ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <RotateCcw className="w-4 h-4" />
+                    )}
+                    RETRY_EXECUTION
+                  </Button>
+                )}
               {onResume && exec.status === "awaiting_approval" && (
                 <Button
-                  onClick={(e) => { e.stopPropagation(); onResume(exec.id); }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onResume(exec.id);
+                  }}
                   disabled={isResuming}
                   className="h-11 px-6 text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 active:scale-95 transition-premium shadow-xl"
                 >
-                  {isResuming ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}
+                  {isResuming ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <PlayCircle className="w-4 h-4" />
+                  )}
                   RESUME_PROTOCOL
                 </Button>
               )}
@@ -254,52 +282,54 @@ function ExecutionRow({
 
           {exec.errorMessage && (
             <div className="space-y-4">
-                <label className="text-[10px] text-destructive uppercase tracking-[0.3em] font-black ml-1">
-                    Operational Fault
-                </label>
-                <div className="relative group/error">
-                    <div className="absolute -inset-1 bg-destructive/10 rounded-3xl blur opacity-30 group-hover/error:opacity-50 transition-premium" />
-                    <div className="relative p-6 bg-destructive/5 rounded-[2rem] border border-destructive/20 text-[12px] font-bold text-destructive shadow-2xl leading-relaxed">
-                        <div className="flex items-center gap-3 mb-4 opacity-60">
-                            <XCircle className="w-4 h-4" />
-                            <span className="font-black uppercase tracking-widest text-[9px]">CRITICAL_EXCEPTION</span>
-                        </div>
-                        <div className="bg-black/40 p-4 rounded-2xl border border-destructive/10 font-mono">
-                            {sanitizeErrorMessage(exec.errorMessage)}
-                        </div>
-                    </div>
+              <label className="text-[10px] text-destructive uppercase tracking-[0.3em] font-black ml-1">
+                Operational Fault
+              </label>
+              <div className="relative group/error">
+                <div className="absolute -inset-1 bg-destructive/10 rounded-3xl blur opacity-30 group-hover/error:opacity-50 transition-premium" />
+                <div className="relative p-6 bg-destructive/5 rounded-[2rem] border border-destructive/20 text-[12px] font-bold text-destructive shadow-2xl leading-relaxed">
+                  <div className="flex items-center gap-3 mb-4 opacity-60">
+                    <XCircle className="w-4 h-4" />
+                    <span className="font-black uppercase tracking-widest text-[9px]">
+                      CRITICAL_EXCEPTION
+                    </span>
+                  </div>
+                  <div className="bg-black/40 p-4 rounded-2xl border border-destructive/10 font-mono">
+                    {sanitizeErrorMessage(exec.errorMessage)}
+                  </div>
                 </div>
+              </div>
             </div>
           )}
 
           <div className="space-y-4">
             <div className="flex items-center justify-between px-2">
-                <p className="text-muted-foreground/30 text-[10px] font-black uppercase tracking-[0.3em] flex items-center gap-3">
-                  <Activity className="w-4 h-4 text-primary" />
-                  Telemetric Stream
-                </p>
-                {outputText && (
-                    <button 
-                        onClick={() => {
-                            navigator.clipboard.writeText(outputText);
-                            toast.success("Output copied to clipboard");
-                        }}
-                        className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/40 hover:text-white transition-premium shadow-lg"
-                        title="Copy Output"
-                    >
-                        <Copy className="w-4 h-4" />
-                    </button>
-                )}
+              <p className="text-muted-foreground/30 text-[10px] font-black uppercase tracking-[0.3em] flex items-center gap-3">
+                <Activity className="w-4 h-4 text-primary" />
+                Telemetric Stream
+              </p>
+              {outputText && (
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(outputText);
+                    toast.success("Output copied to clipboard");
+                  }}
+                  className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/40 hover:text-white transition-premium shadow-lg"
+                  title="Copy Output"
+                >
+                  <Copy className="w-4 h-4" />
+                </button>
+              )}
             </div>
             {outputText ? (
               <div className="relative">
                 <div className="absolute inset-0 bg-primary/5 rounded-[2rem] blur-3xl opacity-20 pointer-events-none" />
                 <div className="relative p-6 bg-black/40 rounded-[2rem] border border-white/5 shadow-2xl group overflow-hidden">
-                    <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-20 pointer-events-none" />
-                    <pre className="relative z-10 overflow-x-auto whitespace-pre-wrap max-h-96 text-[11px] font-mono text-foreground/70 custom-scrollbar selection:bg-primary/20 leading-relaxed p-2">
+                  <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-20 pointer-events-none" />
+                  <pre className="relative z-10 overflow-x-auto whitespace-pre-wrap max-h-96 text-[11px] font-mono text-foreground/70 custom-scrollbar selection:bg-primary/20 leading-relaxed p-2">
                     {outputText}
-                    </pre>
-                    <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.1)_50%),linear-gradient(90deg,rgba(255,0,0,0.02),rgba(0,255,0,0.01),rgba(0,0,255,0.02))] bg-[length:100%_4px,3px_100%]" />
+                  </pre>
+                  <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.1)_50%),linear-gradient(90deg,rgba(255,0,0,0.02),rgba(0,255,0,0.01),rgba(0,0,255,0.02))] bg-[length:100%_4px,3px_100%]" />
                 </div>
               </div>
             ) : (
@@ -334,7 +364,9 @@ export const WorkflowExecutionHistory = React.memo(
       onMutate: ({ executionId }) => setPendingId(executionId),
       onSuccess: () => {
         toast.success("Execution retried");
-        queryClient.invalidateQueries({ queryKey: ["workflow-execution-history", workflowId] });
+        queryClient.invalidateQueries({
+          queryKey: ["workflow-execution-history", workflowId],
+        });
       },
       onError: () => toast.error("Failed to retry execution"),
       onSettled: () => setPendingId(null),
@@ -344,7 +376,9 @@ export const WorkflowExecutionHistory = React.memo(
       onMutate: ({ executionId }) => setPendingId(executionId),
       onSuccess: () => {
         toast.success("Execution resumed");
-        queryClient.invalidateQueries({ queryKey: ["workflow-execution-history", workflowId] });
+        queryClient.invalidateQueries({
+          queryKey: ["workflow-execution-history", workflowId],
+        });
       },
       onError: () => toast.error("Failed to resume execution"),
       onSettled: () => setPendingId(null),
@@ -397,39 +431,52 @@ export const WorkflowExecutionHistory = React.memo(
     }, [workflowId, queryClient]);
 
     const content = (
-      <div className={cn("space-y-8 animate-in fade-in duration-700", onClose && "mt-0 p-2")}>
+      <div
+        className={cn(
+          "space-y-8 animate-in fade-in duration-700",
+          onClose && "mt-0 p-2",
+        )}
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-4">
           <div className="flex items-center gap-6">
-              <div className={cn(
-                  "flex items-center justify-center w-12 h-12 rounded-[1.25rem] bg-surface-3/60 border border-white/5 shadow-2xl transition-premium relative overflow-hidden",
-                  hasRunning && "border-primary/40 shadow-[0_0_25px_hsla(var(--primary),0.2)]"
-              )}>
-                <div className={cn("absolute inset-0 opacity-10 blur-xl", hasRunning ? "bg-primary" : "bg-white/10")} />
-                {hasRunning ? (
-                  <Activity className="w-6 h-6 text-primary relative z-10" />
-                ) : (
-                  <Clock className="w-6 h-6 text-muted-foreground/40 relative z-10" />
+            <div
+              className={cn(
+                "flex items-center justify-center w-12 h-12 rounded-[1.25rem] bg-surface-3/60 border border-white/5 shadow-2xl transition-premium relative overflow-hidden",
+                hasRunning &&
+                  "border-primary/40 shadow-[0_0_25px_hsla(var(--primary),0.2)]",
+              )}
+            >
+              <div
+                className={cn(
+                  "absolute inset-0 opacity-10 blur-xl",
+                  hasRunning ? "bg-primary" : "bg-white/10",
+                )}
+              />
+              {hasRunning ? (
+                <Activity className="w-6 h-6 text-primary relative z-10" />
+              ) : (
+                <Clock className="w-6 h-6 text-muted-foreground/40 relative z-10" />
+              )}
+            </div>
+            <div className="flex flex-col gap-1">
+              <h4 className="text-md font-black text-white tracking-tight font-outfit uppercase">
+                {onClose ? "Execution Registry" : "Execution Log"}
+              </h4>
+              <div className="flex items-center gap-3">
+                <span className="text-[10px] text-muted-foreground/30 font-black uppercase tracking-[0.3em]">
+                  {onClose ? workflowName : "Historical Telemetry"}
+                </span>
+                {hasRunning && (
+                  <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full shadow-[0_0_15px_hsla(var(--primary),0.1)]">
+                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                    <span className="text-[9px] font-black text-primary tracking-[0.2em] uppercase">
+                      Capture_Active
+                    </span>
+                  </div>
                 )}
               </div>
-              <div className="flex flex-col gap-1">
-                  <h4 className="text-md font-black text-white tracking-tight font-outfit uppercase">
-                    {onClose ? "Execution Registry" : "Execution Log"}
-                  </h4>
-                  <div className="flex items-center gap-3">
-                      <span className="text-[10px] text-muted-foreground/30 font-black uppercase tracking-[0.3em]">
-                        {onClose ? workflowName : "Historical Telemetry"}
-                      </span>
-                      {hasRunning && (
-                        <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full shadow-[0_0_15px_hsla(var(--primary),0.1)]">
-                            <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-                            <span className="text-[9px] font-black text-primary tracking-[0.2em] uppercase">
-                            Capture_Active
-                            </span>
-                        </div>
-                      )}
-                  </div>
-              </div>
+            </div>
           </div>
           <Button
             onClick={() => refetch()}
@@ -447,15 +494,17 @@ export const WorkflowExecutionHistory = React.memo(
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-24 gap-6 text-muted-foreground/20 animate-in fade-in duration-1000">
             <div className="relative">
-                <Loader2 className="w-12 h-12 animate-spin text-primary/40" />
-                <div className="absolute inset-0 blur-xl bg-primary/20 animate-pulse" />
+              <Loader2 className="w-12 h-12 animate-spin text-primary/40" />
+              <div className="absolute inset-0 blur-xl bg-primary/20 animate-pulse" />
             </div>
-            <p className="text-[11px] font-black uppercase tracking-[0.4em]">Synchronizing Registry...</p>
+            <p className="text-[11px] font-black uppercase tracking-[0.4em]">
+              Synchronizing Registry...
+            </p>
           </div>
         ) : history.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-24 px-10 text-center bg-white/[0.02] rounded-[3rem] border border-white/5 border-dashed">
             <div className="w-20 h-20 rounded-full bg-white/5 border border-white/5 flex items-center justify-center mb-6 opacity-40">
-                <Clock className="w-8 h-8 text-muted-foreground/20" />
+              <Clock className="w-8 h-8 text-muted-foreground/20" />
             </div>
             <p className="text-[11px] font-black text-muted-foreground/10 uppercase tracking-[0.4em]">
               NO_EXECUTION_RECORDS_FOUND
@@ -469,7 +518,9 @@ export const WorkflowExecutionHistory = React.memo(
                 exec={exec}
                 isExpanded={expandedId === exec.id}
                 onToggle={() => toggleExpanded(exec.id)}
-                agentName={exec.actorId ? agentIdToName[exec.actorId] : undefined}
+                agentName={
+                  exec.actorId ? agentIdToName[exec.actorId] : undefined
+                }
                 onRetry={(id) => retryMutation.mutate({ executionId: id })}
                 onResume={(id) => resumeMutation.mutate({ executionId: id })}
                 isRetrying={retryMutation.isPending && pendingId === exec.id}

@@ -4,16 +4,22 @@
  */
 import React, { useState } from "react";
 import {
-  Sparkles, Pencil, X, Play, Pause, Square, Shuffle,
-  Activity, ChevronDown, ChevronUp, Loader2,
+  Sparkles,
+  Pencil,
+  X,
+  Play,
+  Pause,
+  Square,
+  Shuffle,
+  Activity,
+  ChevronDown,
+  ChevronUp,
+  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getCapabilityConfig } from "@/lib/capabilityConfig";
 import { relativeTime } from "@/lib/formatTime";
-import {
-  graphqlRequest,
-  type ActorActionLogEntry,
-} from "@/lib/graphqlClient";
+import { graphqlRequest, type ActorActionLogEntry } from "@/lib/graphqlClient";
 
 // Re-export so callers can import relativeTime from one place within this feature.
 export { relativeTime };
@@ -35,33 +41,44 @@ export function statusColors(status: string) {
   switch (status) {
     case "active":
       return {
-        badge: "bg-success/10 text-success border-success/20 shadow-[0_0_8px_hsla(var(--success),0.2)]",
+        badge:
+          "bg-success/10 text-success border-success/20 shadow-[0_0_8px_hsla(var(--success),0.2)]",
         dot: "bg-success",
         border: "border-l-success",
       };
     case "suspended":
       return {
-        badge: "bg-warning/10 text-warning border-warning/20 shadow-[0_0_8px_hsla(var(--warning),0.2)]",
+        badge:
+          "bg-warning/10 text-warning border-warning/20 shadow-[0_0_8px_hsla(var(--warning),0.2)]",
         dot: "bg-warning",
         border: "border-l-warning",
       };
     case "terminated":
       return {
-        badge: "bg-destructive/10 text-destructive border-destructive/20 shadow-[0_0_8px_hsla(var(--destructive),0.2)]",
+        badge:
+          "bg-destructive/10 text-destructive border-destructive/20 shadow-[0_0_8px_hsla(var(--destructive),0.2)]",
         dot: "bg-destructive",
         border: "border-l-destructive",
       };
     default:
-      return { badge: "bg-muted-foreground/10 text-muted-foreground", dot: "bg-muted-foreground", border: "border-l-muted-foreground" };
+      return {
+        badge: "bg-muted-foreground/10 text-muted-foreground",
+        dot: "bg-muted-foreground",
+        border: "border-l-muted-foreground",
+      };
   }
 }
 
 export function workflowStatusColor(status: string | null) {
   switch (status) {
-    case "published": return "text-emerald-400";
-    case "draft":     return "text-amber-400";
-    case "archived":  return "text-muted-foreground/40";
-    default:          return "text-muted-foreground";
+    case "published":
+      return "text-emerald-400";
+    case "draft":
+      return "text-amber-400";
+    case "archived":
+      return "text-muted-foreground/40";
+    default:
+      return "text-muted-foreground";
   }
 }
 
@@ -70,10 +87,12 @@ export function humanizeLogEntry(
   wfName?: string,
 ): string {
   const type = entry.actionType.toLowerCase();
-  const wf = wfName || (entry.workflowId ? `wf:${entry.workflowId.slice(0, 8)}` : null);
+  const wf =
+    wfName || (entry.workflowId ? `wf:${entry.workflowId.slice(0, 8)}` : null);
   if (type === "created") return "Actor created";
   if (type === "workflow_executed") return wf ? `Ran ${wf}` : "Ran a workflow";
-  if (type.includes("handoff_received")) return `Received handoff — ${entry.summary}`;
+  if (type.includes("handoff_received"))
+    return `Received handoff — ${entry.summary}`;
   if (type.includes("handoff")) return `Handoff — ${entry.summary}`;
   if (type === "suspended") return "Actor suspended";
   if (type === "activated") return "Actor activated";
@@ -105,19 +124,19 @@ export function downloadLogCsv(entries: ActorActionLogEntry[]) {
 }
 
 export const ACTION_ICONS: Record<string, React.ReactNode> = {
-  create:           <Sparkles className="w-3.5 h-3.5" />,
-  created:          <Sparkles className="w-3.5 h-3.5" />,
-  update:           <Pencil className="w-3.5 h-3.5" />,
-  delete:           <X className="w-3.5 h-3.5" />,
-  execute:          <Play className="w-3.5 h-3.5" />,
-  workflow_executed:<Play className="w-3.5 h-3.5" />,
-  suspend:          <Pause className="w-3.5 h-3.5" />,
-  suspended:        <Pause className="w-3.5 h-3.5" />,
-  activate:         <Play className="w-3.5 h-3.5" />,
-  activated:        <Play className="w-3.5 h-3.5" />,
-  terminate:        <Square className="w-3.5 h-3.5" />,
-  terminated:       <Square className="w-3.5 h-3.5" />,
-  handoff:          <Shuffle className="w-3.5 h-3.5" />,
+  create: <Sparkles className="w-3.5 h-3.5" />,
+  created: <Sparkles className="w-3.5 h-3.5" />,
+  update: <Pencil className="w-3.5 h-3.5" />,
+  delete: <X className="w-3.5 h-3.5" />,
+  execute: <Play className="w-3.5 h-3.5" />,
+  workflow_executed: <Play className="w-3.5 h-3.5" />,
+  suspend: <Pause className="w-3.5 h-3.5" />,
+  suspended: <Pause className="w-3.5 h-3.5" />,
+  activate: <Play className="w-3.5 h-3.5" />,
+  activated: <Play className="w-3.5 h-3.5" />,
+  terminate: <Square className="w-3.5 h-3.5" />,
+  terminated: <Square className="w-3.5 h-3.5" />,
+  handoff: <Shuffle className="w-3.5 h-3.5" />,
 };
 
 // ── Shared primitive components ───────────────────────────────────────────────
@@ -152,11 +171,22 @@ export function StatCard({
 }) {
   return (
     <div className="bg-surface-4/40 border border-white/5 rounded-[2rem] p-6 glass transition-premium hover:border-white/10">
-      <div className={cn("text-3xl font-black tabular-nums tracking-tight", accent ?? "text-white")}>
+      <div
+        className={cn(
+          "text-3xl font-black tabular-nums tracking-tight",
+          accent ?? "text-white",
+        )}
+      >
         {value}
       </div>
-      <div className="text-[10px] font-black text-muted-foreground uppercase tracking-widest mt-1.5">{label}</div>
-      {sub && <div className="text-[10px] text-muted-foreground/40 font-bold mt-1 uppercase">{sub}</div>}
+      <div className="text-[10px] font-black text-muted-foreground uppercase tracking-widest mt-1.5">
+        {label}
+      </div>
+      {sub && (
+        <div className="text-[10px] text-muted-foreground/40 font-bold mt-1 uppercase">
+          {sub}
+        </div>
+      )}
     </div>
   );
 }
@@ -239,10 +269,14 @@ export function TabBar({
         >
           {t.label}
           {t.count !== undefined && t.count > 0 && (
-            <span className={cn(
-              "text-[9px] px-1.5 py-0.5 rounded-full font-black",
-              active === t.id ? "bg-white/20 text-white" : "bg-surface-4 text-muted-foreground"
-            )}>
+            <span
+              className={cn(
+                "text-[9px] px-1.5 py-0.5 rounded-full font-black",
+                active === t.id
+                  ? "bg-white/20 text-white"
+                  : "bg-surface-4 text-muted-foreground",
+              )}
+            >
               {t.count}
             </span>
           )}
@@ -263,7 +297,10 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
     entry.actionType.toLowerCase() === "workflow_executed" && entry.executionId;
 
   const handleExpand = async () => {
-    if (expanded) { setExpanded(false); return; }
+    if (expanded) {
+      setExpanded(false);
+      return;
+    }
     setExpanded(true);
     if (output !== null || !entry.workflowId || !entry.executionId) return;
     setLoadingOutput(true);
@@ -284,7 +321,9 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
         }`,
         { wfId: entry.workflowId, p: { limit: 100 } },
       );
-      const match = res.workflowExecutionHistory.find((e) => e.id === entry.executionId);
+      const match = res.workflowExecutionHistory.find(
+        (e) => e.id === entry.executionId,
+      );
       if (match) {
         const text =
           match.outputData != null
@@ -315,7 +354,9 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
         {icon}
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-white text-sm leading-snug">{humanizeLogEntry(entry)}</p>
+        <p className="text-white text-sm leading-snug">
+          {humanizeLogEntry(entry)}
+        </p>
         <div className="flex items-center gap-2 mt-0.5 flex-wrap">
           {entry.workflowId && (
             <span className="text-[10px] text-violet-400 font-mono">
@@ -333,9 +374,15 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
               className="text-[10px] text-muted-foreground/40 hover:text-violet-300 transition-premium flex items-center gap-0.5"
             >
               {expanded ? (
-                <><ChevronUp className="w-3 h-3" />hide output</>
+                <>
+                  <ChevronUp className="w-3 h-3" />
+                  hide output
+                </>
               ) : (
-                <><ChevronDown className="w-3 h-3" />view output</>
+                <>
+                  <ChevronDown className="w-3 h-3" />
+                  view output
+                </>
               )}
             </button>
           )}
@@ -351,8 +398,11 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
               <pre className="text-xs text-foreground bg-background border border-white/5 rounded-xl p-3 overflow-auto max-h-64 whitespace-pre-wrap break-words font-mono leading-relaxed">
                 {(() => {
                   if (!output) return "(no output)";
-                  try { return JSON.stringify(JSON.parse(output), null, 2); }
-                  catch { return output; }
+                  try {
+                    return JSON.stringify(JSON.parse(output), null, 2);
+                  } catch {
+                    return output;
+                  }
                 })()}
               </pre>
             )}

@@ -9,10 +9,10 @@ export interface DialogWrapperProps extends React.HTMLAttributes<HTMLDivElement>
  * Standard container for dialog content.
  * Provides the glassmorphism aesthetic and consistent padding.
  */
-export const DialogWrapper: React.FC<DialogWrapperProps> = ({ 
-  children, 
+export const DialogWrapper: React.FC<DialogWrapperProps> = ({
+  children,
   className,
-  ...props 
+  ...props
 }) => {
   return (
     <div

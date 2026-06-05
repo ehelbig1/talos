@@ -37,7 +37,7 @@
     /* Tiered Dark Palette — Surface-based elevation */
     --background: 232 14% 6%; /* #0B0C10 - Slightly deeper */
     --foreground: 210 40% 98%;
-    
+
     /* Level 1: Sidebar, Nav */
     --surface-1: 232 14% 10%; /* #14161F */
     /* Level 2: Main Content Area */
@@ -51,31 +51,31 @@
     --card-foreground: 210 40% 98%;
     --popover: var(--surface-4);
     --popover-foreground: 210 40% 98%;
-    
+
     /* Vibrant Accents — Desaturated for Dark Mode */
     --primary: 250 89% 70%; /* #818CF8 - Modern Indigo/Violet */
     --primary-foreground: 210 40% 98%;
     --secondary: 232 14% 14%;
     --secondary-foreground: 210 40% 98%;
-    
+
     --muted: 232 14% 12%;
     --muted-foreground: 215 20% 65%;
-    
+
     --accent: 250 89% 70%;
     --accent-foreground: 210 40% 98%;
-    
+
     --destructive: 0 84% 60%;
     --destructive-foreground: 210 40% 98%;
-    
+
     --warning: 45 93% 47%;
     --warning-foreground: 45 93% 5%;
-    
+
     --success: 160 84% 39%;
     --success-foreground: 160 84% 98%;
-    
+
     --info: 199 89% 48%;
     --info-foreground: 210 40% 98%;
-    
+
     --border: 232 14% 18%;
     --input: 232 14% 12%;
     --ring: 250 89% 70%;
@@ -83,7 +83,9 @@
   }
 
   @theme {
-    --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-sans:
+      "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", Roboto, sans-serif;
     --font-heading: "Outfit", var(--font-sans);
   }
 
@@ -98,7 +100,12 @@
     -webkit-font-smoothing: antialiased;
   }
 
-  h1, h2, h3, h4, h5, h6 {
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
     font-family: var(--font-heading);
     letter-spacing: -0.02em;
   }
@@ -106,7 +113,7 @@
 
 /* Performance Optimizations */
 @utility gpu {
-  transform: translate3d(0,0,0);
+  transform: translate3d(0, 0, 0);
   backface-visibility: hidden;
   perspective: 1000px;
   will-change: transform, opacity;
@@ -130,9 +137,10 @@
 }
 
 @utility surface-elevation {
-  box-shadow: 0 0 0 1px hsla(var(--foreground), 0.05),
-              0 4px 6px -1px rgba(0, 0, 0, 0.1),
-              0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  box-shadow:
+    0 0 0 1px hsla(var(--foreground), 0.05),
+    0 4px 6px -1px rgba(0, 0, 0, 0.1),
+    0 2px 4px -1px rgba(0, 0, 0, 0.06);
 }
 
 @utility hover-elevation {
@@ -141,8 +149,9 @@
     transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
     transition-duration: 300ms;
     transform: translateY(-4px);
-    box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.3),
-                0 0 20px -5px hsla(var(--primary), 0.2);
+    box-shadow:
+      0 20px 40px -10px rgba(0, 0, 0, 0.3),
+      0 0 20px -5px hsla(var(--primary), 0.2);
     border-color: hsla(var(--primary), 0.3);
   }
 }
@@ -205,9 +214,15 @@
 
 /* Status pulse animation */
 @keyframes status-pulse {
-  0% { box-shadow: 0 0 0 0 hsla(var(--primary), 0.4); }
-  70% { box-shadow: 0 0 0 8px hsla(var(--primary), 0); }
-  100% { box-shadow: 0 0 0 0 hsla(var(--primary), 0); }
+  0% {
+    box-shadow: 0 0 0 0 hsla(var(--primary), 0.4);
+  }
+  70% {
+    box-shadow: 0 0 0 8px hsla(var(--primary), 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 hsla(var(--primary), 0);
+  }
 }
 @utility animate-status-pulse {
   animation: status-pulse 2s infinite;
@@ -215,8 +230,12 @@
 
 /* Shimmer utility */
 @keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
 }
 @utility animate-shimmer {
   background: linear-gradient(
@@ -292,11 +311,12 @@
 
 /* ─── Premium UI Extensions ───────────────────────────────────────── */
 @utility premium-gradient {
-  background: linear-gradient(135deg, 
-    hsla(var(--primary), 0.15) 0%, 
-    hsla(var(--primary), 0.05) 25%, 
-    transparent 50%, 
-    hsla(var(--primary), 0.05) 75%, 
+  background: linear-gradient(
+    135deg,
+    hsla(var(--primary), 0.15) 0%,
+    hsla(var(--primary), 0.05) 25%,
+    transparent 50%,
+    hsla(var(--primary), 0.05) 75%,
     hsla(var(--primary), 0.15) 100%
   );
   background-size: 200% 200%;
@@ -319,8 +339,13 @@
 }
 
 @keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-10px); }
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
 }
 
 @utility animate-progress-bar {

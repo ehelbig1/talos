@@ -101,11 +101,7 @@ const UPDATE_MEMBER_ROLE = gql`
     $targetUserId: UUID!
     $role: String!
   ) {
-    updateMemberRole(
-      orgId: $orgId
-      targetUserId: $targetUserId
-      role: $role
-    ) {
+    updateMemberRole(orgId: $orgId, targetUserId: $targetUserId, role: $role) {
       id
       orgId
       userId
@@ -177,7 +173,9 @@ export default function OrganizationsManager() {
       toast.success("Organization created successfully");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to create organization"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to create organization"),
+      );
     },
   });
 
@@ -189,7 +187,9 @@ export default function OrganizationsManager() {
       toast.success("Member removed");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to remove member"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to remove member"),
+      );
     },
   });
 
@@ -204,7 +204,9 @@ export default function OrganizationsManager() {
       toast.success("Member invited");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to invite member"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to invite member"),
+      );
     },
   });
 
@@ -230,7 +232,9 @@ export default function OrganizationsManager() {
       toast.success("Ownership transferred");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to transfer ownership"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to transfer ownership"),
+      );
     },
   });
 
@@ -260,8 +264,7 @@ export default function OrganizationsManager() {
     });
   };
 
-  const isTransferConfirmed =
-    transferConfirmName.trim() === selectedOrg?.name;
+  const isTransferConfirmed = transferConfirmName.trim() === selectedOrg?.name;
 
   return (
     <div className="max-w-6xl mx-auto py-4 space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
@@ -269,7 +272,10 @@ export default function OrganizationsManager() {
         <div className="flex items-center gap-6">
           <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-[2rem] flex items-center justify-center text-primary shadow-[0_0_30px_hsla(var(--primary),0.1)] relative group">
             <div className="absolute inset-0 bg-primary/5 rounded-full blur-xl animate-pulse" />
-            <Building2 size={32} className="relative z-10 group-hover:scale-110 transition-premium" />
+            <Building2
+              size={32}
+              className="relative z-10 group-hover:scale-110 transition-premium"
+            />
           </div>
           <div>
             <SectionHeader
@@ -334,10 +340,14 @@ export default function OrganizationsManager() {
                     {org.name.charAt(0).toUpperCase()}
                   </div>
                   <div className="flex-1 min-w-0 relative z-10">
-                    <div className={cn(
-                      "text-sm font-black tracking-tight uppercase font-outfit truncate transition-premium",
-                      selectedOrgId === org.id ? "text-white" : "text-muted-foreground/60 group-hover:text-white"
-                    )}>
+                    <div
+                      className={cn(
+                        "text-sm font-black tracking-tight uppercase font-outfit truncate transition-premium",
+                        selectedOrgId === org.id
+                          ? "text-white"
+                          : "text-muted-foreground/60 group-hover:text-white",
+                      )}
+                    >
                       {org.name}
                     </div>
                     <div className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest mt-1 truncate">
@@ -359,10 +369,10 @@ export default function OrganizationsManager() {
             <div className="space-y-8 animate-in fade-in slide-in-from-right-4 duration-700">
               <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl relative overflow-hidden group">
                 <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-                
+
                 <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-10 relative z-10">
                   <div className="flex items-center gap-6">
-                     <div className="w-16 h-16 bg-white/5 border border-white/10 rounded-[1.5rem] flex items-center justify-center text-3xl font-black font-outfit text-white shadow-2xl">
+                    <div className="w-16 h-16 bg-white/5 border border-white/10 rounded-[1.5rem] flex items-center justify-center text-3xl font-black font-outfit text-white shadow-2xl">
                       {selectedOrg?.name.charAt(0).toUpperCase()}
                     </div>
                     <div>
@@ -371,12 +381,13 @@ export default function OrganizationsManager() {
                       </h3>
                       <div className="flex flex-wrap items-center gap-6">
                         <span className="flex items-center gap-2 text-[10px] text-muted-foreground/60 font-black uppercase tracking-[0.2em]">
-                          <Globe className="w-3.5 h-3.5 text-primary" /> talos.sh/
+                          <Globe className="w-3.5 h-3.5 text-primary" />{" "}
+                          talos.sh/
                           {selectedOrg?.slug}
                         </span>
                         <span className="flex items-center gap-2 text-[10px] text-muted-foreground/60 font-black uppercase tracking-[0.2em]">
-                          <Users className="w-3.5 h-3.5 text-primary" /> {members?.length || 0}{" "}
-                          SYNDICATE_MEMBERS
+                          <Users className="w-3.5 h-3.5 text-primary" />{" "}
+                          {members?.length || 0} SYNDICATE_MEMBERS
                         </span>
                       </div>
                     </div>
@@ -387,7 +398,8 @@ export default function OrganizationsManager() {
                       className="flex-1 md:flex-none h-12 px-6 border-white/10 hover:bg-white/5 text-destructive/80 hover:text-destructive border-destructive/20 hover:border-destructive/40 rounded-xl font-black uppercase text-[10px] tracking-widest transition-premium"
                       onClick={() => setShowTransfer(true)}
                     >
-                      <ArrowRightLeft className="w-4 h-4 mr-3" /> TRANSFER_OWNERSHIP
+                      <ArrowRightLeft className="w-4 h-4 mr-3" />{" "}
+                      TRANSFER_OWNERSHIP
                     </Button>
                     <Button
                       variant="premium"
@@ -423,7 +435,8 @@ export default function OrganizationsManager() {
                               <div>
                                 <div className="flex items-center gap-3 mb-1">
                                   <span className="text-sm font-black text-white tracking-tight uppercase font-outfit">
-                                    OPERATIVE_{member.userId.split("-")[0].toUpperCase()}
+                                    OPERATIVE_
+                                    {member.userId.split("-")[0].toUpperCase()}
                                   </span>
                                   {isCurrentUser && (
                                     <span className="text-[9px] font-black uppercase tracking-[0.3em] text-primary bg-primary/10 border border-primary/20 px-2 py-0.5 rounded-full shadow-[0_0_10px_hsla(var(--primary),0.2)]">
@@ -432,7 +445,8 @@ export default function OrganizationsManager() {
                                   )}
                                 </div>
                                 <div className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest">
-                                  ENROLLED {formatDate(member.joinedAt)} &bull; ID: {member.userId.slice(0, 8)}
+                                  ENROLLED {formatDate(member.joinedAt)} &bull;
+                                  ID: {member.userId.slice(0, 8)}
                                 </div>
                               </div>
                             </div>
@@ -543,7 +557,8 @@ export default function OrganizationsManager() {
                 No Organization Selected
               </h3>
               <p className="text-[10px] text-muted-foreground/30 font-black uppercase tracking-widest text-center max-w-xs leading-relaxed">
-                Select an organization from the left to manage members and settings.
+                Select an organization from the left to manage members and
+                settings.
               </p>
             </div>
           )}
@@ -564,7 +579,9 @@ export default function OrganizationsManager() {
           <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl flex items-start gap-4">
             <Building2 className="w-5 h-5 text-primary shrink-0 mt-0.5" />
             <p className="text-[11px] text-muted-foreground/60 leading-relaxed font-medium">
-              Establish a new governing protocol. Organizations allow you to group multiple operatives and resources under a single administrative umbrella.
+              Establish a new governing protocol. Organizations allow you to
+              group multiple operatives and resources under a single
+              administrative umbrella.
             </p>
           </div>
 
@@ -598,7 +615,9 @@ export default function OrganizationsManager() {
                 Uplink_Identifier
               </label>
               <div className="relative flex items-center">
-                <span className="absolute left-4 text-muted-foreground/30 font-outfit text-sm">talos.sh/</span>
+                <span className="absolute left-4 text-muted-foreground/30 font-outfit text-sm">
+                  talos.sh/
+                </span>
                 <Input
                   placeholder="tactical-alpha"
                   value={newOrgSlug}
@@ -627,7 +646,9 @@ export default function OrganizationsManager() {
             <Button
               variant="premium"
               className="flex-1 h-14 rounded-xl shadow-2xl"
-              disabled={!newOrgName || !newOrgSlug || createOrgMutation.isPending}
+              disabled={
+                !newOrgName || !newOrgSlug || createOrgMutation.isPending
+              }
               onClick={() =>
                 createOrgMutation.mutate({
                   name: newOrgName,
@@ -635,7 +656,11 @@ export default function OrganizationsManager() {
                 })
               }
             >
-              {createOrgMutation.isPending ? <LoadingSpinner /> : "ESTABLISH_UPLINK"}
+              {createOrgMutation.isPending ? (
+                <LoadingSpinner />
+              ) : (
+                "ESTABLISH_UPLINK"
+              )}
             </Button>
           </div>
         </div>
@@ -651,7 +676,10 @@ export default function OrganizationsManager() {
           <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl flex items-start gap-4">
             <UserPlus className="w-5 h-5 text-primary shrink-0 mt-0.5" />
             <p className="text-[11px] text-muted-foreground/60 leading-relaxed font-medium">
-              Invite a new operative to the <span className="text-white font-black">{selectedOrg?.name}</span> syndicate. Access privileges are defined by the selected protocol role.
+              Invite a new operative to the{" "}
+              <span className="text-white font-black">{selectedOrg?.name}</span>{" "}
+              syndicate. Access privileges are defined by the selected protocol
+              role.
             </p>
           </div>
 
@@ -681,7 +709,7 @@ export default function OrganizationsManager() {
                       "flex-1 py-3 px-4 rounded-xl text-[10px] font-black uppercase tracking-[0.2em] transition-premium",
                       inviteRole === role
                         ? "bg-primary/20 border border-primary/40 text-primary shadow-[0_0_15px_hsla(var(--primary),0.2)]"
-                        : "text-muted-foreground/20 hover:text-white hover:bg-white/5 border border-transparent"
+                        : "text-muted-foreground/20 hover:text-white hover:bg-white/5 border border-transparent",
                     )}
                   >
                     {role}
@@ -705,28 +733,35 @@ export default function OrganizationsManager() {
               disabled={!inviteUserId.trim() || inviteMemberMutation.isPending}
               onClick={handleInvite}
             >
-              {inviteMemberMutation.isPending ? <LoadingSpinner /> : "DISPATCH_INVITE"}
+              {inviteMemberMutation.isPending ? (
+                <LoadingSpinner />
+              ) : (
+                "DISPATCH_INVITE"
+              )}
             </Button>
           </div>
         </div>
       </Dialog>
 
       {/* Update Role Confirmation Dialog */}
-      <Dialog 
-        open={!!roleChangeTarget} 
+      <Dialog
+        open={!!roleChangeTarget}
         onClose={() => setRoleChangeTarget(null)}
         title="Sync_Clearance"
       >
         <div className="space-y-8">
           <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl">
             <p className="text-[11px] text-muted-foreground/60 leading-relaxed font-medium text-center">
-              Awaiting confirmation to modify operative clearance levels. This change takes effect across all security perimeters immediately.
+              Awaiting confirmation to modify operative clearance levels. This
+              change takes effect across all security perimeters immediately.
             </p>
           </div>
 
           <div className="flex items-center justify-center gap-12 py-4 relative">
-             <div className="flex flex-col items-center gap-3">
-              <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground/30 mb-1">CURRENT</div>
+            <div className="flex flex-col items-center gap-3">
+              <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground/30 mb-1">
+                CURRENT
+              </div>
               <div className="px-5 py-2 bg-white/5 border border-white/10 rounded-xl text-xs font-black uppercase text-muted-foreground/60">
                 {roleChangeTarget?.currentRole}
               </div>
@@ -738,8 +773,10 @@ export default function OrganizationsManager() {
               </div>
             </div>
 
-             <div className="flex flex-col items-center gap-3">
-              <div className="text-[10px] font-black uppercase tracking-widest text-primary/40 mb-1">PROPOSED</div>
+            <div className="flex flex-col items-center gap-3">
+              <div className="text-[10px] font-black uppercase tracking-widest text-primary/40 mb-1">
+                PROPOSED
+              </div>
               <div className="px-5 py-2 bg-primary/20 border border-primary/40 rounded-xl text-xs font-black uppercase text-primary shadow-[0_0_20px_hsla(var(--primary),0.1)]">
                 {roleChangeTarget?.newRole}
               </div>
@@ -760,15 +797,19 @@ export default function OrganizationsManager() {
               disabled={updateMemberRoleMutation.isPending}
               onClick={handleUpdateRole}
             >
-              {updateMemberRoleMutation.isPending ? <LoadingSpinner /> : "COMMIT_RESTRUCTURE"}
+              {updateMemberRoleMutation.isPending ? (
+                <LoadingSpinner />
+              ) : (
+                "COMMIT_RESTRUCTURE"
+              )}
             </Button>
           </div>
         </div>
       </Dialog>
 
       {/* Transfer Ownership Dialog */}
-      <Dialog 
-        open={showTransfer} 
+      <Dialog
+        open={showTransfer}
         onClose={() => setShowTransfer(false)}
         title="Identity_Shift"
       >
@@ -781,7 +822,13 @@ export default function OrganizationsManager() {
                 CRITICAL_GOVERNANCE_OVERRIDE
               </p>
               <p className="text-[11px] text-destructive/70 leading-relaxed font-medium">
-                Transferring ownership grants <span className="text-destructive font-black underline decoration-2">FULL_SOVEREIGNTY</span> to another user. You will be demoted to Admin status immediately. This operation is irreversible without the new owner's consent.
+                Transferring ownership grants{" "}
+                <span className="text-destructive font-black underline decoration-2">
+                  FULL_SOVEREIGNTY
+                </span>{" "}
+                to another user. You will be demoted to Admin status
+                immediately. This operation is irreversible without the new
+                owner's consent.
               </p>
             </div>
           </div>
@@ -804,8 +851,9 @@ export default function OrganizationsManager() {
                 Security_Verification
               </label>
               <div className="space-y-3">
-                 <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest ml-1">
-                  Type <span className="text-white">"{selectedOrg?.name}"</span> to confirm transfer
+                <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest ml-1">
+                  Type <span className="text-white">"{selectedOrg?.name}"</span>{" "}
+                  to confirm transfer
                 </p>
                 <Input
                   placeholder="Verification Phrase"
@@ -813,9 +861,9 @@ export default function OrganizationsManager() {
                   onChange={(e) => setTransferConfirmName(e.target.value)}
                   className={cn(
                     "h-14 bg-white/[0.03] border-white/10 rounded-xl px-4 text-sm transition-premium",
-                    transferConfirmName && !isTransferConfirmed 
-                      ? "border-destructive/50 focus:ring-destructive/20 text-destructive" 
-                      : "focus:border-primary/50 focus:ring-primary/20 text-white"
+                    transferConfirmName && !isTransferConfirmed
+                      ? "border-destructive/50 focus:ring-destructive/20 text-destructive"
+                      : "focus:border-primary/50 focus:ring-primary/20 text-white",
                   )}
                 />
               </div>
@@ -839,7 +887,11 @@ export default function OrganizationsManager() {
               }
               onClick={handleTransferOwnership}
             >
-              {transferOwnershipMutation.isPending ? <LoadingSpinner /> : "EXECUTE_TRANSFER"}
+              {transferOwnershipMutation.isPending ? (
+                <LoadingSpinner />
+              ) : (
+                "EXECUTE_TRANSFER"
+              )}
             </Button>
           </div>
         </div>

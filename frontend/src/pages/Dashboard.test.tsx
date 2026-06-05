@@ -28,7 +28,8 @@ vi.mock("@/lib/graphqlClient", () => ({
   listAgents: vi.fn().mockResolvedValue([]),
   listActors: vi.fn().mockResolvedValue([]),
   subscribeExecution: vi.fn(() => vi.fn()),
-  gql: (strings: TemplateStringsArray, ...values: unknown[]) => strings.join(""),
+  gql: (strings: TemplateStringsArray, ...values: unknown[]) =>
+    strings.join(""),
 }));
 
 vi.mock("@/lib/workflowLoader", () => ({
@@ -40,27 +41,33 @@ let mockWorkflows: unknown[] = [];
 let mockActors: unknown[] = [];
 let mockLatestExecutions: unknown[] = [];
 vi.mock("@/generated/graphql", () => ({
-  useWorkflowsQuery: vi.fn((_vars: unknown, opts?: { select?: (d: any) => any }) => {
-    const raw = { workflows: mockWorkflows };
-    return {
-      data: opts?.select ? opts.select(raw) : raw,
-      isLoading: false,
-    };
-  }),
-  useListActorsQuery: vi.fn((_vars: unknown, opts?: { select?: (d: any) => any }) => {
-    const raw = { actors: mockActors };
-    return {
-      data: opts?.select ? opts.select(raw) : raw,
-      isLoading: false,
-    };
-  }),
-  useLatestWorkflowExecutionsQuery: vi.fn((_vars: unknown, opts?: { select?: (d: any) => any }) => {
-    const raw = { latestWorkflowExecutions: mockLatestExecutions };
-    return {
-      data: opts?.select ? opts.select(raw) : raw,
-      isLoading: false,
-    };
-  }),
+  useWorkflowsQuery: vi.fn(
+    (_vars: unknown, opts?: { select?: (d: any) => any }) => {
+      const raw = { workflows: mockWorkflows };
+      return {
+        data: opts?.select ? opts.select(raw) : raw,
+        isLoading: false,
+      };
+    },
+  ),
+  useListActorsQuery: vi.fn(
+    (_vars: unknown, opts?: { select?: (d: any) => any }) => {
+      const raw = { actors: mockActors };
+      return {
+        data: opts?.select ? opts.select(raw) : raw,
+        isLoading: false,
+      };
+    },
+  ),
+  useLatestWorkflowExecutionsQuery: vi.fn(
+    (_vars: unknown, opts?: { select?: (d: any) => any }) => {
+      const raw = { latestWorkflowExecutions: mockLatestExecutions };
+      return {
+        data: opts?.select ? opts.select(raw) : raw,
+        isLoading: false,
+      };
+    },
+  ),
   useGetAllWorkflowStatsQuery: vi.fn(() => ({
     data: null,
     isLoading: false,
@@ -138,7 +145,9 @@ describe("Dashboard", () => {
     renderWithProviders(<Dashboard />);
 
     // Loading state now renders skeleton cards instead of a spinner text.
-    expect(document.querySelector('[data-testid="skeleton-stat-row"]')).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-testid="skeleton-stat-row"]'),
+    ).toBeInTheDocument();
   });
 
   it("renders empty state when no workflows exist", async () => {

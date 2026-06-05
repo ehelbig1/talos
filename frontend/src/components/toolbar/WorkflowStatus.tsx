@@ -10,7 +10,11 @@ interface WorkflowStatusProps {
   };
 }
 
-export function WorkflowStatus({ name, isDirty, runStatus }: WorkflowStatusProps) {
+export function WorkflowStatus({
+  name,
+  isDirty,
+  runStatus,
+}: WorkflowStatusProps) {
   const healthPill = runStatus ? (
     <div
       className={cn(
@@ -22,7 +26,12 @@ export function WorkflowStatus({ name, isDirty, runStatus }: WorkflowStatusProps
             : "bg-warning/10 text-warning border-warning/20 animate-pulse",
       )}
     >
-      <Activity className={cn("w-3 h-3", runStatus.status === "running" && "animate-spin")} />
+      <Activity
+        className={cn(
+          "w-3 h-3",
+          runStatus.status === "running" && "animate-spin",
+        )}
+      />
       {runStatus.status === "success"
         ? "Operational"
         : runStatus.status === "failed"

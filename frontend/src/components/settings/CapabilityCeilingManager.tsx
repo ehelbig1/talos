@@ -34,7 +34,9 @@ interface CapabilityWorldInfo {
 async function fetchCeilingDetail(): Promise<CapabilityCeilingDetail> {
   const data = await graphqlRequest<{
     capabilityCeilingDetail: CapabilityCeilingDetail;
-  }>(`query { capabilityCeilingDetail { ceiling source grantedByEmail grantedAt notes } }`);
+  }>(
+    `query { capabilityCeilingDetail { ceiling source grantedByEmail grantedAt notes } }`,
+  );
   return data.capabilityCeilingDetail;
 }
 
@@ -78,7 +80,10 @@ function tierBg(rank: number): string {
   return "bg-destructive/5";
 }
 
-function worldRank(worldName: string, hierarchy: CapabilityWorldInfo[]): number {
+function worldRank(
+  worldName: string,
+  hierarchy: CapabilityWorldInfo[],
+): number {
   return hierarchy.find((w) => w.name === worldName)?.rank ?? -1;
 }
 
@@ -154,7 +159,9 @@ export default function CapabilityCeilingManager() {
   if (error) {
     return (
       <div className="bg-destructive/5 border border-destructive/20 rounded-[2.5rem] p-10 text-center">
-        <p className="text-sm text-destructive font-black uppercase tracking-widest mb-6">{error}</p>
+        <p className="text-sm text-destructive font-black uppercase tracking-widest mb-6">
+          {error}
+        </p>
         <button
           onClick={loadData}
           className="inline-flex items-center gap-3 px-6 py-3 bg-white/5 border border-white/10 rounded-2xl text-[10px] font-black uppercase tracking-widest text-white hover:bg-white/10 transition-premium"
@@ -174,9 +181,7 @@ export default function CapabilityCeilingManager() {
     existing.push(w);
     rankGroups.set(w.rank, existing);
   }
-  const sortedRanks = [...rankGroups.entries()].sort(
-    ([a], [b]) => a - b,
-  );
+  const sortedRanks = [...rankGroups.entries()].sort(([a], [b]) => a - b);
 
   return (
     <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl relative overflow-hidden group">
@@ -236,7 +241,12 @@ export default function CapabilityCeilingManager() {
                 <p className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 mb-1">
                   Active Access Threshold
                 </p>
-                <p className={cn("text-3xl font-black tracking-tighter uppercase font-outfit", tierColor(currentRank))}>
+                <p
+                  className={cn(
+                    "text-3xl font-black tracking-tighter uppercase font-outfit",
+                    tierColor(currentRank),
+                  )}
+                >
                   {ceiling?.ceiling ?? "http-node"}
                 </p>
               </div>
@@ -255,7 +265,9 @@ export default function CapabilityCeilingManager() {
                     <Zap className="w-3 h-3" />
                     Protocol_Granted
                   </>
-                ) : "Baseline_Default"}
+                ) : (
+                  "Baseline_Default"
+                )}
               </span>
             </div>
           </div>
@@ -333,10 +345,15 @@ export default function CapabilityCeilingManager() {
                             : "bg-black/20 border-white/[0.02] opacity-30 cursor-not-allowed",
                       )}
                     >
-                       {isCurrent && (
-                        <div className={cn("absolute inset-0 opacity-10 blur-2xl pointer-events-none", tierBg(rank))} />
+                      {isCurrent && (
+                        <div
+                          className={cn(
+                            "absolute inset-0 opacity-10 blur-2xl pointer-events-none",
+                            tierBg(rank),
+                          )}
+                        />
                       )}
-                      
+
                       <div className="flex-1 min-w-0 relative z-10">
                         <div className="flex items-center gap-3">
                           <span
@@ -376,11 +393,11 @@ export default function CapabilityCeilingManager() {
       {/* Footer hint */}
       <div className="mt-10 pt-6 border-t border-white/5 relative z-10">
         <p className="text-[10px] text-muted-foreground/20 leading-relaxed font-black uppercase tracking-widest">
-          The ceiling restricts the maximum WIT world privileges assignable to nodes. 
-          Worlds above this threshold are locked to prevent unauthorized capability escalation.
+          The ceiling restricts the maximum WIT world privileges assignable to
+          nodes. Worlds above this threshold are locked to prevent unauthorized
+          capability escalation.
         </p>
       </div>
     </div>
   );
 }
-

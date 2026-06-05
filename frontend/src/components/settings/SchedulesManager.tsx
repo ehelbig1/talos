@@ -43,7 +43,6 @@ const CRON_EXAMPLES = [
   { label: "Every 5 minutes", value: "*/5 * * * *" },
 ] as const;
 
-
 // ─── Add Schedule Dialog ──────────────────────────────────────────────────────
 
 interface AddScheduleDialogProps {
@@ -72,7 +71,9 @@ function AddScheduleDialog({
       setTimezone("UTC");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to create schedule"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to create schedule"),
+      );
     },
   });
 
@@ -90,7 +91,7 @@ function AddScheduleDialog({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="absolute inset-0 bg-gradient-to-br from-amber-500/10 via-transparent to-transparent opacity-50 pointer-events-none" />
-        
+
         {/* Header */}
         <div className="px-10 py-8 border-b border-white/5 flex items-center justify-between bg-white/[0.02] relative z-10">
           <div className="flex items-center gap-4">
@@ -124,21 +125,23 @@ function AddScheduleDialog({
               Target Workflow
             </label>
             <div className="relative group">
-                <select
+              <select
                 value={workflowId}
                 onChange={(e) => setWorkflowId(e.target.value)}
                 className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-black uppercase tracking-widest text-white focus:outline-none focus:border-amber-500/40 focus:ring-4 focus:ring-amber-500/10 transition-premium shadow-inner appearance-none cursor-pointer"
-                >
-                <option value="" disabled className="bg-surface-3">SELECT_DESTINATION...</option>
+              >
+                <option value="" disabled className="bg-surface-3">
+                  SELECT_DESTINATION...
+                </option>
                 {workflows.map((wf) => (
-                    <option key={wf.id} value={wf.id} className="bg-surface-3">
+                  <option key={wf.id} value={wf.id} className="bg-surface-3">
                     {wf.name.toUpperCase()}
-                    </option>
+                  </option>
                 ))}
-                </select>
-                <div className="absolute right-5 top-1/2 -translate-y-1/2 pointer-events-none text-muted-foreground/30">
-                    <ChevronRight size={14} className="rotate-90" />
-                </div>
+              </select>
+              <div className="absolute right-5 top-1/2 -translate-y-1/2 pointer-events-none text-muted-foreground/30">
+                <ChevronRight size={14} className="rotate-90" />
+              </div>
             </div>
           </div>
 
@@ -155,7 +158,7 @@ function AddScheduleDialog({
               }
               className="bg-black/40 border-white/5 focus:border-amber-500/40 focus:ring-amber-500/10 h-14 rounded-2xl text-xs font-black tracking-widest uppercase px-6"
             />
-            
+
             {/* Cron example chips */}
             <div className="flex flex-wrap gap-2.5 pt-2">
               {CRON_EXAMPLES.map((ex) => (
@@ -166,7 +169,7 @@ function AddScheduleDialog({
                     "px-4 py-2 rounded-xl border text-[9px] font-black uppercase tracking-widest transition-premium active:scale-95",
                     cron === ex.value
                       ? "bg-amber-500/10 border-amber-500/30 text-amber-400 shadow-lg shadow-amber-500/5"
-                      : "bg-white/5 border-white/5 text-muted-foreground/40 hover:border-white/10 hover:text-white"
+                      : "bg-white/5 border-white/5 text-muted-foreground/40 hover:border-white/10 hover:text-white",
                   )}
                 >
                   {ex.label}
@@ -210,7 +213,9 @@ function AddScheduleDialog({
             variant="premium"
             className="px-10 h-14 shadow-2xl"
           >
-            {createMutation.isPending ? "SYNCHRONIZING..." : "SYNTHESIZE SCHEDULE"}
+            {createMutation.isPending
+              ? "SYNCHRONIZING..."
+              : "SYNTHESIZE SCHEDULE"}
           </Button>
         </div>
       </div>
@@ -237,7 +242,9 @@ function EditForm({ schedule, onDone }: EditFormProps) {
       onDone();
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to update schedule"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to update schedule"),
+      );
     },
   });
 
@@ -321,7 +328,9 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
       );
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to update schedule"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to update schedule"),
+      );
     },
   });
 
@@ -332,7 +341,9 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
       setConfirmDelete(false);
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to delete schedule"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to delete schedule"),
+      );
       setConfirmDelete(false);
     },
   });
@@ -355,7 +366,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
         )}
       >
         <div className="absolute inset-0 bg-gradient-to-r from-amber-500/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-        
+
         <div className="flex items-start justify-between gap-6 relative z-10">
           {/* Left: workflow name + cron */}
           <div className="flex items-start gap-6 min-w-0">
@@ -446,18 +457,24 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
         {/* Timing info */}
         <div className="mt-8 flex items-center gap-8 pl-20 relative z-10">
           <div className="flex flex-col gap-1">
-            <span className="text-[9px] font-black uppercase tracking-widest text-muted-foreground/20">NEXT_WINDOW</span>
+            <span className="text-[9px] font-black uppercase tracking-widest text-muted-foreground/20">
+              NEXT_WINDOW
+            </span>
             <div className="flex items-center gap-2 text-[11px] text-muted-foreground font-black uppercase tracking-tighter">
-                <Calendar className="w-3.5 h-3.5 opacity-30" />
-                {schedule.nextTriggerAt ? formatDate(schedule.nextTriggerAt) : "—"}
+              <Calendar className="w-3.5 h-3.5 opacity-30" />
+              {schedule.nextTriggerAt
+                ? formatDate(schedule.nextTriggerAt)
+                : "—"}
             </div>
           </div>
           <div className="w-px h-8 bg-white/5" />
           <div className="flex flex-col gap-1">
-            <span className="text-[9px] font-black uppercase tracking-widest text-muted-foreground/20">PREVIOUS_RUN</span>
+            <span className="text-[9px] font-black uppercase tracking-widest text-muted-foreground/20">
+              PREVIOUS_RUN
+            </span>
             <div className="flex items-center gap-2 text-[11px] text-muted-foreground font-black uppercase tracking-tighter">
-                <Clock className="w-3.5 h-3.5 opacity-30" />
-                {relativeTime(schedule.lastTriggeredAt)}
+              <Clock className="w-3.5 h-3.5 opacity-30" />
+              {relativeTime(schedule.lastTriggeredAt)}
             </div>
           </div>
         </div>
@@ -475,7 +492,9 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
         confirmLabel="TERMINATE SEQUENCE"
         destructive
         isLoading={deleteMutation.isPending}
-        onConfirm={() => deleteMutation.mutate({ workflowId: schedule.workflowId })}
+        onConfirm={() =>
+          deleteMutation.mutate({ workflowId: schedule.workflowId })
+        }
         onCancel={() => setConfirmDelete(false)}
       />
     </>
@@ -537,28 +556,31 @@ export default function SchedulesManager() {
       {/* Content */}
       {schedulesLoading ? (
         <div className="flex flex-col items-center justify-center py-32 gap-6">
-            <div className="w-16 h-16 border-4 border-amber-500/10 border-t-amber-500 rounded-full animate-spin shadow-2xl" />
+          <div className="w-16 h-16 border-4 border-amber-500/10 border-t-amber-500 rounded-full animate-spin shadow-2xl" />
           <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.4em] animate-status-pulse">
             Synchronizing Time-Stream...
           </p>
         </div>
       ) : schedules.length === 0 ? (
         <div className="bg-surface-3/20 backdrop-blur-3xl border border-white/5 rounded-[3rem] p-24 glass-dark text-center flex flex-col items-center">
-            <div className="w-24 h-24 rounded-[3rem] bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/10 mb-8 shadow-2xl">
-              <Calendar size={48} />
-            </div>
-            <h3 className="text-2xl font-black text-white tracking-tight uppercase mb-4">No Automation Detected</h3>
-            <p className="text-sm text-muted-foreground/40 font-bold uppercase tracking-widest max-w-sm mb-10 leading-relaxed">
-            Temporal sequences are not currently initialized. Establish a schedule to automate complex workflow operations.
-            </p>
-            <Button
-              onClick={() => setShowAdd(true)}
-              variant="premium"
-              className="px-10 h-14"
-            >
-              <Plus className="w-5 h-5 mr-2" />
-              Configure First Sequence
-            </Button>
+          <div className="w-24 h-24 rounded-[3rem] bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/10 mb-8 shadow-2xl">
+            <Calendar size={48} />
+          </div>
+          <h3 className="text-2xl font-black text-white tracking-tight uppercase mb-4">
+            No Automation Detected
+          </h3>
+          <p className="text-sm text-muted-foreground/40 font-bold uppercase tracking-widest max-w-sm mb-10 leading-relaxed">
+            Temporal sequences are not currently initialized. Establish a
+            schedule to automate complex workflow operations.
+          </p>
+          <Button
+            onClick={() => setShowAdd(true)}
+            variant="premium"
+            className="px-10 h-14"
+          >
+            <Plus className="w-5 h-5 mr-2" />
+            Configure First Sequence
+          </Button>
         </div>
       ) : (
         <div className="space-y-4">
@@ -579,32 +601,39 @@ export default function SchedulesManager() {
       {schedules.length > 0 && (
         <div className="flex items-center gap-10 px-10 py-6 bg-surface-3/40 border border-white/5 rounded-[2rem] relative overflow-hidden group">
           <div className="absolute inset-0 bg-gradient-to-r from-amber-500/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-          
+
           <div className="flex items-center gap-3 relative z-10">
             <div className="w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_8px_hsla(var(--warning),0.5)]" />
             <span className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.2em]">
-                <strong className="text-white">{schedules.length}</strong> TOTAL_SEQUENCES
+              <strong className="text-white">{schedules.length}</strong>{" "}
+              TOTAL_SEQUENCES
             </span>
           </div>
-          
+
           <div className="flex items-center gap-3 relative z-10">
             <div className="w-2 h-2 rounded-full bg-success shadow-[0_0_8px_hsla(var(--success),0.5)]" />
             <span className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.2em]">
-                <strong className="text-white">{schedules.filter((s) => s.isEnabled).length}</strong> ACTIVE_NODES
+              <strong className="text-white">
+                {schedules.filter((s) => s.isEnabled).length}
+              </strong>{" "}
+              ACTIVE_NODES
             </span>
           </div>
 
           <div className="flex items-center gap-3 relative z-10">
             <div className="w-2 h-2 rounded-full bg-white/10" />
             <span className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.2em]">
-                <strong className="text-white">{schedules.filter((s) => !s.isEnabled).length}</strong> SUSPENDED
+              <strong className="text-white">
+                {schedules.filter((s) => !s.isEnabled).length}
+              </strong>{" "}
+              SUSPENDED
             </span>
           </div>
 
           <div className="ml-auto relative z-10">
-             <span className="text-[10px] text-muted-foreground/20 font-black uppercase tracking-[0.4em]">
-                TEMPORAL_MONITOR_ONLINE
-             </span>
+            <span className="text-[10px] text-muted-foreground/20 font-black uppercase tracking-[0.4em]">
+              TEMPORAL_MONITOR_ONLINE
+            </span>
           </div>
         </div>
       )}

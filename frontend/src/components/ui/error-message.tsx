@@ -121,7 +121,10 @@ export function ErrorMessage({
           {displayTechnicalDetails && (
             <Collapsible open={showDetails} onOpenChange={setShowDetails}>
               <CollapsibleTrigger asChild>
-                <button type="button" className="text-xs text-primary hover:underline focus:outline-none">
+                <button
+                  type="button"
+                  className="text-xs text-primary hover:underline focus:outline-none"
+                >
                   {showDetails ? "Hide" : "Show"} Technical Details ▼
                 </button>
               </CollapsibleTrigger>

@@ -167,9 +167,12 @@ export const NodeConfigForm = React.memo(
       [handleJsonChange],
     );
 
-    const inputBase = "w-full px-5 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30 placeholder:text-muted-foreground/20";
-    const selectBase = "w-full h-12 px-5 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
-    const textareaBase = "w-full px-5 py-4 text-[11px] font-mono bg-black/40 border border-white/5 rounded-[2rem] text-foreground/80 focus:border-primary/40 focus:outline-none transition-premium resize-none leading-relaxed selection:bg-primary/30 custom-scrollbar";
+    const inputBase =
+      "w-full px-5 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30 placeholder:text-muted-foreground/20";
+    const selectBase =
+      "w-full h-12 px-5 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
+    const textareaBase =
+      "w-full px-5 py-4 text-[11px] font-mono bg-black/40 border border-white/5 rounded-[2rem] text-foreground/80 focus:border-primary/40 focus:outline-none transition-premium resize-none leading-relaxed selection:bg-primary/30 custom-scrollbar";
 
     // Render specialized UI per node type (legacy support for hardcoded types).
     switch (type) {
@@ -287,7 +290,8 @@ export const NodeConfigForm = React.memo(
                 <Info className="w-4 h-4" />
               </div>
               <p className="text-[10px] text-primary/60 font-bold uppercase tracking-wider leading-relaxed">
-                Utilize standard JSONPath syntax to traverse and isolate nested values from the protocol stream.
+                Utilize standard JSONPath syntax to traverse and isolate nested
+                values from the protocol stream.
               </p>
             </div>
           </div>
@@ -301,26 +305,31 @@ export const NodeConfigForm = React.memo(
               </label>
               <div className="flex gap-3">
                 <div className="relative flex-1 group/input">
-                    <div className={cn(
-                        "absolute -inset-0.5 rounded-2xl blur opacity-0 transition-premium",
-                        rhaiError ? "bg-destructive/20 group-hover/input:opacity-100" : "bg-primary/10 group-hover/input:opacity-100"
-                    )} />
-                    <Input
-                        id="input-path-input"
-                        placeholder="ctx.results['QUERY_ID'].items"
-                        value={(config.input_path as string) ?? ""}
-                        onChange={handleInputPathChange}
-                        className={cn(
-                        inputBase,
-                        "relative",
-                        rhaiError && "border-destructive/40 text-destructive placeholder:text-destructive/20"
-                        )}
-                    />
-                    {validating && (
-                        <div className="absolute top-1/2 -translate-y-1/2 right-4">
-                        <Loader2 className="w-4 h-4 text-primary animate-spin" />
-                        </div>
+                  <div
+                    className={cn(
+                      "absolute -inset-0.5 rounded-2xl blur opacity-0 transition-premium",
+                      rhaiError
+                        ? "bg-destructive/20 group-hover/input:opacity-100"
+                        : "bg-primary/10 group-hover/input:opacity-100",
                     )}
+                  />
+                  <Input
+                    id="input-path-input"
+                    placeholder="ctx.results['QUERY_ID'].items"
+                    value={(config.input_path as string) ?? ""}
+                    onChange={handleInputPathChange}
+                    className={cn(
+                      inputBase,
+                      "relative",
+                      rhaiError &&
+                        "border-destructive/40 text-destructive placeholder:text-destructive/20",
+                    )}
+                  />
+                  {validating && (
+                    <div className="absolute top-1/2 -translate-y-1/2 right-4">
+                      <Loader2 className="w-4 h-4 text-primary animate-spin" />
+                    </div>
+                  )}
                 </div>
                 <Button
                   onClick={() => setTestModalOpen(true)}
@@ -360,8 +369,12 @@ export const NodeConfigForm = React.memo(
                 <IterationCcw className="w-4 h-4" />
               </div>
               <div className="flex flex-col gap-1">
-                <p className="text-[10px] text-white/60 font-black uppercase tracking-widest">Parallel Stream Processor</p>
-                <p className="text-[9px] text-muted-foreground/40 font-medium">Automatic async fan-out enabled for high-throughput iteration.</p>
+                <p className="text-[10px] text-white/60 font-black uppercase tracking-widest">
+                  Parallel Stream Processor
+                </p>
+                <p className="text-[9px] text-muted-foreground/40 font-medium">
+                  Automatic async fan-out enabled for high-throughput iteration.
+                </p>
               </div>
             </div>
 
@@ -387,10 +400,16 @@ export const NodeConfigForm = React.memo(
                 onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
                   setField("loopCondition", e.target.value)
                 }
-                className={cn(textareaBase, "min-h-[120px]", rhaiError && "border-destructive/40")}
+                className={cn(
+                  textareaBase,
+                  "min-h-[120px]",
+                  rhaiError && "border-destructive/40",
+                )}
               />
               {rhaiError && (
-                <p className="text-[10px] text-destructive font-black uppercase tracking-widest px-2">{rhaiError}</p>
+                <p className="text-[10px] text-destructive font-black uppercase tracking-widest px-2">
+                  {rhaiError}
+                </p>
               )}
             </div>
 
@@ -438,17 +457,17 @@ export const NodeConfigForm = React.memo(
               </label>
               <div className="relative">
                 <select
-                    id="join-mode"
-                    className={selectBase}
-                    value={(config.joinMode as string) ?? "All"}
-                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
+                  id="join-mode"
+                  className={selectBase}
+                  value={(config.joinMode as string) ?? "All"}
+                  onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
                     setField("joinMode", e.target.value)
-                    }
+                  }
                 >
-                    <option value="All">RESOLVE_ALL_NODES</option>
-                    <option value="Any">FIRST_SUCCESSFUL_WINNER</option>
-                    <option value="Majority">MAJORITY_CONSENSUS_(50%+)</option>
-                    <option value="N">EXACT_COUNT_THRESHOLD_(N)</option>
+                  <option value="All">RESOLVE_ALL_NODES</option>
+                  <option value="Any">FIRST_SUCCESSFUL_WINNER</option>
+                  <option value="Majority">MAJORITY_CONSENSUS_(50%+)</option>
+                  <option value="N">EXACT_COUNT_THRESHOLD_(N)</option>
                 </select>
                 <ChevronDown className="absolute right-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40 pointer-events-none" />
               </div>
@@ -456,7 +475,7 @@ export const NodeConfigForm = React.memo(
             {config.joinMode === "N" && (
               <div className="space-y-3 animate-in fade-in zoom-in-95">
                 <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-                    Threshold Count (N)
+                  Threshold Count (N)
                 </label>
                 <Input
                   type="number"
@@ -480,7 +499,11 @@ export const NodeConfigForm = React.memo(
                 onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
                   setField("aggregationExpr", e.target.value)
                 }
-                className={cn(textareaBase, "min-h-[140px]", rhaiError && "border-destructive/40")}
+                className={cn(
+                  textareaBase,
+                  "min-h-[140px]",
+                  rhaiError && "border-destructive/40",
+                )}
               />
             </div>
           </div>
@@ -502,7 +525,8 @@ export const NodeConfigForm = React.memo(
                 className={inputBase}
               />
               <p className="text-[9px] text-muted-foreground/20 font-black uppercase tracking-widest px-1 leading-relaxed">
-                Matched against incoming error telemetry to activate this recovery branch.
+                Matched against incoming error telemetry to activate this
+                recovery branch.
               </p>
             </div>
           </div>
@@ -546,9 +570,12 @@ export const NodeConfigForm = React.memo(
                 <Clock className="w-5 h-5" />
               </div>
               <div className="flex flex-col gap-1 relative z-10">
-                <p className="text-[11px] text-amber-400 font-black uppercase tracking-widest">Protocol Suspension</p>
+                <p className="text-[11px] text-amber-400 font-black uppercase tracking-widest">
+                  Protocol Suspension
+                </p>
                 <p className="text-[10px] text-amber-300/40 font-medium leading-relaxed">
-                    Workflow state will be persisted. Execution resumes only upon manual signal.
+                  Workflow state will be persisted. Execution resumes only upon
+                  manual signal.
                 </p>
               </div>
             </div>
@@ -559,27 +586,32 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-4 animate-in slide-in-from-top-4 duration-500">
             <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-                Advanced Object Configuration
+              Advanced Object Configuration
             </label>
             <div className="relative group/json">
-                <div className={cn(
-                    "absolute -inset-1 rounded-[2.5rem] blur opacity-0 transition-premium",
-                    jsonError ? "bg-destructive/10 group-hover/json:opacity-100" : "bg-primary/5 group-hover/json:opacity-100"
-                )} />
-                <textarea
+              <div
+                className={cn(
+                  "absolute -inset-1 rounded-[2.5rem] blur opacity-0 transition-premium",
+                  jsonError
+                    ? "bg-destructive/10 group-hover/json:opacity-100"
+                    : "bg-primary/5 group-hover/json:opacity-100",
+                )}
+              />
+              <textarea
                 id="config-json"
                 rows={12}
                 className={cn(
-                    textareaBase,
-                    "relative border-white/10 group-hover/json:border-white/20 h-96 p-8",
-                    jsonError && "border-destructive/40 text-destructive shadow-[0_0_30px_hsla(var(--destructive),0.05)]"
+                  textareaBase,
+                  "relative border-white/10 group-hover/json:border-white/20 h-96 p-8",
+                  jsonError &&
+                    "border-destructive/40 text-destructive shadow-[0_0_30px_hsla(var(--destructive),0.05)]",
                 )}
                 value={jsonText}
                 onChange={handleTextareaChange}
-                />
-                <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.05)_50%),linear-gradient(90deg,rgba(255,0,0,0.01),rgba(0,255,0,0.005),rgba(0,0,255,0.01))] bg-[length:100%_4px,3px_100%]" />
+              />
+              <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.05)_50%),linear-gradient(90deg,rgba(255,0,0,0.01),rgba(0,255,0,0.005),rgba(0,0,255,0.01))] bg-[length:100%_4px,3px_100%]" />
             </div>
-            
+
             {jsonError && (
               <div className="p-5 bg-destructive/5 border border-destructive/20 rounded-2xl animate-in slide-in-from-top-2">
                 <p className="text-[11px] text-destructive flex items-center gap-3 font-bold">

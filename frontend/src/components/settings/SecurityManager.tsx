@@ -125,7 +125,8 @@ function RotateDekCard() {
               <p className="text-[11px] text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed max-w-xl">
                 Generates a new Data Encryption Key. Existing secrets remain
                 encrypted with the old DEK until you run a re-encryption sweep.
-                Both old and new DEKs remain active in parallel during migration.
+                Both old and new DEKs remain active in parallel during
+                migration.
               </p>
             </div>
           </div>
@@ -193,7 +194,9 @@ function ReEncryptSecretsCard() {
       toast.success("Secrets re-encrypted successfully");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to re-encrypt secrets"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to re-encrypt secrets"),
+      );
     },
   });
 
@@ -290,11 +293,14 @@ function RotateMasterKeyCard() {
       toast.success("Master key rotated — all DEKs re-encrypted");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to rotate master key"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to rotate master key"),
+      );
     },
   });
 
-  const isKeyValid = newMasterKey.length === 64 && /^[0-9a-fA-F]+$/.test(newMasterKey);
+  const isKeyValid =
+    newMasterKey.length === 64 && /^[0-9a-fA-F]+$/.test(newMasterKey);
   const isConfirmed = confirmPhrase === "I understand";
   const canSubmit = isKeyValid && isConfirmed && !mutation.isPending;
 
@@ -304,14 +310,20 @@ function RotateMasterKeyCard() {
   };
 
   return (
-    <div className={cn(
-      "bg-black/40 border-2 rounded-[2.5rem] p-10 overflow-hidden relative transition-premium group",
-      result ? "border-success/20 shadow-[0_0_50px_hsla(var(--success),0.05)]" : "border-destructive/20 shadow-[0_0_50px_hsla(var(--destructive),0.05)]",
-    )}>
-      <div className={cn(
-        "absolute inset-0 opacity-10 blur-[120px] pointer-events-none",
-        result ? "bg-success/20" : "bg-destructive/20",
-      )} />
+    <div
+      className={cn(
+        "bg-black/40 border-2 rounded-[2.5rem] p-10 overflow-hidden relative transition-premium group",
+        result
+          ? "border-success/20 shadow-[0_0_50px_hsla(var(--success),0.05)]"
+          : "border-destructive/20 shadow-[0_0_50px_hsla(var(--destructive),0.05)]",
+      )}
+    >
+      <div
+        className={cn(
+          "absolute inset-0 opacity-10 blur-[120px] pointer-events-none",
+          result ? "bg-success/20" : "bg-destructive/20",
+        )}
+      />
 
       <div className="relative z-10 space-y-8">
         {/* Title row */}
@@ -324,12 +336,15 @@ function RotateMasterKeyCard() {
               <h3 className="text-2xl font-black text-white tracking-tight uppercase font-outfit">
                 Rotate Root Master Key
               </h3>
-              <WarningBadge level="critical">Terminal / Non-Reversible</WarningBadge>
+              <WarningBadge level="critical">
+                Terminal / Non-Reversible
+              </WarningBadge>
             </div>
             <p className="text-[11px] text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed max-w-2xl">
               Replaces the root master key and re-encrypts all DEKs. The old
               master key will no longer be able to decrypt any data after this
-              operation completes. This is the highest privilege security operation.
+              operation completes. This is the highest privilege security
+              operation.
             </p>
           </div>
         </div>
@@ -342,8 +357,9 @@ function RotateMasterKeyCard() {
               CRITICAL: THIS OPERATION CANNOT BE UNDONE.
             </p>
             <p className="opacity-60 font-bold">
-              All DEKs will be re-encrypted with the new master key. Legacy entropy will be permanently purged.
-              Ensure you have established secure persistence for the new key before commitment.
+              All DEKs will be re-encrypted with the new master key. Legacy
+              entropy will be permanently purged. Ensure you have established
+              secure persistence for the new key before commitment.
             </p>
           </div>
         </div>
@@ -364,7 +380,9 @@ function RotateMasterKeyCard() {
                 }
                 className={cn(
                   "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/20 focus:outline-none focus:ring-4 focus:ring-destructive/10 transition-premium shadow-inner",
-                  newMasterKey.length > 0 && !isKeyValid && "border-destructive/40 focus:border-destructive/60",
+                  newMasterKey.length > 0 &&
+                    !isKeyValid &&
+                    "border-destructive/40 focus:border-destructive/60",
                   isKeyValid && "border-success/40 focus:border-success/60",
                 )}
               />
@@ -395,7 +413,7 @@ function RotateMasterKeyCard() {
               Governance Acknowledgment
             </label>
             <div className="relative">
-               <input
+              <input
                 type="text"
                 placeholder="Type 'I understand' to confirm..."
                 value={confirmPhrase}
@@ -458,7 +476,9 @@ function RotateEncryptionKeyCard() {
       toast.success("Encryption key rotated");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to rotate encryption key"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to rotate encryption key"),
+      );
     },
   });
 
@@ -515,7 +535,8 @@ function RotateEncryptionKeyCard() {
           <div className="relative z-10">
             <ResultBox>
               ROTATION_PROTOCOL_COMPLETE.{" "}
-              <span className="text-white">{rotatedCount}</span> SECRETS_SYNCHRONIZED.
+              <span className="text-white">{rotatedCount}</span>{" "}
+              SECRETS_SYNCHRONIZED.
             </ResultBox>
           </div>
         )}
@@ -545,7 +566,7 @@ export default function SecurityManager() {
       {/* Page header */}
       <div className="flex items-center gap-6">
         <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-[2rem] flex items-center justify-center text-destructive shadow-[0_0_30px_hsla(var(--destructive),0.1)] relative">
-           <div className="absolute inset-0 bg-destructive/5 rounded-full blur-xl animate-pulse" />
+          <div className="absolute inset-0 bg-destructive/5 rounded-full blur-xl animate-pulse" />
           <ShieldAlert size={32} className="relative z-10" />
         </div>
         <div>
@@ -570,9 +591,10 @@ export default function SecurityManager() {
             SENSITIVE_SYSTEM_OPERATIONS_THRESHOLD
           </p>
           <p className="text-[11px] text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed max-w-4xl">
-            Key rotation operations affect all users and integrations immediately. 
-            Ensure active backup redundancy and verified recovery protocols are established. 
-            All entropy shifts are logged to the non-repudiable audit trail.
+            Key rotation operations affect all users and integrations
+            immediately. Ensure active backup redundancy and verified recovery
+            protocols are established. All entropy shifts are logged to the
+            non-repudiable audit trail.
           </p>
         </div>
       </div>
@@ -605,8 +627,9 @@ export default function SecurityManager() {
             GOVERNANCE_ADVISORY
           </h4>
           <p className="text-[11px] text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed max-w-2xl">
-            Maintain a 90-day rotation cadence for DEKs. The master root should remain static unless non-zero trust 
-            compromise is detected or architectural entropy shift is required.
+            Maintain a 90-day rotation cadence for DEKs. The master root should
+            remain static unless non-zero trust compromise is detected or
+            architectural entropy shift is required.
           </p>
         </div>
       </div>

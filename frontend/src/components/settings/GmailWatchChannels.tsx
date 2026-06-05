@@ -92,7 +92,8 @@ async function fetchWatches(): Promise<GmailWatchSummary[]> {
   const res = await authedFetch("/api/gmail/watch-channels");
   if (res.status === 401 || res.status === 404) return [];
   const body: ApiResponse<GmailWatchSummary[]> = await res.json();
-  if (!body.success) throw new Error(body.error ?? "Failed to load gmail watches");
+  if (!body.success)
+    throw new Error(body.error ?? "Failed to load gmail watches");
   return body.data ?? [];
 }
 
@@ -100,7 +101,8 @@ async function fetchGmailIntegrations(): Promise<GmailIntegrationInfo[]> {
   const res = await authedFetch("/api/gmail/integrations");
   if (res.status === 401) return [];
   const body: ApiResponse<GmailIntegrationInfo[]> = await res.json();
-  if (!body.success) throw new Error(body.error ?? "Failed to load gmail integrations");
+  if (!body.success)
+    throw new Error(body.error ?? "Failed to load gmail integrations");
   return (body.data ?? []).filter((i) => i.is_active);
 }
 
@@ -176,7 +178,11 @@ function CreateGmailWatchDialog({
   };
 
   return (
-    <Dialog open={open} onClose={() => !submitting && onClose()} title="Create Gmail watch">
+    <Dialog
+      open={open}
+      onClose={() => !submitting && onClose()}
+      title="Create Gmail watch"
+    >
       <div className="space-y-5">
         <div>
           <label className="block text-xs font-semibold text-muted-foreground mb-2">
@@ -323,7 +329,8 @@ export function GmailWatchChannels(): React.ReactElement | null {
       });
       const body: ApiResponse<{ channel_uuid: string; expiration_ms: number }> =
         await res.json();
-      if (!body.success || !body.data) throw new Error(body.error ?? "Renew failed");
+      if (!body.success || !body.data)
+        throw new Error(body.error ?? "Renew failed");
       return body.data;
     },
     onMutate: async (ch) => {
@@ -362,7 +369,8 @@ export function GmailWatchChannels(): React.ReactElement | null {
       });
       const body: ApiResponse<{ oauth_ok: boolean; duration_ms: number }> =
         await res.json();
-      if (!body.success || !body.data) throw new Error(body.error ?? "Test failed");
+      if (!body.success || !body.data)
+        throw new Error(body.error ?? "Test failed");
       return body.data;
     },
     onSuccess: (data, ch) => {
@@ -407,7 +415,8 @@ export function GmailWatchChannels(): React.ReactElement | null {
   });
 
   const pendingFor = (ch: string): "renew" | "test" | "stop" | null => {
-    if (renewMutation.isPending && renewMutation.variables === ch) return "renew";
+    if (renewMutation.isPending && renewMutation.variables === ch)
+      return "renew";
     if (testMutation.isPending && testMutation.variables === ch) return "test";
     if (stopMutation.isPending && stopMutation.variables === ch) return "stop";
     return null;
@@ -457,7 +466,9 @@ export function GmailWatchChannels(): React.ReactElement | null {
           <Mail size={16} />
         </div>
         <div>
-          <h3 className="text-sm font-bold text-foreground">Gmail Watch Channels</h3>
+          <h3 className="text-sm font-bold text-foreground">
+            Gmail Watch Channels
+          </h3>
           <p className="text-xs text-muted-foreground">
             {watches.length === 0
               ? "None active — create one to receive push notifications on new email"
@@ -567,7 +578,9 @@ export function GmailWatchChannels(): React.ReactElement | null {
                 <th className="text-left px-4 py-2.5 font-semibold">Module</th>
                 <th className="text-left px-4 py-2.5 font-semibold">Expires</th>
                 <th className="text-left px-4 py-2.5 font-semibold">Status</th>
-                <th className="text-right px-4 py-2.5 font-semibold">Actions</th>
+                <th className="text-right px-4 py-2.5 font-semibold">
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -595,7 +608,9 @@ export function GmailWatchChannels(): React.ReactElement | null {
                     </td>
                     <td className="px-4 py-3 text-xs">
                       {w.label_ids.length === 0 ? (
-                        <span className="text-muted-foreground italic">all</span>
+                        <span className="text-muted-foreground italic">
+                          all
+                        </span>
                       ) : (
                         w.label_ids.join(", ")
                       )}

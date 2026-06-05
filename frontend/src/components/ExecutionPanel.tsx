@@ -1,27 +1,19 @@
-import React, {
-  useState,
-  useEffect,
-  useCallback,
-  useMemo,
-} from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button, ConfirmDialog } from "@/components/ui";
-import { graphqlRequest, listActors, type ActorSummary } from "@/lib/graphqlClient";
+import {
+  graphqlRequest,
+  listActors,
+  type ActorSummary,
+} from "@/lib/graphqlClient";
 import { loadWorkflowById } from "@/lib/workflowLoader";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useShallow } from "zustand/react/shallow";
-import {
-  useEphemeralExecutionStore,
-} from "@/store/executionStore";
+import { useEphemeralExecutionStore } from "@/store/executionStore";
 
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
-import {
-  AlertCircle,
-  Clock,
-  Activity,
-  Copy,
-} from "lucide-react";
+import { AlertCircle, Clock, Activity, Copy } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ExecutionWaterfall } from "./ExecutionWaterfall";
 import { TimelineEvent } from "./execution/TimelineEvent";
@@ -32,7 +24,6 @@ interface Workflow {
   id: string;
   name: string;
 }
-
 
 export default function ExecutionPanel() {
   const [workflowId, setWorkflowId] = useState("");
@@ -47,19 +38,27 @@ export default function ExecutionPanel() {
     onConfirm: () => void;
   }>(null);
 
-  const { workflowId: storeWorkflowId, nodes, clearWorkflow } = useWorkflowStore(
+  const {
+    workflowId: storeWorkflowId,
+    nodes,
+    clearWorkflow,
+  } = useWorkflowStore(
     useShallow((s) => ({
       workflowId: s.workflowId,
       nodes: s.nodes,
       clearWorkflow: s.clearWorkflow,
-    }))
+    })),
   );
   const events = useEphemeralExecutionStore((s) => s.events);
-  const clearCurrentExecution = useEphemeralExecutionStore((s) => s.clearCurrentExecution);
+  const clearCurrentExecution = useEphemeralExecutionStore(
+    (s) => s.clearCurrentExecution,
+  );
   const isRunning = useEphemeralExecutionStore((s) => s.isRunning);
   const { copy: copyId } = useCopyToClipboard();
   const [showTimeline, setShowTimeline] = useState(false);
-  const [viewMode, setViewMode] = useState<"timeline" | "waterfall">("timeline");
+  const [viewMode, setViewMode] = useState<"timeline" | "waterfall">(
+    "timeline",
+  );
 
   // React Query for fetching workflows
   const {
@@ -110,17 +109,14 @@ export default function ExecutionPanel() {
         hasActor
           ? `mutation ($workflowId: UUID!, $actorId: UUID) { triggerWorkflow(workflowId: $workflowId, actorId: $actorId) { id } }`
           : `mutation ($workflowId: UUID!) { triggerWorkflow(workflowId: $workflowId) { id } }`,
-        hasActor
-          ? { workflowId, actorId: selectedActorId }
-          : { workflowId },
+        hasActor ? { workflowId, actorId: selectedActorId } : { workflowId },
       );
 
       const execId = data.triggerWorkflow.id;
       setExecutionId(execId);
-      
+
       // The useActiveExecutionSync hook will pick up this new execution automatically
       // via the global workflow_execution_updates stream and start the detail subscription.
-      
     } catch (e: unknown) {
       setError(
         sanitizeErrorMessage(
@@ -131,11 +127,7 @@ export default function ExecutionPanel() {
     } finally {
       setLoading(false);
     }
-  }, [
-    workflowId,
-    selectedActorId,
-    clearCurrentExecution,
-  ]);
+  }, [workflowId, selectedActorId, clearCurrentExecution]);
 
   const handleWorkflowSelect = useCallback(
     async (selectedWorkflowId: string) => {
@@ -186,25 +178,29 @@ export default function ExecutionPanel() {
     [nodes.length, storeWorkflowId, clearWorkflow],
   );
 
-
   const nodeNameMap = useMemo(() => {
     const map = new Map<string, string>();
     for (const n of nodes) {
-      map.set(n.id, n.data.moduleName ?? n.data.label ?? n.id.slice(0, 8) + "…");
+      map.set(
+        n.id,
+        n.data.moduleName ?? n.data.label ?? n.id.slice(0, 8) + "…",
+      );
     }
     return map;
   }, [nodes]);
 
   const resolveNodeName = useCallback(
     (nodeId: string | undefined): string | undefined =>
-      nodeId ? nodeNameMap.get(nodeId) ?? nodeId.slice(0, 8) + "…" : undefined,
+      nodeId
+        ? (nodeNameMap.get(nodeId) ?? nodeId.slice(0, 8) + "…")
+        : undefined,
     [nodeNameMap],
   );
 
   return (
     <div className="flex flex-col bg-surface-1/60 backdrop-blur-3xl border-l border-white/5 text-foreground shadow-2xl relative overflow-hidden transition-premium">
       <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-      
+
       <ConfirmDialog
         open={confirmPending !== null}
         title={confirmPending?.title ?? "Confirm"}
@@ -280,10 +276,15 @@ export default function ExecutionPanel() {
                   className="w-32 h-1 bg-white/5 rounded-full accent-primary cursor-pointer transition-premium hover:accent-primary-foreground"
                   onChange={(e) => {
                     const idx = Number(e.target.value);
-                    const container = document.querySelector('.custom-scrollbar');
+                    const container =
+                      document.querySelector(".custom-scrollbar");
                     if (container) {
-                      const children = container.querySelectorAll('[data-event-idx]');
-                      children[idx]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      const children =
+                        container.querySelectorAll("[data-event-idx]");
+                      children[idx]?.scrollIntoView({
+                        behavior: "smooth",
+                        block: "center",
+                      });
                     }
                   }}
                 />
@@ -301,7 +302,7 @@ export default function ExecutionPanel() {
                     "px-4 py-1.5 text-[9px] font-black uppercase tracking-widest rounded-lg transition-premium",
                     viewMode === mode
                       ? "bg-primary text-primary-foreground shadow-lg shadow-primary/20"
-                      : "text-muted-foreground/40 hover:text-white"
+                      : "text-muted-foreground/40 hover:text-white",
                   )}
                 >
                   {mode.charAt(0).toUpperCase() + mode.slice(1)}
@@ -315,18 +316,18 @@ export default function ExecutionPanel() {
             {events.length === 0 ? (
               <div className="py-20 flex flex-col items-center justify-center text-center">
                 <div className="relative mb-8 group">
-                    <div className="absolute -inset-10 bg-primary/5 rounded-full blur-[60px] opacity-0 group-hover:opacity-100 transition-premium animate-pulse" />
-                    <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 shadow-2xl transition-premium group-hover:scale-105 group-hover:border-primary/20">
-                        <Activity className="h-16 w-16 text-muted-foreground/20 group-hover:text-primary transition-premium stroke-[1px]" />
-                    </div>
+                  <div className="absolute -inset-10 bg-primary/5 rounded-full blur-[60px] opacity-0 group-hover:opacity-100 transition-premium animate-pulse" />
+                  <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 shadow-2xl transition-premium group-hover:scale-105 group-hover:border-primary/20">
+                    <Activity className="h-16 w-16 text-muted-foreground/20 group-hover:text-primary transition-premium stroke-[1px]" />
+                  </div>
                 </div>
                 <div className="space-y-3 max-w-[280px]">
-                    <h3 className="text-xl font-black tracking-tighter text-white font-outfit uppercase opacity-40">
-                      Telemetry Core
-                    </h3>
-                    <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.2em] leading-relaxed">
-                      Initialize protocol to synchronize data streams.
-                    </p>
+                  <h3 className="text-xl font-black tracking-tighter text-white font-outfit uppercase opacity-40">
+                    Telemetry Core
+                  </h3>
+                  <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.2em] leading-relaxed">
+                    Initialize protocol to synchronize data streams.
+                  </p>
                 </div>
               </div>
             ) : viewMode === "waterfall" ? (
@@ -335,7 +336,10 @@ export default function ExecutionPanel() {
                 nodeNames={Object.fromEntries(
                   events
                     .filter((e) => e.nodeId)
-                    .map((e) => [e.nodeId!, resolveNodeName(e.nodeId) ?? e.nodeId!.slice(0, 8)])
+                    .map((e) => [
+                      e.nodeId!,
+                      resolveNodeName(e.nodeId) ?? e.nodeId!.slice(0, 8),
+                    ]),
                 )}
               />
             ) : (

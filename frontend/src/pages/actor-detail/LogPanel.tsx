@@ -2,16 +2,19 @@ import React, { useState, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ClipboardList, Download, Filter, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { getActorActionLog, type ActorActionLogEntry } from "@/lib/graphqlClient";
+import {
+  getActorActionLog,
+  type ActorActionLogEntry,
+} from "@/lib/graphqlClient";
 import { SkeletonTimeline } from "@/components/ui";
 import { LocalEmptyState, LogEntryRow, downloadLogCsv } from "./shared";
 
 const LOG_FILTER_OPTIONS = [
-  { id: "all",              label: "All" },
-  { id: "created",          label: "created" },
-  { id: "workflow_executed",label: "workflow_executed" },
-  { id: "handoff",          label: "handoff" },
-  { id: "lifecycle",        label: "suspended/activated" },
+  { id: "all", label: "All" },
+  { id: "created", label: "created" },
+  { id: "workflow_executed", label: "workflow_executed" },
+  { id: "handoff", label: "handoff" },
+  { id: "lifecycle", label: "suspended/activated" },
 ] as const;
 
 type LogFilter = (typeof LOG_FILTER_OPTIONS)[number]["id"];
@@ -35,7 +38,8 @@ export function LogPanel({ actorId }: { actorId: string }) {
       result = result.filter((e) => {
         const t = e.actionType.toLowerCase();
         if (filter === "handoff") return t.includes("handoff");
-        if (filter === "lifecycle") return t === "suspended" || t === "activated";
+        if (filter === "lifecycle")
+          return t === "suspended" || t === "activated";
         return t === filter;
       });
     }
@@ -96,7 +100,10 @@ export function LogPanel({ actorId }: { actorId: string }) {
       </div>
 
       {filtered.length === 0 ? (
-        <LocalEmptyState icon={<ClipboardList size={40} />} message="No matching entries" />
+        <LocalEmptyState
+          icon={<ClipboardList size={40} />}
+          message="No matching entries"
+        />
       ) : (
         <div className="bg-surface-3/60 border border-white/5 rounded-2xl overflow-hidden">
           <div className="divide-y divide-[rgba(255,255,255,0.04)]">

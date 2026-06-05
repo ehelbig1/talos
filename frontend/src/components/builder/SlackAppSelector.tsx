@@ -5,18 +5,18 @@ import { validateOAuthUrl } from "@/lib/oauthUtils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { authedFetch } from "@/lib/authedFetch";
 import { cn } from "@/lib/utils";
-import { 
-  Hash, 
-  Plus, 
-  MessageSquare, 
-  Globe, 
-  Check, 
-  Loader2, 
-  AlertTriangle, 
-  Rocket, 
+import {
+  Hash,
+  Plus,
+  MessageSquare,
+  Globe,
+  Check,
+  Loader2,
+  AlertTriangle,
+  Rocket,
   ArrowRight,
   Shield,
-  Zap
+  Zap,
 } from "lucide-react";
 
 interface SlackIntegration {
@@ -69,7 +69,11 @@ export function SlackAppSelector({
         throw new Error(data.error || "Unknown error");
       }
     } catch (err) {
-      setError(sanitizeErrorMessage(err instanceof Error ? err.message : "Unknown error"));
+      setError(
+        sanitizeErrorMessage(
+          err instanceof Error ? err.message : "Unknown error",
+        ),
+      );
     } finally {
       setLoading(false);
     }
@@ -83,9 +87,11 @@ export function SlackAppSelector({
 
       if (data.success && data.data?.authorization_url) {
         if (!validateOAuthUrl(data.data.authorization_url)) {
-          throw new Error("Invalid OAuth authorization URL received from server");
+          throw new Error(
+            "Invalid OAuth authorization URL received from server",
+          );
         }
-        
+
         const width = 600;
         const height = 700;
         const left = window.screen.width / 2 - width / 2;
@@ -123,7 +129,11 @@ export function SlackAppSelector({
         throw new Error(data.error || "No authorization URL received");
       }
     } catch (err) {
-      setError(sanitizeErrorMessage(err instanceof Error ? err.message : "Unknown error"));
+      setError(
+        sanitizeErrorMessage(
+          err instanceof Error ? err.message : "Unknown error",
+        ),
+      );
       setConnecting(false);
     }
   };
@@ -153,7 +163,7 @@ export function SlackAppSelector({
   return (
     <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-[2.5rem] space-y-8 shadow-2xl">
       <div className="absolute inset-0 bg-gradient-to-br from-[#4A154B]/5 via-transparent to-transparent opacity-50 pointer-events-none" />
-      
+
       {showCreator && (
         <SlackAppCreator
           webhookUrl={(currentConfig?.WEBHOOK_URL as string) || ""}
@@ -179,13 +189,15 @@ export function SlackAppSelector({
             <MessageSquare className="h-5 w-5 text-[#4A154B]" />
           </div>
           <div>
-              <h4 className="text-[11px] font-black text-white uppercase tracking-[0.2em]">
-                Slack Workspace Integration
-              </h4>
-              <p className="text-[9px] font-black text-muted-foreground/20 uppercase tracking-widest">Distributed Communication Vector</p>
+            <h4 className="text-[11px] font-black text-white uppercase tracking-[0.2em]">
+              Slack Workspace Integration
+            </h4>
+            <p className="text-[9px] font-black text-muted-foreground/20 uppercase tracking-widest">
+              Distributed Communication Vector
+            </p>
           </div>
         </div>
-        
+
         {integrations.length > 0 && (
           <div className="flex gap-2">
             <Button
@@ -201,7 +213,11 @@ export function SlackAppSelector({
               variant="ghost"
               className="h-9 px-4 bg-surface-3 hover:bg-surface-4 text-white text-[9px] font-black uppercase tracking-widest rounded-xl border border-white/5 transition-premium"
             >
-              {connecting ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" /> : <Plus className="w-3.5 h-3.5 mr-2" />}
+              {connecting ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
+              ) : (
+                <Plus className="w-3.5 h-3.5 mr-2" />
+              )}
               Bridge Workspace
             </Button>
           </div>
@@ -211,7 +227,9 @@ export function SlackAppSelector({
       {error && (
         <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl flex items-center gap-4 text-destructive animate-in shake duration-500">
           <AlertTriangle className="h-5 w-5 shrink-0" />
-          <p className="m-0 text-[10px] font-black uppercase tracking-widest">{error}</p>
+          <p className="m-0 text-[10px] font-black uppercase tracking-widest">
+            {error}
+          </p>
         </div>
       )}
 
@@ -224,7 +242,8 @@ export function SlackAppSelector({
             No Slack Workspaces Bridged
           </h5>
           <p className="mb-8 text-[11px] font-bold text-muted-foreground/40 uppercase tracking-widest leading-relaxed max-w-xs mx-auto">
-            Synchronize your Slack grid to enable distributed communication vectors for your automated workflows.
+            Synchronize your Slack grid to enable distributed communication
+            vectors for your automated workflows.
           </p>
           <Button
             onClick={handleConnect}
@@ -237,7 +256,10 @@ export function SlackAppSelector({
                 <span>Establishing Bridge...</span>
               </div>
             ) : (
-              <>🔗 Initialize Connection <ArrowRight className="ml-2 w-3.5 h-3.5" /></>
+              <>
+                🔗 Initialize Connection{" "}
+                <ArrowRight className="ml-2 w-3.5 h-3.5" />
+              </>
             )}
           </Button>
         </div>
@@ -255,29 +277,44 @@ export function SlackAppSelector({
                   onClick={() => handleSelect(integration)}
                   className={cn(
                     "group relative p-4 text-left rounded-2xl border transition-premium hover:scale-[1.01] active:scale-[0.98] overflow-hidden",
-                    isSelected 
-                      ? "bg-[#4A154B]/10 border-[#4A154B] shadow-[0_0_20px_rgba(74,21,75,0.1)]" 
-                      : "bg-surface-3 border-white/5 hover:bg-surface-4 hover:border-white/20"
+                    isSelected
+                      ? "bg-[#4A154B]/10 border-[#4A154B] shadow-[0_0_20px_rgba(74,21,75,0.1)]"
+                      : "bg-surface-3 border-white/5 hover:bg-surface-4 hover:border-white/20",
                   )}
                 >
                   <div className="flex items-center gap-4 relative z-10">
-                    <div className={cn(
+                    <div
+                      className={cn(
                         "w-10 h-10 rounded-xl flex items-center justify-center border transition-premium",
-                        isSelected ? "bg-[#4A154B] text-white border-[#4A154B]" : "bg-white/5 text-muted-foreground/40 border-white/10"
-                    )}>
-                        {isSelected ? <Check className="h-5 w-5" /> : <Hash className="h-5 w-5" />}
+                        isSelected
+                          ? "bg-[#4A154B] text-white border-[#4A154B]"
+                          : "bg-white/5 text-muted-foreground/40 border-white/10",
+                      )}
+                    >
+                      {isSelected ? (
+                        <Check className="h-5 w-5" />
+                      ) : (
+                        <Hash className="h-5 w-5" />
+                      )}
                     </div>
                     <div className="flex-1 min-w-0">
-                        <span className={cn("block text-xs font-black uppercase tracking-widest truncate transition-premium", isSelected ? "text-white" : "text-white/60")}>
-                          {integration.team_name}
-                        </span>
-                        <span className="block text-[9px] font-black text-muted-foreground/20 uppercase tracking-tighter mt-0.5">
-                          ID: {integration.team_id} {integration.last_used_at && `• Active: ${new Date(integration.last_used_at).toLocaleDateString()}`}
-                        </span>
+                      <span
+                        className={cn(
+                          "block text-xs font-black uppercase tracking-widest truncate transition-premium",
+                          isSelected ? "text-white" : "text-white/60",
+                        )}
+                      >
+                        {integration.team_name}
+                      </span>
+                      <span className="block text-[9px] font-black text-muted-foreground/20 uppercase tracking-tighter mt-0.5">
+                        ID: {integration.team_id}{" "}
+                        {integration.last_used_at &&
+                          `• Active: ${new Date(integration.last_used_at).toLocaleDateString()}`}
+                      </span>
                     </div>
                     {isSelected && (
                       <div className="animate-pulse">
-                          <div className="w-2 h-2 rounded-full bg-[#4A154B]" />
+                        <div className="w-2 h-2 rounded-full bg-[#4A154B]" />
                       </div>
                     )}
                   </div>
@@ -287,12 +324,13 @@ export function SlackAppSelector({
           </div>
 
           <div className="p-6 bg-primary/5 border border-primary/10 rounded-[2rem] flex items-start gap-4">
-              <div className="shrink-0 p-2 rounded-xl bg-primary/10 border border-primary/20">
-                  <Zap className="w-4 h-4 text-primary" />
-              </div>
-              <p className="text-[10px] text-primary/60 font-bold uppercase tracking-widest leading-relaxed">
-                Strategic Insight: Use "Manifest App" to quickly synthesize a new Slack vector with pre-configured operational permissions.
-              </p>
+            <div className="shrink-0 p-2 rounded-xl bg-primary/10 border border-primary/20">
+              <Zap className="w-4 h-4 text-primary" />
+            </div>
+            <p className="text-[10px] text-primary/60 font-bold uppercase tracking-widest leading-relaxed">
+              Strategic Insight: Use "Manifest App" to quickly synthesize a new
+              Slack vector with pre-configured operational permissions.
+            </p>
           </div>
         </div>
       )}

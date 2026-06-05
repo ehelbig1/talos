@@ -72,80 +72,85 @@ export function LlmConfigSection({
 
   if (!hasLlm) return null;
 
-  const selectBase = "w-full px-4 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
+  const selectBase =
+    "w-full px-4 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
 
   return (
     <div className="p-6 bg-surface-3/40 border border-white/5 rounded-3xl space-y-6 shadow-2xl relative overflow-hidden group">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-20 pointer-events-none" />
-      
+
       <div className="flex items-center justify-between relative z-10">
         <h4 className="text-[11px] font-black text-white flex items-center gap-3 uppercase tracking-[0.3em] font-outfit">
-            <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 shadow-[0_0_20px_hsla(var(--primary),0.15)] group-hover:scale-110 transition-premium">
+          <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 shadow-[0_0_20px_hsla(var(--primary),0.15)] group-hover:scale-110 transition-premium">
             <Brain className="w-4 h-4 text-primary" />
-            </div>
-            Neural Core
+          </div>
+          Neural Core
         </h4>
         <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
-            <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-            <span className="text-[8px] font-black text-primary tracking-widest uppercase">Active_Link</span>
+          <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+          <span className="text-[8px] font-black text-primary tracking-widest uppercase">
+            Active_Link
+          </span>
         </div>
       </div>
 
       <div className="space-y-6 relative z-10">
         <div className="grid grid-cols-1 gap-6">
-            <div className="space-y-3">
+          <div className="space-y-3">
             <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-                Cognitive Architecture
+              Cognitive Architecture
             </label>
             <div className="relative">
-                <select
-                    className={selectBase}
-                    value={(data.config?.llm_provider as string) || "anthropic"}
-                    onChange={(e) =>
-                    updateNodeData(nodeId, {
-                        config: { ...data.config, llm_provider: e.target.value },
-                    })
-                    }
-                >
-                    <option value="anthropic">ANTHROPIC (CLAUDE)</option>
-                    <option value="openai">OPENAI (GPT)</option>
-                    <option value="gemini">GOOGLE (GEMINI)</option>
-                </select>
-                <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40 pointer-events-none" />
+              <select
+                className={selectBase}
+                value={(data.config?.llm_provider as string) || "anthropic"}
+                onChange={(e) =>
+                  updateNodeData(nodeId, {
+                    config: { ...data.config, llm_provider: e.target.value },
+                  })
+                }
+              >
+                <option value="anthropic">ANTHROPIC (CLAUDE)</option>
+                <option value="openai">OPENAI (GPT)</option>
+                <option value="gemini">GOOGLE (GEMINI)</option>
+              </select>
+              <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40 pointer-events-none" />
             </div>
-            </div>
+          </div>
 
-            <div className="space-y-3">
+          <div className="space-y-3">
             <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-                Model Parameter
+              Model Parameter
             </label>
             <div className="relative">
-                <select
-                    className={selectBase}
-                    value={(data.config?.llm_model as string) || ""}
-                    onChange={(e) =>
-                    updateNodeData(nodeId, {
-                        config: { ...data.config, llm_model: e.target.value },
-                    })
-                    }
-                >
-                    <optgroup label="ANTHROPIC" className="bg-surface-3">
-                    <option value="claude-sonnet-4-6">CLAUDE SONNET 4.6</option>
-                    <option value="claude-opus-4-6">CLAUDE OPUS 4.6</option>
-                    <option value="claude-haiku-4-5-20251001">CLAUDE HAIKU 4.5</option>
-                    </optgroup>
-                    <optgroup label="OPENAI" className="bg-surface-3">
-                    <option value="gpt-4o">GPT-4O</option>
-                    <option value="gpt-4-turbo">GPT-4 TURBO</option>
-                    </optgroup>
-                    <optgroup label="GOOGLE" className="bg-surface-3">
-                    <option value="gemini-1.5-pro">GEMINI 1.5 PRO</option>
-                    <option value="gemini-1.5-flash">GEMINI 1.5 FLASH</option>
-                    </optgroup>
-                </select>
-                <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40 pointer-events-none" />
+              <select
+                className={selectBase}
+                value={(data.config?.llm_model as string) || ""}
+                onChange={(e) =>
+                  updateNodeData(nodeId, {
+                    config: { ...data.config, llm_model: e.target.value },
+                  })
+                }
+              >
+                <optgroup label="ANTHROPIC" className="bg-surface-3">
+                  <option value="claude-sonnet-4-6">CLAUDE SONNET 4.6</option>
+                  <option value="claude-opus-4-6">CLAUDE OPUS 4.6</option>
+                  <option value="claude-haiku-4-5-20251001">
+                    CLAUDE HAIKU 4.5
+                  </option>
+                </optgroup>
+                <optgroup label="OPENAI" className="bg-surface-3">
+                  <option value="gpt-4o">GPT-4O</option>
+                  <option value="gpt-4-turbo">GPT-4 TURBO</option>
+                </optgroup>
+                <optgroup label="GOOGLE" className="bg-surface-3">
+                  <option value="gemini-1.5-pro">GEMINI 1.5 PRO</option>
+                  <option value="gemini-1.5-flash">GEMINI 1.5 FLASH</option>
+                </optgroup>
+              </select>
+              <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40 pointer-events-none" />
             </div>
-            </div>
+          </div>
         </div>
 
         <div className="flex gap-6">
@@ -164,7 +169,10 @@ export function LlmConfigSection({
                 updateNodeData(nodeId, {
                   config: {
                     ...data.config,
-                    llm_temperature: Math.min(2, Math.max(0, parseFloat(e.target.value) || 0.7)),
+                    llm_temperature: Math.min(
+                      2,
+                      Math.max(0, parseFloat(e.target.value) || 0.7),
+                    ),
                   },
                 })
               }
@@ -183,7 +191,10 @@ export function LlmConfigSection({
                 updateNodeData(nodeId, {
                   config: {
                     ...data.config,
-                    llm_max_tokens: Math.max(1, parseInt(e.target.value, 10) || 4096),
+                    llm_max_tokens: Math.max(
+                      1,
+                      parseInt(e.target.value, 10) || 4096,
+                    ),
                   },
                 })
               }
@@ -198,15 +209,15 @@ export function LlmConfigSection({
           <div className="relative group/directive">
             <div className="absolute -inset-0.5 bg-primary/10 rounded-2xl blur opacity-0 group-hover/directive:opacity-100 transition-premium" />
             <textarea
-                rows={4}
-                className="relative w-full px-5 py-4 text-[11px] font-medium bg-black/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:outline-none transition-premium resize-none font-sans leading-relaxed selection:bg-primary/30 placeholder:text-muted-foreground/20"
-                placeholder="DEFINE_OPERATIONAL_DIRECTIVE..."
-                value={(data.config?.llm_system_prompt as string) || ""}
-                onChange={(e) =>
+              rows={4}
+              className="relative w-full px-5 py-4 text-[11px] font-medium bg-black/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:outline-none transition-premium resize-none font-sans leading-relaxed selection:bg-primary/30 placeholder:text-muted-foreground/20"
+              placeholder="DEFINE_OPERATIONAL_DIRECTIVE..."
+              value={(data.config?.llm_system_prompt as string) || ""}
+              onChange={(e) =>
                 updateNodeData(nodeId, {
-                    config: { ...data.config, llm_system_prompt: e.target.value },
+                  config: { ...data.config, llm_system_prompt: e.target.value },
                 })
-                }
+              }
             />
           </div>
         </div>
@@ -224,73 +235,77 @@ export function RetryPolicySection({
   data: WorkflowNodeData;
   updateNodeData: (id: string, data: Partial<WorkflowNodeData>) => void;
 }) {
-  const inputBase = "w-full px-5 py-3.5 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30";
+  const inputBase =
+    "w-full px-5 py-3.5 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30";
 
   return (
     <div className="space-y-8 animate-in slide-in-from-top-4 duration-500">
       <div className="grid grid-cols-2 gap-6">
         <div className="space-y-3">
-            <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-                Threshold
-            </label>
-            <input
-                type="number"
-                placeholder="0"
-                className={inputBase}
-                value={data.retryPolicy?.maxRetries ?? 0}
-                onChange={(e) => {
-                    const currentPolicy = data.retryPolicy || { maxRetries: 0 };
-                    updateNodeData(nodeId, {
-                    retryPolicy: {
-                        ...currentPolicy,
-                        maxRetries: Math.max(0, parseInt(e.target.value, 10) || 0),
-                    },
-                    });
-                }}
-            />
+          <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
+            Threshold
+          </label>
+          <input
+            type="number"
+            placeholder="0"
+            className={inputBase}
+            value={data.retryPolicy?.maxRetries ?? 0}
+            onChange={(e) => {
+              const currentPolicy = data.retryPolicy || { maxRetries: 0 };
+              updateNodeData(nodeId, {
+                retryPolicy: {
+                  ...currentPolicy,
+                  maxRetries: Math.max(0, parseInt(e.target.value, 10) || 0),
+                },
+              });
+            }}
+          />
         </div>
 
         <div className="space-y-3">
-            <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-                Backoff (ms)
-            </label>
-            <input
-                type="number"
-                placeholder="1000"
-                className={inputBase}
-                value={data.retryPolicy?.backoffMs ?? 1000}
-                onChange={(e) => {
-                    const currentPolicy = data.retryPolicy || { maxRetries: 0 };
-                    updateNodeData(nodeId, {
-                    retryPolicy: {
-                        ...currentPolicy,
-                        backoffMs: Math.max(0, parseInt(e.target.value, 10) || 1000),
-                    },
-                    });
-                }}
-            />
+          <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
+            Backoff (ms)
+          </label>
+          <input
+            type="number"
+            placeholder="1000"
+            className={inputBase}
+            value={data.retryPolicy?.backoffMs ?? 1000}
+            onChange={(e) => {
+              const currentPolicy = data.retryPolicy || { maxRetries: 0 };
+              updateNodeData(nodeId, {
+                retryPolicy: {
+                  ...currentPolicy,
+                  backoffMs: Math.max(0, parseInt(e.target.value, 10) || 1000),
+                },
+              });
+            }}
+          />
         </div>
       </div>
 
       <div className="space-y-4">
         <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-            Condition Logic (Rhai)
+          Condition Logic (Rhai)
         </label>
         <div className="relative group/logic">
-            <div className="absolute -inset-1 bg-primary/5 rounded-3xl blur opacity-20 group-hover/logic:opacity-40 transition-premium" />
-            <textarea
-                placeholder="ctx.last_error.code == 503"
-                className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-[11px] min-h-[140px] transition-premium rounded-[2rem] selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40 focus:shadow-[0_0_30px_hsla(var(--primary),0.05)]"
-                value={data.retryPolicy?.retryCondition ?? ""}
-                onChange={(e) => {
-                    const currentPolicy = data.retryPolicy || { maxRetries: 0 };
-                    updateNodeData(nodeId, {
-                    retryPolicy: { ...currentPolicy, retryCondition: e.target.value },
-                    });
-                }}
-            />
+          <div className="absolute -inset-1 bg-primary/5 rounded-3xl blur opacity-20 group-hover/logic:opacity-40 transition-premium" />
+          <textarea
+            placeholder="ctx.last_error.code == 503"
+            className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-[11px] min-h-[140px] transition-premium rounded-[2rem] selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40 focus:shadow-[0_0_30px_hsla(var(--primary),0.05)]"
+            value={data.retryPolicy?.retryCondition ?? ""}
+            onChange={(e) => {
+              const currentPolicy = data.retryPolicy || { maxRetries: 0 };
+              updateNodeData(nodeId, {
+                retryPolicy: {
+                  ...currentPolicy,
+                  retryCondition: e.target.value,
+                },
+              });
+            }}
+          />
         </div>
-        
+
         <div className="flex flex-wrap gap-3 pt-2">
           {[
             { label: "PROTOCOL_FAULT", value: "ctx.last_error.code >= 500" },
@@ -348,21 +363,21 @@ export function SystemInternalsSection({
           Protocol Identity
         </label>
         <div className="grid gap-4">
-            <CopyField
-                label="Node_ID"
-                value={node.id}
-                copied={copiedNodeId}
-                onCopy={onCopyNodeId}
-            />
-            <CopyField
-                label="Source_ID"
-                value={moduleId}
-                copied={copiedModuleId}
-                onCopy={onCopyModuleId}
-            />
+          <CopyField
+            label="Node_ID"
+            value={node.id}
+            copied={copiedNodeId}
+            onCopy={onCopyNodeId}
+          />
+          <CopyField
+            label="Source_ID"
+            value={moduleId}
+            copied={copiedModuleId}
+            onCopy={onCopyModuleId}
+          />
         </div>
       </div>
-      
+
       <div className="pt-8 border-t border-white/5">
         <button
           type="button"

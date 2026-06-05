@@ -134,7 +134,8 @@ async function fetchChannels(): Promise<WatchChannelSummary[]> {
   const res = await authedFetch("/api/google-calendar/watch-channels");
   if (res.status === 401) return [];
   const body: ApiResponse<WatchChannelSummary[]> = await res.json();
-  if (!body.success) throw new Error(body.error ?? "Failed to load watch channels");
+  if (!body.success)
+    throw new Error(body.error ?? "Failed to load watch channels");
   return body.data ?? [];
 }
 
@@ -142,7 +143,8 @@ async function fetchIntegrations(): Promise<IntegrationInfo[]> {
   const res = await authedFetch("/api/google-calendar/integrations");
   if (res.status === 401) return [];
   const body: ApiResponse<IntegrationInfo[]> = await res.json();
-  if (!body.success) throw new Error(body.error ?? "Failed to load integrations");
+  if (!body.success)
+    throw new Error(body.error ?? "Failed to load integrations");
   return (body.data ?? []).filter((i) => i.is_active);
 }
 
@@ -206,7 +208,8 @@ function CreateChannelDialog({
         `/api/google-calendar/integrations/${integrationId}/calendars`,
       );
       const body: ApiResponse<CalendarInfo[]> = await res.json();
-      if (!body.success) throw new Error(body.error ?? "Failed to load calendars");
+      if (!body.success)
+        throw new Error(body.error ?? "Failed to load calendars");
       return body.data ?? [];
     },
     enabled: open && !!integrationId,
@@ -240,25 +243,20 @@ function CreateChannelDialog({
     let failed = 0;
     for (const calId of selected) {
       try {
-        const res = await authedFetch(
-          "/api/google-calendar/watch/create",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              integration_id: integrationId,
-              calendar_id: calId,
-            }),
-          },
-        );
+        const res = await authedFetch("/api/google-calendar/watch/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            integration_id: integrationId,
+            calendar_id: calId,
+          }),
+        });
         const body: ApiResponse<Record<string, unknown>> = await res.json();
         if (body.success) created++;
         else {
           failed++;
           toast.error(
-            sanitizeErrorMessage(
-              `${calId}: ${body.error ?? "create failed"}`,
-            ),
+            sanitizeErrorMessage(`${calId}: ${body.error ?? "create failed"}`),
           );
         }
       } catch (e) {
@@ -301,7 +299,11 @@ function CreateChannelDialog({
   ).length;
 
   return (
-    <Dialog open={open} onClose={() => !submitting && onClose()} title="Create watch channel">
+    <Dialog
+      open={open}
+      onClose={() => !submitting && onClose()}
+      title="Create watch channel"
+    >
       <div className="space-y-5">
         <div>
           <label className="block text-xs font-semibold text-muted-foreground mb-2">
@@ -350,7 +352,9 @@ function CreateChannelDialog({
                     key={c.id}
                     className={cn(
                       "flex items-center gap-3 px-3 py-2.5 text-sm cursor-pointer",
-                      already ? "opacity-50 cursor-not-allowed" : "hover:bg-muted/20",
+                      already
+                        ? "opacity-50 cursor-not-allowed"
+                        : "hover:bg-muted/20",
                     )}
                   >
                     <input
@@ -398,9 +402,7 @@ function CreateChannelDialog({
             //     isn't trustworthy yet. This closes the double-
             //     submit window that earlier let one user create two
             //     Google-side channels for the same calendar.
-            disabled={
-              submitting || selected.size === 0 || channelsFetching
-            }
+            disabled={submitting || selected.size === 0 || channelsFetching}
             className="h-10 px-6 text-xs font-bold"
           >
             {submitting ? (
@@ -487,7 +489,8 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
         { method: "POST" },
       );
       const body: ApiResponse<RenewResult> = await res.json();
-      if (!body.success || !body.data) throw new Error(body.error ?? "Renew failed");
+      if (!body.success || !body.data)
+        throw new Error(body.error ?? "Renew failed");
       return body.data;
     },
     onMutate: async (channelUuid) => {
@@ -498,7 +501,9 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
           ch.channel_uuid === channelUuid
             ? {
                 ...ch,
-                expiration: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+                expiration: new Date(
+                  Date.now() + 7 * 24 * 60 * 60 * 1000,
+                ).toISOString(),
                 updated_at: new Date().toISOString(),
               }
             : ch,
@@ -508,11 +513,15 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
     },
     onError: (err, _vars, ctx) => {
       if (ctx?.prev) qc.setQueryData(CHANNELS_KEY, ctx.prev);
-      toast.error(sanitizeErrorMessage(err instanceof Error ? err.message : String(err)));
+      toast.error(
+        sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
+      );
     },
     onSuccess: (data) => {
       triggerFlash(data.channel_uuid);
-      toast.success(`Channel renewed — new Google channel ${data.google_channel_id.slice(0, 8)}…`);
+      toast.success(
+        `Channel renewed — new Google channel ${data.google_channel_id.slice(0, 8)}…`,
+      );
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: CHANNELS_KEY });
@@ -526,7 +535,8 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
         { method: "POST" },
       );
       const body: ApiResponse<TestResult> = await res.json();
-      if (!body.success || !body.data) throw new Error(body.error ?? "Test failed");
+      if (!body.success || !body.data)
+        throw new Error(body.error ?? "Test failed");
       return body.data;
     },
     onSuccess: (data, channelUuid) => {
@@ -544,7 +554,9 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
       }
     },
     onError: (err) => {
-      toast.error(sanitizeErrorMessage(err instanceof Error ? err.message : String(err)));
+      toast.error(
+        sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
+      );
     },
   });
 
@@ -567,7 +579,9 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
     },
     onError: (err, _vars, ctx) => {
       if (ctx?.prev) qc.setQueryData(CHANNELS_KEY, ctx.prev);
-      toast.error(sanitizeErrorMessage(err instanceof Error ? err.message : String(err)));
+      toast.error(
+        sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
+      );
     },
     onSuccess: () => {
       toast.success("Channel stopped");
@@ -577,10 +591,15 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
     },
   });
 
-  const pendingFor = (channelUuid: string): "renew" | "test" | "stop" | null => {
-    if (renewMutation.isPending && renewMutation.variables === channelUuid) return "renew";
-    if (testMutation.isPending && testMutation.variables === channelUuid) return "test";
-    if (stopMutation.isPending && stopMutation.variables === channelUuid) return "stop";
+  const pendingFor = (
+    channelUuid: string,
+  ): "renew" | "test" | "stop" | null => {
+    if (renewMutation.isPending && renewMutation.variables === channelUuid)
+      return "renew";
+    if (testMutation.isPending && testMutation.variables === channelUuid)
+      return "test";
+    if (stopMutation.isPending && stopMutation.variables === channelUuid)
+      return "stop";
     return null;
   };
 
@@ -616,7 +635,8 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
           Could not load watch channels
         </p>
         <p className="text-xs text-muted-foreground mb-3">
-          The server returned an error. Retry now or wait for the next automatic refresh.
+          The server returned an error. Retry now or wait for the next automatic
+          refresh.
         </p>
         <Button
           variant="outline"
@@ -693,8 +713,8 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
               Reconnect your Google Calendar
             </p>
             <p className="text-xs text-muted-foreground leading-relaxed mb-3">
-              One or more watch channels are failing to renew because the
-              OAuth credentials for{" "}
+              One or more watch channels are failing to renew because the OAuth
+              credentials for{" "}
               {oauthFailingIntegrationIds.size === 1
                 ? "this account have"
                 : `${oauthFailingIntegrationIds.size} accounts have`}{" "}
@@ -712,7 +732,7 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
                 // the existing provider-card path handles
                 // state-token CSRF + redirect sequencing.
                 const el = document.querySelector(
-                  "[data-provider-id=\"google-calendar\"]",
+                  '[data-provider-id="google-calendar"]',
                 );
                 if (el instanceof HTMLElement) {
                   el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -737,10 +757,10 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
             No watch channels yet
           </p>
           <p className="text-xs text-muted-foreground max-w-md mx-auto mb-5">
-            A watch channel lets Talos receive real-time push notifications
-            when events change on a calendar. Bind one to a WASM module (via
-            the workflow builder) to dispatch jobs per event, or leave it
-            unbound to keep the sync token fresh for other integrations.
+            A watch channel lets Talos receive real-time push notifications when
+            events change on a calendar. Bind one to a WASM module (via the
+            workflow builder) to dispatch jobs per event, or leave it unbound to
+            keep the sync token fresh for other integrations.
           </p>
           <Button
             onClick={() => setCreateOpen(true)}
@@ -755,11 +775,15 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
           <table className="w-full text-sm">
             <thead className="bg-muted/30 text-xs text-muted-foreground">
               <tr>
-                <th className="text-left px-4 py-2.5 font-semibold">Calendar</th>
+                <th className="text-left px-4 py-2.5 font-semibold">
+                  Calendar
+                </th>
                 <th className="text-left px-4 py-2.5 font-semibold">Module</th>
                 <th className="text-left px-4 py-2.5 font-semibold">Expires</th>
                 <th className="text-left px-4 py-2.5 font-semibold">Status</th>
-                <th className="text-right px-4 py-2.5 font-semibold">Actions</th>
+                <th className="text-right px-4 py-2.5 font-semibold">
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -778,14 +802,18 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
                     )}
                   >
                     <td className="px-4 py-3">
-                      <div className="font-medium text-foreground">{ch.calendar_id}</div>
+                      <div className="font-medium text-foreground">
+                        {ch.calendar_id}
+                      </div>
                       <div className="text-[10px] text-muted-foreground font-mono mt-0.5">
                         {ch.google_channel_id.slice(0, 12)}…
                       </div>
                     </td>
                     <td className="px-4 py-3">
                       {ch.module_name ? (
-                        <span className="text-foreground">{ch.module_name}</span>
+                        <span className="text-foreground">
+                          {ch.module_name}
+                        </span>
                       ) : (
                         <span className="text-xs text-muted-foreground italic">
                           (no module bound — sync only)
