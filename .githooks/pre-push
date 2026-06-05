@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Pre-push gate — runs `make lint` so the CI-parity quality gates can't
-# silently regress between manual runs.
+# Pre-push gate — runs `make lint` + `make lint-frontend` so the CI-parity
+# quality gates can't silently regress between manual runs.
 #
 # `make lint` covers: rustfmt --check, WIT drift, the 40 structural lints,
-# and `cargo clippy --workspace --no-deps -- -D warnings` (TALOS_LINT_CLIPPY=1).
-# It is the single source of truth for "the gate" — this hook deliberately
-# does NOT re-spell the checks so it can't drift from `make lint`.
+# `cargo clippy --workspace --no-deps -- -D warnings` (TALOS_LINT_CLIPPY=1),
+# and offline cargo-deny (bans/licenses/sources).
+# `make lint-frontend` covers: frontend eslint + prettier + vitest.
+# Both are the single source of truth for "the gate" — this hook deliberately
+# does NOT re-spell the checks so it can't drift from the Make targets.
 #
 # Why pre-push (not pre-commit): a cold clippy build is 60-90s. Running it on
 # every commit is too heavy; running it once before a push is the right
@@ -18,7 +20,7 @@
 set -euo pipefail
 
 if [ "${SKIP_LINT:-0}" = "1" ]; then
-    echo "pre-push: SKIP_LINT=1 set — skipping the make lint gate."
+    echo "pre-push: SKIP_LINT=1 set — skipping the make lint + lint-frontend gates."
     exit 0
 fi
 
@@ -28,6 +30,15 @@ echo "pre-push: running 'make lint' (CI-parity gate; bypass with --no-verify)…
 if ! make -C "$repo_root" lint; then
     echo
     echo "✗ pre-push: 'make lint' failed — push blocked."
+    echo "  Fix the reported issues, or for an emergency push bypass with:"
+    echo "      git push --no-verify"
+    exit 1
+fi
+
+echo "pre-push: running 'make lint-frontend' (eslint + prettier + vitest)…"
+if ! make -C "$repo_root" lint-frontend; then
+    echo
+    echo "✗ pre-push: 'make lint-frontend' failed — push blocked."
     echo "  Fix the reported issues, or for an emergency push bypass with:"
     echo "      git push --no-verify"
     exit 1

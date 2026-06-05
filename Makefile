@@ -24,7 +24,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help up down rebuild restart logs ps shell \
-        check build lint hooks test test-integration coverage-html audit check-catalog ci \
+        check build lint lint-frontend hooks test test-integration coverage-html audit check-catalog ci \
         drill clean nuke _wait-healthy
 
 ## ──── Dev ──────────────────────────────────────────────────────────
@@ -98,11 +98,19 @@ lint: ## Rustfmt + WIT drift + structural + clippy (-D warnings) + offline cargo
 	    printf '\033[1;33m⊘ cargo-deny not installed — skipping offline supply-chain check (advisories run in `make audit`)\033[0m\n'; \
 	fi
 
+lint-frontend: ## Frontend gate — eslint + prettier + vitest (skips if frontend/node_modules absent)
+	@if [ -d frontend/node_modules ]; then \
+	    printf '▶ frontend: eslint + prettier + vitest\n'; \
+	    cd frontend && npm run lint && npm run test; \
+	else \
+	    printf '\033[1;33m⊘ frontend/node_modules absent — skipping frontend gate (run: cd frontend && npm ci)\033[0m\n'; \
+	fi
+
 hooks: ## Install git hooks (.githooks) — activates pre-commit + pre-push gates
 	@git config core.hooksPath .githooks
 	@printf '\033[1;32m✓ git hooks installed\033[0m (core.hooksPath=.githooks)\n'
 	@printf '  pre-commit: secret/migration/compile checks (every commit)\n'
-	@printf '  pre-push:   make lint — fmt + structural + clippy -D warnings (every push)\n'
+	@printf '  pre-push:   make lint + make lint-frontend — Rust (fmt/structural/clippy/deny) + frontend (eslint/prettier/vitest), every push\n'
 	@printf '  bypass a push gate in an emergency with: git push --no-verify\n'
 
 test: ## Run the full test suite with cargo-nextest (fast local)
@@ -145,7 +153,7 @@ audit: ## Supply-chain gates — cargo-deny (advisories + licenses + bans + sour
 check-catalog: ## Compile every module-templates/* against current WIT (used by CI)
 	@bash scripts/check-catalog.sh
 
-ci: lint audit test check-catalog ## Full local gate matching GitHub Actions CI
+ci: lint lint-frontend audit test check-catalog ## Full local gate matching GitHub Actions CI
 	@printf '\033[1;32m✓ CI checks passed — safe to push\033[0m\n'
 
 ## ──── Ops ──────────────────────────────────────────────────────────
