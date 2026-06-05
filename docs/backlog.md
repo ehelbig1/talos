@@ -59,3 +59,37 @@ a cost decision the operator deferred.
 enforce on contributors who skip it; a required CI status check on PRs is the
 only truly unbypassable enforcement. If/when cost allows, promoting the gates to
 `pull_request:` would close that gap for all the gates, not just these two.
+
+---
+
+## Frontend gates are unenforced and have rotted
+
+**Added:** 2026-06-04.
+
+A pass over the `frontend/` gates (which nothing runs automatically — same
+root cause as the Rust gates) found accumulated regressions. The eslint *config*
+error (a dangling `react-hooks/exhaustive-deps` disable with the plugin never
+installed) was fixed by adding the `react-hooks` baseline + removing the dead
+`.eslintrc.cjs`; the prettier sweep is its own PR. The rest are sizeable and
+deferred:
+
+1. **Test suite red — 62 of 254 vitest tests failing across 20 files.** Triaged
+   as **test drift**, not real bugs: ~52 are `TestingLibraryElementError`
+   ("Unable to find" — components redesigned, tests assert old DOM, e.g.
+   AuthForm's email placeholder), 4 are `act()` warnings, and 1 was a stale CSRF
+   mock (the seed moved from `GET /graphql` → `GET /auth/csrf`; the *code* is
+   correct — see `graphqlClient.ts` — only the test mocked the old endpoint).
+   No real regressions found. Needs case-by-case reconciliation (update
+   assertions to current components) WITHOUT rubber-stamping — verify each
+   component is actually correct, don't just match whatever it now renders.
+
+2. **Full `eslint-plugin-react-hooks` v7 ruleset not adopted.** Only the two
+   battle-tested rules are on (`rules-of-hooks` = error, `exhaustive-deps` =
+   warn). v7's `recommended` is the strict React-Compiler set (~14 error rules:
+   `immutability`, `purity`, `set-state-in-effect`, …). Adopting it is a real
+   migration — scope deliberately.
+
+**Enforcement (do after the test suite is green).** Wire `cd frontend && npm
+run lint` + `npm test` into the pre-push hook and/or the CI quality workflow, so
+the frontend can't silently re-rot (the same single-gate story as Rust's
+`make lint`).
