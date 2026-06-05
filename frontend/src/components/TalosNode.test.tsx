@@ -53,14 +53,16 @@ describe("TalosNode", () => {
 
   it("shows config count", () => {
     render(<TalosNode {...defaultProps} />);
-    expect(screen.getByText("1 configured field")).toBeInTheDocument();
+    // Config subtitle now reads "<n> Protocol Field(s)".
+    expect(screen.getByText(/1 Protocol Field/i)).toBeInTheDocument();
   });
 
   it("applies selected styling", () => {
     render(<TalosNode {...defaultProps} selected={true} />);
     const nodeName = screen.getByText("Test Module");
-    // The container of the name should have the styling
-    const nodeContainer = nodeName.closest(".relative");
+    // The selection ring lives on the node's outer container (role="button"),
+    // not the inner flex wrapper around the name.
+    const nodeContainer = nodeName.closest('[role="button"]');
     expect(nodeContainer).toHaveClass("ring-2");
     expect(nodeContainer).toHaveClass("ring-primary/40");
   });

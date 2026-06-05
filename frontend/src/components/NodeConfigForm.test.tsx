@@ -25,8 +25,9 @@ describe("NodeConfigForm", () => {
       />,
     );
 
-    expect(screen.getByLabelText(/Method/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/URL/i)).toBeInTheDocument();
+    // Labels were reworded in the redesign; assert on the new copy + controls.
+    expect(screen.getByText(/Request Method/i)).toBeInTheDocument();
+    expect(screen.getByText(/Target Endpoint URL/i)).toBeInTheDocument();
     expect(screen.getByDisplayValue("POST")).toBeInTheDocument();
     expect(
       screen.getByDisplayValue("https://api.test.com"),
@@ -45,7 +46,7 @@ describe("NodeConfigForm", () => {
       />,
     );
 
-    const urlInput = screen.getByLabelText(/URL/i);
+    const urlInput = screen.getByPlaceholderText(/api\.example\.com/i);
     fireEvent.change(urlInput, { target: { value: "https://new.url" } });
 
     expect(onChange).toHaveBeenCalledWith({
@@ -66,8 +67,8 @@ describe("NodeConfigForm", () => {
       />,
     );
 
-    expect(screen.getByLabelText(/Model/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/Prompt/i)).toBeInTheDocument();
+    expect(screen.getByText(/Compute Model Architecture/i)).toBeInTheDocument();
+    expect(screen.getByText(/Prompt Directive/i)).toBeInTheDocument();
     expect(screen.getByDisplayValue("gpt-4")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Hello world")).toBeInTheDocument();
   });
@@ -86,10 +87,11 @@ describe("NodeConfigForm", () => {
       <NodeConfigForm type="foreach" config={config} onChange={onChange} />,
     );
 
-    expect(screen.getByLabelText(/Input Path/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/Iteration Handle/i)).toBeInTheDocument();
+    expect(screen.getByText(/Collection Source \(Rhai\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/Iteration Memory Handle/i)).toBeInTheDocument();
 
-    const inputPath = screen.getByLabelText(/Input Path/i);
+    // input_path = "items" → its current value identifies the Collection Source input.
+    const inputPath = screen.getByDisplayValue("items");
     fireEvent.change(inputPath, { target: { value: "ctx.results" } });
 
     expect(onChange).toHaveBeenCalledWith(
@@ -153,9 +155,13 @@ describe("NodeConfigForm", () => {
       <NodeConfigForm type="unknown" config={config} onChange={onChange} />,
     );
 
-    const textarea = screen.getByLabelText(/Configuration \(JSON\)/i);
+    // Fallback editor's label was reworded to "Advanced Object Configuration".
+    expect(
+      screen.getByText(/Advanced Object Configuration/i),
+    ).toBeInTheDocument();
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
     expect(textarea).toBeInTheDocument();
-    expect(textarea.innerHTML).toContain("custom");
+    expect(textarea.value).toContain("custom");
   });
 
   it("shows JSON parse error in fallback editor", () => {
@@ -166,9 +172,10 @@ describe("NodeConfigForm", () => {
       <NodeConfigForm type="unknown" config={config} onChange={onChange} />,
     );
 
-    const textarea = screen.getByLabelText(/Configuration \(JSON\)/i);
+    const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: "{ invalid json }" } });
 
-    expect(screen.getByText(/Invalid JSON:/i)).toBeInTheDocument();
+    // Parse failures now surface under the "SCHEMA_VIOLATION" banner.
+    expect(screen.getByText(/SCHEMA_VIOLATION/i)).toBeInTheDocument();
   });
 });
