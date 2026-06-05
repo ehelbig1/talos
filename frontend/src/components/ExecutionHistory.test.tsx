@@ -85,7 +85,9 @@ describe("ExecutionHistory", () => {
   it("shows empty state for non-UUID system modules", async () => {
     render(<ExecutionHistory moduleId="foreach" />);
     await waitFor(() => {
-      expect(screen.getByText(/No past executions found/i)).toBeInTheDocument();
+      expect(
+        screen.getByText(/Zero Execution Cycles Logged/i),
+      ).toBeInTheDocument();
     });
   });
 });

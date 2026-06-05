@@ -20,7 +20,9 @@ describe("ConfigForm", () => {
     render(<ConfigForm schema={mockSchema} value={{}} onChange={onChange} />);
 
     expect(screen.getByText(/Endpoint URL/i)).toBeInTheDocument();
-    expect(screen.getByText(/Advanced Settings/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Extended Configuration Vector/i),
+    ).toBeInTheDocument();
   });
 
   it("calls onChange when values change", () => {
@@ -68,8 +70,9 @@ describe("ConfigForm", () => {
       />,
     );
 
-    // Initial analysis happens on change.
-    const viewSuggestions = await screen.findByText(/Smart Suggestion/i);
+    // Initial analysis happens on change; the suggestions banner surfaces
+    // a "<n> Structural Insight(s) detected" header.
+    const viewSuggestions = await screen.findByText(/Structural Insight/i);
     expect(viewSuggestions).toBeInTheDocument();
   });
 });

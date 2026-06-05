@@ -22,7 +22,7 @@ describe("WorkflowToolbar Component", () => {
 
     expect(screen.getByText("Test Workflow")).toBeInTheDocument();
     expect(screen.getByText("1")).toBeInTheDocument(); // node count
-    expect(screen.getByText("nodes")).toBeInTheDocument();
+    expect(screen.getByText(/nodes/i)).toBeInTheDocument();
   });
 
   it("shows unsaved indicator when dirty", () => {
@@ -32,7 +32,7 @@ describe("WorkflowToolbar Component", () => {
 
     render(<WorkflowToolbar />);
 
-    expect(screen.getByText(/unsaved/i)).toBeInTheDocument();
+    expect(screen.getByText(/uncommitted/i)).toBeInTheDocument();
   });
 
   it("handles saving a new workflow", async () => {
@@ -59,16 +59,15 @@ describe("WorkflowToolbar Component", () => {
     const saveBtn = screen.getByRole("button", { name: /save/i });
     fireEvent.click(saveBtn);
 
-    // Should show name dialog
-    // We use getAllByText because the title appears twice (Modal title + SectionHeader)
-    expect(screen.getAllByText(/name your workflow/i).length).toBeGreaterThan(
+    // Should show the name-assignment dialog
+    expect(screen.getAllByText(/identity assignment/i).length).toBeGreaterThan(
       0,
     );
 
-    const input = screen.getByPlaceholderText(/enter workflow name/i);
+    const input = screen.getByPlaceholderText(/workflow identifier/i);
     fireEvent.change(input, { target: { value: "My New Workflow" } });
 
-    const confirmBtn = screen.getByRole("button", { name: "Save" });
+    const confirmBtn = screen.getByRole("button", { name: /commit identity/i });
     fireEvent.click(confirmBtn);
 
     await waitFor(() => {
@@ -83,13 +82,12 @@ describe("WorkflowToolbar Component", () => {
   it("toggles inspector visibility", () => {
     render(<WorkflowToolbar />);
 
-    const toggleBtn = screen.getByText(/Properties/i);
+    const toggleBtn = screen.getByRole("button", { name: /diagnostics/i });
     fireEvent.click(toggleBtn);
 
     expect(useUIStore.getState().showInspector).toBe(true);
-    expect(screen.getByText(/Hide Properties/i)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText(/Hide Properties/i));
+    fireEvent.click(screen.getByRole("button", { name: /diagnostics/i }));
     expect(useUIStore.getState().showInspector).toBe(false);
   });
 
@@ -101,7 +99,7 @@ describe("WorkflowToolbar Component", () => {
 
     render(<WorkflowToolbar />);
 
-    const newBtn = screen.getByLabelText(/create new workflow/i);
+    const newBtn = screen.getByRole("button", { name: /^new$/i });
     fireEvent.click(newBtn);
 
     // Should show confirm dialog
@@ -127,6 +125,7 @@ describe("WorkflowToolbar Component", () => {
 
     render(<WorkflowToolbar />);
 
-    expect(screen.getByText(/success/i)).toBeInTheDocument();
+    // A "success" run status renders as the "Operational" health pill.
+    expect(screen.getByText(/operational/i)).toBeInTheDocument();
   });
 });

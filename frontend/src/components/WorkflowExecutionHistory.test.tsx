@@ -45,7 +45,7 @@ describe("WorkflowExecutionHistory", () => {
 
   it("renders loading state initially", async () => {
     render(<WorkflowExecutionHistory workflowId={workflowId} />);
-    expect(screen.getByText(/Loading history/i)).toBeInTheDocument();
+    expect(screen.getByText(/Synchronizing Registry/i)).toBeInTheDocument();
   });
 
   it("renders execution list after loading", async () => {
@@ -69,8 +69,8 @@ describe("WorkflowExecutionHistory", () => {
 
     fireEvent.click(screen.getByText("completed"));
 
-    // Both rows have "Aggregated Output" in the DOM (hidden via CSS); at least one visible
-    expect(screen.getAllByText("Aggregated Output").length).toBeGreaterThan(0);
+    // The output section is now headed "Telemetric Stream".
+    expect(screen.getAllByText("Telemetric Stream").length).toBeGreaterThan(0);
     expect(screen.getByText(/"result": "ok"/i)).toBeInTheDocument();
   });
 

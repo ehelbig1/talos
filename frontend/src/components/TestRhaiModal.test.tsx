@@ -23,7 +23,7 @@ describe("TestRhaiModal", () => {
       />,
     );
 
-    expect(screen.getByText(/Test Rhai Expression/i)).toBeInTheDocument();
+    expect(screen.getByText(/Protocol Evaluation/i)).toBeInTheDocument();
     expect(screen.getByText(/ctx.value/i)).toBeInTheDocument();
   });
 
@@ -38,12 +38,14 @@ describe("TestRhaiModal", () => {
       <TestRhaiModal open={true} onOpenChange={mockOnOpenChange} script="42" />,
     );
 
-    const runButton = screen.getByRole("button", { name: /Run Test/i });
+    const runButton = screen.getByRole("button", {
+      name: /Initiate Logic Test/i,
+    });
     fireEvent.click(runButton);
 
     await waitFor(() => {
-      expect(screen.getByText(/Output/i)).toBeInTheDocument();
-      // Use test ID or specific element type for output
+      expect(screen.getByText(/Execution Successful/i)).toBeInTheDocument();
+      // The output is rendered inside a <pre> element
       const outputs = screen.getAllByText("42");
       const output = outputs.find((el) => el.tagName === "PRE");
       expect(output).toBeInTheDocument();
@@ -65,14 +67,16 @@ describe("TestRhaiModal", () => {
       />,
     );
 
-    const runButton = screen.getByRole("button", { name: /Run Test/i });
+    const runButton = screen.getByRole("button", {
+      name: /Initiate Logic Test/i,
+    });
     fireEvent.click(runButton);
 
     await waitFor(() => {
-      // Find the "Error" label specifically
-      const errorLabels = screen.getAllByText(/Error/i);
-      const errorLabel = errorLabels.find((el) => el.textContent === "Error");
-      expect(errorLabel).toBeInTheDocument();
+      // The failure state shows a "Critical Evaluation Failure" label
+      expect(
+        screen.getByText(/Critical Evaluation Failure/i),
+      ).toBeInTheDocument();
 
       const errorDiv = screen.getByText(/Syntax Error/i);
       expect(errorDiv).toBeInTheDocument();

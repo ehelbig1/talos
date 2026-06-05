@@ -29,9 +29,10 @@ describe("Inspector Component", () => {
 
     render(<Inspector />);
 
-    expect(screen.getByText("Workflow Properties")).toBeInTheDocument();
+    expect(screen.getByText("Workflow Registry")).toBeInTheDocument();
     expect(screen.getByText("My Awesome Workflow")).toBeInTheDocument();
-    expect(screen.getByText("Workflow ID")).toBeInTheDocument();
+    // Workflow ID is now surfaced via the SYSTEM_UUID copy field.
+    expect(screen.getByText("SYSTEM_UUID")).toBeInTheDocument();
     expect(screen.getByText("wf-1")).toBeInTheDocument();
   });
 
@@ -50,20 +51,17 @@ describe("Inspector Component", () => {
 
     render(<Inspector />);
 
-    // Perceived loading shimmer might be active, wait for it
+    // The node inspector renders the node label as its header.
     await waitFor(
       () => {
-        expect(
-          screen.queryByTestId("skeleton-inspector"),
-        ).not.toBeInTheDocument();
-        expect(screen.getByText("Node Properties")).toBeInTheDocument();
+        expect(screen.getByText("Test Node")).toBeInTheDocument();
       },
       { timeout: 3000 },
     );
 
-    expect(screen.getByText("Test Node")).toBeInTheDocument();
+    // Config + Diagnostics tabs identify the node inspector view.
     expect(screen.getByText("Configuration")).toBeInTheDocument();
-    expect(screen.getByText("Execution Data")).toBeInTheDocument();
+    expect(screen.getByText("Diagnostics")).toBeInTheDocument();
   });
 
   it.skip("switches between tabs in node view — tab state change not detectable in JSDOM", async () => {
@@ -146,7 +144,7 @@ describe("Inspector Component", () => {
 
     render(<Inspector />);
 
-    expect(screen.getByText("Edge Properties")).toBeInTheDocument();
+    expect(screen.getByText("Link Properties")).toBeInTheDocument();
 
     const textarea = screen.getByPlaceholderText(/ctx.result.score > 0.8/i);
     fireEvent.change(textarea, { target: { value: "invalid script" } });
@@ -176,22 +174,19 @@ describe("Inspector Component", () => {
 
     await waitFor(
       () => {
-        expect(screen.getByText("Node Properties")).toBeInTheDocument();
-        expect(
-          screen.queryByTestId("skeleton-inspector"),
-        ).not.toBeInTheDocument();
+        expect(screen.getByText("Delete Me")).toBeInTheDocument();
       },
       { timeout: 3000 },
     );
 
-    // Expand System Internals section
+    // Expand the Core Metadata (System Internals) section
     const advancedTrigger = screen.getByRole("button", {
-      name: /system internals/i,
+      name: /core metadata/i,
     });
     fireEvent.click(advancedTrigger);
 
     const deleteBtn = await screen.findByRole("button", {
-      name: /terminate & remove node/i,
+      name: /decommission protocol node/i,
     });
     fireEvent.click(deleteBtn);
 

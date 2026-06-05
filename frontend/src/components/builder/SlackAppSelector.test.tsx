@@ -33,7 +33,7 @@ describe("SlackAppSelector", () => {
 
   it("renders loading state initially", async () => {
     render(<SlackAppSelector onSelect={mockOnSelect} />);
-    expect(screen.getByText(/Loading Slack workspaces/i)).toBeInTheDocument();
+    expect(screen.getByText(/Syncing Slack Grid Vectors/i)).toBeInTheDocument();
   });
 
   it("renders integrations after loading", async () => {
@@ -41,12 +41,12 @@ describe("SlackAppSelector", () => {
 
     await waitFor(() => {
       expect(
-        screen.queryByText(/Loading Slack workspaces/i),
+        screen.queryByText(/Syncing Slack Grid Vectors/i),
       ).not.toBeInTheDocument();
     });
 
     expect(screen.getByText("Test Team")).toBeInTheDocument();
-    expect(screen.getByText(/Team ID: T123/i)).toBeInTheDocument();
+    expect(screen.getByText(/ID: T123/i)).toBeInTheDocument();
   });
 
   it("calls onSelect when an integration is clicked", async () => {
@@ -82,7 +82,7 @@ describe("SlackAppSelector", () => {
     await waitFor(
       () => {
         expect(
-          screen.getAllByText(/Connect Your Slack Workspace/i).length,
+          screen.getAllByText(/No Slack Workspaces Bridged/i).length,
         ).toBeGreaterThan(0);
       },
       { timeout: 2000 },
@@ -112,7 +112,7 @@ describe("SlackAppSelector", () => {
       expect(screen.getByText("Test Team")).toBeInTheDocument();
     });
 
-    const connectBtn = screen.getByLabelText(/Connect Slack workspace/i);
+    const connectBtn = screen.getByText(/Bridge Workspace/i);
     fireEvent.click(connectBtn);
 
     await waitFor(() => {
@@ -133,7 +133,7 @@ describe("SlackAppSelector", () => {
       expect(screen.getByText("Test Team")).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByLabelText(/Create new Slack app/i));
+    fireEvent.click(screen.getByRole("button", { name: /Manifest App/i }));
 
     await waitFor(() => {
       expect(screen.getAllByText(/Create Slack App/i).length).toBeGreaterThan(

@@ -14,7 +14,7 @@ describe("CreateModuleDialog", () => {
         onClose={mockOnClose}
       />,
     );
-    expect(screen.getByText(/Loading templates.../i)).toBeInTheDocument();
+    expect(screen.getByText(/Syncing Library.../i)).toBeInTheDocument();
   });
 
   it("renders template list after loading", async () => {
@@ -46,8 +46,8 @@ describe("CreateModuleDialog", () => {
 
     fireEvent.click(screen.getByText("HTTP Request"));
 
-    expect(screen.getByText("Configure Module")).toBeInTheDocument();
-    expect(screen.getByLabelText("Module Name")).toBeInTheDocument();
+    expect(screen.getByText("Configure Module Synthesis")).toBeInTheDocument();
+    expect(screen.getByLabelText("Operational Identifier")).toBeInTheDocument();
     expect(screen.getByDisplayValue("HTTP Request")).toBeInTheDocument(); // Auto-suggested name
   });
 
@@ -63,7 +63,7 @@ describe("CreateModuleDialog", () => {
       fireEvent.click(screen.getByText("HTTP Request"));
     });
 
-    const createButton = screen.getByText("Create Module");
+    const createButton = screen.getByText("Finalize Synthesis");
     fireEvent.click(createButton);
 
     await waitFor(() => {
@@ -89,11 +89,11 @@ describe("CreateModuleDialog", () => {
       expect(screen.getByText("HTTP Request")).toBeInTheDocument();
     });
 
-    const searchInput = screen.getByPlaceholderText("Search templates...");
+    const searchInput = screen.getByPlaceholderText("SEARCH BLUEPRINTS...");
     fireEvent.change(searchInput, { target: { value: "Non-existent" } });
 
     expect(
-      screen.getByText(/No templates found matching your search/i),
+      screen.getByText(/No Blueprints Matched Deployment Query/i),
     ).toBeInTheDocument();
     expect(screen.queryByText("HTTP Request")).not.toBeInTheDocument();
   });

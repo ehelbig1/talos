@@ -35,11 +35,11 @@ describe("AuthForm", () => {
 
   it("renders login form by default", () => {
     render(<AuthForm />);
-    expect(screen.getByPlaceholderText("you@example.com")).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("••••••••")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("ID@TALOS.SYS")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("••••••••••••")).toBeInTheDocument();
     const form = screen.getByRole("form", { name: /auth-form/i });
     expect(
-      within(form).getByRole("button", { name: /Login/i }),
+      within(form).getByRole("button", { name: /Initiate Session/i }),
     ).toBeInTheDocument();
   });
 
@@ -53,19 +53,21 @@ describe("AuthForm", () => {
 
     render(<AuthForm />);
 
-    fireEvent.change(screen.getByPlaceholderText("you@example.com"), {
+    fireEvent.change(screen.getByPlaceholderText("ID@TALOS.SYS"), {
       target: { value: "test@example.com" },
     });
-    fireEvent.change(screen.getByPlaceholderText("••••••••"), {
+    fireEvent.change(screen.getByPlaceholderText("••••••••••••"), {
       target: { value: "password123" },
     });
 
     const form = screen.getByRole("form", { name: /auth-form/i });
-    fireEvent.click(within(form).getByRole("button", { name: /Login/i }));
+    fireEvent.click(
+      within(form).getByRole("button", { name: /Initiate Session/i }),
+    );
 
     await waitFor(() => {
       expect(
-        screen.getByText(/Please enter the 6-digit code/i),
+        screen.getByText(/Enter 6-digit terminal code/i),
       ).toBeInTheDocument();
       expect(screen.getByPlaceholderText("000000")).toBeInTheDocument();
     });
@@ -85,15 +87,17 @@ describe("AuthForm", () => {
     render(<AuthForm />);
 
     // Step 1: Login
-    fireEvent.change(screen.getByPlaceholderText("you@example.com"), {
+    fireEvent.change(screen.getByPlaceholderText("ID@TALOS.SYS"), {
       target: { value: "test@example.com" },
     });
-    fireEvent.change(screen.getByPlaceholderText("••••••••"), {
+    fireEvent.change(screen.getByPlaceholderText("••••••••••••"), {
       target: { value: "password123" },
     });
 
     const form = screen.getByRole("form", { name: /auth-form/i });
-    fireEvent.click(within(form).getByRole("button", { name: /Login/i }));
+    fireEvent.click(
+      within(form).getByRole("button", { name: /Initiate Session/i }),
+    );
 
     await waitFor(() => {
       expect(screen.getByPlaceholderText("000000")).toBeInTheDocument();
@@ -103,7 +107,7 @@ describe("AuthForm", () => {
     fireEvent.change(screen.getByPlaceholderText("000000"), {
       target: { value: "123456" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /Verify & Login/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Confirm Protocol/i }));
 
     await waitFor(() => {
       expect(verifyTwoFactor).toHaveBeenCalledWith("123456");
@@ -123,15 +127,17 @@ describe("AuthForm", () => {
     render(<AuthForm />);
 
     // Step 1: Login
-    fireEvent.change(screen.getByPlaceholderText("you@example.com"), {
+    fireEvent.change(screen.getByPlaceholderText("ID@TALOS.SYS"), {
       target: { value: "test@example.com" },
     });
-    fireEvent.change(screen.getByPlaceholderText("••••••••"), {
+    fireEvent.change(screen.getByPlaceholderText("••••••••••••"), {
       target: { value: "password123" },
     });
 
     const form = screen.getByRole("form", { name: /auth-form/i });
-    fireEvent.click(within(form).getByRole("button", { name: /Login/i }));
+    fireEvent.click(
+      within(form).getByRole("button", { name: /Initiate Session/i }),
+    );
 
     await waitFor(() => {
       expect(screen.getByPlaceholderText("000000")).toBeInTheDocument();

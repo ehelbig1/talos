@@ -77,18 +77,18 @@ describe("EndpointSelector", () => {
     fireEvent.click(screen.getByText("Get user profile"));
 
     expect(screen.getByText("/users/{id}")).toBeInTheDocument();
-    expect(screen.getByText(/Path Parameters/)).toBeInTheDocument();
+    expect(screen.getByText(/Isolated Path Variables/i)).toBeInTheDocument();
 
     // Check pre-filled example
     const pathInput = screen.getByPlaceholderText("123");
     expect(pathInput).toHaveValue("123");
 
-    // Add query param
-    fireEvent.change(screen.getByPlaceholderText("Enter fields"), {
+    // Add query param (no example/default → placeholder is the fallback)
+    fireEvent.change(screen.getByPlaceholderText("IDENTIFIER VALUE..."), {
       target: { value: "id,name" },
     });
 
-    fireEvent.click(screen.getByText(/Apply Configuration/i));
+    fireEvent.click(screen.getByText(/Finalize Configuration/i));
 
     expect(mockOnConfigure).toHaveBeenCalledWith({
       method: "GET",
@@ -109,16 +109,16 @@ describe("EndpointSelector", () => {
     fireEvent.click(screen.getByText("Create user"));
 
     // Switch to Body tab
-    fireEvent.click(screen.getByText(/Request Body/i));
+    fireEvent.click(screen.getByText(/Request Manifest/i));
 
     expect(screen.getByText("username")).toBeInTheDocument();
 
-    // Fill form
-    fireEvent.change(screen.getByPlaceholderText("jdoe"), {
+    // Fill form (example "jdoe" is uppercased into the placeholder)
+    fireEvent.change(screen.getByPlaceholderText("JDOE"), {
       target: { value: "tester" },
     });
 
-    fireEvent.click(screen.getByText(/Apply Configuration/i));
+    fireEvent.click(screen.getByText(/Finalize Configuration/i));
 
     expect(mockOnConfigure).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -148,7 +148,7 @@ describe("EndpointSelector", () => {
     fireEvent.click(screen.getByText("Get user profile"));
     expect(screen.getByText("/users/{id}")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("Cancel"));
+    fireEvent.click(screen.getByText("Abort"));
     expect(screen.getByText("Get user profile")).toBeInTheDocument();
   });
 });

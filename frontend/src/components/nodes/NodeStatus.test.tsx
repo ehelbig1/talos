@@ -4,9 +4,10 @@ import { StatusDot, STATUS_BORDER } from "./NodeStatus";
 
 describe("NodeStatus", () => {
   it("renders correctly for idle status", () => {
-    const { container } = render(<StatusDot status="idle" />);
-    const dot = container.querySelector(".bg-\\[\\#4A4D5E\\]");
+    render(<StatusDot status="idle" />);
+    const dot = screen.getByLabelText("Status: idle");
     expect(dot).toBeInTheDocument();
+    expect(dot).toHaveClass("bg-muted-foreground/30");
     expect(dot).not.toHaveClass("animate-status-pulse");
   });
 

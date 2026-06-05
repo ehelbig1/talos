@@ -28,6 +28,7 @@ vi.mock("@/lib/graphqlClient", () => ({
   listAgents: vi.fn().mockResolvedValue([]),
   listActors: vi.fn().mockResolvedValue([]),
   subscribeExecution: vi.fn(() => vi.fn()),
+  subscribeWorkflowExecutions: vi.fn(() => vi.fn()),
   gql: (strings: TemplateStringsArray, ...values: unknown[]) =>
     strings.join(""),
 }));
@@ -155,7 +156,8 @@ describe("Dashboard", () => {
 
     renderWithProviders(<Dashboard />);
 
-    const emptyMsg = await screen.findByText(/Build your first workflow/i);
+    // Empty state was redesigned: heading "Initialize Workflow" + CTA.
+    const emptyMsg = await screen.findByText(/Initialize Workflow/i);
     expect(emptyMsg).toBeInTheDocument();
   });
 
@@ -190,7 +192,9 @@ describe("Dashboard", () => {
     expect(await screen.findByText("Apple")).toBeInTheDocument();
     expect(await screen.findByText("Banana")).toBeInTheDocument();
 
-    const searchInput = screen.getByPlaceholderText(/Search workflows.../i);
+    const searchInput = screen.getByPlaceholderText(
+      /SEARCH AUTOMATED PIPELINES/i,
+    );
     fireEvent.change(searchInput, { target: { value: "app" } });
 
     expect(screen.getByText("Apple")).toBeInTheDocument();
@@ -212,7 +216,8 @@ describe("Dashboard", () => {
 
     renderWithProviders(<Dashboard />);
 
-    const editButton = await screen.findByText(/Edit/i);
+    // The edit action is now an icon button titled "Configure Architecture".
+    const editButton = await screen.findByTitle(/Configure Architecture/i);
     await act(async () => {
       fireEvent.click(editButton);
     });
