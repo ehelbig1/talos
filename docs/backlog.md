@@ -85,11 +85,32 @@ deferred:
 
 2. **Full `eslint-plugin-react-hooks` v7 ruleset not adopted.** Only the two
    battle-tested rules are on (`rules-of-hooks` = error, `exhaustive-deps` =
-   warn). v7's `recommended` is the strict React-Compiler set (~14 error rules:
-   `immutability`, `purity`, `set-state-in-effect`, …). Adopting it is a real
-   migration — scope deliberately.
+   warn). v7's `recommended` is the strict React-Compiler set. Adopting it is a
+   real, **human-judgment** migration — scope deliberately.
 
-**Enforcement (do after the test suite is green).** Wire `cd frontend && npm
-run lint` + `npm test` into the pre-push hook and/or the CI quality workflow, so
-the frontend can't silently re-rot (the same single-gate story as Rust's
-`make lint`).
+   **Measured blast radius (2026-06-05, run against `reactHooks.configs.recommended`):**
+   35 problems / 27 errors, by rule:
+   - `set-state-in-effect` ×14 — setState inside useEffect; mostly the
+     sync-external-state pattern (often benign, occasionally a re-render loop).
+   - `exhaustive-deps` ×8 (warnings, already enabled).
+   - `purity` ×6 — e.g. `new Date(ev.timestamp ?? Date.now())` in computed-
+     during-render code (`ExecutionWaterfall.tsx`). Technically impure but
+     low-impact; not clear bugs.
+   - `immutability` ×6 — includes **false positives** like
+     `hasFetchedRef.current = true` inside a `useEffect` (`useTemplates.ts`),
+     the idiomatic ref-guard pattern.
+   - `preserve-manual-memoization` ×1.
+
+   **Assessment:** no clear high-confidence bug among them; a meaningful
+   fraction are false-positive / rule-opinionated (ref mutation, Date.now
+   fallbacks). So this is NOT a safe autonomous bulk-fix — each finding needs
+   per-site triage (fix the genuine ones, `// eslint-disable-next-line` +
+   justification for the false positives), ideally human-reviewed. Recommend
+   adopting incrementally: turn on ONE rule at a time, triage its findings,
+   commit, repeat — rather than flipping the whole `recommended` set at once.
+
+**Enforcement — DONE (PR #179, 2026-06-05).** `make lint-frontend`
+(eslint + prettier + vitest) is wired into the pre-push hook alongside
+`make lint`, so the frontend gates can't silently re-rot. The remaining
+enforcement gap is the same as Rust's: contributors who skip `make hooks` and
+the absence of an auto-triggered CI run — see the CI heavy-gates item above.
