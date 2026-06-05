@@ -78,7 +78,9 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
       setStep("setup");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to initialize 2FA setup"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to initialize 2FA setup"),
+      );
     },
   });
 
@@ -147,7 +149,9 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                 Two-Factor Protocol
               </h3>
               <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.3em] mt-2">
-                {enabled ? "ACTIVE_SECURITY_PERIMETER" : "UNSECURED_IDENTITY_STATE"}
+                {enabled
+                  ? "ACTIVE_SECURITY_PERIMETER"
+                  : "UNSECURED_IDENTITY_STATE"}
               </p>
             </div>
           </div>
@@ -204,7 +208,8 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                   Authenticator_App
                 </h4>
                 <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest relative z-10">
-                  Support for Google Authenticator, Authy, and hardware security keys via TOTP.
+                  Support for Google Authenticator, Authy, and hardware security
+                  keys via TOTP.
                 </p>
               </div>
 
@@ -217,7 +222,8 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                   Login_Shield
                 </h4>
                 <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest relative z-10">
-                  Ensures only verified operatives can access the console, even if credentials leak.
+                  Ensures only verified operatives can access the console, even
+                  if credentials leak.
                 </p>
               </div>
             </div>
@@ -260,7 +266,8 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                     </h4>
                   </div>
                   <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest pl-12">
-                    Open your security application and capture the visual key. It will begin synthesizing 6-digit verification bursts.
+                    Open your security application and capture the visual key.
+                    It will begin synthesizing 6-digit verification bursts.
                   </p>
                 </div>
 
@@ -274,7 +281,8 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                     </h4>
                   </div>
                   <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest pl-12 mb-4">
-                    If the visual scan fails, enter the following alphanumeric secret manually:
+                    If the visual scan fails, enter the following alphanumeric
+                    secret manually:
                   </p>
                   <div className="pl-12">
                     <div className="bg-black/40 border border-white/5 rounded-2xl px-6 py-4 flex items-center justify-between group shadow-inner">
@@ -328,7 +336,8 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                 Verify_Protocol
               </h4>
               <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-[0.2em] leading-relaxed">
-                Enter the 6-digit burst from your device to secure your identity perimeter.
+                Enter the 6-digit burst from your device to secure your identity
+                perimeter.
               </p>
             </div>
 
@@ -388,7 +397,9 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                 CRITICAL_SECURITY_NOTICE
               </div>
               <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest relative z-10">
-                Activation binds this account to your hardware authenticator. Ensure backup keys are stored in a non-digital vault for emergency recovery.
+                Activation binds this account to your hardware authenticator.
+                Ensure backup keys are stored in a non-digital vault for
+                emergency recovery.
               </p>
             </div>
           </div>

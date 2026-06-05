@@ -59,13 +59,17 @@ function formatDuration(ms: number | null | undefined): string {
 function TriggerIcon({ type }: { type: string | null | undefined }) {
   const t = (type ?? "").toLowerCase();
   if (t === "webhook") return <Webhook className="w-3.5 h-3.5" />;
-  if (t === "scheduled" || t === "cron") return <CalendarClock className="w-3.5 h-3.5" />;
+  if (t === "scheduled" || t === "cron")
+    return <CalendarClock className="w-3.5 h-3.5" />;
   if (t === "manual" || t === "user") return <User className="w-3.5 h-3.5" />;
   if (t === "mcp") return <Terminal className="w-3.5 h-3.5" />;
   return <Zap className="w-3.5 h-3.5" />;
 }
 
-const STATUS_STYLES: Record<string, { badge: string; dot: string; label: string }> = {
+const STATUS_STYLES: Record<
+  string,
+  { badge: string; dot: string; label: string }
+> = {
   completed: {
     badge: "bg-emerald-500/10 border-emerald-500/25 text-emerald-400",
     dot: "bg-emerald-400",
@@ -129,7 +133,9 @@ export default function WorkflowExecutionHistory({
       setConfirmAction(null);
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to retry execution"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to retry execution"),
+      );
     },
   });
 
@@ -140,7 +146,9 @@ export default function WorkflowExecutionHistory({
       setConfirmAction(null);
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to resume execution"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to resume execution"),
+      );
     },
   });
 
@@ -161,13 +169,12 @@ export default function WorkflowExecutionHistory({
     });
   };
 
-  const actionPending =
-    retryMutation.isPending || resumeMutation.isPending;
+  const actionPending = retryMutation.isPending || resumeMutation.isPending;
 
   return (
-    <Dialog 
-      open={true} 
-      onClose={onClose} 
+    <Dialog
+      open={true}
+      onClose={onClose}
       title="Execution History"
       className="max-w-3xl"
     >
@@ -277,9 +284,7 @@ export default function WorkflowExecutionHistory({
                           <td className="px-6 py-4">
                             <div className="flex items-center gap-1.5 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest">
                               <TriggerIcon type={exec.triggerType} />
-                              <span>
-                                {exec.triggerType ?? "unknown"}
-                              </span>
+                              <span>{exec.triggerType ?? "unknown"}</span>
                             </div>
                           </td>
                           <td className="px-6 py-4">
@@ -340,7 +345,9 @@ export default function WorkflowExecutionHistory({
                               <div className="flex items-start gap-2.5 px-6 py-4 bg-destructive/5 border border-destructive/15 rounded-2xl shadow-inner">
                                 <AlertCircle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
                                 <pre className="text-[10px] text-destructive/80 font-mono whitespace-pre-wrap break-all leading-relaxed font-bold">
-                                  {sanitizeErrorMessage(exec.errorMessage || "")}
+                                  {sanitizeErrorMessage(
+                                    exec.errorMessage || "",
+                                  )}
                                 </pre>
                               </div>
                             </td>
@@ -374,7 +381,11 @@ export default function WorkflowExecutionHistory({
         <Dialog
           open={true}
           onClose={() => setConfirmAction(null)}
-          title={confirmAction.type === "retry" ? "Initialize Retry" : "Initialize Resume"}
+          title={
+            confirmAction.type === "retry"
+              ? "Initialize Retry"
+              : "Initialize Resume"
+          }
           className="max-w-sm"
         >
           <div className="p-2 text-center space-y-6">
@@ -422,7 +433,9 @@ export default function WorkflowExecutionHistory({
                     <LoadingSpinner className="w-4 h-4" />
                     <span>ORCHESTRATING...</span>
                   </div>
-                ) : "CONFIRM"}
+                ) : (
+                  "CONFIRM"
+                )}
               </Button>
             </div>
           </div>
@@ -431,4 +444,3 @@ export default function WorkflowExecutionHistory({
     </Dialog>
   );
 }
-

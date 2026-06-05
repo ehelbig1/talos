@@ -116,7 +116,9 @@ export default function ApiKeysManager() {
       toast.success("API key created successfully");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(`Failed to create API key: ${err.message}`));
+      toast.error(
+        sanitizeErrorMessage(`Failed to create API key: ${err.message}`),
+      );
     },
   });
 
@@ -138,7 +140,9 @@ export default function ApiKeysManager() {
       toast.success("API key revoked");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(`Failed to revoke API key: ${err.message}`));
+      toast.error(
+        sanitizeErrorMessage(`Failed to revoke API key: ${err.message}`),
+      );
     },
   });
 
@@ -155,7 +159,9 @@ export default function ApiKeysManager() {
       toast.success("API key rotated — save your new key");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(`Failed to rotate API key: ${err.message}`));
+      toast.error(
+        sanitizeErrorMessage(`Failed to rotate API key: ${err.message}`),
+      );
     },
   });
 
@@ -171,7 +177,9 @@ export default function ApiKeysManager() {
       toast.success("API key deleted");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(`Failed to delete API key: ${err.message}`));
+      toast.error(
+        sanitizeErrorMessage(`Failed to delete API key: ${err.message}`),
+      );
     },
   });
 
@@ -616,7 +624,9 @@ export default function ApiKeysManager() {
                         await navigator.clipboard.writeText(newKey);
                         toast.success("Key copied to clipboard");
                       } catch {
-                        toast.error("Failed to copy — clipboard unavailable (requires HTTPS)");
+                        toast.error(
+                          "Failed to copy — clipboard unavailable (requires HTTPS)",
+                        );
                       }
                     }}
                   >

@@ -45,7 +45,12 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
       </div>
       <div className="flex justify-end gap-3">
         {/* Auto-focus Cancel so Escape / Enter both dismiss safely */}
-        <Button variant="outline" onClick={onCancel} disabled={isLoading} autoFocus>
+        <Button
+          variant="outline"
+          onClick={onCancel}
+          disabled={isLoading}
+          autoFocus
+        >
           {cancelLabel}
         </Button>
         <Button

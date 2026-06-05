@@ -1,9 +1,5 @@
 import React, { useState } from "react";
-import {
-  getBezierPath,
-  EdgeLabelRenderer,
-  BaseEdge,
-} from "@xyflow/react";
+import { getBezierPath, EdgeLabelRenderer, BaseEdge } from "@xyflow/react";
 import type { EdgeProps, Edge } from "@xyflow/react";
 import { cn } from "@/lib/utils";
 import { useEphemeralExecutionStore } from "@/store/executionStore";

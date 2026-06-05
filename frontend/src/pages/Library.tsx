@@ -13,11 +13,13 @@ function TabLoading() {
         <div className="w-16 h-16 border-4 border-t-primary border-transparent rounded-full animate-spin absolute inset-0 shadow-[0_0_15px_hsla(var(--primary),0.3)]" />
       </div>
       <div className="flex flex-col items-center gap-2">
-        <span className="text-xs font-black text-white/40 uppercase tracking-[0.4em] animate-pulse">Synchronizing Registry</span>
+        <span className="text-xs font-black text-white/40 uppercase tracking-[0.4em] animate-pulse">
+          Synchronizing Registry
+        </span>
         <div className="flex gap-1">
-            <div className="w-1 h-1 rounded-full bg-primary animate-bounce [animation-delay:-0.3s]" />
-            <div className="w-1 h-1 rounded-full bg-primary animate-bounce [animation-delay:-0.15s]" />
-            <div className="w-1 h-1 rounded-full bg-primary animate-bounce" />
+          <div className="w-1 h-1 rounded-full bg-primary animate-bounce [animation-delay:-0.3s]" />
+          <div className="w-1 h-1 rounded-full bg-primary animate-bounce [animation-delay:-0.15s]" />
+          <div className="w-1 h-1 rounded-full bg-primary animate-bounce" />
         </div>
       </div>
     </div>
@@ -70,13 +72,16 @@ export default function Library() {
                   Resource Library
                 </h1>
                 <div className="flex items-center gap-3 mt-3">
-                    <span className="text-[10px] font-black text-primary/60 uppercase tracking-[0.3em]">Operational Node Management</span>
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_8px_hsla(var(--primary),0.5)] animate-pulse" />
+                  <span className="text-[10px] font-black text-primary/60 uppercase tracking-[0.3em]">
+                    Operational Node Management
+                  </span>
+                  <div className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_8px_hsla(var(--primary),0.5)] animate-pulse" />
                 </div>
               </div>
             </div>
             <p className="text-sm text-muted-foreground/40 font-bold uppercase tracking-widest max-w-xl leading-relaxed">
-              Browse pre-configured protocols from the synchronized Registry or manage your provisioned WASM execution modules.
+              Browse pre-configured protocols from the synchronized Registry or
+              manage your provisioned WASM execution modules.
             </p>
           </div>
 
@@ -91,8 +96,18 @@ export default function Library() {
                   : "text-muted-foreground/40 hover:text-white hover:bg-white/5",
               )}
             >
-              <div className={cn("absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-[1.5rem]", tab === "installed" && "hidden")} />
-              <Box className={cn("w-4 h-4 relative z-10 transition-transform group-hover:scale-110", tab === "installed" ? "text-white" : "text-primary/40")} />
+              <div
+                className={cn(
+                  "absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-[1.5rem]",
+                  tab === "installed" && "hidden",
+                )}
+              />
+              <Box
+                className={cn(
+                  "w-4 h-4 relative z-10 transition-transform group-hover:scale-110",
+                  tab === "installed" ? "text-white" : "text-primary/40",
+                )}
+              />
               <span className="relative z-10">Active Modules</span>
             </button>
             <button
@@ -104,8 +119,18 @@ export default function Library() {
                   : "text-muted-foreground/40 hover:text-white hover:bg-white/5",
               )}
             >
-              <div className={cn("absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-[1.5rem]", tab === "templates" && "hidden")} />
-              <BookOpen className={cn("w-4 h-4 relative z-10 transition-transform group-hover:scale-110", tab === "templates" ? "text-white" : "text-primary/40")} />
+              <div
+                className={cn(
+                  "absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-[1.5rem]",
+                  tab === "templates" && "hidden",
+                )}
+              />
+              <BookOpen
+                className={cn(
+                  "w-4 h-4 relative z-10 transition-transform group-hover:scale-110",
+                  tab === "templates" ? "text-white" : "text-primary/40",
+                )}
+              />
               <span className="relative z-10">Registry Catalog</span>
             </button>
           </div>

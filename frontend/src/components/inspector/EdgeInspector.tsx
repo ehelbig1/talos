@@ -53,11 +53,9 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
   }, [edge.data?.condition]);
 
   return (
-    <div
-      className="flex flex-col h-full bg-surface-2/80 backdrop-blur-3xl relative border-l border-white/5 shadow-[-20px_0_50px_rgba(0,0,0,0.4)] animate-in slide-in-from-right duration-500"
-    >
+    <div className="flex flex-col h-full bg-surface-2/80 backdrop-blur-3xl relative border-l border-white/5 shadow-[-20px_0_50px_rgba(0,0,0,0.4)] animate-in slide-in-from-right duration-500">
       <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-20 pointer-events-none" />
-      
+
       <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-surface-2/40 relative z-10">
         <div className="flex items-center gap-4">
           <div className="w-10 h-10 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-[0_0_15px_hsla(var(--primary),0.1)]">
@@ -134,17 +132,29 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                       : "bg-surface-3/20 border-white/5 hover:bg-white/[0.03] hover:border-white/10",
                   )}
                 >
-                  <type.icon className={cn("w-5 h-5 transition-premium group-hover:scale-110", type.color)} />
+                  <type.icon
+                    className={cn(
+                      "w-5 h-5 transition-premium group-hover:scale-110",
+                      type.color,
+                    )}
+                  />
                   <span
                     className={cn(
                       "text-[10px] font-black uppercase tracking-widest",
-                      edge.data?.edgeType === type.value ? "text-white" : "text-muted-foreground/40",
+                      edge.data?.edgeType === type.value
+                        ? "text-white"
+                        : "text-muted-foreground/40",
                     )}
                   >
                     {type.label}
                   </span>
                   {edge.data?.edgeType === type.value && (
-                    <div className={cn("absolute bottom-0 left-0 w-full h-1", type.color.replace('text-', 'bg-'))} />
+                    <div
+                      className={cn(
+                        "absolute bottom-0 left-0 w-full h-1",
+                        type.color.replace("text-", "bg-"),
+                      )}
+                    />
                   )}
                 </button>
               ))}
@@ -164,7 +174,8 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                   placeholder="ctx.result.score > 0.8"
                   className={cn(
                     "bg-surface-4/40 border-white/5 focus:border-primary/50 font-mono text-[11px] min-h-[120px] rounded-xl transition-premium selection:bg-primary/30 leading-relaxed",
-                    syntaxError && "border-destructive/50 focus:border-destructive",
+                    syntaxError &&
+                      "border-destructive/50 focus:border-destructive",
                   )}
                   value={(edge.data?.condition as string) || ""}
                   onChange={(e) =>
@@ -188,15 +199,15 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
               Data Mapping Architecture
             </label>
             <div className="bg-surface-4/20 p-6 rounded-2xl border border-white/5 shadow-2xl relative overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-30 pointer-events-none" />
-                <Textarea
-                  placeholder="ctx.input.query = ctx.result.original_query"
-                  className="bg-transparent border-0 focus:ring-0 p-0 font-mono text-[11px] min-h-[80px] selection:bg-primary/30 leading-relaxed text-white/80"
-                  value={(edge.data?.mapping as string) ?? ""}
-                  onChange={(e) =>
-                    updateEdgeData(edge.id, { mapping: e.target.value })
-                  }
-                />
+              <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-30 pointer-events-none" />
+              <Textarea
+                placeholder="ctx.input.query = ctx.result.original_query"
+                className="bg-transparent border-0 focus:ring-0 p-0 font-mono text-[11px] min-h-[80px] selection:bg-primary/30 leading-relaxed text-white/80"
+                value={(edge.data?.mapping as string) ?? ""}
+                onChange={(e) =>
+                  updateEdgeData(edge.id, { mapping: e.target.value })
+                }
+              />
             </div>
             <p className="text-[10px] text-muted-foreground/20 font-bold uppercase tracking-widest leading-relaxed ml-1">
               ADVANCED: RESTRUCTURE TELEMETRY VECTORS BETWEEN PROTOCOL NODES.

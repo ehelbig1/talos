@@ -5,7 +5,11 @@ import { toast } from "sonner";
 import { Sparkles, Play, RefreshCw, Shuffle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
-import { graphqlRequest, getActorWorkflows, type ActorWorkflowItem } from "@/lib/graphqlClient";
+import {
+  graphqlRequest,
+  getActorWorkflows,
+  type ActorWorkflowItem,
+} from "@/lib/graphqlClient";
 import { isAiWorkflow } from "@/lib/capabilityConfig";
 import { SkeletonTable } from "@/components/ui";
 import { workflowStatusColor, LocalEmptyState, relativeTime } from "./shared";
@@ -28,9 +32,13 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
          }`,
         { workflowId, actorId },
       );
-      toast.success(`Execution started: ${data.triggerWorkflow.id.slice(0, 8)}…`);
+      toast.success(
+        `Execution started: ${data.triggerWorkflow.id.slice(0, 8)}…`,
+      );
     } catch (e) {
-      toast.error(sanitizeErrorMessage(e instanceof Error ? e.message : String(e)));
+      toast.error(
+        sanitizeErrorMessage(e instanceof Error ? e.message : String(e)),
+      );
     } finally {
       setTriggeringId(null);
     }
@@ -39,17 +47,30 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
   if (isLoading) return <SkeletonTable rows={4} className="mt-4" />;
 
   if (workflows.length === 0)
-    return <LocalEmptyState icon={<Shuffle size={40} />} message="No workflows owned by this Actor yet" />;
+    return (
+      <LocalEmptyState
+        icon={<Shuffle size={40} />}
+        message="No workflows owned by this Actor yet"
+      />
+    );
 
   return (
     <div className="bg-surface-3/60 border border-white/5 rounded-2xl overflow-hidden">
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-white/5">
-            <th className="text-left text-xs font-medium text-muted-foreground px-5 py-3">Name</th>
-            <th className="text-left text-xs font-medium text-muted-foreground px-4 py-3">Status</th>
-            <th className="text-right text-xs font-medium text-muted-foreground px-4 py-3">Nodes</th>
-            <th className="text-right text-xs font-medium text-muted-foreground px-5 py-3">Updated</th>
+            <th className="text-left text-xs font-medium text-muted-foreground px-5 py-3">
+              Name
+            </th>
+            <th className="text-left text-xs font-medium text-muted-foreground px-4 py-3">
+              Status
+            </th>
+            <th className="text-right text-xs font-medium text-muted-foreground px-4 py-3">
+              Nodes
+            </th>
+            <th className="text-right text-xs font-medium text-muted-foreground px-5 py-3">
+              Updated
+            </th>
             <th className="text-right text-xs font-medium text-muted-foreground px-5 py-3" />
           </tr>
         </thead>
@@ -72,18 +93,34 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
                   </span>
                 </td>
                 <td className="px-4 py-3">
-                  <span className={cn("capitalize text-xs", workflowStatusColor(wf.status))}>
+                  <span
+                    className={cn(
+                      "capitalize text-xs",
+                      workflowStatusColor(wf.status),
+                    )}
+                  >
                     {wf.status ?? "—"}
                   </span>
                 </td>
-                <td className="px-4 py-3 text-right text-muted-foreground tabular-nums">{wf.nodeCount}</td>
-                <td className="px-5 py-3 text-right text-muted-foreground text-xs">{relativeTime(wf.updatedAt)}</td>
+                <td className="px-4 py-3 text-right text-muted-foreground tabular-nums">
+                  {wf.nodeCount}
+                </td>
+                <td className="px-5 py-3 text-right text-muted-foreground text-xs">
+                  {relativeTime(wf.updatedAt)}
+                </td>
                 <td className="px-5 py-3 text-right">
                   <div className="flex items-center justify-end gap-2">
                     <button
                       onClick={() => handleTrigger(wf.id.toString())}
-                      disabled={triggeringId === wf.id.toString() || wf.status !== "published"}
-                      title={wf.status !== "published" ? "Publish workflow to enable triggering" : "Run as this actor"}
+                      disabled={
+                        triggeringId === wf.id.toString() ||
+                        wf.status !== "published"
+                      }
+                      title={
+                        wf.status !== "published"
+                          ? "Publish workflow to enable triggering"
+                          : "Run as this actor"
+                      }
                       className="flex items-center gap-1 text-xs text-emerald-400 hover:text-emerald-300 disabled:opacity-30 disabled:cursor-not-allowed transition-premium px-2 py-1 rounded-md border border-emerald-500/20 hover:bg-emerald-500/10"
                     >
                       {triggeringId === wf.id.toString() ? (

@@ -54,16 +54,18 @@ export default function WorkflowVersionsPanel({
   const { data, isLoading } = useWorkflowVersionsQuery({ workflowId });
   const versions = data?.workflowVersions ?? [];
 
-  const { data: diffData, isLoading: diffLoading } = useGetVersionDiffSummaryQuery(
-    { workflowId },
-    { enabled: activeTab === "diff" },
-  );
+  const { data: diffData, isLoading: diffLoading } =
+    useGetVersionDiffSummaryQuery(
+      { workflowId },
+      { enabled: activeTab === "diff" },
+    );
   const diff = diffData?.getVersionDiffSummary;
 
-  const { data: changelogData, isLoading: changelogLoading } = useGetWorkflowChangelogQuery(
-    { workflowId },
-    { enabled: activeTab === "changelog" },
-  );
+  const { data: changelogData, isLoading: changelogLoading } =
+    useGetWorkflowChangelogQuery(
+      { workflowId },
+      { enabled: activeTab === "changelog" },
+    );
   const changelog = changelogData?.getWorkflowChangelog ?? [];
 
   const [concurrencyInput, setConcurrencyInput] = useState("");
@@ -90,7 +92,9 @@ export default function WorkflowVersionsPanel({
       setShowPublishForm(false);
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to publish version"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to publish version"),
+      );
     },
   });
 
@@ -103,7 +107,9 @@ export default function WorkflowVersionsPanel({
       setRollbackTargetId(null);
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to rollback version"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to rollback version"),
+      );
     },
   });
 
@@ -120,9 +126,9 @@ export default function WorkflowVersionsPanel({
   };
 
   return (
-    <Dialog 
-      open={true} 
-      onClose={onClose} 
+    <Dialog
+      open={true}
+      onClose={onClose}
       title="Version History"
       className="max-w-2xl"
     >
@@ -142,29 +148,37 @@ export default function WorkflowVersionsPanel({
 
         {/* Tabs */}
         <div className="flex gap-1 border-b border-white/5">
-          {(["versions", "diff", "changelog", "config"] as PanelTab[]).map((tab) => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={cn(
-                "px-6 py-3 text-[9px] font-black uppercase tracking-[0.2em] rounded-t-xl transition-premium border-b-2 -mb-px",
-                activeTab === tab
-                  ? "text-primary border-primary bg-primary/5"
-                  : "text-muted-foreground/40 border-transparent hover:text-white hover:bg-white/5",
-              )}
-            >
-              {tab === "versions" ? "Versions" : tab === "diff" ? "Changes" : tab === "changelog" ? "Changelog" : "Config"}
-            </button>
-          ))}
+          {(["versions", "diff", "changelog", "config"] as PanelTab[]).map(
+            (tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={cn(
+                  "px-6 py-3 text-[9px] font-black uppercase tracking-[0.2em] rounded-t-xl transition-premium border-b-2 -mb-px",
+                  activeTab === tab
+                    ? "text-primary border-primary bg-primary/5"
+                    : "text-muted-foreground/40 border-transparent hover:text-white hover:bg-white/5",
+                )}
+              >
+                {tab === "versions"
+                  ? "Versions"
+                  : tab === "diff"
+                    ? "Changes"
+                    : tab === "changelog"
+                      ? "Changelog"
+                      : "Config"}
+              </button>
+            ),
+          )}
         </div>
 
         {showPublishForm && (
           <div className="p-6 border border-primary/20 bg-primary/5 rounded-[1.5rem] space-y-4 animate-in slide-in-from-top-4 duration-500 glass-light shadow-2xl">
             <div className="flex items-center gap-2">
-                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
-                <p className="text-[10px] font-black uppercase tracking-[0.3em] text-primary">
-                    Finalizing Protocol Snapshot
-                </p>
+              <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
+              <p className="text-[10px] font-black uppercase tracking-[0.3em] text-primary">
+                Finalizing Protocol Snapshot
+              </p>
             </div>
             <textarea
               placeholder="Description (optional) — e.g. Add retry logic to Step 3"
@@ -213,30 +227,74 @@ export default function WorkflowVersionsPanel({
                   <LoadingSpinner className="w-6 h-6 text-primary" />
                 </div>
               ) : !diff ? (
-                <p className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/30 text-center py-12">No telemetry delta available.</p>
+                <p className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/30 text-center py-12">
+                  No telemetry delta available.
+                </p>
               ) : !diff.hasPublishedVersion ? (
                 <div className="text-center py-12 opacity-30">
                   <Diff className="w-10 h-10 text-muted-foreground mx-auto mb-6" />
-                  <p className="text-[10px] font-black uppercase tracking-[0.3em]">No published version to diff against.</p>
+                  <p className="text-[10px] font-black uppercase tracking-[0.3em]">
+                    No published version to diff against.
+                  </p>
                 </div>
               ) : (
                 <div className="space-y-8">
                   <div className="bg-white/[0.02] border border-white/5 rounded-2xl px-6 py-5 shadow-xl glass-light">
                     <p className="text-xs text-muted-foreground/80 leading-relaxed font-medium">
-                        {diff.summary}
+                      {diff.summary}
                     </p>
                   </div>
                   <div className="grid grid-cols-2 md:grid-cols-3 gap-6">
                     {[
-                      { label: "Nodes Added", value: diff.nodesAdded, icon: <PlusCircle className="w-4 h-4" />, color: "text-success bg-success/5 border-success/10" },
-                      { label: "Nodes Changed", value: diff.nodesChanged, icon: <RefreshCw className="w-4 h-4" />, color: "text-warning bg-warning/5 border-warning/10" },
-                      { label: "Nodes Removed", value: diff.nodesRemoved, icon: <MinusCircle className="w-4 h-4" />, color: "text-destructive bg-destructive/5 border-destructive/10" },
-                      { label: "Edges Added", value: diff.edgesAdded, icon: <PlusCircle className="w-4 h-4" />, color: "text-success bg-success/5 border-success/10" },
-                      { label: "Edges Removed", value: diff.edgesRemoved, icon: <MinusCircle className="w-4 h-4" />, color: "text-destructive bg-destructive/5 border-destructive/10" },
+                      {
+                        label: "Nodes Added",
+                        value: diff.nodesAdded,
+                        icon: <PlusCircle className="w-4 h-4" />,
+                        color: "text-success bg-success/5 border-success/10",
+                      },
+                      {
+                        label: "Nodes Changed",
+                        value: diff.nodesChanged,
+                        icon: <RefreshCw className="w-4 h-4" />,
+                        color: "text-warning bg-warning/5 border-warning/10",
+                      },
+                      {
+                        label: "Nodes Removed",
+                        value: diff.nodesRemoved,
+                        icon: <MinusCircle className="w-4 h-4" />,
+                        color:
+                          "text-destructive bg-destructive/5 border-destructive/10",
+                      },
+                      {
+                        label: "Edges Added",
+                        value: diff.edgesAdded,
+                        icon: <PlusCircle className="w-4 h-4" />,
+                        color: "text-success bg-success/5 border-success/10",
+                      },
+                      {
+                        label: "Edges Removed",
+                        value: diff.edgesRemoved,
+                        icon: <MinusCircle className="w-4 h-4" />,
+                        color:
+                          "text-destructive bg-destructive/5 border-destructive/10",
+                      },
                     ].map(({ label, value, icon, color }) => (
-                      <div key={label} className={cn("rounded-2xl border p-5 flex flex-col gap-2 transition-premium hover:scale-105", color)}>
-                        <div className="flex items-center gap-2 opacity-60">{icon}<span className="text-[9px] font-black uppercase tracking-[0.2em]">{label}</span></div>
-                        <span className="text-3xl font-black font-outfit tabular-nums">{value}</span>
+                      <div
+                        key={label}
+                        className={cn(
+                          "rounded-2xl border p-5 flex flex-col gap-2 transition-premium hover:scale-105",
+                          color,
+                        )}
+                      >
+                        <div className="flex items-center gap-2 opacity-60">
+                          {icon}
+                          <span className="text-[9px] font-black uppercase tracking-[0.2em]">
+                            {label}
+                          </span>
+                        </div>
+                        <span className="text-3xl font-black font-outfit tabular-nums">
+                          {value}
+                        </span>
                       </div>
                     ))}
                   </div>
@@ -254,22 +312,33 @@ export default function WorkflowVersionsPanel({
               ) : changelog.length === 0 ? (
                 <div className="text-center py-12 opacity-30">
                   <GitCommit className="w-10 h-10 text-muted-foreground mx-auto mb-6" />
-                  <p className="text-[10px] font-black uppercase tracking-[0.3em]">No changelog entries yet.</p>
+                  <p className="text-[10px] font-black uppercase tracking-[0.3em]">
+                    No changelog entries yet.
+                  </p>
                 </div>
               ) : (
                 <div className="relative space-y-0">
                   <div className="absolute left-[18px] top-0 bottom-0 w-px bg-white/5" />
                   {changelog.map((entry) => (
-                    <div key={entry.versionNumber} className="flex gap-6 pb-8 last:pb-0 group">
+                    <div
+                      key={entry.versionNumber}
+                      className="flex gap-6 pb-8 last:pb-0 group"
+                    >
                       <div className="w-9 h-9 rounded-full bg-surface-3 border border-white/10 flex items-center justify-center shrink-0 z-10 text-[9px] font-black text-primary shadow-2xl transition-premium group-hover:scale-110">
                         v{entry.versionNumber}
                       </div>
                       <div className="flex-1 pt-1.5 min-w-0">
-                        <p className="text-sm font-bold text-white group-hover:text-primary transition-premium">{entry.summary}</p>
+                        <p className="text-sm font-bold text-white group-hover:text-primary transition-premium">
+                          {entry.summary}
+                        </p>
                         {entry.description && (
-                          <p className="text-xs text-muted-foreground/60 mt-2 leading-relaxed font-medium">{entry.description}</p>
+                          <p className="text-xs text-muted-foreground/60 mt-2 leading-relaxed font-medium">
+                            {entry.description}
+                          </p>
                         )}
-                        <p className="text-[9px] text-muted-foreground/30 mt-3 font-black uppercase tracking-widest">{formatDate(entry.publishedAt)}</p>
+                        <p className="text-[9px] text-muted-foreground/30 mt-3 font-black uppercase tracking-widest">
+                          {formatDate(entry.publishedAt)}
+                        </p>
                       </div>
                     </div>
                   ))}
@@ -291,7 +360,8 @@ export default function WorkflowVersionsPanel({
                 <Tag size={28} />
               </div>
               <p className="text-[10px] font-black uppercase tracking-[0.3em] text-center max-w-[260px] leading-relaxed">
-                No protocol snapshots recorded. Synchronize current state to initialize.
+                No protocol snapshots recorded. Synchronize current state to
+                initialize.
               </p>
             </div>
           ) : activeTab === "versions" ? (
@@ -301,9 +371,7 @@ export default function WorkflowVersionsPanel({
                   key={v.id}
                   className={cn(
                     "px-8 py-6 flex items-center justify-between gap-6 group transition-premium",
-                    v.isActive
-                      ? "bg-primary/[0.03]"
-                      : "hover:bg-white/[0.015]",
+                    v.isActive ? "bg-primary/[0.03]" : "hover:bg-white/[0.015]",
                   )}
                 >
                   <div className="flex items-center gap-6 min-w-0">
@@ -375,7 +443,9 @@ export default function WorkflowVersionsPanel({
                     <Gauge className="w-5 h-5 text-primary" />
                   </div>
                   <div>
-                    <h4 className="text-sm font-black text-white uppercase tracking-tight">Capability Ceiling</h4>
+                    <h4 className="text-sm font-black text-white uppercase tracking-tight">
+                      Capability Ceiling
+                    </h4>
                     <p className="text-[10px] font-bold text-muted-foreground/40 mt-1 uppercase tracking-widest">
                       Max simultaneous executions. Null for unbounded capacity.
                     </p>
@@ -385,12 +455,12 @@ export default function WorkflowVersionsPanel({
                   <div className="relative flex-1 group">
                     <div className="absolute -inset-0.5 bg-primary/20 rounded-xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
                     <input
-                        type="number"
-                        min={1}
-                        value={concurrencyInput}
-                        onChange={(e) => setConcurrencyInput(e.target.value)}
-                        placeholder="UNBOUNDED"
-                        className="w-full bg-surface-4/60 border border-white/10 focus:border-primary/40 focus:outline-none focus:ring-1 focus:ring-primary/40 rounded-xl px-5 py-3 text-sm text-white placeholder:text-muted-foreground/20 transition-premium relative z-10 font-medium"
+                      type="number"
+                      min={1}
+                      value={concurrencyInput}
+                      onChange={(e) => setConcurrencyInput(e.target.value)}
+                      placeholder="UNBOUNDED"
+                      className="w-full bg-surface-4/60 border border-white/10 focus:border-primary/40 focus:outline-none focus:ring-1 focus:ring-primary/40 rounded-xl px-5 py-3 text-sm text-white placeholder:text-muted-foreground/20 transition-premium relative z-10 font-medium"
                     />
                   </div>
                   <Button
@@ -398,13 +468,17 @@ export default function WorkflowVersionsPanel({
                     onClick={() =>
                       concurrencyMutation.mutate({
                         workflowId,
-                        maxConcurrent: concurrencyInput ? (parseInt(concurrencyInput, 10) || undefined) : undefined,
+                        maxConcurrent: concurrencyInput
+                          ? parseInt(concurrencyInput, 10) || undefined
+                          : undefined,
                       })
                     }
                     disabled={concurrencyMutation.isPending}
                     className="bg-primary hover:bg-primary/90 text-white font-black px-8 rounded-xl text-[10px] h-12 uppercase tracking-widest shadow-xl transition-premium border border-white/10"
                   >
-                    {concurrencyMutation.isPending ? "SYNCHRONIZING..." : "SAVE LIMIT"}
+                    {concurrencyMutation.isPending
+                      ? "SYNCHRONIZING..."
+                      : "SAVE LIMIT"}
                   </Button>
                   {concurrencyInput && (
                     <Button
@@ -412,7 +486,10 @@ export default function WorkflowVersionsPanel({
                       variant="ghost"
                       onClick={() => {
                         setConcurrencyInput("");
-                        concurrencyMutation.mutate({ workflowId, maxConcurrent: undefined });
+                        concurrencyMutation.mutate({
+                          workflowId,
+                          maxConcurrent: undefined,
+                        });
                       }}
                       className="text-muted-foreground/40 hover:text-white text-[9px] font-black uppercase tracking-widest px-4 h-12"
                     >
@@ -424,7 +501,7 @@ export default function WorkflowVersionsPanel({
 
               <div className="text-center py-6">
                 <p className="text-[9px] font-black text-muted-foreground/20 uppercase tracking-[0.3em]">
-                    Extended system parameters available in next update
+                  Extended system parameters available in next update
                 </p>
               </div>
             </div>
@@ -445,8 +522,8 @@ export default function WorkflowVersionsPanel({
             </div>
             <div>
               <p className="text-sm text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed px-4">
-                The selected snapshot will be re-synchronized as the primary execution logic. 
-                Existing telemetry remains preserved.
+                The selected snapshot will be re-synchronized as the primary
+                execution logic. Existing telemetry remains preserved.
               </p>
             </div>
             <div className="flex items-center gap-4 pt-4">
@@ -478,4 +555,3 @@ export default function WorkflowVersionsPanel({
     </Dialog>
   );
 }
-

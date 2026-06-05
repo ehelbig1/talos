@@ -1,6 +1,18 @@
 import React from "react";
 import { useNavigate } from "react-router-dom";
-import { Layout, Info, AlertTriangle, Zap, X, Calendar, Webhook, Play, Loader2, Clock, ChevronDown } from "lucide-react";
+import {
+  Layout,
+  Info,
+  AlertTriangle,
+  Zap,
+  X,
+  Calendar,
+  Webhook,
+  Play,
+  Loader2,
+  Clock,
+  ChevronDown,
+} from "lucide-react";
 import { toast } from "sonner";
 import {
   Tabs,
@@ -60,15 +72,24 @@ function TriggersSection({ workflowId }: { workflowId: string | null }) {
             disabled={!t.onClick}
             className={cn(
               "w-full flex items-center gap-4 px-4 py-3 rounded-2xl border border-white/5 bg-white/[0.02] hover:bg-white/[0.04] transition-premium text-left disabled:opacity-40 disabled:cursor-default group relative overflow-hidden",
-              t.onClick && "hover:border-white/10 shadow-xl"
+              t.onClick && "hover:border-white/10 shadow-xl",
             )}
           >
-            <div className={cn("p-2 rounded-xl bg-white/5 border border-white/10 transition-premium group-hover:scale-110", t.color)}>
-                <t.icon className="w-4 h-4" />
+            <div
+              className={cn(
+                "p-2 rounded-xl bg-white/5 border border-white/10 transition-premium group-hover:scale-110",
+                t.color,
+              )}
+            >
+              <t.icon className="w-4 h-4" />
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-[10px] text-white font-black uppercase tracking-widest font-outfit">{t.label}</p>
-              <p className="text-[9px] text-muted-foreground/40 font-bold uppercase tracking-tight">{t.desc}</p>
+              <p className="text-[10px] text-white font-black uppercase tracking-widest font-outfit">
+                {t.label}
+              </p>
+              <p className="text-[9px] text-muted-foreground/40 font-bold uppercase tracking-tight">
+                {t.desc}
+              </p>
             </div>
             {t.onClick && (
               <span className="text-[9px] text-primary font-black uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-premium">
@@ -112,15 +133,17 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
       setPriority: s.setPriority,
       intent: s.intent,
       setIntent: s.setIntent,
-    }))
+    })),
   );
 
   const [jsonText, setJsonText] = React.useState(
-    JSON.stringify(intent || {}, null, 2)
+    JSON.stringify(intent || {}, null, 2),
   );
   const [jsonError, setJsonError] = React.useState<string | null>(null);
   const [copiedWorkflowId, setCopiedWorkflowId] = React.useState(false);
-  const copyTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
   React.useEffect(() => {
     return () => {
@@ -139,7 +162,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
     } catch {
       // ignore serialization errors
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intent]);
 
   const handleJsonChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -163,7 +186,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
   return (
     <div className="flex flex-col h-full bg-surface-2/80 backdrop-blur-3xl relative border-l border-white/5 shadow-[-20px_0_50px_rgba(0,0,0,0.4)] animate-in slide-in-from-right duration-500">
       <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-20 pointer-events-none" />
-      
+
       {/* Header */}
       <div className="flex items-center justify-between px-8 py-6 border-b border-white/5 bg-white/[0.02] relative z-10">
         <div className="flex items-center gap-5">
@@ -194,22 +217,22 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
         className="flex-1 flex flex-col overflow-hidden relative z-10"
       >
         <div className="px-8 pt-6 pb-2 border-b border-white/5 bg-white/[0.01]">
-            <TabsList className="w-full justify-start rounded-2xl border border-white/5 bg-black/20 p-1.5 gap-1 shrink-0 h-auto">
+          <TabsList className="w-full justify-start rounded-2xl border border-white/5 bg-black/20 p-1.5 gap-1 shrink-0 h-auto">
             <TabsTrigger
-                value="info"
-                className="flex-1 text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/40 rounded-xl py-3 px-5 transition-premium"
+              value="info"
+              className="flex-1 text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/40 rounded-xl py-3 px-5 transition-premium"
             >
-                <Info className="w-3.5 h-3.5 mr-2 opacity-40" />
-                Manifest
+              <Info className="w-3.5 h-3.5 mr-2 opacity-40" />
+              Manifest
             </TabsTrigger>
             <TabsTrigger
-                value="executions"
-                className="flex-1 text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/40 rounded-xl py-3 px-5 transition-premium"
+              value="executions"
+              className="flex-1 text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/40 rounded-xl py-3 px-5 transition-premium"
             >
-                <Clock className="w-3.5 h-3.5 mr-2 opacity-40" />
-                History
+              <Clock className="w-3.5 h-3.5 mr-2 opacity-40" />
+              History
             </TabsTrigger>
-            </TabsList>
+          </TabsList>
         </div>
 
         <TabsContent
@@ -221,34 +244,38 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
               Protocol Designation
             </label>
             <div className="p-6 bg-surface-3/40 border border-white/5 rounded-[2rem] glass-dark shadow-2xl relative overflow-hidden group">
-                <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-                <p className="text-3xl font-black text-white tracking-tighter font-outfit leading-none selection:bg-primary/30 break-all">
+              <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
+              <p className="text-3xl font-black text-white tracking-tighter font-outfit leading-none selection:bg-primary/30 break-all">
                 {workflowName || "UNTITLED_STREAM"}
-                </p>
+              </p>
             </div>
           </div>
 
           {workflowId && (
             <div className="space-y-4">
-                <label className="text-[10px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-                    System Identity
-                </label>
-                <CopyField
-                    label="SYSTEM_UUID"
-                    value={workflowId}
-                    copied={copiedWorkflowId}
-                    onCopy={async () => {
-                    try {
-                        await navigator.clipboard.writeText(workflowId);
-                        setCopiedWorkflowId(true);
-                        if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
-                        copyTimeoutRef.current = setTimeout(() => setCopiedWorkflowId(false), 2000);
-                        toast.success("Workflow ID copied");
-                    } catch {
-                        // Clipboard API unavailable
-                    }
-                    }}
-                />
+              <label className="text-[10px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
+                System Identity
+              </label>
+              <CopyField
+                label="SYSTEM_UUID"
+                value={workflowId}
+                copied={copiedWorkflowId}
+                onCopy={async () => {
+                  try {
+                    await navigator.clipboard.writeText(workflowId);
+                    setCopiedWorkflowId(true);
+                    if (copyTimeoutRef.current)
+                      clearTimeout(copyTimeoutRef.current);
+                    copyTimeoutRef.current = setTimeout(
+                      () => setCopiedWorkflowId(false),
+                      2000,
+                    );
+                    toast.success("Workflow ID copied");
+                  } catch {
+                    // Clipboard API unavailable
+                  }
+                }}
+              />
             </div>
           )}
 
@@ -258,8 +285,10 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                 TOPOLOGY_NODES
               </div>
               <div className="flex items-center gap-3">
-                  <div className="w-1.5 h-6 bg-primary/40 rounded-full" />
-                  <div className="text-3xl font-black text-white font-outfit">{nodeCount}</div>
+                <div className="w-1.5 h-6 bg-primary/40 rounded-full" />
+                <div className="text-3xl font-black text-white font-outfit">
+                  {nodeCount}
+                </div>
               </div>
             </div>
             <div className="p-6 bg-white/[0.02] border border-white/5 rounded-[2rem] shadow-xl glass-dark group hover:bg-white/[0.04] transition-premium">
@@ -267,8 +296,10 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                 DATA_EDGES
               </div>
               <div className="flex items-center gap-3">
-                  <div className="w-1.5 h-6 bg-success/40 rounded-full" />
-                  <div className="text-3xl font-black text-white font-outfit">{edgeCount}</div>
+                <div className="w-1.5 h-6 bg-success/40 rounded-full" />
+                <div className="text-3xl font-black text-white font-outfit">
+                  {edgeCount}
+                </div>
               </div>
             </div>
           </div>
@@ -283,7 +314,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
               </div>
               Operational Constraints
             </h4>
-            
+
             <div className="space-y-8 relative z-10">
               <div className="space-y-3">
                 <label className="text-[10px] text-muted-foreground/40 uppercase tracking-[0.2em] font-black ml-1">
@@ -311,18 +342,18 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                   Runtime Priority
                 </label>
                 <div className="relative">
-                    <select
+                  <select
                     value={priority}
                     onChange={(e) =>
-                        setPriority(e.target.value as "high" | "normal" | "low")
+                      setPriority(e.target.value as "high" | "normal" | "low")
                     }
                     className="w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-[11px] font-black uppercase tracking-[0.3em] focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer hover:bg-black/60 text-white shadow-inner"
-                    >
+                  >
                     <option value="low">LOW_PRIORITY</option>
                     <option value="normal">NORMAL_PRIORITY</option>
                     <option value="high">HIGH_PRIORITY</option>
-                    </select>
-                    <ChevronDown className="absolute right-6 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/20 pointer-events-none" />
+                  </select>
+                  <ChevronDown className="absolute right-6 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/20 pointer-events-none" />
                 </div>
               </div>
 
@@ -343,7 +374,9 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                   rows={6}
                   className={cn(
                     "w-full bg-black/40 border transition-premium rounded-[2rem] p-6 text-[11px] font-mono focus:outline-none focus:ring-4 resize-none shadow-inner leading-relaxed selection:bg-primary/30 custom-scrollbar",
-                    jsonError ? "border-destructive/40 focus:ring-destructive/10" : "border-white/5 focus:border-primary/40 focus:ring-primary/10"
+                    jsonError
+                      ? "border-destructive/40 focus:ring-destructive/10"
+                      : "border-white/5 focus:border-primary/40 focus:ring-primary/10",
                   )}
                   placeholder='{ "OPERATIONAL_KEY": "VALUE" }'
                   spellCheck={false}
@@ -356,13 +389,17 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
             <div className="p-6 bg-warning/5 border border-warning/10 rounded-[2rem] flex gap-5 shadow-2xl glass-dark animate-status-pulse">
               <AlertTriangle className="w-6 h-6 text-warning shrink-0 mt-0.5" />
               <p className="text-[10px] text-warning/80 font-black uppercase tracking-widest leading-relaxed">
-                WORKFLOW NOT PERSISTED. SAVE PROTOCOL TO INITIALIZE DEPLOYMENT VECTORS AND TELEMETRY STREAMS.
+                WORKFLOW NOT PERSISTED. SAVE PROTOCOL TO INITIALIZE DEPLOYMENT
+                VECTORS AND TELEMETRY STREAMS.
               </p>
             </div>
           )}
         </TabsContent>
 
-        <TabsContent value="executions" className="flex-1 overflow-auto p-4 custom-scrollbar focus:outline-none">
+        <TabsContent
+          value="executions"
+          className="flex-1 overflow-auto p-4 custom-scrollbar focus:outline-none"
+        >
           {workflowId ? (
             <WorkflowExecutionHistory workflowId={workflowId} />
           ) : (

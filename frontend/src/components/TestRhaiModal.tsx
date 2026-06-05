@@ -1,6 +1,13 @@
 import * as React from "react";
 import { Button, Textarea, Dialog } from "@/components/ui";
-import { Loader2, XCircle, CheckCircle2, Terminal, Code2, Play } from "lucide-react";
+import {
+  Loader2,
+  XCircle,
+  CheckCircle2,
+  Terminal,
+  Code2,
+  Play,
+} from "lucide-react";
 import { testRhaiExpression } from "@/lib/graphqlClient";
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -63,36 +70,40 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
   const handleClose = () => onOpenChange(false);
 
   return (
-    <Dialog 
-      open={open} 
-      onClose={handleClose} 
+    <Dialog
+      open={open}
+      onClose={handleClose}
       title="Protocol Evaluation"
       className="max-w-2xl"
     >
       <div className="space-y-8 relative z-10 p-2 -mt-4">
         <div className="flex items-center justify-between mb-2">
-            <p className="text-[11px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
-                Validate Rhai logic against synthetic telemetry context
-            </p>
-            <div className="flex items-center gap-2">
-                <div className="w-1.5 h-1.5 rounded-full bg-primary/40 shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
-                <span className="text-[9px] font-black text-primary/40 uppercase tracking-[0.2em]">Rhai Runtime v1.0</span>
-            </div>
+          <p className="text-[11px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
+            Validate Rhai logic against synthetic telemetry context
+          </p>
+          <div className="flex items-center gap-2">
+            <div className="w-1.5 h-1.5 rounded-full bg-primary/40 shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
+            <span className="text-[9px] font-black text-primary/40 uppercase tracking-[0.2em]">
+              Rhai Runtime v1.0
+            </span>
+          </div>
         </div>
 
         <div className="space-y-10 flex-1 overflow-auto custom-scrollbar pr-1 min-h-0">
           <div className="space-y-4">
             <div className="flex items-center gap-3">
-                <Code2 className="w-4 h-4 text-primary" />
-                <label style={labelStyle} className="mb-0">Operational Expression</label>
+              <Code2 className="w-4 h-4 text-primary" />
+              <label style={labelStyle} className="mb-0">
+                Operational Expression
+              </label>
             </div>
             <div className="bg-surface-4/60 p-6 rounded-[2rem] border border-white/5 font-mono text-[11px] text-primary/80 break-all leading-relaxed shadow-inner glass-light relative overflow-hidden">
               <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
               <div className="relative z-10">
                 {script || (
-                    <span className="text-muted-foreground/20 italic font-black uppercase tracking-widest">
+                  <span className="text-muted-foreground/20 italic font-black uppercase tracking-widest">
                     Awaiting Instruction...
-                    </span>
+                  </span>
                 )}
               </div>
             </div>
@@ -101,17 +112,19 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           <div className="space-y-6">
             <div className="space-y-4">
               <div className="flex items-center gap-3">
-                  <Terminal className="w-4 h-4 text-primary" />
-                  <label style={labelStyle} className="mb-0">Synthetic Telemetry Context (JSON)</label>
+                <Terminal className="w-4 h-4 text-primary" />
+                <label style={labelStyle} className="mb-0">
+                  Synthetic Telemetry Context (JSON)
+                </label>
               </div>
               <div className="relative group">
                 <div className="absolute -inset-0.5 bg-primary/20 rounded-[2rem] blur opacity-0 group-focus-within:opacity-100 transition-premium" />
                 <Textarea
-                    value={mockContext}
-                    onChange={(e) => setMockContext(e.target.value)}
-                    rows={6}
-                    className="font-mono text-[11px] bg-surface-4/60 border-white/5 focus:ring-primary/20 focus:border-primary/40 rounded-[2rem] p-6 text-white shadow-inner resize-none uppercase tracking-widest relative z-10"
-                    placeholder='{ "items": [1, 2, 3] }'
+                  value={mockContext}
+                  onChange={(e) => setMockContext(e.target.value)}
+                  rows={6}
+                  className="font-mono text-[11px] bg-surface-4/60 border-white/5 focus:ring-primary/20 focus:border-primary/40 rounded-[2rem] p-6 text-white shadow-inner resize-none uppercase tracking-widest relative z-10"
+                  placeholder='{ "items": [1, 2, 3] }'
                 />
               </div>
             </div>
@@ -125,12 +138,16 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
               {loading ? (
                 <div className="flex items-center gap-4">
                   <LoadingSpinner className="w-5 h-5" />
-                  <span className="font-black uppercase tracking-[0.2em] text-xs">ORCHESTRATING EVALUATION...</span>
+                  <span className="font-black uppercase tracking-[0.2em] text-xs">
+                    ORCHESTRATING EVALUATION...
+                  </span>
                 </div>
               ) : (
                 <div className="flex items-center gap-3">
-                    <Play className="w-4 h-4 fill-current" />
-                    <span className="font-black uppercase tracking-[0.2em] text-xs">INITIATE LOGIC TEST</span>
+                  <Play className="w-4 h-4 fill-current" />
+                  <span className="font-black uppercase tracking-[0.2em] text-xs">
+                    INITIATE LOGIC TEST
+                  </span>
                 </div>
               )}
             </Button>
@@ -145,15 +162,19 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
                   : "bg-destructive/5 border-destructive/20 text-destructive",
               )}
             >
-              <div className={cn(
-                "absolute inset-0 bg-gradient-to-br opacity-10",
-                result.success ? "from-success via-transparent" : "from-destructive via-transparent"
-              )} />
+              <div
+                className={cn(
+                  "absolute inset-0 bg-gradient-to-br opacity-10",
+                  result.success
+                    ? "from-success via-transparent"
+                    : "from-destructive via-transparent",
+                )}
+              />
               {result.success ? (
                 <div className="relative z-10">
                   <div className="flex items-center gap-3 mb-6">
                     <div className="w-8 h-8 rounded-xl bg-success/10 flex items-center justify-center border border-success/20">
-                        <CheckCircle2 size={16} className="text-success" />
+                      <CheckCircle2 size={16} className="text-success" />
                     </div>
                     <div className="text-[10px] font-black uppercase tracking-[0.3em] text-success/60">
                       Execution Successful
@@ -167,7 +188,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
                 <div className="relative z-10">
                   <div className="flex items-center gap-3 mb-6">
                     <div className="w-8 h-8 rounded-xl bg-destructive/10 flex items-center justify-center border border-destructive/20">
-                        <XCircle size={16} className="text-destructive" />
+                      <XCircle size={16} className="text-destructive" />
                     </div>
                     <div className="text-[10px] font-black uppercase tracking-[0.3em] text-destructive/60">
                       Critical Evaluation Failure
@@ -195,4 +216,3 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
     </Dialog>
   );
 };
-

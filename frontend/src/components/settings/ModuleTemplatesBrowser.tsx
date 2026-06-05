@@ -61,9 +61,16 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
           <div className="w-14 h-14 bg-success/10 border border-success/20 rounded-full flex items-center justify-center mx-auto mb-4">
             <CheckCircle2 className="w-7 h-7 text-success" />
           </div>
-          <h3 className="text-sm font-bold text-foreground uppercase tracking-widest mb-1">Module Installed</h3>
-          <p className="text-xs text-muted-foreground mb-6">"{name}" is now available in your workflow editor.</p>
-          <Button className="w-full rounded-xl font-bold text-xs uppercase tracking-widest" onClick={onClose}>
+          <h3 className="text-sm font-bold text-foreground uppercase tracking-widest mb-1">
+            Module Installed
+          </h3>
+          <p className="text-xs text-muted-foreground mb-6">
+            "{name}" is now available in your workflow editor.
+          </p>
+          <Button
+            className="w-full rounded-xl font-bold text-xs uppercase tracking-widest"
+            onClick={onClose}
+          >
             Done
           </Button>
         </div>
@@ -72,17 +79,30 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
   }
 
   let configError: string | null = null;
-  try { JSON.parse(config); } catch { configError = "Invalid JSON"; }
+  try {
+    JSON.parse(config);
+  } catch {
+    configError = "Invalid JSON";
+  }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
       <div className="bg-card border border-border/80 rounded-2xl p-6 w-full max-w-md shadow-2xl">
         <div className="flex items-center justify-between mb-5">
           <div>
-            <h3 className="text-sm font-bold text-foreground uppercase tracking-widest">Install Module</h3>
-            <p className="text-[11px] text-muted-foreground mt-0.5">{template.name}</p>
+            <h3 className="text-sm font-bold text-foreground uppercase tracking-widest">
+              Install Module
+            </h3>
+            <p className="text-[11px] text-muted-foreground mt-0.5">
+              {template.name}
+            </p>
           </div>
-          <button type="button" onClick={onClose} aria-label="Close" className="p-1.5 hover:bg-muted rounded-lg transition-premium">
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="p-1.5 hover:bg-muted rounded-lg transition-premium"
+          >
             <X className="w-4 h-4 text-muted-foreground" />
           </button>
         </div>
@@ -121,10 +141,15 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
 
           {template.allowedHosts.length > 0 && (
             <div className="bg-warning/5 border border-warning/15 rounded-xl p-3">
-              <p className="text-[10px] font-black uppercase tracking-widest text-warning mb-1.5">Required Host Access</p>
+              <p className="text-[10px] font-black uppercase tracking-widest text-warning mb-1.5">
+                Required Host Access
+              </p>
               <div className="flex flex-wrap gap-1.5">
                 {template.allowedHosts.map((host) => (
-                  <span key={host} className="text-[10px] font-mono bg-background border border-border/60 px-2 py-0.5 rounded text-foreground/80">
+                  <span
+                    key={host}
+                    className="text-[10px] font-mono bg-background border border-border/60 px-2 py-0.5 rounded text-foreground/80"
+                  >
                     {host}
                   </span>
                 ))}
@@ -135,7 +160,9 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
           <div className="flex gap-2 pt-1">
             <Button
               className="flex-1 bg-primary hover:bg-primary/90 text-primary-foreground font-bold rounded-xl h-10 text-xs uppercase tracking-widest"
-              disabled={!name.trim() || !!configError || createMutation.isPending}
+              disabled={
+                !name.trim() || !!configError || createMutation.isPending
+              }
               onClick={() =>
                 createMutation.mutate({
                   input: { templateId: template.id, name, config },
@@ -144,7 +171,11 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
             >
               {createMutation.isPending ? "Installing..." : "Install"}
             </Button>
-            <Button variant="outline" className="flex-1 rounded-xl h-10 text-xs" onClick={onClose}>
+            <Button
+              variant="outline"
+              className="flex-1 rounded-xl h-10 text-xs"
+              onClick={onClose}
+            >
               Cancel
             </Button>
           </div>
@@ -173,7 +204,9 @@ export default function ModuleTemplatesBrowser() {
       )
     : templates;
 
-  const categories = Array.from(new Set(templates.map((t) => t.category))).sort();
+  const categories = Array.from(
+    new Set(templates.map((t) => t.category)),
+  ).sort();
 
   if (isLoading) {
     return (
@@ -181,7 +214,10 @@ export default function ModuleTemplatesBrowser() {
         <div className="h-4 w-48 bg-muted/50 rounded mb-6" />
         <div className="grid grid-cols-2 gap-3">
           {[1, 2, 3, 4].map((i) => (
-            <div key={i} className="h-28 bg-background/40 border border-border/40 rounded-xl" />
+            <div
+              key={i}
+              className="h-28 bg-background/40 border border-border/40 rounded-xl"
+            />
           ))}
         </div>
       </div>
@@ -191,7 +227,10 @@ export default function ModuleTemplatesBrowser() {
   return (
     <>
       {installing && (
-        <InstallDialog template={installing} onClose={() => setInstalling(null)} />
+        <InstallDialog
+          template={installing}
+          onClose={() => setInstalling(null)}
+        />
       )}
 
       <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl relative overflow-hidden group">
@@ -248,7 +287,9 @@ export default function ModuleTemplatesBrowser() {
               <button
                 type="button"
                 key={cat}
-                onClick={() => setSelectedCategory(cat === selectedCategory ? null : cat)}
+                onClick={() =>
+                  setSelectedCategory(cat === selectedCategory ? null : cat)
+                }
                 className={cn(
                   "px-6 py-2 text-[10px] font-black uppercase tracking-widest rounded-xl transition-premium",
                   selectedCategory === cat
@@ -266,28 +307,46 @@ export default function ModuleTemplatesBrowser() {
           <div className="text-center py-24 bg-black/20 border border-dashed border-white/5 rounded-[2.5rem] relative z-10">
             <Package className="w-16 h-16 text-muted-foreground/10 mb-6 mx-auto" />
             <p className="text-[10px] text-muted-foreground/20 font-black uppercase tracking-[0.4em]">
-              {search ? `NO_MATCHES_FOR_${search.toUpperCase()}` : "NO_BLUEPRINTS_DETECTED"}
+              {search
+                ? `NO_MATCHES_FOR_${search.toUpperCase()}`
+                : "NO_BLUEPRINTS_DETECTED"}
             </p>
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 relative z-10">
             {filtered.map((template) => {
-              const colorClass = CATEGORY_COLORS[template.category] ?? "text-muted-foreground bg-muted border-border";
+              const colorClass =
+                CATEGORY_COLORS[template.category] ??
+                "text-muted-foreground bg-muted border-border";
               return (
                 <div
                   key={template.id}
                   className="bg-black/40 border border-white/5 rounded-[2rem] p-8 hover:border-white/10 hover:bg-black/60 transition-premium group/item flex flex-col gap-6 shadow-inner relative overflow-hidden"
                 >
                   <div className="absolute inset-0 bg-gradient-to-br from-violet-500/5 via-transparent to-transparent opacity-0 group-hover/item:opacity-100 transition-premium pointer-events-none" />
-                  
+
                   <div className="flex items-start justify-between gap-4 relative z-10">
                     <div className="flex items-center gap-4 min-w-0">
-                      <div className={cn("p-3 rounded-xl border shrink-0 group-hover/item:scale-110 transition-premium", colorClass)}>
-                        {CATEGORY_ICONS[template.category] ?? <Package className="w-5 h-5" />}
+                      <div
+                        className={cn(
+                          "p-3 rounded-xl border shrink-0 group-hover/item:scale-110 transition-premium",
+                          colorClass,
+                        )}
+                      >
+                        {CATEGORY_ICONS[template.category] ?? (
+                          <Package className="w-5 h-5" />
+                        )}
                       </div>
                       <div className="min-w-0">
-                        <p className="text-lg font-black text-white tracking-tight font-outfit truncate">{template.name}</p>
-                        <span className={cn("text-[9px] font-black uppercase tracking-widest mt-1 block", colorClass.split(" ")[0])}>
+                        <p className="text-lg font-black text-white tracking-tight font-outfit truncate">
+                          {template.name}
+                        </p>
+                        <span
+                          className={cn(
+                            "text-[9px] font-black uppercase tracking-widest mt-1 block",
+                            colorClass.split(" ")[0],
+                          )}
+                        >
                           {template.category}_PROTOCOL
                         </span>
                       </div>
@@ -303,12 +362,17 @@ export default function ModuleTemplatesBrowser() {
                   <div className="mt-auto pt-6 border-t border-white/5 flex items-center justify-between relative z-10">
                     <div className="flex items-center gap-2">
                       {template.allowedHosts.slice(0, 2).map((h) => (
-                        <span key={h} className="text-[8px] font-black uppercase tracking-widest bg-black/40 border border-white/5 px-2 py-1 rounded-lg text-white/40">
+                        <span
+                          key={h}
+                          className="text-[8px] font-black uppercase tracking-widest bg-black/40 border border-white/5 px-2 py-1 rounded-lg text-white/40"
+                        >
                           {h.split(".")[0]}
                         </span>
                       ))}
                       {template.allowedHosts.length > 2 && (
-                        <span className="text-[8px] font-black text-muted-foreground/20">+{template.allowedHosts.length - 2}</span>
+                        <span className="text-[8px] font-black text-muted-foreground/20">
+                          +{template.allowedHosts.length - 2}
+                        </span>
                       )}
                     </div>
 

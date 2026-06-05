@@ -108,7 +108,9 @@ export default function OAuthManager() {
       queryClient.invalidateQueries({ queryKey: ["ListLinkedAccounts"] });
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to unlink account"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to unlink account"),
+      );
     },
   });
 
@@ -141,7 +143,13 @@ export default function OAuthManager() {
         window.location.href = urlData.oauthLoginUrl.authUrl;
       }
     } catch (err: unknown) {
-      toast.error(sanitizeErrorMessage(err instanceof Error ? err.message : "Failed to start OAuth linking flow"));
+      toast.error(
+        sanitizeErrorMessage(
+          err instanceof Error
+            ? err.message
+            : "Failed to start OAuth linking flow",
+        ),
+      );
       setLinkingProvider(null);
     }
   };
@@ -241,10 +249,14 @@ export default function OAuthManager() {
                         )}
                         <div className="flex items-center gap-3 text-muted-foreground/30 font-black uppercase tracking-widest">
                           <Clock className="w-3.5 h-3.5" />
-                          Linked_{new Date(linkedAccount.linkedAt).toLocaleDateString(
-                            undefined,
-                            { month: "short", day: "numeric", year: "numeric" }
-                          ).toUpperCase()}
+                          Linked_
+                          {new Date(linkedAccount.linkedAt)
+                            .toLocaleDateString(undefined, {
+                              month: "short",
+                              day: "numeric",
+                              year: "numeric",
+                            })
+                            .toUpperCase()}
                         </div>
                       </div>
                     ) : (
@@ -312,7 +324,10 @@ export default function OAuthManager() {
             Redundant_Authentication_Shield
           </h4>
           <p className="text-[11px] text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed max-w-3xl">
-            Linking multiple identity providers strengthens your account recovery perimeter. In the event of primary provider downtime, you can maintain operational continuity using any secondary verified protocol.
+            Linking multiple identity providers strengthens your account
+            recovery perimeter. In the event of primary provider downtime, you
+            can maintain operational continuity using any secondary verified
+            protocol.
           </p>
         </div>
       </div>

@@ -111,7 +111,11 @@ export function SlackBrowser({
       setResources(filtered);
       setShowBrowser(true);
     } catch (err) {
-      setError(sanitizeErrorMessage(err instanceof Error ? err.message : "Unknown error"));
+      setError(
+        sanitizeErrorMessage(
+          err instanceof Error ? err.message : "Unknown error",
+        ),
+      );
     } finally {
       setLoading(false);
     }

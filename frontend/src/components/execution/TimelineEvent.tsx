@@ -16,8 +16,10 @@ interface TimelineEventProps {
  */
 export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
   const isFailed = ev.status === "NodeFailed" || ev.status === "FAILED";
-  const isCompleted = ev.status === "NodeCompleted" || ev.status === "COMPLETED";
-  const isRunningStatus = ev.status === "NodeRunning" || ev.status === "RUNNING";
+  const isCompleted =
+    ev.status === "NodeCompleted" || ev.status === "COMPLETED";
+  const isRunningStatus =
+    ev.status === "NodeRunning" || ev.status === "RUNNING";
   const isApproval = ev.status === "AwaitingApproval";
 
   return (
@@ -46,24 +48,26 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
                       : "border-muted-foreground/10",
             )}
           >
-             {isRunningStatus && (
-               <div className="absolute inset-0 rounded-full animate-ping bg-primary/20" />
-             )}
+            {isRunningStatus && (
+              <div className="absolute inset-0 rounded-full animate-ping bg-primary/20" />
+            )}
           </div>
         </div>
 
         <div className="flex-1 min-w-0 pb-8 border-b border-white/[0.03] group-last:border-0">
           <div className="flex flex-wrap items-center gap-3 mb-3">
-            <span className={cn(
-              "text-[9px] font-black px-2.5 py-1 rounded-full uppercase tracking-[0.2em] shadow-sm",
-              isFailed
-                ? "bg-destructive/10 text-destructive border border-destructive/20"
-                : isCompleted
-                  ? "bg-success/10 text-success border border-success/20"
-                  : isApproval
-                    ? "bg-warning/10 text-warning border border-warning/20"
-                    : "bg-primary/10 text-primary border border-primary/20",
-            )}>
+            <span
+              className={cn(
+                "text-[9px] font-black px-2.5 py-1 rounded-full uppercase tracking-[0.2em] shadow-sm",
+                isFailed
+                  ? "bg-destructive/10 text-destructive border border-destructive/20"
+                  : isCompleted
+                    ? "bg-success/10 text-success border border-success/20"
+                    : isApproval
+                      ? "bg-warning/10 text-warning border border-warning/20"
+                      : "bg-primary/10 text-primary border border-primary/20",
+              )}
+            >
               {ev.status}
             </span>
 
@@ -92,17 +96,19 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
               )}
             </div>
 
-            {ev.traceId && /^[0-9a-f]{16,64}$/i.test(ev.traceId) && import.meta.env.VITE_JAEGER_URL && (
-              <a
-                href={`${import.meta.env.VITE_JAEGER_URL}${ev.traceId}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/20 hover:text-primary flex items-center gap-2 ml-auto transition-premium group/link"
-              >
-                <ExternalLink className="h-3 w-3 group-hover:scale-110 transition-transform" />
-                Trace_Link
-              </a>
-            )}
+            {ev.traceId &&
+              /^[0-9a-f]{16,64}$/i.test(ev.traceId) &&
+              import.meta.env.VITE_JAEGER_URL && (
+                <a
+                  href={`${import.meta.env.VITE_JAEGER_URL}${ev.traceId}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/20 hover:text-primary flex items-center gap-2 ml-auto transition-premium group/link"
+                >
+                  <ExternalLink className="h-3 w-3 group-hover:scale-110 transition-transform" />
+                  Trace_Link
+                </a>
+              )}
           </div>
 
           {ev.logMessage && (

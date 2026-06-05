@@ -67,7 +67,9 @@ export const SkeletonCard: React.FC<SkeletonProps> = ({ className = "" }) => (
  * capability badge, and config fields.
  */
 /** Row of 4 stat cards — matches Dashboard/ActorDetail stats layout. */
-export const SkeletonStatRow: React.FC<SkeletonProps> = ({ className = "" }) => (
+export const SkeletonStatRow: React.FC<SkeletonProps> = ({
+  className = "",
+}) => (
   <div
     className={cn("grid grid-cols-2 md:grid-cols-4 gap-3", className)}
     aria-hidden="true"
@@ -116,7 +118,9 @@ export const SkeletonTable: React.FC<SkeletonProps & { rows?: number }> = ({
 );
 
 /** Timeline skeleton — matches ExecutionPanel event timeline. */
-export const SkeletonTimeline: React.FC<SkeletonProps> = ({ className = "" }) => (
+export const SkeletonTimeline: React.FC<SkeletonProps> = ({
+  className = "",
+}) => (
   <div
     className={cn("space-y-3 py-4", className)}
     aria-hidden="true"

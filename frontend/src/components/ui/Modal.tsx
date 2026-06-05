@@ -36,9 +36,7 @@ export const Modal: React.FC<ModalProps> = ({
           {/* Dark-theme modal container */}
           <DialogWrapper className="m-4">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-xl font-semibold">
-                {title}
-              </h2>
+              <h2 className="text-xl font-semibold">{title}</h2>
               <Dialog.Close asChild>
                 <IconButton aria-label="Close dialog">
                   <X className="h-4 w-4" />

@@ -12,7 +12,10 @@ export const LoadingSpinner: React.FC<LoadingSpinnerProps> = ({
   ...props
 }) => (
   <div
-    className={cn("flex flex-col items-center justify-center py-12 gap-4", className)}
+    className={cn(
+      "flex flex-col items-center justify-center py-12 gap-4",
+      className,
+    )}
     aria-label="Loading"
     {...props}
   >

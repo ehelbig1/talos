@@ -7,7 +7,10 @@ import {
   WorkflowExecutionUpdate,
   ExecutionUpdate,
 } from "@/lib/graphqlClient";
-import { useEphemeralExecutionStore, usePersistedExecutionStore } from "@/store/executionStore";
+import {
+  useEphemeralExecutionStore,
+  usePersistedExecutionStore,
+} from "@/store/executionStore";
 import { toast } from "sonner";
 
 // MCP-889 (2026-05-14): stuck-execution watchdog threshold. If a
@@ -21,7 +24,7 @@ const EXECUTION_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const WATCHDOG_INTERVAL_MS = 30 * 1000;
 
 /**
- * A hook that listens for real-time workflow execution events and synchronizes 
+ * A hook that listens for real-time workflow execution events and synchronizes
  * them with the execution store. This ensures the UI (Canvas, Terminal, Inspector)
  * stays in sync with ANY execution happening for the current workflow, whether
  * triggered manually, via webhook, or by a schedule.
@@ -32,65 +35,77 @@ export function useActiveExecutionSync(workflowId: string | null) {
   const setNodeResult = useEphemeralExecutionStore((s) => s.setNodeResult);
   const setRunning = useEphemeralExecutionStore((s) => s.setRunning);
   const addEvent = useEphemeralExecutionStore((s) => s.addEvent);
-  const clearCurrentExecution = useEphemeralExecutionStore((s) => s.clearCurrentExecution);
-  const setWorkflowStatus = usePersistedExecutionStore((s) => s.setWorkflowStatus);
-  
+  const clearCurrentExecution = useEphemeralExecutionStore(
+    (s) => s.clearCurrentExecution,
+  );
+  const setWorkflowStatus = usePersistedExecutionStore(
+    (s) => s.setWorkflowStatus,
+  );
+
   const executionSubscriptionRef = useRef<(() => void) | null>(null);
   const activeExecutionIdRef = useRef<string | null>(null);
   const startTimeRef = useRef<number | null>(null);
   // MCP-889: track last detail-subscription event for the watchdog.
   const lastEventTimeRef = useRef<number | null>(null);
-  const watchdogIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const watchdogIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
 
   useEffect(() => {
     if (!workflowId) return;
 
     // Listen for global workflow execution lifecycle updates
-    const unsubscribeLifecycle = subscribeWorkflowExecutions((event: WorkflowExecutionUpdate) => {
-      // We only care about events for the current workflow context
-      if (event.workflowId !== workflowId) return;
+    const unsubscribeLifecycle = subscribeWorkflowExecutions(
+      (event: WorkflowExecutionUpdate) => {
+        // We only care about events for the current workflow context
+        if (event.workflowId !== workflowId) return;
 
-      if (event.status === "running") {
-        // A new execution started for this workflow!
-        // If we're already tracking this one, ignore. 
-        // If it's a new one, switch our detail subscription to it.
-        if (activeExecutionIdRef.current !== event.executionId) {
-          setupDetailSubscription(event.executionId);
-        }
-      } else if (event.status === "completed" || event.status === "failed") {
-        // The workflow finished. If it's the one we're tracking, mark it done.
-        if (activeExecutionIdRef.current === event.executionId) {
-          const now = new Date().toISOString();
-          setWorkflowStatus(workflowId, {
-            status: event.status === "completed" ? "success" : "failed",
-            runAt: now,
-            error: event.errorMessage,
-          });
-          
-          // Cleanup detail subscription after a small delay to ensure final events arrive
-          setTimeout(() => {
-            if (activeExecutionIdRef.current === event.executionId) {
-              clearCurrentExecution();
-              if (executionSubscriptionRef.current) {
-                executionSubscriptionRef.current();
-                executionSubscriptionRef.current = null;
+        if (event.status === "running") {
+          // A new execution started for this workflow!
+          // If we're already tracking this one, ignore.
+          // If it's a new one, switch our detail subscription to it.
+          if (activeExecutionIdRef.current !== event.executionId) {
+            setupDetailSubscription(event.executionId);
+          }
+        } else if (event.status === "completed" || event.status === "failed") {
+          // The workflow finished. If it's the one we're tracking, mark it done.
+          if (activeExecutionIdRef.current === event.executionId) {
+            const now = new Date().toISOString();
+            setWorkflowStatus(workflowId, {
+              status: event.status === "completed" ? "success" : "failed",
+              runAt: now,
+              error: event.errorMessage,
+            });
+
+            // Cleanup detail subscription after a small delay to ensure final events arrive
+            setTimeout(() => {
+              if (activeExecutionIdRef.current === event.executionId) {
+                clearCurrentExecution();
+                if (executionSubscriptionRef.current) {
+                  executionSubscriptionRef.current();
+                  executionSubscriptionRef.current = null;
+                }
+                activeExecutionIdRef.current = null;
+                // MCP-889: clear stale-detection watchdog now that the
+                // lifecycle event delivered the terminal status normally.
+                if (watchdogIntervalRef.current) {
+                  clearInterval(watchdogIntervalRef.current);
+                  watchdogIntervalRef.current = null;
+                }
               }
-              activeExecutionIdRef.current = null;
-              // MCP-889: clear stale-detection watchdog now that the
-              // lifecycle event delivered the terminal status normally.
-              if (watchdogIntervalRef.current) {
-                clearInterval(watchdogIntervalRef.current);
-                watchdogIntervalRef.current = null;
-              }
-            }
-          }, 1000);
+            }, 1000);
+          }
         }
-      }
-      
-      // Invalidate queries to refresh history lists, etc.
-      queryClient.invalidateQueries({ queryKey: ["LatestWorkflowExecutions"] });
-      queryClient.invalidateQueries({ queryKey: ["workflow-execution-history", workflowId] });
-    });
+
+        // Invalidate queries to refresh history lists, etc.
+        queryClient.invalidateQueries({
+          queryKey: ["LatestWorkflowExecutions"],
+        });
+        queryClient.invalidateQueries({
+          queryKey: ["workflow-execution-history", workflowId],
+        });
+      },
+    );
 
     return () => {
       unsubscribeLifecycle();
@@ -103,7 +118,16 @@ export function useActiveExecutionSync(workflowId: string | null) {
         watchdogIntervalRef.current = null;
       }
     };
-  }, [workflowId, queryClient, setNodeStatus, setNodeResult, setRunning, addEvent, clearCurrentExecution, setWorkflowStatus]);
+  }, [
+    workflowId,
+    queryClient,
+    setNodeStatus,
+    setNodeResult,
+    setRunning,
+    addEvent,
+    clearCurrentExecution,
+    setWorkflowStatus,
+  ]);
 
   const setupDetailSubscription = (execId: string) => {
     // Cleanup previous subscriptions if any
@@ -159,53 +183,62 @@ export function useActiveExecutionSync(workflowId: string | null) {
         }
         // Refresh history queries so the user can see the real
         // post-incident state on the executions list.
-        queryClient.invalidateQueries({ queryKey: ["LatestWorkflowExecutions"] });
-        queryClient.invalidateQueries({ queryKey: ["workflow-execution-history", workflowId] });
+        queryClient.invalidateQueries({
+          queryKey: ["LatestWorkflowExecutions"],
+        });
+        queryClient.invalidateQueries({
+          queryKey: ["workflow-execution-history", workflowId],
+        });
       }
     }, WATCHDOG_INTERVAL_MS);
 
-    const unsubscribeExec = subscribeExecution(execId, (ev: ExecutionUpdate) => {
-      lastEventTimeRef.current = Date.now();
-      const elapsedMs = startTimeRef.current !== null ? Date.now() - startTimeRef.current : 0;
-      addEvent({ ...ev, elapsedMs });
+    const unsubscribeExec = subscribeExecution(
+      execId,
+      (ev: ExecutionUpdate) => {
+        lastEventTimeRef.current = Date.now();
+        const elapsedMs =
+          startTimeRef.current !== null ? Date.now() - startTimeRef.current : 0;
+        addEvent({ ...ev, elapsedMs });
 
-      // Handle node-level status changes
-      if (ev.nodeId) {
-        if (ev.status === "COMPLETED") {
-          setNodeStatus(ev.nodeId, { 
-            status: "success",
-            durationMs: ev.durationMs,
-          });
-          if (ev.logMessage) {
-            try {
-              setNodeResult(ev.nodeId, JSON.parse(ev.logMessage));
-            } catch {
-              setNodeResult(ev.nodeId, ev.logMessage);
+        // Handle node-level status changes
+        if (ev.nodeId) {
+          if (ev.status === "COMPLETED") {
+            setNodeStatus(ev.nodeId, {
+              status: "success",
+              durationMs: ev.durationMs,
+            });
+            if (ev.logMessage) {
+              try {
+                setNodeResult(ev.nodeId, JSON.parse(ev.logMessage));
+              } catch {
+                setNodeResult(ev.nodeId, ev.logMessage);
+              }
             }
+          } else if (ev.status === "FAILED") {
+            setNodeStatus(ev.nodeId, {
+              status: ev.errorRecovery ? "success" : "failed",
+              error: ev.errorRecovery ? undefined : ev.logMessage,
+              durationMs: ev.durationMs,
+            });
+          } else if (ev.status === "RUNNING") {
+            setNodeStatus(ev.nodeId, {
+              status: "running",
+              startedAt: Date.now(),
+            });
+          } else if (ev.status === "AwaitingApproval") {
+            setNodeStatus(ev.nodeId, { status: "awaiting_approval" });
           }
-        } else if (ev.status === "FAILED") {
-          setNodeStatus(ev.nodeId, {
-            status: ev.errorRecovery ? "success" : "failed",
-            error: ev.errorRecovery ? undefined : ev.logMessage,
-            durationMs: ev.durationMs,
-          });
-        } else if (ev.status === "RUNNING") {
-          setNodeStatus(ev.nodeId, { 
-            status: "running",
-            startedAt: Date.now(),
-          });
-        } else if (ev.status === "AwaitingApproval") {
-          setNodeStatus(ev.nodeId, { status: "awaiting_approval" });
         }
-      }
-    });
+      },
+    );
 
     const unsubscribeLlm = subscribeLlmStream(execId, (token) => {
       const state = useEphemeralExecutionStore.getState();
-      // Find the currently running node. 
-      const runningNodeId = Object.entries(state.nodeStatuses)
-        .find(([_, s]) => s.status === "running")?.[0];
-      
+      // Find the currently running node.
+      const runningNodeId = Object.entries(state.nodeStatuses).find(
+        ([_, s]) => s.status === "running",
+      )?.[0];
+
       if (runningNodeId) {
         state.appendNodeStreamingContent(runningNodeId, token);
       }

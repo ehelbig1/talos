@@ -1,4 +1,10 @@
-import React, { useCallback, Suspense, useState, useMemo, useSyncExternalStore } from "react";
+import React, {
+  useCallback,
+  Suspense,
+  useState,
+  useMemo,
+  useSyncExternalStore,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import ErrorBoundary from "@/components/ErrorBoundary";
@@ -108,13 +114,22 @@ function Workspace() {
         description: "Terminate & Remove Node",
       },
     ],
-    [showInspector, terminalState, handleDeleteSelected, setShowInspector, setTerminalState],
+    [
+      showInspector,
+      terminalState,
+      handleDeleteSelected,
+      setShowInspector,
+      setTerminalState,
+    ],
   );
   useKeyboardShortcuts(keyboardShortcuts);
 
   // Subscribe to window resize for terminal height calculation
   const windowHeight = useSyncExternalStore(
-    (cb) => { window.addEventListener("resize", cb); return () => window.removeEventListener("resize", cb); },
+    (cb) => {
+      window.addEventListener("resize", cb);
+      return () => window.removeEventListener("resize", cb);
+    },
     () => window.innerHeight,
   );
 
@@ -184,7 +199,8 @@ function Workspace() {
                 className="!bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !rounded-[2rem] !shadow-2xl overflow-hidden glass"
                 maskColor="hsla(var(--background), 0.8)"
                 nodeColor={(n) => {
-                  if (n.data?.category === "control-flow") return "hsl(var(--info))";
+                  if (n.data?.category === "control-flow")
+                    return "hsl(var(--info))";
                   return "hsl(var(--primary))";
                 }}
                 nodeStrokeWidth={4}
@@ -198,12 +214,12 @@ function Workspace() {
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30 px-6">
               <div className="text-center pointer-events-auto bg-surface-3/40 border border-white/10 p-16 rounded-[4rem] shadow-[0_32px_120px_rgba(0,0,0,0.5)] max-w-xl w-full backdrop-blur-3xl glass relative overflow-hidden group">
                 <div className="absolute inset-0 bg-gradient-to-br from-primary/20 via-transparent to-transparent opacity-50" />
-                
+
                 <div className="relative z-10">
                   <div className="w-24 h-24 mx-auto mb-10 rounded-[2.5rem] bg-surface-4/60 border border-white/10 flex items-center justify-center shadow-2xl group-hover:scale-110 group-hover:rotate-6 transition-premium duration-700">
                     <Zap className="w-12 h-12 text-primary fill-primary/10 drop-shadow-[0_0_20px_hsla(var(--primary),0.6)]" />
                   </div>
-                  
+
                   <h3 className="text-4xl font-black text-white tracking-tighter mb-4 font-outfit">
                     Mission Control
                   </h3>
@@ -216,7 +232,9 @@ function Workspace() {
 
                   <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
                     <button
-                      onClick={() => useUIStore.getState().setToolbarModal("addExisting")}
+                      onClick={() =>
+                        useUIStore.getState().setToolbarModal("addExisting")
+                      }
                       className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-[10px] font-black uppercase tracking-widest bg-primary text-white rounded-2xl transition-premium shadow-xl shadow-primary/20 hover:scale-105 active:scale-95"
                     >
                       <FolderPlus className="w-4 h-4" />

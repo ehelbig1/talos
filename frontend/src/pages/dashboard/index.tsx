@@ -29,7 +29,17 @@ import { ConfirmDialog, SkeletonStatRow } from "@/components/ui";
 import { usePersistedExecutionStore } from "@/store/executionStore";
 import { cn } from "@/lib/utils";
 import type { WorkflowRunStatus } from "@/store/executionStore";
-import { Bot, Search, X, Filter, Activity, Plus, Command, ArrowRight, ChevronDown } from "lucide-react";
+import {
+  Bot,
+  Search,
+  X,
+  Filter,
+  Activity,
+  Plus,
+  Command,
+  ArrowRight,
+  ChevronDown,
+} from "lucide-react";
 
 import WorkflowStatsPanel from "./WorkflowStatsPanel";
 import ActorsPanel from "./ActorsPanel";
@@ -53,8 +63,12 @@ export default function Dashboard() {
     "all" | "success" | "failed" | "idle"
   >("all");
   const [historyWorkflow, setHistoryWorkflow] = useState<Workflow | null>(null);
-  const [versionsWorkflow, setVersionsWorkflow] = useState<Workflow | null>(null);
-  const [workflowToDelete, setWorkflowToDelete] = useState<Workflow | null>(null);
+  const [versionsWorkflow, setVersionsWorkflow] = useState<Workflow | null>(
+    null,
+  );
+  const [workflowToDelete, setWorkflowToDelete] = useState<Workflow | null>(
+    null,
+  );
   const queryClient = useQueryClient();
 
   const deleteWorkflowMutation = useDeleteWorkflowMutation({
@@ -74,7 +88,8 @@ export default function Dashboard() {
     { refetchInterval: 30_000, refetchOnWindowFocus: true },
   );
   const pendingApprovalCount =
-    approvalsData?.pendingApprovals?.filter((a) => a.status === "pending").length ?? 0;
+    approvalsData?.pendingApprovals?.filter((a) => a.status === "pending")
+      .length ?? 0;
 
   const { data: schedulesData } = useMySchedulesQuery(undefined, {
     staleTime: 60_000,
@@ -184,7 +199,7 @@ export default function Dashboard() {
       enabled: workflows.length > 0,
       // Frequency significantly reduced; WebSocket handles immediate start-up telemetry.
       // Heartbeat refetch remains as a fallback for terminal state transitions.
-      refetchInterval: 30_000, 
+      refetchInterval: 30_000,
       refetchOnWindowFocus: true,
     },
   );
@@ -200,7 +215,11 @@ export default function Dashboard() {
           let status: WorkflowRunStatus["status"];
           if (raw === "completed") {
             status = "success";
-          } else if (raw === "failed" || raw === "cancelled" || raw === "timed_out") {
+          } else if (
+            raw === "failed" ||
+            raw === "cancelled" ||
+            raw === "timed_out"
+          ) {
             status = "failed";
           } else if (raw === "running") {
             status = "running";
@@ -227,7 +246,11 @@ export default function Dashboard() {
       let status: WorkflowRunStatus["status"];
       if (event.status === "completed") {
         status = "success";
-      } else if (event.status === "failed" || event.status === "cancelled" || event.status === "timed_out") {
+      } else if (
+        event.status === "failed" ||
+        event.status === "cancelled" ||
+        event.status === "timed_out"
+      ) {
         status = "failed";
       } else if (event.status === "running") {
         status = "running";
@@ -244,17 +267,24 @@ export default function Dashboard() {
 
       // Invalidate the query to ensure secondary UI elements (e.g., stats panels) stay in sync
       queryClient.invalidateQueries({ queryKey: ["LatestWorkflowExecutions"] });
-      
+
       // Feedback toast for major transitions
       if (status === "success") {
-        toast.success(`Workflow complete: ${workflows.find(w => w.id === event.workflowId)?.name || 'Protocol'}`);
+        toast.success(
+          `Workflow complete: ${workflows.find((w) => w.id === event.workflowId)?.name || "Protocol"}`,
+        );
       } else if (status === "failed") {
-        toast.error(`Workflow failed: ${workflows.find(w => w.id === event.workflowId)?.name || 'Protocol'}`);
+        toast.error(
+          `Workflow failed: ${workflows.find((w) => w.id === event.workflowId)?.name || "Protocol"}`,
+        );
       } else if (status === "running") {
-        toast.info(`Workflow initiated: ${workflows.find(w => w.id === event.workflowId)?.name || 'Protocol'}`, {
-          icon: <Activity size={14} className="text-primary" />,
-          duration: 2000,
-        });
+        toast.info(
+          `Workflow initiated: ${workflows.find((w) => w.id === event.workflowId)?.name || "Protocol"}`,
+          {
+            icon: <Activity size={14} className="text-primary" />,
+            duration: 2000,
+          },
+        );
       }
     });
 
@@ -270,7 +300,10 @@ export default function Dashboard() {
           <SkeletonStatRow className="mb-12" />
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
             {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
-              <div key={i} className="bg-surface-3/20 border border-white/5 rounded-[2.5rem] h-[300px] animate-pulse" />
+              <div
+                key={i}
+                className="bg-surface-3/20 border border-white/5 rounded-[2.5rem] h-[300px] animate-pulse"
+              />
             ))}
           </div>
         </div>
@@ -298,29 +331,30 @@ export default function Dashboard() {
                   Control Center
                 </h1>
                 <div className="flex items-center gap-4">
-                    {pendingApprovalCount > 0 && (
-                        <button
-                        onClick={() => navigate("/settings")}
-                        className="px-4 py-1.5 text-[10px] font-black bg-warning/10 text-warning border border-warning/20 rounded-full uppercase tracking-[0.2em] hover:bg-warning/20 transition-premium animate-status-pulse shadow-[0_0_15px_hsla(var(--warning),0.3)]"
-                        >
-                        {pendingApprovalCount} Operational Gate{pendingApprovalCount !== 1 ? "s" : ""}
-                        </button>
-                    )}
-                    <div className="flex items-center gap-2 text-muted-foreground/40 font-black text-[10px] uppercase tracking-[0.3em]">
-                        <span className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
-                        SYSTEM OPERATIONAL
-                    </div>
+                  {pendingApprovalCount > 0 && (
+                    <button
+                      onClick={() => navigate("/settings")}
+                      className="px-4 py-1.5 text-[10px] font-black bg-warning/10 text-warning border border-warning/20 rounded-full uppercase tracking-[0.2em] hover:bg-warning/20 transition-premium animate-status-pulse shadow-[0_0_15px_hsla(var(--warning),0.3)]"
+                    >
+                      {pendingApprovalCount} Operational Gate
+                      {pendingApprovalCount !== 1 ? "s" : ""}
+                    </button>
+                  )}
+                  <div className="flex items-center gap-2 text-muted-foreground/40 font-black text-[10px] uppercase tracking-[0.3em]">
+                    <span className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
+                    SYSTEM OPERATIONAL
+                  </div>
                 </div>
               </div>
             </div>
           </div>
-          
+
           <button
             onClick={handleNew}
             className="px-10 py-5 bg-primary text-white text-xs font-black rounded-[1.5rem] transition-premium shadow-[0_15px_35px_-5px_hsla(var(--primary),0.4)] hover:shadow-[0_20px_45px_-5px_hsla(var(--primary),0.5)] hover:scale-105 active:scale-95 flex items-center gap-4 group border border-white/20 uppercase tracking-[0.2em]"
           >
             <div className="p-1 rounded-lg bg-white/20 group-hover:rotate-90 transition-premium">
-                <Plus className="w-5 h-5" />
+              <Plus className="w-5 h-5" />
             </div>
             Provision Workflow
           </button>
@@ -397,7 +431,8 @@ export default function Dashboard() {
                 No results found
               </h2>
               <p className="text-muted-foreground/40 text-sm max-w-sm font-bold uppercase tracking-widest leading-relaxed mb-10 text-center">
-                The telemetry query &quot;{search.toUpperCase()}&quot; did not return any active automation pipelines.
+                The telemetry query &quot;{search.toUpperCase()}&quot; did not
+                return any active automation pipelines.
               </p>
               <button
                 onClick={() => {
@@ -423,7 +458,9 @@ export default function Dashboard() {
                   onDelete={() => setWorkflowToDelete(workflow)}
                   schedule={schedulesByWorkflowId[workflow.id]}
                   actorName={
-                    workflow.actorId ? actorIdToName[workflow.actorId] : undefined
+                    workflow.actorId
+                      ? actorIdToName[workflow.actorId]
+                      : undefined
                   }
                 />
               ))}
@@ -461,12 +498,17 @@ export default function Dashboard() {
       <ConfirmDialog
         open={workflowToDelete !== null}
         title="Decommission Workflow"
-        message={workflowToDelete ? `Confirming permanent decommissioning of "${workflowToDelete.name}". All operational data will be purged.` : ""}
+        message={
+          workflowToDelete
+            ? `Confirming permanent decommissioning of "${workflowToDelete.name}". All operational data will be purged.`
+            : ""
+        }
         confirmLabel="Purge"
         destructive
         isLoading={deleteWorkflowMutation.isPending}
         onConfirm={() => {
-          if (workflowToDelete) deleteWorkflowMutation.mutate({ id: workflowToDelete.id });
+          if (workflowToDelete)
+            deleteWorkflowMutation.mutate({ id: workflowToDelete.id });
         }}
         onCancel={() => setWorkflowToDelete(null)}
       />

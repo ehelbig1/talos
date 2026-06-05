@@ -17,7 +17,14 @@ import {
 import { useShallow } from "zustand/react/shallow";
 import { cn } from "@/lib/utils";
 import { formatDuration } from "@/lib/utils";
-import { Copy, Check, Play, ArrowDownToLine, ArrowUpFromLine, Info } from "lucide-react";
+import {
+  Copy,
+  Check,
+  Play,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Info,
+} from "lucide-react";
 import { NodeDataViewer } from "./NodeDataViewer";
 
 interface DebugPanelProps {

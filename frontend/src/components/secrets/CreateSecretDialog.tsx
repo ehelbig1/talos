@@ -53,7 +53,9 @@ export function CreateSecretDialog({
       onCreate();
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to create secret"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to create secret"),
+      );
     },
   });
 
@@ -180,9 +182,11 @@ export function CreateSecretDialog({
           {createMutation.isError && (
             <div className="p-4 bg-destructive/10 border border-destructive/20 rounded-xl text-destructive text-sm">
               <p className="font-semibold mb-1">Failed to create secret</p>
-              {sanitizeErrorMessage(createMutation.error instanceof Error
-                ? createMutation.error.message
-                : "An unexpected error occurred.")}
+              {sanitizeErrorMessage(
+                createMutation.error instanceof Error
+                  ? createMutation.error.message
+                  : "An unexpected error occurred.",
+              )}
             </div>
           )}
         </form>

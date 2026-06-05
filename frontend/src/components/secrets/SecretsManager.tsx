@@ -82,7 +82,9 @@ function SecretsManager() {
       setEditValue("");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to update secret"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to update secret"),
+      );
     },
   });
 
@@ -101,7 +103,9 @@ function SecretsManager() {
       toast.success("Secret deleted successfully");
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to delete secret"));
+      toast.error(
+        sanitizeErrorMessage(err.message || "Failed to delete secret"),
+      );
     },
   });
 
@@ -167,20 +171,27 @@ function SecretsManager() {
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-300">
           <div className="bg-surface-3/60 border border-white/5 rounded-[2.5rem] p-10 w-full max-w-lg shadow-[0_0_100px_rgba(0,0,0,0.5)] glass relative overflow-hidden group">
             <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
-            
+
             <div className="flex items-center justify-between mb-8 relative z-10">
               <div className="flex items-center gap-5">
                 <div className="w-12 h-12 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary shadow-[0_0_15px_hsla(var(--primary),0.1)]">
-                    <Pencil size={20} />
+                  <Pencil size={20} />
                 </div>
                 <div>
-                    <h3 className="text-xl font-black text-white uppercase tracking-tighter">Update Secret</h3>
-                    <p className="text-[10px] text-primary font-black uppercase tracking-widest mt-0.5">{secretToEdit.name}</p>
+                  <h3 className="text-xl font-black text-white uppercase tracking-tighter">
+                    Update Secret
+                  </h3>
+                  <p className="text-[10px] text-primary font-black uppercase tracking-widest mt-0.5">
+                    {secretToEdit.name}
+                  </p>
                 </div>
               </div>
-              <button 
-                type="button" 
-                onClick={() => { setSecretToEdit(null); setEditValue(""); }} 
+              <button
+                type="button"
+                onClick={() => {
+                  setSecretToEdit(null);
+                  setEditValue("");
+                }}
                 className="p-2.5 hover:bg-white/5 rounded-xl transition-premium active:scale-90 text-muted-foreground/40 hover:text-white"
               >
                 <X className="w-5 h-5" />
@@ -193,15 +204,15 @@ function SecretsManager() {
                   NEW_PROTOCOL_VALUE
                 </label>
                 <div className="relative group/input">
-                    <div className="absolute -inset-0.5 bg-primary/10 rounded-2xl blur opacity-0 group-hover/input:opacity-100 transition-premium" />
-                    <input
-                        type="password"
-                        autoFocus
-                        value={editValue}
-                        onChange={(e) => setEditValue(e.target.value)}
-                        placeholder="ENTER_SECURE_PAYLOAD..."
-                        className="relative w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm text-foreground focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium placeholder:text-muted-foreground/10"
-                    />
+                  <div className="absolute -inset-0.5 bg-primary/10 rounded-2xl blur opacity-0 group-hover/input:opacity-100 transition-premium" />
+                  <input
+                    type="password"
+                    autoFocus
+                    value={editValue}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    placeholder="ENTER_SECURE_PAYLOAD..."
+                    className="relative w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm text-foreground focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium placeholder:text-muted-foreground/10"
+                  />
                 </div>
               </div>
 
@@ -209,13 +220,25 @@ function SecretsManager() {
                 <button
                   className="flex-1 bg-primary text-black font-black py-4 rounded-2xl text-[10px] uppercase tracking-[0.2em] transition-premium active:scale-95 shadow-2xl shadow-primary/20 disabled:opacity-50 disabled:grayscale"
                   disabled={!editValue.trim() || updateSecretMutation.isPending}
-                  onClick={() => updateSecretMutation.mutate({ input: { keyPath: secretToEdit.keyPath, value: editValue } })}
+                  onClick={() =>
+                    updateSecretMutation.mutate({
+                      input: {
+                        keyPath: secretToEdit.keyPath,
+                        value: editValue,
+                      },
+                    })
+                  }
                 >
-                  {updateSecretMutation.isPending ? "SYNCHRONIZING..." : "COMMIT_UPDATE"}
+                  {updateSecretMutation.isPending
+                    ? "SYNCHRONIZING..."
+                    : "COMMIT_UPDATE"}
                 </button>
                 <button
                   className="px-8 py-4 rounded-2xl text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 hover:text-white hover:bg-white/5 transition-premium active:scale-95"
-                  onClick={() => { setSecretToEdit(null); setEditValue(""); }}
+                  onClick={() => {
+                    setSecretToEdit(null);
+                    setEditValue("");
+                  }}
                 >
                   CANCEL
                 </button>
@@ -227,7 +250,7 @@ function SecretsManager() {
 
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative group">
         <div className="absolute -inset-8 bg-primary/5 rounded-[4rem] blur-[80px] opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-        
+
         <div className="flex items-center gap-6 relative z-10">
           <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-[1.5rem] flex items-center justify-center shadow-[0_0_30px_hsla(var(--primary),0.1)] group-hover:scale-110 group-hover:rotate-3 transition-premium">
             <Key className="w-8 h-8 text-primary" />
@@ -240,7 +263,7 @@ function SecretsManager() {
               <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
                 <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
                 <span className="text-[9px] text-primary font-black uppercase tracking-widest leading-none">
-                    Hardware_Encrypted
+                  Hardware_Encrypted
                 </span>
               </div>
               <div className="w-1 h-1 rounded-full bg-white/10" />
@@ -265,14 +288,16 @@ function SecretsManager() {
 
       <div className="bg-surface-3/30 border border-white/5 rounded-[3rem] shadow-2xl overflow-hidden min-h-[500px] glass relative group/registry">
         <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-20 pointer-events-none" />
-        
+
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-48 gap-6">
             <div className="relative">
-                <div className="w-16 h-16 border-2 border-primary/10 rounded-full" />
-                <div className="w-16 h-16 border-t-2 border-primary rounded-full animate-spin absolute inset-0" />
+              <div className="w-16 h-16 border-2 border-primary/10 rounded-full" />
+              <div className="w-16 h-16 border-t-2 border-primary rounded-full animate-spin absolute inset-0" />
             </div>
-            <p className="text-[10px] text-primary/60 font-black uppercase tracking-[0.4em] animate-status-pulse">Deciphering Registry...</p>
+            <p className="text-[10px] text-primary/60 font-black uppercase tracking-[0.4em] animate-status-pulse">
+              Deciphering Registry...
+            </p>
           </div>
         ) : error ? (
           <div className="p-12 text-center text-destructive bg-destructive/5 flex flex-col items-center gap-4">
@@ -287,12 +312,13 @@ function SecretsManager() {
               <LockIcon size={40} />
             </div>
             <div className="space-y-3">
-                <h3 className="text-2xl font-black text-white/60 tracking-tight uppercase">
+              <h3 className="text-2xl font-black text-white/60 tracking-tight uppercase">
                 Registry_Void
-                </h3>
-                <p className="text-xs text-muted-foreground/40 max-w-sm mx-auto font-medium leading-relaxed">
-                No secure entities detected in current workspace scope. Provision a new payload to begin protocol integration.
-                </p>
+              </h3>
+              <p className="text-xs text-muted-foreground/40 max-w-sm mx-auto font-medium leading-relaxed">
+                No secure entities detected in current workspace scope.
+                Provision a new payload to begin protocol integration.
+              </p>
             </div>
             <button
               onClick={() => setShowCreate(true)}
@@ -332,21 +358,21 @@ function SecretsManager() {
                           {secret.name}
                         </span>
                         {secret.description && (
-                            <span className="text-[10px] text-muted-foreground/40 font-medium line-clamp-1">
+                          <span className="text-[10px] text-muted-foreground/40 font-medium line-clamp-1">
                             {secret.description}
-                            </span>
+                          </span>
                         )}
                       </div>
                     </td>
                     <td className="px-10 py-8">
                       <div className="flex items-center gap-4 group/reveal">
                         <div className="relative group/code">
-                            <div className="absolute -inset-2 bg-primary/10 rounded-xl blur opacity-0 group-hover/code:opacity-100 transition-premium" />
-                            <code className="relative px-4 py-2 bg-black/40 border border-white/5 rounded-xl text-[11px] font-mono text-primary/80 shadow-inner block min-w-[140px] text-center">
+                          <div className="absolute -inset-2 bg-primary/10 rounded-xl blur opacity-0 group-hover/code:opacity-100 transition-premium" />
+                          <code className="relative px-4 py-2 bg-black/40 border border-white/5 rounded-xl text-[11px] font-mono text-primary/80 shadow-inner block min-w-[140px] text-center">
                             {revealedSecretId === secret.id
-                                ? secret.keyPath
-                                : "••••••••••••"}
-                            </code>
+                              ? secret.keyPath
+                              : "••••••••••••"}
+                          </code>
                         </div>
                         {revealedSecretId === secret.id ? (
                           <button
@@ -414,7 +440,10 @@ function SecretsManager() {
                           <History size={18} />
                         </button>
                         <button
-                          onClick={() => { setSecretToEdit(secret); setEditValue(""); }}
+                          onClick={() => {
+                            setSecretToEdit(secret);
+                            setEditValue("");
+                          }}
                           className="w-11 h-11 flex items-center justify-center text-muted-foreground/40 hover:text-primary hover:bg-primary/10 border border-white/5 transition-premium rounded-xl active:scale-90"
                           title="Reconfigure Payload"
                         >
@@ -440,7 +469,7 @@ function SecretsManager() {
       {/* Advanced Security Section */}
       <div className="bg-amber-500/5 border border-amber-500/20 rounded-[3rem] p-12 shadow-2xl backdrop-blur-xl group relative overflow-hidden transition-premium hover:border-amber-500/40">
         <div className="absolute top-0 right-0 w-96 h-96 bg-amber-500/10 rounded-full blur-[120px] -mr-48 -mt-48 pointer-events-none group-hover:bg-amber-500/20 transition-premium duration-1000" />
-        
+
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-12 relative z-10">
           <div className="flex-1 space-y-6">
             <div className="flex items-center gap-6">
@@ -455,7 +484,7 @@ function SecretsManager() {
                   <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 px-3 py-1 rounded-full">
                     <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
                     <span className="text-[9px] text-amber-500 font-black uppercase tracking-widest leading-none">
-                        Critical_Security
+                      Critical_Security
                     </span>
                   </div>
                   <div className="w-1 h-1 rounded-full bg-amber-500/30" />
@@ -466,11 +495,14 @@ function SecretsManager() {
               </div>
             </div>
             <p className="text-sm text-muted-foreground/60 leading-relaxed max-w-3xl font-medium">
-              Rotate the root encryption vector to re-seed the cryptographic foundation of the entire workspace.
+              Rotate the root encryption vector to re-seed the cryptographic
+              foundation of the entire workspace.
               <span className="text-amber-500/80 font-black ml-1 uppercase text-[11px]">
-                Autonomous re-encryption will activate upon the next interrogation of each entity.
+                Autonomous re-encryption will activate upon the next
+                interrogation of each entity.
               </span>
-              Legacy entropy states are archived for a 30-cycle grace period to ensure protocol continuity.
+              Legacy entropy states are archived for a 30-cycle grace period to
+              ensure protocol continuity.
             </p>
           </div>
 

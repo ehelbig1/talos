@@ -14,8 +14,8 @@ export type NodeStatusType =
 export interface NodeStatus {
   status: NodeStatusType;
   error?: string;
-  durationMs?: number;  // Execution duration when completed/failed
-  startedAt?: number;   // Unix timestamp ms when node started running
+  durationMs?: number; // Execution duration when completed/failed
+  startedAt?: number; // Unix timestamp ms when node started running
 }
 
 export interface WorkflowRunStatus {
@@ -221,7 +221,8 @@ export const useEphemeralExecutionStore = create<EphemeralSlice>()((set) => ({
   clearCurrentExecution: () =>
     set({ currentExecutionId: null, isRunning: false }),
 
-  resetNodeStatuses: () => set({ nodeStatuses: {}, nodeResults: {}, nodeStreamingContent: {} }),
+  resetNodeStatuses: () =>
+    set({ nodeStatuses: {}, nodeResults: {}, nodeStreamingContent: {} }),
 }));
 
 // Unified facade that combines both stores — uses useShallow to prevent new object
@@ -231,7 +232,7 @@ export const useExecutionStore = (): ExecutionStore => {
     useShallow((s) => ({
       workflowStatuses: s.workflowStatuses,
       setWorkflowStatus: s.setWorkflowStatus,
-    }))
+    })),
   );
   const ephemeral = useEphemeralExecutionStore(
     useShallow((s) => ({
@@ -244,7 +245,7 @@ export const useExecutionStore = (): ExecutionStore => {
       clearEvents: s.clearEvents,
       clearCurrentExecution: s.clearCurrentExecution,
       resetNodeStatuses: s.resetNodeStatuses,
-    }))
+    })),
   );
 
   return {

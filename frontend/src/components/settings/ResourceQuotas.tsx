@@ -28,7 +28,8 @@ function usagePercent(used: number, limit: number): number {
 }
 
 function usageColor(pct: number): string {
-  if (pct >= 90) return "bg-destructive shadow-[0_0_20px_hsla(var(--destructive),0.5)]";
+  if (pct >= 90)
+    return "bg-destructive shadow-[0_0_20px_hsla(var(--destructive),0.5)]";
   if (pct >= 75) return "bg-warning shadow-[0_0_20px_hsla(var(--warning),0.5)]";
   return "bg-primary shadow-[0_0_20px_hsla(var(--primary),0.5)]";
 }
@@ -70,7 +71,11 @@ export function ResourceQuotas() {
         refetch();
       },
       onError: (err: Error) => {
-        toast.error(sanitizeErrorMessage(err.message || "Failed to update resource quotas"));
+        toast.error(
+          sanitizeErrorMessage(
+            err.message || "Failed to update resource quotas",
+          ),
+        );
       },
     });
 
@@ -165,7 +170,9 @@ export function ResourceQuotas() {
               Resource Quotas
             </h3>
             <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.3em] mt-2 leading-none">
-              {isEditing ? "PROTOCOL_CONFIGURATION_ACTIVE" : "COMPUTE_FABRIC_UTILIZATION"}
+              {isEditing
+                ? "PROTOCOL_CONFIGURATION_ACTIVE"
+                : "COMPUTE_FABRIC_UTILIZATION"}
             </p>
           </div>
         </div>
@@ -221,7 +228,12 @@ export function ResourceQuotas() {
               <div className="flex items-center justify-between mb-8 relative z-10">
                 <div className="flex items-center gap-5">
                   <div className="w-12 h-12 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center group-hover/item:scale-110 transition-premium shadow-inner">
-                    <Icon className={cn("w-6 h-6", isEditing ? "text-primary" : "text-white/40")} />
+                    <Icon
+                      className={cn(
+                        "w-6 h-6",
+                        isEditing ? "text-primary" : "text-white/40",
+                      )}
+                    />
                   </div>
                   <div className="flex-1 min-w-0">
                     <h4 className="text-sm font-black text-white uppercase tracking-widest leading-none truncate">
@@ -287,7 +299,9 @@ export function ResourceQuotas() {
                     <div className="flex items-center gap-3 text-muted-foreground/40">
                       <span className="text-white">{item.used}</span>
                       <span className="opacity-20 text-[8px]">LIMIT_OF</span>
-                      <span className="text-white/60">{item.limit} {item.unit}</span>
+                      <span className="text-white/60">
+                        {item.limit} {item.unit}
+                      </span>
                     </div>
                     {pct > 80 && (
                       <div className="flex items-center gap-2 text-destructive animate-pulse bg-destructive/10 px-3 py-1 rounded-full border border-destructive/20 shadow-[0_0_15px_hsla(var(--destructive),0.2)]">
@@ -307,11 +321,15 @@ export function ResourceQuotas() {
         <div className="flex items-center gap-4">
           <div className="w-2 h-2 rounded-full bg-success animate-pulse shadow-[0_0_8px_hsla(var(--success),0.5)]" />
           <p className="text-[10px] text-muted-foreground/20 font-black uppercase tracking-[0.3em] flex items-center gap-3">
-             TELEMETRY_LINK_ESTABLISHED &bull; UPDATED: {new Date().toLocaleTimeString()}
+            TELEMETRY_LINK_ESTABLISHED &bull; UPDATED:{" "}
+            {new Date().toLocaleTimeString()}
           </p>
         </div>
         {!isEditing && (
-          <button type="button" className="text-[10px] font-black text-primary uppercase tracking-[0.2em] hover:text-white transition-premium flex items-center gap-3 group/btn">
+          <button
+            type="button"
+            className="text-[10px] font-black text-primary uppercase tracking-[0.2em] hover:text-white transition-premium flex items-center gap-3 group/btn"
+          >
             EXTRACT_USAGE_METRICS
             <div className="w-5 h-5 rounded-lg bg-primary/10 flex items-center justify-center group-hover/btn:bg-primary group-hover/btn:text-black transition-premium">
               <BarChart3 className="w-3 h-3" />
@@ -322,4 +340,3 @@ export function ResourceQuotas() {
     </div>
   );
 }
-

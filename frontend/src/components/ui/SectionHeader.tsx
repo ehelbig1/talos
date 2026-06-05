@@ -14,7 +14,7 @@ export const SectionHeader: React.FC<SectionHeaderProps> = ({
   ...props
 }) => {
   const Tag = level;
-  
+
   const styles = {
     h1: "text-4xl sm:text-5xl font-black tracking-tighter text-white",
     h2: "text-2xl sm:text-3xl font-black tracking-tight text-white",
@@ -23,7 +23,11 @@ export const SectionHeader: React.FC<SectionHeaderProps> = ({
   };
 
   return (
-    <Tag id={id} className={cn(styles[level], "font-outfit", className)} {...props}>
+    <Tag
+      id={id}
+      className={cn(styles[level], "font-outfit", className)}
+      {...props}
+    >
       {children}
     </Tag>
   );

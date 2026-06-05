@@ -50,9 +50,7 @@ export function validateOAuthUrl(url: string): boolean {
     const hosts = cachedOAuthHosts ?? ALLOWED_OAUTH_HOSTS;
     return (
       protocol === "https:" &&
-      hosts.some(
-        (h) => hostname === h || hostname.endsWith("." + h),
-      )
+      hosts.some((h) => hostname === h || hostname.endsWith("." + h))
     );
   } catch {
     return false;

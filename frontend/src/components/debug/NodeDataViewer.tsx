@@ -21,9 +21,7 @@ export const NodeDataViewer: React.FC<NodeDataViewerProps> = ({
   }
 
   if (typeof data === "boolean") {
-    return (
-      <span className="text-yellow-400">{data ? "true" : "false"}</span>
-    );
+    return <span className="text-yellow-400">{data ? "true" : "false"}</span>;
   }
 
   if (typeof data === "number") {
@@ -39,12 +37,7 @@ export const NodeDataViewer: React.FC<NodeDataViewerProps> = ({
   }
 
   if (typeof data === "object") {
-    return (
-      <ObjectValue
-        obj={data as Record<string, unknown>}
-        depth={depth}
-      />
-    );
+    return <ObjectValue obj={data as Record<string, unknown>} depth={depth} />;
   }
 
   // Fallback for anything else

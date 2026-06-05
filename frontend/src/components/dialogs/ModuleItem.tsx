@@ -28,7 +28,7 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
       )}
     >
       {selected && (
-          <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50 pointer-events-none animate-in fade-in duration-500" />
+        <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50 pointer-events-none animate-in fade-in duration-500" />
       )}
       <div className="flex justify-between items-start">
         <div className="flex-1">

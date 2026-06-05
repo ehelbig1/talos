@@ -30,10 +30,7 @@ export default class ErrorBoundary extends Component<
     // Optional integration point: window.__talosOnRenderError can be
     // attached at startup (e.g. from observability bootstrap) without
     // forcing every consumer to import a reporter.
-    type RenderErrorReporter = (
-      error: Error,
-      info: React.ErrorInfo,
-    ) => void;
+    type RenderErrorReporter = (error: Error, info: React.ErrorInfo) => void;
     const reporter = (
       window as unknown as { __talosOnRenderError?: RenderErrorReporter }
     ).__talosOnRenderError;

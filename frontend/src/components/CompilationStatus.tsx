@@ -6,15 +6,17 @@ import { cn } from "@/lib/utils";
 
 /**
  * CompilationStatus Component
- * 
- * Listens to real-time compilation telemetry events and displays 
+ *
+ * Listens to real-time compilation telemetry events and displays
  * active build progress in a premium, floating status indicator.
  */
 export function CompilationStatus() {
   const { jobs, updateJob, removeJob } = useCompilationStore();
   // Track per-job dismiss timers so we can cancel them on unmount and avoid
   // scheduling duplicate timers if a terminal event fires more than once.
-  const dismissTimers = React.useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const dismissTimers = React.useRef<
+    Map<string, ReturnType<typeof setTimeout>>
+  >(new Map());
 
   useEffect(() => {
     // MCP-928 (2026-05-14): schedule auto-removal in ONE place so
@@ -101,44 +103,54 @@ export function CompilationStatus() {
           key={job.jobId}
           className={cn(
             "p-6 rounded-[2rem] border shadow-2xl glass-dark flex flex-col gap-4 relative overflow-hidden transition-premium",
-            job.status === "failed" 
-              ? "border-destructive/20 bg-destructive/5 shadow-destructive/10" 
-              : "border-white/5 bg-surface-2/40 shadow-black/40"
+            job.status === "failed"
+              ? "border-destructive/20 bg-destructive/5 shadow-destructive/10"
+              : "border-white/5 bg-surface-2/40 shadow-black/40",
           )}
         >
           {/* Animated Background Gradient for Active Jobs */}
-          {(job.status !== "success" && job.status !== "failed") && (
+          {job.status !== "success" && job.status !== "failed" && (
             <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-primary/5 animate-pulse pointer-events-none" />
           )}
 
           {/* Progress Bar Track */}
           <div className="absolute bottom-0 left-0 h-1 bg-white/5 w-full" />
-          
+
           {/* Active Progress Bar */}
-          <div 
+          <div
             className={cn(
               "absolute bottom-0 left-0 h-1 transition-all duration-1000 ease-premium-out",
-              job.status === "success" ? "bg-success shadow-[0_0_15px_hsla(var(--success),0.6)]" :
-              job.status === "failed" ? "bg-destructive shadow-[0_0_15px_hsla(var(--destructive),0.6)]" :
-              "bg-primary shadow-[0_0_15px_hsla(var(--primary),0.6)]"
+              job.status === "success"
+                ? "bg-success shadow-[0_0_15px_hsla(var(--success),0.6)]"
+                : job.status === "failed"
+                  ? "bg-destructive shadow-[0_0_15px_hsla(var(--destructive),0.6)]"
+                  : "bg-primary shadow-[0_0_15px_hsla(var(--primary),0.6)]",
             )}
             style={{ width: `${(job.progress || 0) * 100}%` }}
           />
 
           <div className="flex items-start gap-4 relative z-10">
             {/* Status Icon Container */}
-            <div className={cn(
-              "w-12 h-12 rounded-[1.25rem] flex items-center justify-center shrink-0 border relative transition-premium",
-              job.status === "success" ? "bg-success/10 border-success/20 text-success" :
-              job.status === "failed" ? "bg-destructive/10 border-destructive/20 text-destructive" :
-              "bg-primary/10 border-primary/20 text-primary"
-            )}>
-              {job.status === "success" ? <CheckCircle2 className="w-6 h-6" /> :
-               job.status === "failed" ? <AlertCircle className="w-6 h-6" /> :
-               <Cpu className="w-6 h-6 animate-pulse" />}
-              
+            <div
+              className={cn(
+                "w-12 h-12 rounded-[1.25rem] flex items-center justify-center shrink-0 border relative transition-premium",
+                job.status === "success"
+                  ? "bg-success/10 border-success/20 text-success"
+                  : job.status === "failed"
+                    ? "bg-destructive/10 border-destructive/20 text-destructive"
+                    : "bg-primary/10 border-primary/20 text-primary",
+              )}
+            >
+              {job.status === "success" ? (
+                <CheckCircle2 className="w-6 h-6" />
+              ) : job.status === "failed" ? (
+                <AlertCircle className="w-6 h-6" />
+              ) : (
+                <Cpu className="w-6 h-6 animate-pulse" />
+              )}
+
               {/* Micro-glow for active state */}
-              {(job.status !== "success" && job.status !== "failed") && (
+              {job.status !== "success" && job.status !== "failed" && (
                 <div className="absolute -inset-2 bg-primary/20 rounded-full blur-xl animate-pulse" />
               )}
             </div>
@@ -148,38 +160,44 @@ export function CompilationStatus() {
                 <span className="text-[9px] font-black uppercase tracking-[0.25em] text-white/30 truncate">
                   Build Log :: {job.jobId.slice(0, 8)}
                 </span>
-                {(job.status !== "success" && job.status !== "failed") && (
-                    <div className="flex items-center gap-1.5">
-                        <div className="w-1.5 h-1.5 rounded-full bg-primary animate-ping" />
-                        <span className="text-[8px] font-black text-primary uppercase tracking-tighter">Live</span>
-                    </div>
+                {job.status !== "success" && job.status !== "failed" && (
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-ping" />
+                    <span className="text-[8px] font-black text-primary uppercase tracking-tighter">
+                      Live
+                    </span>
+                  </div>
                 )}
               </div>
-              
+
               <h4 className="text-xs font-black text-white uppercase tracking-tight truncate font-outfit leading-tight mt-0.5">
                 {job.message || "Synthesizing Module..."}
               </h4>
 
               <div className="flex items-center gap-2 mt-1.5">
-                 <div className={cn(
+                <div
+                  className={cn(
                     "px-2 py-0.5 rounded-md text-[8px] font-black uppercase tracking-widest",
-                    job.status === "success" ? "bg-success/20 text-success" :
-                    job.status === "failed" ? "bg-destructive/20 text-destructive" :
-                    "bg-primary/20 text-primary"
-                 )}>
-                    {job.status}
-                 </div>
-                 {job.progress !== undefined && (
-                     <span className="text-[10px] font-black text-white/20 tabular-nums">
-                        {Math.round(job.progress * 100)}%
-                     </span>
-                 )}
+                    job.status === "success"
+                      ? "bg-success/20 text-success"
+                      : job.status === "failed"
+                        ? "bg-destructive/20 text-destructive"
+                        : "bg-primary/20 text-primary",
+                  )}
+                >
+                  {job.status}
+                </div>
+                {job.progress !== undefined && (
+                  <span className="text-[10px] font-black text-white/20 tabular-nums">
+                    {Math.round(job.progress * 100)}%
+                  </span>
+                )}
               </div>
             </div>
 
             {/* Manual Dismiss Button */}
             {(job.status === "success" || job.status === "failed") && (
-              <button 
+              <button
                 onClick={() => removeJob(job.jobId)}
                 className="text-white/20 hover:text-white hover:bg-white/5 rounded-lg p-1 transition-premium active:scale-90"
               >

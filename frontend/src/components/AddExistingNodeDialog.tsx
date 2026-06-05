@@ -67,21 +67,22 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
       <div className="space-y-8">
         <div className="relative overflow-hidden p-6 bg-primary/5 border border-white/5 rounded-[2.5rem] shadow-inner glass-light group">
           <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-premium">
-              <Library className="w-12 h-12 text-primary" />
+            <Library className="w-12 h-12 text-primary" />
           </div>
           <div className="flex items-start gap-5 relative z-10">
-              <div className="shrink-0 w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-xl">
-                  <Library className="w-6 h-6 text-primary" />
-              </div>
-              <div className="space-y-1">
-                  <p className="text-[11px] font-black text-white tracking-tight font-outfit uppercase">
-                      Provisioning Accelerator
-                  </p>
-                  <p className="text-[10px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
-                      Deploy pre-validated execution modules to bypass synthesis latencies. 
-                      These protocols are ready for immediate instantiation.
-                  </p>
-              </div>
+            <div className="shrink-0 w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-xl">
+              <Library className="w-6 h-6 text-primary" />
+            </div>
+            <div className="space-y-1">
+              <p className="text-[11px] font-black text-white tracking-tight font-outfit uppercase">
+                Provisioning Accelerator
+              </p>
+              <p className="text-[10px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
+                Deploy pre-validated execution modules to bypass synthesis
+                latencies. These protocols are ready for immediate
+                instantiation.
+              </p>
+            </div>
           </div>
         </div>
 
@@ -103,11 +104,13 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
           {loading ? (
             <div className="flex-1 flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/20 animate-status-pulse">
               <div className="w-10 h-10 border-4 border-primary/10 border-t-primary rounded-full animate-spin shadow-[0_0_15px_hsla(var(--primary),0.2)]" />
-              <p className="text-[10px] font-black uppercase tracking-[0.3em]">Synchronizing Registry...</p>
+              <p className="text-[10px] font-black uppercase tracking-[0.3em]">
+                Synchronizing Registry...
+              </p>
             </div>
           ) : error ? (
             <div className="animate-in fade-in slide-in-from-top-2">
-                <ErrorBanner message={error} />
+              <ErrorBanner message={error} />
             </div>
           ) : filteredModules.length === 0 ? (
             <div className="flex-1 flex flex-col items-center justify-center py-20 px-8 text-center border-2 border-dashed border-white/5 rounded-[3rem] bg-surface-1/10 grayscale opacity-20">
@@ -116,7 +119,8 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
                 No Blueprint Matches
               </p>
               <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest leading-relaxed max-w-[240px] font-bold">
-                Adjust query parameters or synthesize new modules from the Catalog.
+                Adjust query parameters or synthesize new modules from the
+                Catalog.
               </p>
             </div>
           ) : (
@@ -137,7 +141,8 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
           <div className="flex items-center gap-3">
             <div className="w-1.5 h-1.5 rounded-full bg-primary/40 shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
             <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.3em]">
-                {filteredModules.length} Operational Protocol{filteredModules.length !== 1 ? "s" : ""} Online
+              {filteredModules.length} Operational Protocol
+              {filteredModules.length !== 1 ? "s" : ""} Online
             </p>
           </div>
           <div className="flex gap-4">

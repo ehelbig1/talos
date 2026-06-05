@@ -38,15 +38,26 @@ export const EmptyState: React.FC<EmptyStateProps> = (props) => {
   // Freeform mode (backward-compatible)
   if ("children" in props && props.children) {
     return (
-      <div className={cn("bg-surface-3/60 text-foreground p-8 rounded-xl border border-white/5 text-center", props.className)}>
+      <div
+        className={cn(
+          "bg-surface-3/60 text-foreground p-8 rounded-xl border border-white/5 text-center",
+          props.className,
+        )}
+      >
         {props.children}
       </div>
     );
   }
 
   // Structured mode
-  const { icon: Icon = Inbox, title, description, actionLabel, onAction, className } =
-    props as EmptyStatePropsStructured;
+  const {
+    icon: Icon = Inbox,
+    title,
+    description,
+    actionLabel,
+    onAction,
+    className,
+  } = props as EmptyStatePropsStructured;
 
   return (
     <div

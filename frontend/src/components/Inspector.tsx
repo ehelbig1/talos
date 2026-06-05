@@ -1,7 +1,10 @@
 import React, { useEffect, useCallback, useState } from "react";
 import { useWorkflowStore, type WorkflowState } from "@/store/workflowStore";
 import { useUIStore, type UIState } from "@/store/uiStore";
-import { useEphemeralExecutionStore, type EphemeralSlice } from "@/store/executionStore";
+import {
+  useEphemeralExecutionStore,
+  type EphemeralSlice,
+} from "@/store/executionStore";
 import { NodeInspector } from "./inspector/NodeInspector";
 import { EdgeInspector } from "./inspector/EdgeInspector";
 import { WorkflowInspector } from "./inspector/WorkflowInspector";
@@ -39,14 +42,15 @@ function Inspector() {
     })),
   );
 
-  const { setShowInspector, setSelectedNodeId, debugNodeId, setDebugNodeId } = useUIStore(
-    useShallow((state: UIState) => ({
-      setShowInspector: state.setShowInspector,
-      setSelectedNodeId: state.setSelectedNodeId,
-      debugNodeId: state.debugNodeId,
-      setDebugNodeId: state.setDebugNodeId,
-    })),
-  );
+  const { setShowInspector, setSelectedNodeId, debugNodeId, setDebugNodeId } =
+    useUIStore(
+      useShallow((state: UIState) => ({
+        setShowInspector: state.setShowInspector,
+        setSelectedNodeId: state.setSelectedNodeId,
+        debugNodeId: state.debugNodeId,
+        setDebugNodeId: state.setDebugNodeId,
+      })),
+    );
 
   const hasExecution = useEphemeralExecutionStore(
     (state: EphemeralSlice) =>
@@ -139,7 +143,7 @@ function Inspector() {
           className="flex flex-col h-full bg-surface-1/60 backdrop-blur-3xl relative"
         >
           <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-          
+
           <TabsList className="w-full justify-start rounded-none border-b border-white/5 bg-surface-2/40 px-4 gap-2 shrink-0 relative z-10">
             <TabsTrigger
               value="inspector"
@@ -172,9 +176,7 @@ function Inspector() {
       ) : (
         <div className="flex flex-col h-full bg-surface-1/60 backdrop-blur-3xl relative">
           <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-          <div className="flex-1 relative z-10">
-            {content}
-          </div>
+          <div className="flex-1 relative z-10">{content}</div>
         </div>
       )}
       <ConfirmDialog

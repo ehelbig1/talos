@@ -24,7 +24,12 @@ export function KeyboardShortcutsHelp() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "?" && !e.metaKey && !e.ctrlKey) {
         const tag = (e.target as HTMLElement)?.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) return;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          (e.target as HTMLElement)?.isContentEditable
+        )
+          return;
         setIsOpen((v) => !v);
       }
     };

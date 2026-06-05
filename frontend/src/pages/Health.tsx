@@ -65,25 +65,39 @@ function StatCard({
       <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
         {React.cloneElement(Icon, { size: 48 })}
       </div>
-      
+
       <div className="relative z-10 flex flex-col h-full">
         <div className="flex items-center gap-2 mb-4">
-          <div className={cn("w-8 h-8 rounded-xl flex items-center justify-center bg-surface-4/60 border border-white/5", accent)}>
+          <div
+            className={cn(
+              "w-8 h-8 rounded-xl flex items-center justify-center bg-surface-4/60 border border-white/5",
+              accent,
+            )}
+          >
             {icon}
           </div>
           <span className="text-[10px] font-black text-muted-foreground uppercase tracking-widest">
             {label}
           </span>
         </div>
-        
+
         {loading ? (
           <div className="h-10 w-24 bg-white/5 rounded-xl animate-shimmer mt-auto" />
         ) : (
           <div className="mt-auto">
-            <div className={cn("text-3xl font-black tabular-nums tracking-tighter", accent)}>
+            <div
+              className={cn(
+                "text-3xl font-black tabular-nums tracking-tighter",
+                accent,
+              )}
+            >
               {value}
             </div>
-            {sub && <div className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest mt-1.5">{sub}</div>}
+            {sub && (
+              <div className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest mt-1.5">
+                {sub}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -98,21 +112,33 @@ function StatCard({
 function RateBar({ rate }: { rate: number }) {
   const color =
     rate >= 95 ? "bg-success" : rate >= 80 ? "bg-warning" : "bg-destructive";
-  const glow = 
-    rate >= 95 ? "shadow-[0_0_10px_hsla(var(--success),0.5)]" : rate >= 80 ? "shadow-[0_0_10px_hsla(var(--warning),0.5)]" : "shadow-[0_0_10px_hsla(var(--destructive),0.5)]";
+  const glow =
+    rate >= 95
+      ? "shadow-[0_0_10px_hsla(var(--success),0.5)]"
+      : rate >= 80
+        ? "shadow-[0_0_10px_hsla(var(--warning),0.5)]"
+        : "shadow-[0_0_10px_hsla(var(--destructive),0.5)]";
 
   return (
     <div className="flex items-center gap-3 min-w-0">
       <div className="flex-1 bg-white/5 rounded-full h-1.5 overflow-hidden">
         <div
-          className={cn("h-full rounded-full transition-all duration-1000", color, glow)}
+          className={cn(
+            "h-full rounded-full transition-all duration-1000",
+            color,
+            glow,
+          )}
           style={{ width: `${rate}%` }}
         />
       </div>
       <span
         className={cn(
           "text-[10px] font-black tabular-nums w-10 text-right shrink-0 tracking-widest",
-          rate >= 95 ? "text-success" : rate >= 80 ? "text-warning" : "text-destructive",
+          rate >= 95
+            ? "text-success"
+            : rate >= 80
+              ? "text-warning"
+              : "text-destructive",
         )}
       >
         {rate}%
@@ -140,7 +166,9 @@ function SectionHeader({
         <div className="w-8 h-8 rounded-xl bg-surface-4/60 border border-white/5 flex items-center justify-center text-primary">
           {icon}
         </div>
-        <h2 className="text-[11px] font-black text-white uppercase tracking-widest">{title}</h2>
+        <h2 className="text-[11px] font-black text-white uppercase tracking-widest">
+          {title}
+        </h2>
       </div>
       {count !== undefined && (
         <span className="text-[10px] font-black text-muted-foreground/40 bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
@@ -216,7 +244,9 @@ function ActorBreakdown() {
       ) : actors.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-12 text-center">
           <Bot className="w-10 h-10 text-muted-foreground/10 mb-4" />
-          <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">No identities registered</p>
+          <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">
+            No identities registered
+          </p>
         </div>
       ) : (
         <div className="space-y-3">
@@ -228,14 +258,18 @@ function ActorBreakdown() {
                   onClick={() => navigate("/actors")}
                   className={cn(
                     "w-full flex items-center gap-4 p-4 rounded-2xl border transition-premium group active:scale-95",
-                    r.bg
+                    r.bg,
                   )}
                 >
-                  <span className={cn("w-2 h-2 rounded-full shrink-0", r.dot)} />
+                  <span
+                    className={cn("w-2 h-2 rounded-full shrink-0", r.dot)}
+                  />
                   <span className="text-[10px] font-black text-muted-foreground/80 uppercase tracking-widest flex-1 text-left group-hover:text-foreground transition-colors">
                     {r.label}
                   </span>
-                  <span className={cn("text-lg font-black tabular-nums", r.text)}>
+                  <span
+                    className={cn("text-lg font-black tabular-nums", r.text)}
+                  >
                     {r.count}
                   </span>
                 </button>
@@ -313,7 +347,9 @@ function UpcomingSchedules() {
       ) : upcoming.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-12 text-center">
           <Calendar className="w-10 h-10 text-muted-foreground/10 mb-4" />
-          <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">No triggers scheduled</p>
+          <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">
+            No triggers scheduled
+          </p>
         </div>
       ) : (
         <div className="space-y-2">
@@ -326,10 +362,12 @@ function UpcomingSchedules() {
                 key={s.id}
                 className="flex items-center gap-4 p-4 bg-surface-4/40 border border-white/5 rounded-2xl transition-premium hover:bg-surface-4/60 group"
               >
-                <div className={cn(
-                  "w-10 h-10 rounded-xl flex items-center justify-center bg-surface-3 border border-white/5",
-                  isOverdue ? "text-destructive" : "text-primary"
-                )}>
+                <div
+                  className={cn(
+                    "w-10 h-10 rounded-xl flex items-center justify-center bg-surface-3 border border-white/5",
+                    isOverdue ? "text-destructive" : "text-primary",
+                  )}
+                >
                   <Clock size={18} />
                 </div>
                 <div className="flex-1 min-w-0">
@@ -343,7 +381,9 @@ function UpcomingSchedules() {
                 <span
                   className={cn(
                     "text-[10px] font-black uppercase tracking-widest shrink-0",
-                    isOverdue ? "text-destructive animate-status-pulse" : "text-primary",
+                    isOverdue
+                      ? "text-destructive animate-status-pulse"
+                      : "text-primary",
                   )}
                 >
                   {futureTime(s.nextTriggerAt)}
@@ -389,7 +429,7 @@ function WorkflowHealth() {
   return (
     <div className="bg-surface-3/40 border border-white/5 rounded-[3rem] p-8 glass relative overflow-hidden group">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30" />
-      
+
       <div className="relative z-10">
         <div className="flex items-center justify-between mb-8">
           <SectionHeader
@@ -423,7 +463,9 @@ function WorkflowHealth() {
         ) : sorted.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-24 text-center">
             <Activity className="w-16 h-16 text-muted-foreground/10 mb-6" />
-            <p className="text-sm font-black text-muted-foreground/40 uppercase tracking-widest">No telemetry data recorded in the last 7 days</p>
+            <p className="text-sm font-black text-muted-foreground/40 uppercase tracking-widest">
+              No telemetry data recorded in the last 7 days
+            </p>
           </div>
         ) : (
           <div className="overflow-x-auto custom-scrollbar">
@@ -457,10 +499,14 @@ function WorkflowHealth() {
                     >
                       <td className="py-4 pl-4">
                         <div className="flex items-center gap-3">
-                          <div className={cn(
-                            "w-2 h-2 rounded-full",
-                            s.failed > 0 ? "bg-destructive shadow-[0_0_8px_hsla(var(--destructive),0.5)]" : "bg-success shadow-[0_0_8px_hsla(var(--success),0.5)]"
-                          )} />
+                          <div
+                            className={cn(
+                              "w-2 h-2 rounded-full",
+                              s.failed > 0
+                                ? "bg-destructive shadow-[0_0_8px_hsla(var(--destructive),0.5)]"
+                                : "bg-success shadow-[0_0_8px_hsla(var(--success),0.5)]",
+                            )}
+                          />
                           <span
                             className="text-sm font-black text-white truncate max-w-[240px] tracking-tight group-hover/row:text-primary transition-colors"
                             title={s.name}
@@ -476,7 +522,9 @@ function WorkflowHealth() {
                         <span
                           className={cn(
                             "text-xs font-black",
-                            s.failed > 0 ? "text-destructive" : "text-muted-foreground/20"
+                            s.failed > 0
+                              ? "text-destructive"
+                              : "text-muted-foreground/20",
                           )}
                         >
                           {s.failed}
@@ -576,7 +624,6 @@ export default function Health() {
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/5 via-background to-background opacity-50" />
 
       <div className="max-w-7xl mx-auto px-8 py-12 relative z-10">
-        
         {/* Page header */}
         <header className="mb-12">
           <div className="flex items-center gap-4 mb-2">
@@ -584,7 +631,9 @@ export default function Health() {
               <TrendingUp className="w-6 h-6 text-primary" />
             </div>
             <div>
-              <h1 className="text-4xl font-black text-white tracking-tighter drop-shadow-sm">System Intelligence</h1>
+              <h1 className="text-4xl font-black text-white tracking-tighter drop-shadow-sm">
+                System Intelligence
+              </h1>
               <p className="text-[11px] font-black text-muted-foreground/40 uppercase tracking-widest mt-1.5 flex items-center gap-2">
                 Mission Control &bull; Operational Telemetry &bull; 7-Day Matrix
               </p>
@@ -604,7 +653,11 @@ export default function Health() {
           <StatCard
             label="Active Entities"
             value={activeActors}
-            sub={actors.length > 0 ? `${actors.length} Identity Registry` : undefined}
+            sub={
+              actors.length > 0
+                ? `${actors.length} Identity Registry`
+                : undefined
+            }
             icon={<Bot size={18} />}
             accent="text-success"
             loading={actorsLoading}
@@ -612,7 +665,11 @@ export default function Health() {
           <StatCard
             label="Total Cycles"
             value={totalExecsToday}
-            sub={failedToday > 0 ? `${failedToday} System Faults` : "Clean execution"}
+            sub={
+              failedToday > 0
+                ? `${failedToday} System Faults`
+                : "Clean execution"
+            }
             icon={<Activity size={18} />}
             accent={failedToday > 0 ? "text-warning" : "text-success"}
             loading={statsLoading}
@@ -656,8 +713,9 @@ export default function Health() {
         {/* Footer note */}
         <footer className="pt-8 border-t border-white/5">
           <p className="text-[10px] font-black text-muted-foreground/20 text-center uppercase tracking-widest leading-relaxed max-w-2xl mx-auto">
-            Operational intelligence reflects a rolling 168-hour temporal window. 
-            Entity memory and cross-world permissions are enforced via persistent MCP protocols.
+            Operational intelligence reflects a rolling 168-hour temporal
+            window. Entity memory and cross-world permissions are enforced via
+            persistent MCP protocols.
           </p>
         </footer>
       </div>

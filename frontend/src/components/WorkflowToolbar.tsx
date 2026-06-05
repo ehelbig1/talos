@@ -9,13 +9,16 @@ import {
   Play,
   Tag,
 } from "lucide-react";
-import React, { useState, useEffect, useRef, useCallback, memo, lazy, Suspense } from "react";
-import {
-  ConfirmDialog,
-  Dialog,
-  Button,
-  Input,
-} from "@/components/ui";
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  memo,
+  lazy,
+  Suspense,
+} from "react";
+import { ConfirmDialog, Dialog, Button, Input } from "@/components/ui";
 import { useShallow } from "zustand/react/shallow";
 import {
   usePersistedExecutionStore,
@@ -26,7 +29,10 @@ import { useWorkflowStore } from "@/store/workflowStore";
 import { useUIStore } from "@/store/uiStore";
 import { useQueryClient } from "@tanstack/react-query";
 import { useWorkflowSave } from "@/hooks/useWorkflowSave";
-import { useDeleteWorkflowMutation, usePublishWorkflowVersionMutation } from "@/generated/graphql";
+import {
+  useDeleteWorkflowMutation,
+  usePublishWorkflowVersionMutation,
+} from "@/generated/graphql";
 import { ControlFlowMenu } from "@/components/builder/ControlFlowMenu";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -60,15 +66,15 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
   const queryClient = useQueryClient();
 
   // Workflow Store
-  const { 
-    nodeCount, 
-    edgeCount, 
-    workflowName, 
-    workflowId, 
-    isDirty, 
+  const {
+    nodeCount,
+    edgeCount,
+    workflowName,
+    workflowId,
+    isDirty,
     setWorkflowMeta,
-    clearWorkflow, 
-    addNode 
+    clearWorkflow,
+    addNode,
   } = useWorkflowStore(
     useShallow((s) => ({
       nodeCount: s.nodes.length,
@@ -92,8 +98,8 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
   );
 
   // Execution Store
-  const runStatus = usePersistedExecutionStore(
-    (s: PersistedSlice) => workflowId ? s.workflowStatuses[workflowId] : undefined,
+  const runStatus = usePersistedExecutionStore((s: PersistedSlice) =>
+    workflowId ? s.workflowStatuses[workflowId] : undefined,
   );
 
   // External triggers for modals (from Workspace empty state)
@@ -139,7 +145,10 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
     }
   }, [modal.kind]);
 
-  const { handleSave, isSaving } = useWorkflowSave({ workflowId, workflowName });
+  const { handleSave, isSaving } = useWorkflowSave({
+    workflowId,
+    workflowName,
+  });
 
   const handleNew = useCallback(() => {
     if (nodeCount === 0) {
@@ -149,43 +158,49 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
     }
   }, [nodeCount, clearWorkflow]);
 
-  const handleModuleCreated = useCallback((
-    moduleId: string,
-    moduleName: string,
-    config?: Record<string, unknown>,
-    category?: string,
-  ) => {
-    addNode(
-      moduleId,
-      moduleName,
-      { x: 250, y: 250 },
-      config || {},
-      undefined,
-      undefined,
-      category,
-    );
-  }, [addNode]);
+  const handleModuleCreated = useCallback(
+    (
+      moduleId: string,
+      moduleName: string,
+      config?: Record<string, unknown>,
+      category?: string,
+    ) => {
+      addNode(
+        moduleId,
+        moduleName,
+        { x: 250, y: 250 },
+        config || {},
+        undefined,
+        undefined,
+        category,
+      );
+    },
+    [addNode],
+  );
 
-  const handleExistingNodeAdded = useCallback((
-    moduleId: string,
-    moduleName: string,
-    config: Record<string, unknown>,
-    capabilityWorld?: string,
-    capabilityDescription?: string,
-    category?: string,
-    importedInterfaces?: string[],
-  ) => {
-    addNode(
-      moduleId,
-      moduleName,
-      { x: 250, y: 250 },
-      config,
-      capabilityWorld,
-      capabilityDescription,
-      category,
-      importedInterfaces,
-    );
-  }, [addNode]);
+  const handleExistingNodeAdded = useCallback(
+    (
+      moduleId: string,
+      moduleName: string,
+      config: Record<string, unknown>,
+      capabilityWorld?: string,
+      capabilityDescription?: string,
+      category?: string,
+      importedInterfaces?: string[],
+    ) => {
+      addNode(
+        moduleId,
+        moduleName,
+        { x: 250, y: 250 },
+        config,
+        capabilityWorld,
+        capabilityDescription,
+        category,
+        importedInterfaces,
+      );
+    },
+    [addNode],
+  );
 
   const handleSaveWithName = useCallback(async () => {
     if (!workflowId) {
@@ -219,7 +234,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
   };
 
   return (
-    <div 
+    <div
       className="bg-surface-1/60 backdrop-blur-xl border-b border-white/5 px-6 py-3 flex items-center gap-8 shrink-0 sticky top-0 z-40 shadow-2xl relative group"
       role="toolbar"
       aria-label="Workflow Construction Tools"
@@ -280,10 +295,10 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
             />
           </div>
           <div className="flex justify-end gap-3 pt-4 relative z-10">
-            <Button 
-                variant="ghost" 
-                onClick={closeModal}
-                className="h-12 px-8 text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+            <Button
+              variant="ghost"
+              onClick={closeModal}
+              className="h-12 px-8 text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
             >
               Abort
             </Button>
@@ -306,7 +321,8 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
       >
         <div className="space-y-6">
           <p className="text-[11px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
-            Create a named protocol snapshot. This allows for rapid rollback and audit tracking across the deployment pipeline.
+            Create a named protocol snapshot. This allows for rapid rollback and
+            audit tracking across the deployment pipeline.
           </p>
           <div className="relative group">
             <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
@@ -317,8 +333,15 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
                 setModal({ kind: "publish", desc: e.target.value })
               }
               onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
-                if (e.key === "Enter" && workflowId && modal.kind === "publish") {
-                  publishVersionMutation.mutate({ workflowId, description: modal.desc || undefined });
+                if (
+                  e.key === "Enter" &&
+                  workflowId &&
+                  modal.kind === "publish"
+                ) {
+                  publishVersionMutation.mutate({
+                    workflowId,
+                    description: modal.desc || undefined,
+                  });
                 }
                 if (e.key === "Escape") closeModal();
               }}
@@ -327,17 +350,21 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
             />
           </div>
           <div className="flex justify-end gap-3 pt-4 relative z-10">
-            <Button 
-                variant="ghost" 
-                onClick={closeModal}
-                className="h-12 px-8 text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+            <Button
+              variant="ghost"
+              onClick={closeModal}
+              className="h-12 px-8 text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
             >
               Cancel
             </Button>
             <Button
               variant="premium"
               onClick={() => {
-                if (workflowId && modal.kind === "publish") publishVersionMutation.mutate({ workflowId, description: modal.desc || undefined });
+                if (workflowId && modal.kind === "publish")
+                  publishVersionMutation.mutate({
+                    workflowId,
+                    description: modal.desc || undefined,
+                  });
               }}
               disabled={publishVersionMutation.isPending}
               className="h-12 px-10"
@@ -447,10 +474,10 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
 
       {/* Global state & Telemetry */}
       <div className="ml-auto flex items-center gap-6">
-        <WorkflowStatus 
-          name={workflowName} 
-          isDirty={isDirty} 
-          runStatus={runStatus} 
+        <WorkflowStatus
+          name={workflowName}
+          isDirty={isDirty}
+          runStatus={runStatus}
         />
 
         <div className="w-[1px] h-10 bg-white/5" />
@@ -462,17 +489,16 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
             onClick={() => setShowInspector(!showInspector)}
             className={cn(
               "px-4",
-              showInspector ? "bg-white/5 text-white border-white/10" : "text-muted-foreground/40 hover:text-white"
+              showInspector
+                ? "bg-white/5 text-white border-white/10"
+                : "text-muted-foreground/40 hover:text-white",
             )}
           >
             <Settings2 className="w-4 h-4 mr-2" />
             <span className="hidden sm:inline">Diagnostics</span>
           </Button>
 
-          <ResourceStats 
-            nodeCount={nodeCount} 
-            edgeCount={edgeCount} 
-          />
+          <ResourceStats nodeCount={nodeCount} edgeCount={edgeCount} />
         </div>
       </div>
 
@@ -507,4 +533,3 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
     </div>
   );
 });
-

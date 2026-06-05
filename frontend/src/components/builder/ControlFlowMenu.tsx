@@ -9,16 +9,44 @@ import { useWorkflowStore } from "@/store/workflowStore";
 import { useShallow } from "zustand/react/shallow";
 
 const SYSTEM_NODES = [
-  { kind: "ForEach" as const,          label: "For Each",           desc: "Iterate over array items" },
-  { kind: "FanIn" as const,            label: "Fan-In",             desc: "Merge parallel branches" },
-  { kind: "WhileLoop" as const,        label: "While Loop",         desc: "Loop while condition is true" },
-  { kind: "RepeatLoop" as const,       label: "Repeat",             desc: "Repeat N times" },
-  { kind: "SubWorkflow" as const,      label: "Sub-Workflow",       desc: "Run another workflow" },
-  { kind: "ErrorHandler" as const,     label: "Error Handler",      desc: "Catch and handle errors" },
-  { kind: "Wait" as const,             label: "Wait",               desc: "Pause for approval" },
-  { kind: "Collect" as const,          label: "Collect",            desc: "Aggregate multiple inputs" },
-  { kind: "DynamicDispatch" as const,  label: "Dynamic Dispatch",   desc: "Route to module by name" },
-  { kind: "CapabilityDispatch" as const, label: "Capability Dispatch", desc: "Route to module by capability" },
+  {
+    kind: "ForEach" as const,
+    label: "For Each",
+    desc: "Iterate over array items",
+  },
+  { kind: "FanIn" as const, label: "Fan-In", desc: "Merge parallel branches" },
+  {
+    kind: "WhileLoop" as const,
+    label: "While Loop",
+    desc: "Loop while condition is true",
+  },
+  { kind: "RepeatLoop" as const, label: "Repeat", desc: "Repeat N times" },
+  {
+    kind: "SubWorkflow" as const,
+    label: "Sub-Workflow",
+    desc: "Run another workflow",
+  },
+  {
+    kind: "ErrorHandler" as const,
+    label: "Error Handler",
+    desc: "Catch and handle errors",
+  },
+  { kind: "Wait" as const, label: "Wait", desc: "Pause for approval" },
+  {
+    kind: "Collect" as const,
+    label: "Collect",
+    desc: "Aggregate multiple inputs",
+  },
+  {
+    kind: "DynamicDispatch" as const,
+    label: "Dynamic Dispatch",
+    desc: "Route to module by name",
+  },
+  {
+    kind: "CapabilityDispatch" as const,
+    label: "Capability Dispatch",
+    desc: "Route to module by capability",
+  },
 ] as const;
 
 export type SystemNodeKind = (typeof SYSTEM_NODES)[number]["kind"];
@@ -33,7 +61,10 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const { addNode, updateNodeData } = useWorkflowStore(
-    useShallow((s) => ({ addNode: s.addNode, updateNodeData: s.updateNodeData })),
+    useShallow((s) => ({
+      addNode: s.addNode,
+      updateNodeData: s.updateNodeData,
+    })),
   );
 
   const addSystemNode = useCallback(
@@ -42,7 +73,16 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
         x: 250 + Math.random() * 100,
         y: 200 + Math.random() * 100,
       };
-      addNode(`system:${kind}`, label, position, {}, undefined, undefined, "control-flow", []);
+      addNode(
+        `system:${kind}`,
+        label,
+        position,
+        {},
+        undefined,
+        undefined,
+        "control-flow",
+        [],
+      );
       const storeNodes = useWorkflowStore.getState().nodes;
       const newNode = storeNodes[storeNodes.length - 1];
       if (newNode) updateNodeData(newNode.id, { systemNodeKind: kind });
@@ -57,7 +97,10 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
     if (!isOpen) return;
     setActiveIndex(-1);
     const handleClickOutside = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(e.target as Node)
+      ) {
         setIsOpen(false);
       }
     };
@@ -74,7 +117,9 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
         setActiveIndex((i) => (i + 1) % SYSTEM_NODES.length);
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        setActiveIndex((i) => (i - 1 + SYSTEM_NODES.length) % SYSTEM_NODES.length);
+        setActiveIndex(
+          (i) => (i - 1 + SYSTEM_NODES.length) % SYSTEM_NODES.length,
+        );
       } else if (e.key === "Enter" && activeIndex >= 0) {
         e.preventDefault();
         const sn = SYSTEM_NODES[activeIndex];
@@ -113,7 +158,9 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
         >
           <div className="absolute inset-0 bg-gradient-to-br from-cyan-500/10 via-transparent to-transparent opacity-30 pointer-events-none" />
           <div className="relative z-10 px-3 py-1.5 mb-1.5 border-b border-white/5">
-            <span className="text-[9px] font-black text-muted-foreground/40 uppercase tracking-[0.2em]">Logic Primitives</span>
+            <span className="text-[9px] font-black text-muted-foreground/40 uppercase tracking-[0.2em]">
+              Logic Primitives
+            </span>
           </div>
           {SYSTEM_NODES.map((sn, idx) => (
             <button
@@ -127,16 +174,24 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
                 activeIndex === idx ? "bg-white/5" : "hover:bg-white/[0.02]",
               )}
             >
-              <div className={cn(
-                "text-xs font-black uppercase tracking-widest",
-                activeIndex === idx ? "text-cyan-400" : "text-white group-hover:text-cyan-400",
-              )}>
+              <div
+                className={cn(
+                  "text-xs font-black uppercase tracking-widest",
+                  activeIndex === idx
+                    ? "text-cyan-400"
+                    : "text-white group-hover:text-cyan-400",
+                )}
+              >
                 {sn.label}
               </div>
-              <div className={cn(
-                "text-[9px] font-medium leading-relaxed",
-                activeIndex === idx ? "text-muted-foreground" : "text-muted-foreground/60 group-hover:text-muted-foreground",
-              )}>
+              <div
+                className={cn(
+                  "text-[9px] font-medium leading-relaxed",
+                  activeIndex === idx
+                    ? "text-muted-foreground"
+                    : "text-muted-foreground/60 group-hover:text-muted-foreground",
+                )}
+              >
                 {sn.desc}
               </div>
             </button>
