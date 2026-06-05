@@ -64,14 +64,15 @@ jobs:
         # `// secret-scan-allow:` opt-out marker, so the full gate now runs here.
         run: make audit
 
-  # ── Rust unit tests: library unit tests only (cargo nextest --lib) ─────────
-  # Scoped to `--lib` (~1.3k DB-free unit tests). The `tests/`-dir integration
-  # binaries (controller/worker) need a seeded template catalog, a built WASM
-  # sandbox, or a full-app harness, and have NEVER run in CI — bringing them in
-  # is tracked in docs/backlog.md. The DB-backed integration suite is covered
-  # by the `integration` job below (`make test-integration`). So `--lib` here
-  # avoids re-running (and failing on) those never-in-CI binaries while still
-  # gating the bulk of the unit suite.
+  # ── Rust unit tests: library unit tests + the DB-free integration binaries ──
+  # The bulk is `--lib` (~1.3k DB-free unit tests). On top of that we explicitly
+  # run the two `tests/`-dir integration binaries that are DB-free once their
+  # never-in-CI bugs were fixed: `module_template_tests` (disk template
+  # discovery) and `sandbox_security_tests` (WASM sandbox boundaries). The
+  # remaining `tests/`-dir binaries need a full-app DB harness and run in the
+  # `integration` job below (`make test-integration`) — bringing those in is
+  # tracked in docs/backlog.md. `--lib` keeps the default run from re-executing
+  # (and failing on) the DB-requiring binaries.
   test:
     name: Rust tests (unit / lib)
     runs-on: ubuntu-latest
@@ -131,9 +132,19 @@ jobs:
         # CARGO_MANIFEST_DIR path-resolution bug was fixed (the discovery fallback
         # had silently resolved to a non-existent dir since the May-2026 crate move,
         # so every get_template() returned None). The OTHER tests/-dir binaries are
-        # still excluded here — they need a seeded catalog / built WASM sandbox /
-        # full-app DB harness (tracked in docs/backlog.md).
+        # still excluded here — they need a built WASM sandbox / full-app DB
+        # harness (tracked in docs/backlog.md).
         run: cargo nextest run -p controller --test module_template_tests
+
+      - name: Run worker sandbox security tests
+        # Integration binary, DB-free: exercises the WASM sandbox security
+        # boundaries (path-traversal rejection, capability gates, SSRF host
+        # allow/deny, resource caps) via an in-process TalosContext — no network
+        # or DB required. Brought into CI after the stale path-traversal tests
+        # were corrected to the post-MCP-586 capability contract (PR #192). These
+        # are tenant-isolation/sandbox-escape guards — exactly the class that
+        # must not silently rot, which it did while never-in-CI.
+        run: cargo nextest run -p worker --test sandbox_security_tests
 
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable
