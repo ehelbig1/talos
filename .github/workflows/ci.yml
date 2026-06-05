@@ -168,7 +168,10 @@ jobs:
       # key for envelope encryption. 64 hex chars = 32 bytes — matches
       # what `openssl rand -hex 32` produces. Deterministic CI value;
       # production keys live in Helm secrets and are never this string.
-      TALOS_MASTER_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      # NON-zero: SecretsManager::new rejects an all-zero master key (the old
+      # all-zero value here failed every SecretsManager-constructing test; only
+      # surfaced once CI actually ran via quality.yml, 2026-06). 64 hex = 32 B.
+      TALOS_MASTER_KEY: "00000000000000000000000000000000000000000000000000000000deadbeef"
       # JWT signing in AuthService::new requires this; tests pass a
       # 32+ char secret directly but a few code paths still consult
       # the env var at construction time.
