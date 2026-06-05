@@ -430,6 +430,8 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
     let su = connect(&su_url).await;
     let user_a = Uuid::new_v4();
     let user_b = Uuid::new_v4();
+    let org_a = Uuid::new_v4();
+    let org_b = Uuid::new_v4();
     // Unique names so the assertions ignore any seeded workflows.
     let name_a = format!("wfa-{}", user_a.simple());
     let name_b = format!("wfb-{}", user_b.simple());
@@ -455,7 +457,7 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
             .await
             .expect("insert user");
     }
-    // org_id NULL → the user_id clause carries (sufficient for this test).
+    // org_id NULL → the user_id clause carries (sufficient for the READ asserts).
     for (u, n) in [(user_a, &name_a), (user_b, &name_b)] {
         sqlx::query(
             "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
@@ -466,6 +468,18 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
         .execute(&su)
         .await
         .expect("insert workflow");
+    }
+    // Two orgs for the org-based WRITE-side (WITH CHECK) assertions below
+    // (workflows.org_id FKs organizations).
+    for (o, owner) in [(org_a, user_a), (org_b, user_b)] {
+        sqlx::query("INSERT INTO organizations (id, name, slug, owner_id) VALUES ($1,$2,$3,$4)")
+            .bind(o)
+            .bind(format!("org-{}", o.simple()))
+            .bind(format!("org-{}", o.simple()))
+            .bind(owner)
+            .execute(&su)
+            .await
+            .expect("insert org");
     }
 
     let after_at = su_url.rsplit_once('@').map(|(_, r)| r).unwrap_or(&su_url);
@@ -501,33 +515,61 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
         "scoped read must enforce — only A's workflow"
     );
 
-    // WRITE-side (WITH CHECK): under A's scope, inserting a workflow owned
-    // by B is rejected — you can't write a row you don't own. (The wired
-    // create/update/delete mutations rely on this once fail-closed.)
-    let evil_name = format!("evil-{}", user_b.simple());
-    let mut tx_w = begin_tenant_read_scoped(&app, &TenantReadScope::new(user_a, vec![]))
+    // WRITE-side (WITH CHECK, ORG-based per migration 20260602120000): under
+    // ORG A's write scope (begin_org_scoped → app.current_org_id), a write into
+    // the active org is permitted, but a write that would place the row in a
+    // DIFFERENT org (B) is rejected. (The wired create/update mutations rely on
+    // this once enforcement is flipped on.)
+    let mut tx_ok = begin_org_scoped(&app, &OrgScope::new(org_a, user_a))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json) \
+         VALUES (gen_random_uuid(), $1, $2, $3, '', '{}')",
+    )
+    .bind(user_a)
+    .bind(org_a)
+    .bind(format!("okw-{}", org_a.simple()))
+    .execute(&mut *tx_ok)
+    .await
+    .expect("a write into the active org must be permitted");
+    tx_ok.commit().await.unwrap();
+
+    let evil_name = format!("evil-{}", org_b.simple());
+    let mut tx_w = begin_org_scoped(&app, &OrgScope::new(org_a, user_a))
         .await
         .unwrap();
     let rejected = sqlx::query(
-        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
-         VALUES (gen_random_uuid(), $1, $2, '', '{}')",
+        "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json) \
+         VALUES (gen_random_uuid(), $1, $2, $3, '', '{}')",
     )
-    .bind(user_b)
+    .bind(user_a)
+    .bind(org_b)
     .bind(&evil_name)
     .execute(&mut *tx_w)
     .await;
     assert!(
         rejected.is_err(),
-        "RLS WITH CHECK must reject inserting a workflow owned by another user"
+        "RLS WITH CHECK must reject inserting a workflow into a different org"
     );
     let _ = tx_w.rollback().await;
 
-    let _ = sqlx::query("DELETE FROM workflows WHERE name IN ($1,$2,$3)")
-        .bind(&name_a)
-        .bind(&name_b)
-        .bind(&evil_name)
-        .execute(&su)
-        .await;
+    // Cleanup — workflows (FK org_id/user_id) before orgs/users. Deleting by
+    // user_id covers name_a/name_b (org-less) + the committed org-A "okw" row;
+    // evil_name was rolled back. (`evil_name` kept above for the failed insert.)
+    let _ = &evil_name;
+    for u in [user_a, user_b] {
+        let _ = sqlx::query("DELETE FROM workflows WHERE user_id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
+    }
+    for o in [org_a, org_b] {
+        let _ = sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(o)
+            .execute(&su)
+            .await;
+    }
     for u in [user_a, user_b] {
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(u)
@@ -1053,12 +1095,19 @@ async fn unit_of_work_shares_scope_across_calls() {
 }
 
 /// RFC 0005 S3 — write-path enforcement under `SET LOCAL ROLE talos_app`.
-/// The permissive policies declare only `USING` (no explicit `WITH
-/// CHECK`), so per Postgres the `USING` predicate ALSO gates INSERT/UPDATE
-/// of new rows. This proves the consequence that gates the enforcement
-/// flip: a correctly-scoped write succeeds, and a write that would create
-/// a row for ANOTHER tenant is rejected by the policy (SQLSTATE 42501) —
-/// even though the underlying connection is a superuser.
+/// Migration 20260602120000 added an explicit ORG-based `WITH CHECK` to the
+/// org-scoped policies (workflows/secrets/actors): a write must land in the
+/// SINGLE active org (`app.current_org_id`, set by `begin_org_scoped`) — or be
+/// org-less, or made on an un-wired path (write-GUC unset → rollout-safe
+/// permit). This proves the consequence that gates the enforcement flip: a
+/// write into the active org succeeds, and a write that would place a row in
+/// ANOTHER org is rejected by the policy (SQLSTATE 42501) — even though the
+/// underlying connection is a superuser.
+///
+/// NOTE (contract): the org-scoped WITH CHECK pins `org_id` to the active org,
+/// NOT `user_id` — pinning user_id would break the org-scoped write path (which
+/// sets `app.current_org_id`, not `app.current_user_id`). Org-level isolation is
+/// the RLS boundary here; the app layer sets `user_id`.
 #[tokio::test]
 async fn set_role_with_check_gates_cross_tenant_writes() {
     let Some(su_url) = superuser_url() else {
@@ -1069,6 +1118,8 @@ async fn set_role_with_check_gates_cross_tenant_writes() {
 
     let user_a = Uuid::new_v4();
     let user_b = Uuid::new_v4();
+    let org_a = Uuid::new_v4();
+    let org_b = Uuid::new_v4();
     let wf_ok = Uuid::new_v4();
     let wf_bad = Uuid::new_v4();
     for (u, label) in [(user_a, "wca"), (user_b, "wcb")] {
@@ -1080,47 +1131,59 @@ async fn set_role_with_check_gates_cross_tenant_writes() {
             .await
             .unwrap();
     }
+    // Two orgs (workflows.org_id FKs organizations). owner_id is irrelevant to
+    // the WITH CHECK (it pins org_id, not ownership); just satisfy NOT NULL.
+    for (o, owner) in [(org_a, user_a), (org_b, user_b)] {
+        sqlx::query("INSERT INTO organizations (id, name, slug, owner_id) VALUES ($1,$2,$3,$4)")
+            .bind(o)
+            .bind(format!("org-{}", o.simple()))
+            .bind(format!("org-{}", o.simple()))
+            .bind(owner)
+            .execute(&su)
+            .await
+            .unwrap();
+    }
 
-    // Scoped to A, INSERT a workflow owned by A → satisfies USING-as-WITH-CHECK.
+    // Scoped to ORG A, INSERT a workflow into ORG A → satisfies the org-based WITH CHECK.
     let mut tx = su.begin().await.unwrap();
     (&mut *tx)
         .execute(
-            format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{user_a}'; SET LOCAL app.current_org_ids = ''")
-                .as_str(),
+            format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_org_id = '{org_a}'").as_str(),
         )
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
-         VALUES ($1, $2, 'ok', 'mod://x', '{}'::jsonb)",
+        "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json) \
+         VALUES ($1, $2, $3, 'ok', 'mod://x', '{}'::jsonb)",
     )
     .bind(wf_ok)
     .bind(user_a)
+    .bind(org_a)
     .execute(&mut *tx)
     .await
-    .expect("a correctly-scoped write (own user_id) must satisfy the policy");
+    .expect("a write into the active org must satisfy the policy");
     tx.commit().await.unwrap();
 
-    // Scoped to A, INSERT a workflow owned by B → violates the policy.
+    // Scoped to ORG A, INSERT a workflow into ORG B → violates the WITH CHECK.
     let mut tx = su.begin().await.unwrap();
     (&mut *tx)
         .execute(
-            format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{user_a}'; SET LOCAL app.current_org_ids = ''")
-                .as_str(),
+            format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_org_id = '{org_a}'").as_str(),
         )
         .await
         .unwrap();
     let res = sqlx::query(
-        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json) \
-         VALUES ($1, $2, 'bad', 'mod://x', '{}'::jsonb)",
+        "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json) \
+         VALUES ($1, $2, $3, 'bad', 'mod://x', '{}'::jsonb)",
     )
     .bind(wf_bad)
-    .bind(user_b)
+    .bind(user_a)
+    .bind(org_b)
     .execute(&mut *tx)
     .await;
     assert!(
         res.is_err(),
-        "writing a row owned by another tenant under SET ROLE must be rejected by the policy"
+        "writing a workflow into a DIFFERENT org under SET ROLE must be rejected by the WITH CHECK"
     );
     if let Err(sqlx::Error::Database(dbe)) = &res {
         assert_eq!(
@@ -1136,6 +1199,12 @@ async fn set_role_with_check_gates_cross_tenant_writes() {
         .bind(wf_ok)
         .execute(&su)
         .await;
+    for o in [org_a, org_b] {
+        let _ = sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(o)
+            .execute(&su)
+            .await;
+    }
     for u in [user_a, user_b] {
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(u)
