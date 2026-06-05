@@ -58,9 +58,21 @@ Running it on PRs (or nightly) would have caught it immediately.
 
 ---
 
-## Enforce the heavy / networked CI gates (advisory audit + test suite)
+## Enforce the heavy / networked CI gates (advisory audit + test suite) — DONE (PR pending)
 
-**Added:** 2026-06-04.
+**Added:** 2026-06-04. **DONE:** 2026-06-05 — `.github/workflows/quality.yml`.
+
+**Resolution.** Added `quality.yml`, triggered on `pull_request` to main +
+nightly `schedule` + `workflow_dispatch` (trigger chosen by the operator).
+Jobs: `audit` (`make audit` — networked cargo-deny advisories + bans/licenses/
+sources + secret scan + migration idempotency), `test` (`cargo nextest
+--workspace` + Postgres service + migrations), **`integration`
+(`make test-integration` — the env-gated DB suite incl. RLS isolation /
+crash-recovery that `cargo nextest` alone skips)**, and `frontend` (npm lint +
+tsc + vitest). Reuses the `make` targets so CI can't drift from local. Excludes
+the expensive image builds (those stay in the dispatch-only `ci.yml`). This is
+the unbypassable backstop that would have caught the RLS suite going red
+(#181/#182) within a PR / 24h. Original task description retained below.
 
 **What.** Add a CI workflow that runs the quality gates too slow or too
 network-dependent for the local pre-push hook:

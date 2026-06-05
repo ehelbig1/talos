@@ -1,0 +1,228 @@
+name: Quality (heavy gates)
+
+# The correctness gates that are too slow or too network-dependent for the
+# local pre-push hook (`make lint` + `make lint-frontend`), so they need a CI
+# home or they silently rot — exactly how the RLS isolation suite sat red on
+# main for days (PR #181/#182). Lean by design: it runs ONLY the correctness
+# gates. The expensive image builds (docker / sandbox-image) stay in ci.yml,
+# which remains workflow_dispatch-only.
+#
+# Unique value over the pre-push hook:
+#   * full Rust workspace test suite (unit) — too slow for pre-push
+#   * env-gated INTEGRATION tests (RLS isolation, crash-recovery, …) — the
+#     pre-push hook can't spin up Postgres/Redis; `cargo nextest` alone SKIPS
+#     them (they no-op unless TALOS_TEST_*_URL is set)
+#   * networked RUSTSEC advisory scan — pre-push runs only the OFFLINE
+#     cargo-deny checks (bans/licenses/sources)
+#   * frontend lint + test as an unbypassable backstop for contributors who
+#     skip `make hooks`
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * *" # nightly 07:00 UTC — catches new RUSTSEC advisories within 24h
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Single source of truth for the toolchain — keep in lockstep with ci.yml
+  # and rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.95"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Supply-chain: networked RUSTSEC advisories + bans/licenses/sources ─────
+  # `make audit` = cargo-deny (advisories + bans + licenses + sources) + the
+  # secret-pattern scan + migration-idempotency checks. The advisory DB fetch
+  # needs network, which is why this can't live in the offline pre-push hook.
+  audit:
+    name: Supply-chain (cargo-deny advisories)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@7769b73c2ec98c38dfcf2e18c83cfd4880c038c1 # v2.62.21
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check (incl. networked RUSTSEC advisories)
+        # The networked supply-chain gate: advisories (fetches the RustSec DB)
+        # + bans + licenses + sources. This is the piece the OFFLINE pre-push
+        # gate can't run. NOT the full `make audit` — its secret-pattern scan
+        # currently false-positives on legitimate test fixtures (sk-AAAA… DLP
+        # redaction tests); fixing + relocating that offline check is tracked
+        # in docs/backlog.md.
+        run: cargo deny check
+
+  # ── Rust unit tests: nextest with a Postgres service (mirrors ci.yml) ──────
+  test:
+    name: Rust tests (unit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+        env:
+          POSTGRES_USER: talos
+          POSTGRES_PASSWORD: talos
+          POSTGRES_DB: talos
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U talos -d talos"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://talos:talos@localhost:5432/talos
+      TALOS_MASTER_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      JWT_SECRET: "ci-jwt-secret-32-bytes-of-padding-zzzzz"
+      # CI runners have ~14 GB free disk; trim debuginfo so the workspace
+      # debug build doesn't exhaust it mid-link (see ci.yml for the rationale).
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install mold linker
+        # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
+        # so a Linux host can't link the workspace without mold installed.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.7.5
+        with:
+          shared-key: quality-test
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@7769b73c2ec98c38dfcf2e18c83cfd4880c038c1 # v2.62.21
+        with:
+          tool: cargo-nextest
+
+      - name: Apply migrations to services postgres
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+          for f in migrations/*.sql; do
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: Run unit tests
+        run: cargo nextest run --workspace --no-fail-fast
+
+      - name: Doctests
+        run: cargo test --workspace --doc
+
+  # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
+  # recovery, memory, …). `make test-integration` provisions its own disposable
+  # pgvector + Redis via Docker (available on ubuntu-latest), applies the full
+  # migration set, sets TALOS_TEST_*_URL, runs the gated tests, and tears down.
+  # This is the gate that catches what `cargo nextest` SKIPS — e.g. the RLS
+  # write-isolation regression in PR #181/#182.
+  integration:
+    name: Rust tests (integration / DB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install mold linker
+        # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
+        # so a Linux host can't link the workspace without mold installed.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.7.5
+        with:
+          shared-key: quality-integration
+
+      - name: Install sqlx-cli
+        # `make test-integration` runs `sqlx migrate run` against the disposable
+        # Postgres it provisions.
+        uses: taiki-e/install-action@7769b73c2ec98c38dfcf2e18c83cfd4880c038c1 # v2.62.21
+        with:
+          tool: sqlx-cli
+
+      - name: make test-integration
+        # Self-contained: provisions disposable Docker pgvector + Redis, migrates,
+        # runs the TALOS_TEST_*_URL-gated tests, tears down. Single source of
+        # truth with the local target.
+        run: make test-integration
+
+  # ── Frontend: lint + typecheck + tests (backstop for non-`make hooks` devs) ─
+  frontend:
+    name: Frontend (lint + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: Lint (eslint + prettier)
+        run: npm run lint
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npx vitest run
