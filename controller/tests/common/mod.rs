@@ -1,5 +1,7 @@
 use async_graphql::Schema;
-use controller::api::schema::{ApiKeyScopes, MutationRoot, QueryRoot, SubscriptionRoot};
+use controller::api::schema::{
+    ApiKeyScopes, IsTwoFactorVerified, MutationRoot, QueryRoot, SubscriptionRoot,
+};
 use controller::api_keys::{ApiKeyScope, ApiKeyService};
 use controller::auth::AuthService;
 use controller::db::init_pool;
@@ -206,7 +208,13 @@ impl AuthenticatedClient {
     pub async fn execute(&self, query: &str) -> async_graphql::Response {
         let mut req = async_graphql::Request::new(query)
             .data(self.user_id)
-            .data(ApiKeyScopes(self.scopes.clone()));
+            .data(ApiKeyScopes(self.scopes.clone()))
+            // Mirror the real API-key auth path (controller/src/main.rs:5805):
+            // API-key requests are 2FA-verified by construction. Without this,
+            // every 2FA-gated mutation (`require_2fa`, MCP-616 fail-closed)
+            // rejects with "Two-Factor Authentication required" before the
+            // scope check runs.
+            .data(IsTwoFactorVerified(true));
 
         if let Some(org_id) = self.organization_id {
             req = req.data(org_id);
@@ -225,7 +233,9 @@ impl AuthenticatedClient {
         let mut req = async_graphql::Request::new(query)
             .variables(vars)
             .data(self.user_id)
-            .data(ApiKeyScopes(self.scopes.clone()));
+            .data(ApiKeyScopes(self.scopes.clone()))
+            // See `execute` — replicate the API-key path's 2FA-verified context.
+            .data(IsTwoFactorVerified(true));
 
         if let Some(org_id) = self.organization_id {
             req = req.data(org_id);
