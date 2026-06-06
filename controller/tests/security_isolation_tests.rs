@@ -4,7 +4,6 @@ use common::{create_test_user, setup_test_context, AuthenticatedClient};
 use controller::api_keys::ApiKeyScope;
 use uuid::Uuid;
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_cross_user_workflow_access() {
     let ctx = setup_test_context().await;
@@ -71,7 +70,6 @@ async fn test_cross_user_workflow_access() {
     assert!(msg.contains("not found") || msg.contains("denied"));
 }
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_dataloader_leakage_module_logs() {
     let ctx = setup_test_context().await;
@@ -81,22 +79,21 @@ async fn test_dataloader_leakage_module_logs() {
     let user_b_id = create_test_user(&ctx.auth_service, "user_b_logs@example.com").await;
 
     // 2. User B has a module execution with logs
-    let template_id = Uuid::new_v4();
     let module_id = Uuid::new_v4();
     let execution_id = Uuid::new_v4();
 
-    // Insert template and module first to satisfy foreign keys
-    sqlx::query("INSERT INTO node_templates (id, name, category, config_schema, code_template) VALUES ($1, 'Test', 'test', '{}', '')")
-        .bind(template_id)
-        .execute(&ctx.db_pool)
-        .await.unwrap();
-
-    sqlx::query("INSERT INTO wasm_modules (id, name, content_hash, wasm_bytes, template_id, user_id, size_bytes, max_fuel, max_memory_mb) VALUES ($1, 'Test', 'hash', '', $2, $3, 0, 0, 0)")
-        .bind(module_id)
-        .bind(template_id)
-        .bind(user_b_id)
-        .execute(&ctx.db_pool)
-        .await.unwrap();
+    // Insert the module to satisfy module_executions' FK. Phase-5 unified the
+    // old `node_templates` + `wasm_modules` pair into a single `modules` table;
+    // a user-owned compiled module is `kind = 'sandbox'`.
+    sqlx::query(
+        "INSERT INTO modules (id, user_id, name, kind, content_hash, wasm_bytes, size_bytes, max_fuel) \
+         VALUES ($1, $2, 'Test', 'sandbox', 'hash', ''::bytea, 0, 0)",
+    )
+    .bind(module_id)
+    .bind(user_b_id)
+    .execute(&ctx.db_pool)
+    .await
+    .unwrap();
 
     // Now insert the execution
     sqlx::query("INSERT INTO module_executions (id, module_id, user_id, status, trigger_type) VALUES ($1, $2, $3, 'completed', 'manual')")
@@ -141,7 +138,6 @@ async fn test_dataloader_leakage_module_logs() {
     assert!(msg.contains("not found") || msg.contains("denied"));
 }
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_scope_escalation_api_key() {
     let ctx = setup_test_context().await;
