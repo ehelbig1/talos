@@ -1,15 +1,22 @@
 use crate::common::{create_test_user, setup_test_context, AuthenticatedClient};
+use controller::api_keys::ApiKeyScope;
 use serde_json::json;
 use uuid::Uuid;
 
 mod common;
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_dead_letter_queue_flow() {
     let ctx = setup_test_context().await;
     let user_id: Uuid = create_test_user(&ctx.auth_service, "governance@example.com").await;
-    let client = AuthenticatedClient::new(user_id, None, vec![], ctx.schema.clone());
+    // `deadLetterQueue` is gated on WorkflowsRead (results are still filtered to
+    // the calling user, so this scope grants visibility, not cross-user access).
+    let client = AuthenticatedClient::new(
+        user_id,
+        None,
+        vec![ApiKeyScope::WorkflowsRead],
+        ctx.schema.clone(),
+    );
 
     // 1. Seed a workflow node failure into DLQ
     let workflow_id = Uuid::new_v4();
@@ -69,36 +76,31 @@ async fn test_dead_letter_queue_flow() {
     assert_eq!(entry["errorMessage"], "WASM Runtime Panic");
 }
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_webhook_dlq_flow() {
     let ctx = setup_test_context().await;
     let user_id: Uuid = create_test_user(&ctx.auth_service, "webhook-dlq@example.com").await;
-    let client = AuthenticatedClient::new(user_id, None, vec![], ctx.schema.clone());
+    // `webhookDeadLetterQueue` is gated on WebhooksAccess (user-filtered).
+    let client = AuthenticatedClient::new(
+        user_id,
+        None,
+        vec![ApiKeyScope::WebhooksAccess],
+        ctx.schema.clone(),
+    );
 
-    // 1. Seed a module first
-    let template_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO node_templates (id, name, category, config_schema, code_template) VALUES ($1, $2, $3, $4, $5)")
-        .bind(template_id)
-        .bind("Test Template")
-        .bind("http")
-        .bind(json!({}))
-        .bind("")
-        .execute(&ctx.db_pool)
-        .await
-        .unwrap();
-
+    // 1. Seed a module first (Phase-5 unified `modules` table replaces the old
+    //    node_templates + wasm_modules pair; user-owned compiled = 'sandbox').
     let module_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO wasm_modules (id, name, content_hash, wasm_bytes, template_id, size_bytes) VALUES ($1, $2, $3, $4, $5, $6)")
-        .bind(module_id)
-        .bind("Test Module")
-        .bind("hash_123")
-        .bind(vec![0u8; 10])
-        .bind(template_id)
-        .bind(10)
-        .execute(&ctx.db_pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO modules (id, user_id, name, kind, content_hash, wasm_bytes, size_bytes) \
+         VALUES ($1, $2, 'Test Module', 'sandbox', 'hash_123', $3, 10)",
+    )
+    .bind(module_id)
+    .bind(user_id)
+    .bind(vec![0u8; 10])
+    .execute(&ctx.db_pool)
+    .await
+    .unwrap();
 
     // 2. Seed a webhook trigger
     let trigger_id = Uuid::new_v4();
@@ -163,12 +165,17 @@ async fn test_webhook_dlq_flow() {
         .await;
 }
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_approval_queue_and_resource_quotas() {
     let ctx = setup_test_context().await;
     let user_id: Uuid = create_test_user(&ctx.auth_service, "approval@example.com").await;
-    let client = AuthenticatedClient::new(user_id, None, vec![], ctx.schema.clone());
+    // This test hits two queries with different gates: `pendingApprovals`
+    // (WorkflowsRead) and `resourceQuotas` (Admin — it exposes org capacity
+    // policy, MCP-757). Admin satisfies both (it bypasses the per-scope check);
+    // the resolvers still resolve the org from the caller's DB membership, so
+    // this grants visibility, not cross-tenant access.
+    let client =
+        AuthenticatedClient::new(user_id, None, vec![ApiKeyScope::Admin], ctx.schema.clone());
 
     // 0. Seed an Organization
     let org_id = Uuid::new_v4();
@@ -189,29 +196,18 @@ async fn test_approval_queue_and_resource_quotas() {
         .await
         .unwrap();
 
-    // 1. Seed necessary FKs for approvals
-    let template_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO node_templates (id, name, category, config_schema, code_template) VALUES ($1, $2, $3, $4, $5)")
-        .bind(template_id)
-        .bind("Approval Template")
-        .bind("integration")
-        .bind(json!({}))
-        .bind("")
-        .execute(&ctx.db_pool)
-        .await
-        .unwrap();
-
+    // 1. Seed necessary FKs for approvals (Phase-5 unified `modules` table)
     let module_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO wasm_modules (id, name, content_hash, wasm_bytes, template_id, size_bytes) VALUES ($1, $2, $3, $4, $5, $6)")
-        .bind(module_id)
-        .bind("Approval Module")
-        .bind("approval_hash")
-        .bind(vec![0u8; 10])
-        .bind(template_id)
-        .bind(10)
-        .execute(&ctx.db_pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO modules (id, user_id, name, kind, content_hash, wasm_bytes, size_bytes) \
+         VALUES ($1, $2, 'Approval Module', 'sandbox', 'approval_hash', $3, 10)",
+    )
+    .bind(module_id)
+    .bind(user_id)
+    .bind(vec![0u8; 10])
+    .execute(&ctx.db_pool)
+    .await
+    .unwrap();
 
     let execution_id = Uuid::new_v4();
     sqlx::query("INSERT INTO module_executions (id, module_id, user_id, status, trigger_type) VALUES ($1, $2, $3, $4, $5)")

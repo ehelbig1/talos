@@ -112,6 +112,8 @@ CTRL_TESTS=(
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"
+    "security_isolation_tests"
+    "governance_tests"
 )
 for ctest in "${CTRL_TESTS[@]}"; do
     echo
