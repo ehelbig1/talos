@@ -124,6 +124,33 @@ for ctest in "${CTRL_TESTS[@]}"; do
     fi
 done
 
+# ── Testcontainers-based controller binaries ────────────────────────────────
+# These self-provision their OWN Postgres via testcontainers (controller/tests/
+# test_helpers) — they IGNORE DATABASE_URL and the shared 'talos*' DBs above, so
+# they only need a Docker daemon (already used by this script) + a non-zero
+# TALOS_MASTER_KEY for any SecretsManager construction. Run single-threaded:
+# each binary shares one container across its tests and several do global writes.
+# All currently green (47 tests across auth / oauth / org-RBAC / registry-access /
+# secrets — security-critical surfaces); gated here so they can't silently rot
+# the way the DB-harness + Phase-5 binaries did. The test_helpers harness shares
+# only the container (one fresh pool per test) so they no longer flake.
+TC_TESTS=(
+    "auth_tests"
+    "oauth_tests"
+    "oauth_scoped_token_tests"
+    "organization_tests"
+    "registry_access_tests"
+    "secrets_tests"
+)
+for tctest in "${TC_TESTS[@]}"; do
+    echo
+    echo "▶ controller :: ${tctest}  [testcontainers, single-threaded]"
+    if ! TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
+        cargo test -p controller --test "$tctest" -- --test-threads=1; then
+        rc=1
+    fi
+done
+
 echo
 if [ "$rc" -eq 0 ]; then
     echo "✓ integration tests passed"
