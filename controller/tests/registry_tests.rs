@@ -26,24 +26,27 @@ async fn create_test_user(db: &Pool<Postgres>) -> Uuid {
     user_id
 }
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_list_templates() {
     let (registry, db) = setup_registry().await;
 
-    // Clean up
-    sqlx::query("DELETE FROM node_templates")
+    // Clean up. Phase 5: `list_templates` reads from the unified `modules`
+    // table (the old node_templates + wasm_modules pair was dropped).
+    sqlx::query("DELETE FROM modules")
         .execute(&db)
         .await
         .unwrap();
 
-    // Insert test templates
+    // Insert catalog templates directly. `list_templates` maps modules →
+    // NodeTemplate as: category = COALESCE(category, kind),
+    // code_template = COALESCE(source_code, ''), precompiled_wasm = wasm_bytes.
+    // Catalog entries are user_id IS NULL with kind = 'catalog'.
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO node_templates (id, name, category, description, config_schema, code_template, precompiled_wasm)
-         VALUES ($1, $2, $3, $4, $5, $6, $7), ($8, $9, $10, $11, $12, $13, $14)"
+        "INSERT INTO modules (id, name, kind, category, description, config_schema, source_code, wasm_bytes)
+         VALUES ($1, $2, 'catalog', $3, $4, $5, $6, $7), ($8, $9, 'catalog', $10, $11, $12, $13, $14)"
     )
     .bind(id1).bind("Template A").bind("cat1").bind("desc1").bind(json!({})).bind("code1").bind(vec![1u8, 2, 3])
     .bind(id2).bind("Template B").bind("cat2").bind("desc2").bind(json!({})).bind("code2").bind(vec![4u8, 5, 6])
@@ -62,7 +65,6 @@ async fn test_list_templates() {
     assert_eq!(filtered[0].name, "Template A");
 }
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_module_storage_and_retrieval() {
     let (registry, db) = setup_registry().await;
@@ -113,7 +115,6 @@ async fn test_module_storage_and_retrieval() {
     assert!(result.is_err(), "Access should be denied for other user");
 }
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_get_execution_info() {
     let (registry, db) = setup_registry().await;
@@ -129,7 +130,7 @@ async fn test_get_execution_info() {
         size_bytes: 3,
         max_fuel: 100,
         max_memory_mb: 32,
-        allowed_hosts: vec![], // Should trigger fallback
+        allowed_hosts: vec![], // explicit empty — no implicit host grants
         allowed_secrets: vec![],
         requires_approval_for: vec![],
         allowed_methods: vec![],
@@ -149,22 +150,31 @@ async fn test_get_execution_info() {
         .await
         .unwrap();
 
-    // Check fallback hosts (empty allowed_hosts triggers default list)
-    assert!(info.allowed_hosts.contains(&"api.github.com".to_string()));
-    assert!(info
-        .allowed_hosts
-        .contains(&"www.googleapis.com".to_string()));
+    // allowed_hosts is returned exactly as declared — no implicit fallback
+    // list. The old "empty → default github/googleapis allow-list" behavior was
+    // removed: a module only reaches the hosts it explicitly requested (granting
+    // un-requested hosts is an egress-policy hole). Empty in → empty out.
+    assert!(
+        info.allowed_hosts.is_empty(),
+        "empty allowed_hosts must stay empty (no implicit host grants), got {:?}",
+        info.allowed_hosts
+    );
 
-    assert_eq!(info.module_uri, format!("redis:wasm:{}", module_id));
+    // module_uri is USER-SCOPED (`redis:wasm:{user_id}:{module_id}`) — the
+    // cross-tenant cache-key isolation fix; the old unscoped `redis:wasm:{id}`
+    // form let loop/sub-workflow re-dispatches miss the user-scoped cache key.
+    assert_eq!(
+        info.module_uri,
+        format!("redis:wasm:{}:{}", user_id, module_id)
+    );
 }
 
-#[ignore = "references dropped wasm_modules/node_templates tables — port fixtures to unified `modules` table (Phase 5)"]
 #[tokio::test]
 async fn test_cache_limits_eviction() {
     let (registry, db) = setup_registry().await;
 
-    // Clean up wasm_modules
-    sqlx::query("DELETE FROM wasm_modules")
+    // Clean up (Phase 5: unified `modules` table replaces `wasm_modules`).
+    sqlx::query("DELETE FROM modules")
         .execute(&db)
         .await
         .unwrap();
@@ -196,10 +206,11 @@ async fn test_cache_limits_eviction() {
             integration_name: None,
         };
         let id = registry.store_module(m).await.unwrap();
-        // Manually set last_used to ensure deterministic eviction order
-        // Modules added with i=0 (oldest), i=1, i=2 (newest)
+        // Manually set last_used_at to ensure deterministic eviction order
+        // (enforce_cache_limits evicts ORDER BY last_used_at ASC NULLS FIRST).
+        // Modules added with i=0 (oldest), i=1, i=2 (newest).
         sqlx::query(
-            "UPDATE wasm_modules SET last_used = NOW() - INTERVAL '1 hour' * $1 WHERE id = $2",
+            "UPDATE modules SET last_used_at = NOW() - INTERVAL '1 hour' * $1 WHERE id = $2",
         )
         .bind(10 - i)
         .bind(id)
@@ -216,10 +227,9 @@ async fn test_cache_limits_eviction() {
     assert_eq!(stats.module_count, 2);
 
     // Verify M0 is deleted
-    let remaining =
-        sqlx::query_scalar::<_, String>("SELECT name FROM wasm_modules ORDER BY name ASC")
-            .fetch_all(&db)
-            .await
-            .unwrap();
+    let remaining = sqlx::query_scalar::<_, String>("SELECT name FROM modules ORDER BY name ASC")
+        .fetch_all(&db)
+        .await
+        .unwrap();
     assert_eq!(remaining, vec!["M1", "M2"]);
 }
