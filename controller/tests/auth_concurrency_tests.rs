@@ -61,7 +61,6 @@ async fn test_revoke_refresh_race() {
 }
 
 #[tokio::test]
-#[ignore = "Stale assumption: r266 added refresh-token rotation, so a single refresh_token is single-use — the second loop iteration always fails. Test needs to capture each rotation's new token, not reuse the original."]
 async fn test_in_memory_rate_limit_fallback() {
     let ctx = setup_test_context().await;
 
@@ -78,18 +77,29 @@ async fn test_in_memory_rate_limit_fallback() {
 
     let email = format!("ratelimit_{}@example.com", Uuid::new_v4());
     let _user_id = common::create_test_user(&auth, &email).await;
-    let (_, refresh_token) = common::login_test_user(&auth, &email).await;
+    let (_, mut refresh_token) = common::login_test_user(&auth, &email).await;
 
-    // Window allows 10 requests per 60 seconds per session.
-    // Try to refresh 11 times.
+    // The in-memory fallback allows 10 refreshes per 60s per USER (the limiter
+    // keys on user_id — see AuthService::refresh_access_token — which is stable
+    // across refresh-token rotation, so the cap can't be bypassed by chaining
+    // rotations). r266 made refresh tokens single-use, so each call rotates the
+    // token: capture the new one and feed it forward, otherwise the 2nd call
+    // fails on token validity rather than exercising the rate limit.
     for i in 1..=10 {
-        auth.refresh_access_token(&refresh_token)
+        let (_access, new_refresh, _user, _is_2fa) = auth
+            .refresh_access_token(&refresh_token)
             .await
-            .unwrap_or_else(|_| panic!("Request {} should succeed", i));
+            .unwrap_or_else(|e| panic!("Request {i} should succeed, got: {e}"));
+        refresh_token = new_refresh;
     }
 
-    // 11th request should fail
+    // 11th request — with the LATEST valid token — must fail on the rate limit,
+    // not on token validity. Asserting the specific message proves it's the
+    // limiter (not rotation) that stops it.
     let res = auth.refresh_access_token(&refresh_token).await;
     assert!(res.is_err(), "11th request should have been rate limited");
-    assert!(res.unwrap_err().to_string().contains("Rate limit exceeded"));
+    assert!(
+        res.unwrap_err().to_string().contains("Rate limit exceeded"),
+        "11th failure must be the rate limit, not a token-validity error"
+    );
 }

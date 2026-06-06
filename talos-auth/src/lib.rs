@@ -1105,7 +1105,12 @@ impl AuthService {
             }
         };
 
-        // Rate limiting by session ID to prevent spam and CPU exhaustion from bcrypt.
+        // Rate limiting by USER ID (`session.1` is user_id — see the SELECT
+        // above) to prevent spam and CPU exhaustion from bcrypt. Keying on the
+        // user, not the session, is deliberate: refresh-token rotation issues a
+        // new session_id on every call, so a per-session limit would reset each
+        // refresh and be trivially bypassable by chaining rotations. user_id is
+        // stable across the rotation chain, so the cap actually holds.
         // First try distributed rate limiting via Redis.
         if let Some(redis) = &self.redis_client {
             match self.check_refresh_rate_limit_redis(session.1, redis).await {
@@ -1170,7 +1175,7 @@ impl AuthService {
             } else {
                 *count += 1;
                 if *count > 10 {
-                    // Max 10 refreshes per minute per session
+                    // Max 10 refreshes per minute per user (see keying note above)
                     return Err(anyhow::anyhow!("Rate limit exceeded for token refresh"));
                 }
             }
