@@ -146,6 +146,30 @@ jobs:
         # must not silently rot, which it did while never-in-CI.
         run: cargo nextest run -p worker --test sandbox_security_tests
 
+      - name: Run DB-free security integration binaries
+        # More tests/-dir binaries that need NO database or container — pure
+        # logic / in-process harnesses, like the two steps above. They never ran
+        # in CI (only --lib + the two explicit binaries did), so they were free
+        # to rot. All verified green. Run via nextest specifically because
+        # `csrf_integration_tests` mutates process-global env (RUST_ENV,
+        # ALLOW_DEV_UNSAFE_CSRF_BYPASS) — under `cargo test`'s thread parallelism
+        # a sibling test's env write races and falsely "bypasses" CSRF; nextest's
+        # process-per-test isolation makes each test's env private, so the gate is
+        # stable. Covers: JWT security, CSRF protection, input validation,
+        # MCP-safety, webhook security (controller); tier-1 LLM egress + agentic
+        # safety (worker); signed job-protocol security (HMAC/replay/wire-format).
+        run: |
+          cargo nextest run -p controller \
+            --test jwt_security_tests \
+            --test webhook_security_tests \
+            --test csrf_integration_tests \
+            --test input_validation_tests \
+            --test mcp_safety_tests
+          cargo nextest run -p worker \
+            --test tier1_llm_enforcement_tests \
+            --test agentic_safety_tests
+          cargo nextest run -p talos-workflow-job-protocol --test security_tests
+
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable
   # pgvector + Redis via Docker (available on ubuntu-latest), applies the full

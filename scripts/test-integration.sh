@@ -140,6 +140,7 @@ TC_TESTS=(
     "oauth_scoped_token_tests"
     "organization_tests"
     "registry_access_tests"
+    "registry_tests"
     "secrets_tests"
 )
 for tctest in "${TC_TESTS[@]}"; do
