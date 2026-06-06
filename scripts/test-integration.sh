@@ -49,11 +49,18 @@ docker exec "$PG_NAME" pg_isready >/dev/null 2>&1 || { echo "Postgres never beca
 PG_BASE="postgres://${PG_USER}:${PG_PASS}@127.0.0.1:${PG_PORT}"
 MIGRATED_URL="${PG_BASE}/talos"
 SELFCONTAINED_URL="${PG_BASE}/talos_sc"
+# Dedicated migrated DB for the controller DB-harness binaries (see CTRL_TESTS
+# below). They DELETE global tables in setup, so they get their own DB to stay
+# isolated from the shared 'talos' migrated tests.
+CTL_URL="${PG_BASE}/talos_ctl"
 
 echo "▶ applying migrations to 'talos'…"
 DATABASE_URL="$MIGRATED_URL" sqlx migrate run --source migrations >/dev/null
 echo "▶ creating empty 'talos_sc' for self-contained tests…"
 docker exec "$PG_NAME" psql -U "$PG_USER" -d talos -c "CREATE DATABASE talos_sc" >/dev/null
+echo "▶ creating + migrating 'talos_ctl' for the controller DB-harness binaries…"
+docker exec "$PG_NAME" psql -U "$PG_USER" -d talos -c "CREATE DATABASE talos_ctl" >/dev/null
+DATABASE_URL="$CTL_URL" sqlx migrate run --source migrations >/dev/null
 
 export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 
@@ -86,6 +93,30 @@ for entry in "${TESTS[@]}"; do
     echo
     echo "▶ ${crate} :: ${test}  [${store}]"
     if ! TALOS_TEST_DATABASE_URL="$db" cargo test -p "$crate" --test "$test"; then
+        rc=1
+    fi
+done
+
+# ── Controller DB-harness binaries ──────────────────────────────────────────
+# These predate the TALOS_TEST_DATABASE_URL convention: they read DATABASE_URL
+# directly via controller::db::init_pool, need a non-zero TALOS_MASTER_KEY
+# (SecretsManager rejects all-zero), and DELETE global tables in
+# setup_test_context — so they run SINGLE-THREADED against their OWN migrated DB
+# ('talos_ctl') to stay isolated from the shared-'talos' migrated tests above.
+# Brought into CI after their stale 2FA-context drift was fixed (PR #193); the
+# JWT secret is a hard-coded literal in the harness, so only the master key is
+# needed here. 64 hex = 32 bytes, non-zero.
+CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
+CTRL_TESTS=(
+    "api_key_tests"
+    "api_auth_integration_test"
+    "integration_mcp_tests"
+)
+for ctest in "${CTRL_TESTS[@]}"; do
+    echo
+    echo "▶ controller :: ${ctest}  [migrated:talos_ctl, DATABASE_URL, single-threaded]"
+    if ! DATABASE_URL="$CTL_URL" TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
+        cargo test -p controller --test "$ctest" -- --test-threads=1; then
         rc=1
     fi
 done

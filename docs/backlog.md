@@ -72,40 +72,45 @@ Running it on PRs (or nightly) would have caught it immediately.
 
 ---
 
-## Bring the `tests/`-dir integration binaries into CI
+## Bring the `tests/`-dir integration binaries into CI — DONE (2026-06-05)
 
-**Added:** 2026-06-05. **Priority: medium (coverage gap).**
+**Added:** 2026-06-05. **Resolved:** 2026-06-05. **Priority: was medium (coverage gap).**
 
-`quality.yml`'s `test` job is scoped to `cargo nextest --workspace --lib` (the
-~1.3k DB-free library unit tests) because its first real CI runs exposed that
-several `tests/`-dir integration binaries have **never run in CI** and fail on
-unmet environment, not real bugs:
-- `controller/tests/module_template_tests.rs` — **DONE (2026-06-05): now in CI.**
+All five formerly-never-in-CI `tests/`-dir binaries are now gated, and probing
+them found **one real latent bug** + **three stale security-test drifts** (the
+exact reason "nobody runs them" is dangerous). Final state:
+
+- `controller/tests/module_template_tests.rs` — **DONE (#190): in the `test` job.**
   The failure (`get_template("http-request")` → `None`) was NOT "catalog not
   seeded" — it was a **real bug**: `talos_module_templates::all_templates()`
   located `module-templates/` via `env!("CARGO_MANIFEST_DIR")` with a stale
   `.ends_with("controller")` pop that broke when the crate was relocated out of
   `controller/` in the May-2026 decomposition, so discovery silently resolved to
   a non-existent dir and returned empty. Fixed to walk manifest-dir ancestors;
-  the 17 tests now pass and run as a dedicated `test`-job step. (No production
-  impact — the free fn has zero non-test callers; prod seeding goes via
-  `talos-registry`. The Docker `/app/module-templates` path was unaffected.)
-- `worker/tests/sandbox_security_tests.rs` (path-traversal, etc.) — needs a
-  built **WASM sandbox context**; `make_context()` behaves differently in CI.
-  Still excluded.
-- `controller/tests/integration_mcp_tests.rs`, `api_auth_integration_test`,
-  `api_key_tests` — **full-app DB harness** (the all-zero `TALOS_MASTER_KEY`
-  was one such blocker, already fixed). Still excluded.
+  17 tests pass as a dedicated `test`-job step. (No prod impact — zero non-test
+  callers; prod seeding goes via `talos-registry`; Docker `/app/module-templates`
+  unaffected.)
+- `worker/tests/sandbox_security_tests.rs` — **DONE (#192 fix + #194 gate): in the
+  `test` job** (DB-free). The 3 path-traversal tests were **stale, not a vuln**:
+  they used the Http capability world, so `read` short-circuited on the MCP-586
+  capability gate (`Permissiondenied`) before reaching `sanitize_path`
+  (`Invalidpath`). Fixed to the Filesystem world + added a capability-gate test;
+  36 pass.
+- `controller/tests/{api_key_tests,api_auth_integration_test,integration_mcp_tests}.rs`
+  — **DONE (#193 fix + this change: in the `integration` job).** `api_key_tests`
+  was clean; the other two were **stale**: the harness didn't inject
+  `IsTwoFactorVerified(true)` (which the real auth path always does — hard-coded
+  for API keys), so MCP-616's fail-closed `require_2fa` rejected every 2FA-gated
+  mutation before the real logic ran. Fixed to replicate the production context.
+  Wired into `scripts/test-integration.sh` as a dedicated block: their own
+  migrated DB (`talos_ctl`), `DATABASE_URL`/`TALOS_MASTER_KEY` (they predate the
+  `TALOS_TEST_DATABASE_URL` convention), `--test-threads=1` (destructive global
+  setup). Verified end-to-end locally.
 
-The remaining two (WASM sandbox, full-app DB harness) pass locally (full dev env)
-but are still never-in-CI. Bringing them in is per-binary work: build/provide the
-WASM fixtures, wire the full-app harness + DB. The **DB-backed** suite that
-mattered most (RLS isolation, crash-recovery, memory) is already covered by the
-`integration` job (`make test-integration`). Do these as a deliberate follow-up;
-until then the `test` job gates the lib unit suite + the module-template catalog
-tests, and the `integration` job gates the curated DB suite. (Also: re-confirm
-`cargo test --workspace --doc` passes in CI before re-adding the doctest step
-that was dropped here.)
+Net: `test` job now gates lib unit suite + module-template + sandbox-security;
+`integration` job gates the curated DB suite + the 3 controller DB binaries.
+(Still open, minor: re-confirm `cargo test --workspace --doc` passes in CI before
+re-adding the doctest step that was dropped from `quality.yml`.)
 
 ---
 
