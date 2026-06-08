@@ -59,15 +59,24 @@ impl OrgScope {
         }
     }
 
-    /// The `SET LOCAL app.current_org_id = '<uuid>'` statement that opens
-    /// a tenant-scoped transaction. `SET LOCAL` cannot take bind
-    /// parameters, so the UUID is interpolated — safe because
-    /// `active_org_id` is a `Uuid` (no caller-controlled text, no
-    /// injection surface). Centralised here so every tx uses the same
-    /// GUC spelling as the RLS policies.
+    /// The `SET LOCAL` statements that open a tenant-scoped transaction.
+    /// Sets BOTH the active-org GUC (the org-scoped RLS boundary) AND the
+    /// acting-user GUC, so per-user-pinned WRITE policies can enforce
+    /// `owner_user_id = app.current_user_id` (RFC 0006 Option B — currently
+    /// `secrets`). Org-pinned-only tables (`workflows`, `actors`) don't
+    /// reference the user GUC, so the extra `SET LOCAL` is a no-op for them.
+    ///
+    /// `SET LOCAL` cannot take bind parameters, so the UUIDs are interpolated —
+    /// safe because both are `Uuid`s (no caller-controlled text, no injection
+    /// surface). Centralised here so every tx uses the same GUC spelling as the
+    /// RLS policies. Multiple statements ride one simple-query round-trip
+    /// (same pattern as `TenantReadScope::set_local_sql`).
     #[must_use]
     pub fn set_local_org_sql(&self) -> String {
-        format!("SET LOCAL {ACTIVE_ORG_GUC} = '{}'", self.active_org_id)
+        format!(
+            "SET LOCAL {ACTIVE_ORG_GUC} = '{}'; SET LOCAL {READ_USER_GUC} = '{}'",
+            self.active_org_id, self.user_id
+        )
     }
 }
 
@@ -244,12 +253,17 @@ mod tests {
         let org = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let user = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
         let scope = OrgScope::new(org, user);
+        // Sets BOTH the active-org GUC and the acting-user GUC (RFC 0006
+        // Option B — so per-user-pinned write policies like `secrets` can
+        // enforce owner_user_id = app.current_user_id).
         assert_eq!(
             scope.set_local_org_sql(),
-            "SET LOCAL app.current_org_id = '11111111-1111-1111-1111-111111111111'"
+            "SET LOCAL app.current_org_id = '11111111-1111-1111-1111-111111111111'; \
+             SET LOCAL app.current_user_id = '22222222-2222-2222-2222-222222222222'"
         );
-        // GUC spelling is shared with the RLS policy definitions.
+        // GUC spellings are shared with the RLS policy definitions.
         assert!(scope.set_local_org_sql().contains(ACTIVE_ORG_GUC));
+        assert!(scope.set_local_org_sql().contains(READ_USER_GUC));
     }
 
     #[test]
