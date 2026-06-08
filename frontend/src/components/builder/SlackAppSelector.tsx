@@ -48,15 +48,6 @@ export function SlackAppSelector({
   const [showCreator, setShowCreator] = useState(false);
   const pollTimerRef = useRef<number | null>(null);
 
-  useEffect(() => {
-    fetchIntegrations();
-    return () => {
-      if (pollTimerRef.current !== null) {
-        clearInterval(pollTimerRef.current);
-      }
-    };
-  }, []);
-
   const fetchIntegrations = async () => {
     try {
       setLoading(true);
@@ -78,6 +69,17 @@ export function SlackAppSelector({
       setLoading(false);
     }
   };
+
+  // Declared above this effect so the function exists before it is referenced
+  // (react-hooks/immutability — no use-before-declaration).
+  useEffect(() => {
+    fetchIntegrations();
+    return () => {
+      if (pollTimerRef.current !== null) {
+        clearInterval(pollTimerRef.current);
+      }
+    };
+  }, []);
 
   const handleConnect = async () => {
     try {

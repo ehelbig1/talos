@@ -298,6 +298,7 @@ export function IntegrationsManager() {
             toast.error("Invalid OAuth authorization URL received from server");
             return;
           }
+          // eslint-disable-next-line react-hooks/immutability -- intentional browser navigation to the OAuth authorization URL in an async click handler (not a render-time mutation of external state); the URL is validated above.
           window.location.href = d.data.authorization_url;
         } else {
           toast.error(

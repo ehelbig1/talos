@@ -56,17 +56,18 @@ export default [
             "react-hooks/unsupported-syntax": "warn",
             "react-hooks/config": "error",
             "react-hooks/gating": "error",
-            // DEFERRED — these have current findings and need per-site human
-            // triage (real bug vs. intentional idiom), done one rule per PR so
-            // each fix is reviewable rather than a blanket suppression:
+            // Enabled after per-site triage of their findings:
+            //   - immutability (6): 4 use-before-declare fixed (hoisted fn /
+            //     reorder), 2 window.location navigations justified-disabled.
+            //   - preserve-manual-memoization (1): memo dep corrected.
+            "react-hooks/immutability": "error",
+            "react-hooks/preserve-manual-memoization": "error",
+            // DEFERRED — still have findings needing per-site triage, one rule
+            // per PR (real bug vs. intentional idiom, never a blanket suppress):
             //   - set-state-in-effect (14): cascading-render risk vs. benign sync
-            //   - immutability (6): real mutation vs. idiomatic ref-guard
             //   - purity (6): mostly intentional Date.now() (display/fallback)
-            //   - preserve-manual-memoization (1): a real memo-dep fix
             // "react-hooks/set-state-in-effect": "error",
-            // "react-hooks/immutability": "error",
             // "react-hooks/purity": "error",
-            // "react-hooks/preserve-manual-memoization": "error",
 
             // Use TypeScript-aware rules instead of base ESLint rules
             "no-unused-vars": "off",

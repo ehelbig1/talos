@@ -67,10 +67,6 @@ export function GoogleCalendarSelector({
   const [selectedCalendars, setSelectedCalendars] = useState<string[]>([]);
   const [setupComplete, setSetupComplete] = useState(false);
 
-  useEffect(() => {
-    fetchIntegrations();
-  }, []);
-
   const fetchIntegrations = async () => {
     try {
       setLoading(true);
@@ -97,6 +93,12 @@ export function GoogleCalendarSelector({
       setLoading(false);
     }
   };
+
+  // Declared after fetchIntegrations so the function exists before this effect
+  // references it (react-hooks/immutability — no use-before-declaration).
+  useEffect(() => {
+    fetchIntegrations();
+  }, []);
 
   const fetchCalendars = async (integrationId: string) => {
     try {

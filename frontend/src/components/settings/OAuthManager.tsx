@@ -140,6 +140,7 @@ export default function OAuthManager() {
           setLinkingProvider(null);
           return;
         }
+        // eslint-disable-next-line react-hooks/immutability -- intentional browser navigation to the OAuth login URL in an async handler (not a render-time mutation of external state); the URL is validated above.
         window.location.href = urlData.oauthLoginUrl.authUrl;
       }
     } catch (err: unknown) {
