@@ -8885,6 +8885,7 @@ dependencies = [
  "talos-graph-rag",
  "talos-memory",
  "talos-secrets-manager",
+ "talos-tenancy",
  "talos-text-util",
  "talos-workflow-engine-core",
  "tokio",

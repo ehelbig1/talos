@@ -1461,13 +1461,21 @@ impl WorkflowsMutations {
             }
         };
 
-        // RFC 0004 M4: insert on a user-scoped tx so the workflows RLS
-        // WITH CHECK is satisfied via the user_id clause (the new row is
-        // owned by the inserting user). Required so the eventual
-        // fail-closed flip doesn't reject creates.
-        let mut tx = talos_db::begin_user_scoped(db_pool, *user_id)
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+        // RFC 0006 / RFC 0005 S3: insert on an ORG-scoped tx so the
+        // workflows RLS WITH CHECK (org pin — `org_id = app.current_org_id`)
+        // actually ENFORCES once the fail-closed flip is on. The owning
+        // `org_id` resolved above is both bound into the row AND set as the
+        // scope's active org, so they match by construction; a write that
+        // tried to land the row in any other org would be rejected (42501).
+        // `begin_org_scoped` also sets `app.current_user_id`, which the
+        // org-pinned workflows policy simply ignores. Latent while
+        // `TALOS_RLS_SET_ROLE` is off (sets the GUCs, no role switch).
+        let mut tx =
+            talos_db::begin_org_scoped(db_pool, &talos_tenancy::OrgScope::new(org_id, *user_id))
+                .await
+                .map_err(|e| {
+                    async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe()
+                })?;
         let workflow_id = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO workflows (name, module_uri, graph_json, user_id, max_concurrent_executions, intent, org_id)
