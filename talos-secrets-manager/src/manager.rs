@@ -2678,11 +2678,24 @@ impl SecretsManager {
                 .expect("sha256 always produces ≥8 bytes"),
         );
 
-        let mut tx = self
-            .db_pool
-            .begin()
+        // RFC 0005 S3 (owner-keyed write — upsert targets `created_by =
+        // $creator_user_id`, and the new/updated row's owner_user_id IS the
+        // creator). Scope the tx so the secrets RLS USING + owner WITH CHECK
+        // back up that filter — same shape as create_secret. org-scoped →
+        // begin_org_scoped (current_org_id + current_user_id); personal →
+        // begin_user_scoped (current_user_id; org pin permits the NULL org).
+        // Safe + latent while TALOS_RLS_SET_ROLE is off.
+        let mut tx = match org_id {
+            Some(active_org_id) => talos_db::begin_org_scoped(
+                &self.db_pool,
+                &talos_tenancy::OrgScope::new(active_org_id, creator_user_id),
+            )
             .await
-            .context("Failed to begin upsert_secret transaction")?;
+            .context("Failed to begin org-scoped upsert_secret transaction")?,
+            None => talos_db::begin_user_scoped(&self.db_pool, creator_user_id)
+                .await
+                .context("Failed to begin user-scoped upsert_secret transaction")?,
+        };
 
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key)
