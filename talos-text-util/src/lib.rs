@@ -415,9 +415,51 @@ pub fn bounded_preview(s: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{prefix}…"))
 }
 
+/// SHA-256 of `input`, lowercase hex-encoded.
+///
+/// Canonical token-lookup hash shared across the workspace so the write
+/// side and the read side can never drift on the algorithm (the
+/// validation-drift discipline from CLAUDE.md). It matches Postgres
+/// `encode(digest(input, 'sha256'), 'hex')` byte-for-byte, so a value
+/// hashed here equals one backfilled in SQL via pgcrypto.
+///
+/// This is a *lookup* hash (fast, deterministic, indexable), NOT a
+/// password hash — use bcrypt/argon2 for credentials that must resist
+/// offline brute force. It is appropriate for high-entropy bearer tokens
+/// (e.g. 256-bit approval-gate tokens) where the goal is to (a) avoid
+/// storing/looking-up the raw secret and (b) make the DB lookup keyed on
+/// a non-secret digest rather than the secret itself.
+pub fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        // Standard SHA-256("abc") test vector.
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Empty string vector.
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // Deterministic + 64 lowercase-hex chars.
+        let h = sha256_hex("approval-token-sample");
+        assert_eq!(h.len(), 64);
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(h, sha256_hex("approval-token-sample"));
+    }
 
     #[test]
     fn returns_original_when_under_cap() {
