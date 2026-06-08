@@ -339,7 +339,10 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
   // user left the page open. Same idle-timeout-fallback pattern as
   // MCP-888/889; after the cap fires, the user can manually click
   // "Refresh History" to force a fresh fetch.
-  const mountedAtRef = React.useRef<number>(Date.now());
+  // Mount timestamp for the poll-duration cap. A lazy useState initializer
+  // runs exactly once and keeps render idempotent — calling Date.now()
+  // directly in render is impure (react-hooks/purity).
+  const [mountedAt] = React.useState(() => Date.now());
   const POLL_CAP_MS = 30 * 60 * 1000;
 
   const {
@@ -358,7 +361,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
       refetchInterval: (query: {
         state: { data?: GetModuleExecutionHistoryQuery };
       }) => {
-        if (Date.now() - mountedAtRef.current > POLL_CAP_MS) {
+        if (Date.now() - mountedAt > POLL_CAP_MS) {
           return false;
         }
         const execs = query.state.data?.moduleExecutionHistory;

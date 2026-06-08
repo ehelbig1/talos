@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import type { TimedEvent } from "@/store/executionStore";
 import { cn } from "@/lib/utils";
 
@@ -25,6 +25,11 @@ const STATUS_COLORS = {
  * Horizontal bar chart showing per-node execution timing.
  */
 export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
+  // Stable fallback timestamp for events that arrive without one (the real
+  // timing comes from event timestamps). Captured once via a lazy useState
+  // initializer so render stays pure — calling Date.now() directly in the
+  // memo body is impure (react-hooks/purity).
+  const [fallbackNow] = useState(() => Date.now());
   const bars = useMemo(() => {
     if (!events.length) return [];
 
@@ -33,14 +38,14 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
 
     // Track the absolute start timestamp of the execution
     const firstTimestamp = new Date(
-      events[0]?.timestamp ?? Date.now(),
+      events[0]?.timestamp ?? fallbackNow,
     ).getTime();
 
     for (const ev of events) {
       const nodeId = ev.nodeId;
       if (!nodeId) continue;
 
-      const evTimestamp = new Date(ev.timestamp ?? Date.now()).getTime();
+      const evTimestamp = new Date(ev.timestamp ?? fallbackNow).getTime();
       const relativeMs = evTimestamp - firstTimestamp;
 
       if (
@@ -75,8 +80,9 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
 
     // Add bars for still-running nodes
     const totalElapsed = events.length
-      ? new Date(events[events.length - 1]?.timestamp ?? Date.now()).getTime() -
-        firstTimestamp
+      ? new Date(
+          events[events.length - 1]?.timestamp ?? fallbackNow,
+        ).getTime() - firstTimestamp
       : 0;
 
     for (const [nodeId, startMs] of nodeStarts) {
@@ -92,7 +98,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
     }
 
     return result.sort((a, b) => a.startMs - b.startMs);
-  }, [events, nodeNames]);
+  }, [events, nodeNames, fallbackNow]);
 
   if (!bars.length) {
     return (

@@ -417,11 +417,21 @@ export default function ActorCompare() {
         );
         const execId = data.triggerWorkflow.id;
 
-        updateLane(actor.id, {
-          executionId: execId,
-          status: "queued",
-          startedAt: Date.now(),
-        });
+        // Capture the queued-at timestamp inside the state updater (as the
+        // live-update handler below does) so Date.now() isn't called in
+        // render-reachable scope (react-hooks/purity).
+        setLanes((prev) =>
+          prev.map((l) =>
+            l.actor.id === actor.id
+              ? {
+                  ...l,
+                  executionId: execId,
+                  status: "queued",
+                  startedAt: Date.now(),
+                }
+              : l,
+          ),
+        );
 
         // Subscribe to live updates for this execution
         const unsub = subscribeExecution(execId, (event: ExecutionUpdate) => {
