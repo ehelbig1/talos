@@ -2498,34 +2498,48 @@ async fn handle_list_published_modules(
         }
     };
 
-    // Scan workflow-templates dir to build module_name → [pattern_name] index
-    let patterns_dir = std::path::Path::new("/app/workflow-templates");
-    let mut pattern_refs: std::collections::HashMap<String, Vec<String>> = Default::default();
-    if patterns_dir.is_dir() {
-        if let Ok(rd) = std::fs::read_dir(patterns_dir) {
-            for entry in rd.flatten() {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    if let Ok(tmpl) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let pat_name = tmpl
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if let Some(nodes) = tmpl.get("nodes").and_then(|v| v.as_array()) {
-                            for node in nodes {
-                                if let Some(mn) = node.get("module_name").and_then(|v| v.as_str()) {
-                                    pattern_refs
-                                        .entry(mn.to_string())
-                                        .or_default()
-                                        .push(pat_name.clone());
+    // Scan workflow-templates dir to build module_name → [pattern_name] index.
+    // Offloaded to spawn_blocking: this synchronously reads + JSON-parses every
+    // file in the dir (which grows with the pattern library), so running it
+    // inline would block this async handler's executor thread for the whole
+    // scan. Mirrors the catalog-scan offload in modules.rs. Graceful-empty on
+    // any error is preserved (missing dir/files → empty index, as before).
+    let pattern_refs: std::collections::HashMap<String, Vec<String>> =
+        tokio::task::spawn_blocking(|| {
+            let mut pattern_refs: std::collections::HashMap<String, Vec<String>> =
+                Default::default();
+            let patterns_dir = std::path::Path::new("/app/workflow-templates");
+            if patterns_dir.is_dir() {
+                if let Ok(rd) = std::fs::read_dir(patterns_dir) {
+                    for entry in rd.flatten() {
+                        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                            if let Ok(tmpl) = serde_json::from_str::<serde_json::Value>(&content) {
+                                let pat_name = tmpl
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if let Some(nodes) = tmpl.get("nodes").and_then(|v| v.as_array()) {
+                                    for node in nodes {
+                                        if let Some(mn) =
+                                            node.get("module_name").and_then(|v| v.as_str())
+                                        {
+                                            pattern_refs
+                                                .entry(mn.to_string())
+                                                .or_default()
+                                                .push(pat_name.clone());
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-    }
+            pattern_refs
+        })
+        .await
+        .unwrap_or_default();
 
     let total = rows.len();
     let modules: Vec<serde_json::Value> = rows
