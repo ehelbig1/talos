@@ -109,8 +109,29 @@ exact reason "nobody runs them" is dangerous). Final state:
 
 Net: `test` job now gates lib unit suite + module-template + sandbox-security;
 `integration` job gates the curated DB suite + the 3 controller DB binaries.
-(Still open, minor: re-confirm `cargo test --workspace --doc` passes in CI before
-re-adding the doctest step that was dropped from `quality.yml`.)
+
+**SWEEP COMPLETE (2026-06-08).** Every `tests/`-dir integration binary in the
+workspace now runs in CI:
+- **`test` job (DB-free, via nextest):** module-template, sandbox-security, the
+  DB-free security set (jwt/csrf/input-validation/mcp-safety/webhook-security +
+  worker tier1/agentic + job-protocol security), and the DB-free engine/protocol/
+  worker/controller set (engine ×9, serialization, wire_format_snapshots,
+  runtime/trap, circuit_breaker, execution_event, js_compilation, nats_topic,
+  rhai, worker_manager).
+- **`integration` job:** the curated `TESTS` DB suite; `CTRL_TESTS` (DATABASE_URL/
+  `talos_ctl`, single-threaded) = api_key, api_auth, integration_mcp,
+  auth_concurrency, security_isolation, governance, **scheduler_tests,
+  workflow_version_tests, env_vars**; `TC_TESTS` (testcontainers) = auth, oauth,
+  oauth_scoped_token, organization, registry_access, registry, secrets.
+- **Only exclusion:** `webhooks_hmac_test` (`#[ignore]`'d — needs a NATS
+  container; tracked separately).
+
+The probing found 1 real latent bug (CARGO_MANIFEST_DIR discovery, #190), 1 real
+harness flake (cross-runtime pool, #198), and ~16 stale/dark tests trailing
+correct security hardening (#192/#193/#196/#197/#198). (Still open, minor:
+re-confirm `cargo test --workspace --doc` passes in CI before re-adding the
+doctest step that was dropped from `quality.yml` — doctests verified green
+locally on 2026-06-05.)
 
 ---
 
