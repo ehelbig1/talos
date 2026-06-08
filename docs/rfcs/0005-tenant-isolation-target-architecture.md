@@ -162,6 +162,65 @@ The default does not flip to on until enforcement is proven across the
 representative deploy modes (in-cluster superuser + managed non-superuser)
 — a small follow-up once operators have run with it enabled.
 
+### Post-S3 enablement checklist (explicit `WITH CHECK` + secret writes)
+
+The runbook above describes the permissive `USING`-as-check rollout. Since then
+the write surface has been hardened with **explicit `WITH CHECK`** policies and
+the secret-write paths wired through `begin_org_scoped` / `begin_tenant_read_scoped`
+(PRs #206–#210). What now enforces, per table, once the flag is on:
+
+| Table(s) | Write rule under enforcement |
+|---|---|
+| `workflows`, `actors` | org pin only (`org_id = active org`); collaborative within the org |
+| `secrets` — **personal** (`org_id IS NULL`) | owner pin (`owner_user_id = acting user`) — RFC 0006 (b) |
+| `secrets` — **org-shared** (`org_id` set) | org pin only (membership/RBAC governs *who*); RFC 0006 (b) |
+| `scratch_sessions`, `user_module_pins`, `workflow_executions` | user pin (`user_id = acting user`) |
+
+**Deliberately exempt — these run on the underlying owner/superuser connection
+and bypass RLS by design (no `SET ROLE`), so enabling the flag must NOT break
+them:** the secret *decrypt* path (worker→controller RPC, `vault://` resolution,
+LLM-key fetch), the `last_accessed_at` / access-count bump, the KEK
+re-encrypt/rewrap, the engine graph-load / scheduler / analytics readers, and the
+admin/internal secret-write paths (`update_secret`/`delete_secret` called with
+`user_id = None`). If any of these begins to fail with `42501` after the flip,
+something is wrongly routing through `SET ROLE talos_app` — investigate before
+proceeding.
+
+**Pre-flight grant check (the managed-Postgres gotcha).** `GRANT … ON ALL TABLES`
+in `20260529220000` covers tables that existed at migration time; later tables
+rely on `ALTER DEFAULT PRIVILEGES`, which only applies to tables created **by the
+same granting role**. If migrations ever run as a different role, a newer table
+can be missing `talos_app` DML — and a request-path query against it then fails
+closed under enforcement. Before flipping the flag, confirm zero gaps:
+
+```sql
+-- Any base table in `public` that talos_app cannot fully DML = a gap to GRANT.
+SELECT c.relname, priv.p AS missing_privilege
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE')) AS priv(p)
+WHERE c.relkind = 'r'
+  AND NOT has_table_privilege('talos_app', c.oid, priv.p)
+ORDER BY 1, 2;
+-- Expect ZERO rows. Any row → `GRANT <priv> ON <table> TO talos_app;`
+-- (and check the sequence grants likewise via has_sequence_privilege).
+```
+
+**Validate the wired write paths specifically** (staging, flag on): create +
+update + delete + rotate a **personal** secret as its owner (all succeed);
+attempt a cross-user personal secret write (rejected `42501`); a non-owner org
+member updates an **org-shared** secret (succeeds); create a workflow/actor in
+the active org (succeeds). `make test-integration` with `TALOS_RLS_SET_ROLE=1`
+exercises the policy contracts (`rls_org_isolation` runs every case under
+`SET ROLE talos_app`).
+
+**Stage it:** enable on a non-prod environment first, soak for a representative
+window (cover a secret-rotation cycle + an OAuth credential refresh, which both
+write secrets), watch logs for unexpected `42501`s, then promote to prod.
+Rollback is the instant flag flip described above.
+
+See RFC 0006 for the per-table write-isolation decisions this checklist enforces.
+
 ## Staged roadmap
 
 RLS is **defense-in-depth** — the app layer is and stays the *primary*
