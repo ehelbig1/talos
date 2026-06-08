@@ -123,15 +123,21 @@ workspace now runs in CI:
   auth_concurrency, security_isolation, governance, **scheduler_tests,
   workflow_version_tests, env_vars**; `TC_TESTS` (testcontainers) = auth, oauth,
   oauth_scoped_token, organization, registry_access, registry, secrets.
-- **Only exclusion:** `webhooks_hmac_test` (`#[ignore]`'d — needs a NATS
-  container; tracked separately).
+- **`webhooks_hmac_test`** — was the last `#[ignore]`'d holdout ("requires NATS
+  container"). The ignore reason was doubly wrong: the only test (`verify_slack_hmac`)
+  is pure HMAC verification that never touches NATS, and it actually failed for
+  two unrelated latent reasons — `WebhookRouter::new` calls `tokio::spawn` (DLQ
+  processor) so it needs an ambient runtime, and `async_nats::connect` failed fast
+  against a dead server. Fixed by making it `#[tokio::test]` + a lazy NATS client
+  (`retry_on_initial_connect`, the analogue of the existing `connect_lazy` pool).
+  Now DB/NATS-free and gated in the `test` job security group. **100% of
+  `tests/`-dir binaries now run in CI — no exclusions.**
 
-The probing found 1 real latent bug (CARGO_MANIFEST_DIR discovery, #190), 1 real
-harness flake (cross-runtime pool, #198), and ~16 stale/dark tests trailing
-correct security hardening (#192/#193/#196/#197/#198). (Still open, minor:
-re-confirm `cargo test --workspace --doc` passes in CI before re-adding the
-doctest step that was dropped from `quality.yml` — doctests verified green
-locally on 2026-06-05.)
+**100% COMPLETE (2026-06-08).** The doctest gate is back (`cargo test --workspace
+--doc`, ~218 doctests, re-confirmed green). The probing found 1 real latent bug
+(CARGO_MANIFEST_DIR discovery, #190), 1 real harness flake (cross-runtime pool,
+#198), 2 more latent test-harness defects (webhooks_hmac runtime+NATS), and ~16
+stale/dark tests trailing correct security hardening (#192/#193/#196/#197/#198).
 
 ---
 

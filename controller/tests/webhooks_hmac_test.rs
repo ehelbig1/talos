@@ -9,22 +9,21 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
-use tokio::runtime::Runtime;
 
 // Helper to create a minimal router for testing HMAC verification.
-fn test_router() -> anyhow::Result<WebhookRouter> {
-    // Use a dummy lazy pool (no real DB connection needed for HMAC tests)
-    // Establish a Tokio runtime before creating a lazy connection pool, as sqlx
-    // requires a runtime for its internal background tasks.
+//
+// Runs inside the test's Tokio runtime (`#[tokio::test]`): `WebhookRouter::new`
+// spawns a background DLQ processor via `tokio::spawn`, which panics outside a
+// runtime. Both the Postgres pool (`connect_lazy`) and the NATS client
+// (`retry_on_initial_connect`) are lazy, so no live DB or NATS server is needed —
+// the HMAC verification under test touches neither.
+async fn test_router() -> anyhow::Result<WebhookRouter> {
     // Ensure SecretsManager can initialize without requiring external secrets.
     std::env::set_var("TALOS_MASTER_KEY", "a".repeat(64));
-    let rt = Runtime::new().expect("Failed to create Tokio runtime");
-    let pool = rt.block_on(async {
-        PgPoolOptions::new()
-            .max_connections(1)
-            .connect_lazy("postgres://localhost/dummy")
-            .expect("Failed to create lazy pool")
-    });
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy("postgres://localhost/dummy")
+        .expect("Failed to create lazy pool");
 
     let (event_sender, _) = tokio::sync::broadcast::channel(1);
     let (dlq_event_sender, _) = tokio::sync::broadcast::channel(1);
@@ -41,10 +40,13 @@ fn test_router() -> anyhow::Result<WebhookRouter> {
                 .context("SecretsManager init")?,
         ),
         Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(async_nats::connect("nats://localhost:4222"))
-                .unwrap(),
+            // Lazy NATS client: returns immediately, reconnects in the
+            // background — no live server needed (see fn-level comment).
+            async_nats::ConnectOptions::new()
+                .retry_on_initial_connect()
+                .connect("nats://localhost:4222")
+                .await
+                .context("nats client (lazy)")?,
         ),
         None,
         Arc::new(CircuitBreaker::new()),
@@ -56,9 +58,8 @@ fn test_router() -> anyhow::Result<WebhookRouter> {
     )
 }
 
-#[test]
-#[ignore = "Requires NATS container — TODO: add testcontainers-nats"]
-fn verify_slack_hmac() {
+#[tokio::test]
+async fn verify_slack_hmac() {
     let secret = "test_secret";
     let body = b"{\"type\":\"url_verification\"}";
     let timestamp = std::time::SystemTime::now()
@@ -87,6 +88,6 @@ fn verify_slack_hmac() {
         HeaderValue::from_str(&timestamp).unwrap(),
     );
 
-    let router = test_router().expect("router init");
+    let router = test_router().await.expect("router init");
     assert!(router.verify_hmac_signature(&headers, &body[..].into(), secret));
 }
