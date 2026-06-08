@@ -115,6 +115,49 @@ basis the open questions below are resolved as:
 permissive today). The migration can only *restrict* a GUC-set write, never break
 an un-wired/engine/decrypt one.
 
+### Implementation finding (2026-06-08) — OPEN: owner-pin vs org-shared-secret membership writes
+
+Wiring the S3 write paths (PRs #207/#208 + upsert) surfaced a tension the Option
+B decision didn't anticipate. The clean owner-keyed writes — `create_secret`,
+`upsert_secret`, and the `*_by_id` methods (delete/namespace/expiry/rotate) — are
+now scoped and consistent with the owner pin (the row's `owner_user_id` IS the
+acting user). **But `update_secret` and `delete_secret` are not owner-only:**
+their existing app-layer gate is
+
+```
+WHERE key_path = $1
+  AND ($user_id IS NULL          -- admin / internal: no ownership filter
+       OR owner_user_id = $user_id
+       OR org_id = ANY($accessible_org_ids))   -- ANY org member may write
+```
+
+So today an org **member** (not just the owner) may update/delete an
+**org-shared** secret, and an admin path (`$user_id = NULL`) bypasses ownership
+entirely. The Option B owner pin (`owner_user_id = app.current_user_id`)
+**conflicts** with this: once enforcement is on, scoping these methods to the
+acting user would *reject* a non-owner member's write to an org-shared secret
+that the app layer currently allows — and the admin path can't be user-scoped at
+all. (No conflict today: these methods are still unscoped/permissive.)
+
+**This needs an owner decision before `update_secret`/`delete_secret` are wired:**
+
+- **(a) Owner-only model.** Tighten `update_secret`/`delete_secret` to owner-only
+  (drop the `org_id = ANY(...)` write path); keep the owner pin for all secrets.
+  Simpler/stricter, but a *behaviour change* — team members can no longer manage
+  org-shared secrets they didn't create.
+- **(b) Personal-vs-org split (recommended).** Scope the owner pin to *personal*
+  secrets only: refine the `secrets` WITH CHECK so `org_id IS NOT NULL` rows are
+  org-pinned (governed by membership + RBAC, like `workflows`/`actors`) and only
+  `org_id IS NULL` (personal) rows carry the `owner_user_id` pin. Then
+  `update_secret`/`delete_secret` scope via `begin_tenant_read_scoped`
+  (membership), preserving today's collaborative behaviour. This is the more
+  consistent choice — it mirrors the org-shared-is-collaborative decision already
+  made for `workflows`/`actors`. The admin path stays unscoped (BYPASSRLS /
+  no-GUC) by design.
+
+Until decided, `update_secret`/`delete_secret` remain unscoped (permissive) — no
+behaviour change, no enforcement of the conflicted paths.
+
 ## Decisions
 
 ### Decision 1 — Org-scoped tables pin `org_id`, not `user_id`
