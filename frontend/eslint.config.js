@@ -70,10 +70,13 @@ export default [
             //   - 6 mount-fetch components migrated to react-query useQuery so
             //     loading/data/error is derived, not mirrored via an effect.
             "react-hooks/set-state-in-effect": "error",
-            // DEFERRED — one rule per PR (real bug vs. intentional idiom,
-            // never a blanket suppress):
-            //   - purity (6): mostly intentional Date.now() (display/fallback)
-            // "react-hooks/purity": "error",
+            // Enabled after properly fixing all 6 findings (no suppressions):
+            //   - mount-time / fallback timestamps captured via lazy
+            //     useState(() => Date.now()) initializers (allowed — run once).
+            //   - the schedule "overdue" check uses an interval-ticked `now`.
+            //   - the actor-compare queued-at time is captured inside the
+            //     setState updater (render keeps idempotent).
+            "react-hooks/purity": "error",
 
             // Use TypeScript-aware rules instead of base ESLint rules
             "no-unused-vars": "off",
