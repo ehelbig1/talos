@@ -207,6 +207,14 @@ jobs:
             --test rhai_check \
             --test worker_manager_tests
 
+      - name: Run doctests
+        # nextest does NOT run doctests (a documented limitation), so the steps
+        # above skip them entirely — they were dropped from CI and went unrun.
+        # `cargo test --doc` is the only runner for them. ~218 doctests across
+        # the workspace, all DB-free. Confirmed green before re-adding (the last
+        # item from the never-in-CI sweep's docs/backlog.md note).
+        run: cargo test --workspace --doc
+
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable
   # pgvector + Redis via Docker (available on ubuntu-latest), applies the full
