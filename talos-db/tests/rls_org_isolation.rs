@@ -1212,3 +1212,142 @@ async fn set_role_with_check_gates_cross_tenant_writes() {
             .await;
     }
 }
+
+/// RFC 0006 Option B — `secrets` WRITES are pinned to the acting user
+/// (`owner_user_id = app.current_user_id`) IN ADDITION to the org pin, so within
+/// a single org one user cannot forge / overwrite a secret owned by another
+/// user (secrets carry per-user DEK lineage). Collaborative org-scoped tables
+/// (`workflows`) stay org-pinned ONLY — proven here by a workflow write with a
+/// different `user_id` succeeding under the same scope.
+///
+/// Sets the role + both GUCs by hand (like
+/// `set_role_with_check_gates_cross_tenant_writes`) so the WITH CHECK enforces
+/// deterministically under the superuser connection regardless of
+/// `TALOS_RLS_SET_ROLE`. `begin_org_scoped` emits the same two SET LOCALs in
+/// production (talos-tenancy::OrgScope::set_local_org_sql).
+#[tokio::test]
+async fn secrets_with_check_pins_owner_to_acting_user() {
+    let Some(su_url) = superuser_url() else {
+        return;
+    };
+    let su = connect(&su_url).await;
+    use sqlx::Executor as _;
+
+    let user_a = Uuid::new_v4();
+    let user_b = Uuid::new_v4();
+    let org_a = Uuid::new_v4();
+    let ek = Uuid::new_v4();
+
+    for (u, label) in [(user_a, "soa"), (user_b, "sob")] {
+        sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
+            .bind(u)
+            .bind(format!("{label}-{}@test.invalid", u.simple()))
+            .bind(label)
+            .execute(&su)
+            .await
+            .unwrap();
+    }
+    // Single org; BOTH users are owners so the org pin passes for either owner_user_id.
+    sqlx::query("INSERT INTO organizations (id, name, slug, owner_id) VALUES ($1,$2,$3,$4)")
+        .bind(org_a)
+        .bind(format!("org-{}", org_a.simple()))
+        .bind(format!("org-{}", org_a.simple()))
+        .bind(user_a)
+        .execute(&su)
+        .await
+        .unwrap();
+    // secrets.encryption_key_id is a NOT NULL FK — create a key to satisfy it so
+    // the INSERT reaches the WITH CHECK rather than failing on the FK.
+    sqlx::query("INSERT INTO encryption_keys (id, encrypted_key) VALUES ($1, ''::bytea)")
+        .bind(ek)
+        .execute(&su)
+        .await
+        .unwrap();
+
+    let scope_a =
+        format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_org_id = '{org_a}'; SET LOCAL app.current_user_id = '{user_a}'");
+
+    // 1. user_a writes a secret OWNED BY user_a in org_a → satisfies org + owner pin.
+    let mut tx = su.begin().await.unwrap();
+    (&mut *tx).execute(scope_a.as_str()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id, created_by, org_id) \
+         VALUES ($1, 's', 'sec/own-ok', ''::bytea, $2, $3, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ek)
+    .bind(user_a)
+    .bind(org_a)
+    .execute(&mut *tx)
+    .await
+    .expect("a secret owned by the acting user must satisfy the WITH CHECK");
+    tx.commit().await.unwrap();
+
+    // 2. user_a tries to write a secret OWNED BY user_b in org_a → per-user pin rejects.
+    let mut tx = su.begin().await.unwrap();
+    (&mut *tx).execute(scope_a.as_str()).await.unwrap();
+    let res = sqlx::query(
+        "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id, created_by, org_id) \
+         VALUES ($1, 's', 'sec/forge', ''::bytea, $2, $3, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ek)
+    .bind(user_b)
+    .bind(org_a)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        res.is_err(),
+        "user_a must NOT create a secret owned by user_b within the same org (RFC 0006 Option B per-user pin)"
+    );
+    if let Err(sqlx::Error::Database(dbe)) = &res {
+        assert_eq!(
+            dbe.code().as_deref(),
+            Some("42501"),
+            "expected a row-level-security WITH CHECK violation (42501)"
+        );
+    }
+    let _ = tx.rollback().await;
+
+    // 3. workflows stay ORG-PINNED ONLY: the same scope writing a workflow with a
+    //    DIFFERENT user_id must still succeed (collaboration is not user-pinned).
+    let mut tx = su.begin().await.unwrap();
+    (&mut *tx).execute(scope_a.as_str()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json) \
+         VALUES ($1, $2, $3, 'collab', 'mod://x', '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_b) // different user — allowed for org-shared workflows
+    .bind(org_a)
+    .execute(&mut *tx)
+    .await
+    .expect(
+        "workflows are org-pinned only — a collaborative write with another user_id must succeed",
+    );
+    tx.commit().await.unwrap();
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM workflows WHERE org_id = $1")
+        .bind(org_a)
+        .execute(&su)
+        .await;
+    let _ = sqlx::query("DELETE FROM secrets WHERE org_id = $1")
+        .bind(org_a)
+        .execute(&su)
+        .await;
+    let _ = sqlx::query("DELETE FROM encryption_keys WHERE id = $1")
+        .bind(ek)
+        .execute(&su)
+        .await;
+    let _ = sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_a)
+        .execute(&su)
+        .await;
+    for u in [user_a, user_b] {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(u)
+            .execute(&su)
+            .await;
+    }
+}

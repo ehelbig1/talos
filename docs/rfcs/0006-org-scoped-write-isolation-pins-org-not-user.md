@@ -1,8 +1,12 @@
 # RFC 0006 — Org-scoped write isolation pins `org_id`, not `user_id`
 
-**Status:** Draft (decision record — awaiting owner sign-off before RLS enforcement is flipped on)
+**Status:** In progress — **DECIDED 2026-06-08 (enterprise posture): Option B for
+`secrets`, Option A for `workflows`/`actors`.** Phase B implemented (dual-GUC owner
+pin on `secrets`); see "Decision (2026-06-08)" below. Latent until RLS enforcement
+(`TALOS_RLS_SET_ROLE`) is enabled and secret writes are wired through
+`begin_org_scoped`.
 **Author:** Platform
-**Date:** 2026-06-05
+**Date:** 2026-06-05 (decided 2026-06-08)
 **Builds on:** [RFC 0004 — Tenant = Organization](./0004-tenant-equals-organization.md) and
 [RFC 0005 — Tenant-isolation target architecture](./0005-tenant-isolation-target-architecture.md)
 (§3 "Fail-closed RLS on every owned table"). This RFC records one specific
@@ -80,6 +84,36 @@ Two safety properties hold by construction:
    never block an un-wired / mid-rollout / engine-bypass write. If a per-table
    write-GUC assumption is slightly wrong, the worst case is "less restrictive
    than ideal," never "broken writes."
+
+## Decision (2026-06-08) — enterprise posture
+
+Talos is being geared toward **enterprise** clients (many users per org, insider
+threat model, compliance auditors who reward DB-level defense-in-depth). On that
+basis the open questions below are resolved as:
+
+- **`secrets` → Option B (dual-GUC, per-user owner pin).** Secrets carry per-user
+  DEK lineage and are the highest-sensitivity table; "user A forges/overwrites a
+  secret owned by user B *within the same org*" is a real integrity + compliance
+  gap that belongs at the DB layer, not app-layer-only. **Implemented:**
+  - `begin_org_scoped` now sets `app.current_user_id` alongside
+    `app.current_org_id` (`talos-tenancy::OrgScope::set_local_org_sql`).
+  - Migration `20260608120000_rls_secrets_user_pin_with_check.sql` adds
+    `owner_user_id = app.current_user_id` (rollout-safe `unset/NULL → permit`) to
+    the `secrets_tenant_isolation` WITH CHECK, on top of the existing org pin.
+  - Test `talos-db::rls_org_isolation::secrets_with_check_pins_owner_to_acting_user`
+    proves: owner==acting-user write succeeds, cross-user write rejected (42501),
+    and a `workflows` write with a different `user_id` still succeeds.
+- **`workflows` / `actors` → Option A (org pin only).** They are collaborative,
+  RBAC-governed org resources; user-pinning would break legitimate intra-org
+  collaboration (e.g. an org admin editing a member's workflow). Intra-org
+  permissions stay in the role checks — now CI-gated by `organization_tests` /
+  `security_isolation_tests`.
+
+**Rollout:** the owner pin is latent (rollout-safe) until BOTH (a)
+`TALOS_RLS_SET_ROLE` is enabled and (b) secret WRITE paths are wired through
+`begin_org_scoped` (the staged RFC 0005 S3 work — secret writes are still
+permissive today). The migration can only *restrict* a GUC-set write, never break
+an un-wired/engine/decrypt one.
 
 ## Decisions
 
@@ -159,26 +193,26 @@ each independently shippable and flag-safe:
   decision is a prerequisite for it, not the enablement itself.
 - Re-litigating tenant = organization (RFC 0004).
 
-## Open questions
+## Open questions — RESOLVED (2026-06-08, enterprise posture)
 
-1. **Is "organization is the RLS write boundary" the accepted contract?** If
-   yes, Decision 1 stands as-is and we proceed to Phase A. (Default
-   recommendation.)
-2. **Does `secrets` specifically warrant dual-GUC (Phase B)?** i.e., is
-   "controller writes a secret stamped to the wrong user within the right org"
-   in the threat model? If yes, scope Phase B to `secrets` only.
-3. Same question, explicitly answered "no" for `workflows` and `actors` (shared
-   org resources) unless a future feature gives them hard per-user write
-   ownership semantics.
+1. **Is "organization is the RLS write boundary" the accepted contract?**
+   **Yes** — org is the hard tenant boundary (RLS) for all org-scoped tables.
+2. **Does `secrets` specifically warrant dual-GUC (Phase B)?** **Yes** — scoped
+   to `secrets` only (per-user DEK lineage + compliance sensitivity). Implemented.
+3. **`workflows`/`actors` user-pinned?** **No** — they stay org-pinned only
+   (collaborative, RBAC-governed); user-pinning would break intra-org
+   collaboration. Revisit only if a feature gives them hard per-user write
+   ownership.
 
-## Success criteria
+## Success criteria — met
 
-- Owner records a decision on Q1 (and Q2/Q3) in this RFC.
-- If Phase A: RFC 0005's enforcement runbook can be executed knowing the
+- Owner recorded the decision (enterprise posture, above).
+- Phase B (`secrets`): the dual-GUC owner pin rejects an intra-org cross-user
+  write under `SET LOCAL ROLE talos_app`, while same-user and collaborative
+  `workflows` writes still succeed — proven by
+  `talos-db::rls_org_isolation::secrets_with_check_pins_owner_to_acting_user`
+  (gated in CI). RFC 0005's enforcement runbook can now proceed knowing the
   write-isolation contract is intentional and signed off.
-- If Phase B: the chosen table(s) reject an intra-org cross-user write under
-  `SET LOCAL ROLE talos_app` in `rls_org_isolation.rs`, and org-scoped writes on
-  the wired path still succeed.
 
 ## See also
 
