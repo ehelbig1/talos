@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useCallback } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { graphqlRequest } from "@/lib/graphqlClient";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
@@ -90,33 +91,37 @@ function worldRank(
 // ── Component ─────────────────────────────────────────────────────────────
 
 export default function CapabilityCeilingManager() {
-  const [ceiling, setCeiling] = useState<CapabilityCeilingDetail | null>(null);
-  const [hierarchy, setHierarchy] = useState<CapabilityWorldInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const loadData = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
+  // Ceiling + world hierarchy are fetched together via react-query so the
+  // loading/data/error state is derived, not mirrored through a
+  // setState-in-effect. `refetch` backs the manual refresh / retry buttons
+  // and the post-revoke reload below.
+  const {
+    data,
+    isLoading: loading,
+    error: queryError,
+    refetch,
+  } = useQuery({
+    queryKey: ["capabilityCeiling"],
+    queryFn: async () => {
       const [detail, worlds] = await Promise.all([
         fetchCeilingDetail(),
         fetchWorldHierarchy(),
       ]);
-      setCeiling(detail);
-      setHierarchy(worlds);
-    } catch (e) {
-      setError(
-        sanitizeErrorMessage(e instanceof Error ? e.message : "Failed to load"),
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
+      return { detail, worlds };
+    },
+  });
+  const ceiling = data?.detail ?? null;
+  const hierarchy = data?.worlds ?? [];
+  const error = queryError
+    ? sanitizeErrorMessage(
+        queryError instanceof Error ? queryError.message : "Failed to load",
+      )
+    : null;
+  // Wrap so onClick handlers don't pass the MouseEvent through as
+  // react-query RefetchOptions.
+  const loadData = useCallback(() => {
+    refetch();
+  }, [refetch]);
 
   const handleRevoke = async () => {
     if (!ceiling) return;

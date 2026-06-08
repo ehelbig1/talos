@@ -62,12 +62,21 @@ export default [
             //   - preserve-manual-memoization (1): memo dep corrected.
             "react-hooks/immutability": "error",
             "react-hooks/preserve-manual-memoization": "error",
-            // DEFERRED — still have findings needing per-site triage, one rule
-            // per PR (real bug vs. intentional idiom, never a blanket suppress):
-            //   - set-state-in-effect (14): cascading-render risk vs. benign sync
-            //   - purity (6): mostly intentional Date.now() (display/fallback)
-            // "react-hooks/set-state-in-effect": "error",
-            // "react-hooks/purity": "error",
+            // Enabled after properly fixing all 15 findings (no suppressions):
+            //   - 1 genuine derived-state bug (AuthContext) removed.
+            //   - 8 external→local syncs moved to the React-endorsed
+            //     "store information from previous renders" render-phase
+            //     pattern (https://react.dev/learn/you-might-not-need-an-effect).
+            //   - 6 mount-fetch components migrated to react-query useQuery so
+            //     loading/data/error is derived, not mirrored via an effect.
+            "react-hooks/set-state-in-effect": "error",
+            // Enabled after properly fixing all 6 findings (no suppressions):
+            //   - mount-time / fallback timestamps captured via lazy
+            //     useState(() => Date.now()) initializers (allowed — run once).
+            //   - the schedule "overdue" check uses an interval-ticked `now`.
+            //   - the actor-compare queued-at time is captured inside the
+            //     setState updater (render keeps idempotent).
+            "react-hooks/purity": "error",
 
             // Use TypeScript-aware rules instead of base ESLint rules
             "no-unused-vars": "off",

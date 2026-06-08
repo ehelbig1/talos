@@ -180,12 +180,18 @@ function CreateChannelDialog({
   const channelsFetching = useIsFetching({ queryKey: CHANNELS_KEY }) > 0;
 
   // Keep the integration select in sync if the first integration
-  // changes between renders (e.g. the list loaded after mount).
-  useEffect(() => {
+  // changes between renders (e.g. the list loaded after mount). Done
+  // during render via the "store information from previous renders"
+  // pattern (https://react.dev/learn/you-might-not-need-an-effect)
+  // instead of a setState-in-effect; the `!integrationId` guard means a
+  // user choice is never overridden.
+  const [lastIntegrations, setLastIntegrations] = useState(integrations);
+  if (integrations !== lastIntegrations) {
+    setLastIntegrations(integrations);
     if (!integrationId && integrations[0]) {
       setIntegrationId(integrations[0].id);
     }
-  }, [integrations, integrationId]);
+  }
 
   // Every time the dialog opens, force-refetch the channel list so
   // `existingChannels` reflects any creations that happened outside

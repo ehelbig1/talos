@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui";
 import { SlackAppCreator } from "./SlackAppCreator";
 import { validateOAuthUrl } from "@/lib/oauthUtils";
@@ -40,40 +41,47 @@ export function SlackAppSelector({
   onSelect,
   currentConfig,
 }: SlackAppSelectorProps) {
-  const [integrations, setIntegrations] = useState<SlackIntegration[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Integrations are fetched on mount via react-query so the loading/data
+  // state is derived, not mirrored through a setState-in-effect. `refetch`
+  // is invoked when the OAuth popup closes.
+  const {
+    data: integrations = [],
+    isLoading: loading,
+    error: integrationsError,
+    refetch: refetchIntegrations,
+  } = useQuery<SlackIntegration[]>({
+    queryKey: ["slackIntegrations"],
+    queryFn: async () => {
+      const response = await authedFetch("/api/slack/integrations");
+      const data = await response.json();
+      if (!data.success) {
+        throw new Error(data.error || "Unknown error");
+      }
+      return (data.data || []) as SlackIntegration[];
+    },
+  });
+  // Local error for the connect (OAuth) path (event-driven). Integration
+  // load failures come from the query above.
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [showCreator, setShowCreator] = useState(false);
   const pollTimerRef = useRef<number | null>(null);
 
-  const fetchIntegrations = async () => {
-    try {
-      setLoading(true);
-      const response = await authedFetch("/api/slack/integrations");
-      const data = await response.json();
+  // Combined error display: an event-driven connect error takes
+  // precedence, otherwise the integration-load error.
+  const displayError =
+    error ??
+    (integrationsError
+      ? sanitizeErrorMessage(
+          integrationsError instanceof Error
+            ? integrationsError.message
+            : "Unknown error",
+        )
+      : null);
 
-      if (data.success) {
-        setIntegrations(data.data || []);
-      } else {
-        throw new Error(data.error || "Unknown error");
-      }
-    } catch (err) {
-      setError(
-        sanitizeErrorMessage(
-          err instanceof Error ? err.message : "Unknown error",
-        ),
-      );
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Declared above this effect so the function exists before it is referenced
-  // (react-hooks/immutability — no use-before-declaration).
+  // Clear any in-flight OAuth popup poller on unmount.
   useEffect(() => {
-    fetchIntegrations();
     return () => {
       if (pollTimerRef.current !== null) {
         clearInterval(pollTimerRef.current);
@@ -117,7 +125,7 @@ export function SlackAppSelector({
           if (popup?.closed) {
             clearInterval(pollTimerRef.current!);
             pollTimerRef.current = null;
-            fetchIntegrations();
+            refetchIntegrations();
             setConnecting(false);
             return;
           }
@@ -226,11 +234,11 @@ export function SlackAppSelector({
         )}
       </div>
 
-      {error && (
+      {displayError && (
         <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl flex items-center gap-4 text-destructive animate-in shake duration-500">
           <AlertTriangle className="h-5 w-5 shrink-0" />
           <p className="m-0 text-[10px] font-black uppercase tracking-widest">
-            {error}
+            {displayError}
           </p>
         </div>
       )}

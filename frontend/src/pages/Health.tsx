@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -314,6 +314,16 @@ function UpcomingSchedules() {
     staleTime: 60_000,
   });
 
+  // Wall-clock time for the "overdue" check, refreshed on an interval so a
+  // schedule turns overdue as time passes without needing a refetch. Calling
+  // Date.now() directly in render is impure (react-hooks/purity); a lazy
+  // initializer + interval keeps render idempotent.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
   const upcoming: ScheduleWithWorkflow[] = useMemo(() => {
     return schedules
       .filter((s) => s.isEnabled && s.nextTriggerAt)
@@ -355,8 +365,7 @@ function UpcomingSchedules() {
         <div className="space-y-2">
           {upcoming.map((s) => {
             const isOverdue =
-              s.nextTriggerAt &&
-              new Date(s.nextTriggerAt).getTime() < Date.now();
+              s.nextTriggerAt && new Date(s.nextTriggerAt).getTime() < now;
             return (
               <div
                 key={s.id}

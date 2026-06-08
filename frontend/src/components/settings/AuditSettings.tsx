@@ -36,13 +36,20 @@ export default function AuditSettings() {
   const [protocol, setProtocol] = useState("grpc");
   const [headers, setHeaders] = useState("");
 
-  React.useEffect(() => {
+  // Seed the editable form from the fetched settings whenever the query
+  // result changes (initial load + post-save refetch). Done during render
+  // via the "store information from previous renders" pattern
+  // (https://react.dev/learn/you-might-not-need-an-effect) instead of a
+  // setState-in-effect, so it doesn't cascade an extra committed render.
+  const [lastData, setLastData] = React.useState(data);
+  if (data !== lastData) {
+    setLastData(data);
     if (data?.auditSettings) {
       setEnabled(data.auditSettings.streamingEnabled);
       setEndpoint(data.auditSettings.otlpEndpoint || "");
       setProtocol(data.auditSettings.otlpProtocol || "grpc");
     }
-  }, [data]);
+  }
 
   const {
     mutate: updateSettings,

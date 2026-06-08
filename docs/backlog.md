@@ -237,9 +237,21 @@ dead `.eslintrc.cjs`; the prettier sweep was its own PR. The rest:
    the current components after verifying each renders correctly, not
    rubber-stamped). Suite now 253 passing / 1 skipped / 0 failing.
 
-2. **Full `eslint-plugin-react-hooks` v7 ruleset — IN PROGRESS (incremental).**
-   v7's `recommended` is the strict React-Compiler set. Adopting it is a real,
-   **human-judgment** migration, so it's done one rule per PR.
+2. **Full `eslint-plugin-react-hooks` v7 ruleset — DONE (2026-06-08).**
+   The entire `recommended` (strict React-Compiler) set is now enabled as
+   `error`/`warn`, adopted one rule per PR with per-site triage — no blanket
+   suppressions. Final state: **slice 4** turned on `set-state-in-effect` and
+   `purity` after *properly fixing* every finding (no `eslint-disable`):
+   - `set-state-in-effect` (15): 1 genuine derived-state bug removed
+     (`AuthContext.isTwoFactorVerified`); 8 external→local syncs moved to the
+     React-documented render-phase "store previous value" pattern; 6 mount-fetch
+     components migrated to react-query `useQuery`. (PRs: #214 AuthContext, #215.)
+   - `purity` (6): mount/fallback timestamps via lazy `useState(() => Date.now())`
+     initializers; the schedule overdue-check uses an interval-ticked `now`; the
+     actor-compare queued-at time captured inside the setState updater.
+   The earlier "needs disables / not a safe bulk-fix" assessment below was
+   superseded — each finding turned out to have a clean structural fix. Original
+   incremental plan retained for history.
    - **DONE (slice 1):** enabled the two baseline rules PLUS every recommended
      rule with **zero current findings** — real correctness guards (`set-state-in-render`
      infinite-loop, `static-components`, `use-memo`/`void-use-memo`, `refs`,
@@ -252,10 +264,8 @@ dead `.eslintrc.cjs`; the prettier sweep was its own PR. The rest:
      (useActiveExecutionSync); 2 `window.location` OAuth navigations
      justified-disabled (IntegrationsManager, OAuthManager). preserve-memo: the
      TestWorkflowModal `useMemo` dep corrected (`[result?.nodeTraces]` → `[result]`).
-   - **REMAINING (per-site triage, one rule per PR):** `set-state-in-effect` (14,
-     cascading-render vs benign sync — the judgment-heavy one) and `purity` (6,
-     mostly intentional `Date.now()` — needs a keep-with-disables vs leave-off
-     decision since the codebase isn't adopting React Compiler).
+   - **DONE (slice 3):** `set-state-in-effect` (15) — see the completion summary
+     above. **DONE (slice 4):** `purity` (6) — same.
 
    **Measured blast radius (2026-06-05, run against `reactHooks.configs.recommended`):**
    35 problems / 27 errors, by rule:
