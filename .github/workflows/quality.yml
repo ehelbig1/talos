@@ -162,6 +162,7 @@ jobs:
           cargo nextest run -p controller \
             --test jwt_security_tests \
             --test webhook_security_tests \
+            --test webhooks_hmac_test \
             --test csrf_integration_tests \
             --test input_validation_tests \
             --test mcp_safety_tests
