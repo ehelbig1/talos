@@ -2894,9 +2894,12 @@ impl SecretsManager {
     /// Returns `Ok(true)` when the row was removed, `Ok(false)` if the
     /// id didn't match (stale/foreign).
     pub async fn delete_secret_by_id(&self, user_id: Uuid, secret_id: Uuid) -> Result<bool> {
-        let mut tx = self
-            .db_pool
-            .begin()
+        // RFC 0005 S3: open the tx scoped to the acting user so the `secrets`
+        // RLS USING + WITH CHECK (owner pin) back up the existing
+        // `created_by = $user_id` WHERE filter. begin_user_scoped sets
+        // app.current_user_id (the org pin permits via unset). Safe + latent
+        // while TALOS_RLS_SET_ROLE is off (only sets the GUC, no role switch).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id)
             .await
             .context("Failed to begin secret-delete-by-id transaction")?;
 
@@ -2956,9 +2959,8 @@ impl SecretsManager {
         // module that referenced it by `(name, default)`. The L-5
         // tx-atomic pattern guarantees the audit row commits iff the
         // UPDATE lands.
-        let mut tx = self
-            .db_pool
-            .begin()
+        // RFC 0005 S3: user-scoped tx — RLS backstop for `created_by = $user_id`.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id)
             .await
             .context("Failed to begin namespace-update transaction")?;
         let result = sqlx::query(
@@ -3008,9 +3010,8 @@ impl SecretsManager {
         // expiry from "tomorrow" to "next year" silently disables
         // the rotation-reminder mechanism. The audit row records the
         // event so security review can spot suspicious extensions.
-        let mut tx = self
-            .db_pool
-            .begin()
+        // RFC 0005 S3: user-scoped tx — RLS backstop for `created_by = $user_id`.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id)
             .await
             .context("Failed to begin expiry-update transaction")?;
         let result = sqlx::query(
@@ -3070,9 +3071,8 @@ impl SecretsManager {
 
         // UPDATE + audit row in a single transaction (L-5) so the
         // rotation event is observable iff the rotation lands.
-        let mut tx = self
-            .db_pool
-            .begin()
+        // RFC 0005 S3: user-scoped tx — RLS backstop for `created_by = $user_id`.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id)
             .await
             .context("Failed to begin rotate-by-id transaction")?;
 
