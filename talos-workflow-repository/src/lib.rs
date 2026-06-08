@@ -789,17 +789,40 @@ impl WorkflowRepository {
         actor_id: Option<Uuid>,
     ) -> Result<Uuid> {
         let wf_id = Uuid::new_v4();
+
+        // RFC 0004: stamp org_id = the creator's personal org (this path has
+        // no org-context selector). RFC 0006 / RFC 0005 S3: resolve that org
+        // in Rust (rather than the previous inline subquery) so we can BOTH
+        // bind it into the row AND open the write on a tx scoped to it via
+        // `begin_org_scoped` — making the org-pin RLS WITH CHECK enforce
+        // (`org_id = app.current_org_id`) once the fail-closed flip is on.
+        // NULL-tolerant: if the personal org is somehow absent, org_id stays
+        // NULL (the policy's `org_id IS NULL → permit` clause applies) and the
+        // write runs `begin_user_scoped`. Latent while `TALOS_RLS_SET_ROLE`
+        // is off (sets the GUCs, no role switch).
+        let personal_org: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 AND is_personal")
+                .bind(user_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+
+        let mut tx = match personal_org {
+            Some(org) => {
+                talos_db::begin_org_scoped(
+                    &self.db_pool,
+                    &talos_tenancy::OrgScope::new(org, user_id),
+                )
+                .await?
+            }
+            None => talos_db::begin_user_scoped(&self.db_pool, user_id).await?,
+        };
+
         sqlx::query(
-            // RFC 0004: stamp org_id = the creator's personal org (this
-            // path has no org-context selector). NULL-tolerant: if the
-            // personal org is somehow absent, org_id stays NULL and the
-            // owner still sees the row via the user_id union clause.
             "INSERT INTO workflows \
              (id, user_id, name, module_uri, graph_json, description, tags, capabilities, \
               intent, max_concurrent_executions, timeout_seconds, actor_id, readiness_score, \
               created_at, updated_at, org_id) \
-             VALUES ($1, $2, $3, '', $4, $5, $6, $7, $8, $9, $10, $11, 0, NOW(), NOW(), \
-              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
+             VALUES ($1, $2, $3, '', $4, $5, $6, $7, $8, $9, $10, $11, 0, NOW(), NOW(), $12)",
         )
         .bind(wf_id)
         .bind(user_id)
@@ -812,8 +835,10 @@ impl WorkflowRepository {
         .bind(max_concurrent)
         .bind(timeout_secs)
         .bind(actor_id)
-        .execute(&self.db_pool)
+        .bind(personal_org)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(wf_id)
     }
 
