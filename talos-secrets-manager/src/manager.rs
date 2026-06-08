@@ -975,11 +975,29 @@ impl SecretsManager {
         // 3. Store secret + audit log in a single transaction (L-5).
         //    Either both commit or neither does — no possibility of a
         //    secret existing without its audit trail or vice versa.
-        let mut tx = self
-            .db_pool
-            .begin()
+        //
+        //    RFC 0006 Option B / RFC 0005 S3: open the tx with the tenant scope
+        //    set so the `secrets` RLS WITH CHECK (org pin + `owner_user_id`
+        //    pin) is satisfied once enforcement is enabled. The new secret's
+        //    owner IS the creator (`owner_user_id = creator_user_id`, bound
+        //    below), so the per-user pin matches. Org-scoped secret →
+        //    `begin_org_scoped` (sets `current_org_id` + `current_user_id`);
+        //    org-less / personal secret → `begin_user_scoped` (sets
+        //    `current_user_id`; the org pin permits the NULL org). While
+        //    `TALOS_RLS_SET_ROLE` is off these only set the GUCs (no role
+        //    switch) → no behaviour change. `secret_audit_log` has no RLS, so
+        //    the audit insert on this tx is unaffected.
+        let mut tx = match org_id {
+            Some(active_org_id) => talos_db::begin_org_scoped(
+                &self.db_pool,
+                &talos_tenancy::OrgScope::new(active_org_id, creator_user_id),
+            )
             .await
-            .context("Failed to begin secret-create transaction")?;
+            .context("Failed to begin org-scoped secret-create transaction")?,
+            None => talos_db::begin_user_scoped(&self.db_pool, creator_user_id)
+                .await
+                .context("Failed to begin user-scoped secret-create transaction")?,
+        };
 
         let insert_result = sqlx::query_scalar::<_, Uuid>(
             r#"
