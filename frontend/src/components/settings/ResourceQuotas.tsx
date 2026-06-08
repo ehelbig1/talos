@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
 import { gql } from "@/lib/graphqlClient";
 import {
   useGetResourceQuotasQuery,
@@ -81,7 +81,18 @@ export function ResourceQuotas() {
 
   const q = data?.resourceQuotas;
 
-  useEffect(() => {
+  // Seed the editable form from the fetched quota whenever the quota
+  // changes (incl. the 30s refetch) and the user isn't mid-edit. Done
+  // during render via the "store information from previous renders"
+  // pattern (https://react.dev/learn/you-might-not-need-an-effect)
+  // instead of a setState-in-effect. We always advance the trackers when
+  // either input changes so that leaving edit mode re-syncs to the
+  // latest quota — matching the previous effect's [q, isEditing] deps.
+  const [lastQuota, setLastQuota] = useState(q);
+  const [lastIsEditing, setLastIsEditing] = useState(isEditing);
+  if (q !== lastQuota || isEditing !== lastIsEditing) {
+    setLastQuota(q);
+    setLastIsEditing(isEditing);
     if (q && !isEditing) {
       setEditedLimits({
         cpuCores: q.cpuCores,
@@ -90,7 +101,7 @@ export function ResourceQuotas() {
         concurrentExecutions: q.concurrentExecutions,
       });
     }
-  }, [q, isEditing]);
+  }
 
   const quotaList = q
     ? [

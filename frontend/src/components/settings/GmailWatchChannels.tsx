@@ -131,9 +131,17 @@ function CreateGmailWatchDialog({
   const [submitting, setSubmitting] = useState(false);
   const watchesFetching = useIsFetching({ queryKey: WATCHES_KEY }) > 0;
 
-  useEffect(() => {
+  // Default the select to the first integration once the list loads
+  // after mount (it may be empty on first render). Done during render via
+  // the "store information from previous renders" pattern
+  // (https://react.dev/learn/you-might-not-need-an-effect) instead of a
+  // setState-in-effect; the `!integrationId` guard means a user choice is
+  // never overridden.
+  const [lastIntegrations, setLastIntegrations] = useState(integrations);
+  if (integrations !== lastIntegrations) {
+    setLastIntegrations(integrations);
     if (!integrationId && integrations[0]) setIntegrationId(integrations[0].id);
-  }, [integrations, integrationId]);
+  }
 
   useEffect(() => {
     if (open) qc.invalidateQueries({ queryKey: WATCHES_KEY });

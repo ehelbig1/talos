@@ -151,19 +151,27 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
     };
   }, []);
 
-  // Sync internal text if store changes externally
-  React.useEffect(() => {
-    if (jsonError) return;
-    try {
-      const currentText = JSON.stringify(intent || {}, null, 2);
-      if (currentText !== jsonText) {
-        setJsonText(currentText);
+  // Sync the internal textarea buffer when the store's `intent` changes
+  // externally. Done during render via the "store information from
+  // previous renders" pattern (https://react.dev/learn/you-might-not-need-an-effect)
+  // rather than a setState-in-effect: we re-serialize only when the
+  // `intent` reference actually changes, and skip the sync while the
+  // user has an unparseable edit in flight (`jsonError`) so we don't
+  // clobber their in-progress text.
+  const [lastSyncedIntent, setLastSyncedIntent] = React.useState(intent);
+  if (intent !== lastSyncedIntent) {
+    setLastSyncedIntent(intent);
+    if (!jsonError) {
+      try {
+        const currentText = JSON.stringify(intent || {}, null, 2);
+        if (currentText !== jsonText) {
+          setJsonText(currentText);
+        }
+      } catch {
+        // ignore serialization errors
       }
-    } catch {
-      // ignore serialization errors
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intent]);
+  }
 
   const handleJsonChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;

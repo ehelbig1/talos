@@ -115,18 +115,30 @@ export function ModuleBuilder({
     enabled: !!selectedTemplateId,
   });
 
-  // Apply smart defaults when template loads
-  useEffect(() => {
-    if (selectedTemplate && Object.keys(config).length === 0) {
-      const defaults = getTemplateDefaults(
-        selectedTemplate.category,
-        selectedTemplate.name,
-      );
-      if (Object.keys(defaults).length > 0) {
-        setConfig(defaults);
-      }
+  // Apply smart defaults once a freshly-selected template's details
+  // arrive. Done during render via the "store information from previous
+  // renders" pattern (https://react.dev/learn/you-might-not-need-an-effect)
+  // rather than an effect, so it doesn't cascade an extra committed
+  // render (react-hooks/set-state-in-effect). The `appliedDefaultsFor`
+  // guard makes it fire at most once per template id and breaks the
+  // render loop when a template has no defaults.
+  const [appliedDefaultsFor, setAppliedDefaultsFor] = useState<string | null>(
+    null,
+  );
+  if (
+    selectedTemplate &&
+    selectedTemplate.id !== appliedDefaultsFor &&
+    Object.keys(config).length === 0
+  ) {
+    setAppliedDefaultsFor(selectedTemplate.id);
+    const defaults = getTemplateDefaults(
+      selectedTemplate.category,
+      selectedTemplate.name,
+    );
+    if (Object.keys(defaults).length > 0) {
+      setConfig(defaults);
     }
-  }, [selectedTemplate]);
+  }
 
   const isWebhookTemplate =
     selectedTemplate?.category === "webhook" ||

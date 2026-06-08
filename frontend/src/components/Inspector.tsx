@@ -114,19 +114,17 @@ function Inspector() {
 
   // Determine the active tab: if debugNodeId is set and execution data exists, default to debug
   const showDebugTab = hasExecution && debugNodeId != null;
-  const [activeTab, setActiveTab] = useState<string>("inspector");
 
-  // When debugNodeId is set externally, switch to the debug tab
-  useEffect(() => {
-    if (debugNodeId != null && hasExecution) {
-      setActiveTab("debug");
-    }
-  }, [debugNodeId, hasExecution]);
+  // The tab strip only renders while `debugNodeId != null` (see
+  // `showDebugTab`), and switching to "inspector" clears `debugNodeId`
+  // — which removes the strip entirely. So the active tab is fully
+  // derivable from `debugNodeId` and needs no mirrored state or sync
+  // effect (react-hooks/set-state-in-effect).
+  const activeTab = debugNodeId != null ? "debug" : "inspector";
 
   // Clear debugNodeId when switching away from the debug tab
   const handleTabChange = useCallback(
     (value: string) => {
-      setActiveTab(value);
       if (value !== "debug") {
         setDebugNodeId(null);
       }

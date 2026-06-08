@@ -92,10 +92,19 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
     [addNode, updateNodeData, onClose],
   );
 
+  // Toggle the menu. Resetting the keyboard-nav highlight lives here in
+  // the open path (an event) rather than in the open effect, so the
+  // effect stays a pure external-listener subscription
+  // (react-hooks/set-state-in-effect). Resetting on close too is a
+  // harmless no-op since the list is hidden.
+  const toggleOpen = useCallback(() => {
+    setIsOpen((v) => !v);
+    setActiveIndex(-1);
+  }, []);
+
   // Close on outside click
   useEffect(() => {
     if (!isOpen) return;
-    setActiveIndex(-1);
     const handleClickOutside = (e: MouseEvent) => {
       if (
         containerRef.current &&
@@ -135,7 +144,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
   return (
     <div className="relative" ref={containerRef}>
       <button
-        onClick={() => setIsOpen((v) => !v)}
+        onClick={toggleOpen}
         aria-label="Open control flow menu"
         aria-expanded={isOpen}
         aria-haspopup="true"

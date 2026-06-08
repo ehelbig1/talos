@@ -27,6 +27,12 @@ interface Workflow {
 
 export default function ExecutionPanel() {
   const [workflowId, setWorkflowId] = useState("");
+  // Tracks the store's workflowId so we can re-sync local state during
+  // render when the editor loads a different workflow (see below),
+  // instead of mirroring it through a setState-in-effect.
+  const [lastStoreWorkflowId, setLastStoreWorkflowId] = useState<
+    string | null | undefined
+  >(undefined);
   const [selectedActorId, setSelectedActorId] = useState<string>("");
   const [executionId, setExecutionId] = useState("");
   const [loading, setLoading] = useState(false);
@@ -83,10 +89,16 @@ export default function ExecutionPanel() {
     select: (data) => data.filter((a) => a.status === "active"),
   });
 
-  // Sync with workflow currently loaded in editor
-  useEffect(() => {
+  // Sync with the workflow currently loaded in the editor. Done during
+  // render via the "store information from previous renders" pattern
+  // (https://react.dev/learn/you-might-not-need-an-effect) so a store
+  // change doesn't cascade an extra committed render. The user can still
+  // override `workflowId` locally between store changes (the selector
+  // handler below); the next store change re-syncs.
+  if (storeWorkflowId !== lastStoreWorkflowId) {
+    setLastStoreWorkflowId(storeWorkflowId);
     setWorkflowId(storeWorkflowId || "new");
-  }, [storeWorkflowId]);
+  }
 
   useEffect(() => {
     const handleWorkflowSaved = () => refetchWorkflows();
