@@ -333,6 +333,38 @@ impl WorkflowRepository {
         }
     }
 
+    /// Open a write transaction scoped to the creator's **personal org**
+    /// (RFC 0006 org-pin / RFC 0005 S3). Resolves that org in Rust so the
+    /// caller can BOTH bind it as the new row's `org_id` AND have the
+    /// org-pin RLS `WITH CHECK` enforce (`org_id = app.current_org_id`)
+    /// once the fail-closed flip is on — the bound org and the scoped org
+    /// match by construction. Returns `(tx, personal_org)`; the caller MUST
+    /// bind `personal_org` as the row's `org_id` and commit the tx. Falls
+    /// back to a user-scoped tx + `None` org when the personal org is absent
+    /// (the policy's `org_id IS NULL → permit` clause applies). Latent while
+    /// `TALOS_RLS_SET_ROLE` is off (sets the GUCs, no role switch).
+    async fn begin_personal_org_write(
+        &self,
+        user_id: Uuid,
+    ) -> Result<(sqlx::Transaction<'_, sqlx::Postgres>, Option<Uuid>)> {
+        let personal_org: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 AND is_personal")
+                .bind(user_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        let tx = match personal_org {
+            Some(org) => {
+                talos_db::begin_org_scoped(
+                    &self.db_pool,
+                    &talos_tenancy::OrgScope::new(org, user_id),
+                )
+                .await?
+            }
+            None => talos_db::begin_user_scoped(&self.db_pool, user_id).await?,
+        };
+        Ok((tx, personal_org))
+    }
+
     /// Builder: attach SecretsManager so `mark_execution_*` and
     /// `update_execution_output` encrypt `output_data` at rest. Mirrors
     /// `ActorRepository::with_encryption` and the equivalent helper on
@@ -790,32 +822,11 @@ impl WorkflowRepository {
     ) -> Result<Uuid> {
         let wf_id = Uuid::new_v4();
 
-        // RFC 0004: stamp org_id = the creator's personal org (this path has
-        // no org-context selector). RFC 0006 / RFC 0005 S3: resolve that org
-        // in Rust (rather than the previous inline subquery) so we can BOTH
-        // bind it into the row AND open the write on a tx scoped to it via
-        // `begin_org_scoped` — making the org-pin RLS WITH CHECK enforce
-        // (`org_id = app.current_org_id`) once the fail-closed flip is on.
-        // NULL-tolerant: if the personal org is somehow absent, org_id stays
-        // NULL (the policy's `org_id IS NULL → permit` clause applies) and the
-        // write runs `begin_user_scoped`. Latent while `TALOS_RLS_SET_ROLE`
-        // is off (sets the GUCs, no role switch).
-        let personal_org: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 AND is_personal")
-                .bind(user_id)
-                .fetch_optional(&self.db_pool)
-                .await?;
-
-        let mut tx = match personal_org {
-            Some(org) => {
-                talos_db::begin_org_scoped(
-                    &self.db_pool,
-                    &talos_tenancy::OrgScope::new(org, user_id),
-                )
-                .await?
-            }
-            None => talos_db::begin_user_scoped(&self.db_pool, user_id).await?,
-        };
+        // RFC 0004: stamp org_id = the creator's personal org. RFC 0006 /
+        // RFC 0005 S3: scope the write to that org so the org-pin RLS WITH
+        // CHECK enforces (see `begin_personal_org_write`). The resolved org
+        // is bound as `org_id` ($12) so the row's org matches the scope.
+        let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
 
         sqlx::query(
             "INSERT INTO workflows \
@@ -3510,11 +3521,12 @@ impl WorkflowRepository {
         description: &str,
         graph_json: &str,
     ) -> Result<()> {
+        // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
+        // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($7).
+        let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
         sqlx::query(
-            // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
             "INSERT INTO workflows (id, user_id, actor_id, name, description, graph_json, status, workflow_type, org_id) \
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'published', 'internal', \
-              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'published', 'internal', $7)",
         )
         .bind(workflow_id)
         .bind(user_id)
@@ -3522,8 +3534,10 @@ impl WorkflowRepository {
         .bind(name)
         .bind(description)
         .bind(graph_json)
-        .execute(&self.db_pool)
+        .bind(personal_org)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3541,11 +3555,12 @@ impl WorkflowRepository {
         capabilities: &[String],
         module_uri: &str,
     ) -> Result<()> {
+        // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
+        // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($8).
+        let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
         sqlx::query(
-            // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
             "INSERT INTO workflows (id, user_id, name, description, graph_json, is_enabled, capabilities, module_uri, org_id) \
-             VALUES ($1, $2, $3, $4, $5, true, $6, $7, \
-              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
+             VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)",
         )
         .bind(workflow_id)
         .bind(user_id)
@@ -3554,8 +3569,10 @@ impl WorkflowRepository {
         .bind(graph_json)
         .bind(capabilities)
         .bind(module_uri)
-        .execute(&self.db_pool)
+        .bind(personal_org)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3830,19 +3847,22 @@ impl WorkflowRepository {
         graph_json: &str,
         tags: &[String],
     ) -> Result<()> {
+        // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
+        // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($6).
+        let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
         sqlx::query(
-            // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
             "INSERT INTO workflows (id, user_id, name, module_uri, graph_json, tags, created_at, updated_at, org_id) \
-             VALUES ($1, $2, $3, '', $4, $5, NOW(), NOW(), \
-              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
+             VALUES ($1, $2, $3, '', $4, $5, NOW(), NOW(), $6)",
         )
         .bind(new_id)
         .bind(user_id)
         .bind(new_name)
         .bind(graph_json)
         .bind(tags)
-        .execute(&self.db_pool)
+        .bind(personal_org)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4803,18 +4823,24 @@ impl WorkflowRepository {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Workflow not found or not owned by caller"))?
         } else {
-            sqlx::query_scalar(
-                // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
+            // RFC 0006 / RFC 0005 S3: scope the INSERT to the creator's
+            // personal org so the org-pin WITH CHECK enforces; bind the
+            // resolved org as `org_id` ($4). (The UPDATE branch above doesn't
+            // move org_id, so it stays unscoped — permit-via-unset.)
+            let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+            let new_id: Uuid = sqlx::query_scalar(
                 "INSERT INTO workflows (user_id, name, module_uri, graph_json, created_at, updated_at, org_id) \
-                 VALUES ($1, $2, '', $3, NOW(), NOW(), \
-                  (SELECT id FROM organizations WHERE owner_id = $1 AND is_personal)) \
+                 VALUES ($1, $2, '', $3, NOW(), NOW(), $4) \
                  RETURNING id",
             )
             .bind(user_id)
             .bind(name)
             .bind(graph_json)
-            .fetch_one(&self.db_pool)
-            .await?
+            .bind(personal_org)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            new_id
         };
         Ok(id)
     }
