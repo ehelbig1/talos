@@ -115,7 +115,25 @@ basis the open questions below are resolved as:
 permissive today). The migration can only *restrict* a GUC-set write, never break
 an un-wired/engine/decrypt one.
 
-### Implementation finding (2026-06-08) — OPEN: owner-pin vs org-shared-secret membership writes
+### Implementation finding (2026-06-08) — RESOLVED via option (b): owner-pin vs org-shared-secret membership writes
+
+> **RESOLVED (2026-06-08): option (b) — personal-vs-org split.** The owner pin
+> now applies to PERSONAL secrets only (`org_id IS NULL`); org-shared secrets are
+> collaborative (org pin + membership/RBAC, like `workflows`/`actors`).
+> Implemented:
+> - Migration `20260608130000_rls_secrets_personal_owner_pin_only.sql` refines
+>   the `secrets` WITH CHECK so the `owner_user_id` pin short-circuits to TRUE for
+>   `org_id IS NOT NULL` rows (supersedes 20260608120000's blanket pin).
+> - `update_secret` / `delete_secret` scope their NON-admin path via
+>   `begin_tenant_read_scoped(user_id, accessible_org_ids)` (membership), backing
+>   up the existing `($user IS NULL OR owner OR org_id = ANY($orgs))` gate; the
+>   admin path (`user_id = None`) stays unscoped by design.
+> - Test
+>   `rls_org_isolation::secrets_owner_pin_is_personal_only_org_shared_is_collaborative`
+>   proves personal cross-user write rejected (42501), personal own write OK,
+>   org-shared non-owner member write permitted, workflow collaborative write OK.
+> Original analysis kept below.
+
 
 Wiring the S3 write paths (PRs #207/#208 + upsert) surfaced a tension the Option
 B decision didn't anticipate. The clean owner-keyed writes — `create_secret`,

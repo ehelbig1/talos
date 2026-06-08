@@ -1307,11 +1307,29 @@ impl SecretsManager {
         // same transaction precedes the UPDATE.
         //
         // Update + audit row commit in a single tx (L-5).
-        let mut tx = self
-            .db_pool
-            .begin()
+        //
+        // RFC 0005 S3 / RFC 0006 (b): scope the NON-admin path to the caller's
+        // membership (begin_tenant_read_scoped sets app.current_user_id +
+        // app.current_org_ids), so the secrets RLS USING (owner OR membership) +
+        // WITH CHECK back up the existing `($user IS NULL OR owner_user_id =
+        // $user OR org_id = ANY($orgs))` gate below. Under decision (b) the owner
+        // pin applies only to personal (org_id NULL) secrets, so a member's
+        // write to an org-shared secret is permitted. The admin/internal path
+        // (updater_user_id = None) stays UNSCOPED by design — it intentionally
+        // bypasses ownership. Safe + latent while TALOS_RLS_SET_ROLE is off.
+        let mut tx = match updater_user_id {
+            Some(uid) => talos_db::begin_tenant_read_scoped(
+                &self.db_pool,
+                &talos_tenancy::TenantReadScope::new(uid, accessible_org_ids.to_vec()),
+            )
             .await
-            .context("Failed to begin secret-update transaction")?;
+            .context("Failed to begin membership-scoped secret-update transaction")?,
+            None => self
+                .db_pool
+                .begin()
+                .await
+                .context("Failed to begin secret-update transaction")?,
+        };
 
         // Lock the row + apply ownership/org guard. fetch_optional →
         // None on "not found or access denied" (preserved from the
@@ -1962,11 +1980,26 @@ impl SecretsManager {
         // RETURNING (id, owner_user_id) so cache-invalidation can be scoped to
         // the deleted secret's actual owner — same rationale as update_secret.
         // DELETE + audit insert run in a single tx (L-5).
-        let mut tx = self
-            .db_pool
-            .begin()
+        //
+        // RFC 0005 S3 / RFC 0006 (b): scope the NON-admin path to the caller's
+        // membership so the secrets RLS USING (owner OR membership) backs up the
+        // `($user IS NULL OR owner OR created_by OR org_id = ANY($orgs))` gate
+        // below; org-shared deletes by a member are allowed (owner pin is
+        // personal-only). Admin/internal path (deleter_user_id = None) stays
+        // UNSCOPED by design. Safe + latent while TALOS_RLS_SET_ROLE is off.
+        let mut tx = match deleter_user_id {
+            Some(uid) => talos_db::begin_tenant_read_scoped(
+                &self.db_pool,
+                &talos_tenancy::TenantReadScope::new(uid, accessible_org_ids.to_vec()),
+            )
             .await
-            .context("Failed to begin secret-delete transaction")?;
+            .context("Failed to begin membership-scoped secret-delete transaction")?,
+            None => self
+                .db_pool
+                .begin()
+                .await
+                .context("Failed to begin secret-delete transaction")?,
+        };
 
         let deleted: Option<(Uuid, Option<Uuid>)> = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
             r#"DELETE FROM secrets

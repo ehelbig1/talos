@@ -1213,20 +1213,23 @@ async fn set_role_with_check_gates_cross_tenant_writes() {
     }
 }
 
-/// RFC 0006 Option B — `secrets` WRITES are pinned to the acting user
-/// (`owner_user_id = app.current_user_id`) IN ADDITION to the org pin, so within
-/// a single org one user cannot forge / overwrite a secret owned by another
-/// user (secrets carry per-user DEK lineage). Collaborative org-scoped tables
-/// (`workflows`) stay org-pinned ONLY — proven here by a workflow write with a
-/// different `user_id` succeeding under the same scope.
+/// RFC 0006 decision (b) — the `secrets` owner pin applies to PERSONAL secrets
+/// only (`org_id IS NULL`); ORG-SHARED secrets are collaborative (org pin +
+/// membership/RBAC), like `workflows`/`actors`. Proves all three:
+///   1. personal secret owned by the acting user        → permitted (owner pin)
+///   2. personal secret owned by a DIFFERENT user       → REJECTED (owner pin)
+///   3. org-shared secret owned by a DIFFERENT member   → permitted (owner pin
+///      skipped for org_id IS NOT NULL; org pin satisfied)
+///   4. a workflow with a different user_id under the org scope → permitted
+///      (org-pinned only, unchanged)
 ///
-/// Sets the role + both GUCs by hand (like
-/// `set_role_with_check_gates_cross_tenant_writes`) so the WITH CHECK enforces
-/// deterministically under the superuser connection regardless of
-/// `TALOS_RLS_SET_ROLE`. `begin_org_scoped` emits the same two SET LOCALs in
-/// production (talos-tenancy::OrgScope::set_local_org_sql).
+/// Sets role + GUCs by hand (like `set_role_with_check_gates_cross_tenant_writes`)
+/// so the WITH CHECK enforces deterministically regardless of
+/// `TALOS_RLS_SET_ROLE`. Personal cases set only `app.current_user_id` (no active
+/// org, as `begin_user_scoped` does); the org-shared case sets
+/// `app.current_org_id` too (as `begin_org_scoped` does).
 #[tokio::test]
-async fn secrets_with_check_pins_owner_to_acting_user() {
+async fn secrets_owner_pin_is_personal_only_org_shared_is_collaborative() {
     let Some(su_url) = superuser_url() else {
         return;
     };
@@ -1264,41 +1267,43 @@ async fn secrets_with_check_pins_owner_to_acting_user() {
         .await
         .unwrap();
 
-    let scope_a =
+    // Personal scope: acting user, NO active org (as begin_user_scoped emits).
+    let scope_personal =
+        format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{user_a}'");
+    // Org scope: active org + acting user (as begin_org_scoped emits).
+    let scope_org =
         format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_org_id = '{org_a}'; SET LOCAL app.current_user_id = '{user_a}'");
 
-    // 1. user_a writes a secret OWNED BY user_a in org_a → satisfies org + owner pin.
+    // 1. PERSONAL secret (org_id NULL) owned by user_a → owner pin satisfied.
     let mut tx = su.begin().await.unwrap();
-    (&mut *tx).execute(scope_a.as_str()).await.unwrap();
+    (&mut *tx).execute(scope_personal.as_str()).await.unwrap();
     sqlx::query(
         "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id, created_by, org_id) \
-         VALUES ($1, 's', 'sec/own-ok', ''::bytea, $2, $3, $3, $4)",
+         VALUES ($1, 's', 'sec/personal-own', ''::bytea, $2, $3, $3, NULL)",
     )
     .bind(Uuid::new_v4())
     .bind(ek)
     .bind(user_a)
-    .bind(org_a)
     .execute(&mut *tx)
     .await
-    .expect("a secret owned by the acting user must satisfy the WITH CHECK");
+    .expect("a personal secret owned by the acting user must satisfy the owner pin");
     tx.commit().await.unwrap();
 
-    // 2. user_a tries to write a secret OWNED BY user_b in org_a → per-user pin rejects.
+    // 2. PERSONAL secret (org_id NULL) owned by user_b → owner pin REJECTS.
     let mut tx = su.begin().await.unwrap();
-    (&mut *tx).execute(scope_a.as_str()).await.unwrap();
+    (&mut *tx).execute(scope_personal.as_str()).await.unwrap();
     let res = sqlx::query(
         "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id, created_by, org_id) \
-         VALUES ($1, 's', 'sec/forge', ''::bytea, $2, $3, $3, $4)",
+         VALUES ($1, 's', 'sec/personal-forge', ''::bytea, $2, $3, $3, NULL)",
     )
     .bind(Uuid::new_v4())
     .bind(ek)
     .bind(user_b)
-    .bind(org_a)
     .execute(&mut *tx)
     .await;
     assert!(
         res.is_err(),
-        "user_a must NOT create a secret owned by user_b within the same org (RFC 0006 Option B per-user pin)"
+        "user_a must NOT create a PERSONAL secret owned by user_b (owner pin)"
     );
     if let Err(sqlx::Error::Database(dbe)) = &res {
         assert_eq!(
@@ -1309,10 +1314,28 @@ async fn secrets_with_check_pins_owner_to_acting_user() {
     }
     let _ = tx.rollback().await;
 
-    // 3. workflows stay ORG-PINNED ONLY: the same scope writing a workflow with a
-    //    DIFFERENT user_id must still succeed (collaboration is not user-pinned).
+    // 3. ORG-SHARED secret (org_id = org_a) owned by user_b, written by member
+    //    user_a → PERMITTED. Owner pin is skipped for org_id IS NOT NULL; the org
+    //    pin (org_a = current_org_id) is satisfied. Collaborative, like workflows.
     let mut tx = su.begin().await.unwrap();
-    (&mut *tx).execute(scope_a.as_str()).await.unwrap();
+    (&mut *tx).execute(scope_org.as_str()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id, created_by, org_id) \
+         VALUES ($1, 's', 'sec/org-shared', ''::bytea, $2, $3, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ek)
+    .bind(user_b) // different owner — allowed for an org-shared secret
+    .bind(org_a)
+    .execute(&mut *tx)
+    .await
+    .expect("an org-shared secret is org-pinned only — a member's write must succeed regardless of owner");
+    tx.commit().await.unwrap();
+
+    // 4. workflows stay ORG-PINNED ONLY: a workflow with a DIFFERENT user_id under
+    //    the org scope must still succeed (collaboration is not user-pinned).
+    let mut tx = su.begin().await.unwrap();
+    (&mut *tx).execute(scope_org.as_str()).await.unwrap();
     sqlx::query(
         "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json) \
          VALUES ($1, $2, $3, 'collab', 'mod://x', '{}'::jsonb)",
@@ -1332,8 +1355,10 @@ async fn secrets_with_check_pins_owner_to_acting_user() {
         .bind(org_a)
         .execute(&su)
         .await;
-    let _ = sqlx::query("DELETE FROM secrets WHERE org_id = $1")
-        .bind(org_a)
+    // created_by covers both the personal (org_id NULL) and org-shared rows.
+    let _ = sqlx::query("DELETE FROM secrets WHERE created_by = $1 OR created_by = $2")
+        .bind(user_a)
+        .bind(user_b)
         .execute(&su)
         .await;
     let _ = sqlx::query("DELETE FROM encryption_keys WHERE id = $1")
