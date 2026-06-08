@@ -237,10 +237,17 @@ dead `.eslintrc.cjs`; the prettier sweep was its own PR. The rest:
    the current components after verifying each renders correctly, not
    rubber-stamped). Suite now 253 passing / 1 skipped / 0 failing.
 
-2. **Full `eslint-plugin-react-hooks` v7 ruleset not adopted.** Only the two
-   battle-tested rules are on (`rules-of-hooks` = error, `exhaustive-deps` =
-   warn). v7's `recommended` is the strict React-Compiler set. Adopting it is a
-   real, **human-judgment** migration — scope deliberately.
+2. **Full `eslint-plugin-react-hooks` v7 ruleset — IN PROGRESS (incremental).**
+   v7's `recommended` is the strict React-Compiler set. Adopting it is a real,
+   **human-judgment** migration, so it's done one rule per PR.
+   - **DONE (slice 1):** enabled the two baseline rules PLUS every recommended
+     rule with **zero current findings** — real correctness guards (`set-state-in-render`
+     infinite-loop, `static-components`, `use-memo`/`void-use-memo`, `refs`,
+     `error-boundaries`, `globals`, `config`, `gating`, + `incompatible-library`/
+     `unsupported-syntax` as warns). Pure upside, no code churn.
+   - **REMAINING (per-site triage, one rule per PR):** the four finding-bearing
+     rules below stay OFF until triaged: `set-state-in-effect` (14),
+     `immutability` (6), `purity` (6), `preserve-manual-memoization` (1).
 
    **Measured blast radius (2026-06-05, run against `reactHooks.configs.recommended`):**
    35 problems / 27 errors, by rule:
