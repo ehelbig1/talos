@@ -271,9 +271,11 @@ each independently shippable and flag-safe:
 - Phase B (`secrets`): the dual-GUC owner pin rejects an intra-org cross-user
   write under `SET LOCAL ROLE talos_app`, while same-user and collaborative
   `workflows` writes still succeed — proven by
-  `talos-db::rls_org_isolation::secrets_with_check_pins_owner_to_acting_user`
-  (gated in CI). RFC 0005's enforcement runbook can now proceed knowing the
-  write-isolation contract is intentional and signed off.
+  `talos-db::rls_org_isolation::secrets_owner_pin_is_personal_only_org_shared_is_collaborative`
+  (gated in CI). All secret WRITE paths are now wired (#207–#210); activation is
+  RFC 0005's **Post-S3 enablement checklist** ("Enabling enforcement (operator
+  runbook)" → grant-completeness query + per-table contract + system-write
+  exemptions), an ops step.
 
 ## See also
 
