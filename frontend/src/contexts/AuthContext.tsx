@@ -25,16 +25,15 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
-  const [isTwoFactorVerified, setIsTwoFactorVerified] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
 
-  useEffect(() => {
-    if (user) {
-      setIsTwoFactorVerified(user.isTwoFactorVerified);
-    } else {
-      setIsTwoFactorVerified(false);
-    }
-  }, [user]);
+  // `isTwoFactorVerified` is PURELY derived from the current user — there
+  // is no independent "verify" path that sets it without also updating
+  // `user` (login re-fetches the user; logout nulls it). Deriving it
+  // during render instead of mirroring it into state via an effect
+  // removes the redundant double-render on every `setUser` and the
+  // state-desync hazard the mirror created (react-hooks/set-state-in-effect).
+  const isTwoFactorVerified = user?.isTwoFactorVerified ?? false;
 
   useEffect(() => {
     let mounted = true;
@@ -63,8 +62,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = () => {
+    // Nulling the user makes the derived `isTwoFactorVerified` false; no
+    // separate setter needed.
     setUser(null);
-    setIsTwoFactorVerified(false);
     authLogout();
   };
 
