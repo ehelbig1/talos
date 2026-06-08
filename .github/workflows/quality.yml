@@ -170,6 +170,43 @@ jobs:
             --test agentic_safety_tests
           cargo nextest run -p talos-workflow-job-protocol --test security_tests
 
+      - name: Run DB-free engine + protocol + remaining integration binaries
+        # The rest of the workspace's DB-free tests/-dir binaries — engine
+        # behaviour (cancellation, checkpointing, fan-in, subflow recursion,
+        # wait/pause/resume, timeouts, rate-limit, precheck, trigger input),
+        # signed job-protocol serialization + wire-format snapshots, worker
+        # runtime/trap, and controller circuit-breaker / execution-event /
+        # JS-compilation / NATS-topic / rhai / worker-manager. All verified
+        # green and need no DB or container. Completes the DB-free never-in-CI
+        # gate; the only remaining ungated binaries need a real DB
+        # (env_vars / scheduler_tests / workflow_version_tests — tracked) or NATS
+        # (webhooks_hmac_test, already #[ignore]'d).
+        run: |
+          cargo nextest run -p talos-workflow-engine \
+            --test cancellation \
+            --test checkpointing \
+            --test fan_in_join \
+            --test precheck_errors \
+            --test rate_limit_store \
+            --test subflow_recursion \
+            --test trigger_input \
+            --test wait_pause_resume \
+            --test workflow_timeout
+          cargo nextest run -p talos-workflow-job-protocol \
+            --test serialization \
+            --test wire_format_snapshots
+          cargo nextest run -p worker \
+            --test runtime_test \
+            --test runtime_integration_test \
+            --test trap_test
+          cargo nextest run -p controller \
+            --test circuit_breaker_integration \
+            --test execution_event_tests \
+            --test js_compilation_tests \
+            --test nats_topic_tests \
+            --test rhai_check \
+            --test worker_manager_tests
+
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable
   # pgvector + Redis via Docker (available on ubuntu-latest), applies the full
