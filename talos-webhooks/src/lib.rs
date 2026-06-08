@@ -2991,6 +2991,21 @@ pub async fn approval_handler(
 /// The preview looks up the gate to show title + description so the
 /// reviewer knows what they're about to decide on, and refuses to
 /// show a form for gates that are expired / already resolved.
+/// Constant-time comparison of an approval-gate token against the value
+/// stored on the row the SHA-256 lookup returned. The lookup keys on
+/// `token_hash` (a non-secret digest) so the indexed query never compares
+/// the raw secret; this final `ct_eq` makes the auth decision itself
+/// constant-time and defends against the (cryptographically negligible)
+/// SHA-256 collision. An empty stored token can never authenticate —
+/// guards the empty-string `ct_eq` bypass class (MCP-629).
+fn approval_token_matches(stored: &str, provided: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    if stored.is_empty() {
+        return false;
+    }
+    stored.as_bytes().ct_eq(provided.as_bytes()).unwrap_u8() == 1
+}
+
 pub async fn approval_gate_preview(
     Path((token, action)): Path<(String, String)>,
     Extension(db_pool): Extension<Pool<Postgres>>,
@@ -3013,17 +3028,21 @@ pub async fn approval_gate_preview(
         )
             .into_response();
     }
+    // Look up by the SHA-256 token hash (non-secret, indexed) rather than
+    // the raw token, then constant-time-compare the stored token below.
+    let token_hash = talos_text_util::sha256_hex(&token);
     let row: Option<(
         String,
         String,
         Option<String>,
         chrono::DateTime<chrono::Utc>,
+        String,
     )> = match sqlx::query_as(
-        "SELECT status, title, description, expires_at \
+        "SELECT status, title, description, expires_at, token \
              FROM workflow_approval_gates \
-             WHERE token = $1",
+             WHERE token_hash = $1",
     )
-    .bind(&token)
+    .bind(&token_hash)
     .fetch_optional(&db_pool)
     .await
     {
@@ -3042,9 +3061,9 @@ pub async fn approval_gate_preview(
             None
         }
     };
-    let (status, title, description, expires_at) = match row {
-        Some(r) => r,
-        None => {
+    let (status, title, description, expires_at, _) = match row {
+        Some(r) if approval_token_matches(&r.4, &token) => r,
+        _ => {
             return (
                 StatusCode::NOT_FOUND,
                 axum::response::Html("<h1>Approval gate not found</h1><p>The link may have expired or already been used.</p>"),
@@ -3157,27 +3176,28 @@ pub async fn approval_gate_handler(
             .into_response();
     }
 
-    // Look up the gate — we compare status and expiry atomically in the UPDATE
-    // 2026-05-28 audit follow-up (low confidence): the WHERE token = $1
-    // lookup uses Postgres byte-level comparator, not the canonical
-    // workspace `subtle::ConstantTimeEq` discipline used elsewhere
-    // (csrf, api-keys, totp, registry signature, webhook HMAC). The
-    // 64-char hex pre-filter at line 2976 bounds attack surface in
-    // practice. A proper hardening would (1) add `token_hash` column
-    // (SHA-256 prefix index), (2) lookup by hash, (3) ct_eq the full
-    // token after fetch. Deferred — schema change with backfill cost.
+    // Look up by the SHA-256 token hash (non-secret, indexed via the
+    // `token_hash` generated column) rather than the raw token, then
+    // constant-time-compare the stored token below. Status + expiry are
+    // re-checked atomically in the UPDATE. This is the hardening the
+    // 2026-05-28 audit note deferred (migration 20260608140000): the
+    // indexed lookup no longer compares the raw secret, and the auth
+    // decision is constant-time — matching the `subtle::ConstantTimeEq`
+    // discipline used for CSRF, API keys, TOTP, registry sigs, webhook HMAC.
+    let token_hash = talos_text_util::sha256_hex(&token);
     let row: Option<(
         uuid::Uuid,
         String,
         Option<uuid::Uuid>,
         serde_json::Value,
         uuid::Uuid,
+        String,
     )> = match sqlx::query_as(
-        "SELECT id, status, continuation_workflow_id, payload, user_id \
+        "SELECT id, status, continuation_workflow_id, payload, user_id, token \
          FROM workflow_approval_gates \
-         WHERE token = $1",
+         WHERE token_hash = $1",
     )
-    .bind(&token)
+    .bind(&token_hash)
     .fetch_optional(&db_pool)
     .await
     {
@@ -3198,8 +3218,8 @@ pub async fn approval_gate_handler(
     };
 
     let (gate_id, current_status, continuation_wf_id, payload, user_id) = match row {
-        Some(r) => r,
-        None => {
+        Some(r) if approval_token_matches(&r.5, &token) => (r.0, r.1, r.2, r.3, r.4),
+        _ => {
             return (
                 StatusCode::NOT_FOUND,
                 axum::response::Html("<h1>Approval gate not found</h1><p>The link may have expired or already been used.</p>"),
@@ -3586,5 +3606,46 @@ mod auth_downgrade_tests {
         // Degenerate (resolved-but-not-configured) is impossible in practice
         // but must also not fail closed.
         assert!(!webhook_must_fail_closed_on_hmac(false, true));
+    }
+}
+
+#[cfg(test)]
+mod approval_token_match_tests {
+    use super::approval_token_matches;
+
+    #[test]
+    fn matches_identical_token() {
+        let tok = "a".repeat(64);
+        assert!(approval_token_matches(&tok, &tok));
+    }
+
+    #[test]
+    fn rejects_different_token() {
+        let stored = "a".repeat(64);
+        let provided = format!("{}b", "a".repeat(63));
+        assert!(!approval_token_matches(&stored, &provided));
+    }
+
+    #[test]
+    fn rejects_length_mismatch() {
+        assert!(!approval_token_matches("abcd", "abcde"));
+        assert!(!approval_token_matches(&"a".repeat(64), "a"));
+    }
+
+    #[test]
+    fn empty_stored_never_authenticates() {
+        // Empty-string ct_eq bypass class (MCP-629): a row whose stored
+        // token is "" must never match — not even an empty provided token.
+        assert!(!approval_token_matches("", ""));
+        assert!(!approval_token_matches("", "anything"));
+    }
+
+    #[test]
+    fn matches_sha256_lookup_contract() {
+        // The handler fetches the row WHERE token_hash = sha256_hex(provided),
+        // so the stored token on a legitimately-matched row equals `provided`.
+        let provided = "deadbeef".repeat(8); // 64 hex chars
+        let _hash = talos_text_util::sha256_hex(&provided);
+        assert!(approval_token_matches(&provided, &provided));
     }
 }
