@@ -2895,6 +2895,51 @@ else
 fi
 echo
 
+bold "▶ check 41: approval-gate token lookups must use token_hash, not the raw token"
+
+# PR #217: the /approvals/<token>/{approve,reject} handler + preview authenticate
+# purely on the URL token. A `WHERE token = $N` lookup compares the raw secret
+# with Postgres byte-comparison — NOT the workspace `subtle::ConstantTimeEq`
+# discipline used for every other bearer credential. The fix added a generated
+# `token_hash` column and switched lookups to `WHERE token_hash = $N` + a
+# constant-time compare of the full token. A future query that reintroduces a
+# bare `token = $N` equality on `workflow_approval_gates` silently regresses
+# that hardening (it survives `cargo check` and every test that doesn't measure
+# timing). Scope: only files that reference `workflow_approval_gates`. The
+# `[^_a-zA-Z]token = \$N` pattern matches a bare `token` equality bind while
+# ignoring `token_hash`, `state_token` (OAuth CSRF nonce — legitimately raw),
+# and `verification_token`. Opt-out `// allow-approval-token-raw-lookup: <reason>`
+# within 4 lines above.
+
+APPROVAL_TOKEN_VIOLATIONS=0
+gate_files=$(grep -rlE "workflow_approval_gates" --include='*.rs' talos-* controller 2>/dev/null \
+    | grep -vE '/tests/' || true)
+for f in $gate_files; do
+    [ -f "$f" ] || continue
+    while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        lineno=$(echo "$m" | cut -d: -f1)
+        body=$(echo "$m" | cut -d: -f2-)
+        echo "$body" | grep -qE '^[[:space:]]*//' && continue
+        start=$((lineno > 4 ? lineno - 4 : 1))
+        ctx=$(sed -n "${start},${lineno}p" "$f" 2>/dev/null || true)
+        echo "$ctx" | grep -q 'allow-approval-token-raw-lookup' && continue
+        printf '  %s:%s\n' "$f" "$lineno"
+        APPROVAL_TOKEN_VIOLATIONS=$((APPROVAL_TOKEN_VIOLATIONS + 1))
+    done <<< "$(grep -nE '[^_a-zA-Z]token = \$[0-9]' "$f" 2>/dev/null)"
+done
+
+if [ "$APPROVAL_TOKEN_VIOLATIONS" -gt 0 ]; then
+    red "✗ $APPROVAL_TOKEN_VIOLATIONS raw-token lookup(s) on workflow_approval_gates"
+    yellow "  → look up WHERE token_hash = talos_text_util::sha256_hex(provided), then"
+    yellow "    constant-time compare the stored token (see approval_token_matches, PR #217)."
+    yellow "  → or // allow-approval-token-raw-lookup: <reason> if genuinely not a gate token."
+    EXIT_CODE=1
+else
+    green "✓ approval-gate token lookups all key on token_hash (no raw-token equality)"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
