@@ -65,6 +65,7 @@ export function useActiveExecutionSync(workflowId: string | null) {
           // If we're already tracking this one, ignore.
           // If it's a new one, switch our detail subscription to it.
           if (activeExecutionIdRef.current !== event.executionId) {
+            // eslint-disable-next-line react-hooks/immutability -- runtime-safe forward reference: this runs inside an async NATS subscription callback (fires after the hook body has assigned setupDetailSubscription, declared below), so the binding always exists. Reordering the ~120-line declaration above this effect isn't worth the risk for a compiler-ordering hint.
             setupDetailSubscription(event.executionId);
           }
         } else if (event.status === "completed" || event.status === "failed") {

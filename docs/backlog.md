@@ -245,9 +245,17 @@ dead `.eslintrc.cjs`; the prettier sweep was its own PR. The rest:
      infinite-loop, `static-components`, `use-memo`/`void-use-memo`, `refs`,
      `error-boundaries`, `globals`, `config`, `gating`, + `incompatible-library`/
      `unsupported-syntax` as warns). Pure upside, no code churn.
-   - **REMAINING (per-site triage, one rule per PR):** the four finding-bearing
-     rules below stay OFF until triaged: `set-state-in-effect` (14),
-     `immutability` (6), `purity` (6), `preserve-manual-memoization` (1).
+   - **DONE (slice 2):** `immutability` (6) + `preserve-manual-memoization` (1)
+     enabled after per-site triage. immutability: 2 use-before-declare fixed by
+     reorder (GoogleCalendarSelector, SlackAppSelector), 1 by hoisted-fn
+     (useTemplates); 1 runtime-safe async-callback forward-ref justified-disabled
+     (useActiveExecutionSync); 2 `window.location` OAuth navigations
+     justified-disabled (IntegrationsManager, OAuthManager). preserve-memo: the
+     TestWorkflowModal `useMemo` dep corrected (`[result?.nodeTraces]` → `[result]`).
+   - **REMAINING (per-site triage, one rule per PR):** `set-state-in-effect` (14,
+     cascading-render vs benign sync — the judgment-heavy one) and `purity` (6,
+     mostly intentional `Date.now()` — needs a keep-with-disables vs leave-off
+     decision since the codebase isn't adopting React Compiler).
 
    **Measured blast radius (2026-06-05, run against `reactHooks.configs.recommended`):**
    35 problems / 27 errors, by rule:

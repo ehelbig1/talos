@@ -25,7 +25,7 @@ export function useTemplates() {
     }
   }, []);
 
-  const fetchTemplates = async () => {
+  async function fetchTemplates() {
     try {
       setLoading(true);
       const data = await graphqlRequest<{ nodeTemplates: NodeTemplate[] }>(
@@ -54,7 +54,7 @@ export function useTemplates() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
   return { templates, loading, error, refetch: fetchTemplates };
 }

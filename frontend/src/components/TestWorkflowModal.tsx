@@ -208,7 +208,11 @@ export function TestWorkflowModal({
       },
       { succeeded: 0, failed: 0, skipped: 0 },
     );
-  }, [result?.nodeTraces]);
+    // Depend on `result` (not the narrower `result?.nodeTraces`): the body
+    // reads `result`, so the narrower manual dep could go stale if `result` is
+    // replaced while its `nodeTraces` reference compares equal. Matches the
+    // compiler-inferred dependency (react-hooks/preserve-manual-memoization).
+  }, [result]);
 
   return (
     <Dialog
