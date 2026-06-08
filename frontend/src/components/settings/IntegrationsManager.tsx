@@ -1,7 +1,7 @@
 import { config } from "@/config";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import React, { useState, useEffect } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { Button } from "@/components/ui/button";
 import { SectionHeader } from "@/components/ui/SectionHeader";
@@ -74,8 +74,18 @@ function getIcon(iconName: string): LucideIcon {
 
 export function IntegrationsManager() {
   const queryClient = useQueryClient();
-  const [loadingServices, setLoadingServices] = useState(false);
-  const [integrations, setIntegrations] = useState<GqlServiceIntegration[]>([]);
+  // Service integrations are fetched via react-query so the loading/data
+  // state is derived, not mirrored through a setState-in-effect. `refetch`
+  // is used by the connect / disconnect / OAuth-callback paths below.
+  const {
+    data: integrations = [],
+    isLoading: loadingServices,
+    isError: integrationsError,
+    refetch: refetchIntegrations,
+  } = useQuery<GqlServiceIntegration[]>({
+    queryKey: ["serviceIntegrations"],
+    queryFn: listServiceIntegrations,
+  });
   const [confirmModal, setConfirmModal] = useState<{
     open: boolean;
     service: IntegrationService | null;
@@ -114,23 +124,12 @@ export function IntegrationsManager() {
     loadOAuthHosts();
   }, []);
 
-  const fetchServiceIntegrations = async () => {
-    setLoadingServices(true);
-    try {
-      const data = await listServiceIntegrations();
-      setIntegrations(data);
-    } catch (err) {
-      if (import.meta.env.DEV)
-        console.error("Failed to fetch service integrations", err);
-      toast.error("Failed to load integrations");
-    } finally {
-      setLoadingServices(false);
-    }
-  };
-
+  // Surface load failures as a toast (the fetch + retry is owned by
+  // react-query above). No setState here, so this stays a pure
+  // side-effect synchronization.
   useEffect(() => {
-    fetchServiceIntegrations();
-  }, []);
+    if (integrationsError) toast.error("Failed to load integrations");
+  }, [integrationsError]);
 
   // Handle OAuth callback query params for any provider (e.g. {provider.id}_connected / _error)
   useEffect(() => {
@@ -145,7 +144,7 @@ export function IntegrationsManager() {
       const connectedVal = params.get(connectedKey);
       if (connectedVal) {
         toast.success(`${provider.display_name} connected: ${connectedVal}`);
-        fetchServiceIntegrations();
+        refetchIntegrations();
         params.delete(connectedKey);
         dirty = true;
       }
@@ -178,7 +177,7 @@ export function IntegrationsManager() {
           );
         } else {
           toast.success(`${label} connected: ${val}`);
-          fetchServiceIntegrations();
+          refetchIntegrations();
         }
         params.delete(param);
         dirty = true;
@@ -192,7 +191,7 @@ export function IntegrationsManager() {
         `${window.location.pathname}${params.toString() ? `?${params}` : ""}`,
       );
     }
-  }, [providers]);
+  }, [providers, refetchIntegrations]);
 
   // Disconnect Service
   const handleDisconnectService = async () => {
@@ -203,7 +202,7 @@ export function IntegrationsManager() {
     try {
       const success = await disconnectServiceIntegration(id, service);
       if (success) {
-        fetchServiceIntegrations();
+        refetchIntegrations();
         toast.success(`${service} integration disconnected`);
         setConfirmModal({
           open: false,
@@ -278,7 +277,7 @@ export function IntegrationsManager() {
       if (popup?.closed) {
         clearInterval(pollTimerRef.current!);
         pollTimerRef.current = null;
-        fetchServiceIntegrations();
+        refetchIntegrations();
         return;
       }
       if (Date.now() - watchStartedAt > POPUP_WATCH_MAX_MS) {

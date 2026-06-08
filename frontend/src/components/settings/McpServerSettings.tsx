@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { CopyField } from "@/components/ui/CopyField";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
@@ -57,8 +58,19 @@ export default function McpServerSettings() {
   const [createdAgent, setCreatedAgent] = useState<
     RegisterMcpAgentMutation["registerMcpAgent"] | null
   >(null);
-  const [agents, setAgents] = useState<McpAgent[]>([]);
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
+  // Agents are fetched via react-query so loading/data is derived rather
+  // than mirrored through a setState-in-effect. `refetch` is used after a
+  // successful registration; the revoke path updates the cache optimistically.
+  const {
+    data: agents = [],
+    isLoading: loading,
+    isError: agentsError,
+    refetch: refetchAgents,
+  } = useQuery<McpAgent[]>({
+    queryKey: ["mcpAgents"],
+    queryFn: listMcpAgents,
+  });
   const [revokingId, setRevokingId] = useState<string | null>(null);
   const [revokeConfirmId, setRevokeConfirmId] = useState<string | null>(null);
 
@@ -68,23 +80,11 @@ export default function McpServerSettings() {
   const localEndpoint = `${baseUrl}/mcp/local`;
   const authEndpoint = `${baseUrl}/mcp`;
 
-  const fetchAgents = async () => {
-    try {
-      setLoading(true);
-      const data = await listMcpAgents();
-      setAgents(data);
-    } catch (err) {
-      if (import.meta.env.DEV)
-        console.error("Failed to fetch MCP agents:", err);
-      toast.error("Failed to load active protocol agents");
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // Surface load failures as a toast (fetch + retry owned by react-query).
+  // No setState here, so it stays a pure side-effect synchronization.
   useEffect(() => {
-    fetchAgents();
-  }, []);
+    if (agentsError) toast.error("Failed to load active protocol agents");
+  }, [agentsError]);
 
   const { mutate: registerAgent, isPending: creating } =
     useRegisterMcpAgentMutation({
@@ -92,7 +92,7 @@ export default function McpServerSettings() {
         if (data.registerMcpAgent) {
           setCreatedAgent(data.registerMcpAgent);
           setPluginName("");
-          fetchAgents();
+          refetchAgents();
           toast.success("MCP Protocol Agent provisioned successfully");
         }
       },
@@ -124,7 +124,10 @@ export default function McpServerSettings() {
       const success = await revokeMcpAgent(id);
       if (success) {
         toast.success("Agent protocol access revoked");
-        setAgents((prev) => prev.filter((a) => a.id !== id));
+        // Optimistically drop the revoked agent from the query cache.
+        queryClient.setQueryData<McpAgent[]>(["mcpAgents"], (prev) =>
+          (prev ?? []).filter((a) => a.id !== id),
+        );
       } else {
         toast.error("Revocation sequence failed");
       }

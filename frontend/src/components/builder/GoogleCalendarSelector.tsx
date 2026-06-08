@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { getCsrfToken } from "@/lib/csrf";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
@@ -54,12 +55,30 @@ export function GoogleCalendarSelector({
   onSelect,
   currentConfig,
 }: GoogleCalendarSelectorProps) {
-  const [integrations, setIntegrations] = useState<GoogleCalendarIntegration[]>(
-    [],
-  );
+  // Integrations are fetched on mount via react-query so the loading/data
+  // state is derived, not mirrored through a setState-in-effect.
+  const {
+    data: integrations = [],
+    isLoading: loading,
+    error: integrationsError,
+  } = useQuery<GoogleCalendarIntegration[]>({
+    queryKey: ["googleCalendarIntegrations"],
+    queryFn: async () => {
+      const response = await authedFetch("/api/google-calendar/integrations");
+      if (!response.ok) {
+        throw new Error("Failed to fetch Google Calendar integrations");
+      }
+      const data = await response.json();
+      if (!data.success) {
+        throw new Error("Failed to load integrations.");
+      }
+      return (data.data || []) as GoogleCalendarIntegration[];
+    },
+  });
   const [calendars, setCalendars] = useState<CalendarData[]>([]);
-  const [loading, setLoading] = useState(true);
   const [loadingCalendars, setLoadingCalendars] = useState(false);
+  // Local error for the calendar-fetch and confirm-validation paths
+  // (event-driven). Integration-load failures come from the query above.
   const [error, setError] = useState<string | null>(null);
   const [selectedIntegrationId, setSelectedIntegrationId] = useState<
     string | null
@@ -67,38 +86,17 @@ export function GoogleCalendarSelector({
   const [selectedCalendars, setSelectedCalendars] = useState<string[]>([]);
   const [setupComplete, setSetupComplete] = useState(false);
 
-  const fetchIntegrations = async () => {
-    try {
-      setLoading(true);
-      const response = await authedFetch("/api/google-calendar/integrations");
-
-      if (!response.ok) {
-        throw new Error("Failed to fetch Google Calendar integrations");
-      }
-
-      const data = await response.json();
-
-      if (data.success) {
-        setIntegrations(data.data || []);
-      } else {
-        throw new Error("Failed to load integrations.");
-      }
-    } catch (err) {
-      setError(
-        sanitizeErrorMessage(
-          err instanceof Error ? err.message : "Failed to load integrations",
-        ),
-      );
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Declared after fetchIntegrations so the function exists before this effect
-  // references it (react-hooks/immutability — no use-before-declaration).
-  useEffect(() => {
-    fetchIntegrations();
-  }, []);
+  // Combined error display: an event-driven local error (calendars /
+  // validation) takes precedence, otherwise the integration-load error.
+  const displayError =
+    error ??
+    (integrationsError
+      ? sanitizeErrorMessage(
+          integrationsError instanceof Error
+            ? integrationsError.message
+            : "Failed to load integrations",
+        )
+      : null);
 
   const fetchCalendars = async (integrationId: string) => {
     try {
@@ -194,11 +192,11 @@ export function GoogleCalendarSelector({
         )}
       </div>
 
-      {error && (
+      {displayError && (
         <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl flex items-center gap-4 text-destructive animate-in shake duration-500">
           <AlertTriangle className="h-5 w-5 shrink-0" />
           <p className="m-0 text-[10px] font-black uppercase tracking-widest">
-            {error}
+            {displayError}
           </p>
         </div>
       )}
