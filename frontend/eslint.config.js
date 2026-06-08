@@ -37,13 +37,36 @@ export default [
             "react-hooks": reactHooks,
         },
         rules: {
-            // React hooks correctness — the two battle-tested baseline rules
-            // (NOT the full v7 React-Compiler `recommended` set, which is a
-            // separate, larger migration tracked in docs/backlog.md).
-            // `rules-of-hooks` catches conditional/loop hook calls (real bugs);
-            // `exhaustive-deps` is a warning (stale-closure hint, non-blocking).
+            // React hooks correctness — adopting the v7 React-Compiler
+            // `recommended` ruleset incrementally (docs/backlog.md). This slice
+            // turns on the two baseline rules PLUS every recommended rule that
+            // has ZERO current violations — real correctness guards (e.g.
+            // set-state-in-render infinite-loop, components-defined-in-render,
+            // useMemo misuse, ref-during-render) that are pure upside.
             "react-hooks/rules-of-hooks": "error",
             "react-hooks/exhaustive-deps": "warn",
+            "react-hooks/static-components": "error",
+            "react-hooks/use-memo": "error",
+            "react-hooks/void-use-memo": "error",
+            "react-hooks/incompatible-library": "warn",
+            "react-hooks/globals": "error",
+            "react-hooks/refs": "error",
+            "react-hooks/error-boundaries": "error",
+            "react-hooks/set-state-in-render": "error",
+            "react-hooks/unsupported-syntax": "warn",
+            "react-hooks/config": "error",
+            "react-hooks/gating": "error",
+            // DEFERRED — these have current findings and need per-site human
+            // triage (real bug vs. intentional idiom), done one rule per PR so
+            // each fix is reviewable rather than a blanket suppression:
+            //   - set-state-in-effect (14): cascading-render risk vs. benign sync
+            //   - immutability (6): real mutation vs. idiomatic ref-guard
+            //   - purity (6): mostly intentional Date.now() (display/fallback)
+            //   - preserve-manual-memoization (1): a real memo-dep fix
+            // "react-hooks/set-state-in-effect": "error",
+            // "react-hooks/immutability": "error",
+            // "react-hooks/purity": "error",
+            // "react-hooks/preserve-manual-memoization": "error",
 
             // Use TypeScript-aware rules instead of base ESLint rules
             "no-unused-vars": "off",
