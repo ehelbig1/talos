@@ -259,6 +259,13 @@ impl GmailIntegrationService {
     /// `user_id` is recovered from the state token (stored during `get_authorization_url`),
     /// so this handler does NOT require session authentication.
     pub async fn handle_callback(&self, code: String, state: String) -> Result<GmailIntegration> {
+        // Format-gate the state value before it hits the DB lookup — same
+        // 1-255-char / restricted-charset check the login flow applies on both
+        // store + validate (MCP-1171). Parameterized `$1` already isolates
+        // injection; this closes the defense-asymmetry (the writer uses
+        // CsrfToken::new_random — always canonical) and the multi-KB-state
+        // DoS-amplification on the consume path.
+        talos_oauth::validate_oauth_state_token_format(&state)?;
         // Validate CSRF state token (single-use, atomic) and recover user_id + PKCE verifier.
         let state_row = sqlx::query_as::<_, (Uuid, Option<String>, Option<Uuid>)>(
             "UPDATE oauth_state_tokens \

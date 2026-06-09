@@ -190,6 +190,11 @@ impl AtlassianIntegrationService {
         code: String,
         state: String,
     ) -> Result<AtlassianIntegration> {
+        // 0. Format-gate the state value before the DB lookup — same check the
+        // login flow applies on store + validate (MCP-1171 symmetry). `$1`
+        // binding already isolates injection; this closes the defense
+        // asymmetry + the multi-KB-state DoS-amplification on consume.
+        talos_oauth::validate_oauth_state_token_format(&state)?;
         // 1. Validate CSRF state token (single-use, atomic) and recover user_id.
         let state_row = sqlx::query_as::<_, (Uuid, Option<String>, Option<Uuid>)>(
             "UPDATE oauth_state_tokens \
