@@ -243,6 +243,17 @@ fn is_mutation(stmt: &Statement) -> bool {
 fn always_blocked_label(stmt: &Statement) -> Option<&'static str> {
     match stmt {
         Statement::Copy { .. } | Statement::CopyIntoSnowflake { .. } => Some("COPY"),
+        // EXPLAIN is blocked unconditionally to match the controller's
+        // `controller_permits_data_statement` (talos-rpc-subscribers), which
+        // admits only Query/Insert/Update/Delete/Merge. `EXPLAIN ANALYZE
+        // <stmt>` EXECUTES its inner statement, so classifying EXPLAIN as a
+        // harmless read-only op (its previous treatment) would green-light
+        // `EXPLAIN ANALYZE INSERT …` / `EXPLAIN ANALYZE CREATE TABLE … AS
+        // SELECT` past the worker validator. The controller catches it today,
+        // but the worker is the documented PRIMARY fence and must not be
+        // strictly weaker. (Plain `EXPLAIN SELECT` is collateral — it never
+        // worked end-to-end since the controller already rejects all EXPLAIN.)
+        Statement::Explain { .. } | Statement::ExplainTable { .. } => Some("EXPLAIN"),
         Statement::SetRole { .. } => Some("SET ROLE"),
         Statement::SetVariable { .. } => Some("SET"),
         Statement::SetTimeZone { .. } => Some("SET TIME ZONE"),
@@ -663,8 +674,9 @@ fn statement_returns_rows(stmt: &Statement) -> bool {
         S::Insert(ins) => !ins.returning.as_deref().unwrap_or(&[]).is_empty(),
         S::Update { returning, .. } => !returning.as_deref().unwrap_or(&[]).is_empty(),
         S::Delete(del) => !del.returning.as_deref().unwrap_or(&[]).is_empty(),
-        // EXPLAIN returns analysis rows; route as fetch so the worker
-        // gets the result text.
+        // EXPLAIN would emit analysis rows, but `always_blocked_label`
+        // rejects it before routing — this arm is unreachable via
+        // `validate_sql` and kept only so the pure classifier stays correct.
         S::Explain { .. } | S::ExplainTable { .. } => true,
         _ => false,
     }
@@ -679,9 +691,10 @@ fn statement_returns_rows(stmt: &Statement) -> bool {
 /// default — which is a footgun if the controller dispatches a
 /// database-node job without explicitly setting `allowed_sql_operations`.
 /// The new default ([`DenyMutations`](Self::DenyMutations)) is
-/// least-privilege: empty allowlist permits only SELECT (and EXPLAIN,
-/// which is read-only). To enable mutations, the controller MUST
-/// dispatch a JobRequest with an explicit allowlist.
+/// least-privilege: empty allowlist permits only SELECT. To enable
+/// mutations, the controller MUST dispatch a JobRequest with an explicit
+/// allowlist. (EXPLAIN is unconditionally blocked — see
+/// `always_blocked_label`.)
 ///
 /// Operators with workflows that depend on the legacy permissive
 /// behaviour can opt back in with
@@ -689,9 +702,9 @@ fn statement_returns_rows(stmt: &Statement) -> bool {
 /// startup logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmptyAllowlistPolicy {
-    /// Empty allowlist permits only read-only statements (SELECT,
-    /// EXPLAIN). All mutations require an explicit allowlist entry.
-    /// The default in production.
+    /// Empty allowlist permits only SELECT (the sole read-only statement
+    /// type that passes; EXPLAIN is unconditionally blocked). All mutations
+    /// require an explicit allowlist entry. The default in production.
     DenyMutations,
     /// Empty allowlist permits every non-DDL non-AlwaysBlocked
     /// statement. The pre-M-3 behaviour. Legacy compatibility only;
@@ -822,11 +835,12 @@ pub fn validate_sql_with_policy(
     }
 
     // M-3 (2026-05-22): empty allowlist no longer means "anything
-    // non-DDL goes". Under `DenyMutations`, only SELECT / EXPLAIN
-    // pass when the allowlist is empty — every mutation requires an
-    // explicit grant in the JobRequest. Legacy permissive behaviour
-    // is gated behind `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST=1`.
-    if stmt_type != "SELECT" && stmt_type != "EXPLAIN" {
+    // non-DDL goes". Under `DenyMutations`, only SELECT passes when the
+    // allowlist is empty — every mutation requires an explicit grant in
+    // the JobRequest. Legacy permissive behaviour is gated behind
+    // `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST=1`. (EXPLAIN is unconditionally
+    // blocked by `always_blocked_label` above, so it never reaches here.)
+    if stmt_type != "SELECT" {
         if allowed_operations.is_empty() {
             match empty_policy {
                 EmptyAllowlistPolicy::DenyMutations => {
@@ -950,9 +964,13 @@ mod tests {
             validate_sql("DELETE FROM t WHERE id = $1", &[]).unwrap_err(),
             SqlValidationError::DisallowedOperation(s) if s == "DELETE"
         ));
-        // SELECT / EXPLAIN still pass under the default.
+        // SELECT still passes under the default; EXPLAIN is now blocked
+        // unconditionally (controller alignment — it executes its inner stmt).
         assert!(validate_sql("SELECT 1", &[]).is_ok());
-        assert!(validate_sql("EXPLAIN SELECT 1", &[]).is_ok());
+        assert!(matches!(
+            validate_sql("EXPLAIN SELECT 1", &[]).unwrap_err(),
+            SqlValidationError::AlwaysBlocked(s) if s == "EXPLAIN"
+        ));
     }
 
     /// Legacy permissive behaviour is reachable via the explicit
@@ -1034,9 +1052,31 @@ mod tests {
     }
 
     #[test]
-    fn explain_allowed_by_default() {
-        // EXPLAIN is read-only — useful for query optimization
-        assert!(validate_sql("EXPLAIN SELECT 1", &[]).is_ok());
+    fn explain_is_blocked_to_match_controller() {
+        // EXPLAIN is unconditionally blocked: `EXPLAIN ANALYZE <stmt>`
+        // EXECUTES its inner statement, so the worker must not classify it as
+        // a harmless read-only op. Aligns with the controller's
+        // `controller_permits_data_statement` (admits only DML, not EXPLAIN).
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "EXPLAIN ANALYZE INSERT INTO t (a) VALUES (1)",
+            "EXPLAIN ANALYZE CREATE TABLE x AS SELECT 1",
+        ] {
+            assert!(
+                matches!(
+                    validate_sql(sql, &[]).unwrap_err(),
+                    SqlValidationError::AlwaysBlocked(s) if s == "EXPLAIN"
+                ),
+                "expected EXPLAIN block for {sql:?}",
+            );
+            // Even an explicit INSERT grant must not let EXPLAIN ANALYZE
+            // smuggle the write past the worker.
+            assert!(validate_sql(
+                "EXPLAIN ANALYZE INSERT INTO t (a) VALUES (1)",
+                &["INSERT".to_string()]
+            )
+            .is_err(),);
+        }
     }
 
     #[test]
@@ -1154,12 +1194,9 @@ mod tests {
         assert!(!v.returns_rows);
     }
 
-    #[test]
-    fn returns_rows_explain_is_true() {
-        // EXPLAIN returns analysis output rows; should route as fetch.
-        let v = validate_sql("EXPLAIN SELECT 1", &[]).unwrap();
-        assert!(v.returns_rows);
-    }
+    // (EXPLAIN row-routing test removed: EXPLAIN is now unconditionally
+    // blocked by `always_blocked_label` and never reaches routing. The block
+    // is covered by `explain_is_blocked_to_match_controller`.)
 
     // MCP-472: unconditional deny-list. Each statement type below
     // parses successfully through sqlparser-rs 0.53 but had no entry
