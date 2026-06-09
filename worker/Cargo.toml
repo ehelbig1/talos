@@ -88,7 +88,9 @@ rand = { version = "0.8", default-features = true, features = ["std"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Phase 3: Advanced capabilities (v3.0)
-minijinja = "2.5"  # Jinja2-compatible template engine
+# `fuel` feature gates per-render instruction budget (set_fuel) so a
+# guest template's CPU is bounded host-side (see wit_templates::render).
+minijinja = { version = "2.5", features = ["fuel"] }  # Jinja2-compatible template engine
 csv = "1.3"  # CSV parsing and generation
 quick-xml = { version = "0.37", features = ["serialize"] }  # XML parsing with security
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # Redis client; rustls for rediss:// (Upstash, ElastiCache TLS)
