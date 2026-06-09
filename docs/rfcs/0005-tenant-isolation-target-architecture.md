@@ -186,6 +186,30 @@ admin/internal secret-write paths (`update_secret`/`delete_secret` called with
 something is wrongly routing through `SET ROLE talos_app` — investigate before
 proceeding.
 
+**Pre-flight role verification (verify before the restart, not at boot).** The
+controller boot guard already `error!`s if `talos_app` is missing or
+mis-attributed once the flag is on — but you can confirm the role is correct
+*before* the restart-and-read-logs cycle by running these as the controller's
+connecting role. They mirror exactly what the guard checks:
+
+```sql
+-- 1. talos_app exists and is security-correct (NOT superuser, NOT BYPASSRLS,
+--    NOLOGIN). Zero rows → migration 20260529220000 not applied → scoped tx
+--    will FAIL. rolsuper/rolbypassrls = t → RLS SILENTLY BYPASSED.
+SELECT rolname, rolsuper, rolbypassrls, rolcanlogin
+FROM pg_roles WHERE rolname = 'talos_app';   -- expect: f, f, f
+
+-- 2. The controller session can assume the role (membership grant). Must
+--    succeed silently; "permission denied to set role" → the GRANT talos_app
+--    TO <connecting_role> in the migration didn't run for this role.
+SET ROLE talos_app; RESET ROLE;
+
+-- 3. RLS is enabled (and FORCEd on the S0–S2 tables) on the policed tables.
+SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class
+WHERE relname IN ('workflows','actors','secrets','workflow_executions',
+                  'scratch_sessions','user_module_pins') ORDER BY 1;  -- relrowsecurity = t
+```
+
 **Pre-flight grant check (the managed-Postgres gotcha).** `GRANT … ON ALL TABLES`
 in `20260529220000` covers tables that existed at migration time; later tables
 rely on `ALTER DEFAULT PRIVILEGES`, which only applies to tables created **by the
