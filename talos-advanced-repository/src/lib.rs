@@ -1129,13 +1129,32 @@ impl AdvancedRepository {
         capabilities: &[String],
         intent: Option<&serde_json::Value>,
     ) -> Result<()> {
+        // RFC 0004: stamp org_id = the creator's personal org. RFC 0006 /
+        // RFC 0005 S3: resolve that org in Rust so we can bind it AND scope
+        // the write to it (`begin_org_scoped`), making the workflows org-pin
+        // RLS WITH CHECK enforce once the fail-closed flip is on. NULL-tolerant:
+        // no personal org → `begin_user_scoped` + NULL org (policy's
+        // `org_id IS NULL → permit`). Latent while `TALOS_RLS_SET_ROLE` is off.
+        let personal_org: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 AND is_personal")
+                .bind(user_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        let mut tx = match personal_org {
+            Some(org) => {
+                talos_db::begin_org_scoped(
+                    &self.db_pool,
+                    &talos_tenancy::OrgScope::new(org, user_id),
+                )
+                .await?
+            }
+            None => talos_db::begin_user_scoped(&self.db_pool, user_id).await?,
+        };
         sqlx::query(
-            // RFC 0004: stamp org_id = the creator's personal org (NULL-tolerant).
             "INSERT INTO workflows \
              (id, user_id, name, module_uri, graph_json, capabilities, intent, status, \
               created_at, updated_at, org_id) \
-             VALUES ($1, $2, $3, '', $4, $5, $6, 'draft', NOW(), NOW(), \
-              (SELECT id FROM organizations WHERE owner_id = $2 AND is_personal))",
+             VALUES ($1, $2, $3, '', $4, $5, $6, 'draft', NOW(), NOW(), $7)",
         )
         .bind(wf_id)
         .bind(user_id)
@@ -1143,10 +1162,11 @@ impl AdvancedRepository {
         .bind(graph_json)
         .bind(capabilities)
         .bind(intent)
-        .execute(&self.db_pool)
+        .bind(personal_org)
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
-        .context("insert_promoted_workflow")
+        .context("insert_promoted_workflow")?;
+        tx.commit().await.context("commit insert_promoted_workflow")
     }
 
     // ── Config suggestions ────────────────────────────────────────────────────

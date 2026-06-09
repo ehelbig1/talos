@@ -2940,6 +2940,60 @@ else
 fi
 echo
 
+bold "▶ check 42: org-pinned-table creates must run on a tenant-scoped tx"
+
+# RFC 0006 / RFC 0005 S3 (PRs #219–#222): the org-pinned tables
+# (workflows / actors / secrets) carry an RLS WITH CHECK pinned to
+# `app.current_org_id`. For that pin to ENFORCE once `TALOS_RLS_SET_ROLE`
+# flips on, an `INSERT` (the org-setting write) MUST run on a tx opened by
+# `begin_org_scoped` (or the repo `begin_personal_org_write` helpers) so the
+# org GUC is set — NOT on the bare connection pool, where the pin only
+# passes via its rollout-safe `unset → permit` clause (i.e. does not
+# enforce). A new create path that executes `INSERT INTO {workflows,actors,
+# secrets}` on `&self.db_pool` / `db_pool` silently reintroduces that gap —
+# it survives `cargo check` and every test that doesn't run under the
+# `talos_app` role. (UPDATE/DELETE that don't move `org_id` are out of scope:
+# they stay permit-via-unset and are protected by the read-scope USING clause
+# + the app-layer `user_id` filter.) Comment lines are skipped (a `//` that
+# merely mentions an INSERT is not a write). Opt-out
+# `// allow-unscoped-org-write: <reason>` within 4 lines above (engine /
+# system / seeding paths that intentionally stay permissive).
+
+ORG_WRITE_VIOLATIONS=0
+org_write_files=$(grep -rlE "INSERT INTO (workflows|actors|secrets)\b" --include='*.rs' talos-* controller 2>/dev/null \
+    | grep -vE '/tests/' || true)
+for f in $org_write_files; do
+    [ -f "$f" ] || continue
+    while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        lineno=$(echo "$m" | cut -d: -f1)
+        body=$(echo "$m" | cut -d: -f2-)
+        # Skip comment-line matches (a `//` referencing an INSERT, not a write).
+        echo "$body" | grep -qE '^[[:space:]]*//' && continue
+        # Inspect the statement's executor in the following lines.
+        ctx=$(sed -n "${lineno},$((lineno + 16))p" "$f" 2>/dev/null || true)
+        # Scoped writes use `&mut *tx` / a threaded conn — never the bare pool.
+        echo "$ctx" | grep -qE '\.(execute|fetch_one|fetch_optional|fetch_all)\([[:space:]]*(&self\.db_pool|&self\.pool|db_pool|&pool|pool)[[:space:]]*\)' || continue
+        # Opt-out within 4 lines above.
+        start=$((lineno > 4 ? lineno - 4 : 1))
+        above=$(sed -n "${start},${lineno}p" "$f" 2>/dev/null || true)
+        echo "$above" | grep -q 'allow-unscoped-org-write' && continue
+        printf '  %s:%s\n' "$f" "$lineno"
+        ORG_WRITE_VIOLATIONS=$((ORG_WRITE_VIOLATIONS + 1))
+    done <<< "$(grep -nE 'INSERT INTO (workflows|actors|secrets)\b' "$f" 2>/dev/null)"
+done
+
+if [ "$ORG_WRITE_VIOLATIONS" -gt 0 ]; then
+    red "✗ $ORG_WRITE_VIOLATIONS org-pinned-table create(s) on the bare pool (unscoped)"
+    yellow "  → open the write via talos_db::begin_org_scoped (or the repo"
+    yellow "    begin_personal_org_write helper) so the org-pin WITH CHECK enforces (RFC 0006)."
+    yellow "  → or // allow-unscoped-org-write: <reason> for an engine/system/seeding path."
+    EXIT_CODE=1
+else
+    green "✓ org-pinned-table creates all run on a tenant-scoped tx"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
