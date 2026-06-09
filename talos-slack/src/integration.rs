@@ -224,6 +224,11 @@ impl SlackIntegrationService {
 
     /// Handle OAuth callback and store the integration
     pub async fn handle_callback(&self, code: String, state: String) -> Result<SlackIntegration> {
+        // Format-gate the state value before the DB lookup — same check the
+        // login flow applies on store + validate (MCP-1171 symmetry). `$1`
+        // binding already isolates injection; this closes the defense
+        // asymmetry + the multi-KB-state DoS-amplification on consume.
+        talos_oauth::validate_oauth_state_token_format(&state)?;
         // Validate CSRF state token + recover PKCE verifier + user_id.
         //
         // SECURITY: user_id is recovered from the state token (set at

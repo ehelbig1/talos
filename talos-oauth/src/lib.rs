@@ -361,7 +361,12 @@ pub struct OAuthService {
 /// asymmetry meant the validator accepted shapes the writer would
 /// have rejected (defense-rule inconsistency). Single source of truth
 /// closes both gaps.
-fn validate_oauth_state_token_format(state_token: &str) -> Result<()> {
+///
+/// `pub` so the per-provider integration callbacks
+/// (`talos-gmail`/`talos-slack`/`talos-atlassian` `handle_callback`) apply the
+/// same pre-DB format gate as the login flow — extending the MCP-1171
+/// symmetry to every `oauth_state_tokens` consume path.
+pub fn validate_oauth_state_token_format(state_token: &str) -> Result<()> {
     if state_token.is_empty() || state_token.len() > 255 {
         anyhow::bail!("OAuth state token must be 1-255 characters");
     }
