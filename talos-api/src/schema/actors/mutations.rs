@@ -299,15 +299,27 @@ impl ActorsMutations {
 
         let actor_id = Uuid::new_v4();
 
-        // RFC 0005 S3: INSERT on a per-user scoped tx so the actors RLS
-        // policy's WITH CHECK pins the new row to the caller — if the
-        // bound user_id ever drifted from the acting user, the insert
-        // fails closed (42501) rather than creating a cross-tenant actor.
-        // Commit before the post-insert log/summary (they reference the
-        // row).
-        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+        // RFC 0006 / RFC 0005 S3: actors are ORG-pinned (the actors RLS
+        // WITH CHECK keys on `org_id = app.current_org_id`, not user_id).
+        // Scope the create to the owner's personal org so the pin enforces;
+        // the `trg_set_org_id` trigger stamps that same org on the row
+        // (creates don't bind org_id), so they match by construction.
+        // `begin_org_scoped` also sets the user GUC, satisfying the policy's
+        // `user_id = current_user_id` read clause. Commit before the
+        // post-insert log/summary (they reference the row).
+        let org_id =
+            talos_organizations::OrganizationService::create_personal_org(db_pool, user_id, None)
+                .await
+                .map_err(|e| {
+                    async_graphql::Error::new(format!("resolve personal org: {e}")).extend_safe()
+                })?
+                .id;
+        let mut tx =
+            talos_db::begin_org_scoped(db_pool, &talos_tenancy::OrgScope::new(org_id, user_id))
+                .await
+                .map_err(|e| {
+                    async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe()
+                })?;
         sqlx::query(
             "INSERT INTO actors (id, user_id, name, description, max_capability_world, status) \
              VALUES ($1, $2, $3, $4, $5, 'active')",
@@ -951,13 +963,27 @@ impl ActorsMutations {
         let db_pool = ctx.data::<sqlx::PgPool>()?;
         use sqlx::Row as _;
 
-        // RFC 0005 S3: the source-actor ownership read + the clone INSERT
-        // share one per-user scoped tx — the actors RLS policy backstops
-        // both, and its WITH CHECK pins the new row to the caller. Commit
-        // before the memory copy below (it needs the new actor row).
-        let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+        // RFC 0006 / RFC 0005 S3: the source-actor ownership read + the
+        // clone INSERT share one tx scoped to the owner's personal org.
+        // actors are ORG-pinned, so the INSERT's WITH CHECK keys on
+        // `org_id = app.current_org_id` (the trg_set_org_id trigger stamps
+        // that same org on the new row). `begin_org_scoped` also sets the
+        // user GUC, so the ownership read below still matches via the
+        // policy's `user_id = current_user_id` clause. Commit before the
+        // memory copy below (it needs the new actor row).
+        let org_id =
+            talos_organizations::OrganizationService::create_personal_org(db_pool, user_id, None)
+                .await
+                .map_err(|e| {
+                    async_graphql::Error::new(format!("resolve personal org: {e}")).extend_safe()
+                })?
+                .id;
+        let mut tx =
+            talos_db::begin_org_scoped(db_pool, &talos_tenancy::OrgScope::new(org_id, user_id))
+                .await
+                .map_err(|e| {
+                    async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe()
+                })?;
 
         // Fetch source actor (ownership check)
         let src = sqlx::query(
