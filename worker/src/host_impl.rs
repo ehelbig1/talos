@@ -8599,7 +8599,19 @@ impl wit_templates::Host for TalosContext {
         let vars: serde_json::Value =
             serde_json::from_str(&variables).map_err(|_| wit_templates::Error::Parseerror)?;
 
+        // Per-render instruction budget. The input (1 MB), variables (10 MB),
+        // and output (10 MB) caps don't bound a template that burns CPU
+        // WITHOUT growing output — e.g. `{% for i in range(100000000) %}{%
+        // endfor %}` — which runs synchronously on the host async thread and
+        // can starve co-resident jobs until the per-job wall-clock timeout
+        // fires. `set_fuel` makes such a template fail fast with a render
+        // error instead. Deliberately generous (the per-job timeout remains
+        // the ultimate bound): far above any legitimate template, low enough
+        // to cut an unbounded loop early.
+        const MAX_RENDER_FUEL: u64 = 50_000_000;
+
         let mut env = minijinja::Environment::new();
+        env.set_fuel(Some(MAX_RENDER_FUEL));
         // Auto-escape HTML by default for security (prevents XSS).
         env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
         env.add_template("__inline__", &template)
@@ -8634,6 +8646,40 @@ impl wit_templates::Host for TalosContext {
             .map_err(|_| wit_templates::Error::Parseerror)?;
         let template = String::from_utf8(contents).map_err(|_| wit_templates::Error::Parseerror)?;
         self.render(template, variables, syntax).await
+    }
+}
+
+#[cfg(test)]
+mod template_fuel_tests {
+    // Validates the `set_fuel` mechanism `render` relies on: a template that
+    // burns CPU without growing output (so the byte caps don't catch it) must
+    // be cut by the fuel budget. Uses a low budget so the test is instant; the
+    // production budget (`MAX_RENDER_FUEL`) is generous but the mechanism is
+    // identical.
+    #[test]
+    fn fuel_bound_cuts_a_runaway_loop_but_not_a_cheap_template() {
+        let mut env = minijinja::Environment::new();
+        env.set_fuel(Some(10_000));
+        env.add_template("runaway", "{% for i in range(100000000) %}{% endfor %}")
+            .unwrap();
+        let r = env
+            .get_template("runaway")
+            .unwrap()
+            .render(minijinja::context! {});
+        assert!(
+            r.is_err(),
+            "fuel-bounded runaway loop must error, not run to completion"
+        );
+
+        // A cheap template still renders fine under the same budget.
+        env.add_template("ok", "hello {{ 1 + 1 }}").unwrap();
+        assert_eq!(
+            env.get_template("ok")
+                .unwrap()
+                .render(minijinja::context! {})
+                .unwrap(),
+            "hello 2"
+        );
     }
 }
 
