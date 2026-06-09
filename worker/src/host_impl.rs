@@ -5527,6 +5527,26 @@ fn json_path_query<'a>(
 // Date / time
 // ============================================================================
 
+/// Panic-safe strftime formatting of a Unix timestamp for a guest-supplied
+/// format string.
+///
+/// SECURITY: `format` is guest-controlled. chrono's `DelayedFormat` Display
+/// impl returns `fmt::Error` for malformed strftime specifiers (e.g. "%",
+/// "%Q", "%:::::z"), and `.to_string()` turns that into a **panic**
+/// (`write!(...).expect("a Display implementation returned an error
+/// unexpectedly")`). A guest must never be able to panic a host function —
+/// depending on unwind/abort behaviour that is at best a per-job crash and at
+/// worst a process abort taking down co-resident tenants. Formatting via
+/// `write!` into a String surfaces the formatting error as `Err(())` instead.
+/// Pure + testable so the no-panic guarantee is regression-locked.
+fn format_unix_timestamp(timestamp: u64, format: &str) -> Result<String, ()> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0).ok_or(())?;
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    write!(out, "{}", dt.format(format)).map_err(|_| ())?;
+    Ok(out)
+}
+
 impl wit_datetime::Host for TalosContext {
     async fn now_unix(&mut self) -> u64 {
         std::time::SystemTime::now()
@@ -5577,9 +5597,7 @@ impl wit_datetime::Host for TalosContext {
         timestamp: u64,
         format: String,
     ) -> Result<String, wit_datetime::Error> {
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0)
-            .ok_or(wit_datetime::Error::Invalidformat)?;
-        Ok(dt.format(&format).to_string())
+        format_unix_timestamp(timestamp, &format).map_err(|_| wit_datetime::Error::Invalidformat)
     }
 
     async fn add_seconds(&mut self, timestamp: u64, seconds: i64) -> u64 {
@@ -5588,6 +5606,47 @@ impl wit_datetime::Host for TalosContext {
 
     async fn diff_seconds(&mut self, timestamp1: u64, timestamp2: u64) -> i64 {
         (timestamp1 as i64).saturating_sub(timestamp2 as i64)
+    }
+}
+
+#[cfg(test)]
+mod datetime_format_tests {
+    use super::format_unix_timestamp;
+
+    #[test]
+    fn malformed_strftime_returns_err_not_panic() {
+        // Each of these makes chrono's `DelayedFormat::to_string()` PANIC
+        // (verified against chrono 0.4.44). The host fn must surface them as
+        // Err — a guest-supplied format string can never panic the host.
+        for bad in ["%", "%Q", "%-", "%:::::z", "%%%"] {
+            assert!(
+                format_unix_timestamp(0, bad).is_err(),
+                "expected Err (not panic) for malformed format {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn valid_strftime_formats_correctly() {
+        assert_eq!(
+            format_unix_timestamp(0, "%Y-%m-%d %H:%M:%S").unwrap(),
+            "1970-01-01 00:00:00"
+        );
+        // Literal text with no specifiers is passed through.
+        assert_eq!(
+            format_unix_timestamp(0, "literal text").unwrap(),
+            "literal text"
+        );
+        // A double-percent escape is valid and renders a literal '%'.
+        assert_eq!(format_unix_timestamp(0, "%%").unwrap(), "%");
+    }
+
+    #[test]
+    fn out_of_range_timestamp_returns_err_not_panic() {
+        // i64::MAX seconds is far beyond chrono's representable range, so
+        // from_timestamp returns None → Err, never panic. (Note u64::MAX as
+        // i64 is -1, a valid timestamp, so it must NOT be used here.)
+        assert!(format_unix_timestamp(i64::MAX as u64, "%Y").is_err());
     }
 }
 
