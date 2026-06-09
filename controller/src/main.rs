@@ -1829,6 +1829,19 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => tracing::error!("Failed to cleanup webhook request logs: {}", e),
                 }
 
+                // Clean up webhook dead-letter-queue rows. Dropped-request
+                // payloads (DLP-redacted) accumulate forever without this
+                // sweep — an unbounded storage-exhaustion vector under a
+                // circuit-breaker / rate-limit flood against a known trigger.
+                match cleanup_webhooks.cleanup_dlq(retention_days).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!("Cleaned up {} webhook DLQ entries", count);
+                        }
+                    }
+                    Err(e) => tracing::error!("Failed to cleanup webhook DLQ: {}", e),
+                }
+
                 last_cleanup_day = Some(current_day);
                 tracing::info!("Audit log cleanup completed");
             }

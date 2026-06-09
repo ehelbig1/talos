@@ -2748,6 +2748,37 @@ impl WebhookRouter {
 
         Ok(result.rows_affected())
     }
+
+    /// Clean up old dead-letter-queue rows (default retention: 90 days).
+    ///
+    /// `webhook_dlq` stores the (DLP-redacted) payload + headers of every
+    /// request dropped by the circuit breaker or rate limiter, so a sustained
+    /// flood against a known trigger — easy to trigger, no auth required —
+    /// accumulates rows indefinitely without this sweep, an unbounded
+    /// storage-exhaustion vector on the shared Postgres instance. The
+    /// in-memory channel is bounded (backpressure-drops past
+    /// `DLQ_CHANNEL_CAPACITY`), but flushed rows previously lived forever.
+    /// Mirrors [`cleanup_request_logs`] — same non-positive-`retention_days`
+    /// guard (MCP-997 caller-supplied-negative class: a negative value flips
+    /// `NOW() - INTERVAL '1 day' * -N` into `NOW() + INTERVAL`, matching every
+    /// row and purging the whole table).
+    pub async fn cleanup_dlq(&self, retention_days: i64) -> Result<u64> {
+        if retention_days <= 0 {
+            tracing::warn!(
+                target: "talos_audit",
+                retention_days,
+                "webhook-DLQ cleanup refused: retention_days must be positive (would purge the entire DLQ)"
+            );
+            return Ok(0);
+        }
+        let result =
+            sqlx::query("DELETE FROM webhook_dlq WHERE created_at < NOW() - INTERVAL '1 day' * $1")
+                .bind(retention_days)
+                .execute(&self.db_pool)
+                .await?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 /// Axum handler for webhook requests
