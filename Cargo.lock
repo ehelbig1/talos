@@ -7133,6 +7133,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-memory",
  "talos-secrets-manager",
+ "talos-tenancy",
  "talos-text-util",
  "talos-workflow-engine",
  "talos-workflow-engine-core",

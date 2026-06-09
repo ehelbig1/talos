@@ -290,6 +290,39 @@ impl ActorRepository {
         }
     }
 
+    /// Open a write transaction scoped to the creator's **personal org**
+    /// (RFC 0006 org-pin / RFC 0005 S3). The `actors` BEFORE-INSERT trigger
+    /// `trg_set_org_id` (migration 20260529140000) stamps `org_id` = the
+    /// owner's personal org, so creates do NOT bind `org_id` themselves —
+    /// this helper only needs to set `app.current_org_id` to that same org so
+    /// the org-pin RLS `WITH CHECK` enforces (`org_id = app.current_org_id`)
+    /// once the fail-closed flip is on. Both sides resolve the org the same
+    /// way (`owner_id = $user AND is_personal`), so they match by
+    /// construction. Falls back to a user-scoped tx when the personal org is
+    /// absent (the trigger then leaves `org_id` NULL → the policy's
+    /// `org_id IS NULL → permit` clause). Latent while `TALOS_RLS_SET_ROLE`
+    /// is off (sets the GUCs, no role switch). The caller MUST commit.
+    async fn begin_personal_org_write(
+        &self,
+        user_id: Uuid,
+    ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+        let personal_org: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 AND is_personal")
+                .bind(user_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(match personal_org {
+            Some(org) => {
+                talos_db::begin_org_scoped(
+                    &self.db_pool,
+                    &talos_tenancy::OrgScope::new(org, user_id),
+                )
+                .await?
+            }
+            None => talos_db::begin_user_scoped(&self.db_pool, user_id).await?,
+        })
+    }
+
     /// Builder: attach SecretsManager so output-writing methods encrypt at rest.
     pub fn with_encryption(mut self, sm: Arc<talos_secrets_manager::SecretsManager>) -> Self {
         self.secrets_manager = Some(sm);
@@ -326,6 +359,9 @@ impl ActorRepository {
         description: Option<&str>,
         max_capability_world: &str,
     ) -> Result<()> {
+        // RFC 0006 / RFC 0005 S3: scope to the owner's personal org so the
+        // org-pin WITH CHECK enforces (org_id is trigger-stamped, not bound).
+        let mut tx = self.begin_personal_org_write(user_id).await?;
         sqlx::query(
             "INSERT INTO actors (id, user_id, name, description, max_capability_world) \
              VALUES ($1, $2, $3, $4, $5)",
@@ -335,8 +371,9 @@ impl ActorRepository {
         .bind(name)
         .bind(description)
         .bind(max_capability_world)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1593,6 +1630,9 @@ impl ActorRepository {
         max_capability_world: &str,
         secret_grants: &[String],
     ) -> Result<()> {
+        // RFC 0006 / RFC 0005 S3: scope to the owner's personal org so the
+        // org-pin WITH CHECK enforces (org_id is trigger-stamped, not bound).
+        let mut tx = self.begin_personal_org_write(user_id).await?;
         sqlx::query(
             "INSERT INTO actors (id, user_id, name, description, max_capability_world, secret_grants) \
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -1603,8 +1643,9 @@ impl ActorRepository {
         .bind(description)
         .bind(max_capability_world)
         .bind(secret_grants)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1637,6 +1678,9 @@ impl ActorRepository {
         secret_grants: &[String],
         max_actors_per_user: i64,
     ) -> Result<u64> {
+        // RFC 0006 / RFC 0005 S3: scope to the owner's personal org so the
+        // org-pin WITH CHECK enforces (org_id is trigger-stamped, not bound).
+        let mut tx = self.begin_personal_org_write(user_id).await?;
         let result = sqlx::query(
             "INSERT INTO actors (id, user_id, name, description, max_capability_world, secret_grants) \
              SELECT $1, $2, $3, $4, $5, $6 \
@@ -1649,8 +1693,9 @@ impl ActorRepository {
         .bind(max_capability_world)
         .bind(secret_grants)
         .bind(max_actors_per_user)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -1869,6 +1914,9 @@ impl ActorRepository {
         max_capability_world: &str,
         max_actors_per_user: i64,
     ) -> Result<u64> {
+        // RFC 0006 / RFC 0005 S3: scope to the owner's personal org so the
+        // org-pin WITH CHECK enforces (org_id is trigger-stamped, not bound).
+        let mut tx = self.begin_personal_org_write(user_id).await?;
         let result = sqlx::query(
             "INSERT INTO actors (id, user_id, name, description, max_capability_world) \
              SELECT $1, $2, $3, $4, $5 \
@@ -1880,8 +1928,9 @@ impl ActorRepository {
         .bind(description)
         .bind(max_capability_world)
         .bind(max_actors_per_user)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
