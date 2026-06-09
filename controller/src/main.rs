@@ -3783,13 +3783,26 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::delete(slack::disconnect_integration_handler),
         )
         .route("/api/slack/connect", get(slack::connect_slack_handler))
-        .route("/api/slack/callback", get(slack::slack_callback_handler))
         .with_state(slack_integration_service.clone())
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
         .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
         .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
         .layer(Extension(api_limiter.clone())) // Runs 2nd
         .layer(Extension(whitelist.clone())); // Runs 1st (first)
+
+    // Slack OAuth callback — NO auth middleware (mirrors gmail/atlassian).
+    // Cross-site redirects from slack.com don't carry the session cookie
+    // (SameSite=Strict), so the auth'd router above 401'd the callback before
+    // `slack_callback_handler` ran — breaking the Slack connect flow. The
+    // handler authenticates via the state token (bound to user_id at
+    // /connect time, which IS behind auth) — its signature takes no
+    // `Extension<Uuid>`, identical to the working gmail/atlassian callbacks.
+    let slack_callback_route = Router::new()
+        .route("/api/slack/callback", get(slack::slack_callback_handler))
+        .with_state(slack_integration_service.clone())
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
 
     // Create Gmail integration management routes
     // NOTE: Layers execute in REVERSE order (bottom-up)
@@ -4329,6 +4342,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(oauth_routes)
         .merge(slack_api_routes)
         .merge(slack_integration_routes)
+        .merge(slack_callback_route)
         .merge(admin_routes)
         .merge(gmail_api_routes)
         .merge(gmail_integration_routes)
