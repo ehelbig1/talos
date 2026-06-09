@@ -623,7 +623,13 @@ impl WebhookRouter {
                 self.circuit_breaker
                     .record_failure_with_type(ip, CircuitBreakerFailureType::TriggerDisabled);
             }
-            return Ok((StatusCode::NOT_FOUND, "Not found").into_response());
+            // Same status AND body as the trigger-not-found path so a caller
+            // can't distinguish "disabled" from "never existed" (trims the
+            // existence/enabled-state oracle; sibling of the MCP-1102
+            // approval-gate fix). Enumeration is already infeasible — the
+            // trigger id is a 122-bit UUID — this closes the residual leak
+            // for an id an attacker already holds.
+            return Ok((StatusCode::NOT_FOUND, "Webhook not found").into_response());
         }
 
         // 2. Check rate limit (lock-free with DashMap).
@@ -2144,9 +2150,17 @@ impl WebhookRouter {
             "#,
         )
         .bind(trigger_id)
-        .fetch_one(&self.db_pool)
+        // fetch_optional, NOT fetch_one + .context("not found"): the latter
+        // stamped "not found" onto EVERY error including transient DB failures
+        // (pool exhaustion, connection drop), which `webhook_handler` then
+        // substring-matched to a 404 — masking a real outage as a missing
+        // trigger (a legit webhook silently 404s during a DB blip) and muddying
+        // the existence oracle. Now a genuine miss → Ok(None) → "not found"
+        // (404); a DB error → Err (no "not found" substring) → 500 + logged.
+        .fetch_optional(&self.db_pool)
         .await
-        .context("Webhook trigger not found")
+        .context("get_trigger query failed")?
+        .ok_or_else(|| anyhow::anyhow!("Webhook trigger not found"))
     }
 
     /// Verify HMAC signature from webhook request
