@@ -13,9 +13,6 @@
 
 pub use talos_api::*;
 
-pub mod dataloaders {
-    pub use talos_api::dataloaders::*;
-}
 pub mod schema {
     pub use talos_api::schema::*;
 }
