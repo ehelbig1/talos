@@ -48,7 +48,12 @@ sdks/typescript/node_modules/
 
 # Claude and other AI assistants
 .codex/
-.claude/
+.claude/*
+# …but DO track the shared web-session hook + its registration so all
+# sessions get the same setup. Personal/local overrides stay ignored.
+!.claude/settings.json
+!.claude/hooks/
+.claude/settings.local.json
 
 # Temporary build/debug output
 controller/check_output*.txt

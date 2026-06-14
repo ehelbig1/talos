@@ -8,6 +8,77 @@ Each entry: what, why it matters, why it's not done yet, and a suggested shape.
 
 ---
 
+## Per-test DB isolation — retire the global-`DELETE` shared-state test pattern
+
+**Added:** 2026-06-14. **Priority: MEDIUM (CI throughput + correctness footgun).**
+
+**What.** `controller/tests/common/mod.rs::setup_test_context()` (and the
+analogous setup in `integration_mcp_tests.rs`) begins every test by running a
+cascade of global `DELETE FROM …` against the shared test database —
+`organization_members`, `organizations`, `api_keys`, `users`, `workflows`, …
+(`mod.rs:38-68`). Because the deletes are unscoped, two tests running
+concurrently against the same DB delete each other's rows mid-flight, surfacing
+as flaky FK violations / missing `api_keys`. The current mitigation is in
+`.config/nextest.toml`: a `db-shared-state` test-group pins seven binaries
+(`api_auth_integration_test`, `api_key_tests`, `auth_concurrency_tests`,
+`governance_tests`, `scheduler_tests`, `security_isolation_tests`,
+`workflow_version_tests`) to `max-threads = 1`, serialising them across binaries.
+That `nextest.toml` comment already names this as a stopgap: *"Long-term fix is
+per-test transaction isolation … until that lands, this group keeps CI green."*
+
+**Why it matters.**
+1. **Throughput** — those seven binaries run strictly serially in the
+   `integration` CI job and locally; per-test isolation lets nextest parallelise
+   them, cutting integration-suite wall-clock.
+2. **Correctness footgun** — the serialisation is enforced only by a
+   hand-maintained binary list in `nextest.toml`. A new DB-backed test binary
+   that calls `setup_test_context()` but isn't added to the list runs in
+   parallel and reintroduces the exact flake the group exists to prevent —
+   silent, and only under load. (`scratch_rls`, `rls_org_isolation`,
+   `personal_org_resolution`, `crash_recovery` already use *scoped*
+   `DELETE … WHERE id = $1`, so they're fine — the issue is specifically the
+   unscoped global wipe.)
+
+**Why it's not done yet.** It's a test-infra refactor touching the heaviest
+crate in the workspace (the controller integration suite), and it can't be
+meaningfully verified without a running Postgres + the full toolchain — so it
+wants a focused session, not a drive-by.
+
+**Suggested shape — schema-per-test (lowest blast radius for pool-based services).**
+True per-test *transaction* rollback is awkward here: the services
+(`AuthService`, `ApiKeyService`, `SecretsManager`, the async-graphql resolvers)
+each hold a `Pool<Postgres>` and check out their own connections, so a single
+rolled-back `Transaction` can't be threaded through them without rewriting every
+service constructor. Schema-per-test avoids that — the pool stays, only its
+`search_path` changes:
+
+1. Add a `setup_isolated_context()` to `controller/tests/common/mod.rs` that:
+   - generates a unique schema name (`test_<uuid-hex>`);
+   - opens a pool whose `after_connect` sets `SET search_path = '<schema>', public`
+     (extension types like `vector` resolve via the `public` fallback; tables get
+     created in the per-test schema because unqualified DDL targets the first
+     `search_path` entry);
+   - runs `sqlx::migrate!()` into the fresh schema;
+   - returns a `TestContext` plus a `Drop` guard that `DROP SCHEMA … CASCADE`s.
+2. Delete the global-`DELETE` block — each test now owns a private schema, so no
+   cleanup is needed and no test can see another's rows.
+3. Migrate the seven binaries off `setup_test_context()` onto the isolated
+   variant, then **remove the `db-shared-state` group from `.config/nextest.toml`**
+   and let them run parallel.
+4. Guardrail so the footgun can't return: either delete `setup_test_context()`
+   outright once all callers move, or add a `scripts/lint-structural.sh` check
+   that fails if a `tests/`-dir file calls the global-wipe setup (mirrors how the
+   repo already freezes patterns it doesn't want to regress).
+
+**Watch-outs:** migration count × test count schema creations add per-test
+setup cost (acceptable — they run in parallel now); confirm no migration hard-codes
+`public.` for a Talos table (extensions are fine, they *should* be in `public`);
+the testcontainers binaries (`TC_TESTS`) already get a fresh container DB so they
+need no change; `CTL_TESTS` that share `talos_ctl` via `DATABASE_URL` are the
+ones this converts.
+
+---
+
 ## RLS write-isolation: tests reconciled (green) — only the design tradeoff awaits owner sign-off
 
 **Added:** 2026-06-05. **Priority: MEDIUM (was HIGH — the test-RED part is fixed).**
