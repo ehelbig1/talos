@@ -190,7 +190,14 @@ proceeding.
 controller boot guard already `error!`s if `talos_app` is missing or
 mis-attributed once the flag is on — but you can confirm the role is correct
 *before* the restart-and-read-logs cycle by running these as the controller's
-connecting role. They mirror exactly what the guard checks:
+connecting role. They mirror exactly what the guard checks.
+
+> **Runnable gate:** `make rls-preflight DATABASE_URL=<controller's connection>`
+> (or `bash scripts/rls-preflight.sh "$DATABASE_URL"`) bundles every check
+> below — role attributes, `SET ROLE`, RLS-enabled, **and** the grant-completeness
+> gotcha further down — into one fail-closed command (exit 0 = ready). Run it
+> against staging then prod, as the controller's connecting role, before flipping
+> the flag. The raw SQL is kept here for reference / manual inspection.
 
 ```sql
 -- 1. talos_app exists and is security-correct (NOT superuser, NOT BYPASSRLS,
