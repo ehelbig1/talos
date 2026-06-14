@@ -4,12 +4,13 @@ use controller::api::schema::{
 };
 use controller::api_keys::{ApiKeyScope, ApiKeyService};
 use controller::auth::AuthService;
-use controller::db::init_pool;
 use controller::dlp::DlpService;
 use controller::module_executions::ModuleExecutionService;
 use controller::secrets::SecretsManager;
 use controller::totp_2fa::TotpService;
-use sqlx::{Pool, Postgres};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{Connection, PgConnection, Pool, Postgres};
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -25,47 +26,123 @@ pub struct TestContext {
     pub execution_service: Arc<ModuleExecutionService>,
     pub totp_service: Arc<TotpService>,
     pub secrets_manager: Arc<SecretsManager>,
+    // Drops the per-test database when the context goes out of scope. MUST be
+    // the last field so it drops AFTER `db_pool` (fields drop in declaration
+    // order) — the pool's connections close first, then the DB is removed.
+    _db: TestDb,
+}
+
+/// A throwaway per-test database, created as a fast file-copy of the migrated
+/// template database (`DATABASE_URL`, e.g. `talos_ctl`). Each test gets its own
+/// isolated database, so tests never see each other's rows. This retires the
+/// global `DELETE FROM …` cleanup and the cross-binary serialization it forced
+/// — see docs/backlog.md "Per-test DB isolation".
+#[allow(dead_code)]
+pub struct TestDb {
+    /// The original `DATABASE_URL` (used to reconstruct an admin connection on
+    /// the maintenance `postgres` db for the drop).
+    template_url: String,
+    db_name: String,
+}
+
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        // Drop is synchronous but sqlx is async, and we are typically dropping
+        // from inside the test's Tokio runtime — building a runtime inside a
+        // runtime panics. Run the drop on a dedicated OS thread with its own
+        // current-thread runtime. `DROP DATABASE … WITH (FORCE)` terminates any
+        // backends the test's pool still holds. Best-effort: a failure here
+        // only leaks one small (data-free) database, swept on the next run.
+        let template_url = self.template_url.clone();
+        let db_name = self.db_name.clone();
+        let _ = std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                let Ok(admin_opts) = PgConnectOptions::from_str(&template_url) else {
+                    return;
+                };
+                let admin_opts = admin_opts.database("postgres");
+                if let Ok(mut conn) = PgConnection::connect_with(&admin_opts).await {
+                    let _ = sqlx::query(&format!(
+                        "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+                    ))
+                    .execute(&mut conn)
+                    .await;
+                    let _ = conn.close().await;
+                }
+            });
+        })
+        .join();
+    }
+}
+
+/// Create an isolated per-test database (a `TEMPLATE` clone of the migrated DB
+/// `DATABASE_URL` points at) and return a pool bound to it plus a guard that
+/// drops it on scope-exit. Used by `setup_test_context` and by other CTL test
+/// binaries that need an isolated DB without the shared-state cleanup.
+#[allow(dead_code)]
+pub async fn isolated_db_pool() -> (Pool<Postgres>, TestDb) {
+    let _ = dotenvy::dotenv();
+    let db_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to a migrated template database (e.g. talos_ctl)");
+    let base = PgConnectOptions::from_str(&db_url)
+        .expect("DATABASE_URL is not a valid Postgres connection string");
+    let template = base.get_database().unwrap_or("postgres").to_string();
+    let db_name = format!("test_{}", Uuid::new_v4().simple());
+
+    // CREATE DATABASE … TEMPLATE must run from a connection NOT on the template
+    // (and the template must be connection-free). Use the maintenance db.
+    let admin_opts = base.clone().database("postgres");
+    let mut admin = PgConnection::connect_with(&admin_opts)
+        .await
+        .expect("connect to maintenance 'postgres' db");
+
+    // The template is connection-free in steady state, but a peer test cloning
+    // the same template at the same instant can briefly hold it; retry the
+    // "source database is being accessed by other users" race a few times.
+    let create_sql = format!("CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\"");
+    let mut attempt = 0;
+    loop {
+        match sqlx::query(&create_sql).execute(&mut admin).await {
+            Ok(_) => break,
+            Err(e) if attempt < 10 && e.to_string().contains("being accessed by other users") => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+            }
+            Err(e) => panic!("failed to create test database from template '{template}': {e}"),
+        }
+    }
+    let _ = admin.close().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect_with(base.clone().database(&db_name))
+        .await
+        .expect("connect to isolated test database");
+
+    (
+        pool,
+        TestDb {
+            template_url: db_url,
+            db_name,
+        },
+    )
 }
 
 #[allow(dead_code)]
 pub async fn setup_test_context() -> TestContext {
-    let _ = dotenvy::dotenv();
-    let db_pool = init_pool()
-        .await
-        .expect("Failed to connect to test database");
-
-    // Clean up test data
-    let _ = sqlx::query("DELETE FROM organization_members")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM organizations")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM execution_approvals")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM dead_letter_queue")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM webhook_dlq")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM webhook_triggers")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM api_keys").execute(&db_pool).await;
-    let _ = sqlx::query("DELETE FROM user_sessions")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM module_execution_logs")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM module_executions")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM modules").execute(&db_pool).await;
-    let _ = sqlx::query("DELETE FROM workflows").execute(&db_pool).await;
-    let _ = sqlx::query("DELETE FROM users").execute(&db_pool).await;
+    // Each test runs against its own isolated database (a template clone of the
+    // migrated DB). No global `DELETE FROM …` cleanup is needed — the database
+    // starts empty of test rows and is dropped when the context goes out of
+    // scope. This is what lets these binaries run in parallel.
+    let (db_pool, _db) = isolated_db_pool().await;
 
     let auth_service = Arc::new(
         AuthService::new(
@@ -108,6 +185,7 @@ pub async fn setup_test_context() -> TestContext {
         execution_service,
         totp_service,
         secrets_manager,
+        _db,
     }
 }
 

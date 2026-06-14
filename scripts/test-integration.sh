@@ -118,11 +118,18 @@ CTRL_TESTS=(
     "workflow_version_tests"
     "env_vars"
 )
+# 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
+# private per-test database (controller/tests/common::isolated_db_pool), so the
+# binaries run multi-threaded with no shared-state cleanup. The one exception is
+# env_vars, which mutates the global DATABASE_URL/ALLOWED_ORIGIN process env and
+# must keep its tests single-threaded within the shared test process.
 for ctest in "${CTRL_TESTS[@]}"; do
+    threadflag=()
+    [ "$ctest" = "env_vars" ] && threadflag=(--test-threads=1)
     echo
-    echo "▶ controller :: ${ctest}  [migrated:talos_ctl, DATABASE_URL, single-threaded]"
+    echo "▶ controller :: ${ctest}  [migrated:talos_ctl template → per-test isolated DB]"
     if ! DATABASE_URL="$CTL_URL" TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
-        cargo test -p controller --test "$ctest" -- --test-threads=1; then
+        cargo test -p controller --test "$ctest" -- "${threadflag[@]}"; then
         rc=1
     fi
 done

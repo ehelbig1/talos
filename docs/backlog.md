@@ -10,7 +10,31 @@ Each entry: what, why it matters, why it's not done yet, and a suggested shape.
 
 ## Per-test DB isolation — retire the global-`DELETE` shared-state test pattern
 
-**Added:** 2026-06-14. **Priority: MEDIUM (CI throughput + correctness footgun).**
+**Added:** 2026-06-14. **RESOLVED 2026-06-14.** **Priority was: MEDIUM
+(CI throughput + correctness footgun).**
+
+> **RESOLVED — implemented as template-database-per-test (not schema-per-test).**
+> The 240-migration count made the originally-sketched schema-per-test approach
+> (re-migrate per test) far too slow, so the implementation instead uses a fast
+> `CREATE DATABASE <unique> TEMPLATE <migrated-db>` file-copy clone per test:
+> `controller/tests/common::isolated_db_pool()` + a `TestDb` Drop guard that
+> `DROP DATABASE … WITH (FORCE)`s on scope-exit (on a dedicated OS thread, since
+> Drop is sync and we're inside the test runtime). `setup_test_context` (7
+> binaries) and `integration_mcp_tests` (converted, 2 call sites) now route
+> through it; the global `DELETE FROM …` cleanup is gone. The obsolete
+> `db-shared-state` nextest group was removed; `scripts/test-integration.sh`
+> drops `--test-threads=1` for the isolated binaries (keeping it only for
+> `env_vars`, which mutates the global `DATABASE_URL` process env). Guarded by
+> structural-lint **check 43** (no `init_pool()` in `controller/tests` outside
+> `env_vars`). **Verified:** the harness compiles (api_key_tests +
+> integration_mcp_tests build clean); the isolation mechanism — concurrent
+> template-clone with retry + per-test isolation + Drop teardown leaving zero
+> leftover DBs — was proven end-to-end against a live Postgres via a standalone
+> replica; SQL mechanics proven via psql; lints + rustfmt green. **Not run here:**
+> the full converted suite against the real 240-migration schema (needs a
+> pgvector image + sqlx-cli; Docker was unavailable in the authoring sandbox) —
+> the `quality.yml` integration job exercises it on PR. Original plan retained
+> below for context.
 
 **What.** `controller/tests/common/mod.rs::setup_test_context()` (and the
 analogous setup in `integration_mcp_tests.rs`) begins every test by running a
