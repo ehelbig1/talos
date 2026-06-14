@@ -1,8 +1,9 @@
 # RFC 0003 — Durable workflow execution
 
-**Status:** In progress (Phase 1 landed, flag-gated default-off)
+**Status:** In progress (Phase 1 + Phase 2 landed, flag-gated default-off;
+remaining work is staging validation + a fresh-run fencing decision)
 **Author:** Platform
-**Date:** 2026-05-28
+**Date:** 2026-05-28 (status updated 2026-06-14)
 
 ## TL;DR
 
@@ -107,9 +108,45 @@ JetStream) only dispatches the next task. So the correct ordering is:
 | Phase | Shape | Status |
 |---|---|---|
 | **1** | Per-node checkpointing of completed outputs; resume re-seeds via the existing `run_with_seed` path | **Landed**, flag-gated default-off |
-| **2** | Resume on startup: a sweep that finds `running` executions with a checkpoint and re-drives them (today resume is scheduler/`Wait`-triggered only) | Future |
+| **2** | Resume on startup: a sweep that finds stuck `running` executions with a checkpoint and re-drives them, with an epoch fence against split-brain | **Landed**, flag-gated default-off (same `EXECUTION_CHECKPOINTING_ENABLED` flag) |
 | **3** | Durable task dispatch (JetStream pull-consumer + ack) for controller-fleet elasticity — only if scale demands it; gated on Phase 2 making the orchestrator crash-resumable | Deferred / maybe never |
 | — | Event-sourced deterministic replay (Temporal-style) | **Non-goal** — incompatible with arbitrary-WASM-node workflows |
+
+**Phase 2 — landed (2026-06).** The startup crash-recovery sweep is wired in
+`controller/src/main.rs` (`recover_stuck_executions`, gated on
+`EXECUTION_CHECKPOINTING_ENABLED` + NATS availability). The orchestration lives
+in `talos-execution-orchestration/src/crash_recovery.rs`: it claims orphaned
+`running` rows older than `EXECUTION_RESUME_STALE_MINS` via an atomic
+`running → resuming` flip (`FOR UPDATE SKIP LOCKED`, exactly-once under
+concurrency), reclaims stale `resuming` rows (resumers that themselves crashed),
+and re-drives via `run_with_seed_fenced` (`talos-engine/src/fence.rs`) — an
+epoch heartbeat that aborts a superseded controller's engine the moment another
+claim bumps `workflow_executions.epoch`. Covered by
+`talos-execution-repository/tests/crash_recovery.rs` (claim exactly-once,
+stale-threshold, status-guarded fail/reclaim, epoch bump) which runs in the
+`quality.yml` integration job.
+
+**Remaining before declaring durable execution "shipped" (flag default → on):**
+
+1. **Cluster/staging validation** per the runbook below — kill a controller
+   mid-run, confirm the checkpoint persists, resume skips already-completed
+   nodes (no duplicate dispatch via `node_executions` counts), final output
+   matches a clean run; load-test with `CHECKPOINT_EVERY_N_NODES=1` and watch
+   DB-pool pressure. This is the only hard gate; it needs a real two-controller
+   cluster, so it can't be CI-validated.
+2. **Fresh-run fencing decision** (`docs/split-brain-fencing-design.md`, F4).
+   The resume path is fenced; the *fresh-run* path is not — a superseded
+   original controller can keep dispatching new nodes until it finishes
+   (terminal writes are already status-guarded, and the at-least-once contract
+   (F2) means authors make nodes idempotent, so this is bounded, not
+   unbounded). Pick one before wrapping every fresh run in a fence: LISTEN/NOTIFY
+   cancellation, threshold-gate (only fence runs that exceed the stale window),
+   or accept the residual exposure. Low urgency; **not** a blocker for enabling
+   the flag in a single-controller deploy.
+3. **Operational preconditions:** `WORKER_SHARED_KEY` set identically on
+   controller + worker (checkpoints are WSK-encrypted); drain in-flight
+   executions before rotating WSK (rotation strands checkpoints — documented in
+   `checkpoint_store.rs`).
 
 ## Phase 1 design (landed)
 
