@@ -46,7 +46,7 @@ Four-digit, zero-padded, allocated in order. Never reused.
 |---|-------|--------|--------|
 | [0001](0001-multi-tenancy.md) | Multi-tenancy implementation | Draft | Three-phase plan for T1 logical + T2 cryptographic + T3 physical tenant isolation |
 | [0002](0002-extract-compilation-service.md) | Extract the compilation service | Draft | First extraction from the controller monolith; compilation as HTTP service behind a feature flag |
-| [0003](0003-durable-execution.md) | Durable workflow execution | In progress | Controller-restart resume of checkpointed executions; Phase 1 landed, flag-gated default-off |
+| [0003](0003-durable-execution.md) | Durable workflow execution | In progress | Controller-restart resume of checkpointed executions; Phase 1 + Phase 2 (crash-recovery sweep + epoch fence) landed, flag-gated default-off; remaining = staging validation + fresh-run fencing decision |
 | [0004](0004-tenant-equals-organization.md) | Tenant = Organization | In progress | The tenant is the organization; membership-union policy, GUC primitives, permissive rollout (M1 landing) |
 | [0005](0005-tenant-isolation-target-architecture.md) | Tenant-isolation target architecture | Draft | End-state RLS: dual-role via `SET LOCAL ROLE`, request-scoped unit-of-work, fail-closed `WITH CHECK`; executed in stages |
 | [0006](0006-org-scoped-write-isolation-pins-org-not-user.md) | Org-scoped write isolation pins `org_id`, not `user_id` | In progress | Decided (enterprise): `secrets` gets a per-user owner pin (Option B, implemented); `workflows`/`actors` stay org-pinned only. Latent until RLS enforcement is on + secret writes wired to `begin_org_scoped` |

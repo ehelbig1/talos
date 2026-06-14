@@ -81,6 +81,32 @@ echo "📦 Preparing sqlx offline query cache..."
 cargo sqlx prepare --workspace
 
 echo ""
+echo "🔗 Checking linker (mold)..."
+# .cargo/config.toml pins the mold linker for Linux (-fuse-ld=mold) — a big
+# speedup on a 100+-crate workspace. If it's missing, cargo fails the FINAL
+# LINK with a confusing "linking with `cc` failed" on trivial build scripts
+# (proc-macro2, libc), which looks like a toolchain break but isn't. Catch it
+# here with an actionable message instead.
+if [ "$(uname -s)" = "Linux" ] && ! command -v mold &> /dev/null; then
+    echo "   ⚠️  mold not found — .cargo/config.toml requires it on Linux."
+    if command -v apt-get &> /dev/null; then
+        echo "   Installing mold via apt-get..."
+        sudo apt-get install -y mold || true
+    elif command -v dnf &> /dev/null; then
+        echo "   Installing mold via dnf..."
+        sudo dnf install -y mold || true
+    elif command -v pacman &> /dev/null; then
+        echo "   Installing mold via pacman..."
+        sudo pacman -S --noconfirm mold || true
+    fi
+    if ! command -v mold &> /dev/null; then
+        echo "   Could not auto-install mold. Either install it manually"
+        echo "   (https://github.com/rui314/mold) or build without it:"
+        echo "       RUSTFLAGS=\"\" cargo build --workspace"
+    fi
+fi
+
+echo ""
 echo "🔨 Building workspace..."
 cargo build --workspace
 

@@ -2,7 +2,108 @@
 
 All notable changes to the Talos platform are documented in this file.
 
-## [Unreleased] — 2026-05-05
+## [Unreleased] — 2026-05-05 → 2026-06-14
+
+> Entries below dated after 2026-05-05 use **PR numbers** (the May→June work
+> landed as discrete PRs rather than the `rNNN` review-pass numbering of the
+> architectural-extraction sprint). The `rNNN` sections that follow are the
+> 2026-05-05 architectural-mandate batch, unchanged.
+
+### Security — tenant isolation (RFC 0005 S3 / RFC 0006)
+
+The RLS write-path enforcement layer is now functionally complete and
+flag-gated off (`TALOS_RLS_SET_ROLE`, default false). What landed:
+
+#### Secret write-isolation — per-user owner pin (RFC 0006, #206–#210)
+
+* **#206** — personal secrets gain a per-user owner pin (`owner_user_id`);
+  RFC 0006 Option B.
+* **#207** — `create_secret` routed through `begin_org_scoped` /
+  `begin_user_scoped` so the write runs under `SET LOCAL ROLE talos_app`.
+* **#208** — by-id `update`/`delete` scoped owner-only (defense-in-depth
+  `created_by = $user` re-assert in the WHERE clause).
+* **#209** — `upsert_secret` scoped; the non-atomic create-or-delete-and-retry
+  path replaced with `INSERT … ON CONFLICT … RETURNING` (see r306 below).
+* **#210** — personal (`org_id IS NULL`, owner-pinned) vs. org-shared
+  (`org_id` set, membership/RBAC-governed) secret split finalised.
+
+#### Workflow/actor create-scoping + lint freeze (#219–#223)
+
+* **#219/#220** — workflow create + all `INSERT` paths routed through
+  `begin_org_scoped`.
+* **#221/#222** — actor create scoped on both the MCP and GraphQL surfaces.
+* **#223** — structural lint **check 42**: org-pinned-table creates
+  (`workflows`/`actors`/`secrets`) must run on a tenant-scoped tx, never a
+  bare pool (opt-out `// allow-unscoped-org-write` for engine/system paths).
+
+#### Approval-gate token hardening (#217/#218)
+
+* **#217** — approval-gate token lookups key on `token_hash` (SHA-256) then
+  constant-time compare the full token, replacing raw-token `WHERE token = $N`
+  equality.
+* **#218** — structural lint **check 41** freezes the pattern.
+
+#### Enablement runbook + pre-flight gate (#211, #224, this branch)
+
+* **#211** — RFC 0005 enforcement-enablement operator runbook.
+* **#224** — runnable pre-flight role verification added to the runbook.
+* **(this branch)** — `scripts/rls-preflight.sh` + `make rls-preflight`:
+  bundles role-attribute / `SET ROLE` / RLS-enabled / grant-completeness
+  checks into one fail-closed command. Validated against a live Postgres.
+
+### Security — sandbox, webhook & OAuth hardening (#225–#231)
+
+* **#225** — a guest-controlled datetime format string can no longer panic the
+  worker host.
+* **#226** — the worker SQL validator blocks `EXPLAIN`, matching the controller
+  fence.
+* **#227** — minijinja template render bounded by a fuel budget (CPU DoS).
+* **#228** — retention sweep for the previously-unbounded webhook DLQ.
+* **#229** — webhook trigger lookup distinguishes DB errors from not-found and
+  unifies the trigger oracle (no existence leak).
+* **#230** — Slack OAuth callback moved to a no-auth router so the connect flow
+  works.
+* **#231** — OAuth `state` is format-validated on the integration callback
+  consume paths.
+
+### CI & quality gates (#190–#204)
+
+Closes the "nobody runs it → it rots" failure mode that let a security RLS
+suite sit red on `main` for days. **100% of `tests/`-dir integration binaries
+now run in CI**, plus the heavy/networked gates.
+
+* **`quality.yml`** — new workflow on `pull_request` to main + nightly +
+  dispatch: `audit` (`cargo deny`), `test` (DB-free lib + security + engine
+  suites via nextest), `integration` (the DB suite incl. RLS isolation /
+  crash-recovery), `frontend` (eslint + tsc + vitest). The unbypassable
+  backstop the opt-in pre-push hook can't cover.
+* **#190–#202** — gated every formerly-dark `tests/`-dir binary
+  (module-template, sandbox-security, the DB-free security set, engine/protocol,
+  and the controller DB harness via testcontainers). Probing them found 1 real
+  latent bug (CARGO_MANIFEST_DIR template discovery, #190) + ~16 stale/dark
+  security tests trailing correct hardening.
+* **#203** — doctest gate restored (`cargo test --workspace --doc`, ~218
+  doctests).
+* **#204** — the last `#[ignore]`'d holdout (`webhooks_hmac`) made DB/NATS-free
+  and gated.
+
+### Frontend — react-hooks v7 ruleset (#212–#216)
+
+Full `eslint-plugin-react-hooks` v7 `recommended` (React-Compiler) ruleset
+adopted one rule per PR with per-site triage — no blanket suppressions.
+
+* **#212** — slice 1: baseline + every recommended rule with zero findings.
+* **#213** — slice 2: `immutability` + `preserve-manual-memoization`.
+* **#214** — fix: `AuthContext.isTwoFactorVerified` was a mirrored-state bug;
+  now derived (caught by `set-state-in-effect`).
+* **#215** — slice 3: `set-state-in-effect` (mount-fetch → react-query, external
+  syncs → render-phase pattern).
+* **#216** — slice 4: `purity` (lazy `useState` initializers for timestamps).
+
+### Performance
+
+* **#205** — the blocking template-catalog filesystem scan is offloaded off the
+  async runtime.
 
 ### Architectural mandate enforcement
 

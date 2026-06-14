@@ -25,7 +25,7 @@ export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/n
 
 .PHONY: help up down rebuild restart logs ps shell \
         check build lint lint-frontend hooks test test-integration coverage-html audit check-catalog ci \
-        drill clean nuke _wait-healthy
+        drill clean nuke smoke rls-preflight _wait-healthy
 
 ## ──── Dev ──────────────────────────────────────────────────────────
 
@@ -168,6 +168,9 @@ drill: ## Run the backup→restore drill (pg_dump + vault snapshot → scratch s
 
 smoke: ## End-to-end probe of a deployed cluster (BASE_URL=https://… SMOKE_AGENT_TOKEN=… SMOKE_ACTOR_ID=…)
 	@bash scripts/smoke.sh
+
+rls-preflight: ## Verify Postgres is ready for RLS SET-ROLE enforcement (DATABASE_URL=… controller's role)
+	@bash scripts/rls-preflight.sh
 
 VERSION ?=
 SERVICES ?=
