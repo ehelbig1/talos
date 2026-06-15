@@ -1,37 +1,23 @@
+mod common;
+
 use controller::api::schema::{IsTwoFactorVerified, MutationRoot, QueryRoot, SubscriptionRoot};
 use controller::auth::AuthService;
-use controller::db::init_pool;
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
 
 type TalosSchema = async_graphql::Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
-async fn setup_test_context() -> (Pool<Postgres>, TalosSchema, Arc<AuthService>) {
-    let _ = dotenvy::dotenv();
-    let db_pool = init_pool()
-        .await
-        .expect("Failed to connect to test database");
-
-    // Clean up test data
-    let _ = sqlx::query("DELETE FROM mcp_agents")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM agent_roles")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM slack_integrations")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM gmail_integrations")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM google_calendar_integrations")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM integration_credentials")
-        .execute(&db_pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM users").execute(&db_pool).await;
+// Each test gets its own isolated database (template clone), so no global
+// `DELETE FROM …` cleanup is needed. The returned `common::TestDb` guard MUST
+// be held by the caller for the duration of the test — dropping it drops the
+// database.
+async fn setup_test_context() -> (
+    Pool<Postgres>,
+    TalosSchema,
+    Arc<AuthService>,
+    common::TestDb,
+) {
+    let (db_pool, db_guard) = common::isolated_db_pool().await;
 
     let auth_service = Arc::new(
         AuthService::new(
@@ -52,12 +38,12 @@ async fn setup_test_context() -> (Pool<Postgres>, TalosSchema, Arc<AuthService>)
     .data(auth_service.clone())
     .finish();
 
-    (db_pool, schema, auth_service)
+    (db_pool, schema, auth_service, db_guard)
 }
 
 #[tokio::test]
 async fn test_service_integrations_query_and_disconnect() {
-    let (db_pool, schema, auth_service) = setup_test_context().await;
+    let (db_pool, schema, auth_service, _db) = setup_test_context().await;
 
     let user_id = auth_service
         .create_user(
@@ -147,7 +133,7 @@ async fn test_service_integrations_query_and_disconnect() {
 
 #[tokio::test]
 async fn test_mcp_agents_query_and_revoke() {
-    let (db_pool, schema, auth_service) = setup_test_context().await;
+    let (db_pool, schema, auth_service, _db) = setup_test_context().await;
 
     let user_id = auth_service
         .create_user(

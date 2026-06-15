@@ -1,32 +1,15 @@
 # nextest configuration.
 #
-# The `db-shared-state` test group serialises integration tests that share
-# database state via `controller::tests::common::setup_test_context()`.
-# That helper runs a global `DELETE FROM users` (and friends) at the start
-# of every test, which under nextest's default parallelism deletes another
-# concurrently-running test's rows mid-execution. The cascade then surfaces
-# as flaky FK violations, missing api_keys, etc.
+# The former `db-shared-state` group serialised the controller DB-harness
+# binaries because `controller::tests::common::setup_test_context()` ran a
+# global `DELETE FROM users` (and friends) against a SHARED database, so two
+# concurrent tests deleted each other's rows. That global cleanup is gone:
+# `setup_test_context` now gives every test its own isolated database (a fast
+# `CREATE DATABASE … TEMPLATE` clone of the migrated DB, dropped on scope-exit
+# — see controller/tests/common/mod.rs::isolated_db_pool). Tests no longer
+# share DB state, so they run fully parallel and the serialization group has
+# been removed.
 #
-# Pinning these binaries to `max-threads = 1` keeps tests within each
-# binary parallel (nextest manages its own intra-binary concurrency) but
-# serialises across binaries, so two tests can't both be inside
-# `setup_test_context()` simultaneously.
-#
-# Long-term fix is per-test transaction isolation (each test gets its own
-# DB schema or runs inside a rollback'd transaction) — until that lands,
-# this group keeps CI green without resorting to `#[ignore]`.
-
-[test-groups]
-db-shared-state = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = '''
-    binary(api_auth_integration_test)
-    | binary(api_key_tests)
-    | binary(auth_concurrency_tests)
-    | binary(governance_tests)
-    | binary(scheduler_tests)
-    | binary(security_isolation_tests)
-    | binary(workflow_version_tests)
-'''
-test-group = 'db-shared-state'
+# (env_vars mutates the global `DATABASE_URL` process env, but nextest runs
+# each test in its own process, so that mutation can't leak across tests — it
+# never needed a group.)

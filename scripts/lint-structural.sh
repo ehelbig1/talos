@@ -2994,6 +2994,41 @@ else
 fi
 echo
 
+bold "▶ check 43: controller test setup must use the isolated-DB harness, not init_pool()"
+
+# Per-test DB isolation (docs/backlog.md): `controller/tests/common::
+# setup_test_context` / `isolated_db_pool` give every test its OWN database
+# (a fast `CREATE DATABASE … TEMPLATE` clone of the migrated DB, dropped on
+# scope-exit), so tests never share DB state. A test setup that instead calls
+# `controller::db::init_pool()` connects to the shared `DATABASE_URL` directly —
+# reintroducing the global-`DELETE FROM …` shared-state pattern (and the
+# cross-binary flake) the isolation removed, AND writing to the `talos_ctl`
+# TEMPLATE that the other binaries clone (corrupting their snapshots). The one
+# legitimate caller is `env_vars.rs`, which TESTS init_pool's missing-DATABASE_URL
+# behavior. Opt-out `// allow-test-init-pool: <reason>` on the same line.
+
+INITPOOL_VIOLATIONS=0
+initpool_hits=$(grep -rnE 'init_pool[[:space:]]*\(' --include='*.rs' controller/tests 2>/dev/null \
+    | grep -vE '/env_vars\.rs:' || true)
+while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    echo "$m" | grep -q 'allow-test-init-pool' && continue
+    body=$(echo "$m" | cut -d: -f3-)
+    echo "$body" | grep -qE '^[[:space:]]*//' && continue
+    printf '  %s\n' "$m"
+    INITPOOL_VIOLATIONS=$((INITPOOL_VIOLATIONS + 1))
+done <<< "$initpool_hits"
+
+if [ "$INITPOOL_VIOLATIONS" -gt 0 ]; then
+    red "✗ $INITPOOL_VIOLATIONS controller test(s) call init_pool() directly (shared-DB harness)"
+    yellow "  → use common::setup_test_context / common::isolated_db_pool for an isolated per-test DB."
+    yellow "  → or // allow-test-init-pool: <reason> (e.g. a test OF init_pool itself)."
+    EXIT_CODE=1
+else
+    green "✓ controller tests use the isolated-DB harness (no direct init_pool)"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
