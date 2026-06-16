@@ -19,6 +19,7 @@ use sha2::Sha256;
 use sqlx::{Pool, Postgres};
 use talos_workflow_engine_core::{BoxError, CheckpointStore};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// Minimum key length for AES-256-GCM. Keys longer than this are
 /// truncated to the first 32 bytes.
@@ -52,10 +53,10 @@ const CHECKPOINT_AEAD_KEY_LABEL: &[u8] = b"talos/worker-shared-key/checkpoint-ae
 /// and decrypt derive it identically so the round-trip stays symmetric.
 /// Mirrors `derive_envelope_aead_key` in `talos-workflow-job-protocol`
 /// but with a distinct domain-separation label.
-fn derive_checkpoint_aead_key(root: &[u8]) -> [u8; AES_KEY_LEN] {
+fn derive_checkpoint_aead_key(root: &[u8]) -> Zeroizing<[u8; AES_KEY_LEN]> {
     let hk = Hkdf::<Sha256>::new(None, root);
-    let mut subkey = [0u8; AES_KEY_LEN];
-    hk.expand(CHECKPOINT_AEAD_KEY_LABEL, &mut subkey)
+    let mut subkey = Zeroizing::new([0u8; AES_KEY_LEN]);
+    hk.expand(CHECKPOINT_AEAD_KEY_LABEL, subkey.as_mut())
         .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
     subkey
 }
@@ -501,10 +502,14 @@ fn encrypt_checkpoint(
             key.len()
         ));
     }
-    let plaintext =
-        serde_json::to_vec(data).map_err(|e| format!("Failed to serialize checkpoint: {e}"))?;
+    // Checkpoint plaintext is the serialized node-output JSON, which can
+    // carry sensitive workflow data — keep it in Zeroizing so the buffer
+    // is wiped on drop.
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+        serde_json::to_vec(data).map_err(|e| format!("Failed to serialize checkpoint: {e}"))?,
+    );
     let aead_key = derive_checkpoint_aead_key(key);
-    let cipher = Aes256Gcm::new_from_slice(&aead_key)
+    let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
         .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
@@ -513,7 +518,7 @@ fn encrypt_checkpoint(
         .encrypt(
             nonce,
             Payload {
-                msg: plaintext.as_ref(),
+                msg: plaintext.as_slice(),
                 aad,
             },
         )
@@ -552,18 +557,24 @@ fn decrypt_checkpoint(
         ));
     }
     let aead_key = derive_checkpoint_aead_key(key);
-    let cipher = Aes256Gcm::new_from_slice(&aead_key)
+    let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
         .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let nonce = Nonce::from_slice(nonce);
-    let plaintext = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
-        .map_err(|_| "Checkpoint decryption failed — wrong key or corrupted data".to_string())?;
+    // Wipe the decrypted node-output bytes on drop, including the
+    // deserialize-error branch below.
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| {
+                "Checkpoint decryption failed — wrong key or corrupted data".to_string()
+            })?,
+    );
     serde_json::from_slice(&plaintext).map_err(|e| format!("Failed to deserialize checkpoint: {e}"))
 }
 

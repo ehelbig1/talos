@@ -3630,12 +3630,17 @@ impl SecretsManager {
 
         let dek = self.get_dek(key_id).await?;
         let cipher = Aes256Gcm::new_from_slice(&dek.key)?;
-        let plaintext_bytes = cipher
-            .decrypt(nonce, payload)
-            .map_err(|e| anyhow!("Decryption failed: {}", e))?;
-        let plaintext = String::from_utf8(plaintext_bytes)
+        // Keep the AES-GCM output in Zeroizing<Vec<u8>> so the plaintext
+        // buffer is wiped on drop — including the UTF-8 error branch
+        // below. Mirrors `decrypt_value_by_key_with_aad`.
+        let plaintext_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+            cipher
+                .decrypt(nonce, payload)
+                .map_err(|e| anyhow!("Decryption failed: {}", e))?,
+        );
+        let plaintext = std::str::from_utf8(&plaintext_bytes)
             .map_err(|_| anyhow!("Decrypted value is not valid UTF-8"))?;
-        Ok(Zeroizing::new(plaintext))
+        Ok(Zeroizing::new(plaintext.to_string()))
     }
 
     /// Rotate the Data Encryption Key.

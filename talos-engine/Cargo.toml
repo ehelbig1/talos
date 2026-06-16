@@ -57,6 +57,7 @@ tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tokio-util = { version = "0.7", default-features = false }
 tracing.workspace = true
 uuid.workspace = true
+zeroize = "1.8"
 
 [lints]
 workspace = true

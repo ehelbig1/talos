@@ -17,6 +17,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 // ── OTLP auth-header encryption (L3, 2026-05-28 review) ────────────────────────
 //
@@ -55,10 +56,10 @@ const OTLP_HEADER_AEAD_LABEL: &[u8] = b"talos/master-key/audit-otlp-header-aead/
 /// Derive the dedicated 32-byte AES-256-GCM subkey for OTLP auth-header
 /// encryption from the raw `TALOS_MASTER_KEY`. Deterministic; encrypt and
 /// decrypt derive it identically.
-fn derive_otlp_header_key(master_key: &[u8]) -> [u8; 32] {
+fn derive_otlp_header_key(master_key: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, master_key);
-    let mut subkey = [0u8; 32];
-    hk.expand(OTLP_HEADER_AEAD_LABEL, &mut subkey)
+    let mut subkey = Zeroizing::new([0u8; 32]);
+    hk.expand(OTLP_HEADER_AEAD_LABEL, subkey.as_mut())
         .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
     subkey
 }
@@ -71,9 +72,9 @@ fn otlp_header_aad(user_id: Uuid) -> [u8; 16] {
 
 /// Load + hex-decode `TALOS_MASTER_KEY`. Returns `None` (caller logs) if the env
 /// var is unset or not valid hex.
-fn load_master_key_bytes() -> Option<Vec<u8>> {
-    let hex_str = std::env::var("TALOS_MASTER_KEY").ok()?;
-    hex::decode(hex_str.trim()).ok()
+fn load_master_key_bytes() -> Option<Zeroizing<Vec<u8>>> {
+    let hex_str = Zeroizing::new(std::env::var("TALOS_MASTER_KEY").ok()?);
+    hex::decode(hex_str.trim()).ok().map(Zeroizing::new)
 }
 
 /// Encrypt OTLP auth headers (a JSON string) for storage. Returns
@@ -95,7 +96,7 @@ pub fn decrypt_otlp_auth_headers(
     ciphertext: &[u8],
     nonce: &[u8],
     user_id: Uuid,
-) -> Result<String, String> {
+) -> Result<Zeroizing<String>, String> {
     let master_key = load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
     decrypt_otlp_auth_headers_with_master_key(ciphertext, nonce, user_id, &master_key)
 }
@@ -109,7 +110,8 @@ fn encrypt_otlp_auth_headers_with_master_key(
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     use rand::RngCore;
     let subkey = derive_otlp_header_key(master_key);
-    let cipher = Aes256Gcm::new_from_slice(&subkey).map_err(|e| format!("cipher init: {e}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(subkey.as_slice()).map_err(|e| format!("cipher init: {e}"))?;
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let aad = otlp_header_aad(user_id);
@@ -132,7 +134,7 @@ fn decrypt_otlp_auth_headers_with_master_key(
     nonce: &[u8],
     user_id: Uuid,
     master_key: &[u8],
-) -> Result<String, String> {
+) -> Result<Zeroizing<String>, String> {
     if nonce.len() != 12 {
         return Err(format!(
             "nonce wrong length (expected 12, got {})",
@@ -140,20 +142,28 @@ fn decrypt_otlp_auth_headers_with_master_key(
         ));
     }
     let subkey = derive_otlp_header_key(master_key);
-    let cipher = Aes256Gcm::new_from_slice(&subkey).map_err(|e| format!("cipher init: {e}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(subkey.as_slice()).map_err(|e| format!("cipher init: {e}"))?;
     let aad = otlp_header_aad(user_id);
-    let plaintext = cipher
-        .decrypt(
-            Nonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| {
-            "decrypt failed — wrong key, corrupted data, or tenant (AAD) mismatch".to_string()
-        })?;
-    String::from_utf8(plaintext).map_err(|_| "decrypted bytes are not valid UTF-8".to_string())
+    // Hold the decrypted bytes (auth headers carry `Bearer` tokens) in
+    // Zeroizing so the buffer is wiped on drop — including the UTF-8
+    // error branch below. Mirrors the SecretsManager decrypt path.
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                "decrypt failed — wrong key, corrupted data, or tenant (AAD) mismatch".to_string()
+            })?,
+    );
+    let s = std::str::from_utf8(&plaintext)
+        .map_err(|_| "decrypted bytes are not valid UTF-8".to_string())?;
+    Ok(Zeroizing::new(s.to_string()))
 }
 
 #[cfg(test)]
@@ -172,7 +182,7 @@ mod otlp_header_crypto_tests {
             encrypt_otlp_auth_headers_with_master_key(headers, user, &master_key()).unwrap();
         let out =
             decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, user, &master_key()).unwrap();
-        assert_eq!(out, headers);
+        assert_eq!(&*out, headers);
     }
 
     #[test]
