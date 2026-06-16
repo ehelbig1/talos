@@ -824,30 +824,18 @@ impl ModuleRepository {
         }))
     }
 
-    /// Fallback for `get_module_info` — kept for rare rows that
-    /// pre-date the Phase 1.1 backfill or were created during a
-    /// rollback window. Reads from the `modules` table now (Phase 3.2);
-    /// the legacy `node_templates` SELECT was removed.
-    pub async fn get_node_template_info(
-        &self,
-        template_id: Uuid,
-    ) -> Result<Option<NodeTemplateInfo>> {
-        let row = sqlx::query(
-            "SELECT name, kind, capability_world, allowed_hosts, allowed_secrets, \
-                    COALESCE(LENGTH(wasm_bytes)::bigint, size_bytes::bigint) AS size_bytes, \
-                    (source_code IS NOT NULL) AS has_source_code, \
-                    created_at \
-             FROM modules \
-             WHERE id = $1 \
-             LIMIT 1",
-        )
-        .bind(template_id)
-        .fetch_optional(&self.db_pool)
-        .await?;
-        Self::row_to_template_info(row)
-    }
+    // Removed: the unscoped `get_node_template_info(template_id)` — it had
+    // ZERO live callers (MCP-795 routed the two fallback sites,
+    // `handle_get_module_info` and `handle_test_secret_access`, to the
+    // user-scoped variant below precisely because the unscoped form leaked
+    // private template metadata — name / capability_world / allowed_hosts /
+    // allowed_secrets / has_source_code — of EVERY user's templates and let an
+    // attacker probe another user's secret-path grants). Leaving it in the
+    // repo was a latent IDOR footgun: a future handler could call it with a
+    // caller-supplied `template_id` and silently reintroduce the leak. Use
+    // `get_node_template_info_for_user` — the only correct path.
 
-    /// User-scoped variant of `get_node_template_info` — returns metadata
+    /// User-scoped variant — returns metadata
     /// only for catalog templates (`user_id IS NULL`) or templates owned
     /// by `user_id`. Mirrors the MCP-793/794 scope-pair pattern:
     /// `get_template_for_user` / `list_templates_paginated_for_user`.
