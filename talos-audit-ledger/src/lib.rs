@@ -142,11 +142,67 @@ fn otlp_header_aad(user_id: Uuid) -> [u8; 16] {
     *user_id.as_bytes()
 }
 
-/// Load + hex-decode `TALOS_MASTER_KEY`. Returns `None` (caller logs) if the env
-/// var is unset or not valid hex.
+/// Load + hex-decode `TALOS_MASTER_KEY`, validating it before use. Returns
+/// `None` (fail-closed; caller turns this into an opaque error) if the env var
+/// is unset, not valid hex, the wrong length, or all-zero.
+///
+/// This loader is the ONLY `TALOS_MASTER_KEY` consumer that can run WITHOUT
+/// the KEK provider's `EnvKekProvider::from_hex` guard — namely the
+/// `KEK_PROVIDER=vault` + `KEK_DISABLE_LEGACY=true` terminal state, where the
+/// env provider is never constructed and nothing else validates the key. The
+/// OTLP AEAD subkey is HKDF-derived from these bytes, so an empty value
+/// (`TALOS_MASTER_KEY=""`, the chart default — `hex::decode("")` is `Ok([])`),
+/// a short value, or an all-zero value would derive a low-entropy or globally
+/// recomputable encryption key for the per-tenant OTLP auth headers (Bearer
+/// tokens). We therefore mirror `EnvKekProvider`'s checks here and refuse to
+/// derive a key from degenerate material rather than silently producing weak
+/// ciphertext.
 fn load_master_key_bytes() -> Option<Zeroizing<Vec<u8>>> {
     let hex_str = Zeroizing::new(std::env::var("TALOS_MASTER_KEY").ok()?);
-    hex::decode(hex_str.trim()).ok().map(Zeroizing::new)
+    let bytes = match hex::decode(hex_str.trim()) {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "otlp_master_key_invalid_hex",
+                "TALOS_MASTER_KEY is not valid hex — OTLP audit-header encryption disabled (fail-closed)."
+            );
+            return None;
+        }
+    };
+    validate_master_key_bytes(bytes)
+}
+
+/// Validate decoded `TALOS_MASTER_KEY` bytes before they seed the OTLP AEAD
+/// HKDF. Pure (no env / no logging side-effects beyond a structured WARN) so
+/// the security-critical accept/reject logic is unit-tested directly. Mirrors
+/// `EnvKekProvider`'s length + all-zero guards. Returns `None` (fail-closed)
+/// for any degenerate key — including the empty vec produced by the chart's
+/// default `TALOS_MASTER_KEY=""` (`hex::decode("")` is `Ok([])`).
+fn validate_master_key_bytes(bytes: Vec<u8>) -> Option<Zeroizing<Vec<u8>>> {
+    if bytes.len() != 32 {
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "otlp_master_key_wrong_length",
+            key_len = bytes.len(),
+            "TALOS_MASTER_KEY is {} bytes (expected 32) — OTLP audit-header encryption \
+             disabled (fail-closed). If you run KEK_PROVIDER=vault with KEK_DISABLE_LEGACY=true, \
+             TALOS_MASTER_KEY must still be set to a real 32-byte key for authenticated OTLP \
+             streaming. Generate with: openssl rand -hex 32",
+            bytes.len()
+        );
+        return None;
+    }
+    if bytes.iter().all(|&b| b == 0) {
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "otlp_master_key_all_zero",
+            "TALOS_MASTER_KEY is all-zero — refusing to derive an OTLP header key from a \
+             degenerate key (fail-closed). This is almost always an unset / mis-templated secret."
+        );
+        return None;
+    }
+    Some(Zeroizing::new(bytes))
 }
 
 /// Encrypt OTLP auth headers (a JSON string) for storage. Returns
@@ -265,6 +321,33 @@ mod otlp_header_crypto_tests {
         let out =
             decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, user, &master_key()).unwrap();
         assert_eq!(&*out, headers);
+    }
+
+    #[test]
+    fn validate_master_key_accepts_real_32_byte_key() {
+        let ok = validate_master_key_bytes(vec![0x11u8; 32]);
+        assert!(ok.is_some());
+        assert_eq!(ok.unwrap().len(), 32);
+    }
+
+    #[test]
+    fn validate_master_key_rejects_empty() {
+        // The chart default is TALOS_MASTER_KEY="" → hex::decode("") == Ok([]).
+        // Must fail closed, not derive a key from empty (publicly recomputable) IKM.
+        assert!(validate_master_key_bytes(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn validate_master_key_rejects_wrong_length() {
+        assert!(validate_master_key_bytes(vec![0x11u8; 16]).is_none());
+        assert!(validate_master_key_bytes(vec![0x11u8; 31]).is_none());
+        assert!(validate_master_key_bytes(vec![0x11u8; 33]).is_none());
+    }
+
+    #[test]
+    fn validate_master_key_rejects_all_zero() {
+        // 32 valid-length bytes but degenerate — almost always a mis-templated secret.
+        assert!(validate_master_key_bytes(vec![0u8; 32]).is_none());
     }
 
     #[test]
