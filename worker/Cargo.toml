@@ -49,6 +49,7 @@ talos-trace = { path = "../talos-trace" }
 talos-trace-nats = { path = "../talos-trace-nats" }
 talos-shutdown = { path = "../talos-shutdown" }
 talos-config = { path = "../talos-config" }
+talos-audit-event = { path = "../talos-audit-event" }
 # MCP-1046: char-boundary-aware truncation for wit_logging.
 talos-text-util = { path = "../talos-text-util" }
 pgvector = { version = "0.4", features = ["sqlx"] }

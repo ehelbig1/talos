@@ -64,8 +64,8 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
 
 ### Repudiation
 - **Threat:** Admin invokes destructive operations (delete workflow, modify secrets) without audit trail.
-- **Mitigation:** Audit ledger with HMAC-signed events and hash chains. Immutability triggers on 4 audit tables prevent UPDATE/DELETE. `admin_event_log` records all admin actions.
-- **File:** `controller/src/audit_ledger.rs`, `worker/src/audit.rs`
+- **Mitigation:** Audit ledger with HMAC-signed events and hash chains. The WORM consumer **verifies the per-event HMAC and recomputes the event hash inline before S3 persist**, quarantining failures to an Object-Locked `rejected/` prefix (not silently dropped); an offline `verify_chain`/`verify_execution_chain` validates sequence contiguity, `previous_hash` linkage, and genesis across the full chain (finding #2). Immutability triggers on 4 audit tables prevent UPDATE/DELETE. `admin_event_log` records all admin actions.
+- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain`), `talos-audit-ledger` (consumer + inline verify + S3 verifier), `worker/src/audit.rs`
 
 ### Information Disclosure
 - **Threat:** Tool responses leak internal errors, stack traces, or secret values.
@@ -198,8 +198,8 @@ This is the highest-risk attack surface. Users submit arbitrary Rust source code
 
 ### Information Disclosure
 - **Threat:** Secret values exfiltrated from database dump.
-- **Mitigation:** AES-256-GCM envelope encryption. DEK encrypted by master KEK (`TALOS_MASTER_KEY`). Master key from env/file, never stored in DB. DEK cached with Zeroizing memory.
-- **File:** `controller/src/db.rs`
+- **Mitigation:** AES-256-GCM envelope encryption. DEK encrypted by master KEK (`TALOS_MASTER_KEY`). Master key from env/file, never stored in DB. DEK cached with Zeroizing memory. Each AEAD operation encrypts under a **per-context HKDF subkey** of the DEK (per secret / actor-key / execution / tenant), not the shared DEK directly — the per-key message count is ~1, so the random-96-bit-nonce birthday bound is unreachable (finding #1).
+- **File:** `controller/src/db.rs`, `talos-secrets-manager`
 
 ### Denial of Service
 - **Threat:** Expensive queries lock tables or exhaust connections.
@@ -250,8 +250,8 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 | Control | Implementation | File Path |
 |---------|---------------|-----------|
 | WASM sandboxing | Fuel limits, memory caps, capability worlds, wall-clock timeout | `worker/src/runtime.rs` |
-| Job signing | HMAC-SHA256 + AES-256-GCM + nonce per job | `talos-workflow-job-protocol/src/lib.rs` |
-| Audit ledger | HMAC-signed events, hash chains, immutability triggers | `worker/src/audit.rs`, `controller/src/audit_ledger.rs` |
+| Job signing | HMAC-SHA256 + AES-256-GCM under a per-job HKDF subkey + nonce per job | `talos-workflow-job-protocol/src/lib.rs` |
+| Audit ledger | HMAC-signed events, hash chains, DB immutability triggers, **consumer-side inline HMAC+hash verify before WORM persist (poison → Object-Locked `rejected/`), offline `verify_chain` for sequence/linkage/genesis** | `talos-audit-event`, `talos-audit-ledger`, `worker/src/audit.rs` |
 | SQL validation | AST-parsed via sqlparser, parameterized queries only | `worker/src/sql_validator.rs` |
 | DLP | PII redaction (SSN, CC, email, phone, JWT), Luhn validation | `controller/src/dlp.rs` |
 | Rate limiting | Per-IP, per-route, fail-closed in production | `controller/src/rate_limit.rs` |
@@ -260,7 +260,7 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 | CSRF | Double-submit cookies, constant-time comparison | `controller/src/csrf.rs` |
 | Security headers | CSP, X-Frame-Options, HSTS, X-Content-Type-Options | `controller/src/security_headers.rs` |
 | SSRF protection | RFC1918/link-local/metadata endpoint blocking | `controller/src/mcp/utils.rs` |
-| Secret encryption | AES-256-GCM envelope encryption, master KEK, Zeroizing DEK cache | `controller/src/db.rs` |
+| Secret encryption | AES-256-GCM envelope encryption, master KEK, per-context HKDF subkey derivation (per secret/actor/execution/tenant; ~1 message per key), Zeroizing DEK cache | `controller/src/db.rs`, `talos-secrets-manager` |
 
 ---
 

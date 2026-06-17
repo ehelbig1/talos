@@ -199,7 +199,7 @@ let ctx = engine
 | Concern | Where it lives | Why |
 |---|---|---|
 | Workflow graph definitions | Postgres (`workflows` table) | Versionable, queryable, supports name + capability lookups. |
-| Per-execution checkpoints | Postgres (`workflow_checkpoints` table) | Durable across replica restarts. AES-GCM at rest if you encrypt. |
+| Per-execution checkpoints | Postgres (`workflow_checkpoints` table) | Durable across replica restarts. Encrypted at rest under a per-execution AES-GCM subkey (HKDF folds `execution_id`; v2→v1 decrypt fallback). |
 | Per-dispatch audit log | Postgres (`module_executions` table) | Joinable with workflow + user tables for cost attribution. |
 | Secrets | Postgres (`secrets` table, envelope-encrypted) | Single source of truth; OAuth refresh hook colocated. |
 | Rate-limit counters | Redis | Sub-millisecond counter increments; shared across replicas. |

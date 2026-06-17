@@ -16,8 +16,58 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use talos_audit_event::{audit_verify_keys, verify_chain, AuditEvent, ChainVerificationReport};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+/// Outcome of inline per-message audit verification (finding #2, Layer 1).
+enum VerifyOutcome {
+    /// Persist the event. `unsigned` is true when no HMAC was present but
+    /// verification keys ARE configured — anomalous in steady state (logged
+    /// loudly) but NOT rejected, per the producer's "missing signature =
+    /// unverified, not invalid" contract for the pre-signing migration window.
+    Accept { unsigned: bool },
+    /// Positive tamper/corruption evidence — do NOT persist to the ledger;
+    /// the message is quarantined instead.
+    Reject(&'static str),
+}
+
+/// Verify a single audit message before persistence (finding #2, Layer 1 —
+/// the stateless authenticity check). Two independent checks:
+///   1. **Integrity** — re-derive the event hash canonically (via the shared
+///      `talos_audit_event` code, so it can't drift from the producer) and
+///      confirm it equals the published `hash`. Catches transport corruption
+///      or a doctored `hash` field.
+///   2. **Authenticity** — verify the HMAC-SHA256 signature against the
+///      configured keys. Catches a forged/altered event from anyone without
+///      the signing key.
+///
+/// The STATEFUL completeness check (sequence contiguity, chain linkage) is
+/// deliberately NOT here — it needs the full ordered record set and runs
+/// offline via [`talos_audit_event::verify_chain`].
+fn verify_audit_message(
+    event_value: &Value,
+    published_hash: Option<&str>,
+    keys: &[Vec<u8>],
+) -> VerifyOutcome {
+    let event: AuditEvent = match serde_json::from_value(event_value.clone()) {
+        Ok(e) => e,
+        Err(_) => return VerifyOutcome::Reject("event_deserialize_failed"),
+    };
+    let recomputed = event.calculate_hash();
+    match published_hash {
+        Some(h) if h == recomputed => {}
+        _ => return VerifyOutcome::Reject("hash_mismatch"),
+    }
+    match event.verify_signature(keys) {
+        Some(true) => VerifyOutcome::Accept { unsigned: false },
+        Some(false) => VerifyOutcome::Reject("bad_signature"),
+        // Unsigned: only anomalous when keys are configured.
+        None => VerifyOutcome::Accept {
+            unsigned: !keys.is_empty(),
+        },
+    }
+}
 
 // ── OTLP auth-header encryption (L3, 2026-05-28 review) ────────────────────────
 //
@@ -585,6 +635,60 @@ impl OTLPCache {
     }
 }
 
+/// Build the optional S3 client for the WORM audit bucket from env.
+///
+/// Endpoint resolution: `AWS_ENDPOINT_URL`, then `MINIO_ENDPOINT` (empty
+/// strings treated as unset — the helm-placeholder class fixed in
+/// MCP-934). Path-style addressing via `AWS_S3_FORCE_PATH_STYLE` (MinIO).
+/// `None` when no endpoint is configured. Shared by the subscriber (write
+/// path) and [`verify_execution_chain`] (read path) so the (endpoint,
+/// path-style) resolution can never drift between them.
+pub async fn build_audit_s3_client() -> Option<S3Client> {
+    let s3_endpoint = std::env::var("AWS_ENDPOINT_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("MINIO_ENDPOINT")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })?;
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let mut builder = aws_sdk_s3::config::Builder::from(&config).endpoint_url(s3_endpoint);
+    // MCP-1073: canonical bool-env helper (accepts 1/yes/on/TRUE), required
+    // for MinIO which needs path-style addressing.
+    if talos_config::bool_env_or_default("AWS_S3_FORCE_PATH_STYLE", false) {
+        builder = builder.force_path_style(true);
+    }
+    Some(S3Client::from_conf(builder.build()))
+}
+
+/// The WORM audit bucket name (`MINIO_BUCKET`, default `audit-logs`). Empty
+/// is treated as unset (MCP-653).
+pub fn audit_bucket_name() -> String {
+    std::env::var("MINIO_BUCKET")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "audit-logs".to_string())
+}
+
+/// Convenience entry point for an admin/audit caller (an operator endpoint
+/// or a periodic sweep): build the S3 client from env and verify the
+/// persisted chain for one execution. Errors when no S3 endpoint is
+/// configured (the chain has no durable store to read).
+pub async fn verify_execution_chain_from_env(
+    workflow_id: &str,
+    execution_id: &str,
+) -> Result<ChainVerificationReport> {
+    let client = build_audit_s3_client().await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no audit S3 endpoint configured (set AWS_ENDPOINT_URL or MINIO_ENDPOINT) — \
+             the WORM chain has no durable store to verify"
+        )
+    })?;
+    let bucket = audit_bucket_name();
+    verify_execution_chain(&client, &bucket, workflow_id, execution_id).await
+}
+
 pub async fn start_audit_ledger_subscriber(nc: Client, db_pool: PgPool) -> Result<()> {
     tracing::info!("Initializing audit ledger subscriber");
     tracing::debug!("Audit ledger subscriber initialisation proceeding");
@@ -640,33 +744,10 @@ pub async fn start_audit_ledger_subscriber(nc: Client, db_pool: PgPool) -> Resul
     //
     // Same empty-env-var-bypass class as MCP-590/591/597/598/599/
     // 615/653/710 etc. Single canonical fix shape: `.filter(|v|
-    // !v.is_empty())` after each `.ok()`.
-    let s3_endpoint = std::env::var("AWS_ENDPOINT_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::env::var("MINIO_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty())
-        });
-    let s3_client: Option<S3Client> = if let Some(endpoint) = s3_endpoint {
-        let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-        let mut builder = aws_sdk_s3::config::Builder::from(&config).endpoint_url(endpoint);
-        // MCP-1073 (2026-05-16): canonical bool-env helper. Pre-fix
-        // `== "true"` case-sensitive exact-match — operators using
-        // MinIO (a common audit-log target that REQUIRES path-style
-        // addressing) who set `=1` / `=yes` / `=on` / `=TRUE` got
-        // the FALSE branch silently, breaking bucket addressing with
-        // "bucket not found" errors. Same user-visible-bug class as
-        // MCP-1072 (ENABLE_HSTS explicit-disable). Sibling drift
-        // class to MCP-1060/1064/1065/1066/1072.
-        if talos_config::bool_env_or_default("AWS_S3_FORCE_PATH_STYLE", false) {
-            builder = builder.force_path_style(true);
-        }
-        Some(S3Client::from_conf(builder.build()))
-    } else {
-        None
-    };
+    // !v.is_empty())` after each `.ok()`. Resolution + path-style logic
+    // lives in `build_audit_s3_client` so the offline verifier reads from
+    // the exact same bucket the subscriber writes to.
+    let s3_client: Option<S3Client> = build_audit_s3_client().await;
 
     tracing::info!(
         "Audit ledger subscriber ready – S3 client {}",
@@ -692,10 +773,7 @@ pub async fn start_audit_ledger_subscriber(nc: Client, db_pool: PgPool) -> Resul
         // at upload time — every WORM audit-log batch silently failed
         // until the operator noticed. Treat empty as unset. Same fix
         // shape as MCP-630/631.
-        let bucket = std::env::var("MINIO_BUCKET")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "audit-logs".to_string());
+        let bucket = audit_bucket_name();
         let max_batch_size = 100;
 
         // MCP-1119 (2026-05-16): supervisor loop that re-binds the
@@ -832,7 +910,16 @@ async fn process_batch(
     tracing::debug!("Processing WORM batch of {} audit messages", batch.len());
 
     let mut invalid_messages = Vec::new();
+    // Finding #2, Layer 1: messages that fail cryptographic verification.
+    // (idx, reason, execution_id) — quarantined to S3, never persisted to
+    // the ledger, never ACK-dropped silently.
+    let mut rejected_messages: Vec<(usize, &'static str, String)> = Vec::new();
     let mut grouped_messages: HashMap<String, Vec<(Value, usize)>> = HashMap::new();
+
+    // Verification keys (current + previous), loaded once per batch. Empty
+    // when signing is disabled — then HMAC checks are skipped (events are
+    // persisted as "unverified") but the hash-integrity check still runs.
+    let verify_keys = talos_audit_event::audit_verify_keys();
 
     // MCP-808 (2026-05-14): pre-pass + batch user_id lookup. Pre-fix the
     // per-message loop below ran up to TWO `WHERE id = $1` round-trips per
@@ -878,13 +965,47 @@ async fn process_batch(
                         .unwrap_or("unknown")
                         .to_string();
                     let workflow_uuid = Uuid::parse_str(&workflow_id).ok();
-                    parsed.push(ParsedMsg {
-                        idx,
-                        wrapper,
-                        execution_id,
-                        workflow_id,
-                        workflow_uuid,
-                    });
+
+                    // Finding #2, Layer 1: verify BEFORE persisting. A
+                    // verification failure is positive tamper/corruption
+                    // evidence — quarantine it (loud ERROR + retained bytes),
+                    // never silently drop, never persist to the ledger.
+                    let published_hash = wrapper.get("hash").and_then(|h| h.as_str());
+                    let seq = event["sequence_num"].as_u64().unwrap_or(0);
+                    match verify_audit_message(event, published_hash, &verify_keys) {
+                        VerifyOutcome::Accept { unsigned } => {
+                            if unsigned {
+                                tracing::error!(
+                                    target: "talos_audit",
+                                    event_kind = "audit_event_unsigned",
+                                    execution_id = %execution_id,
+                                    sequence_num = seq,
+                                    "audit event carries no HMAC signature but signing keys ARE \
+                                     configured — persisting as UNVERIFIED (possible signature \
+                                     strip, or a pre-signing event still in flight)"
+                                );
+                            }
+                            parsed.push(ParsedMsg {
+                                idx,
+                                wrapper,
+                                execution_id,
+                                workflow_id,
+                                workflow_uuid,
+                            });
+                        }
+                        VerifyOutcome::Reject(reason) => {
+                            tracing::error!(
+                                target: "talos_audit",
+                                event_kind = "audit_event_verification_failed",
+                                reason,
+                                execution_id = %execution_id,
+                                sequence_num = seq,
+                                "audit event FAILED cryptographic verification — quarantining, \
+                                 NOT persisting to the ledger. This is a tamper/corruption signal."
+                            );
+                            rejected_messages.push((idx, reason, execution_id));
+                        }
+                    }
                 } else {
                     // MCP-921 (2026-05-14): drop `{:?}` Debug-dump of
                     // the unparsed wrapper. Pre-fix this WARN-level
@@ -1180,9 +1301,68 @@ async fn process_batch(
         }
     }
 
-    // Acknowledge all processed messages (valid and successfully persisted, plus invalid ones so they don't block)
+    // Finding #2, Layer 1: quarantine verification-failed messages to a
+    // dedicated `rejected/` S3 prefix (Object-Locked like the ledger) so the
+    // tamper/corruption evidence is RETAINED, not dropped into the void the
+    // way the pre-fix silent ACK did. Best-effort: a quarantine-write failure
+    // is itself logged loudly; the structured ERROR emitted at detection time
+    // is the durable SIEM signal regardless. We ACK afterwards so a
+    // permanently-bad message can't wedge the stream in a redelivery loop.
+    if !rejected_messages.is_empty() {
+        if let Some(client) = s3_client {
+            for (idx, reason, execution_id) in &rejected_messages {
+                let Some(msg) = batch.get(*idx) else { continue };
+                let key = format!(
+                    "rejected/{}/{}_{}_{}.json",
+                    execution_id,
+                    reason,
+                    Utc::now()
+                        .timestamp_nanos_opt()
+                        .unwrap_or_else(|| Utc::now().timestamp()),
+                    idx
+                );
+                let mut put = client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .body(ByteStream::from(msg.payload.to_vec()));
+                if let Some(lock) = object_lock {
+                    let retain_until =
+                        chrono::Utc::now() + chrono::Duration::days(lock.retention_days);
+                    put = put
+                        .object_lock_mode(aws_sdk_s3::types::ObjectLockMode::Compliance)
+                        .object_lock_retain_until_date(S3DateTime::from_secs(
+                            retain_until.timestamp(),
+                        ));
+                }
+                if let Err(e) = put.send().await {
+                    tracing::error!(
+                        target: "talos_audit",
+                        event_kind = "audit_event_quarantine_failed",
+                        reason = *reason,
+                        execution_id = %execution_id,
+                        error = %e,
+                        "failed to quarantine a verification-rejected audit message to S3 — \
+                         the rejection ERROR above is the durable signal"
+                    );
+                }
+            }
+        }
+        tracing::error!(
+            target: "talos_audit",
+            event_kind = "audit_batch_rejections",
+            rejected = rejected_messages.len(),
+            "quarantined {} audit message(s) that failed cryptographic verification",
+            rejected_messages.len()
+        );
+    }
+
+    // Acknowledge all processed messages: valid+persisted, structurally-invalid
+    // (no `event` wrapper / unparseable), AND verification-rejected (already
+    // quarantined). All are terminal — ACK so they don't block the stream.
     let mut all_to_ack = invalid_messages;
     all_to_ack.extend(successful_indices);
+    all_to_ack.extend(rejected_messages.iter().map(|(idx, _, _)| *idx));
 
     for idx in all_to_ack {
         if let Some(msg) = batch.get(idx) {
@@ -1202,4 +1382,274 @@ async fn process_batch(
     // Clear the batch so we start fresh. Failed messages remain unacknowledged
     // and JetStream will automatically redeliver them after the ack_wait timeout.
     batch.clear();
+}
+
+// ============================================================================
+// Offline chain verification — S3 reader (finding #2, Layer 2)
+// ============================================================================
+
+/// Hard cap on `.jsonl` objects scanned per execution, so a pathological /
+/// adversarial execution id can't make the verifier read unboundedly.
+const MAX_CHAIN_OBJECTS: usize = 50_000;
+/// Hard cap on events assembled for one verification, bounding memory.
+const MAX_CHAIN_EVENTS: usize = 5_000_000;
+
+/// Parse the persisted `.jsonl` object bodies into [`AuditEvent`]s. Each line
+/// is a `{ "event": <AuditEvent>, "hash": ... }` wrapper (the same shape
+/// `process_batch` writes); the `event` object is extracted and typed. Lines
+/// that don't parse are skipped with a WARN — a malformed line is itself a
+/// finding the chain check will surface as a gap. Pure: unit-testable without S3.
+fn extract_events_from_jsonl(objects: &[Vec<u8>]) -> Vec<AuditEvent> {
+    let mut events = Vec::new();
+    for body in objects {
+        for line in body.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if events.len() >= MAX_CHAIN_EVENTS {
+                tracing::warn!(
+                    target: "talos_audit",
+                    cap = MAX_CHAIN_EVENTS,
+                    "audit chain verification hit the event cap — report is over a truncated prefix"
+                );
+                return events;
+            }
+            match serde_json::from_slice::<Value>(line) {
+                Ok(wrapper) => {
+                    if let Some(ev) = wrapper.get("event") {
+                        match serde_json::from_value::<AuditEvent>(ev.clone()) {
+                            Ok(e) => events.push(e),
+                            Err(e) => tracing::warn!(
+                                target: "talos_audit",
+                                error = %e,
+                                "skipping a persisted ledger line whose event failed to deserialize"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "talos_audit",
+                    error = %e,
+                    "skipping an unparseable persisted ledger line"
+                ),
+            }
+        }
+    }
+    events
+}
+
+/// Offline verification of a persisted audit chain for one execution
+/// (finding #2, Layer 2 — the stateful completeness check). Reads every
+/// `<execution_id>/*.jsonl` object from the WORM bucket, reassembles the
+/// events, and runs [`talos_audit_event::verify_chain`] over the full ordered
+/// set with the configured verification keys.
+///
+/// This is the deliberately-offline counterpart to the inline per-message
+/// check ([`verify_audit_message`]): it detects sequence gaps (deletion /
+/// never-persisted events), broken `previous_hash` linkage (reorder /
+/// substitution), genesis mismatch, and per-event HMAC failures — the checks
+/// that need the whole record set and so cannot live in the streaming
+/// persister. Intended to back an operator/admin audit endpoint or a periodic
+/// sweep; safe to call on demand.
+pub async fn verify_execution_chain(
+    s3_client: &S3Client,
+    bucket: &str,
+    workflow_id: &str,
+    execution_id: &str,
+) -> Result<ChainVerificationReport> {
+    let prefix = format!("{execution_id}/");
+    let mut bodies: Vec<Vec<u8>> = Vec::new();
+    let mut continuation: Option<String> = None;
+    let mut object_count = 0usize;
+
+    loop {
+        let mut req = s3_client.list_objects_v2().bucket(bucket).prefix(&prefix);
+        if let Some(token) = &continuation {
+            req = req.continuation_token(token);
+        }
+        let page = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("list_objects_v2 failed for {prefix}: {e}"))?;
+
+        for obj in page.contents() {
+            let Some(key) = obj.key() else { continue };
+            if object_count >= MAX_CHAIN_OBJECTS {
+                tracing::warn!(
+                    target: "talos_audit",
+                    execution_id,
+                    cap = MAX_CHAIN_OBJECTS,
+                    "audit chain verification hit the object cap — report is over a truncated prefix"
+                );
+                break;
+            }
+            object_count += 1;
+            let got = s3_client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("get_object failed for {key}: {e}"))?;
+            let bytes = got
+                .body
+                .collect()
+                .await
+                .map_err(|e| anyhow::anyhow!("reading body of {key} failed: {e}"))?
+                .into_bytes();
+            bodies.push(bytes.to_vec());
+        }
+
+        match page.next_continuation_token() {
+            Some(t) if object_count < MAX_CHAIN_OBJECTS => continuation = Some(t.to_string()),
+            _ => break,
+        }
+    }
+
+    let events = extract_events_from_jsonl(&bodies);
+    let keys = audit_verify_keys();
+    Ok(verify_chain(workflow_id, execution_id, &events, &keys))
+}
+
+#[cfg(test)]
+mod chain_reader_tests {
+    use super::*;
+    use talos_audit_event::{ChainBreak, ExecutionLedger};
+
+    /// Serialize a chain into `.jsonl` object bodies the way `process_batch`
+    /// persists them (`{ "event": ..., "hash": ... }` per line), optionally
+    /// split across multiple objects, to exercise the parse+reassemble path.
+    fn jsonl_objects(events: &[AuditEvent], chunk: usize) -> Vec<Vec<u8>> {
+        events
+            .chunks(chunk.max(1))
+            .map(|group| {
+                let mut body = Vec::new();
+                for e in group {
+                    let wrapper = serde_json::json!({ "event": e, "hash": e.calculate_hash() });
+                    body.extend(serde_json::to_vec(&wrapper).unwrap());
+                    body.push(b'\n');
+                }
+                body
+            })
+            .collect()
+    }
+
+    fn chain(n: u64) -> Vec<AuditEvent> {
+        let mut l = ExecutionLedger::new("wf", "ex");
+        (1..=n)
+            .map(|i| l.append("worker", "act", &format!("p{i}")))
+            .collect()
+    }
+
+    #[test]
+    fn reassembles_and_verifies_valid_chain_across_objects() {
+        let events = chain(7);
+        let objects = jsonl_objects(&events, 3); // 3 objects
+        let parsed = extract_events_from_jsonl(&objects);
+        assert_eq!(parsed.len(), 7);
+        let report = verify_chain("wf", "ex", &parsed, &[]);
+        assert!(report.ok, "breaks: {:?}", report.breaks);
+    }
+
+    #[test]
+    fn detects_a_missing_object_as_a_gap() {
+        let events = chain(6);
+        let mut objects = jsonl_objects(&events, 2); // 3 objects of 2 events
+        objects.remove(1); // drop the object holding seq 3,4
+        let parsed = extract_events_from_jsonl(&objects);
+        let report = verify_chain("wf", "ex", &parsed, &[]);
+        assert!(!report.ok);
+        assert!(report
+            .breaks
+            .iter()
+            .any(|b| matches!(b, ChainBreak::SequenceGap { .. })));
+    }
+
+    #[test]
+    fn skips_malformed_lines_without_panicking() {
+        let mut objects = jsonl_objects(&chain(2), 5);
+        objects.push(b"not json at all\n{}\n".to_vec());
+        let parsed = extract_events_from_jsonl(&objects);
+        assert_eq!(parsed.len(), 2); // the two valid events survive
+    }
+}
+
+#[cfg(test)]
+mod inline_verify_tests {
+    //! Finding #2, Layer 1: per-message verify-at-persist verdicts. The
+    //! canonical hash/HMAC logic itself is tested in `talos-audit-event`;
+    //! these cover the wrapper-level decision (`{event, hash}` → verdict).
+    use super::*;
+
+    fn ev() -> AuditEvent {
+        AuditEvent {
+            workflow_id: "wf".into(),
+            execution_id: "ex".into(),
+            sequence_num: 1,
+            timestamp: 1,
+            actor: "a".into(),
+            action: "act".into(),
+            payload: "p".into(),
+            previous_hash: "g".into(),
+            hmac_signature: None,
+        }
+    }
+
+    #[test]
+    fn accepts_valid_unsigned_when_no_keys() {
+        let e = ev();
+        let h = e.calculate_hash();
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(matches!(
+            verify_audit_message(&v, Some(&h), &[]),
+            VerifyOutcome::Accept { unsigned: false }
+        ));
+    }
+
+    #[test]
+    fn rejects_hash_mismatch_and_missing_hash() {
+        let v = serde_json::to_value(ev()).unwrap();
+        assert!(matches!(
+            verify_audit_message(&v, Some("deadbeef"), &[]),
+            VerifyOutcome::Reject("hash_mismatch")
+        ));
+        assert!(matches!(
+            verify_audit_message(&v, None, &[]),
+            VerifyOutcome::Reject("hash_mismatch")
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_signature() {
+        let mut e = ev();
+        e.hmac_signature = Some("deadbeef".into()); // valid hex, wrong MAC
+        let h = e.calculate_hash();
+        let v = serde_json::to_value(&e).unwrap();
+        let key = b"0123456789abcdef0123456789abcdef".to_vec();
+        assert!(matches!(
+            verify_audit_message(&v, Some(&h), &[key]),
+            VerifyOutcome::Reject("bad_signature")
+        ));
+    }
+
+    #[test]
+    fn flags_unsigned_when_keys_present_but_still_accepts() {
+        let e = ev();
+        let h = e.calculate_hash();
+        let v = serde_json::to_value(&e).unwrap();
+        let key = b"0123456789abcdef0123456789abcdef".to_vec();
+        assert!(matches!(
+            verify_audit_message(&v, Some(&h), &[key]),
+            VerifyOutcome::Accept { unsigned: true }
+        ));
+    }
+
+    #[test]
+    fn rejects_non_audit_event_json() {
+        let v = serde_json::json!({"not": "an event"});
+        assert!(matches!(
+            verify_audit_message(&v, Some("x"), &[]),
+            VerifyOutcome::Reject("event_deserialize_failed")
+        ));
+    }
 }
