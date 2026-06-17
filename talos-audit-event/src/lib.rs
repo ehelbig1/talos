@@ -290,7 +290,11 @@ pub enum ChainBreak {
     DuplicateSequence { seq: u64 },
     /// The first event's `previous_hash` does not match the deterministic
     /// genesis hash for `(workflow_id, execution_id)`.
-    GenesisMismatch { seq: u64, expected: String, found: String },
+    GenesisMismatch {
+        seq: u64,
+        expected: String,
+        found: String,
+    },
     /// An event's `previous_hash` does not equal the recomputed hash of the
     /// preceding event — the chain link is broken (reorder / substitution).
     LinkageMismatch {

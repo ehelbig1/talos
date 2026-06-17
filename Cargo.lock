@@ -7370,6 +7370,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "talos-audit-event",
  "talos-config",
  "talos-dlp-provider",
  "talos-http-utils",

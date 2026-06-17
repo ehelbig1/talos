@@ -120,7 +120,10 @@ fn verify_signature_round_trip() {
     event.hmac_signature = Some(hmac_sign(&event, &key));
     assert_eq!(event.verify_signature(&[key.clone()]), Some(true));
     // Wrong key -> invalid.
-    assert_eq!(event.verify_signature(&[b"wrong-key".to_vec()]), Some(false));
+    assert_eq!(
+        event.verify_signature(&[b"wrong-key".to_vec()]),
+        Some(false)
+    );
     // Tampered payload -> invalid (hash changes under the same signature).
     let mut tampered = event.clone();
     tampered.payload = "p2".to_string();
@@ -162,10 +165,13 @@ fn verify_chain_detects_sequence_gap() {
     events.remove(1); // drop seq 2 -> gap
     let report = verify_chain("wf", "ex", &events, &[]);
     assert!(!report.ok);
-    assert!(report
-        .breaks
-        .iter()
-        .any(|b| matches!(b, ChainBreak::SequenceGap { expected: 2, found: 3 })));
+    assert!(report.breaks.iter().any(|b| matches!(
+        b,
+        ChainBreak::SequenceGap {
+            expected: 2,
+            found: 3
+        }
+    )));
 }
 
 #[test]
