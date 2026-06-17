@@ -365,7 +365,7 @@ impl ExecutionRepository {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SecretsManager not available for output encryption"))?;
         let json_str = serde_json::to_string(output)?;
-        sm.encrypt_value_aad_v1(&json_str, exec_id.as_bytes()).await
+        sm.encrypt_value_aad_v3(&json_str, exec_id.as_bytes()).await
     }
 
     /// Decrypt encrypted output bytes back to JSON. Dispatches on the

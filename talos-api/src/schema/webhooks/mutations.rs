@@ -239,7 +239,7 @@ impl WebhooksMutations {
         let (signing_secret_enc, signing_key_id, signing_secret_format) =
             if let Some(ref secret) = input.signing_secret {
                 let (key_id, encrypted, version) = secrets_manager
-                    .encrypt_value_aad_v1(secret, trigger_id.as_bytes())
+                    .encrypt_value_aad_v3(secret, trigger_id.as_bytes())
                     .await
                     .map_err(|e| {
                         tracing::error!("Failed to encrypt webhook signing_secret: {}", e);

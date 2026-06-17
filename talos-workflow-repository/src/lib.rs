@@ -409,7 +409,7 @@ impl WorkflowRepository {
         };
         let json_str = serde_json::to_string(output)?;
         let (key_id, enc_bytes, version) = sm
-            .encrypt_value_aad_v1(&json_str, exec_id.as_bytes())
+            .encrypt_value_aad_v3(&json_str, exec_id.as_bytes())
             .await?;
         Ok(Some((key_id, enc_bytes, version)))
     }

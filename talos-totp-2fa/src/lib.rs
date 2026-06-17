@@ -498,7 +498,7 @@ impl TotpService {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let (key_id, encrypted_bytes, version) = self
             .secrets_manager
-            .encrypt_value_aad_v1(secret, user_id.as_bytes())
+            .encrypt_value_aad_v3(secret, user_id.as_bytes())
             .await?;
         // Encode as: key_id_hex:base64(nonce||ciphertext)
         let encoded = format!("{}:{}", key_id, STANDARD.encode(&encrypted_bytes));

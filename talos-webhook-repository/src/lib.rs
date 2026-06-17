@@ -99,7 +99,7 @@ impl WebhookRepository {
         ) = match signing_secret {
             Some(s) if !s.is_empty() => {
                 let (key_id, ciphertext, version) = secrets_manager
-                    .encrypt_value_aad_v1(s, webhook_id.as_bytes())
+                    .encrypt_value_aad_v3(s, webhook_id.as_bytes())
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to encrypt webhook signing_secret: {}", e)
