@@ -40,6 +40,7 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-audit-event = { path = "../talos-audit-event" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-text-util = { path = "../talos-text-util" }

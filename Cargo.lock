@@ -7374,6 +7374,7 @@ dependencies = [
  "talos-config",
  "talos-dlp-provider",
  "talos-http-utils",
+ "talos-secrets-manager",
  "talos-text-util",
  "tokio",
  "tonic",
