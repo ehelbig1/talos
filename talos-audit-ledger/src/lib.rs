@@ -16,7 +16,11 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use talos_audit_event::{audit_verify_keys, verify_chain, AuditEvent, ChainVerificationReport};
+// `pub use` so consumers (e.g. the talos-api GraphQL admin query) can name the
+// report types without a direct dep on talos-audit-event.
+pub use talos_audit_event::{
+    audit_verify_keys, verify_chain, AuditEvent, ChainBreak, ChainVerificationReport,
+};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 

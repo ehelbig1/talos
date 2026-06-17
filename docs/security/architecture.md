@@ -419,6 +419,10 @@ controller-side consumer (`talos-audit-ledger`):
   `audit_chain_verification_failed` ERROR per broken chain plus an
   `audit_chain_sweep_summary` per pass — the SIEM alerting signal. Self-disables
   when no S3/WORM endpoint is configured.
+- **On-demand (Layer 2, forensic):** the GraphQL `verifyAuditChain(executionId)`
+  query (platform-admin only, via `is_platform_admin`) runs the same verifier
+  for a single execution and returns the structured break list — for
+  investigating a specific alert.
 
 Signing requires `TALOS_AUDIT_SIGNING_KEY` (32+ bytes) on workers AND the
 controller; `TALOS_AUDIT_SIGNING_KEY_PREVIOUS` supports rotation overlap.

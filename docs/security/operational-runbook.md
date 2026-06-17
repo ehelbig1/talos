@@ -155,10 +155,13 @@ endpoint (`AWS_ENDPOINT_URL` / `MINIO_ENDPOINT`) is configured.
 tamper/corruption evidence. Alert (lower severity) on
 `audit_event_quarantine_failed` and a sustained `audit_event_unsigned`.
 
-**On a failure.** A `*_verification_failed` event names the `execution_id`;
-re-run `verify_execution_chain` for it (the `breaks` list distinguishes a
-sequence gap / deletion from a linkage break / forged HMAC), and inspect the
-quarantined objects under `rejected/<execution_id>/` in the WORM bucket.
+**On a failure.** A `*_verification_failed` event names the `execution_id`.
+Re-verify on demand via the platform-admin GraphQL query
+`verifyAuditChain(executionId: "<id>")` — it returns `{ ok, totalEvents,
+signaturesChecked, breaks { kind, sequence, expected, found } }`, where
+`kind` distinguishes a sequence gap / deletion from a linkage break / forged
+HMAC. Then inspect the quarantined objects under `rejected/<execution_id>/`
+in the WORM bucket.
 
 ---
 

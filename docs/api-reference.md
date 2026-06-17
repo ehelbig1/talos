@@ -57,6 +57,7 @@ CSRF protection is enforced on mutations in production via the `X-CSRF-Token` he
 | `workflowExecutionHistory(workflowId, limit, offset)` | Paginated execution history | Required |
 | `moduleExecutionHistory(moduleId, limit, offset)` | Module-level execution history | Required |
 | `moduleExecutionLogs(executionId, limit, offset)` | Execution log entries | Required |
+| `verifyAuditChain(executionId: UUID)` | Verify an execution's WORM audit chain (HMAC + hash-chain + sequence contiguity); returns `{ ok, totalEvents, signaturesChecked, breaks { kind, sequence, expected, found } }` | Platform admin |
 
 ### Webhooks & Secrets
 
