@@ -7336,6 +7336,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-audit-event"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "hmac 0.12.1",
+ "serde",
+ "sha2 0.10.9",
+ "talos-config",
+ "tracing",
+]
+
+[[package]]
 name = "talos-audit-ledger"
 version = "0.1.0"
 dependencies = [
@@ -11118,6 +11131,7 @@ dependencies = [
  "sqlparser",
  "sqlx",
  "subtle",
+ "talos-audit-event",
  "talos-capability-world",
  "talos-config",
  "talos-dlp",

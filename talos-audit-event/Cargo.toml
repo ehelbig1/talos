@@ -1,0 +1,19 @@
+[package]
+name = "talos-audit-event"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+hex = "0.4"
+hmac = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+talos-config = { path = "../talos-config" }
+tracing.workspace = true
+
+[lints]
+workspace = true
