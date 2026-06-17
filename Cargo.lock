@@ -7352,23 +7352,18 @@ dependencies = [
 name = "talos-audit-ledger"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "async-nats",
  "aws-config",
  "aws-sdk-s3",
  "chrono",
  "futures",
- "hex",
- "hkdf",
  "lru 0.16.4",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "rand 0.8.6",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "sqlx",
  "talos-audit-event",
  "talos-config",

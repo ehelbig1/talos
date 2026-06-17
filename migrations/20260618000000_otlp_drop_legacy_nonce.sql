@@ -1,0 +1,11 @@
+-- Retire the legacy env-master-key OTLP auth-header scheme entirely.
+--
+-- With no running instances and no legacy rows to support, the bespoke
+-- env-master-key HKDF crypto path was removed from talos-audit-ledger. The OTLP
+-- auth headers are now sealed exclusively with the SecretsManager v3 envelope
+-- (KEK-backed DEK + per-context HKDF subkey + user_id AAD), whose 12-byte nonce
+-- is embedded in the ciphertext blob stored in `auth_headers_encrypted`.
+--
+-- `auth_headers_nonce` only existed to hold the separately-stored nonce of the
+-- old scheme. It is no longer read or written by any code path — drop it.
+ALTER TABLE user_audit_settings DROP COLUMN IF EXISTS auth_headers_nonce;

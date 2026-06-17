@@ -1,7 +1,3 @@
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce,
-};
 use anyhow::Result;
 use async_nats::jetstream::{self, stream::Config as StreamConfig, Message};
 use async_nats::Client;
@@ -75,166 +71,22 @@ fn verify_audit_message(
 
 // ── OTLP auth-header encryption ────────────────────────────────────────────────
 //
-// Encrypts/decrypts the per-tenant OTLP streaming auth headers. There are TWO
-// schemes, dispatched on the `user_audit_settings.auth_headers_enc_key_id`
-// column. The read path (`OTLPCache::get_tracer`) dual-reads both; the write
-// path (`talos-api` update_audit_settings) only ever writes the current one.
+// The per-tenant OTLP streaming auth headers are sealed with the canonical
+// SecretsManager v3 envelope: a KEK-backed DEK (unwrapped through whatever
+// KekProvider is configured — env OR Vault transit) + a per-context HKDF subkey
+// + the tenant's `user_id` bound as AAD. This is the SAME envelope every other
+// AAD-bound column uses, so it carries no bespoke crypto and — critically — does
+// NOT depend on the env master key: a Vault-only deployment that has dropped
+// TALOS_MASTER_KEY still encrypts and decrypts these headers.
 //
-//   * CURRENT — SecretsManager v3 envelope (`encrypt_otlp_auth_headers_v3` +
-//     `SecretsManager::decrypt_versioned`). A KEK-backed DEK + per-context HKDF
-//     subkey + `user_id` AAD. The DEK is unwrapped through whatever KekProvider
-//     is configured (env OR Vault transit), so this scheme does NOT depend on
-//     the env master key — a Vault-only deployment that has dropped
-//     TALOS_MASTER_KEY can still encrypt these headers. Rows carry
-//     `auth_headers_enc_key_id` (the DEK id) + `auth_headers_format = 3`.
+// Write path: `talos-api` update_audit_settings → `encrypt_otlp_auth_headers_v3`.
+// Read path: `OTLPCache::get_tracer` → `SecretsManager::decrypt_versioned`,
+// keyed on the stored `auth_headers_enc_key_id` + `auth_headers_format`. The
+// `user_id` AAD means a DB-write attacker can't transpose one tenant's header
+// blob into another's `user_audit_settings` row and have it decrypt.
 //
-//   * LEGACY (read-only) — the env-master-key HKDF scheme below
-//     (`encrypt_otlp_auth_headers` / `decrypt_otlp_auth_headers`). An HKDF
-//     subkey of TALOS_MASTER_KEY + `user_id` AAD. Rows have
-//     `auth_headers_enc_key_id IS NULL`. Retained ONLY so headers saved before
-//     the v3 migration still decrypt; re-saving via update_audit_settings
-//     migrates the row to the KEK-backed v3 envelope. Still needs
-//     TALOS_MASTER_KEY until every legacy row is re-saved.
-//
-// Both schemes bind `user_id` as AAD, so a DB-write attacker can't transpose
-// one tenant's header blob into another's `user_audit_settings` row and have it
-// decrypt. Both derive a dedicated AEAD subkey via HKDF-SHA256 with a unique
-// label (never the raw root as an AES data key). The earlier (pre-2026-05-28)
-// mismatch — write path using a SecretsManager DEK envelope while the read path
-// decrypted with the RAW master key — is gone: the read path now understands
-// both the v3 envelope and the legacy env-key scheme explicitly.
-
-/// HKDF-SHA256 domain-separation label for the OTLP auth-header AEAD subkey.
-const OTLP_HEADER_AEAD_LABEL: &[u8] = b"talos/master-key/audit-otlp-header-aead/v1";
-
-/// v2 label (finding #1): the OTLP subkey folds the owning `user_id` into
-/// the HKDF `info`, so each tenant gets its own derived key. The AES-GCM
-/// random-nonce budget is then per-tenant (this surface is low-volume —
-/// one row per tenant, written on a settings change — so the uniformity
-/// matters more than the volume). Distinct label from v1.
-const OTLP_HEADER_AEAD_LABEL_V2: &[u8] = b"talos/master-key/audit-otlp-header-aead/v2-per-user";
-
-/// v1 (legacy) OTLP subkey: a single static subkey per master key, shared
-/// by every tenant. Retained as the decrypt fallback so headers saved
-/// before the v2 rollout still decrypt without an operator re-save.
-fn derive_otlp_header_key_v1(master_key: &[u8]) -> Zeroizing<[u8; 32]> {
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, master_key);
-    let mut subkey = Zeroizing::new([0u8; 32]);
-    hk.expand(OTLP_HEADER_AEAD_LABEL, subkey.as_mut())
-        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
-    subkey
-}
-
-/// v2 per-tenant OTLP subkey: the `user_id` bytes are the HKDF `info`, so
-/// the subkey is unique per tenant. Deterministic; encrypt and decrypt
-/// derive it identically.
-fn derive_otlp_header_key_v2(master_key: &[u8], user_id: Uuid) -> Zeroizing<[u8; 32]> {
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(OTLP_HEADER_AEAD_LABEL_V2), master_key);
-    let mut subkey = Zeroizing::new([0u8; 32]);
-    hk.expand(user_id.as_bytes(), subkey.as_mut())
-        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
-    subkey
-}
-
-/// AAD = the 16 raw bytes of the owning tenant's `user_id`. Binds the ciphertext
-/// to one tenant so a row can't be transposed between users.
-fn otlp_header_aad(user_id: Uuid) -> [u8; 16] {
-    *user_id.as_bytes()
-}
-
-/// Load + hex-decode `TALOS_MASTER_KEY`, validating it before use. Returns
-/// `None` (fail-closed; caller turns this into an opaque error) if the env var
-/// is unset, not valid hex, the wrong length, or all-zero.
-///
-/// This loader is the ONLY `TALOS_MASTER_KEY` consumer that can run WITHOUT
-/// the KEK provider's `EnvKekProvider::from_hex` guard — namely the
-/// `KEK_PROVIDER=vault` + `KEK_DISABLE_LEGACY=true` terminal state, where the
-/// env provider is never constructed and nothing else validates the key. The
-/// OTLP AEAD subkey is HKDF-derived from these bytes, so an empty value
-/// (`TALOS_MASTER_KEY=""`, the chart default — `hex::decode("")` is `Ok([])`),
-/// a short value, or an all-zero value would derive a low-entropy or globally
-/// recomputable encryption key for the per-tenant OTLP auth headers (Bearer
-/// tokens). We therefore mirror `EnvKekProvider`'s checks here and refuse to
-/// derive a key from degenerate material rather than silently producing weak
-/// ciphertext.
-fn load_master_key_bytes() -> Option<Zeroizing<Vec<u8>>> {
-    let hex_str = Zeroizing::new(std::env::var("TALOS_MASTER_KEY").ok()?);
-    let bytes = match hex::decode(hex_str.trim()) {
-        Ok(b) => b,
-        Err(_) => {
-            tracing::warn!(
-                target: "talos_audit",
-                event_kind = "otlp_master_key_invalid_hex",
-                "TALOS_MASTER_KEY is not valid hex — OTLP audit-header encryption disabled (fail-closed)."
-            );
-            return None;
-        }
-    };
-    validate_master_key_bytes(bytes)
-}
-
-/// Validate decoded `TALOS_MASTER_KEY` bytes before they seed the OTLP AEAD
-/// HKDF. Pure (no env / no logging side-effects beyond a structured WARN) so
-/// the security-critical accept/reject logic is unit-tested directly. Mirrors
-/// `EnvKekProvider`'s length + all-zero guards. Returns `None` (fail-closed)
-/// for any degenerate key — including the empty vec produced by the chart's
-/// default `TALOS_MASTER_KEY=""` (`hex::decode("")` is `Ok([])`).
-fn validate_master_key_bytes(bytes: Vec<u8>) -> Option<Zeroizing<Vec<u8>>> {
-    if bytes.len() != 32 {
-        tracing::warn!(
-            target: "talos_audit",
-            event_kind = "otlp_master_key_wrong_length",
-            key_len = bytes.len(),
-            "TALOS_MASTER_KEY is {} bytes (expected 32) — OTLP audit-header encryption \
-             disabled (fail-closed). If you run KEK_PROVIDER=vault with KEK_DISABLE_LEGACY=true, \
-             TALOS_MASTER_KEY must still be set to a real 32-byte key for authenticated OTLP \
-             streaming. Generate with: openssl rand -hex 32",
-            bytes.len()
-        );
-        return None;
-    }
-    if bytes.iter().all(|&b| b == 0) {
-        tracing::warn!(
-            target: "talos_audit",
-            event_kind = "otlp_master_key_all_zero",
-            "TALOS_MASTER_KEY is all-zero — refusing to derive an OTLP header key from a \
-             degenerate key (fail-closed). This is almost always an unset / mis-templated secret."
-        );
-        return None;
-    }
-    Some(Zeroizing::new(bytes))
-}
-
-/// Encrypt OTLP auth headers (a JSON string) under the **legacy** env-master-key
-/// scheme. Returns `(ciphertext, nonce)` for the `auth_headers_encrypted` /
-/// `auth_headers_nonce` columns. Errors (opaque string — never the plaintext) if
-/// `TALOS_MASTER_KEY` is unavailable or encryption fails.
-///
-/// ⚠️ No longer used by the write path — `update_audit_settings` now writes the
-/// KEK-backed [`encrypt_otlp_auth_headers_v3`] envelope. Retained for the
-/// decrypt-side round-trip tests and any external caller; the only live consumer
-/// of this scheme is [`decrypt_otlp_auth_headers`], reading pre-v3 rows.
-pub fn encrypt_otlp_auth_headers(
-    plaintext: &str,
-    user_id: Uuid,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let master_key = load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
-    encrypt_otlp_auth_headers_with_master_key(plaintext, user_id, &master_key)
-}
-
-/// Decrypt OTLP auth headers stored by [`encrypt_otlp_auth_headers`] (legacy
-/// env-key scheme). Returns the JSON string. Called by the read path's legacy
-/// branch (rows with `auth_headers_enc_key_id IS NULL`). Fails closed (opaque
-/// error) on a wrong key, corrupted ciphertext, AAD/tenant mismatch, or bad
-/// nonce length.
-pub fn decrypt_otlp_auth_headers(
-    ciphertext: &[u8],
-    nonce: &[u8],
-    user_id: Uuid,
-) -> Result<Zeroizing<String>, String> {
-    let master_key = load_master_key_bytes().ok_or("TALOS_MASTER_KEY is unset or not valid hex")?;
-    decrypt_otlp_auth_headers_with_master_key(ciphertext, nonce, user_id, &master_key)
-}
+// (The earlier bespoke env-master-key HKDF scheme was removed once it had no
+// rows to support — there is exactly one encryption path now.)
 
 /// v3 envelope encrypt for OTLP auth headers via [`SecretsManager`] — the
 /// KEK-backed path that does **not** depend on the env master key. The DEK is
@@ -245,10 +97,9 @@ pub fn decrypt_otlp_auth_headers(
 /// Returns `(key_id, ciphertext_blob, format_version)` for the
 /// `auth_headers_enc_key_id` / `auth_headers_encrypted` / `auth_headers_format`
 /// columns. The blob is `[12-byte nonce][AES-256-GCM ciphertext+tag]` exactly
-/// like every other SecretsManager v3 column — the nonce is embedded, NOT
-/// stored separately (`auth_headers_nonce` stays NULL for v3 rows). AAD = the
-/// owning tenant's `user_id` bytes, identical to the legacy scheme, so a blob
-/// still can't be transposed between tenants.
+/// like every other SecretsManager v3 column — the nonce is embedded in the
+/// blob, never stored separately. AAD = the owning tenant's `user_id` bytes, so
+/// a blob can't be transposed between tenants.
 ///
 /// [`SecretsManager`]: talos_secrets_manager::SecretsManager
 pub async fn encrypt_otlp_auth_headers_v3(
@@ -260,210 +111,6 @@ pub async fn encrypt_otlp_auth_headers_v3(
         .encrypt_value_aad_v3(plaintext, user_id.as_bytes())
         .await
         .map_err(|e| format!("OTLP auth-header v3 encrypt failed: {e}"))
-}
-
-/// Encryption core taking the master key explicitly (env-free, so the crypto
-/// round-trip is unit-testable without touching the process environment).
-fn encrypt_otlp_auth_headers_with_master_key(
-    plaintext: &str,
-    user_id: Uuid,
-    master_key: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), String> {
-    use rand::RngCore;
-    // v2: per-tenant key derivation (user_id folded into the HKDF info).
-    let subkey = derive_otlp_header_key_v2(master_key, user_id);
-    let cipher =
-        Aes256Gcm::new_from_slice(subkey.as_slice()).map_err(|e| format!("cipher init: {e}"))?;
-    let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let aad = otlp_header_aad(user_id);
-    let ciphertext = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: plaintext.as_bytes(),
-                aad: &aad,
-            },
-        )
-        .map_err(|e| format!("encrypt: {e}"))?;
-    Ok((ciphertext, nonce_bytes.to_vec()))
-}
-
-/// Decryption core taking the master key explicitly (env-free; see the encrypt
-/// core).
-fn decrypt_otlp_auth_headers_with_master_key(
-    ciphertext: &[u8],
-    nonce: &[u8],
-    user_id: Uuid,
-    master_key: &[u8],
-) -> Result<Zeroizing<String>, String> {
-    if nonce.len() != 12 {
-        return Err(format!(
-            "nonce wrong length (expected 12, got {})",
-            nonce.len()
-        ));
-    }
-    let aad = otlp_header_aad(user_id);
-    // Try the v2 per-tenant key first, then fall back to the v1 static key
-    // so headers saved before the v2 rollout still decrypt without an
-    // operator re-save. AES-GCM's tag makes the extra attempt safe — a
-    // wrong key cannot forge a passing tag; `aad` is bound on each attempt.
-    // Hold the decrypted bytes (auth headers carry `Bearer` tokens) in
-    // Zeroizing so the buffer is wiped on drop, including the UTF-8 error
-    // branch below.
-    let mut decrypted: Option<Zeroizing<Vec<u8>>> = None;
-    for subkey in [
-        derive_otlp_header_key_v2(master_key, user_id),
-        derive_otlp_header_key_v1(master_key),
-    ] {
-        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())
-            .map_err(|e| format!("cipher init: {e}"))?;
-        if let Ok(pt) = cipher.decrypt(
-            Nonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        ) {
-            decrypted = Some(Zeroizing::new(pt));
-            break;
-        }
-    }
-    let plaintext = decrypted.ok_or_else(|| {
-        "decrypt failed — wrong key, corrupted data, or tenant (AAD) mismatch".to_string()
-    })?;
-    let s = std::str::from_utf8(&plaintext)
-        .map_err(|_| "decrypted bytes are not valid UTF-8".to_string())?;
-    Ok(Zeroizing::new(s.to_string()))
-}
-
-#[cfg(test)]
-mod otlp_header_crypto_tests {
-    use super::*;
-
-    fn master_key() -> Vec<u8> {
-        vec![0x11u8; 32]
-    }
-
-    #[test]
-    fn round_trip_with_matching_user_succeeds() {
-        let user = Uuid::new_v4();
-        let headers = r#"{"authorization":"Bearer abc","x-tenant":"acme"}"#;
-        let (ct, nonce) =
-            encrypt_otlp_auth_headers_with_master_key(headers, user, &master_key()).unwrap();
-        let out =
-            decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, user, &master_key()).unwrap();
-        assert_eq!(&*out, headers);
-    }
-
-    #[test]
-    fn validate_master_key_accepts_real_32_byte_key() {
-        let ok = validate_master_key_bytes(vec![0x11u8; 32]);
-        assert!(ok.is_some());
-        assert_eq!(ok.unwrap().len(), 32);
-    }
-
-    #[test]
-    fn validate_master_key_rejects_empty() {
-        // The chart default is TALOS_MASTER_KEY="" → hex::decode("") == Ok([]).
-        // Must fail closed, not derive a key from empty (publicly recomputable) IKM.
-        assert!(validate_master_key_bytes(Vec::new()).is_none());
-    }
-
-    #[test]
-    fn validate_master_key_rejects_wrong_length() {
-        assert!(validate_master_key_bytes(vec![0x11u8; 16]).is_none());
-        assert!(validate_master_key_bytes(vec![0x11u8; 31]).is_none());
-        assert!(validate_master_key_bytes(vec![0x11u8; 33]).is_none());
-    }
-
-    #[test]
-    fn validate_master_key_rejects_all_zero() {
-        // 32 valid-length bytes but degenerate — almost always a mis-templated secret.
-        assert!(validate_master_key_bytes(vec![0u8; 32]).is_none());
-    }
-
-    #[test]
-    fn decrypt_with_different_user_fails_aad_mismatch() {
-        let user = Uuid::new_v4();
-        let other = Uuid::new_v4();
-        assert_ne!(user, other);
-        let (ct, nonce) =
-            encrypt_otlp_auth_headers_with_master_key("{}", user, &master_key()).unwrap();
-        // Transposing the blob to another tenant must fail closed.
-        let err = decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, other, &master_key())
-            .unwrap_err();
-        assert!(err.contains("AAD") || err.contains("mismatch"), "got {err}");
-    }
-
-    #[test]
-    fn decrypt_with_wrong_master_key_fails() {
-        let user = Uuid::new_v4();
-        let (ct, nonce) =
-            encrypt_otlp_auth_headers_with_master_key("{}", user, &master_key()).unwrap();
-        let wrong = vec![0x22u8; 32];
-        assert!(decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, user, &wrong).is_err());
-    }
-
-    #[test]
-    fn derived_subkey_differs_from_raw_master_key() {
-        let mk = master_key();
-        let subkey = derive_otlp_header_key_v1(&mk);
-        assert_ne!(
-            &subkey[..],
-            &mk[..],
-            "subkey must not equal the raw master key"
-        );
-        assert_eq!(
-            subkey,
-            derive_otlp_header_key_v1(&mk),
-            "derivation is deterministic"
-        );
-        // v2 per-tenant derivation: distinct tenants derive distinct keys,
-        // each differing from the v1 static key (finding #1).
-        let a = derive_otlp_header_key_v2(&mk, Uuid::new_v4());
-        let b = derive_otlp_header_key_v2(&mk, Uuid::new_v4());
-        assert_ne!(&*a, &*b, "different tenants must derive different keys");
-        assert_ne!(
-            &*a, &*subkey,
-            "v2 per-tenant key must differ from v1 static"
-        );
-    }
-
-    #[test]
-    fn legacy_v1_headers_decrypt_via_fallback() {
-        // Headers saved under the v1 static key (pre-v2 rollout) must still
-        // decrypt through the v2-first fallback.
-        let mk = master_key();
-        let user = Uuid::new_v4();
-        let headers = r#"{"authorization":"Bearer legacy"}"#;
-
-        // Hand-encrypt a v1 blob: static key + user_id AAD.
-        let v1_key = derive_otlp_header_key_v1(&mk);
-        let cipher = Aes256Gcm::new_from_slice(v1_key.as_slice()).unwrap();
-        let nonce = [5u8; 12];
-        let aad = otlp_header_aad(user);
-        let ct = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: headers.as_bytes(),
-                    aad: &aad,
-                },
-            )
-            .unwrap();
-        let out = decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, user, &mk).unwrap();
-        assert_eq!(&*out, headers);
-    }
-
-    #[test]
-    fn rejects_wrong_nonce_length() {
-        let user = Uuid::new_v4();
-        let err =
-            decrypt_otlp_auth_headers_with_master_key(&[1, 2, 3], &[0u8; 11], user, &master_key())
-                .unwrap_err();
-        assert!(err.contains("nonce wrong length"), "got {err}");
-    }
 }
 
 /// S3 Object-Lock retention applied per audit batch upload when
@@ -634,15 +281,14 @@ impl OTLPCache {
             otlp_endpoint: Option<String>,
             otlp_protocol: Option<String>,
             auth_headers_encrypted: Option<Vec<u8>>,
-            auth_headers_nonce: Option<Vec<u8>>,
-            // v3 envelope columns (NULL/0 on legacy env-key rows).
+            // v3 envelope columns: the DEK id + AAD format version.
             auth_headers_enc_key_id: Option<Uuid>,
             auth_headers_format: i16,
         }
         let settings = sqlx::query_as::<_, SettingsRow>(
             r#"
             SELECT streaming_enabled, otlp_endpoint, otlp_protocol,
-                   auth_headers_encrypted, auth_headers_nonce,
+                   auth_headers_encrypted,
                    auth_headers_enc_key_id, auth_headers_format
             FROM user_audit_settings
             WHERE user_id = $1
@@ -693,13 +339,10 @@ impl OTLPCache {
         let mut metadata = tonic::metadata::MetadataMap::new();
 
         if let Some(encrypted) = settings.auth_headers_encrypted {
-            // Dual-read dispatch (do NOT silently swallow failures — a decrypt
-            // error means the exporter would stream WITHOUT auth, which
-            // operators must be able to see):
-            //   * v3 row (auth_headers_enc_key_id set) → SecretsManager envelope,
-            //     KEK-backed so no env master key is needed. AAD = user_id.
-            //   * legacy row (key_id NULL) → env-master-key HKDF helper, which
-            //     needs auth_headers_nonce + TALOS_MASTER_KEY.
+            // Decrypt the SecretsManager v3 envelope (KEK-backed DEK + per-context
+            // HKDF subkey + user_id AAD). Do NOT silently swallow failures — a
+            // decrypt error means the exporter would stream WITHOUT auth, which
+            // operators must be able to see.
             let decrypted: Result<Zeroizing<String>, String> =
                 match (settings.auth_headers_enc_key_id, secrets_manager) {
                     (Some(key_id), Some(sm)) => sm
@@ -711,13 +354,12 @@ impl OTLPCache {
                         )
                         .await
                         .map_err(|e| format!("v3 envelope decrypt failed: {e}")),
-                    (Some(_), None) => Err("row uses the SecretsManager v3 envelope but no \
-                         SecretsManager is wired into the audit subscriber"
+                    (Some(_), None) => Err("no SecretsManager is wired into the audit \
+                         subscriber — cannot decrypt OTLP auth headers"
                         .to_string()),
-                    (None, _) => match settings.auth_headers_nonce {
-                        Some(nonce) => decrypt_otlp_auth_headers(&encrypted, &nonce, user_id),
-                        None => Err("legacy env-key row is missing auth_headers_nonce".to_string()),
-                    },
+                    (None, _) => Err("auth_headers_encrypted is present but \
+                         auth_headers_enc_key_id is NULL (corrupt or pre-v3 row)"
+                        .to_string()),
                 };
 
             match decrypted {
@@ -747,9 +389,8 @@ impl OTLPCache {
                         user_id = %user_id,
                         reason = %reason,
                         "Failed to decrypt OTLP auth headers — exporter will stream WITHOUT auth \
-                         headers. For v3 rows check the KEK provider (env/Vault); for legacy rows \
-                         check TALOS_MASTER_KEY. Re-saving via update_audit_settings migrates a \
-                         legacy row to the KEK-backed v3 envelope."
+                         headers. Check the KEK provider (env/Vault) the SecretsManager is wired \
+                         to, then re-save via update_audit_settings."
                     );
                 }
             }
