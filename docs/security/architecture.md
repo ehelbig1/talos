@@ -106,15 +106,25 @@
                   OR local AES-GCM)
 
   Per-row data storage (every column carrying user data):
-  +----------+     DEK encrypts    +-------------+    stored in DB
-  | Plaintext|   AES-256-GCM      | Ciphertext  | ----------------->
-  |  value   |   (random nonce)   |  + key_id   |   secrets,
-  +----------+                     +-------------+   oauth_tokens,
-                                                     actor_memory.value_enc,
-                                                     module_executions.{input,
-                                                       output,trigger_metadata}_enc,
-                                                     workflow_executions.output_data_enc
+  +----------+   DEK → per-context   +-------------+    stored in DB
+  | Plaintext|   HKDF subkey         | Ciphertext  | ----------------->
+  |  value   |   AES-256-GCM         |  + key_id   |   secrets,
+  +----------+   (AAD-bound,         +-------------+   oauth_tokens,
+                  random nonce)                        actor_memory.value_enc,
+                                                       module_executions.{input,
+                                                         output,trigger_metadata}_enc,
+                                                       workflow_executions.output_data_enc
 ```
+
+**Per-context key derivation (format v3, finding #1).** The cached DEK is the
+derivation *root*, not the data key. Each row is sealed under a per-context
+subkey `HKDF-SHA256(ikm = DEK, salt = label, info = aad_context)`, where the
+context is the row's identity (secret_id / actor_id‖key / execution_id /
+per-slot tag) — the same bytes bound as AES-GCM AAD. This keeps the per-key
+message count at ~1, so the random-96-bit-nonce birthday bound is never
+approached, and a leaked single-row subkey can't decrypt any other context. A
+per-row `encryption_format_version` selects the scheme; legacy v0/v1/v2 rows
+still decrypt under lazy migration (`SecretsManager::decrypt_versioned`).
 
 The `KekProvider` abstraction means every encrypted column above
 behaves identically regardless of whether the KEK is a local AES key
@@ -128,7 +138,7 @@ See `docs/deployment.md` for the env→Vault migration procedure
 |------|--------|----------|-----------------|
 | 1. Creation | User provides secret value via API | Controller | Input validation; TLS in transit |
 | 2. DEK retrieval | Active DEK fetched (cache or DB) | SecretsManager | DashMap cache with 5-min TTL; Zeroizing memory |
-| 3. Encryption | Secret encrypted with DEK | SecretsManager | AES-256-GCM; random 12-byte nonce; nonce prepended to ciphertext |
+| 3. Encryption | Secret encrypted under a per-context HKDF subkey of the DEK | SecretsManager | AES-256-GCM (format v3); AAD-bound to secret_id; per-context subkey so each key encrypts ~1 message; random 12-byte nonce prepended to ciphertext |
 | 4. Storage | Encrypted blob stored in DB | PostgreSQL | Parameterized INSERT; `key_path` indexed for lookup |
 | 5. Audit | Access logged to `secret_audit_log` | Controller | Append-only table; immutability trigger; DLP redaction on payload |
 | 6. Retrieval | Module requests secret by key_path | Worker host | `allowed_secrets` allowlist check; deny-all default |
@@ -382,6 +392,29 @@ HTTPS enforced for all outbound webhook URLs.
 
 All triggers use `prevent_audit_modification()` function: BEFORE UPDATE OR DELETE, raises SQLSTATE 42501 (insufficient_privilege).
 
+#### 6.1.1 WORM ledger cryptographic verification (finding #2)
+
+The worker emits a per-execution, **HMAC-SHA256-signed SHA-256 hash chain**
+of audit events (`talos-audit-event`) over `talos.audit.ledger`. The
+controller-side consumer (`talos-audit-ledger`):
+
+- **Inline, before S3 persist (Layer 1):** recomputes each event's hash and
+  verifies it equals the published hash (integrity), and verifies the HMAC
+  against the configured keys (authenticity). Events that fail are **not**
+  persisted to the ledger — they are quarantined to an Object-Locked
+  `rejected/` prefix (evidence retained) and logged at ERROR, rather than the
+  pre-fix silent ACK-drop. Persistence is to S3 with Object-Lock Compliance
+  (WORM) when enabled.
+- **Offline (Layer 2):** `verify_chain` / `verify_execution_chain` re-derive
+  the chain over the full ordered record set and detect sequence gaps
+  (deletion / never-persisted events), broken `previous_hash` linkage
+  (reorder/substitution), genesis mismatch, and per-event HMAC failures —
+  the stateful checks that need the whole chain and so can't run in the
+  streaming persister.
+
+Signing requires `TALOS_AUDIT_SIGNING_KEY` (32+ bytes) on workers AND the
+controller; `TALOS_AUDIT_SIGNING_KEY_PREVIOUS` supports rotation overlap.
+
 ### 6.2 Observability Stack
 
 | Layer | Technology | Metrics |
@@ -389,7 +422,7 @@ All triggers use `prevent_audit_modification()` function: BEFORE UPDATE OR DELET
 | Application metrics | Prometheus (`prometheus` crate) | Webhook counts/latency, auth success/failure, execution counts/duration, rate limit hits, cache hit/miss, DLQ drops |
 | Distributed tracing | OpenTelemetry (OTLP export) | Per-tenant tracer providers; LRU cache (100 providers); configurable endpoint per user |
 | Structured logging | `tracing` crate | JSON-formatted in production; span context propagation |
-| Audit streaming | NATS JetStream | Real-time audit event stream to external SIEM |
+| Audit streaming | NATS JetStream | Real-time audit event stream to external SIEM; consumer verifies HMAC + hash before WORM (S3 Object Lock) persist, quarantining failures to `rejected/`; offline chain verifier for linkage/sequence/genesis (§6.1.1) |
 
 ### 6.3 Sensitive Value Logging Policy
 

@@ -157,6 +157,24 @@ tier-1 ceiling to tier-2 without invalidating the signature.
 - Audit logs record `key_hash` (SHA-256 of path), never the value.
 - Error messages reference `key_path`/`name` only, never decrypted content.
 
+**Per-context AEAD subkeys (format v3, finding #1).** Every AES-GCM path
+derives a PER-CONTEXT key — `HKDF-SHA256(ikm = root, salt = label, info = aad_context)`
+— rather than encrypting many rows under one shared key. DB-backed paths
+(`SecretsManager`: secrets / actor_memory / TOTP / webhook secrets / exec
+output / module payloads) use `AAD_FORMAT_V3_DERIVED = 3` keyed on the row's
+identity (the same bytes bound as AAD); checkpoints fold `execution_id`
+(`checkpoint-aead/v2-per-execution`), the worker secret-envelope folds the
+per-job AAD (`envelope-aead/v2-per-job`), OTLP headers fold `user_id`. This
+keeps the per-key message count at ~1 so the random-96-bit-nonce birthday
+bound is unreachable. Migration is lazy/fail-closed: readers dispatch on the
+per-row `*_format` column via `decrypt_versioned` (v0/v1/v2 still decrypt);
+adding a new AEAD writer? use `encrypt_value_aad_v3` and widen that table's
+format CHECK constraint. **Envelope deploy ordering:** workers must roll
+first/together with controllers — a v1-only worker can't open a v2-sealed
+envelope (the v2→v1 decrypt fallback only covers the reverse). New AEAD
+format versions need the format CHECK widened in a migration (see
+`20260617120000`).
+
 **Worker-side secret isolation:**
 - `check_secret_allowlist(key_path)` enforces BOTH the per-module `allowed_secrets` grant AND the host-reserved deny-list (`is_reserved_host_secret_path`). The deny-list blocks LLM provider keys even with `allowed_secrets: ["*"]`.
 - The allowlist matcher lives in ONE place: `job_protocol::vault_path_permitted`. Both controller (validation) and worker (runtime enforcement) import from there.
@@ -235,7 +253,7 @@ tier-1 ceiling to tier-2 without invalidating the signature.
 
 ## Architectural Mandate (CRITICAL)
 
-**Workspace topology after the May-2026 spike.** The controller bin is now ~7.3k LoC (down from ~95k); 104 `talos-*` workspace crates own the implementation. The bin is bootstrap (main.rs ~6.4k, lib.rs + ~59 re-export shims under 10 LoC each). Every former top-level module in `controller/src/*` is now a small re-export shim pointing at its canonical home crate; do not write new logic in those shims. When a path like `crate::foo::bar` appears in remaining controller code, treat it as syntactic sugar for `talos_foo::bar` — the dep tree, lints, and ownership belong to the underlying crate.
+**Workspace topology after the May-2026 spike.** The controller bin is now ~7.3k LoC (down from ~95k); 105 `talos-*` workspace crates own the implementation. The bin is bootstrap (main.rs ~6.4k, lib.rs + ~59 re-export shims under 10 LoC each). Every former top-level module in `controller/src/*` is now a small re-export shim pointing at its canonical home crate; do not write new logic in those shims. When a path like `crate::foo::bar` appears in remaining controller code, treat it as syntactic sugar for `talos_foo::bar` — the dep tree, lints, and ownership belong to the underlying crate.
 
 The MCP handler tree lives in `talos-mcp-handlers` (~65k LoC, 27 source files: 21 handler-domain modules + lib/types/utils/schemas/tests support). The GraphQL surface lives in `talos-api`. Both keep `pub mod` re-export shims at `controller/src/mcp/mod.rs` and `controller/src/api/mod.rs` so existing import paths keep resolving. **When the priority-extraction list below references `mcp/foo.rs`, the actual file is now `talos-mcp-handlers/src/foo.rs` — the work is the same, the path moved.**
 
@@ -306,6 +324,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
 - `talos-api-docs` — GraphQL Playground + REST docs.
 - `talos-ws-auth` — GraphQL-over-WebSocket handshake + auth.
 - `talos-mcp-handlers` — entire MCP handler tree (27 source files, ~65k LoC, ~280 tool handlers across 21 handler-domain modules, McpState).
+- `talos-audit-event` — shared cryptographic audit-event primitives (the hash-chained, HMAC-signed `AuditEvent` + `ExecutionLedger` + offline `verify_chain`). SINGLE SOURCE OF TRUTH for audit hashing/signing: the worker producer AND the `talos-audit-ledger` WORM consumer both depend on it so the verifier can never drift from the producer. `worker/src/audit.rs` is now a re-export shim.
 
 **Good examples to follow:** `ModuleExecutionService`, `AuthService`, `SecretsManager`, `CompilationService`, `SubworkflowContractService`, `ParallelWorkflowEngine`, `ActorRepository::get_actor_full_summary` (LATERAL join pattern), `graph.rs::fetch_graph_json` (helper delegation pattern).
 **Anti-pattern to avoid:** Raw `sqlx::query(...)` calls directly inside MCP handler functions. **Down to 0** in `talos-mcp-handlers/src/*.rs` as of 2026-05-04 and held at 0 through r303/r304 (down from 371 → 276 → 0). The lint-equivalent invariant is now: any new handler PR adding raw `sqlx::query` to a `talos-mcp-handlers` file is a regression — push the SQL into the relevant repository crate first. `encrypted_secrets: Default::default()` in any dispatch path is the other regression class.

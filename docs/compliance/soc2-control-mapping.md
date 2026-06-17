@@ -62,10 +62,10 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 
 | Control ID | Control Description | Implementation | Evidence Location |
 |-----------|-------------------|----------------|-------------------|
-| CC6.3-01 | Envelope encryption for secrets | AES-256-GCM; DEK wrapped by KEK provider; random 12-byte nonce per operation | `controller/src/secrets/mod.rs` (SecretsManager) |
+| CC6.3-01 | Envelope encryption for secrets | AES-256-GCM; DEK wrapped by KEK provider; **per-context HKDF subkey derived per row** (`HKDF(DEK, info=secret_id)`, format v3) so each key encrypts ~1 message and the random-nonce birthday bound is never approached; AAD-bound; random 12-byte nonce per operation | `controller/src/secrets/mod.rs` (SecretsManager) |
 | CC6.3-02 | Transit encryption (client) | HTTPS enforced; HSTS headers in production | Load balancer configuration |
 | CC6.3-03 | Transit encryption (Redis) | `rediss://` TLS enforced in production; startup panic on `redis://` | `controller/src/main.rs` line ~178 |
-| CC6.3-04 | Transit encryption (NATS jobs) | Secrets encrypted with AES-256-GCM before NATS transmission; separate encryption per job | `talos-workflow-job-protocol/src/lib.rs` (EncryptedSecrets; sibling repo `../talos-workflow-engine/talos-workflow-job-protocol/`) |
+| CC6.3-04 | Transit encryption (NATS jobs) | Secrets encrypted with AES-256-GCM before NATS transmission under a **per-job HKDF subkey derived from `WORKER_SHARED_KEY`** (per-context key separation; ~1 message per key) | `talos-workflow-job-protocol/src/lib.rs` (EncryptedSecrets; sibling repo `../talos-workflow-engine/talos-workflow-job-protocol/`) |
 | CC6.3-05 | KEK management (production) | HashiCorp Vault transit engine; KEK never enters controller process memory; transit token scoped to encrypt+decrypt on `talos-kek` only; rotation via `vault transit/keys/talos-kek/rotate` | `controller/src/secrets/vault_kek_provider.rs`, runbook §2.1.1 |
 | CC6.3-05a | KEK management (dev only) | Env var or Docker secret file mount (`TALOS_MASTER_KEY` / `TALOS_MASTER_KEY_FILE`); 256-bit; Zeroizing memory; NOT for production | `controller/src/config.rs`, `controller/src/secrets/kek_provider.rs::EnvKekProvider` |
 | CC6.3-05b | Pluggable KEK abstraction | `KekProvider` trait isolates KEK backend from call sites; switching env↔Vault is a config flip + dual-wrap migration, not a code change | `controller/src/secrets/kek_provider.rs` |
@@ -73,9 +73,9 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 | CC6.3-07 | OAuth token encryption | OAuth tokens encrypted before storage; plaintext columns dropped (migration 036) | `controller/src/oauth/credentials.rs`, `migrations/036_drop_plaintext_tokens.sql` |
 | CC6.3-08 | Webhook signing secret encryption | Stored encrypted via envelope encryption | `migrations/20260312000200_encrypt_webhook_signing_secrets.sql` |
 | CC6.3-09 | DEK caching with TTL | In-memory DashMap cache; configurable TTL (default 300s via DEK_CACHE_TTL_SECS) | `controller/src/secrets/mod.rs` (CachedDek) |
-| CC6.3-10 | Actor memory at-rest encryption | AES-256-GCM envelope encryption on `actor_memory.value_enc` + `value_key_id` (NOT NULL); plaintext `value` column dropped Phase B 2026-04-24 | `talos-memory/src/lib.rs` (MemoryCryptoHook), migrations `20260423235406` + `20260424010000` |
-| CC6.3-11 | Module-execution payload encryption | AES-256-GCM envelope encryption on `module_executions.{input_data, output_data, trigger_metadata}_enc` + shared `payload_enc_key_id`; all writers route through `module_payload_encryption::encrypt_payload_bundle` | `controller/src/module_payload_encryption.rs`, migration `20260424030501` |
-| CC6.3-12 | Workflow-execution output encryption | AES-256-GCM envelope encryption on `workflow_executions.output_data_enc` + `output_enc_key_id`; all writer paths route through encryption-aware methods | `controller/src/execution_repository.rs::mark_execution_completed`, `mark_execution_waiting`, `mark_execution_failed` |
+| CC6.3-10 | Actor memory at-rest encryption | AES-256-GCM on `actor_memory.value_enc` + `value_key_id` (NOT NULL) under a **per-context HKDF subkey** (`info = actor_id‖key`, format v3); plaintext `value` column dropped Phase B 2026-04-24 | `talos-memory/src/lib.rs` (MemoryCryptoHook), migrations `20260423235406` + `20260424010000` + `20260617120000` |
+| CC6.3-11 | Module-execution payload encryption | AES-256-GCM on `module_executions.{input_data, output_data, trigger_metadata}_enc` + shared `payload_enc_key_id` under a **per-context HKDF subkey** (`info = execution_id‖slot`, format v3); all writers route through `module_payload_encryption::encrypt_payload_bundle` | `controller/src/module_payload_encryption.rs`, migrations `20260424030501` + `20260617120000` |
+| CC6.3-12 | Workflow-execution output encryption | AES-256-GCM on `workflow_executions.output_data_enc` + `output_enc_key_id` under a **per-context HKDF subkey** (`info = execution_id`, format v3); all writer paths route through encryption-aware methods | `controller/src/execution_repository.rs::mark_execution_completed`, `mark_execution_waiting`, `mark_execution_failed` |
 | CC6.3-13 | Per-actor LLM data-egress ceiling | `actors.max_llm_tier` (tier1/tier2) HMAC-bound in JobRequest + PipelineJobRequest signing; enforced at 5 worker surfaces (`llm::*`, `wit_http`, `wit_graphql`, `wit_webhook`, HTTP-stream) + vault-header gate; tier changes audit-logged | `worker/src/host_impl.rs::decide_llm_tier_access`, migration `20260424100000`, runbook §1.3 |
 | CC6.3-14 | Supply-chain integrity | `cargo deny check` (RUSTSEC + license + ban + source policy) + `cargo audit` gated in CI; every Docker image pinned by SHA-256 digest; weekly Dependabot bumps grouped by domain; SLSA L2 cosign-signed release images with SBOM + provenance attestations | `deny.toml`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `scripts/verify-image.sh`, `.github/dependabot.yml` |
 
@@ -119,19 +119,22 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 | Control ID | Control Description | Implementation | Evidence Location |
 |-----------|-------------------|----------------|-------------------|
 | CC7.1-01 | Immutable audit logs | 4 audit tables with BEFORE UPDATE/DELETE triggers; SQLSTATE 42501 on modification | `migrations/20260408000001_audit_log_immutability.sql` |
+| CC7.1-01a | Audit-ledger cryptographic verification | Worker emits a per-execution HMAC-SHA256-signed SHA-256 hash chain; the WORM consumer **verifies each event's HMAC + recomputes its hash inline before S3 (Object Lock) persist**, quarantining failures to an Object-Locked `rejected/` prefix instead of ACK-dropping them; offline `verify_chain`/`verify_execution_chain` validates sequence contiguity, `previous_hash` linkage, and genesis across the full chain | `talos-audit-event` (chain + `verify_chain`), `talos-audit-ledger` (inline verify + S3 verifier) |
 | CC7.1-02 | Prometheus metrics | Webhook requests, auth attempts, execution counts, rate limit hits, cache stats, DLQ drops | `controller/src/metrics.rs` (TalosMetrics) |
 | CC7.1-03 | OpenTelemetry tracing | Per-tenant OTLP export; LRU tracer cache (100 providers); configurable endpoint | `controller/src/audit_ledger.rs` |
 | CC7.1-04 | Structured logging | `tracing` crate with JSON output; span context; structured fields | Throughout controller and worker |
 | CC7.1-05 | Secret access audit | Every secret access logged to `secret_audit_log` (key_path, requestor, timestamp) | `controller/src/secrets/mod.rs` |
 | CC7.1-06 | Admin event log | Privileged operations recorded (MCP agent registration/revocation, actor changes) | `migrations/20260407000001_admin_event_log.sql` |
 | CC7.1-07 | Auth audit log | Login/logout events with IP, user-agent, success/failure | `controller/src/auth/mod.rs` |
-| CC7.1-08 | NATS audit streaming | Real-time audit event stream to external SIEM via JetStream | `controller/src/audit_ledger.rs` |
+| CC7.1-08 | NATS audit streaming | Real-time audit event stream to external SIEM via JetStream; the WORM consumer verifies each event's HMAC + recomputes its hash before persisting (Object Lock), quarantining verification failures to a `rejected/` prefix rather than ACK-dropping them | `talos-audit-ledger` |
 
 **Testing procedure:**
 1. Attempt `UPDATE audit_events SET ...` -- verify trigger rejection
 2. Run `scripts/soc2/collect-evidence.sh` -- verify audit exports contain expected entries
 3. Verify Prometheus `/metrics` endpoint returns expected metric families
 4. Check `secret_audit_log` after secret access -- verify entry exists
+5. Feed a tampered (bad-HMAC) audit event into the JetStream consumer -- verify it lands in the Object-Locked `rejected/` prefix and is NOT persisted to the main WORM path
+6. Run `verify_execution_chain` over an exported chain with an injected sequence gap / broken `previous_hash` -- verify the break is reported
 
 ### CC7.2 -- Anomaly Detection
 

@@ -105,10 +105,15 @@ The trait traffics in plaintext `JsonValue`. Per-node outputs may carry
 PII or secrets that the engine has already let through its
 `OutputSanitizer`. **If your store persists to disk or a database, wrap
 the snapshot in AES-256-GCM (or the consumer's chosen AEAD) inside the
-impl** — the engine never sees the ciphertext. Reference NATS-aligned
-deployments use a per-tenant key from KMS, fresh nonce per save, and
-authenticate `execution_id` as additional data so a stolen snapshot
-can't be replayed under a different id.
+impl** — the engine never sees the ciphertext. The reference controller
+store derives a **per-execution AEAD subkey** from the `WORKER_SHARED_KEY`
+root via HKDF, folding `execution_id` into the derivation `info`
+(`checkpoint-aead/v2-per-execution`), with a fresh nonce per save. Decrypt
+tries the per-execution (v2) derivation, then falls back to the legacy
+static (v1) derivation so checkpoints written before the rollout still
+resume. `execution_id` is also bound as AES-GCM additional-authenticated
+data, so a snapshot stolen from one execution can't be opened — let alone
+replayed — under another id.
 
 ### Idempotency
 

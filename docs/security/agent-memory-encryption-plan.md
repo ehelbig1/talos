@@ -17,6 +17,16 @@
 >
 > Verification: `cargo run --example verify_phase_b -p controller`.
 > Operational runbook §1 lists this row as ✅ in the protection matrix.
+>
+> **Superseded by format v3 (finding #1, 2026-06).** New `actor_memory`
+> writes now use `AAD_FORMAT_V3_DERIVED` — AAD-bound to `actor_id‖key` AND
+> encrypted under a per-context HKDF subkey `HKDF(DEK, info = actor_id‖key)`,
+> not the raw DEK. Reads dispatch on the per-row `value_format` column via
+> `SecretsManager::decrypt_versioned` (v0/v1 rows still decrypt). This
+> delivers the per-context key separation the original §7 deferred as "out
+> of scope: per-actor encryption keys" — DEKs remain user-scoped, but a
+> leaked single-row subkey no longer decrypts any other context. The §2.2/§2.3
+> wire-format and read-path samples below describe the pre-v3 (v1) scheme.
 
 ---
 

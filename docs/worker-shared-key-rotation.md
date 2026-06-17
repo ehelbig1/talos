@@ -25,6 +25,17 @@ a **signature** (HMAC) or an **encryption** (AES-256-GCM HKDF subkey):
 | `encrypted_secrets` (per-job secret envelope) | AES-GCM | controller | worker |
 | execution checkpoints (durable resume state) | AES-GCM | controller | controller (at rest) |
 
+Each AES-GCM primitive derives its subkey from the root via HKDF with a
+**per-context `info`** (finding #1): checkpoints fold `execution_id` (label
+`checkpoint-aead/v2-per-execution`), the per-job secret envelope folds the
+job AAD (`envelope-aead/v2-per-job`), and OTLP audit headers fold `user_id`
+(`audit-otlp-header-aead/v2-per-user`). This bounds each subkey to ~1
+message so the random-96-bit-nonce birthday budget is never approached.
+Derivation is internal — it does **not** change the wire format or the HMAC
+signing payloads, and the ring still tries every root; each root now
+attempts both the v2 (per-context) and the legacy v1 (static) derivation on
+decrypt. See "Derivation-version rollout" below for the one ordering caveat.
+
 The ring is read from two environment variables on **both** the controller and
 every worker:
 
@@ -57,6 +68,28 @@ HMAC paths the blast radius is bounded (rejected requests retry; freshness
 window is ~60 s). For the **AEAD paths it is not** — an `encrypted_secrets`
 payload or a checkpoint sealed under a key the reader doesn't hold fails
 closed permanently. Order matters most for secrets and checkpoints.
+
+## Derivation-version rollout (v1 → v2) is a separate event from key rotation
+
+Independent of *root-key* rotation above, the AEAD subkeys moved from a single
+static per-root subkey (v1) to a **per-context** subkey (v2) — see the HKDF
+note under the primitive table. This is a code-deploy event, not a key change,
+and it has its own ordering rule. Decrypt tries v2 then falls back to v1, so an
+upgraded reader still opens v1-sealed material — but **the fallback is
+one-directional**:
+
+* **Envelope (`encrypted_secrets`) — roll workers first or together with
+  controllers.** A v2 controller seals the per-job envelope under the v2
+  derivation; a v1-only worker has no v2 code path and cannot open it (the
+  fallback only covers the controller-old/worker-new direction). Deploy the
+  worker image to the v2 build *before or simultaneously with* the controllers.
+  The no-AAD envelope wrappers keep v1, so only AAD-bearing job envelopes are
+  affected.
+* **Checkpoints and OTLP headers — no cross-process ordering constraint.** The
+  same process seals and reads them, so it always holds both derivations. The
+  v1→v2 checkpoint bump does **not** force a re-key or strand in-flight
+  checkpoints: a v2 reader falls back to the v1 derivation under the same root,
+  so a checkpoint written by a pre-v2 controller still resumes after upgrade.
 
 ## Procedure
 
