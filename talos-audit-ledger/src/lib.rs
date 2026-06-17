@@ -53,13 +53,31 @@ use zeroize::Zeroizing;
 /// HKDF-SHA256 domain-separation label for the OTLP auth-header AEAD subkey.
 const OTLP_HEADER_AEAD_LABEL: &[u8] = b"talos/master-key/audit-otlp-header-aead/v1";
 
-/// Derive the dedicated 32-byte AES-256-GCM subkey for OTLP auth-header
-/// encryption from the raw `TALOS_MASTER_KEY`. Deterministic; encrypt and
-/// decrypt derive it identically.
-fn derive_otlp_header_key(master_key: &[u8]) -> Zeroizing<[u8; 32]> {
+/// v2 label (finding #1): the OTLP subkey folds the owning `user_id` into
+/// the HKDF `info`, so each tenant gets its own derived key. The AES-GCM
+/// random-nonce budget is then per-tenant (this surface is low-volume —
+/// one row per tenant, written on a settings change — so the uniformity
+/// matters more than the volume). Distinct label from v1.
+const OTLP_HEADER_AEAD_LABEL_V2: &[u8] = b"talos/master-key/audit-otlp-header-aead/v2-per-user";
+
+/// v1 (legacy) OTLP subkey: a single static subkey per master key, shared
+/// by every tenant. Retained as the decrypt fallback so headers saved
+/// before the v2 rollout still decrypt without an operator re-save.
+fn derive_otlp_header_key_v1(master_key: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, master_key);
     let mut subkey = Zeroizing::new([0u8; 32]);
     hk.expand(OTLP_HEADER_AEAD_LABEL, subkey.as_mut())
+        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
+    subkey
+}
+
+/// v2 per-tenant OTLP subkey: the `user_id` bytes are the HKDF `info`, so
+/// the subkey is unique per tenant. Deterministic; encrypt and decrypt
+/// derive it identically.
+fn derive_otlp_header_key_v2(master_key: &[u8], user_id: Uuid) -> Zeroizing<[u8; 32]> {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(OTLP_HEADER_AEAD_LABEL_V2), master_key);
+    let mut subkey = Zeroizing::new([0u8; 32]);
+    hk.expand(user_id.as_bytes(), subkey.as_mut())
         .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
     subkey
 }
@@ -109,7 +127,8 @@ fn encrypt_otlp_auth_headers_with_master_key(
     master_key: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     use rand::RngCore;
-    let subkey = derive_otlp_header_key(master_key);
+    // v2: per-tenant key derivation (user_id folded into the HKDF info).
+    let subkey = derive_otlp_header_key_v2(master_key, user_id);
     let cipher =
         Aes256Gcm::new_from_slice(subkey.as_slice()).map_err(|e| format!("cipher init: {e}"))?;
     let mut nonce_bytes = [0u8; 12];
@@ -141,26 +160,35 @@ fn decrypt_otlp_auth_headers_with_master_key(
             nonce.len()
         ));
     }
-    let subkey = derive_otlp_header_key(master_key);
-    let cipher =
-        Aes256Gcm::new_from_slice(subkey.as_slice()).map_err(|e| format!("cipher init: {e}"))?;
     let aad = otlp_header_aad(user_id);
+    // Try the v2 per-tenant key first, then fall back to the v1 static key
+    // so headers saved before the v2 rollout still decrypt without an
+    // operator re-save. AES-GCM's tag makes the extra attempt safe — a
+    // wrong key cannot forge a passing tag; `aad` is bound on each attempt.
     // Hold the decrypted bytes (auth headers carry `Bearer` tokens) in
-    // Zeroizing so the buffer is wiped on drop — including the UTF-8
-    // error branch below. Mirrors the SecretsManager decrypt path.
-    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
-        cipher
-            .decrypt(
-                Nonce::from_slice(nonce),
-                Payload {
-                    msg: ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| {
-                "decrypt failed — wrong key, corrupted data, or tenant (AAD) mismatch".to_string()
-            })?,
-    );
+    // Zeroizing so the buffer is wiped on drop, including the UTF-8 error
+    // branch below.
+    let mut decrypted: Option<Zeroizing<Vec<u8>>> = None;
+    for subkey in [
+        derive_otlp_header_key_v2(master_key, user_id),
+        derive_otlp_header_key_v1(master_key),
+    ] {
+        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())
+            .map_err(|e| format!("cipher init: {e}"))?;
+        if let Ok(pt) = cipher.decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        ) {
+            decrypted = Some(Zeroizing::new(pt));
+            break;
+        }
+    }
+    let plaintext = decrypted.ok_or_else(|| {
+        "decrypt failed — wrong key, corrupted data, or tenant (AAD) mismatch".to_string()
+    })?;
     let s = std::str::from_utf8(&plaintext)
         .map_err(|_| "decrypted bytes are not valid UTF-8".to_string())?;
     Ok(Zeroizing::new(s.to_string()))
@@ -210,7 +238,7 @@ mod otlp_header_crypto_tests {
     #[test]
     fn derived_subkey_differs_from_raw_master_key() {
         let mk = master_key();
-        let subkey = derive_otlp_header_key(&mk);
+        let subkey = derive_otlp_header_key_v1(&mk);
         assert_ne!(
             &subkey[..],
             &mk[..],
@@ -218,9 +246,44 @@ mod otlp_header_crypto_tests {
         );
         assert_eq!(
             subkey,
-            derive_otlp_header_key(&mk),
+            derive_otlp_header_key_v1(&mk),
             "derivation is deterministic"
         );
+        // v2 per-tenant derivation: distinct tenants derive distinct keys,
+        // each differing from the v1 static key (finding #1).
+        let a = derive_otlp_header_key_v2(&mk, Uuid::new_v4());
+        let b = derive_otlp_header_key_v2(&mk, Uuid::new_v4());
+        assert_ne!(&*a, &*b, "different tenants must derive different keys");
+        assert_ne!(
+            &*a, &*subkey,
+            "v2 per-tenant key must differ from v1 static"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_headers_decrypt_via_fallback() {
+        // Headers saved under the v1 static key (pre-v2 rollout) must still
+        // decrypt through the v2-first fallback.
+        let mk = master_key();
+        let user = Uuid::new_v4();
+        let headers = r#"{"authorization":"Bearer legacy"}"#;
+
+        // Hand-encrypt a v1 blob: static key + user_id AAD.
+        let v1_key = derive_otlp_header_key_v1(&mk);
+        let cipher = Aes256Gcm::new_from_slice(v1_key.as_slice()).unwrap();
+        let nonce = [5u8; 12];
+        let aad = otlp_header_aad(user);
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: headers.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let out = decrypt_otlp_auth_headers_with_master_key(&ct, &nonce, user, &mk).unwrap();
+        assert_eq!(&*out, headers);
     }
 
     #[test]
