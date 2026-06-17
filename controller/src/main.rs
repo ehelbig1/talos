@@ -455,16 +455,10 @@ async fn main() -> anyhow::Result<()> {
                     authenticated,
                     "NATS client initialized and connected"
                 );
-                // Start the audit ledger subscriber. If it fails we want to know why, so propagate the error.
-                tracing::info!("Calling start_audit_ledger_subscriber");
-                {
-                    crate::audit_ledger::start_audit_ledger_subscriber(
-                        client.clone(),
-                        db_pool.clone(),
-                    )
-                    .await?;
-                }
-                tracing::info!("AUDIT_SUBSCRIBER_STARTED_AND_RUNNING");
+                // The audit ledger subscriber is started AFTER the secrets
+                // manager is initialized (see below) so it can be handed an
+                // Arc<SecretsManager> for the KEK-backed OTLP auth-header
+                // envelope (v3). Don't start it here.
                 Some(std::sync::Arc::new(client))
             }
             Err(e) => {
@@ -568,6 +562,21 @@ async fn main() -> anyhow::Result<()> {
     )?);
     secrets_manager.initialize().await?;
     tracing::info!("Secrets manager initialized");
+
+    // ---------- Start the audit ledger subscriber ----------
+    // Deferred from the NATS-connect block above so it can be handed the
+    // SecretsManager for the KEK-backed OTLP auth-header envelope (v3). If it
+    // fails we want to know why, so propagate the error.
+    if let Some(nats) = &nats_client {
+        tracing::info!("Calling start_audit_ledger_subscriber");
+        crate::audit_ledger::start_audit_ledger_subscriber(
+            (**nats).clone(),
+            db_pool.clone(),
+            Some(secrets_manager.clone()),
+        )
+        .await?;
+        tracing::info!("AUDIT_SUBSCRIBER_STARTED_AND_RUNNING");
+    }
 
     // ---------- Wire actor_memory at-rest encryption ----------
     // Register the crypto hook BEFORE any memory writes. talos_memory

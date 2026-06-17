@@ -574,8 +574,21 @@ impl SecurityMutations {
             }
         }
 
-        let mut encrypted_headers = None;
-        let mut headers_nonce = None;
+        // OTLP auth headers are sealed with the canonical SecretsManager
+        // envelope (v3): a KEK-backed DEK (env OR Vault transit) + a per-context
+        // HKDF subkey + this tenant's `user_id` bound as AAD. This replaces the
+        // prior bespoke env-master-key HKDF scheme so a Vault-only deployment
+        // that has dropped TALOS_MASTER_KEY can still encrypt these headers. The
+        // audit-ledger read path dual-reads: v3 rows (auth_headers_enc_key_id
+        // set) decrypt via the same SecretsManager; legacy rows fall back to the
+        // env-key helper. Both ends bind `user_id` as AAD, so a stored blob
+        // still can't be transposed between tenants.
+        let mut encrypted_headers: Option<Vec<u8>> = None;
+        // Legacy column — the v3 blob carries its own 12-byte nonce prefix, so
+        // new writes always leave auth_headers_nonce NULL.
+        let headers_nonce: Option<Vec<u8>> = None;
+        let mut headers_enc_key_id: Option<Uuid> = None;
+        let mut headers_format: i16 = 0;
 
         if let Some(headers) = auth_headers {
             if headers.len() > 100_000 {
@@ -586,52 +599,62 @@ impl SecurityMutations {
                 );
             }
             if !headers.is_empty() {
-                // L3 (2026-05-28 review): encrypt with the canonical
-                // `talos_audit_ledger` helper — an HKDF subkey of
-                // TALOS_MASTER_KEY bound to this `user_id` via AAD — which is
-                // the EXACT primitive the audit-ledger read path decrypts with.
-                // Pre-L3 this used a SecretsManager DEK envelope while the read
-                // path decrypted with the raw TALOS_MASTER_KEY, so the round
-                // trip ALWAYS failed and the (silently-swallowed) result was
-                // that authenticated audit streaming never worked. Both ends now
-                // share one helper so they cannot drift.
-                let (ciphertext, nonce) = talos_audit_ledger::encrypt_otlp_auth_headers(
-                    &headers, *user_id,
-                )
-                .map_err(|_| {
-                    // Opaque message — never leak crypto/internal detail.
-                    async_graphql::Error::new(
-                        "Failed to encrypt audit auth headers (is TALOS_MASTER_KEY configured?)",
+                let secrets_manager = ctx
+                    .data::<Arc<talos_secrets_manager::SecretsManager>>()
+                    .map_err(|_| {
+                        async_graphql::Error::new("Secrets manager not configured").extend_safe()
+                    })?;
+                let (key_id, ciphertext, format) =
+                    talos_audit_ledger::encrypt_otlp_auth_headers_v3(
+                        secrets_manager,
+                        &headers,
+                        *user_id,
                     )
-                    .extend_safe()
-                })?;
+                    .await
+                    .map_err(|_| {
+                        // Opaque message — never leak crypto/internal detail.
+                        async_graphql::Error::new("Failed to encrypt audit auth headers")
+                            .extend_safe()
+                    })?;
                 encrypted_headers = Some(ciphertext);
-                headers_nonce = Some(nonce);
+                headers_enc_key_id = Some(key_id);
+                headers_format = format;
             }
         }
 
-        sqlx::query!(
+        // Runtime query (not the `sqlx::query!` macro) so the new
+        // auth_headers_enc_key_id / auth_headers_format columns don't require
+        // regenerating the offline `.sqlx` cache against a live migrated DB.
+        // Same bare-pool pattern as rotateEncryptionKey's count query above;
+        // user_audit_settings is keyed by user_id and is not an org-pinned RLS
+        // table, so no tenant-scoped tx is required.
+        sqlx::query(
             r#"
             INSERT INTO user_audit_settings (
-                user_id, streaming_enabled, otlp_endpoint, otlp_protocol, 
-                auth_headers_encrypted, auth_headers_nonce, updated_at
+                user_id, streaming_enabled, otlp_endpoint, otlp_protocol,
+                auth_headers_encrypted, auth_headers_nonce,
+                auth_headers_enc_key_id, auth_headers_format, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
             ON CONFLICT (user_id) DO UPDATE SET
                 streaming_enabled = EXCLUDED.streaming_enabled,
                 otlp_endpoint = EXCLUDED.otlp_endpoint,
                 otlp_protocol = EXCLUDED.otlp_protocol,
                 auth_headers_encrypted = EXCLUDED.auth_headers_encrypted,
                 auth_headers_nonce = EXCLUDED.auth_headers_nonce,
+                auth_headers_enc_key_id = EXCLUDED.auth_headers_enc_key_id,
+                auth_headers_format = EXCLUDED.auth_headers_format,
                 updated_at = NOW()
             "#,
-            user_id,
-            streaming_enabled,
-            otlp_endpoint,
-            otlp_protocol,
-            encrypted_headers,
-            headers_nonce,
         )
+        .bind(*user_id)
+        .bind(streaming_enabled)
+        .bind(otlp_endpoint)
+        .bind(otlp_protocol)
+        .bind(encrypted_headers)
+        .bind(headers_nonce)
+        .bind(headers_enc_key_id)
+        .bind(headers_format)
         .execute(db_pool)
         .await?;
 
