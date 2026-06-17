@@ -242,6 +242,16 @@ controller:
     s3ObjectLock:
       enabled: false
       retentionDays: 2555     # 7 years; clamped to [1, 36500] at runtime
+    # Continuous WORM chain-verification sweep. The controller re-verifies
+    # the HMAC + hash chain of recently-completed executions on this
+    # interval and logs `audit_chain_verification_failed` (target
+    # `talos_audit`) for any tamper/deletion/reorder — page on it in your
+    # SIEM. Default 3600s (1h), clamped to [300, 86400] at runtime; set to
+    # 0 to disable. No-op unless a WORM endpoint (S3/MinIO) is configured.
+    # Verification also requires TALOS_AUDIT_SIGNING_KEY on workers + the
+    # controller (see the bootstrap secret); without it events persist but
+    # are flagged UNVERIFIED.
+    chainSweepIntervalSecs: 3600
 
   # Extra arbitrary env vars rendered as name/value pairs into the Deployment.
   # Use this for non-sensitive per-deploy overrides.

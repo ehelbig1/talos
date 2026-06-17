@@ -220,6 +220,10 @@ spec:
             - name: TALOS_AUDIT_S3_RETENTION_DAYS
               value: {{ .Values.controller.audit.s3ObjectLock.retentionDays | quote }}
             {{- end }}
+            # Continuous WORM chain-verification sweep cadence (0 disables).
+            # See values.yaml controller.audit.chainSweepIntervalSecs.
+            - name: AUDIT_CHAIN_SWEEP_INTERVAL_SECS
+              value: {{ .Values.controller.audit.chainSweepIntervalSecs | quote }}
             {{- with .Values.controller.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -90,6 +90,7 @@ The production overlay:
 | `EXECUTION_RETENTION_DAYS` | `30` | Days to keep workflow executions |
 | `EXECUTION_MAX_ROWS` | `100000` | Max execution rows before eviction |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | Days to keep audit logs |
+| `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Cadence of the continuous WORM audit-chain verification sweep (clamped [300, 86400]; `0` disables). No-op without a WORM S3/MinIO endpoint; verification also needs `TALOS_AUDIT_SIGNING_KEY`. Logs `audit_chain_verification_failed` on any break. |
 | `WASM_CACHE_RETENTION_DAYS` | `30` | Days to keep unused WASM modules |
 | `WASM_CACHE_MAX_MODULES` | `1000` | Max cached WASM modules |
 | `WASM_CACHE_MAX_SIZE_MB` | `500` | Max WASM cache size in MB |
