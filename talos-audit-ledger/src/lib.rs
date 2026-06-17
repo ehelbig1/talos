@@ -16,7 +16,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use talos_audit_event::AuditEvent;
+use talos_audit_event::{audit_verify_keys, verify_chain, AuditEvent, ChainVerificationReport};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -635,6 +635,60 @@ impl OTLPCache {
     }
 }
 
+/// Build the optional S3 client for the WORM audit bucket from env.
+///
+/// Endpoint resolution: `AWS_ENDPOINT_URL`, then `MINIO_ENDPOINT` (empty
+/// strings treated as unset — the helm-placeholder class fixed in
+/// MCP-934). Path-style addressing via `AWS_S3_FORCE_PATH_STYLE` (MinIO).
+/// `None` when no endpoint is configured. Shared by the subscriber (write
+/// path) and [`verify_execution_chain`] (read path) so the (endpoint,
+/// path-style) resolution can never drift between them.
+pub async fn build_audit_s3_client() -> Option<S3Client> {
+    let s3_endpoint = std::env::var("AWS_ENDPOINT_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("MINIO_ENDPOINT")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })?;
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let mut builder = aws_sdk_s3::config::Builder::from(&config).endpoint_url(s3_endpoint);
+    // MCP-1073: canonical bool-env helper (accepts 1/yes/on/TRUE), required
+    // for MinIO which needs path-style addressing.
+    if talos_config::bool_env_or_default("AWS_S3_FORCE_PATH_STYLE", false) {
+        builder = builder.force_path_style(true);
+    }
+    Some(S3Client::from_conf(builder.build()))
+}
+
+/// The WORM audit bucket name (`MINIO_BUCKET`, default `audit-logs`). Empty
+/// is treated as unset (MCP-653).
+pub fn audit_bucket_name() -> String {
+    std::env::var("MINIO_BUCKET")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "audit-logs".to_string())
+}
+
+/// Convenience entry point for an admin/audit caller (an operator endpoint
+/// or a periodic sweep): build the S3 client from env and verify the
+/// persisted chain for one execution. Errors when no S3 endpoint is
+/// configured (the chain has no durable store to read).
+pub async fn verify_execution_chain_from_env(
+    workflow_id: &str,
+    execution_id: &str,
+) -> Result<ChainVerificationReport> {
+    let client = build_audit_s3_client().await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no audit S3 endpoint configured (set AWS_ENDPOINT_URL or MINIO_ENDPOINT) — \
+             the WORM chain has no durable store to verify"
+        )
+    })?;
+    let bucket = audit_bucket_name();
+    verify_execution_chain(&client, &bucket, workflow_id, execution_id).await
+}
+
 pub async fn start_audit_ledger_subscriber(nc: Client, db_pool: PgPool) -> Result<()> {
     tracing::info!("Initializing audit ledger subscriber");
     tracing::debug!("Audit ledger subscriber initialisation proceeding");
@@ -690,33 +744,10 @@ pub async fn start_audit_ledger_subscriber(nc: Client, db_pool: PgPool) -> Resul
     //
     // Same empty-env-var-bypass class as MCP-590/591/597/598/599/
     // 615/653/710 etc. Single canonical fix shape: `.filter(|v|
-    // !v.is_empty())` after each `.ok()`.
-    let s3_endpoint = std::env::var("AWS_ENDPOINT_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::env::var("MINIO_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty())
-        });
-    let s3_client: Option<S3Client> = if let Some(endpoint) = s3_endpoint {
-        let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-        let mut builder = aws_sdk_s3::config::Builder::from(&config).endpoint_url(endpoint);
-        // MCP-1073 (2026-05-16): canonical bool-env helper. Pre-fix
-        // `== "true"` case-sensitive exact-match — operators using
-        // MinIO (a common audit-log target that REQUIRES path-style
-        // addressing) who set `=1` / `=yes` / `=on` / `=TRUE` got
-        // the FALSE branch silently, breaking bucket addressing with
-        // "bucket not found" errors. Same user-visible-bug class as
-        // MCP-1072 (ENABLE_HSTS explicit-disable). Sibling drift
-        // class to MCP-1060/1064/1065/1066/1072.
-        if talos_config::bool_env_or_default("AWS_S3_FORCE_PATH_STYLE", false) {
-            builder = builder.force_path_style(true);
-        }
-        Some(S3Client::from_conf(builder.build()))
-    } else {
-        None
-    };
+    // !v.is_empty())` after each `.ok()`. Resolution + path-style logic
+    // lives in `build_audit_s3_client` so the offline verifier reads from
+    // the exact same bucket the subscriber writes to.
+    let s3_client: Option<S3Client> = build_audit_s3_client().await;
 
     tracing::info!(
         "Audit ledger subscriber ready – S3 client {}",
@@ -742,10 +773,7 @@ pub async fn start_audit_ledger_subscriber(nc: Client, db_pool: PgPool) -> Resul
         // at upload time — every WORM audit-log batch silently failed
         // until the operator noticed. Treat empty as unset. Same fix
         // shape as MCP-630/631.
-        let bucket = std::env::var("MINIO_BUCKET")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "audit-logs".to_string());
+        let bucket = audit_bucket_name();
         let max_batch_size = 100;
 
         // MCP-1119 (2026-05-16): supervisor loop that re-binds the
@@ -1354,6 +1382,196 @@ async fn process_batch(
     // Clear the batch so we start fresh. Failed messages remain unacknowledged
     // and JetStream will automatically redeliver them after the ack_wait timeout.
     batch.clear();
+}
+
+// ============================================================================
+// Offline chain verification — S3 reader (finding #2, Layer 2)
+// ============================================================================
+
+/// Hard cap on `.jsonl` objects scanned per execution, so a pathological /
+/// adversarial execution id can't make the verifier read unboundedly.
+const MAX_CHAIN_OBJECTS: usize = 50_000;
+/// Hard cap on events assembled for one verification, bounding memory.
+const MAX_CHAIN_EVENTS: usize = 5_000_000;
+
+/// Parse the persisted `.jsonl` object bodies into [`AuditEvent`]s. Each line
+/// is a `{ "event": <AuditEvent>, "hash": ... }` wrapper (the same shape
+/// `process_batch` writes); the `event` object is extracted and typed. Lines
+/// that don't parse are skipped with a WARN — a malformed line is itself a
+/// finding the chain check will surface as a gap. Pure: unit-testable without S3.
+fn extract_events_from_jsonl(objects: &[Vec<u8>]) -> Vec<AuditEvent> {
+    let mut events = Vec::new();
+    for body in objects {
+        for line in body.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if events.len() >= MAX_CHAIN_EVENTS {
+                tracing::warn!(
+                    target: "talos_audit",
+                    cap = MAX_CHAIN_EVENTS,
+                    "audit chain verification hit the event cap — report is over a truncated prefix"
+                );
+                return events;
+            }
+            match serde_json::from_slice::<Value>(line) {
+                Ok(wrapper) => {
+                    if let Some(ev) = wrapper.get("event") {
+                        match serde_json::from_value::<AuditEvent>(ev.clone()) {
+                            Ok(e) => events.push(e),
+                            Err(e) => tracing::warn!(
+                                target: "talos_audit",
+                                error = %e,
+                                "skipping a persisted ledger line whose event failed to deserialize"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "talos_audit",
+                    error = %e,
+                    "skipping an unparseable persisted ledger line"
+                ),
+            }
+        }
+    }
+    events
+}
+
+/// Offline verification of a persisted audit chain for one execution
+/// (finding #2, Layer 2 — the stateful completeness check). Reads every
+/// `<execution_id>/*.jsonl` object from the WORM bucket, reassembles the
+/// events, and runs [`talos_audit_event::verify_chain`] over the full ordered
+/// set with the configured verification keys.
+///
+/// This is the deliberately-offline counterpart to the inline per-message
+/// check ([`verify_audit_message`]): it detects sequence gaps (deletion /
+/// never-persisted events), broken `previous_hash` linkage (reorder /
+/// substitution), genesis mismatch, and per-event HMAC failures — the checks
+/// that need the whole record set and so cannot live in the streaming
+/// persister. Intended to back an operator/admin audit endpoint or a periodic
+/// sweep; safe to call on demand.
+pub async fn verify_execution_chain(
+    s3_client: &S3Client,
+    bucket: &str,
+    workflow_id: &str,
+    execution_id: &str,
+) -> Result<ChainVerificationReport> {
+    let prefix = format!("{execution_id}/");
+    let mut bodies: Vec<Vec<u8>> = Vec::new();
+    let mut continuation: Option<String> = None;
+    let mut object_count = 0usize;
+
+    loop {
+        let mut req = s3_client.list_objects_v2().bucket(bucket).prefix(&prefix);
+        if let Some(token) = &continuation {
+            req = req.continuation_token(token);
+        }
+        let page = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("list_objects_v2 failed for {prefix}: {e}"))?;
+
+        for obj in page.contents() {
+            let Some(key) = obj.key() else { continue };
+            if object_count >= MAX_CHAIN_OBJECTS {
+                tracing::warn!(
+                    target: "talos_audit",
+                    execution_id,
+                    cap = MAX_CHAIN_OBJECTS,
+                    "audit chain verification hit the object cap — report is over a truncated prefix"
+                );
+                break;
+            }
+            object_count += 1;
+            let got = s3_client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("get_object failed for {key}: {e}"))?;
+            let bytes = got
+                .body
+                .collect()
+                .await
+                .map_err(|e| anyhow::anyhow!("reading body of {key} failed: {e}"))?
+                .into_bytes();
+            bodies.push(bytes.to_vec());
+        }
+
+        match page.next_continuation_token() {
+            Some(t) if object_count < MAX_CHAIN_OBJECTS => continuation = Some(t.to_string()),
+            _ => break,
+        }
+    }
+
+    let events = extract_events_from_jsonl(&bodies);
+    let keys = audit_verify_keys();
+    Ok(verify_chain(workflow_id, execution_id, &events, &keys))
+}
+
+#[cfg(test)]
+mod chain_reader_tests {
+    use super::*;
+    use talos_audit_event::{ChainBreak, ExecutionLedger};
+
+    /// Serialize a chain into `.jsonl` object bodies the way `process_batch`
+    /// persists them (`{ "event": ..., "hash": ... }` per line), optionally
+    /// split across multiple objects, to exercise the parse+reassemble path.
+    fn jsonl_objects(events: &[AuditEvent], chunk: usize) -> Vec<Vec<u8>> {
+        events
+            .chunks(chunk.max(1))
+            .map(|group| {
+                let mut body = Vec::new();
+                for e in group {
+                    let wrapper = serde_json::json!({ "event": e, "hash": e.calculate_hash() });
+                    body.extend(serde_json::to_vec(&wrapper).unwrap());
+                    body.push(b'\n');
+                }
+                body
+            })
+            .collect()
+    }
+
+    fn chain(n: u64) -> Vec<AuditEvent> {
+        let mut l = ExecutionLedger::new("wf", "ex");
+        (1..=n)
+            .map(|i| l.append("worker", "act", &format!("p{i}")))
+            .collect()
+    }
+
+    #[test]
+    fn reassembles_and_verifies_valid_chain_across_objects() {
+        let events = chain(7);
+        let objects = jsonl_objects(&events, 3); // 3 objects
+        let parsed = extract_events_from_jsonl(&objects);
+        assert_eq!(parsed.len(), 7);
+        let report = verify_chain("wf", "ex", &parsed, &[]);
+        assert!(report.ok, "breaks: {:?}", report.breaks);
+    }
+
+    #[test]
+    fn detects_a_missing_object_as_a_gap() {
+        let events = chain(6);
+        let mut objects = jsonl_objects(&events, 2); // 3 objects of 2 events
+        objects.remove(1); // drop the object holding seq 3,4
+        let parsed = extract_events_from_jsonl(&objects);
+        let report = verify_chain("wf", "ex", &parsed, &[]);
+        assert!(!report.ok);
+        assert!(report
+            .breaks
+            .iter()
+            .any(|b| matches!(b, ChainBreak::SequenceGap { .. })));
+    }
+
+    #[test]
+    fn skips_malformed_lines_without_panicking() {
+        let mut objects = jsonl_objects(&chain(2), 5);
+        objects.push(b"not json at all\n{}\n".to_vec());
+        let parsed = extract_events_from_jsonl(&objects);
+        assert_eq!(parsed.len(), 2); // the two valid events survive
+    }
 }
 
 #[cfg(test)]
