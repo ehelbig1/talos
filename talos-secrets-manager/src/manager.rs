@@ -1430,14 +1430,24 @@ impl SecretsManager {
         Ok(())
     }
 
-    /// Encrypt a raw value using the active DEK.
+    /// Encrypt a raw value using the active DEK — **legacy: no AAD, no
+    /// per-context key derivation.**
     ///
-    /// Returns `(key_id, nonce_12_bytes || ciphertext)` so callers can store both
-    /// the key reference and the opaque blob. Use `decrypt_value_by_key` to reverse.
+    /// Returns `(key_id, nonce_12_bytes || ciphertext)`. Reverse with
+    /// `decrypt_value_by_key`.
     ///
-    /// Intended for encrypting OAuth tokens in integration-specific tables
-    /// (e.g. `gmail_integrations.access_token_enc`) where the secrets table
-    /// cannot easily be referenced via key_path.
+    /// ⚠️ New code MUST NOT use this. It encrypts under the single shared
+    /// active DEK with a random 96-bit nonce, so the AES-GCM random-nonce
+    /// birthday budget is consumed *globally* across every row, and it binds
+    /// no AAD — a DB-write attacker can swap ciphertexts between rows sharing
+    /// a `key_id`. There are no production callers today (OAuth tokens flow
+    /// through `create_secret`, which uses the v3 path). Use
+    /// [`Self::encrypt_value_aad_v3`] instead (per-context-derived key +
+    /// AAD-bound); the legacy v0 ciphertext it would produce is still readable
+    /// via `decrypt_value_by_key` for any stranded historical row.
+    #[deprecated(
+        note = "no AAD + global-DEK nonce budget; use encrypt_value_aad_v3 (per-context-derived key, AAD-bound)"
+    )]
     pub async fn encrypt_value(&self, value: &str) -> Result<(Uuid, Vec<u8>)> {
         let dek = self.get_active_dek().await?;
         let cipher = Aes256Gcm::new_from_slice(&dek.key)?;
@@ -1643,9 +1653,18 @@ impl SecretsManager {
     }
 
     /// Convenience wrapper around `encrypt_value_with_aad` for callers
-    /// that always want the v1 format. Returns the encrypted bytes
-    /// alongside the version constant so the caller can bind both
-    /// into a single SQL write. Pattern:
+    /// that always want the v1 format.
+    ///
+    /// ⚠️ Prefer [`Self::encrypt_value_aad_v3`] for new writers — same
+    /// `(key_id, ciphertext, version)` return shape and byte-identical wire
+    /// format, but v3 derives a per-context HKDF subkey so the AES-GCM
+    /// random-nonce birthday budget is bounded per context rather than
+    /// shared globally across every v1 row under the active DEK. v1 is
+    /// retained only for the one-shot `backfill_workflow_output_encryption`
+    /// migration tool; there are no steady-state v1 writers.
+    ///
+    /// Returns the encrypted bytes alongside the version constant so the
+    /// caller can bind both into a single SQL write. Pattern:
     ///
     /// ```rust,ignore
     /// let row_id = Uuid::new_v4();
@@ -1748,7 +1767,15 @@ impl SecretsManager {
         Ok(Zeroizing::new(plaintext.to_string()))
     }
 
-    /// Encrypt a raw value with Additional Authenticated Data (AAD).
+    /// Encrypt a raw value with Additional Authenticated Data (AAD) — the
+    /// **v1 (global-DEK) primitive.**
+    ///
+    /// ⚠️ Prefer [`Self::encrypt_value_aad_v3`] for new writers: v3 adds a
+    /// per-context HKDF key derivation on top of the same AAD binding, so the
+    /// random-nonce budget is per-context rather than shared across every row
+    /// under the active DEK. This function remains only as the building block
+    /// for the `encrypt_value_aad_v1` wrapper (the backfill migration tool) —
+    /// it has no direct steady-state production writers.
     ///
     /// AES-GCM binds the AAD into its authentication tag — the
     /// ciphertext can only be decrypted by passing the same AAD bytes.

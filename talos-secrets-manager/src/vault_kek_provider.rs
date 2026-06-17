@@ -272,7 +272,11 @@ impl KekProvider for VaultTransitProvider {
         &self,
         dek: &[u8; 32],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>> {
-        let plaintext_b64 = B64.encode(dek);
+        // The base64 of the plaintext DEK is as sensitive as the DEK bytes
+        // themselves — keep it in Zeroizing so the heap allocation is wiped
+        // on drop rather than lingering until the allocator reuses the page.
+        // Matches the Zeroizing discipline on every other plaintext-DEK path.
+        let plaintext_b64 = Zeroizing::new(B64.encode(dek));
         Box::pin(async move {
             let url = format!("{}/v1/{}/encrypt/{}", self.addr, self.mount, self.key_name);
             let resp = self
@@ -280,7 +284,7 @@ impl KekProvider for VaultTransitProvider {
                 .post(&url)
                 .header("X-Vault-Token", self.token.as_str())
                 .json(&EncryptRequest {
-                    plaintext: &plaintext_b64,
+                    plaintext: plaintext_b64.as_str(),
                 })
                 .send()
                 .await
@@ -359,23 +363,29 @@ impl KekProvider for VaultTransitProvider {
                     truncated
                 ));
             }
-            let body: VaultResponse<DecryptData> = resp
+            let mut body: VaultResponse<DecryptData> = resp
                 .json()
                 .await
                 .context("Vault transit decrypt: malformed JSON response")?;
             if !body.errors.is_empty() {
                 return Err(anyhow!("Vault transit decrypt: {}", body.errors.join("; ")));
             }
-            let plaintext = B64
-                .decode(&body.data.plaintext)
-                .context("Vault transit decrypt: returned plaintext is not valid base64")?;
+            // Both the base64 string and the decoded bytes are plaintext DEK
+            // material. Move the base64 out of the deserialized response into a
+            // Zeroizing buffer (so the copy held in `body` is wiped, not left
+            // for the allocator), and decode into another Zeroizing buffer.
+            let plaintext_b64 = Zeroizing::new(std::mem::take(&mut body.data.plaintext));
+            let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+                B64.decode(plaintext_b64.as_bytes())
+                    .context("Vault transit decrypt: returned plaintext is not valid base64")?,
+            );
             if plaintext.len() != 32 {
                 return Err(anyhow!(
                     "Vault transit decrypt: returned {} bytes, expected 32",
                     plaintext.len()
                 ));
             }
-            Ok(Zeroizing::new(plaintext))
+            Ok(plaintext)
         })
     }
 

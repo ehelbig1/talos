@@ -21,8 +21,11 @@ use talos_workflow_engine_core::{BoxError, CheckpointStore};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-/// Minimum key length for AES-256-GCM. Keys longer than this are
-/// truncated to the first 32 bytes.
+/// Required key length for AES-256-GCM. `encrypt_checkpoint` /
+/// `decrypt_checkpoint` require the root key to be EXACTLY this many bytes
+/// (M-11): a longer key is rejected, not silently truncated to its first 32
+/// bytes, so an operator-misconfigured key (e.g. a hex string interpreted as
+/// raw bytes) surfaces loudly instead of producing undecryptable checkpoints.
 const AES_KEY_LEN: usize = 32;
 
 /// AES-GCM nonce length used by the `aes_gcm` crate's default.

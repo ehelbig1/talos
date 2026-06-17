@@ -35,6 +35,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::kek_provider::KekProvider;
 
@@ -133,7 +134,10 @@ pub async fn rewrap_all_deks_to_v2(
                     plaintext.len()
                 ));
             }
-            let mut dek_arr = [0u8; 32];
+            // Hold the recovered plaintext DEK in Zeroizing so the stack copy
+            // is wiped on drop each iteration, matching `unwrap_dek`'s own
+            // Zeroizing return rather than leaving bare key bytes around.
+            let mut dek_arr = Zeroizing::new([0u8; 32]);
             dek_arr.copy_from_slice(&plaintext);
 
             // Step 2: wrap with target provider.
