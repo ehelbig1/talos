@@ -576,17 +576,12 @@ impl SecurityMutations {
 
         // OTLP auth headers are sealed with the canonical SecretsManager
         // envelope (v3): a KEK-backed DEK (env OR Vault transit) + a per-context
-        // HKDF subkey + this tenant's `user_id` bound as AAD. This replaces the
-        // prior bespoke env-master-key HKDF scheme so a Vault-only deployment
-        // that has dropped TALOS_MASTER_KEY can still encrypt these headers. The
-        // audit-ledger read path dual-reads: v3 rows (auth_headers_enc_key_id
-        // set) decrypt via the same SecretsManager; legacy rows fall back to the
-        // env-key helper. Both ends bind `user_id` as AAD, so a stored blob
-        // still can't be transposed between tenants.
+        // HKDF subkey + this tenant's `user_id` bound as AAD — the only OTLP
+        // encryption path (the legacy env-master-key scheme has been removed).
+        // Because the DEK is KEK-backed, a Vault-only deployment that has dropped
+        // TALOS_MASTER_KEY can still encrypt these headers. The `user_id` AAD
+        // means a stored blob can't be transposed between tenants.
         let mut encrypted_headers: Option<Vec<u8>> = None;
-        // Legacy column — the v3 blob carries its own 12-byte nonce prefix, so
-        // new writes always leave auth_headers_nonce NULL.
-        let headers_nonce: Option<Vec<u8>> = None;
         let mut headers_enc_key_id: Option<Uuid> = None;
         let mut headers_format: i16 = 0;
 
@@ -622,7 +617,7 @@ impl SecurityMutations {
             }
         }
 
-        // Runtime query (not the `sqlx::query!` macro) so the new
+        // Runtime query (not the `sqlx::query!` macro) so the
         // auth_headers_enc_key_id / auth_headers_format columns don't require
         // regenerating the offline `.sqlx` cache against a live migrated DB.
         // Same bare-pool pattern as rotateEncryptionKey's count query above;
@@ -632,16 +627,15 @@ impl SecurityMutations {
             r#"
             INSERT INTO user_audit_settings (
                 user_id, streaming_enabled, otlp_endpoint, otlp_protocol,
-                auth_headers_encrypted, auth_headers_nonce,
+                auth_headers_encrypted,
                 auth_headers_enc_key_id, auth_headers_format, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
             ON CONFLICT (user_id) DO UPDATE SET
                 streaming_enabled = EXCLUDED.streaming_enabled,
                 otlp_endpoint = EXCLUDED.otlp_endpoint,
                 otlp_protocol = EXCLUDED.otlp_protocol,
                 auth_headers_encrypted = EXCLUDED.auth_headers_encrypted,
-                auth_headers_nonce = EXCLUDED.auth_headers_nonce,
                 auth_headers_enc_key_id = EXCLUDED.auth_headers_enc_key_id,
                 auth_headers_format = EXCLUDED.auth_headers_format,
                 updated_at = NOW()
@@ -652,7 +646,6 @@ impl SecurityMutations {
         .bind(otlp_endpoint)
         .bind(otlp_protocol)
         .bind(encrypted_headers)
-        .bind(headers_nonce)
         .bind(headers_enc_key_id)
         .bind(headers_format)
         .execute(db_pool)

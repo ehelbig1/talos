@@ -7,7 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-aes-gcm = "0.10"
 anyhow.workspace = true
 lru = "0.16"
 opentelemetry = "0.32"
@@ -31,12 +30,8 @@ aws-sdk-s3 = { version = "1.30", default-features = false, features = [
 ] }
 chrono.workspace = true
 futures = "0.3"
-hex = "0.4"
-hkdf = "0.12"
-rand = { version = "0.8", default-features = true, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-audit-event = { path = "../talos-audit-event" }
