@@ -16,7 +16,11 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use talos_audit_event::{audit_verify_keys, verify_chain, AuditEvent, ChainVerificationReport};
+// `pub use` so consumers (e.g. the talos-api GraphQL admin query) can name the
+// report types without a direct dep on talos-audit-event.
+pub use talos_audit_event::{
+    audit_verify_keys, verify_chain, AuditEvent, ChainBreak, ChainVerificationReport,
+};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -687,6 +691,143 @@ pub async fn verify_execution_chain_from_env(
     })?;
     let bucket = audit_bucket_name();
     verify_execution_chain(&client, &bucket, workflow_id, execution_id).await
+}
+
+/// Tally from one [`run_chain_verification_sweep`] pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ChainSweepStats {
+    /// Executions queried (terminal + within the window + cap).
+    pub scanned: usize,
+    /// Chains that verified with no breaks.
+    pub verified_ok: usize,
+    /// Chains WITH breaks — tamper / corruption / gap / linkage / bad HMAC.
+    pub failed: usize,
+    /// Executions whose chain could not be read (S3/IO error) — unverified.
+    pub errored: usize,
+}
+
+/// Periodic sweep that runs the offline chain verifier over recently-completed
+/// executions and emits a loud structured event for any break (finding #2).
+/// This is what makes the WORM ledger **continuously** verified rather than
+/// only on demand — it runs as a trusted controller-side system task, so it
+/// needs no per-tenant scoping and no MCP/RBAC surface.
+///
+/// Scope: terminal executions (`completed`/`failed`/`cancelled`) whose
+/// `completed_at` falls in `[now - lookback, now - settle]`, newest first,
+/// capped at `max_executions`. The `settle` floor avoids false "sequence gap"
+/// reports on executions whose audit events are still being batched to S3 (the
+/// consumer flushes every few seconds) — only chains old enough to be fully
+/// flushed are checked. Run the sweep on an interval that overlaps the lookback
+/// window slightly so nothing at a boundary is missed; re-verification is
+/// idempotent and cheap.
+pub async fn run_chain_verification_sweep(
+    db_pool: &PgPool,
+    s3_client: &S3Client,
+    bucket: &str,
+    lookback_secs: i64,
+    settle_secs: i64,
+    max_executions: i64,
+) -> ChainSweepStats {
+    let mut stats = ChainSweepStats::default();
+
+    // `INTERVAL '1 second' * $N` (not make_interval) — the int4-only
+    // make_interval args don't apply, and this form takes a bigint bind.
+    // Unique ORDER BY tiebreaker (id) per the pagination-stability rule.
+    let rows = match sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT id, workflow_id \
+         FROM workflow_executions \
+         WHERE status IN ('completed', 'failed', 'cancelled') \
+           AND completed_at IS NOT NULL \
+           AND completed_at <= NOW() - (INTERVAL '1 second' * $1) \
+           AND completed_at >= NOW() - (INTERVAL '1 second' * $2) \
+         ORDER BY completed_at DESC, id DESC \
+         LIMIT $3",
+    )
+    .bind(settle_secs)
+    .bind(lookback_secs)
+    .bind(max_executions)
+    .fetch_all(db_pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_audit",
+                event_kind = "audit_chain_sweep_query_failed",
+                error = %e,
+                "audit chain sweep could not enumerate executions — skipping this pass"
+            );
+            return stats;
+        }
+    };
+
+    stats.scanned = rows.len();
+    for (exec_id, wf_id) in rows {
+        match verify_execution_chain(s3_client, bucket, &wf_id.to_string(), &exec_id.to_string())
+            .await
+        {
+            Ok(report) if report.ok => stats.verified_ok += 1,
+            Ok(report) => {
+                stats.failed += 1;
+                // The security signal — one ERROR per broken chain so SIEM
+                // can alert per execution. `breaks` is a structured list.
+                tracing::error!(
+                    target: "talos_audit",
+                    event_kind = "audit_chain_verification_failed",
+                    execution_id = %exec_id,
+                    workflow_id = %wf_id,
+                    total_events = report.total_events,
+                    signatures_checked = report.signatures_checked,
+                    breaks = ?report.breaks,
+                    "audit chain verification FAILED for a completed execution — \
+                     possible tampering, deletion, reorder, or corruption"
+                );
+            }
+            Err(e) => {
+                stats.errored += 1;
+                tracing::warn!(
+                    target: "talos_audit",
+                    event_kind = "audit_chain_verification_errored",
+                    execution_id = %exec_id,
+                    workflow_id = %wf_id,
+                    error = %e,
+                    "could not verify an execution's audit chain (S3/IO) — left unverified"
+                );
+            }
+        }
+    }
+    stats
+}
+
+/// Convenience wrapper: build the S3 client + bucket from env and run
+/// [`run_chain_verification_sweep`]. Returns `None` (and logs once at DEBUG)
+/// when no S3 endpoint is configured, so the caller can spawn it
+/// unconditionally — it self-disables without a WORM store.
+pub async fn run_chain_verification_sweep_from_env(
+    db_pool: &PgPool,
+    lookback_secs: i64,
+    settle_secs: i64,
+    max_executions: i64,
+) -> Option<ChainSweepStats> {
+    let Some(client) = build_audit_s3_client().await else {
+        tracing::debug!(
+            target: "talos_audit",
+            "audit chain verification sweep skipped — no S3 endpoint configured"
+        );
+        return None;
+    };
+    let bucket = audit_bucket_name();
+    Some(
+        run_chain_verification_sweep(
+            db_pool,
+            &client,
+            &bucket,
+            lookback_secs,
+            settle_secs,
+            max_executions,
+        )
+        .await,
+    )
 }
 
 pub async fn start_audit_ledger_subscriber(nc: Client, db_pool: PgPool) -> Result<()> {

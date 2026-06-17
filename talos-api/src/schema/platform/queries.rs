@@ -221,6 +221,73 @@ impl PlatformQueries {
             .collect())
     }
 
+    /// Verify the cryptographic audit chain for one execution (finding #2,
+    /// on-demand forensic check). Platform admin only — it reads the WORM
+    /// audit store across tenants, so it goes through the canonical
+    /// `is_platform_admin` gate (NOT the org-admin conflation the MCP-998
+    /// sweep removed). Returns the structured break list (sequence gaps,
+    /// linkage/genesis mismatch, bad/missing HMAC); the inline ingest check
+    /// and the continuous sweep cover the always-on side.
+    async fn verify_audit_chain(
+        &self,
+        ctx: &Context<'_>,
+        execution_id: Uuid,
+    ) -> Result<AuditChainVerification> {
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        let user_id = ctx
+            .data_opt::<Uuid>()
+            .copied()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
+
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let is_admin = actor_repo.is_platform_admin(user_id).await.map_err(|e| {
+            tracing::error!("verify_audit_chain admin check failed: {}", e);
+            async_graphql::Error::new("Database error").extend_safe()
+        })?;
+        if !is_admin {
+            return Err(
+                async_graphql::Error::new("Only platform admins can verify audit chains")
+                    .extend_safe(),
+            );
+        }
+
+        // The chain genesis is bound to (workflow_id, execution_id), so we
+        // need the owning workflow id. Look it up from the execution.
+        let workflow_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT workflow_id FROM workflow_executions WHERE id = $1")
+                // allow-bare-pool-rls: platform-admin-only forensic read (authz
+                // established upstream via is_platform_admin). The audit ledger
+                // is intentionally cross-tenant — an admin investigating an
+                // alert must resolve ANY execution's workflow_id, so a
+                // tenant-scoped tx would wrongly restrict it to the admin's own
+                // org. Single-column, non-sensitive (a UUID), no payload.
+                .bind(execution_id)
+                .fetch_optional(db_pool)
+                .await
+                .map_err(|e| e.extend_safe())?;
+        let workflow_id = workflow_id
+            .ok_or_else(|| async_graphql::Error::new("Execution not found").extend_safe())?;
+
+        let report = talos_audit_ledger::verify_execution_chain_from_env(
+            &workflow_id.to_string(),
+            &execution_id.to_string(),
+        )
+        .await
+        .map_err(|e| {
+            // Generic client message; full detail (incl. "no S3 endpoint
+            // configured") stays server-side per the no-leak rule.
+            tracing::error!(
+                target: "talos_audit",
+                execution_id = %execution_id,
+                "verify_audit_chain failed: {}", e
+            );
+            async_graphql::Error::new("Audit chain verification unavailable").extend_safe()
+        })?;
+
+        Ok(AuditChainVerification::from(report))
+    }
+
     async fn resource_quotas(&self, ctx: &Context<'_>) -> Result<ResourceQuota> {
         // MCP-757 sibling: paired mutation `update_resource_quotas` is
         // `require_2fa` + Admin-scoped; this read surface had no scope

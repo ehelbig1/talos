@@ -1131,3 +1131,156 @@ pub struct GrantCapabilityCeilingInput {
     pub max_capability_world: String,
     pub notes: Option<String>,
 }
+
+/// One integrity failure found while verifying a persisted audit chain.
+/// Flattened from `talos_audit_ledger::ChainBreak` for the GraphQL surface.
+#[derive(SimpleObject, Clone)]
+pub struct AuditChainBreak {
+    /// `sequence_gap` | `duplicate_sequence` | `genesis_mismatch` |
+    /// `linkage_mismatch` | `bad_signature` | `unsigned`.
+    pub kind: String,
+    /// The sequence number the break is associated with, if applicable.
+    pub sequence: Option<i64>,
+    /// Expected value (prior/genesis hash, or expected sequence), if applicable.
+    pub expected: Option<String>,
+    /// Found value, if applicable.
+    pub found: Option<String>,
+}
+
+impl From<&talos_audit_ledger::ChainBreak> for AuditChainBreak {
+    fn from(b: &talos_audit_ledger::ChainBreak) -> Self {
+        use talos_audit_ledger::ChainBreak as CB;
+        match b {
+            CB::SequenceGap { expected, found } => Self {
+                kind: "sequence_gap".to_string(),
+                sequence: i64::try_from(*found).ok(),
+                expected: Some(expected.to_string()),
+                found: Some(found.to_string()),
+            },
+            CB::DuplicateSequence { seq } => Self {
+                kind: "duplicate_sequence".to_string(),
+                sequence: i64::try_from(*seq).ok(),
+                expected: None,
+                found: None,
+            },
+            CB::GenesisMismatch {
+                seq,
+                expected,
+                found,
+            } => Self {
+                kind: "genesis_mismatch".to_string(),
+                sequence: i64::try_from(*seq).ok(),
+                expected: Some(expected.clone()),
+                found: Some(found.clone()),
+            },
+            CB::LinkageMismatch {
+                seq,
+                expected_previous,
+                found_previous,
+            } => Self {
+                kind: "linkage_mismatch".to_string(),
+                sequence: i64::try_from(*seq).ok(),
+                expected: Some(expected_previous.clone()),
+                found: Some(found_previous.clone()),
+            },
+            CB::BadSignature { seq } => Self {
+                kind: "bad_signature".to_string(),
+                sequence: i64::try_from(*seq).ok(),
+                expected: None,
+                found: None,
+            },
+            CB::Unsigned { seq } => Self {
+                kind: "unsigned".to_string(),
+                sequence: i64::try_from(*seq).ok(),
+                expected: None,
+                found: None,
+            },
+        }
+    }
+}
+
+/// Result of verifying the cryptographic audit chain for one execution
+/// (finding #2). `ok` is true iff there are no `breaks` and — when signing
+/// keys are configured — every event's HMAC verified.
+#[derive(SimpleObject, Clone)]
+pub struct AuditChainVerification {
+    pub execution_id: String,
+    pub workflow_id: String,
+    pub total_events: i32,
+    pub ok: bool,
+    /// Whether HMAC verification was attempted (signing keys configured).
+    pub signatures_checked: bool,
+    pub breaks: Vec<AuditChainBreak>,
+}
+
+impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainVerification {
+    fn from(r: talos_audit_ledger::ChainVerificationReport) -> Self {
+        Self {
+            execution_id: r.execution_id,
+            workflow_id: r.workflow_id,
+            total_events: i32::try_from(r.total_events).unwrap_or(i32::MAX),
+            ok: r.ok,
+            signatures_checked: r.signatures_checked,
+            breaks: r.breaks.iter().map(AuditChainBreak::from).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_chain_mapping_tests {
+    use super::*;
+    use talos_audit_ledger::ChainBreak;
+
+    #[test]
+    fn sequence_gap_maps_found_to_sequence_and_both_to_expected_found() {
+        let b = AuditChainBreak::from(&ChainBreak::SequenceGap {
+            expected: 2,
+            found: 4,
+        });
+        assert_eq!(b.kind, "sequence_gap");
+        assert_eq!(b.sequence, Some(4));
+        assert_eq!(b.expected.as_deref(), Some("2"));
+        assert_eq!(b.found.as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn linkage_mismatch_maps_prev_hashes_to_expected_found() {
+        let b = AuditChainBreak::from(&ChainBreak::LinkageMismatch {
+            seq: 3,
+            expected_previous: "aaa".to_string(),
+            found_previous: "bbb".to_string(),
+        });
+        assert_eq!(b.kind, "linkage_mismatch");
+        assert_eq!(b.sequence, Some(3));
+        assert_eq!(b.expected.as_deref(), Some("aaa"));
+        assert_eq!(b.found.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn signature_variants_carry_only_the_sequence() {
+        let bad = AuditChainBreak::from(&ChainBreak::BadSignature { seq: 5 });
+        assert_eq!(bad.kind, "bad_signature");
+        assert_eq!(bad.sequence, Some(5));
+        assert!(bad.expected.is_none() && bad.found.is_none());
+
+        let unsigned = AuditChainBreak::from(&ChainBreak::Unsigned { seq: 6 });
+        assert_eq!(unsigned.kind, "unsigned");
+        assert_eq!(unsigned.sequence, Some(6));
+    }
+
+    #[test]
+    fn report_total_events_saturates_not_wraps() {
+        let report = talos_audit_ledger::ChainVerificationReport {
+            execution_id: "ex".to_string(),
+            workflow_id: "wf".to_string(),
+            total_events: usize::MAX,
+            ok: false,
+            signatures_checked: true,
+            breaks: vec![],
+        };
+        let v = AuditChainVerification::from(report);
+        assert_eq!(v.total_events, i32::MAX);
+        assert!(!v.ok);
+        assert!(v.signatures_checked);
+    }
+}
