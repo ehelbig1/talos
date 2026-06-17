@@ -8447,6 +8447,7 @@ dependencies = [
  "chrono",
  "dashmap 6.2.1",
  "hex",
+ "hkdf",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",

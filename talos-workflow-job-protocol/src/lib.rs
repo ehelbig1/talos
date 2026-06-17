@@ -32,14 +32,46 @@ type HmacSha256 = Hmac<Sha256>;
 /// rotating `WORKER_SHARED_KEY` itself).
 const ENVELOPE_AEAD_KEY_LABEL: &[u8] = b"talos/worker-shared-key/envelope-aead/v1";
 
-/// Expand the root `WORKER_SHARED_KEY` into the 32-byte AES-256-GCM
-/// subkey used for secret envelopes. Pure and deterministic.
-fn derive_envelope_aead_key(root: &[u8]) -> [u8; 32] {
+/// v2 label (finding #1): the per-job envelope subkey folds the job's AAD
+/// (the execution context bytes) into the HKDF `info`, so each job gets
+/// its OWN AES key. The AES-GCM random-nonce birthday budget is then
+/// per-job rather than shared across every envelope the fleet seals under
+/// one `WORKER_SHARED_KEY`. Distinct label from v1 so the two subkeys
+/// never collide.
+const ENVELOPE_AEAD_KEY_LABEL_V2: &[u8] = b"talos/worker-shared-key/envelope-aead/v2-per-job";
+
+/// v1 (legacy) envelope subkey: a single static subkey per root, shared by
+/// every envelope. Used for the no-AAD wrappers (`encrypt`/`decrypt`) and
+/// as the decrypt fallback for envelopes sealed before the v2 rollout.
+fn derive_envelope_aead_key_v1(root: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, root);
     let mut subkey = [0u8; 32];
     hk.expand(ENVELOPE_AEAD_KEY_LABEL, &mut subkey)
         .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
     subkey
+}
+
+/// v2 per-job envelope subkey: `aad` (the job/execution context) is the
+/// HKDF `info`, so the subkey is unique per job. Pure and deterministic;
+/// controller (seal) and worker (open) derive it identically.
+fn derive_envelope_aead_key_v2(root: &[u8], aad: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(ENVELOPE_AEAD_KEY_LABEL_V2), root);
+    let mut subkey = [0u8; 32];
+    hk.expand(aad, &mut subkey)
+        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
+    subkey
+}
+
+/// Select the envelope AES key for an AAD context. A non-empty `aad` (the
+/// production per-job path) uses the v2 per-job derivation; an empty `aad`
+/// (the legacy no-AAD `encrypt`/`decrypt` wrappers) preserves the exact v1
+/// static behavior so those byte-for-byte round-trips are unchanged.
+fn envelope_seal_key(root: &[u8], aad: &[u8]) -> [u8; 32] {
+    if aad.is_empty() {
+        derive_envelope_aead_key_v1(root)
+    } else {
+        derive_envelope_aead_key_v2(root, aad)
+    }
 }
 
 /// Length-prefix a variable-width string segment for a canonical signing
@@ -1183,9 +1215,11 @@ impl EncryptedSecrets {
             serde_json::to_vec(secrets).map_err(|e| format!("serialize secrets: {e}"))?;
 
         // The AES-GCM key is an HKDF subkey of the root, never the raw
-        // root (which is also the HMAC signing key). Encrypt and decrypt
-        // derive it identically, so the round-trip stays symmetric.
-        let aead_key = derive_envelope_aead_key(key);
+        // root (which is also the HMAC signing key). v2: a non-empty `aad`
+        // folds the per-job context into the subkey so the random-nonce
+        // budget is per-job. Encrypt and decrypt derive it identically, so
+        // the round-trip stays symmetric.
+        let aead_key = envelope_seal_key(key, aad);
         let cipher =
             Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
 
@@ -1245,26 +1279,41 @@ impl EncryptedSecrets {
             return Err("invalid nonce length".to_string());
         }
 
-        // The AES-GCM key is an HKDF subkey of the root, never the raw
-        // root (which is also the HMAC signing key). Encrypt and decrypt
-        // derive it identically, so the round-trip stays symmetric.
-        let aead_key = derive_envelope_aead_key(key);
-        let cipher =
-            Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
-
         let nonce = Nonce::from_slice(&self.nonce);
 
-        let plaintext = cipher
-            .decrypt(
+        // The AES-GCM key is an HKDF subkey of the root, never the raw root
+        // (which is also the HMAC signing key). For a non-empty `aad` (the
+        // production per-job path) try the v2 per-job key first, then fall
+        // back to the v1 static key so envelopes sealed by a not-yet-rolled
+        // controller still open during the rolling deploy. (Roll workers
+        // first/together: a worker that only knows v1 cannot open a v2
+        // envelope.) For an empty `aad` there is only the v1 key. AES-GCM's
+        // tag makes the extra attempt safe — a wrong key cannot forge a
+        // passing tag. `aad` is bound into the tag on every attempt.
+        let candidates: Vec<[u8; 32]> = if aad.is_empty() {
+            vec![derive_envelope_aead_key_v1(key)]
+        } else {
+            vec![
+                derive_envelope_aead_key_v2(key, aad),
+                derive_envelope_aead_key_v1(key),
+            ]
+        };
+
+        for aead_key in candidates {
+            let cipher =
+                Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
+            if let Ok(plaintext) = cipher.decrypt(
                 nonce,
                 Payload {
                     msg: self.ciphertext.as_ref(),
                     aad,
                 },
-            )
-            .map_err(|_| "decryption failed — wrong key or tampered ciphertext".to_string())?;
-
-        serde_json::from_slice(&plaintext).map_err(|e| format!("deserialize secrets: {e}"))
+            ) {
+                return serde_json::from_slice(&plaintext)
+                    .map_err(|e| format!("deserialize secrets: {e}"));
+            }
+        }
+        Err("decryption failed — wrong key or tampered ciphertext".to_string())
     }
 
     /// Decrypt against a [`WorkerKeyRing`] (the decrypt-ring), trying the
@@ -3230,7 +3279,7 @@ mod tests {
     #[test]
     fn envelope_subkey_is_domain_separated_and_deterministic() {
         let root = [7u8; 32];
-        let subkey = derive_envelope_aead_key(&root);
+        let subkey = derive_envelope_aead_key_v1(&root);
         assert_ne!(
             &subkey[..],
             &root[..],
@@ -3238,9 +3287,60 @@ mod tests {
         );
         assert_eq!(
             subkey,
-            derive_envelope_aead_key(&root),
+            derive_envelope_aead_key_v1(&root),
             "derivation must be deterministic across processes"
         );
+        // v2 per-job derivation: distinct jobs derive distinct keys, and
+        // each differs from the v1 static key (finding #1).
+        let k_a = derive_envelope_aead_key_v2(&root, b"job:aaa");
+        let k_b = derive_envelope_aead_key_v2(&root, b"job:bbb");
+        assert_ne!(
+            k_a, k_b,
+            "different jobs must derive different envelope keys"
+        );
+        assert_ne!(
+            k_a, subkey,
+            "v2 per-job key must differ from the v1 static key"
+        );
+        assert_eq!(
+            k_a,
+            derive_envelope_aead_key_v2(&root, b"job:aaa"),
+            "v2 derivation must be deterministic across processes"
+        );
+    }
+
+    /// Migration: an envelope sealed under the legacy v1 static key (a
+    /// not-yet-rolled controller) must still open via the v2-first decrypt
+    /// fallback once the worker is on the new code.
+    #[test]
+    fn legacy_v1_envelope_opens_via_fallback() {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        let key = test_key();
+        let mut secrets = HashMap::new();
+        secrets.insert("anthropic/api_key".to_string(), "sk-legacy".to_string());
+        let aad = b"job:legacy-1";
+
+        // Hand-seal a v1 envelope: static key + aad bound in the tag.
+        let v1_key = derive_envelope_aead_key_v1(&key);
+        let cipher = Aes256Gcm::new_from_slice(&v1_key).unwrap();
+        let nonce_bytes = [3u8; 12];
+        let plaintext = serde_json::to_vec(&secrets).unwrap();
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad,
+                },
+            )
+            .unwrap();
+        let env = EncryptedSecrets {
+            ciphertext,
+            nonce: nonce_bytes.to_vec(),
+        };
+        // v2-first decrypt must fall back to v1 and recover the secrets.
+        assert_eq!(env.decrypt_with_aad(&key, aad).unwrap(), secrets);
     }
 
     /// The strongest proof the slice does what Part 2 claims: a sealed

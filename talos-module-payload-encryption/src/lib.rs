@@ -143,7 +143,13 @@ pub async fn encrypt_payload_bundle(
     }
 
     let mut bundle = EncryptedPayloadBundle::default();
-    let format_version = talos_secrets_manager::SecretsManager::AAD_FORMAT_V2;
+    // v3: per-context-derived key (finding #1) on top of the v2 per-slot
+    // AAD binding. `payload_slot_aad` includes the slot tag for any
+    // `format_version >= V2`, so v3 keeps the within-row swap resistance;
+    // the derived key additionally bounds the random-nonce birthday budget
+    // to one (module_execution_id, slot) context. Readers dispatch on the
+    // per-row `payload_format`, so existing v1/v2 rows stay readable.
+    let format_version = talos_secrets_manager::SecretsManager::AAD_FORMAT_V3_DERIVED;
     bundle.format_version = format_version;
     for (slot, value) in [
         (PayloadSlot::Input, input),
@@ -154,8 +160,8 @@ pub async fn encrypt_payload_bundle(
         let plain = serde_json::to_string(v)
             .with_context(|| format!("payload_encryption: serialize {slot:?}"))?;
         let aad = payload_slot_aad(module_execution_id, slot, format_version);
-        let (kid, ciphertext) = sm
-            .encrypt_value_with_aad(&plain, &aad)
+        let (kid, ciphertext, _version) = sm
+            .encrypt_value_aad_v3(&plain, &aad)
             .await
             .with_context(|| format!("payload_encryption: encrypt {slot:?}"))?;
         if let Some(prev) = bundle.key_id {

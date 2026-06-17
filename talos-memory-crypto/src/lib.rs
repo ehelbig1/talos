@@ -25,9 +25,11 @@ use uuid::Uuid;
 use talos_secrets_manager::SecretsManager;
 
 /// Adapter from `talos_memory::MemoryCryptoHook` to `SecretsManager`.
-/// Delegates `encrypt` to `SecretsManager::encrypt_value_aad_v1`
-/// (returns `(key_id, ciphertext, version)`) and `decrypt` to
-/// `SecretsManager::decrypt_versioned`.
+/// Delegates `encrypt` to `SecretsManager::encrypt_value_aad_v3`
+/// (per-context-derived key + AAD-bound; returns
+/// `(key_id, ciphertext, version)`) and `decrypt` to
+/// `SecretsManager::decrypt_versioned` (which dispatches on the stored
+/// `value_format`, so legacy v1 rows keep decrypting).
 pub struct SecretsManagerMemoryCrypto {
     secrets: Arc<SecretsManager>,
 }
@@ -46,7 +48,7 @@ impl talos_memory::MemoryCryptoHook for SecretsManagerMemoryCrypto {
         aad: Vec<u8>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(Uuid, Vec<u8>, i16)>> + Send>> {
         let secrets = self.secrets.clone();
-        Box::pin(async move { secrets.encrypt_value_aad_v1(&plaintext, &aad).await })
+        Box::pin(async move { secrets.encrypt_value_aad_v3(&plaintext, &aad).await })
     }
 
     fn decrypt(

@@ -961,15 +961,15 @@ impl SecretsManager {
         // 1. Pre-generate secret_id so it's available as AAD.
         let secret_id = Uuid::new_v4();
 
-        // 2. Encrypt with secret_id bytes as AAD (v1 format).
-        let (key_id, stored_value) = self
-            .encrypt_value_with_aad(value, secret_id.as_bytes())
+        // 2. Encrypt with secret_id bytes as AAD + per-context-derived key (v3).
+        let (key_id, stored_value, _version) = self
+            .encrypt_value_aad_v3(value, secret_id.as_bytes())
             .await?;
         // Extract the 12-byte nonce prefix back out for the legacy
         // `nonce` column (kept for backward-compat with operator
         // tooling that inspects the column directly).
         let nonce_bytes = stored_value.get(..12).ok_or_else(|| {
-            anyhow!("encrypt_value_with_aad returned a ciphertext shorter than the nonce prefix")
+            anyhow!("encrypt_value_aad_v3 returned a ciphertext shorter than the nonce prefix")
         })?;
 
         // 3. Store secret + audit log in a single transaction (L-5).
@@ -1021,7 +1021,7 @@ impl SecretsManager {
         .bind(creator_user_id)
         .bind(&allowed_modules)
         .bind(org_id)
-        .bind(Self::SECRETS_AAD_FORMAT_V1)
+        .bind(Self::AAD_FORMAT_V3_DERIVED)
         .fetch_one(&mut *tx)
         .await;
 
@@ -1359,17 +1359,17 @@ impl SecretsManager {
             }
         };
 
-        // Encrypt with secret_id bytes as AAD (v1 format).
-        let (key_id, stored_value) = self
-            .encrypt_value_with_aad(new_value, secret_id.as_bytes())
+        // Encrypt with secret_id bytes as AAD + per-context-derived key (v3).
+        let (key_id, stored_value, _version) = self
+            .encrypt_value_aad_v3(new_value, secret_id.as_bytes())
             .await?;
         let nonce_bytes = stored_value.get(..12).ok_or_else(|| {
-            anyhow!("encrypt_value_with_aad returned a ciphertext shorter than the nonce prefix")
+            anyhow!("encrypt_value_aad_v3 returned a ciphertext shorter than the nonce prefix")
         })?;
 
         // Apply the update. The CHECK on encryption_format_version is
-        // upgraded to 1 unconditionally — a row written via this path
-        // is always v1 going forward. The pre-fetch SELECT FOR UPDATE
+        // upgraded to 3 unconditionally — a row written via this path
+        // is always v3 going forward. The pre-fetch SELECT FOR UPDATE
         // already locked the row; the UPDATE cannot miss under that
         // lock, so we don't need RETURNING — `secret_id` and
         // `owner_user_id_for_cache` are already in scope.
@@ -1382,7 +1382,7 @@ impl SecretsManager {
         .bind(&stored_value)
         .bind(key_id)
         .bind(nonce_bytes)
-        .bind(Self::SECRETS_AAD_FORMAT_V1)
+        .bind(Self::AAD_FORMAT_V3_DERIVED)
         .bind(secret_id)
         .execute(&mut *tx)
         .await?;
@@ -1500,6 +1500,50 @@ impl SecretsManager {
     /// payloads.
     pub const AAD_FORMAT_V2: i16 = 2;
 
+    /// AAD format version 3: AAD-bound **and per-context key-derived**.
+    ///
+    /// v1/v2 encrypt every row under the single shared active DEK with a
+    /// random 96-bit nonce, so the AES-GCM random-nonce birthday budget
+    /// (~2^32 messages before a 2^-32 collision probability, NIST SP
+    /// 800-38D) is consumed *globally* across every row sharing that DEK.
+    /// v3 closes this: the AES key is `HKDF-SHA256(ikm = dek.key, salt =
+    /// DEK_PER_ROW_AEAD_LABEL, info = aad)`, so each distinct AAD context
+    /// (secret_id / actor_id‖key / execution_id / per-slot tag) gets its
+    /// own derived key. The per-key message count collapses from "all
+    /// rows under the DEK, forever" to "the rewrites of one context"
+    /// (≈1), making nonce collision unreachable at any realistic — or
+    /// even adversarial — volume.
+    ///
+    /// The AAD is STILL bound into the GCM tag (defense in depth: the
+    /// swap-resistance property holds even if the KDF reasoning is later
+    /// questioned). At rest the wire format is byte-identical to v1/v2
+    /// (`[12-byte nonce][ciphertext+tag]`); only the key differs, so the
+    /// per-row `format_version` column is the sole signal a reader has to
+    /// derive the key rather than use `dek.key` directly. A v3 write
+    /// REQUIRES a non-empty AAD (an empty context defeats the partition).
+    pub const AAD_FORMAT_V3_DERIVED: i16 = 3;
+
+    /// HKDF-SHA256 salt / domain-separation label for v3 per-context DEK
+    /// subkey derivation. Distinct from any other HKDF label in the
+    /// workspace so a v3 subkey can never collide with the checkpoint /
+    /// envelope / OTLP subkeys even if the same root bytes were ever
+    /// (mis)used as IKM.
+    const DEK_PER_ROW_AEAD_LABEL: &[u8] = b"talos/dek/per-context-aead/v1";
+
+    /// Derive the per-context AES-256-GCM subkey for the v3 format from
+    /// the DEK and the row's AAD context. Deterministic — encrypt and
+    /// decrypt derive identically from the stored `key_id` + the same
+    /// AAD bytes the reader already reconstructs.
+    fn derive_per_context_subkey(dek_key: &[u8], aad: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(Self::DEK_PER_ROW_AEAD_LABEL), dek_key);
+        let mut subkey = Zeroizing::new([0u8; 32]);
+        hk.expand(aad, subkey.as_mut())
+            // HKDF-Expand only fails when the requested length exceeds
+            // 255*HashLen; 32 bytes is always valid, so this is unreachable.
+            .map_err(|_| anyhow!("HKDF expand for per-context subkey failed"))?;
+        Ok(subkey)
+    }
+
     /// Decrypt a `secrets.encrypted_value` blob, dispatching on the
     /// row's `encryption_format_version`. Centralises the v0/v1 fork
     /// so every read path uses the same logic.
@@ -1525,9 +1569,15 @@ impl SecretsManager {
                 self.decrypt_value_by_key_with_aad(key_id, encrypted, secret_id.as_bytes())
                     .await
             }
+            // v3: per-context-derived key bound to secret_id (same AAD as v1).
+            v if v == Self::AAD_FORMAT_V3_DERIVED => {
+                self.decrypt_value_derived_with_aad(key_id, encrypted, secret_id.as_bytes())
+                    .await
+            }
             other => Err(anyhow!(
-                "unknown secrets encryption_format_version {other}; this build only knows 0 (legacy no-AAD) and {} (v1 AAD-bound). Row may have been written by a newer code version.",
-                Self::SECRETS_AAD_FORMAT_V1
+                "unknown secrets encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), and {} (v3 per-context-derived). Row may have been written by a newer code version.",
+                Self::SECRETS_AAD_FORMAT_V1,
+                Self::AAD_FORMAT_V3_DERIVED
             )),
         }
     }
@@ -1575,10 +1625,19 @@ impl SecretsManager {
                 self.decrypt_value_by_key_with_aad(key_id, encrypted, aad)
                     .await
             }
+            // v3: same wire format as v1/v2, but the AES key is the
+            // per-context HKDF subkey of the DEK rather than the DEK
+            // itself. The AAD is reconstructed identically by the caller
+            // and used both to derive the key AND as the GCM tag binding.
+            v if v == Self::AAD_FORMAT_V3_DERIVED => {
+                self.decrypt_value_derived_with_aad(key_id, encrypted, aad)
+                    .await
+            }
             other => Err(anyhow!(
-                "unknown encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), and {} (v2 slot-bound AAD). Caller may be reading rows written by a newer code version.",
+                "unknown encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), {} (v2 slot-bound AAD), and {} (v3 per-context-derived). Caller may be reading rows written by a newer code version.",
                 Self::AAD_FORMAT_V1,
-                Self::AAD_FORMAT_V2
+                Self::AAD_FORMAT_V2,
+                Self::AAD_FORMAT_V3_DERIVED
             )),
         }
     }
@@ -1610,6 +1669,83 @@ impl SecretsManager {
     ) -> Result<(Uuid, Vec<u8>, i16)> {
         let (key_id, ciphertext) = self.encrypt_value_with_aad(value, aad).await?;
         Ok((key_id, ciphertext, Self::AAD_FORMAT_V1))
+    }
+
+    /// v3 encrypt: AAD-bound **and** per-context key-derived. Drop-in
+    /// replacement for [`Self::encrypt_value_aad_v1`] — same
+    /// `(key_id, ciphertext, version)` return shape and same wire format
+    /// — but the AES key is the per-context HKDF subkey of the active DEK
+    /// instead of the DEK itself, so the random-nonce birthday budget is
+    /// consumed per-context rather than globally. See
+    /// [`Self::AAD_FORMAT_V3_DERIVED`].
+    ///
+    /// Returns the active DEK's `key_id` (NOT a per-row key id) so DEK
+    /// lookup, caching, and rotation are unchanged — the per-context key
+    /// is re-derived from `dek.key` + the AAD at decrypt time. Requires a
+    /// non-empty `aad`: an empty context would derive a single shared
+    /// subkey and defeat the partition, so it is rejected loudly.
+    pub async fn encrypt_value_aad_v3(
+        &self,
+        value: &str,
+        aad: &[u8],
+    ) -> Result<(Uuid, Vec<u8>, i16)> {
+        if aad.is_empty() {
+            return Err(anyhow!(
+                "v3 per-context encryption requires a non-empty AAD context"
+            ));
+        }
+        let dek = self.get_active_dek().await?;
+        let subkey = Self::derive_per_context_subkey(&dek.key, aad)?;
+        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())?;
+        let nonce_bytes = Self::generate_nonce();
+        let payload = aes_gcm::aead::Payload {
+            msg: value.as_bytes(),
+            aad,
+        };
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), payload)
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+        let mut stored = nonce_bytes.to_vec();
+        stored.extend_from_slice(&ciphertext);
+        Ok((dek.id, stored, Self::AAD_FORMAT_V3_DERIVED))
+    }
+
+    /// Decrypt a v3 (`AAD_FORMAT_V3_DERIVED`) blob: re-derive the
+    /// per-context subkey from the DEK named by `key_id` and the `aad`,
+    /// then AES-GCM-decrypt with that subkey and the same AAD bound into
+    /// the tag. Mirrors [`Self::decrypt_value_by_key_with_aad`] but with
+    /// the HKDF derivation step; fails closed (generic error, no AAD
+    /// detail) on any mismatch.
+    async fn decrypt_value_derived_with_aad(
+        &self,
+        key_id: Uuid,
+        encrypted: &[u8],
+        aad: &[u8],
+    ) -> Result<Zeroizing<String>> {
+        if encrypted.len() < 12 {
+            return Err(anyhow!("Invalid encrypted value: too short"));
+        }
+        let nonce = Nonce::from_slice(&encrypted[..12]);
+        let ciphertext = &encrypted[12..];
+
+        let dek = self.get_dek(key_id).await?;
+        let subkey = Self::derive_per_context_subkey(&dek.key, aad)?;
+        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())?;
+        let payload = aes_gcm::aead::Payload {
+            msg: ciphertext,
+            aad,
+        };
+        // Same plaintext-hygiene discipline as the v1/v2 path: hold the
+        // GCM output in Zeroizing<Vec<u8>> so it is wiped on drop even on
+        // the UTF-8 error branch.
+        let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(
+            cipher
+                .decrypt(nonce, payload)
+                .map_err(|e| anyhow!("Decryption failed: {}", e))?,
+        );
+        let plaintext =
+            std::str::from_utf8(&decrypted).context("Invalid UTF-8 in decrypted value")?;
+        Ok(Zeroizing::new(plaintext.to_string()))
     }
 
     /// Encrypt a raw value with Additional Authenticated Data (AAD).
@@ -2755,12 +2891,12 @@ impl SecretsManager {
             None => (Uuid::new_v4(), true),
         };
 
-        // Encrypt with the row's id as AAD (v1 format).
-        let (key_id, stored_value) = self
-            .encrypt_value_with_aad(value, secret_id.as_bytes())
+        // Encrypt with the row's id as AAD + per-context-derived key (v3).
+        let (key_id, stored_value, _version) = self
+            .encrypt_value_aad_v3(value, secret_id.as_bytes())
             .await?;
         let nonce_bytes = stored_value.get(..12).ok_or_else(|| {
-            anyhow!("encrypt_value_with_aad returned a ciphertext shorter than the nonce prefix")
+            anyhow!("encrypt_value_aad_v3 returned a ciphertext shorter than the nonce prefix")
         })?;
 
         if was_inserted {
@@ -2785,7 +2921,7 @@ impl SecretsManager {
             .bind(creator_user_id)
             .bind(&allowed_modules)
             .bind(org_id)
-            .bind(Self::SECRETS_AAD_FORMAT_V1)
+            .bind(Self::AAD_FORMAT_V3_DERIVED)
             .execute(&mut *tx)
             .await
             .map_err(|e| anyhow::Error::new(e).context("upsert_secret INSERT failed"))?;
@@ -2808,7 +2944,7 @@ impl SecretsManager {
             .bind(key_id)
             .bind(nonce_bytes)
             .bind(description)
-            .bind(Self::SECRETS_AAD_FORMAT_V1)
+            .bind(Self::AAD_FORMAT_V3_DERIVED)
             .bind(secret_id)
             .execute(&mut *tx)
             .await
@@ -3107,12 +3243,13 @@ impl SecretsManager {
         // N T2-N1: bind `secret_id` as AAD on the rotated ciphertext.
         // Caller already supplies `secret_id` (typically resolved via
         // `resolve_to_id`), so the AAD is known at encrypt time
-        // without a pre-fetch. The post-rotate row is v1 format.
-        let (key_id, stored_value) = self
-            .encrypt_value_with_aad(new_value, secret_id.as_bytes())
+        // without a pre-fetch. The post-rotate row is v3 format
+        // (AAD-bound + per-context-derived key).
+        let (key_id, stored_value, _version) = self
+            .encrypt_value_aad_v3(new_value, secret_id.as_bytes())
             .await?;
         let nonce_bytes = stored_value.get(..12).ok_or_else(|| {
-            anyhow!("encrypt_value_with_aad returned a ciphertext shorter than the nonce prefix")
+            anyhow!("encrypt_value_aad_v3 returned a ciphertext shorter than the nonce prefix")
         })?;
 
         // UPDATE + audit row in a single transaction (L-5) so the
@@ -3132,7 +3269,7 @@ impl SecretsManager {
         .bind(&stored_value)
         .bind(key_id)
         .bind(nonce_bytes)
-        .bind(Self::SECRETS_AAD_FORMAT_V1)
+        .bind(Self::AAD_FORMAT_V3_DERIVED)
         .bind(secret_id)
         .bind(user_id)
         .fetch_optional(&mut *tx)
@@ -3778,15 +3915,18 @@ impl SecretsManager {
         use sqlx::Row as _;
         let active_dek = self.get_active_dek().await?;
 
-        // N T2-N1: fetch encryption_format_version too so the decrypt
-        // dispatches v0 (no AAD) vs v1 (id-bound AAD). Re-encrypt path
-        // ALWAYS writes v1 going forward — this is the operator
-        // upgrade pathway from v0 to v1.
+        // N T2-N1 + finding #1: fetch encryption_format_version too so the
+        // decrypt dispatches v0 (no AAD) / v1 (id-bound AAD) / v3
+        // (id-bound AAD + per-context-derived key). Re-encrypt ALWAYS
+        // writes v3 going forward — this is the operator upgrade pathway
+        // to the per-context-key format.
         //
-        // Selection criterion: rows that are NOT (active_dek AND v1) —
-        // i.e. either the DEK is stale OR the format version is 0.
-        // After this loop runs to completion, every row is on the
-        // active DEK AND v1 format.
+        // Selection criterion: rows that are NOT (active_dek AND v3) —
+        // i.e. the DEK is stale OR the format version is below v3.
+        // After this loop runs to completion, every row is on the active
+        // DEK AND v3 format. Binding the target version (V3) means a row
+        // freshly written as v3 on a STALE dek is still selected (key
+        // mismatch) and re-written as v3 — never downgraded.
         let stale_rows = sqlx::query(
             r#"
             SELECT id, encrypted_value, encryption_key_id, encryption_format_version
@@ -3795,7 +3935,7 @@ impl SecretsManager {
             "#,
         )
         .bind(active_dek.id)
-        .bind(Self::SECRETS_AAD_FORMAT_V1)
+        .bind(Self::AAD_FORMAT_V3_DERIVED)
         .fetch_all(&self.db_pool)
         .await
         .context("Failed to fetch secrets for re-encryption")?;
@@ -3864,11 +4004,11 @@ impl SecretsManager {
                 }
             };
 
-            // Re-encrypt with the new active DEK and v1 AAD format.
-            // `encrypt_value_with_aad` uses the active DEK; we don't
-            // need to re-derive it per-iteration.
-            let (key_id, new_stored) = match self
-                .encrypt_value_with_aad(&plaintext, secret_id.as_bytes())
+            // Re-encrypt with the new active DEK and v3 AAD format
+            // (per-context-derived key). `encrypt_value_aad_v3` uses the
+            // active DEK; we don't need to re-derive it per-iteration.
+            let (key_id, new_stored, _version) = match self
+                .encrypt_value_aad_v3(&plaintext, secret_id.as_bytes())
                 .await
             {
                 Ok(t) => t,
@@ -3911,7 +4051,7 @@ impl SecretsManager {
             )
             .bind(&new_stored)
             .bind(key_id)
-            .bind(Self::SECRETS_AAD_FORMAT_V1)
+            .bind(Self::AAD_FORMAT_V3_DERIVED)
             .bind(secret_id)
             .bind(encryption_key_id)
             .bind(encryption_format_version)
@@ -4852,6 +4992,130 @@ mod aad_binding_tests {
             err.to_string()
                 .contains("unknown encryption_format_version"),
             "got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod per_context_subkey_tests {
+    //! Finding #1: property tests for v3 per-context key derivation
+    //! (`AAD_FORMAT_V3_DERIVED`). These exercise the pure
+    //! `derive_per_context_subkey` helper + the raw AES-GCM primitive,
+    //! so the security guarantee is validated without a Postgres DEK.
+    //!
+    //! The guarantee: each AAD context gets its own AES key, so the
+    //! random-nonce birthday budget is consumed per-context (≈1 message)
+    //! rather than globally across every row sharing the DEK.
+    use super::SecretsManager;
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use uuid::Uuid;
+
+    fn root_dek() -> [u8; 32] {
+        // Stand-in for `dek.key`; value is irrelevant to the property.
+        [0x5au8; 32]
+    }
+
+    #[test]
+    fn derivation_is_deterministic_for_same_context() {
+        let dek = root_dek();
+        let aad = Uuid::new_v4();
+        let k1 = SecretsManager::derive_per_context_subkey(&dek, aad.as_bytes()).unwrap();
+        let k2 = SecretsManager::derive_per_context_subkey(&dek, aad.as_bytes()).unwrap();
+        assert_eq!(&*k1, &*k2, "same (dek, aad) must derive the same subkey");
+    }
+
+    #[test]
+    fn distinct_contexts_derive_distinct_keys() {
+        let dek = root_dek();
+        let a = SecretsManager::derive_per_context_subkey(&dek, Uuid::new_v4().as_bytes()).unwrap();
+        let b = SecretsManager::derive_per_context_subkey(&dek, Uuid::new_v4().as_bytes()).unwrap();
+        assert_ne!(
+            &*a, &*b,
+            "different AAD contexts must derive different keys"
+        );
+    }
+
+    #[test]
+    fn subkey_differs_from_raw_dek_and_tracks_the_dek() {
+        let dek_a = root_dek();
+        let dek_b = [0xa5u8; 32];
+        let aad = Uuid::new_v4();
+        let from_a = SecretsManager::derive_per_context_subkey(&dek_a, aad.as_bytes()).unwrap();
+        let from_b = SecretsManager::derive_per_context_subkey(&dek_b, aad.as_bytes()).unwrap();
+        // Never hand the raw DEK to the cipher.
+        assert_ne!(&from_a[..], &dek_a[..], "subkey must not equal the raw DEK");
+        // Same context under a different DEK is a different key (so DEK
+        // rotation still changes the effective key material).
+        assert_ne!(&*from_a, &*from_b, "subkey must depend on the DEK too");
+    }
+
+    #[test]
+    fn round_trip_under_derived_key_succeeds() {
+        let dek = root_dek();
+        let aad = Uuid::new_v4();
+        let subkey = SecretsManager::derive_per_context_subkey(&dek, aad.as_bytes()).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice()).unwrap();
+        let nonce = Nonce::from_slice(&[9u8; 12]);
+        let pt = b"per-context plaintext";
+        let ct = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: pt,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .unwrap();
+        let dec = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct.as_ref(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .unwrap();
+        assert_eq!(dec, pt);
+    }
+
+    #[test]
+    fn ciphertext_from_one_context_fails_under_another_contexts_key() {
+        // The core finding-#1 property: even if an attacker transposed a
+        // v3 ciphertext (nonce+bytes) to a row with a DIFFERENT context,
+        // the reader derives a different key from that row's context and
+        // the GCM tag fails closed — no decryption, no oracle.
+        let dek = root_dek();
+        let ctx_a = Uuid::new_v4();
+        let ctx_b = Uuid::new_v4();
+        let key_a = SecretsManager::derive_per_context_subkey(&dek, ctx_a.as_bytes()).unwrap();
+        let key_b = SecretsManager::derive_per_context_subkey(&dek, ctx_b.as_bytes()).unwrap();
+
+        let cipher_a = Aes256Gcm::new_from_slice(key_a.as_slice()).unwrap();
+        let nonce = Nonce::from_slice(&[11u8; 12]);
+        let ct = cipher_a
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: b"secret under context A",
+                    aad: ctx_a.as_bytes(),
+                },
+            )
+            .unwrap();
+
+        // Reader at context B derives key_b and binds ctx_b as AAD.
+        let cipher_b = Aes256Gcm::new_from_slice(key_b.as_slice()).unwrap();
+        assert!(
+            cipher_b
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: ct.as_ref(),
+                        aad: ctx_b.as_bytes(),
+                    },
+                )
+                .is_err(),
+            "ciphertext must not decrypt under a different context's derived key"
         );
     }
 }

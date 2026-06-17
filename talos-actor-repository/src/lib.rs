@@ -1327,10 +1327,10 @@ impl ActorRepository {
             // MCP-S2: bind the output ciphertext to exec_id so an
             // attacker with DB write capability can't swap user B's
             // execution output onto user A's row to leak it through
-            // the GraphQL read path. Same v1 AAD format constant as the
-            // secrets table; per-row format column dispatches.
+            // the GraphQL read path. v3 = AAD-bound + per-context-derived
+            // key; per-row format column dispatches so legacy rows still read.
             let (key_id, enc_bytes, format_version) = sm
-                .encrypt_value_aad_v1(&json_str, exec_id.as_bytes())
+                .encrypt_value_aad_v3(&json_str, exec_id.as_bytes())
                 .await?;
             sqlx::query(
                 "UPDATE workflow_executions \

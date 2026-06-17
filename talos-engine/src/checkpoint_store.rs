@@ -48,15 +48,38 @@ const NONCE_LEN: usize = 12;
 /// acceptable one-time cost.
 const CHECKPOINT_AEAD_KEY_LABEL: &[u8] = b"talos/worker-shared-key/checkpoint-aead/v1";
 
-/// Expand the root `WORKER_SHARED_KEY` into the 32-byte AES-256-GCM
-/// subkey used for execution checkpoints. Pure and deterministic; encrypt
-/// and decrypt derive it identically so the round-trip stays symmetric.
-/// Mirrors `derive_envelope_aead_key` in `talos-workflow-job-protocol`
-/// but with a distinct domain-separation label.
-fn derive_checkpoint_aead_key(root: &[u8]) -> Zeroizing<[u8; AES_KEY_LEN]> {
+/// v2 label (finding #1): the per-execution checkpoint subkey folds the
+/// `execution_id` into the HKDF `info` so each execution gets its OWN AES
+/// key. The AES-GCM random-nonce birthday budget is then consumed per
+/// execution (at most the node-checkpoint writes of one workflow run)
+/// instead of globally across every checkpoint the fleet ever writes
+/// under one `WORKER_SHARED_KEY`. Distinct from the v1 label so a v2
+/// subkey can never collide with the legacy static one.
+const CHECKPOINT_AEAD_KEY_LABEL_V2: &[u8] =
+    b"talos/worker-shared-key/checkpoint-aead/v2-per-execution";
+
+/// v1 (legacy) derivation: a single static subkey per root, used by every
+/// checkpoint regardless of execution. Retained ONLY as a decrypt
+/// fallback so in-flight checkpoints written before the v2 rollout still
+/// resume during the migration window. New writes use [`derive_checkpoint_aead_key`].
+fn derive_checkpoint_aead_key_legacy_v1(root: &[u8]) -> Zeroizing<[u8; AES_KEY_LEN]> {
     let hk = Hkdf::<Sha256>::new(None, root);
     let mut subkey = Zeroizing::new([0u8; AES_KEY_LEN]);
     hk.expand(CHECKPOINT_AEAD_KEY_LABEL, subkey.as_mut())
+        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
+    subkey
+}
+
+/// Expand the root `WORKER_SHARED_KEY` into the per-execution 32-byte
+/// AES-256-GCM subkey for execution checkpoints (v2). The `execution_id`
+/// bytes are the HKDF `info`, so the subkey is unique per execution.
+/// Pure and deterministic; encrypt and decrypt derive it identically.
+/// Mirrors `derive_envelope_aead_key` in `talos-workflow-job-protocol`
+/// but with a distinct domain-separation label + per-execution info.
+fn derive_checkpoint_aead_key(root: &[u8], execution_aad: &[u8]) -> Zeroizing<[u8; AES_KEY_LEN]> {
+    let hk = Hkdf::<Sha256>::new(Some(CHECKPOINT_AEAD_KEY_LABEL_V2), root);
+    let mut subkey = Zeroizing::new([0u8; AES_KEY_LEN]);
+    hk.expand(execution_aad, subkey.as_mut())
         .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
     subkey
 }
@@ -508,7 +531,9 @@ fn encrypt_checkpoint(
     let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
         serde_json::to_vec(data).map_err(|e| format!("Failed to serialize checkpoint: {e}"))?,
     );
-    let aead_key = derive_checkpoint_aead_key(key);
+    // v2: per-execution key derivation — `aad` is the execution_id, folded
+    // into the HKDF info so the random-nonce budget is per-execution.
+    let aead_key = derive_checkpoint_aead_key(key, aad);
     let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
         .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -556,25 +581,35 @@ fn decrypt_checkpoint(
             nonce.len()
         ));
     }
-    let aead_key = derive_checkpoint_aead_key(key);
-    let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
-        .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let nonce = Nonce::from_slice(nonce);
+
+    // Try the v2 per-execution key first (the steady-state hit), then the
+    // legacy v1 static key. AES-GCM's tag makes the fallback unambiguous:
+    // a v2 ciphertext can NOT pass under the v1 key and vice versa, so the
+    // extra attempt never yields a false-accept — it only lets in-flight
+    // checkpoints written before the v2 rollout still resume during the
+    // migration window. Both attempts bind `aad` (execution_id) in the tag.
+    let v2_key = derive_checkpoint_aead_key(key, aad);
+    let v1_key = derive_checkpoint_aead_key_legacy_v1(key);
     // Wipe the decrypted node-output bytes on drop, including the
     // deserialize-error branch below.
-    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
-        cipher
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: ciphertext,
-                    aad,
-                },
-            )
-            .map_err(|_| {
-                "Checkpoint decryption failed — wrong key or corrupted data".to_string()
-            })?,
-    );
+    let mut plaintext: Option<Zeroizing<Vec<u8>>> = None;
+    for candidate in [v2_key, v1_key] {
+        let cipher = Aes256Gcm::new_from_slice(candidate.as_slice())
+            .map_err(|e| format!("Failed to create cipher: {e}"))?;
+        if let Ok(pt) = cipher.decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        ) {
+            plaintext = Some(Zeroizing::new(pt));
+            break;
+        }
+    }
+    let plaintext = plaintext
+        .ok_or_else(|| "Checkpoint decryption failed — wrong key or corrupted data".to_string())?;
     serde_json::from_slice(&plaintext).map_err(|e| format!("Failed to deserialize checkpoint: {e}"))
 }
 
@@ -749,13 +784,60 @@ mod checkpoint_aead_tests {
         // The AEAD key must be the HKDF subkey, never the raw root (which
         // is also the HMAC signing key for rpc_auth / JobRequest / JobResult).
         let root = k(AES_KEY_LEN);
-        let subkey = derive_checkpoint_aead_key(&root);
+        let exec = Uuid::new_v4();
+        let subkey = derive_checkpoint_aead_key(&root, exec.as_bytes());
         assert_ne!(
             &subkey[..],
             &root[..],
             "derived checkpoint AEAD subkey must differ from the raw root key"
         );
-        // Deterministic across calls.
-        assert_eq!(subkey, derive_checkpoint_aead_key(&root));
+        // Deterministic across calls for the same (root, execution).
+        assert_eq!(subkey, derive_checkpoint_aead_key(&root, exec.as_bytes()));
+    }
+
+    #[test]
+    fn distinct_executions_derive_distinct_subkeys() {
+        // Finding #1: per-execution partition — each execution_id yields a
+        // different checkpoint key, bounding the random-nonce budget to one
+        // execution's writes.
+        let root = k(AES_KEY_LEN);
+        let a = derive_checkpoint_aead_key(&root, Uuid::new_v4().as_bytes());
+        let b = derive_checkpoint_aead_key(&root, Uuid::new_v4().as_bytes());
+        assert_ne!(&*a, &*b, "different executions must derive different keys");
+        // And the v2 per-execution key must differ from the legacy static one.
+        let legacy = derive_checkpoint_aead_key_legacy_v1(&root);
+        assert_ne!(
+            &*a, &*legacy,
+            "v2 per-execution key must differ from the v1 static key"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_ciphertext_still_decrypts_during_migration() {
+        // A checkpoint written under the old static-key scheme (v1) must
+        // still resume after the v2 rollout, via the decrypt fallback.
+        let root = k(AES_KEY_LEN);
+        let exec = Uuid::new_v4();
+        let snapshot = serde_json::json!({"node": "legacy", "value": 7});
+
+        // Hand-roll a v1 ciphertext: static legacy key + execution_id AAD.
+        let v1_key = derive_checkpoint_aead_key_legacy_v1(&root);
+        let cipher = Aes256Gcm::new_from_slice(v1_key.as_slice()).unwrap();
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let pt = serde_json::to_vec(&snapshot).unwrap();
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: pt.as_ref(),
+                    aad: exec.as_bytes(),
+                },
+            )
+            .unwrap();
+
+        // The v2-first decrypt path must fall back to v1 and succeed.
+        let decrypted = decrypt_checkpoint(&ct, &nonce_bytes, &root, exec.as_bytes()).unwrap();
+        assert_eq!(decrypted, snapshot);
     }
 }
