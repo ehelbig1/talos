@@ -124,6 +124,42 @@ audit-log immutability trigger when cleaning orphan secrets.
 See §1.3 for the per-actor LLM tier ceiling, which is a complementary
 privacy control at the data-egress boundary.
 
+### 1.5 Audit-ledger cryptographic verification (finding #2)
+
+The WORM audit ledger is HMAC-signed + hash-chained, and the chain is now
+**verified**, not just persisted:
+
+- **Ingest (inline).** The `talos.audit.ledger` consumer recomputes each
+  event's hash and verifies its HMAC before writing to S3. Failures are
+  quarantined to an Object-Locked `rejected/<execution_id>/` prefix (never
+  silently dropped) and logged at ERROR with `event_kind =
+  "audit_event_verification_failed"`.
+- **Continuous (sweep).** A controller background task verifies the full
+  chain of recently-completed executions on an interval and emits
+  `event_kind = "audit_chain_verification_failed"` (one per broken chain,
+  with the structured `breaks` list) plus an `audit_chain_sweep_summary` per
+  pass.
+
+**Required config.** Set `TALOS_AUDIT_SIGNING_KEY` (32+ hex bytes;
+`openssl rand -hex 32`) on **every worker AND the controller**, and
+`TALOS_AUDIT_SIGNING_KEY_PREVIOUS` (comma-separated) during a signing-key
+rotation. Without a key, events are persisted but logged as UNVERIFIED
+(`audit_event_unsigned`) — in production that is a misconfiguration.
+
+**Sweep tuning.** `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` (default 3600, clamped
+[300, 86400]; `0` disables). The sweep self-disables when no S3/WORM
+endpoint (`AWS_ENDPOINT_URL` / `MINIO_ENDPOINT`) is configured.
+
+**SIEM alerting.** Page on `audit_event_verification_failed` and
+`audit_chain_verification_failed` (target `talos_audit`) — both are positive
+tamper/corruption evidence. Alert (lower severity) on
+`audit_event_quarantine_failed` and a sustained `audit_event_unsigned`.
+
+**On a failure.** A `*_verification_failed` event names the `execution_id`;
+re-run `verify_execution_chain` for it (the `breaks` list distinguishes a
+sequence gap / deletion from a linkage break / forged HMAC), and inspect the
+quarantined objects under `rejected/<execution_id>/` in the WORM bucket.
+
 ---
 
 ## 2. Routine procedures (set quarterly calendar reminders)

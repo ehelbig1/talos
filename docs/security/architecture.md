@@ -411,6 +411,14 @@ controller-side consumer (`talos-audit-ledger`):
   (reorder/substitution), genesis mismatch, and per-event HMAC failures —
   the stateful checks that need the whole chain and so can't run in the
   streaming persister.
+- **Continuous (Layer 2, wired):** a controller-side background sweep
+  (`run_chain_verification_sweep`, interval `AUDIT_CHAIN_SWEEP_INTERVAL_SECS`,
+  default 3600s; `0` disables) runs the offline verifier over executions that
+  reached a terminal state in the recent window (a 120s settle floor skips
+  events still batching to S3) and emits one structured
+  `audit_chain_verification_failed` ERROR per broken chain plus an
+  `audit_chain_sweep_summary` per pass — the SIEM alerting signal. Self-disables
+  when no S3/WORM endpoint is configured.
 
 Signing requires `TALOS_AUDIT_SIGNING_KEY` (32+ bytes) on workers AND the
 controller; `TALOS_AUDIT_SIGNING_KEY_PREVIOUS` supports rotation overlap.

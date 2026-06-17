@@ -1328,6 +1328,89 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // ---------- Audit-chain verification sweep (finding #2, Layer 2) ----------
+    //
+    // Continuously verifies the WORM audit ledger: each tick runs the offline
+    // chain verifier over recently-completed executions and emits a loud
+    // structured `audit_chain_verification_failed` event for any break
+    // (tamper / deletion / reorder / bad HMAC). This is what turns "we CAN
+    // verify the chain" into "we continuously DO" — the inline per-message
+    // check (`talos_audit_ledger::verify_audit_message`) catches forgery at
+    // ingest; this sweep catches gaps/deletions that only the full ordered
+    // set reveals. Runs as a trusted system task on the bare pool (the audit
+    // ledger is intentionally cross-tenant), so it needs no MCP/RBAC surface.
+    //
+    // Self-disables when no S3/WORM endpoint is configured (the from_env
+    // helper returns None). Interval default 1h, clamped [300s, 86400s];
+    // `AUDIT_CHAIN_SWEEP_INTERVAL_SECS=0` disables it. Lookback is 2× the
+    // interval so window edges overlap (re-verification is idempotent); the
+    // 120s settle floor skips just-finished executions whose audit events may
+    // still be batching to S3, avoiding false sequence-gap reports.
+    let audit_sweep_interval_secs: u64 = std::env::var("AUDIT_CHAIN_SWEEP_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3600);
+    if audit_sweep_interval_secs == 0 {
+        tracing::info!(
+            "Audit-chain verification sweep disabled (AUDIT_CHAIN_SWEEP_INTERVAL_SECS=0)"
+        );
+    } else {
+        let audit_sweep_interval_secs = audit_sweep_interval_secs.clamp(300, 86400);
+        let audit_sweep_pool = db_pool.clone();
+        let audit_sweep_shutdown = bg_shutdown_rx.clone();
+        let lookback_secs = (audit_sweep_interval_secs as i64).saturating_mul(2);
+        const SETTLE_SECS: i64 = 120;
+        const MAX_EXECUTIONS_PER_SWEEP: i64 = 500;
+        tokio::spawn(async move {
+            let mut shutdown = audit_sweep_shutdown;
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(audit_sweep_interval_secs));
+            // Burn the immediate first tick — at startup the most-recent
+            // executions are still inside the settle window anyway.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if let Some(stats) = talos_audit_ledger::run_chain_verification_sweep_from_env(
+                            &audit_sweep_pool,
+                            lookback_secs,
+                            SETTLE_SECS,
+                            MAX_EXECUTIONS_PER_SWEEP,
+                        )
+                        .await
+                        {
+                            if stats.failed > 0 || stats.errored > 0 {
+                                tracing::warn!(
+                                    target: "talos_audit",
+                                    event_kind = "audit_chain_sweep_summary",
+                                    scanned = stats.scanned,
+                                    verified_ok = stats.verified_ok,
+                                    failed = stats.failed,
+                                    errored = stats.errored,
+                                    "audit chain verification sweep completed WITH findings"
+                                );
+                            } else if stats.scanned > 0 {
+                                tracing::info!(
+                                    target: "talos_audit",
+                                    event_kind = "audit_chain_sweep_summary",
+                                    scanned = stats.scanned,
+                                    verified_ok = stats.verified_ok,
+                                    "audit chain verification sweep completed clean"
+                                );
+                            }
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            tracing::info!("Audit-chain verification sweep loop received shutdown signal");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // ---------- MCP-991: bcrypt cache revocation sweep ----------
     // Closes the residual revocation gap that the per-entry TTL can't
     // reach when `revoke_mcp_agent` deletes an `mcp_agents` row via
