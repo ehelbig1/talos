@@ -348,15 +348,19 @@ pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
         }
     };
 
-    // SECURITY: In production, require sslmode in the DATABASE_URL to ensure
-    // credentials and data are encrypted in transit. Acceptable values:
-    // sslmode=require, sslmode=verify-ca, sslmode=verify-full.
-    if talos_config::is_production() && !db_url.contains("sslmode=") {
-        tracing::warn!(
-            "DATABASE_URL does not contain sslmode parameter. \
-             In production, use ?sslmode=require (or verify-ca/verify-full) \
-             to encrypt database connections."
-        );
+    // SECURITY: In production, REFUSE to start unless the DATABASE_URL pins a
+    // TLS-guaranteeing sslmode. Absent / `disable` / `allow` / `prefer` all
+    // permit a cleartext connection (`prefer` only *opportunistically* uses
+    // TLS), leaving credentials and ePHI on the wire — a transmission-security
+    // violation (HIPAA §164.312(e) / SOC2 CC6.7). Only require / verify-ca /
+    // verify-full guarantee encryption.
+    // tls-prod-gate-postgres
+    if talos_config::is_production() && !db_url_tls_guaranteed(&db_url) {
+        return Err(anyhow::anyhow!(
+            "DATABASE_URL must set sslmode=require (or verify-ca / verify-full) in \
+             production — refusing to start. sslmode absent/disable/allow/prefer does \
+             not guarantee TLS, leaving credentials and data in cleartext on the wire."
+        ));
     }
 
     // Connection pool configuration for production workloads
@@ -504,6 +508,49 @@ pub async fn init_read_replica_pool() -> Option<Pool<Postgres>> {
             );
             None
         }
+    }
+}
+
+/// Returns `true` when `db_url` pins an sslmode that GUARANTEES a TLS
+/// connection: `require`, `verify-ca`, or `verify-full`. Returns `false` for an
+/// absent sslmode or the non-guaranteeing modes (`disable`, `allow`, `prefer` —
+/// `prefer` only opportunistically negotiates TLS and silently falls back to
+/// cleartext). Pure so the production boot gate's accept/reject logic is
+/// unit-tested without env or a live DB. See `tls-prod-gate-postgres`.
+fn db_url_tls_guaranteed(db_url: &str) -> bool {
+    db_url.contains("sslmode=require")
+        || db_url.contains("sslmode=verify-ca")
+        || db_url.contains("sslmode=verify-full")
+}
+
+#[cfg(test)]
+mod db_url_tls_gate_tests {
+    use super::db_url_tls_guaranteed;
+
+    #[test]
+    fn accepts_tls_guaranteeing_modes() {
+        for m in ["require", "verify-ca", "verify-full"] {
+            let url = format!("postgres://u:p@host/db?sslmode={m}");
+            assert!(db_url_tls_guaranteed(&url), "should accept sslmode={m}");
+        }
+    }
+
+    #[test]
+    fn rejects_absent_and_non_guaranteeing_modes() {
+        // Absent entirely → cleartext-capable.
+        assert!(!db_url_tls_guaranteed("postgres://u:p@host/db"));
+        // Modes that permit (or silently fall back to) cleartext.
+        for m in ["disable", "allow", "prefer"] {
+            let url = format!("postgres://u:p@host/db?sslmode={m}");
+            assert!(!db_url_tls_guaranteed(&url), "must reject sslmode={m}");
+        }
+    }
+
+    #[test]
+    fn accepts_tls_mode_among_other_params() {
+        let url =
+            "postgres://u:p@host/db?connect_timeout=5&sslmode=verify-full&application_name=talos";
+        assert!(db_url_tls_guaranteed(url));
     }
 }
 

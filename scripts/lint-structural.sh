@@ -3029,6 +3029,48 @@ else
 fi
 echo
 
+bold "▶ check 44: production in-transit TLS gates must fail closed (not warn)"
+
+# P1-A (compliance: HIPAA §164.312(e) / SOC2 CC6.7 / ISO A.8.24 transmission
+# security): every cleartext-capable backend connection (Redis / NATS / Postgres
+# / Neo4j) MUST refuse to boot in production on a non-TLS URL, not merely log a
+# warning. The message bus carries decrypted memory values (potential PHI) and
+# HMAC-signed payloads; Postgres carries credentials + ePHI; etc. Each gate is
+# tagged `// tls-prod-gate-<name>`. This check freezes (a) the four gates'
+# existence and (b) that each fails closed (return Err / panic / bail) rather
+# than being softened back to a lone tracing::warn! — the pre-P1-A regression
+# shape (NATS + Postgres shipped warn-only; Redis already panicked).
+
+TLS_GATE_VIOLATIONS=0
+for gate in redis nats postgres neo4j; do
+    hit=$(grep -rn "tls-prod-gate-${gate}" --include='*.rs' controller/src talos-db/src 2>/dev/null | head -1 || true)
+    if [ -z "$hit" ]; then
+        red "✗ missing production TLS gate marker: tls-prod-gate-${gate}"
+        TLS_GATE_VIOLATIONS=$((TLS_GATE_VIOLATIONS + 1))
+        continue
+    fi
+    file=$(echo "$hit" | cut -d: -f1)
+    lineno=$(echo "$hit" | cut -d: -f2)
+    # The marker line + the 12 lines following it must contain a fail-closed
+    # action. A gate softened back to `tracing::warn!` (no return/panic/bail)
+    # is exactly the regression this check exists to catch.
+    window=$(sed -n "${lineno},$((lineno + 12))p" "$file" 2>/dev/null || true)
+    if ! echo "$window" | grep -qE 'return Err|panic!|bail!'; then
+        red "✗ TLS gate '${gate}' at ${file}:${lineno} does not fail closed (no return Err/panic/bail within 12 lines)"
+        yellow "  → a production no-TLS condition must refuse boot, not tracing::warn!"
+        TLS_GATE_VIOLATIONS=$((TLS_GATE_VIOLATIONS + 1))
+    fi
+done
+
+if [ "$TLS_GATE_VIOLATIONS" -gt 0 ]; then
+    red "✗ $TLS_GATE_VIOLATIONS production TLS gate(s) missing or not fail-closed"
+    yellow "  → Redis/NATS/Postgres/Neo4j prod connections must reject plaintext URLs at boot."
+    EXIT_CODE=1
+else
+    green "✓ production in-transit TLS gates (redis/nats/postgres/neo4j) all fail closed"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"

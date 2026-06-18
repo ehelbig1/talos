@@ -122,6 +122,21 @@ controller:
   # reads via std::env::var (see controller/src/).
   env:
     RUST_LOG: "info,controller=debug,audit_ledger=info"
+    # SECURITY — in-transit TLS is FAIL-CLOSED when RUST_ENV=production.
+    # The controller REFUSES TO BOOT in production unless every backend
+    # connection uses TLS (transmission security: HIPAA §164.312(e) /
+    # SOC2 CC6.7 / ISO A.8.24):
+    #   • NATS_URL      → tls:// or nats+tls://
+    #   • NEO4J_URI     → neo4j+s:// , neo4j+ssc:// , bolt+s:// or bolt+ssc://
+    #   • DATABASE_URL  → ?sslmode=require (or verify-ca / verify-full)
+    #   • REDIS_URL     → rediss://
+    # ⚠️ The in-cluster defaults are PLAINTEXT (nats://, bolt://,
+    # sslmode=disable) and are therefore INCOMPATIBLE with RUST_ENV=production.
+    # For a production/compliant deployment, point these at TLS endpoints (or
+    # front the in-cluster services with an mTLS service mesh). For a
+    # homelab/in-cluster install on a trusted pod network, set RUST_ENV to a
+    # non-production value to skip the gate (you forgo the production hardening
+    # that flag also enables). There is no plaintext-in-production override.
     RUST_ENV: "production"
     # Trust X-Forwarded-For headers from cluster-internal proxies (Traefik
     # in kube-system, nginx in the frontend pod). Without this, the
@@ -565,6 +580,11 @@ postgres:
   # Kept here for documentation only; the chart doesn't consume this
   # field — install.sh writes the connection string directly into the
   # bootstrap Secret.
+  #
+  # SECURITY: under RUST_ENV=production the DATABASE_URL MUST carry
+  # ?sslmode=require (or verify-ca / verify-full) — the controller refuses to
+  # boot otherwise. sslmode absent/disable/allow/prefer does not guarantee TLS.
+  # Example: postgres://user:pass@host:5432/talos?sslmode=verify-full
   external:
     url: ""
 
