@@ -26,12 +26,11 @@ pre-install/pre-upgrade hook + weight -15 ensures the Secret exists before the
 Postgres (-14/-11) and Neo4j StatefulSets mount it.
 */ -}}
 {{- if .Values.tls.inCluster.enabled }}
-{{- /* NATS is added when its client-side CA wiring lands (separate change);
-       this template currently provisions the Postgres + Neo4j certs. */ -}}
-{{- range $svc := (list "postgres" "neo4j") }}
+{{- range $svc := (list "postgres" "neo4j" "nats") }}
 {{- $needed := false -}}
 {{- if and (eq $svc "postgres") $.Values.postgres.enabled }}{{- $needed = true -}}{{- end }}
 {{- if and (eq $svc "neo4j") $.Values.neo4j.enabled }}{{- $needed = true -}}{{- end }}
+{{- if and (eq $svc "nats") $.Values.nats.enabled }}{{- $needed = true -}}{{- end }}
 {{- if $needed }}
 {{- $secretName := printf "%s-tls" (include "talos.componentName" (list $ $svc)) }}
 {{- $cn := include "talos.componentName" (list $ $svc) }}

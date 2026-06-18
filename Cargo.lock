@@ -1744,6 +1744,7 @@ dependencies = [
  "talos-module-payload-encryption",
  "talos-module-repository",
  "talos-module-templates",
+ "talos-nats-tls",
  "talos-node-cache",
  "talos-oauth",
  "talos-organizations",
@@ -8207,6 +8208,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-nats-tls"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "futures",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "talos-node-cache"
 version = "0.1.0"
 dependencies = [
@@ -11134,6 +11145,7 @@ dependencies = [
  "talos-dlp",
  "talos-dlp-provider",
  "talos-memory",
+ "talos-nats-tls",
  "talos-secrets",
  "talos-shutdown",
  "talos-ssrf-classify",

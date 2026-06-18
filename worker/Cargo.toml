@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 # Core async runtime
 tokio = { version = "1.41", features = ["full"] }
 async-nats = "0.47"
+talos-nats-tls = { path = "../talos-nats-tls" }
 
 # Wasmtime 43.0.2 — critical security updates. 43.0.1 covered:
 #   CVE-2026-34971 sandbox escape, CVE-2026-27572 HTTP headers DoS,

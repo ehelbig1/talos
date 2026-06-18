@@ -3192,11 +3192,10 @@ async fn main() -> anyhow::Result<()> {
 
     let nc: Client = match (nats_user, nats_password) {
         (Some(user), Some(pass)) => {
-            match async_nats::ConnectOptions::new()
-                .user_and_password(user, pass)
-                .connect(&nats_url)
-                .await
-            {
+            // apply_nats_ca adds the in-cluster NATS CA + requires TLS when
+            // NATS_CA_FILE is set (tls:// URL); no-op otherwise.
+            let opts = async_nats::ConnectOptions::new().user_and_password(user, pass);
+            match talos_nats_tls::apply_nats_ca(opts).connect(&nats_url).await {
                 Ok(c) => {
                     println!(
                         "      Connected to NATS (authenticated) at {}",
@@ -3227,7 +3226,8 @@ async fn main() -> anyhow::Result<()> {
                 "NATS_USER/NATS_PASSWORD not set — connecting without authentication. \
                  This is acceptable for development but MUST NOT be used in production."
             );
-            match async_nats::connect(&nats_url).await {
+            let opts = talos_nats_tls::apply_nats_ca(async_nats::ConnectOptions::new());
+            match opts.connect(&nats_url).await {
                 Ok(c) => {
                     println!(
                         "      Connected to NATS (unauthenticated) at {}",

@@ -84,10 +84,24 @@ spec:
               mountPath: /etc/nats
             - name: data
               mountPath: /data
+            {{- if .Values.tls.inCluster.enabled }}
+            # Client-port TLS cert+key (PR #243); nats.conf points cert_file/
+            # key_file here. defaultMode 0640 + fsGroup lets the nats uid read
+            # the key.
+            - name: tls
+              mountPath: /etc/nats-tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "talos.componentName" (list . "nats") }}
+        {{- if .Values.tls.inCluster.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "talos.componentName" (list . "nats-tls") }}
+            defaultMode: 0640
+        {{- end }}
         {{- if not .Values.nats.persistence.enabled }}
         # MCP-806 (2026-05-14): emptyDir fallback when persistence is
         # disabled. Pre-fix the StatefulSet volumeMount at /data

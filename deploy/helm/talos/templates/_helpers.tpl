@@ -88,9 +88,12 @@ keep `bootstrapSecret.enabled: false` and supply the same name.
 {{- default (printf "%s-controller-secrets" (include "talos.fullname" .)) .Values.bootstrapSecret.secretName -}}
 {{- end -}}
 
-{{/* NATS in-cluster DNS (Service name). */}}
+{{/* NATS in-cluster DNS (Service name). Uses the tls:// scheme when in-cluster
+     TLS is enabled so the controller's production TLS gate (#243) is satisfied;
+     the controller + worker trust the self-signed cert via NATS_CA_FILE. */}}
 {{- define "talos.natsUrl" -}}
-nats://{{ include "talos.componentName" (list . "nats") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.nats.service.clientPort | default 4222 }}
+{{- $scheme := ternary "tls" "nats" .Values.tls.inCluster.enabled -}}
+{{ $scheme }}://{{ include "talos.componentName" (list . "nats") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.nats.service.clientPort | default 4222 }}
 {{- end -}}
 
 {{/* Neo4j in-cluster URI. Uses the bolt+ssc:// TLS scheme (encrypt + accept
