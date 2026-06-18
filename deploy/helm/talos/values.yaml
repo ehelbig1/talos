@@ -182,8 +182,22 @@ controller:
     GLOBAL_RATE_LIMIT: "10000"
     ALLOW_DEV_UNSAFE_CSRF_BYPASS: "false"
     ENABLE_HSTS: "true"
+    # KEK (key-encryption-key) backend that wraps every DEK.
+    #   "vault" (default) — KMS-backed HashiCorp Vault transit; the root key
+    #     never leaves Vault. Required posture for HIPAA/SOC2/ISO key management.
+    #   "env"  — root key is TALOS_MASTER_KEY, living in a Secret + process
+    #     memory. Convenient for a single-host / homelab install with no Vault,
+    #     but recoverable by anyone with `kubectl get secret` or a heap dump.
+    # SECURITY: under RUST_ENV=production the controller REFUSES TO BOOT with
+    # KEK_PROVIDER=env unless TALOS_ALLOW_ENV_KEK=true is set to acknowledge the
+    # weaker posture (the acceptance is logged at ERROR for audit). There is no
+    # silent env-KEK-in-prod path.
     KEK_PROVIDER: "vault"
     VAULT_TRANSIT_KEY_NAME: "talos-kek"
+    # Opt-in to run KEK_PROVIDER=env in production (homelab / no-Vault). Leave
+    # unset for the compliant Vault-backed default. When "true", the controller
+    # boots with the env master key and logs an ERROR-level audit event.
+    # TALOS_ALLOW_ENV_KEK: "true"
     TALOS_DISABLE_POOLING: "true"
     # RFC 0005 S3 — tenant-isolation RLS enforcement via SET LOCAL ROLE.
     # When "true", every request-path transaction (begin_tenant_read_scoped

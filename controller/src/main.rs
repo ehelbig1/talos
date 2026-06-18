@@ -522,8 +522,50 @@ async fn main() -> anyhow::Result<()> {
         Option<std::sync::Arc<dyn crate::secrets::kek_provider::KekProvider>>,
     ) = match kek_provider_kind.as_str() {
         "env" => {
-            // Phase 1/2 path or post-Phase-5 with env still primary.
-            // No legacy needed.
+            // P1-B production KEK guard. An env-backed KEK keeps the root key
+            // (TALOS_MASTER_KEY) in a Kubernetes Secret AND in process memory,
+            // where anyone with `kubectl get secret` or a heap/core dump can
+            // recover it — defeating envelope encryption against an insider or
+            // dump-exfil threat. Regulated deployments (HIPAA/SOC2/ISO key
+            // management) want a KMS-backed KEK (`KEK_PROVIDER=vault`, the chart
+            // default) so the root key never leaves Vault.
+            //
+            // Refuse to boot in production unless the operator explicitly
+            // acknowledges the weaker posture. There IS an override (unlike the
+            // in-transit-TLS gates) because env-KEK is a legitimate single-host
+            // / homelab mode with no Vault — but it must be a deliberate,
+            // audited opt-in, not a silent default.
+            // prod-kek-guard
+            if crate::config::is_production() {
+                let allow_env_kek = std::env::var("TALOS_ALLOW_ENV_KEK")
+                    .ok()
+                    .map(|v| {
+                        let v = v.trim();
+                        v.eq_ignore_ascii_case("true")
+                            || v == "1"
+                            || v.eq_ignore_ascii_case("yes")
+                            || v.eq_ignore_ascii_case("on")
+                    })
+                    .unwrap_or(false);
+                if !allow_env_kek {
+                    return Err(anyhow::anyhow!(
+                        "KEK_PROVIDER=env keeps the master key (TALOS_MASTER_KEY) in a Secret + \
+                         process memory — refused in production. Use KEK_PROVIDER=vault \
+                         (KMS-backed; the chart default) so the root key never leaves Vault. To \
+                         run env-KEK in production anyway (e.g. a single-host homelab with no \
+                         Vault), set TALOS_ALLOW_ENV_KEK=true to acknowledge the weaker posture."
+                    ));
+                }
+                // Override in use — loud + SIEM-greppable so the weaker posture
+                // is visible in audit/alerting, not silently accepted.
+                tracing::error!(
+                    target: "talos_security",
+                    event_kind = "env_kek_in_production",
+                    "KEK_PROVIDER=env accepted in production via TALOS_ALLOW_ENV_KEK — the master \
+                     key lives in a Secret + process memory (no KMS). Migrate to \
+                     KEK_PROVIDER=vault for a compliant key-management posture."
+                );
+            }
             (
                 crate::secrets::kek_provider::env_kek_provider_from_environment()?,
                 None,
