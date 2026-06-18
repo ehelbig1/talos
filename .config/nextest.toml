@@ -13,3 +13,21 @@
 # (env_vars mutates the global `DATABASE_URL` process env, but nextest runs
 # each test in its own process, so that mutation can't leak across tests — it
 # never needed a group.)
+
+[profile.default]
+# Defense-in-depth against a hung test silently consuming a CI job's whole
+# timeout. A test still running after `period` is logged SLOW; after
+# `terminate-after` such periods (here 3 × 120s = 6 min) nextest KILLS it and
+# reports a named TIMEOUT failure — instead of the test blocking the job until
+# its 30/40-min cap with no signal as to which test is stuck.
+#
+# 6 min is set well ABOVE any legitimate test so it never fires on a healthy
+# run: the unit/lib suite's tests are all <5s, and the integration (DB) job
+# completes end-to-end in <10 min. It only catches a genuine hang.
+#
+# Motivated by PR #247: an unbounded Redis `ConnectionManager` retry made two
+# rate-limit `*_unreachable_redis` tests take ~7 min each, intermittently
+# timing out the "Rust tests (unit / lib)" job at 30 min with no indication of
+# the culprit (it took a local terminate-timeout run to identify them). With
+# this, a future hang of that shape fails fast and names itself.
+slow-timeout = { period = "120s", terminate-after = 3 }
