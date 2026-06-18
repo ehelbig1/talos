@@ -3071,6 +3071,35 @@ else
 fi
 echo
 
+bold "▶ check 45: env-KEK in production must be guarded (no plaintext master key by default)"
+
+# P1-B (compliance: HIPAA/SOC2/ISO key management): an env-backed KEK keeps the
+# root key (TALOS_MASTER_KEY) in a Secret + process memory. The controller MUST
+# refuse to boot with KEK_PROVIDER=env under RUST_ENV=production unless the
+# operator explicitly opts in (TALOS_ALLOW_ENV_KEK) — KMS-backed Vault is the
+# compliant default. The guard is tagged `// prod-kek-guard`; this check freezes
+# (a) its existence and (b) that it fails closed (return Err) within 25 lines —
+# catching a future softening to a warn-only / always-accept regression.
+
+KEK_GUARD_HITS=$(grep -rn "prod-kek-guard" --include='*.rs' controller/src 2>/dev/null | head -1 || true)
+if [ -z "$KEK_GUARD_HITS" ]; then
+    red "✗ missing production env-KEK guard marker: prod-kek-guard"
+    yellow "  → the KEK_PROVIDER=env arm must refuse boot in production (see controller/src/main.rs)"
+    EXIT_CODE=1
+else
+    file=$(echo "$KEK_GUARD_HITS" | cut -d: -f1)
+    lineno=$(echo "$KEK_GUARD_HITS" | cut -d: -f2)
+    window=$(sed -n "${lineno},$((lineno + 25))p" "$file" 2>/dev/null || true)
+    if echo "$window" | grep -q 'return Err'; then
+        green "✓ env-KEK-in-production guard present and fails closed"
+    else
+        red "✗ env-KEK guard at ${file}:${lineno} does not fail closed (no return Err within 25 lines)"
+        yellow "  → a production env-KEK without TALOS_ALLOW_ENV_KEK must refuse boot, not warn."
+        EXIT_CODE=1
+    fi
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
