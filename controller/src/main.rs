@@ -348,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         // SECURITY: In production, enforce TLS (rediss://) and reject plaintext (redis://).
         // This prevents an operator misconfiguration from silently exposing secrets and
         // session tokens over an unencrypted Redis connection.
+        // tls-prod-gate-redis
         if crate::config::is_production() && !redis_url.starts_with("rediss://") {
             panic!(
                 "REDIS_URL must use 'rediss://' (TLS) in production. \
@@ -388,16 +389,20 @@ async fn main() -> anyhow::Result<()> {
 
     // ---------- Initialize NATS client for message queues ----------
     let nats_client = if let Ok(nats_url) = std::env::var("NATS_URL") {
-        // SECURITY: In production, warn if NATS URL doesn't use TLS (tls:// or nats+tls://).
-        // NATS credentials and HMAC-signed job payloads should be encrypted in transit.
+        // SECURITY: In production, REFUSE to start on a plaintext NATS URL. The
+        // message bus carries HMAC-signed job payloads AND decrypted memory
+        // values (potential PHI) in RPC replies — cleartext on the wire is a
+        // transmission-security violation (HIPAA §164.312(e) / SOC2 CC6.7).
+        // tls-prod-gate-nats
         if crate::config::is_production()
             && !nats_url.starts_with("tls://")
             && !nats_url.starts_with("nats+tls://")
         {
-            tracing::warn!(
-                "NATS_URL does not use TLS. In production, use tls:// or nats+tls:// \
-                 to encrypt message bus traffic."
-            );
+            return Err(anyhow::anyhow!(
+                "NATS_URL must use TLS (tls:// or nats+tls://) in production — refusing to \
+                 start. Got scheme: '{}'.",
+                nats_url.split("://").next().unwrap_or("<unknown>")
+            ));
         }
 
         // SECURITY: Use authenticated connection when NATS_USER + NATS_PASSWORD are set.
@@ -2304,6 +2309,28 @@ async fn main() -> anyhow::Result<()> {
 
     // ---------- Initialize Graph RAG service (Neo4j) ----------
     {
+        // SECURITY: In production, REFUSE to start on a plaintext Neo4j URI.
+        // Graph-RAG traffic can carry actor data; only the TLS schemes encrypt
+        // it on the wire (HIPAA §164.312(e) / SOC2 CC6.7). This gate lives here
+        // (not inside GraphRagService::new) because the call site below treats
+        // an init Err as "continue without graph" — a misconfigured plaintext
+        // URI must hard-fail the boot, not silently disable graph-RAG.
+        // tls-prod-gate-neo4j
+        if let Ok(neo4j_uri) = std::env::var("NEO4J_URI") {
+            if !neo4j_uri.is_empty()
+                && crate::config::is_production()
+                && !neo4j_uri.starts_with("neo4j+s://")
+                && !neo4j_uri.starts_with("neo4j+ssc://")
+                && !neo4j_uri.starts_with("bolt+s://")
+                && !neo4j_uri.starts_with("bolt+ssc://")
+            {
+                return Err(anyhow::anyhow!(
+                    "NEO4J_URI must use a TLS scheme (neo4j+s://, neo4j+ssc://, bolt+s://, or \
+                     bolt+ssc://) in production — refusing to start. Got scheme: '{}'.",
+                    neo4j_uri.split("://").next().unwrap_or("<unknown>")
+                ));
+            }
+        }
         match graph_rag::GraphRagService::new().await {
             Ok(Some(service)) => {
                 // Vault-first Anthropic key resolution AND tier-1
