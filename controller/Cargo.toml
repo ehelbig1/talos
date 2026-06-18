@@ -178,6 +178,7 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp", 
 # auto-selecting a CryptoProvider when more than one is in the dep graph.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 async-nats = "0.47"
+talos-nats-tls = { path = "../talos-nats-tls" }
 cap-std = "3.4"  # Capability-based file system for WASM sandboxing
 
 # 2FA/TOTP

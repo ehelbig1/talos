@@ -432,11 +432,12 @@ async fn main() -> anyhow::Result<()> {
         let authenticated = nats_user.is_some();
         let connect_result = match (nats_user, nats_password) {
             (Some(user), Some(pass)) => {
-                async_nats::ConnectOptions::new()
+                // apply_nats_ca adds the in-cluster NATS CA + requires TLS when
+                // NATS_CA_FILE is set (tls:// URL); no-op otherwise.
+                let opts = async_nats::ConnectOptions::new()
                     .user_and_password(user, pass)
-                    .request_timeout(Some(std::time::Duration::from_secs(86400 * 7))) // 7 days for governance approvals
-                    .connect(&nats_url)
-                    .await
+                    .request_timeout(Some(std::time::Duration::from_secs(86400 * 7))); // 7 days for governance approvals
+                talos_nats_tls::apply_nats_ca(opts).connect(&nats_url).await
             }
             _ => {
                 if crate::config::is_production() {
@@ -446,10 +447,9 @@ async fn main() -> anyhow::Result<()> {
                          to the job queue."
                     );
                 }
-                async_nats::ConnectOptions::new()
-                    .request_timeout(Some(std::time::Duration::from_secs(86400 * 7))) // 7 days for governance approvals
-                    .connect(&nats_url)
-                    .await
+                let opts = async_nats::ConnectOptions::new()
+                    .request_timeout(Some(std::time::Duration::from_secs(86400 * 7))); // 7 days for governance approvals
+                talos_nats_tls::apply_nats_ca(opts).connect(&nats_url).await
             }
         };
 

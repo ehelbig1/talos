@@ -1,0 +1,22 @@
+[package]
+name = "talos-nats-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Shared NATS in-cluster TLS wiring for the controller + worker connect paths,
+# so the CA-trust logic is a single source of truth and can't drift between the
+# two binaries. The chart's in-cluster NATS terminates TLS with a self-signed
+# cert; both processes connect with a `tls://` URL and must trust it.
+[dependencies]
+async-nats = "0.47"
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+
+[lints]
+workspace = true

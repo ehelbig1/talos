@@ -19,6 +19,19 @@ data:
       user: $NATS_USER
       password: $NATS_PASSWORD
     }
+{{- if $.Values.tls.inCluster.enabled }}
+
+    # In-transit TLS on the client port (PR #243 transmission security). The
+    # cert+key are mounted at /etc/nats-tls from the chart-generated
+    # <release>-nats-tls Secret. Clients (controller + worker) connect with a
+    # tls:// URL and trust this self-signed cert via NATS_CA_FILE. NOTE: for a
+    # multi-replica NATS cluster the route port would also need cluster-level
+    # TLS; the default is a single replica (no routes), so client TLS suffices.
+    tls {
+      cert_file: "/etc/nats-tls/tls.crt"
+      key_file:  "/etc/nats-tls/tls.key"
+    }
+{{- end }}
 
     {{- if .Values.nats.jetstream.enabled }}
     jetstream {

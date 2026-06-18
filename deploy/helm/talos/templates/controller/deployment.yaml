@@ -87,6 +87,12 @@ spec:
             # --- In-cluster service addresses (derived) ---
             - name: NATS_URL
               value: {{ include "talos.natsUrl" . | quote }}
+            {{- if .Values.tls.inCluster.enabled }}
+            # Trust the in-cluster NATS self-signed cert (talos_nats_tls reads
+            # this). Required because NATS_URL is tls:// under #243.
+            - name: NATS_CA_FILE
+              value: /etc/talos/nats-ca/tls.crt
+            {{- end }}
             - name: NEO4J_URI
               value: {{ include "talos.neo4jUri" . | quote }}
             - name: VAULT_ADDR
@@ -266,10 +272,25 @@ spec:
               mountPath: /tmp/cargo-cache
             - name: cargo-target
               mountPath: /tmp/cargo-target
+            {{- if .Values.tls.inCluster.enabled }}
+            - name: nats-ca
+              mountPath: /etc/talos/nats-ca
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: "512Mi"
+        {{- if .Values.tls.inCluster.enabled }}
+        # Only the cert (the trust anchor) — never the key — is projected into
+        # the client pod, so it can verify the NATS server's self-signed cert.
+        - name: nats-ca
+          secret:
+            secretName: {{ include "talos.componentName" (list . "nats-tls") }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+        {{- end }}
         - name: compilation-cache
           emptyDir:
             sizeLimit: {{ .Values.controller.compilationCache.sizeLimit | quote }}
