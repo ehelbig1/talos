@@ -710,7 +710,39 @@ impl DistributedRateLimiter {
         self.fallback.check_key(&identifier.to_string()).is_ok()
     }
 
+    /// Hard ceiling on a single Redis rate-limit check (connection setup +
+    /// the EVAL round-trip). Without it, an unreachable Redis makes
+    /// `ConnectionManager::new` run its full reconnect/backoff sequence
+    /// (minutes) before the error surfaces — blocking the caller on every
+    /// request and DELAYING the fail-open/closed fallback that is meant to
+    /// react PROMPTLY to a Redis outage. 3s is generous for a healthy
+    /// same-cluster Redis (a warm `ConnectionManager` answers in <5ms) while
+    /// bounding the worst case. Also stops the two `*_unreachable_redis` unit
+    /// tests from pinning CI for minutes each.
+    const REDIS_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
     async fn check_redis(
+        &self,
+        client: &redis::Client,
+        identifier: &str,
+    ) -> Result<bool, redis::RedisError> {
+        // Bound the whole check; on timeout surface an IoError so `check`
+        // applies the configured fail-open / fail-closed policy promptly.
+        match tokio::time::timeout(
+            Self::REDIS_CHECK_TIMEOUT,
+            self.check_redis_inner(client, identifier),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_elapsed) => Err(redis::RedisError::from((
+                redis::ErrorKind::IoError,
+                "rate-limit Redis check timed out",
+            ))),
+        }
+    }
+
+    async fn check_redis_inner(
         &self,
         client: &redis::Client,
         identifier: &str,
