@@ -1,0 +1,69 @@
+{{- /*
+In-cluster TLS certificates (self-signed, chart-generated).
+
+WHY: under RUST_ENV=production the controller fails closed on plaintext
+connections to its backends (PR #243 — transmission security, HIPAA
+§164.312(e) / SOC2 CC6.7). The in-cluster NATS / Neo4j / Postgres services
+historically spoke plaintext, so a default production install would refuse to
+boot. This template provisions a per-service self-signed cert+key Secret so the
+chart can terminate TLS on those services and the clients can use TLS URLs.
+
+CERT REUSE ACROSS UPGRADES: `lookup` reads any existing per-service TLS Secret
+and reuses its cert+key, so a `helm upgrade` does NOT regenerate certs (which
+would force-roll every backend and break in-flight TLS sessions). On a fresh
+install the lookup is empty and `genSelfSignedCert` mints a 10-year cert. Rotate
+a cert by deleting its `<release>-<svc>-tls` Secret and re-running the upgrade.
+
+CLIENT VERIFICATION: Postgres clients use `sslmode=require` and Neo4j clients
+use `bolt+ssc://` — both encrypt but do NOT verify the server cert, so a
+self-signed cert needs no CA distribution. (NATS has no "accept self-signed"
+URL scheme; its CA is wired into the controller + worker separately — see the
+NATS TLS change.) For a stricter posture (verify-full / neo4j+s://), supply
+operator-managed certs (e.g. cert-manager) in these Secret names instead.
+
+`resource-policy: keep` so `helm uninstall` doesn't wipe the certs; the
+pre-install/pre-upgrade hook + weight -15 ensures the Secret exists before the
+Postgres (-14/-11) and Neo4j StatefulSets mount it.
+*/ -}}
+{{- if .Values.tls.inCluster.enabled }}
+{{- /* NATS is added when its client-side CA wiring lands (separate change);
+       this template currently provisions the Postgres + Neo4j certs. */ -}}
+{{- range $svc := (list "postgres" "neo4j") }}
+{{- $needed := false -}}
+{{- if and (eq $svc "postgres") $.Values.postgres.enabled }}{{- $needed = true -}}{{- end }}
+{{- if and (eq $svc "neo4j") $.Values.neo4j.enabled }}{{- $needed = true -}}{{- end }}
+{{- if $needed }}
+{{- $secretName := printf "%s-tls" (include "talos.componentName" (list $ $svc)) }}
+{{- $cn := include "talos.componentName" (list $ $svc) }}
+{{- $dns := printf "%s.%s.svc.cluster.local" $cn $.Release.Namespace }}
+{{- $existing := lookup "v1" "Secret" $.Release.Namespace $secretName }}
+{{- $crt := "" }}
+{{- $key := "" }}
+{{- if and $existing (hasKey ($existing.data | default dict) "tls.crt") (hasKey ($existing.data | default dict) "tls.key") }}
+{{- $crt = index $existing.data "tls.crt" }}
+{{- $key = index $existing.data "tls.key" }}
+{{- else }}
+{{- $cert := genSelfSignedCert $dns nil (list $dns $cn (printf "%s-0.%s" $cn $dns)) (int $.Values.tls.inCluster.validityDays) }}
+{{- $crt = b64enc $cert.Cert }}
+{{- $key = b64enc $cert.Key }}
+{{- end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list $ $svc) | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-15"
+    "helm.sh/hook-delete-policy": before-hook-creation
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $crt }}
+  tls.key: {{ $key }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -294,13 +294,17 @@ if [[ "${TALOS_USE_INTERNAL_POSTGRES:-no}" == "yes" ]]; then
         ok "postgres credentials secret created"
     fi
     # Build the connection string the controller / migration job will use.
-    # `sslmode=disable` is appropriate for the in-cluster path — the
-    # connection never leaves the pod-network mesh and the chart's
-    # NetworkPolicy already restricts who can speak to port 5432.
+    # `sslmode=require` matches the in-cluster Postgres TLS the chart now
+    # terminates (tls.inCluster.enabled, default ON) — required because the
+    # controller fails closed on a non-TLS DATABASE_URL under
+    # RUST_ENV=production (transmission security, PR #243). `require` encrypts
+    # without verifying the self-signed server cert (no CA distribution). If
+    # you set tls.inCluster.enabled=false, change this back to sslmode=disable
+    # AND run a non-production RUST_ENV (plaintext is rejected in production).
     # NOTE: Service DNS uses the chart's `talos.componentName` helper —
     # we mirror its naming convention here.
     PG_SERVICE_HOST="${TALOS_FULLNAME}-postgres.${TALOS_NAMESPACE}.svc.cluster.local"
-    TALOS_POSTGRES_URL="postgresql://${PG_USER}:${PG_PASSWORD}@${PG_SERVICE_HOST}:5432/${PG_DB}?sslmode=disable"
+    TALOS_POSTGRES_URL="postgresql://${PG_USER}:${PG_PASSWORD}@${PG_SERVICE_HOST}:5432/${PG_DB}?sslmode=require"
     ok "internal Postgres URL set — pointing at $PG_SERVICE_HOST:5432/${PG_DB}"
 fi
 

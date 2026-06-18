@@ -86,4 +86,16 @@ data:
 
     # Safety
     password_encryption = scram-sha-256
+{{- if .Values.tls.inCluster.enabled }}
+
+    # In-transit TLS (PR #243 transmission security). Cert+key are mounted at
+    # /etc/postgresql/tls from the chart-generated <release>-postgres-tls
+    # Secret. Clients connect with sslmode=require — encrypted, no cert
+    # verification (the cert is self-signed; no CA distribution needed). The key
+    # Secret mounts defaultMode 0640 owned root:<fsGroup 999>, which Postgres
+    # accepts (root-owned, group-readable, no group/world write).
+    ssl = on
+    ssl_cert_file = '/etc/postgresql/tls/tls.crt'
+    ssl_key_file = '/etc/postgresql/tls/tls.key'
+{{- end }}
 {{- end }}

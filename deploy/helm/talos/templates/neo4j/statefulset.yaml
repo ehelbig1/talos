@@ -30,6 +30,37 @@ spec:
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "talos.podSecurityContext" . | nindent 8 }}
+      {{- if .Values.tls.inCluster.enabled }}
+      initContainers:
+        # Assemble the Bolt SSL policy directory (PR #243 in-transit TLS).
+        # Neo4j 5.x requires the policy base_directory to contain the cert+key
+        # AND — even with client_auth=NONE — empty trusted/ and revoked/
+        # subdirs, with the private key NOT group/world readable. A read-only
+        # Secret mount can provide none of those, so stage them into an
+        # emptyDir here from the chart-generated <release>-neo4j-tls Secret.
+        - name: bolt-ssl-setup
+          image: {{ include "talos.image" .Values.neo4j.image }}
+          imagePullPolicy: {{ .Values.neo4j.image.pullPolicy }}
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              cp /tls-src/tls.crt /ssl/bolt/public.crt
+              cp /tls-src/tls.key /ssl/bolt/private.key
+              chmod 0644 /ssl/bolt/public.crt
+              chmod 0600 /ssl/bolt/private.key
+              mkdir -p /ssl/bolt/trusted /ssl/bolt/revoked
+              chmod 0700 /ssl/bolt/trusted /ssl/bolt/revoked
+          volumeMounts:
+            - name: tls-src
+              mountPath: /tls-src
+              readOnly: true
+            - name: bolt-ssl
+              mountPath: /ssl/bolt
+      {{- end }}
       containers:
         - name: neo4j
           image: {{ include "talos.image" .Values.neo4j.image }}
@@ -51,6 +82,23 @@ spec:
               value: {{ .Values.neo4j.heap.initial | quote }}
             - name: NEO4J_server_memory_heap_max__size
               value: {{ .Values.neo4j.heap.max | quote }}
+            {{- if .Values.tls.inCluster.enabled }}
+            # In-transit TLS for Bolt (PR #243). The bolt-ssl-setup
+            # initContainer staged /ssl/bolt. Clients connect with bolt+ssc://
+            # (encrypt + accept the self-signed cert without verification).
+            - name: NEO4J_dbms_connector_bolt_tls__level
+              value: "REQUIRED"
+            - name: NEO4J_dbms_ssl_policy_bolt_enabled
+              value: "true"
+            - name: NEO4J_dbms_ssl_policy_bolt_base__directory
+              value: "/ssl/bolt"
+            - name: NEO4J_dbms_ssl_policy_bolt_private__key
+              value: "private.key"
+            - name: NEO4J_dbms_ssl_policy_bolt_public__certificate
+              value: "public.crt"
+            - name: NEO4J_dbms_ssl_policy_bolt_client__auth
+              value: "NONE"
+            {{- end }}
           ports:
             - name: bolt
               containerPort: 7687
@@ -107,7 +155,23 @@ spec:
               mountPath: /var/lib/neo4j/plugins
             - name: conf
               mountPath: /var/lib/neo4j/conf
+            {{- if .Values.tls.inCluster.enabled }}
+            - name: bolt-ssl
+              mountPath: /ssl/bolt
+              readOnly: true
+            {{- end }}
       volumes:
+        {{- if .Values.tls.inCluster.enabled }}
+        # Raw self-signed cert+key from the chart-generated Secret (read-only),
+        # staged into the bolt-ssl emptyDir by the bolt-ssl-setup initContainer.
+        - name: tls-src
+          secret:
+            secretName: {{ include "talos.componentName" (list . "neo4j-tls") }}
+            defaultMode: 0640
+        - name: bolt-ssl
+          emptyDir:
+            sizeLimit: "16Mi"
+        {{- end }}
         - name: logs
           emptyDir:
             sizeLimit: "1Gi"
