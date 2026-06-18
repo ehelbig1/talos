@@ -86,7 +86,10 @@ spec:
             # In-transit TLS for Bolt (PR #243). The bolt-ssl-setup
             # initContainer staged /ssl/bolt. Clients connect with bolt+ssc://
             # (encrypt + accept the self-signed cert without verification).
-            - name: NEO4J_dbms_connector_bolt_tls__level
+            # Neo4j 5.x: the connector tls_level moved to `server.bolt.*`
+            # (the legacy `dbms.connector.bolt.tls_level` still works but logs a
+            # deprecation warning — confirmed via a 5.26-community boot test).
+            - name: NEO4J_server_bolt_tls__level
               value: "REQUIRED"
             - name: NEO4J_dbms_ssl_policy_bolt_enabled
               value: "true"
