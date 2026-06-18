@@ -93,10 +93,13 @@ keep `bootstrapSecret.enabled: false` and supply the same name.
 nats://{{ include "talos.componentName" (list . "nats") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.nats.service.clientPort | default 4222 }}
 {{- end -}}
 
-{{/* Neo4j in-cluster URI. */}}
+{{/* Neo4j in-cluster URI. Uses the bolt+ssc:// TLS scheme (encrypt + accept
+     the chart's self-signed cert without verification) when in-cluster TLS is
+     enabled, so the controller's production TLS gate (#243) is satisfied. */}}
 {{- define "talos.neo4jUri" -}}
 {{- if .Values.neo4j.enabled -}}
-bolt://{{ include "talos.componentName" (list . "neo4j") }}.{{ .Release.Namespace }}.svc.cluster.local:7687
+{{- $scheme := ternary "bolt+ssc" "bolt" .Values.tls.inCluster.enabled -}}
+{{ $scheme }}://{{ include "talos.componentName" (list . "neo4j") }}.{{ .Release.Namespace }}.svc.cluster.local:7687
 {{- else -}}
 {{ .Values.neo4j.external.uri }}
 {{- end -}}

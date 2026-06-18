@@ -190,6 +190,16 @@ spec:
               mountPath: /etc/postgresql/postgresql.conf
               subPath: postgresql.conf
               readOnly: true
+            {{- if .Values.tls.inCluster.enabled }}
+            # In-transit TLS cert+key (PR #243). postgresql.conf points
+            # ssl_cert_file/ssl_key_file here. fsGroup 999 makes the mounted
+            # files root:999; defaultMode 0640 lets the postgres uid (999, in
+            # the group) read them while satisfying Postgres' key-perm check
+            # (root-owned, no group/world write).
+            - name: tls
+              mountPath: /etc/postgresql/tls
+              readOnly: true
+            {{- end }}
           # Override the default entrypoint's config path so postgres
           # picks up our tuned values. The official image's entrypoint
           # (docker-entrypoint.sh) honours `-c config_file=...` on the
@@ -208,6 +218,12 @@ spec:
         - name: config
           configMap:
             name: {{ include "talos.componentName" (list . "postgres-config") }}
+        {{- if .Values.tls.inCluster.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "talos.componentName" (list . "postgres-tls") }}
+            defaultMode: 0640
+        {{- end }}
             items:
               - key: postgresql.conf
                 path: postgresql.conf

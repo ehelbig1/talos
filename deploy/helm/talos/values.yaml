@@ -27,6 +27,27 @@ global:
   namespace: "talos"
 
 # ----------------------------------------------------------------------------
+# In-cluster TLS — terminates TLS on the self-hosted NATS / Neo4j / Postgres
+# services so a RUST_ENV=production install boots through the controller's
+# fail-closed transmission-security gates (PR #243). When enabled the chart
+# generates a self-signed cert+key per in-cluster service (reused across
+# upgrades; see templates/tls/incluster-certs.yaml) and wires the clients to
+# TLS URLs (Postgres sslmode=require, Neo4j bolt+ssc://, NATS tls://).
+# ----------------------------------------------------------------------------
+tls:
+  inCluster:
+    # Master toggle. Default ON so the production chart boots. Disabling it on
+    # a RUST_ENV=production deployment will make the controller refuse to start
+    # (the #243 gates reject plaintext nats://, bolt://, sslmode=disable). Only
+    # turn this off if you front the in-cluster services with an external TLS
+    # terminator / service mesh, or run a non-production (homelab) RUST_ENV.
+    enabled: true
+    # Validity of the chart-generated self-signed certs, in days. Certs are
+    # reused across `helm upgrade` (not regenerated), so this only applies on
+    # first issuance / after a manual cert-Secret deletion.
+    validityDays: 3650
+
+# ----------------------------------------------------------------------------
 # Controller — Rust/Axum GraphQL + REST + MCP API server.
 # Owns Postgres + Neo4j + Vault credentials.
 # ----------------------------------------------------------------------------
