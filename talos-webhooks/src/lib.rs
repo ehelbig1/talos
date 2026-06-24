@@ -2173,22 +2173,74 @@ impl WebhookRouter {
             }
         } else {
             // Async mode: spawn engine, return 202 immediately.
+            //
+            // FU-1 fence: this background run is a long-lived `running` row that
+            // can outlast the crash-recovery stale window and be reclaimed by a
+            // restarting controller while it's still dispatching. Fence it on the
+            // row's ACTUAL current epoch (a wrong value would abort a healthy run
+            // on the first heartbeat tick — a silent lost execution), falling
+            // back to the unfenced path on an epoch-read failure. The sync path
+            // above is intentionally NOT fenced — it's bounded by sync_timeout
+            // (≤120s, under the stale window), and a reclaim there would abort
+            // the inline run the caller is waiting on.
+            let db_pool_for_fence = self.db_pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = talos_engine::nats_run::run_with_trigger_input_via_nats(
-                    &mut engine,
-                    nats,
-                    worker_shared_key,
-                    input_payload,
-                    execution_id,
+                let fence_epoch = sqlx::query_scalar::<_, i64>(
+                    "SELECT epoch FROM workflow_executions WHERE id = $1",
                 )
+                .bind(execution_id)
+                .fetch_optional(&db_pool_for_fence)
                 .await
-                {
-                    tracing::error!(
-                        execution_id = %execution_id,
-                        workflow_id = %workflow_id,
-                        error = ?e,
-                        "Workflow execution failed (async)"
-                    );
+                .ok()
+                .flatten();
+
+                let run_result = match fence_epoch {
+                    Some(epoch) => {
+                        talos_engine::fence::run_with_trigger_input_fenced(
+                            &mut engine,
+                            nats,
+                            worker_shared_key,
+                            input_payload,
+                            execution_id,
+                            db_pool_for_fence,
+                            epoch,
+                        )
+                        .await
+                    }
+                    None => {
+                        tracing::warn!(
+                            execution_id = %execution_id,
+                            "Webhook async: could not read epoch for fresh-run fence; running unfenced"
+                        );
+                        talos_engine::nats_run::run_with_trigger_input_via_nats(
+                            &mut engine,
+                            nats,
+                            worker_shared_key,
+                            input_payload,
+                            execution_id,
+                        )
+                        .await
+                    }
+                };
+
+                if let Err(e) = run_result {
+                    if talos_engine::fence::was_fenced(&e) {
+                        // Reclaimed by crash-recovery (epoch advanced) — the row
+                        // belongs to the resumer now; not a failure of this run.
+                        tracing::warn!(
+                            execution_id = %execution_id,
+                            workflow_id = %workflow_id,
+                            "Webhook async: run fenced — superseded by a crash-recovery \
+                             reclaim; leaving the row to its new owner"
+                        );
+                    } else {
+                        tracing::error!(
+                            execution_id = %execution_id,
+                            workflow_id = %workflow_id,
+                            error = ?e,
+                            "Workflow execution failed (async)"
+                        );
+                    }
                 }
             });
 
