@@ -12,17 +12,34 @@
 //! `WHERE status = 'running'` (or `'resuming'`), so a superseded controller's
 //! finalize no-ops. What remains is the *continued dispatch* of new nodes by a
 //! controller that no longer owns the execution (duplicate side effects). This
-//! module closes that: each owning controller holds the `epoch` it observed,
-//! and a lightweight heartbeat polls the row's current epoch. When the epoch
-//! moves on (another claim/reclaim bumped it — see
+//! module reduces that window for **resumed** runs: a controller that resumes
+//! via [`run_with_seed_fenced`] holds the `epoch` it claimed and a lightweight
+//! heartbeat polls the row's current epoch. When the epoch moves on (another
+//! claim/reclaim bumped it — see
 //! `ExecutionRepository::claim_stuck_execution_for_resume` /
-//! `reclaim_orphaned_resuming`), the controller has been superseded and the
+//! `reclaim_orphaned_resuming`), the resumer has been superseded and the
 //! engine's [`CancellationToken`] is fired, aborting the run promptly instead of
 //! racing to completion against a row another controller owns.
 //!
-//! The epoch — not status — is the disambiguator: a superseded original
-//! controller and the legitimate resumer can BOTH observe `resuming`, but only
-//! one holds the current epoch. See `docs/split-brain-fencing-design.md`.
+//! The epoch — not status — is the disambiguator: a superseded resumer and the
+//! legitimate next resumer can BOTH observe `resuming`, but only one holds the
+//! current epoch. See `docs/split-brain-fencing-design.md`.
+//!
+//! ## Scope limitation — fresh runs are NOT actively fenced
+//!
+//! The heartbeat is installed ONLY on the resume path
+//! (`crash_recovery::resume_execution` → [`run_with_seed_fenced`]). The
+//! ORIGINAL fresh-run controller (`trigger.rs` → `run_with_trigger_input_via_nats`)
+//! runs WITHOUT an epoch heartbeat. So if a fresh run goes stale (GC pause /
+//! partition / a node slower than the stale window) and a restarting controller
+//! reclaims it, the original is NOT aborted — it keeps dispatching alongside the
+//! resumer until it next blocks/completes. This is bounded, not unbounded:
+//! terminal writes are status-guarded (no terminal-state corruption or
+//! lost-update on the row), so the only exposure is the at-least-once duplicate
+//! node dispatch the durable-execution contract already documents
+//! (`crash_recovery` module docs). Tightening this — stamping an epoch at fresh
+//! INSERT and fencing the fresh-run path the same way — is a tracked follow-up;
+//! do NOT read this module as fencing the original fresh-run controller today.
 
 use std::collections::HashMap;
 use std::sync::Arc;

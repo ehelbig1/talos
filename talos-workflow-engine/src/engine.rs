@@ -4454,12 +4454,12 @@ impl ParallelWorkflowEngine {
     /// Cancellation only stops the engine's own scheduling. Workers
     /// already executing a `DispatchJob` continue until they
     /// complete on their own — the engine has no out-of-band channel
-    /// to abort them. If your transport supports mid-flight
-    /// cancellation (e.g. NATS request-reply with a side subject),
-    /// wire it through your `NodeDispatcher` impl using
-    /// the
-    /// [`DispatchJob`](talos_workflow_engine_core::DispatchJob)`::cancellation_token`
-    /// field.
+    /// to abort them. [`DispatchJob`](talos_workflow_engine_core::DispatchJob)
+    /// carries no cancellation handle; if your transport supports
+    /// mid-flight cancellation (e.g. NATS request-reply with a side
+    /// subject), implement it inside your `NodeDispatcher` using the
+    /// transport's own channel — there is no engine-level field to thread
+    /// it through.
     ///
     /// Use [`tokio_util::sync::CancellationToken::new`] to construct
     /// a token; clone it as needed to share with the cancel-trigger
