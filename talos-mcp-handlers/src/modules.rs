@@ -2196,9 +2196,18 @@ async fn handle_set_module_rate_limit(
         }
     };
 
+    // Only a platform-admin may set the rate limit on a global CATALOG module
+    // (user_id IS NULL) — that row is shared, so its rate_limit affects every
+    // tenant. A normal user is scoped to modules they own; an attempt against a
+    // catalog module simply matches 0 rows → "not found or access denied".
+    let allow_catalog = state
+        .actor_repo
+        .is_platform_admin(user_id)
+        .await
+        .unwrap_or(false);
     let (r1_affected, r2_affected) = match state
         .module_repo
-        .set_module_rate_limit(module_id, user_id, rpm)
+        .set_module_rate_limit(module_id, user_id, rpm, allow_catalog)
         .await
     {
         Ok(t) => t,

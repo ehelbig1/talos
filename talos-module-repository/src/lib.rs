@@ -1191,22 +1191,41 @@ impl ModuleRepository {
     /// Update rate_limit_per_minute on the unified modules table.
     /// Phase 5: modules-only. Returns (rows_affected, 0) for signature
     /// stability with pre-Phase-5 callers that expected the tuple shape.
+    ///
+    /// Owner-scoped by default. A global CATALOG module (`user_id IS NULL`) is a
+    /// SHARED row whose `rate_limit_per_minute` affects every tenant that runs
+    /// it, so mutating one requires `allow_catalog` (the caller is a
+    /// platform-admin). Without this gate any authenticated user could throttle
+    /// or unthrottle a shared template deployment-wide — a cross-tenant write.
     pub async fn set_module_rate_limit(
         &self,
         module_id: Uuid,
         user_id: Uuid,
         rpm: Option<i32>,
+        allow_catalog: bool,
     ) -> Result<(u64, u64)> {
-        let result = sqlx::query(
-            "UPDATE modules SET rate_limit_per_minute = $1 \
-             WHERE id = $2 \
-               AND (user_id = $3 OR user_id IS NULL)",
-        )
-        .bind(rpm)
-        .bind(module_id)
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await?;
+        let result = if allow_catalog {
+            sqlx::query(
+                "UPDATE modules SET rate_limit_per_minute = $1 \
+                 WHERE id = $2 \
+                   AND (user_id = $3 OR user_id IS NULL)",
+            )
+            .bind(rpm)
+            .bind(module_id)
+            .bind(user_id)
+            .execute(&self.db_pool)
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE modules SET rate_limit_per_minute = $1 \
+                 WHERE id = $2 AND user_id = $3",
+            )
+            .bind(rpm)
+            .bind(module_id)
+            .bind(user_id)
+            .execute(&self.db_pool)
+            .await?
+        };
         Ok((result.rows_affected(), 0))
     }
 
