@@ -36,9 +36,9 @@
 //!   transport (JetStream) redelivering mid-flight — rare, and no worse than
 //!   today (which dedupes nothing). Adding single-flight waiting was rejected as
 //!   not worth the deadlock surface for the incidence.
-//! - The **pipeline** path (`PipelineJobResult`) has the same exposure and is a
-//!   tracked follow-up (same shape, different result type).
-//! - `dry_run` jobs are never cached (no side effects; cheap to re-run).
+//! - `dry_run` single jobs are never cached (no side effects; cheap to re-run).
+//!   (`PipelineJobRequest` carries no `dry_run` flag, so the pipeline cache has
+//!   no equivalent skip.)
 //! - Results larger than [`MAX_CACHED_RESULT_BYTES`] are not cached (bounds
 //!   memory; large outputs are rare and a double-run of one is the residual).
 //!
@@ -73,17 +73,22 @@ const MAX_ENTRIES: usize = 4096;
 /// the overwhelming majority of module outputs.
 const MAX_CACHED_RESULT_BYTES: usize = 256 * 1024;
 
-struct Entry {
-    result: JobResult,
+struct Entry<V> {
+    result: V,
     stored_at: Instant,
 }
 
-/// A bounded, TTL-evicting cache of completed `JobResult`s keyed on `job_id`.
-pub(crate) struct JobResultCache {
-    map: DashMap<Uuid, Entry>,
+/// A bounded, TTL-evicting cache of completed results keyed on `job_id`.
+///
+/// Generic over the cached value `V` so the single-job path stores the typed
+/// `JobResult` (re-published via `publish_result_with_retry`) and the pipeline
+/// path stores the already-serialized publish `Bytes` (re-published verbatim) —
+/// the bound/TTL/sweep logic is identical for both.
+pub(crate) struct JobResultCache<V> {
+    map: DashMap<Uuid, Entry<V>>,
 }
 
-impl JobResultCache {
+impl<V: Clone> JobResultCache<V> {
     fn new() -> Self {
         Self {
             map: DashMap::new(),
@@ -91,11 +96,11 @@ impl JobResultCache {
     }
 
     /// Return the cached result for `job_id` if present and not expired.
-    pub(crate) fn get(&self, job_id: Uuid) -> Option<JobResult> {
+    pub(crate) fn get(&self, job_id: Uuid) -> Option<V> {
         self.get_at(job_id, Instant::now())
     }
 
-    fn get_at(&self, job_id: Uuid, now: Instant) -> Option<JobResult> {
+    fn get_at(&self, job_id: Uuid, now: Instant) -> Option<V> {
         let entry = self.map.get(&job_id)?;
         if now.duration_since(entry.stored_at) <= CACHE_TTL {
             Some(entry.result.clone())
@@ -109,11 +114,11 @@ impl JobResultCache {
     /// result as it will be published; oversized results are skipped. No-op for
     /// a result whose serialized form exceeds the size cap or when the cache is
     /// full of live entries.
-    pub(crate) fn put(&self, job_id: Uuid, result: JobResult, serialized_len: usize) {
+    pub(crate) fn put(&self, job_id: Uuid, result: V, serialized_len: usize) {
         self.put_at(job_id, result, serialized_len, Instant::now());
     }
 
-    fn put_at(&self, job_id: Uuid, result: JobResult, serialized_len: usize, now: Instant) {
+    fn put_at(&self, job_id: Uuid, result: V, serialized_len: usize, now: Instant) {
         if serialized_len > MAX_CACHED_RESULT_BYTES {
             return;
         }
@@ -151,10 +156,18 @@ impl JobResultCache {
     }
 }
 
-/// Process-global completed-result cache. Keyed on `job_id` (a fresh v4 UUID per
-/// dispatch, preserved across transport retries), so there is no cross-job key
-/// collision.
-pub(crate) static JOB_RESULT_CACHE: LazyLock<JobResultCache> = LazyLock::new(JobResultCache::new);
+/// Process-global completed single-job-result cache. Keyed on `job_id` (a fresh
+/// v4 UUID per dispatch, preserved across transport retries), so there is no
+/// cross-job key collision.
+pub(crate) static JOB_RESULT_CACHE: LazyLock<JobResultCache<JobResult>> =
+    LazyLock::new(JobResultCache::new);
+
+/// Process-global completed PIPELINE-result cache. Same transport-retry
+/// double-execution exposure as the single-job path; the pipeline handler
+/// publishes already-serialized `Bytes` (post size-gating), so we cache and
+/// re-publish those bytes verbatim rather than the typed `PipelineJobResult`.
+pub(crate) static PIPELINE_PAYLOAD_CACHE: LazyLock<JobResultCache<bytes::Bytes>> =
+    LazyLock::new(JobResultCache::new);
 
 /// Interval for the background sweep of expired entries. Read-path eviction
 /// handles active job_ids; this reaps entries for workers that go idle so the
@@ -182,7 +195,7 @@ mod tests {
 
     #[test]
     fn put_then_get_returns_the_result() {
-        let cache = JobResultCache::new();
+        let cache: JobResultCache<JobResult> = JobResultCache::new();
         let id = Uuid::new_v4();
         let t0 = Instant::now();
         cache.put_at(id, result(id), 100, t0);
@@ -193,13 +206,13 @@ mod tests {
 
     #[test]
     fn miss_for_unknown_job() {
-        let cache = JobResultCache::new();
+        let cache: JobResultCache<JobResult> = JobResultCache::new();
         assert!(cache.get(Uuid::new_v4()).is_none());
     }
 
     #[test]
     fn expired_entry_is_a_miss() {
-        let cache = JobResultCache::new();
+        let cache: JobResultCache<JobResult> = JobResultCache::new();
         let id = Uuid::new_v4();
         let t0 = Instant::now();
         cache.put_at(id, result(id), 100, t0);
@@ -210,7 +223,7 @@ mod tests {
 
     #[test]
     fn oversized_result_is_not_cached() {
-        let cache = JobResultCache::new();
+        let cache: JobResultCache<JobResult> = JobResultCache::new();
         let id = Uuid::new_v4();
         let t0 = Instant::now();
         cache.put_at(id, result(id), MAX_CACHED_RESULT_BYTES + 1, t0);
@@ -222,7 +235,7 @@ mod tests {
 
     #[test]
     fn sweep_drops_only_expired() {
-        let cache = JobResultCache::new();
+        let cache: JobResultCache<JobResult> = JobResultCache::new();
         let old = Uuid::new_v4();
         let fresh = Uuid::new_v4();
         let t0 = Instant::now();
@@ -241,7 +254,7 @@ mod tests {
 
     #[test]
     fn re_store_same_job_does_not_grow_map() {
-        let cache = JobResultCache::new();
+        let cache: JobResultCache<JobResult> = JobResultCache::new();
         let id = Uuid::new_v4();
         let t0 = Instant::now();
         cache.put_at(id, result(id), 100, t0);
@@ -251,5 +264,31 @@ mod tests {
             1,
             "re-storing the same job_id must not grow the map"
         );
+    }
+
+    #[test]
+    fn generic_cache_works_for_pipeline_bytes() {
+        // The pipeline path caches the published payload `Bytes`; same TTL +
+        // size-cap logic via the generic `JobResultCache<V>`.
+        let cache: JobResultCache<bytes::Bytes> = JobResultCache::new();
+        let id = Uuid::new_v4();
+        let t0 = Instant::now();
+        let payload = bytes::Bytes::from_static(b"signed-pipeline-result");
+
+        cache.put_at(id, payload.clone(), payload.len(), t0);
+        assert_eq!(
+            cache.get_at(id, t0 + Duration::from_secs(1)),
+            Some(payload.clone())
+        );
+
+        // Oversized payload is not cached.
+        let other = Uuid::new_v4();
+        cache.put_at(other, payload.clone(), MAX_CACHED_RESULT_BYTES + 1, t0);
+        assert!(cache.get_at(other, t0).is_none());
+
+        // Expiry applies to the bytes instance too.
+        assert!(cache
+            .get_at(id, t0 + CACHE_TTL + Duration::from_secs(1))
+            .is_none());
     }
 }

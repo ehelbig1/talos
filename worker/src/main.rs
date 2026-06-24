@@ -3157,6 +3157,7 @@ async fn main() -> anyhow::Result<()> {
         loop {
             tick.tick().await;
             crate::job_idempotency::JOB_RESULT_CACHE.sweep();
+            crate::job_idempotency::PIPELINE_PAYLOAD_CACHE.sweep();
         }
     });
 
@@ -3617,6 +3618,34 @@ async fn main() -> anyhow::Result<()> {
                             );
 
                             tokio::task::spawn(async move {
+                                // FU-2 (R2-5) pipeline idempotency: a controller transport-retry
+                                // re-sends the same job_id (fresh nonce) AFTER the original ran.
+                                // Re-publish the cached signed payload bytes instead of re-running
+                                // the pipeline (which would repeat every step's side effects). The
+                                // bytes are still within the 300s JobResult freshness window, so
+                                // they're re-published as-is. (PipelineJobRequest has no dry_run.)
+                                if let Some(cached) =
+                                    crate::job_idempotency::PIPELINE_PAYLOAD_CACHE.get(req.job_id)
+                                {
+                                    ::tracing::info!(
+                                        job_id = %req.job_id,
+                                        "idempotency: re-publishing cached pipeline result for \
+                                         re-seen job_id (transport retry); skipping re-execution"
+                                    );
+                                    let publish_result = if let Some(reply) = reply_to {
+                                        publish_bytes_with_retry(&nc_clone, reply, cached, 3).await
+                                    } else {
+                                        let result_topic =
+                                            format!("talos.pipeline.results.{}", req.job_id);
+                                        publish_bytes_with_retry(&nc_clone, result_topic, cached, 3).await
+                                    };
+                                    if let Err(e) = publish_result {
+                                        ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to publish cached pipeline result");
+                                    }
+                                    drop(permit);
+                                    return;
+                                }
+
                                 let mut result =
                                     execute_pipeline_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
 
@@ -3697,6 +3726,16 @@ async fn main() -> anyhow::Result<()> {
                                 } else {
                                     bytes::Bytes::from(serialized)
                                 };
+
+                                // FU-2: cache the final signed payload bytes BEFORE publishing, so
+                                // a retry that arrives because the *reply* (not the execution)
+                                // failed re-publishes the identical bytes instead of re-running the
+                                // pipeline. `Bytes::clone` is a cheap refcount bump.
+                                crate::job_idempotency::PIPELINE_PAYLOAD_CACHE.put(
+                                    result.job_id,
+                                    payload.clone(),
+                                    payload.len(),
+                                );
 
                                 // Single-publish architecture (mirrors single-job
                                 // results, see publish_result_with_retry above for
