@@ -167,15 +167,17 @@ impl GmailApiClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow!(
-                "Gmail API returned non-success status {}: {}",
-                status,
-                error_text
-            ));
+            // Match the api.rs sites (MCP-529): bounded read + codepoint-aware
+            // truncate + DLP-scrub the body, log the redacted preview, and
+            // return a STATUS-ONLY error so the raw Google error body never
+            // rides the anyhow chain into the handler's log line. Pre-fix this
+            // used unbounded `response.text()` and put the raw body into the
+            // returned error.
+            let text = talos_http_body::read_error_text_capped(response).await;
+            let preview = talos_text_util::truncate_at_char_boundary(&text, 500);
+            let redacted = talos_dlp_provider::redact_str(preview);
+            tracing::warn!(%status, body = %redacted, "Gmail API returned error");
+            return Err(anyhow!("Gmail API returned non-success status {}", status));
         }
 
         let json: Value = response

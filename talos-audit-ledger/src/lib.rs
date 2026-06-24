@@ -1055,9 +1055,17 @@ async fn process_batch(
                     "talos.crypto.sequence",
                     event["sequence_num"].as_u64().unwrap_or(0) as i64,
                 ));
+                // The actor identifier (e.g. "human:manager@company.com" or
+                // "agent:gpt-4") is exported to the tenant's OWN OTLP collector
+                // for trace attribution — the operator-email PII is intentional
+                // tenant-scoped telemetry. Run it through `redact_str` anyway
+                // for consistency with the sibling `talos.payload` attribute
+                // below: defense-in-depth so a secret-shaped value that ever
+                // lands in the actor field (e.g. a misformatted "agent:sk-...")
+                // doesn't egress to the collector in the clear.
                 span.set_attribute(KeyValue::new(
                     "talos.actor",
-                    event["actor"].as_str().unwrap_or("unknown").to_string(),
+                    talos_dlp_provider::redact_str(event["actor"].as_str().unwrap_or("unknown")),
                 ));
                 span.set_attribute(KeyValue::new(
                     "talos.action",

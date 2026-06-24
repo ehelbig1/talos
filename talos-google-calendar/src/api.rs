@@ -2,6 +2,17 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Read a Google Calendar API error response body (already bounded by
+/// `read_error_text_capped`) and DLP-redact it. Mirrors the gmail api.rs
+/// MCP-529 discipline: a verbose Google error envelope that ever echoes
+/// token/email content must not reach logs OR the returned `anyhow` chain in
+/// the clear. Google does not currently echo the bearer token, so this is
+/// defense-in-depth consistency with the rest of the codebase.
+async fn capped_redacted_error(response: reqwest::Response) -> String {
+    let text = talos_http_body::read_error_text_capped(response).await;
+    talos_dlp_provider::redact_str(&text)
+}
+
 /// Google Calendar API client
 pub struct GoogleCalendarApiClient {
     client: reqwest::Client,
@@ -116,7 +127,7 @@ impl GoogleCalendarApiClient {
         tracing::debug!("Google Calendar API response status: {}", status);
 
         if !status.is_success() {
-            let error_text = talos_http_body::read_error_text_capped(response).await;
+            let error_text = capped_redacted_error(response).await;
             tracing::warn!(
                 "Google Calendar API error listing calendars: {}",
                 error_text
@@ -177,7 +188,7 @@ impl GoogleCalendarApiClient {
         }
 
         if !response.status().is_success() {
-            let error_text = talos_http_body::read_error_text_capped(response).await;
+            let error_text = capped_redacted_error(response).await;
             anyhow::bail!("Event list failed: {}", error_text);
         }
 
@@ -217,7 +228,7 @@ impl GoogleCalendarApiClient {
             .context("Failed to get event")?;
 
         if !response.status().is_success() {
-            let error_text = talos_http_body::read_error_text_capped(response).await;
+            let error_text = capped_redacted_error(response).await;
             anyhow::bail!("Get event failed: {}", error_text);
         }
 
@@ -257,7 +268,7 @@ impl GoogleCalendarApiClient {
             .context("Failed to create watch channel")?;
 
         if !response.status().is_success() {
-            let error_text = talos_http_body::read_error_text_capped(response).await;
+            let error_text = capped_redacted_error(response).await;
             anyhow::bail!("Watch creation failed: {}", error_text);
         }
 
@@ -289,7 +300,7 @@ impl GoogleCalendarApiClient {
             .context("Failed to stop watch channel")?;
 
         if !response.status().is_success() {
-            let error_text = talos_http_body::read_error_text_capped(response).await;
+            let error_text = capped_redacted_error(response).await;
             anyhow::bail!("Stop watch failed: {}", error_text);
         }
 
