@@ -765,6 +765,29 @@ impl WebhookDeduplication {
 
         Ok(!set) // Not set = duplicate
     }
+
+    /// Release a dedup claim taken by [`Self::is_duplicate`] (begin/abandon
+    /// pattern). `is_duplicate` atomically RECORDS the claim at arrival — which
+    /// correctly prevents two *concurrent* deliveries of the same event from
+    /// both processing — but if the caller then hits a TRANSIENT failure
+    /// *before* the event is actually processed (e.g. a module/workflow load
+    /// error returning a retryable 5xx), the claim must be released so the
+    /// sender's redelivery isn't silently suppressed as a "duplicate" and the
+    /// delivery lost for the whole window. Callers release ONLY on
+    /// pre-processing failures; a claim for an event that actually ran stays
+    /// recorded.
+    ///
+    /// DELs the same `webhook:processed:{trigger_id}:{event_id}` key. The value
+    /// is a fixed sentinel (`"1"`), so an unconditional DEL is correct — there
+    /// is no per-caller token to guard against (unlike the idempotency
+    /// `reserved` records above), and the key is namespaced per (trigger,
+    /// event), so a release can only affect this exact claim.
+    pub async fn release(&self, trigger_id: Uuid, event_id: &str) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let key = format!("webhook:processed:{}:{}", trigger_id, event_id);
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut conn).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
