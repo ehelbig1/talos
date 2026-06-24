@@ -113,6 +113,14 @@ pub struct CircuitBreaker {
     failure_count: Arc<RwLock<u32>>,
     success_count: Arc<RwLock<u32>>,
     last_failure_time: Arc<RwLock<Option<Instant>>>,
+    /// Number of probe requests ADMITTED in the current half-open window.
+    /// Bounds the recovery-probe burst: classic circuit-breaker behavior
+    /// admits only a limited number of probes in half-open, but `allow()`
+    /// previously returned `true` unconditionally there, so a request burst
+    /// arriving during the reset window all passed through and hammered a
+    /// still-recovering downstream (thundering herd). Reset to 0 on each
+    /// Open→HalfOpen transition; capped at `success_threshold` admissions.
+    half_open_probes: Arc<RwLock<u32>>,
 }
 
 impl Clone for CircuitBreaker {
@@ -132,6 +140,7 @@ impl Clone for CircuitBreaker {
             failure_count: self.failure_count.clone(),
             success_count: self.success_count.clone(),
             last_failure_time: self.last_failure_time.clone(),
+            half_open_probes: self.half_open_probes.clone(),
         }
     }
 }
@@ -145,6 +154,7 @@ impl CircuitBreaker {
             failure_count: Arc::new(RwLock::new(0)),
             success_count: Arc::new(RwLock::new(0)),
             last_failure_time: Arc::new(RwLock::new(None)),
+            half_open_probes: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -177,14 +187,30 @@ impl CircuitBreaker {
                     // Reset counters
                     *self.success_count.write().await = 0;
                     *self.failure_count.write().await = 0;
+                    // This transition admits the FIRST half-open probe; start
+                    // the probe budget at 1 so the cap below is enforced from
+                    // the very next concurrent request.
+                    *self.half_open_probes.write().await = 1;
                     true
                 } else {
                     false
                 }
             }
             CircuitState::HalfOpen => {
-                // Limited requests allowed for testing
-                true
+                // Admit only a bounded number of recovery probes (the same
+                // count needed to close the circuit). Once the budget is
+                // spent, fail fast — the in-flight probes decide the outcome
+                // (enough successes → Closed via record_success; any failure →
+                // Open via record_failure), and admitting more would just pile
+                // load onto a downstream that's still proving itself.
+                let cap = self.config.success_threshold.max(1);
+                let mut admitted = self.half_open_probes.write().await;
+                if *admitted >= cap {
+                    false
+                } else {
+                    *admitted += 1;
+                    true
+                }
             }
         }
     }
@@ -411,6 +437,49 @@ mod tests {
         breaker.record_success().await;
         breaker.record_success().await;
 
+        assert_eq!(breaker.state().await, CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn half_open_admits_only_success_threshold_probes() {
+        // Recovery-probe burst protection: in half-open, at most
+        // `success_threshold` probes are admitted; further requests fail fast
+        // until the in-flight probes decide the outcome.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            reset_timeout: Duration::from_millis(50),
+            success_threshold: 2,
+            name: "test-halfopen-cap".to_string(),
+        };
+        let breaker = CircuitBreaker::new(config);
+
+        // Open the circuit.
+        breaker.record_failure().await;
+        assert_eq!(breaker.state().await, CircuitState::Open);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // First allow() transitions Open→HalfOpen and admits probe #1.
+        assert!(
+            breaker.allow().await,
+            "first probe admitted (enters half-open)"
+        );
+        assert_eq!(breaker.state().await, CircuitState::HalfOpen);
+        // Second probe still within the budget (cap == success_threshold == 2).
+        assert!(breaker.allow().await, "second probe within budget");
+        // Budget spent — further probes fail fast.
+        assert!(
+            !breaker.allow().await,
+            "third probe denied (budget exhausted)"
+        );
+        assert!(!breaker.allow().await, "still denied");
+        // State is unchanged — we're waiting on the in-flight probes to report.
+        assert_eq!(breaker.state().await, CircuitState::HalfOpen);
+
+        // A success that closes the circuit resets the window; a fresh
+        // open→half-open cycle gets a fresh probe budget.
+        breaker.record_success().await;
+        breaker.record_success().await;
         assert_eq!(breaker.state().await, CircuitState::Closed);
     }
 
