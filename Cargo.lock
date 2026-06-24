@@ -7205,6 +7205,7 @@ dependencies = [
  "talos-db",
  "talos-secrets-manager",
  "talos-workflow-job-protocol",
+ "tokio",
  "tracing",
  "uuid",
 ]

@@ -3271,9 +3271,28 @@ impl AnalyticsRepository {
     // -- Hygiene report ---------------------------------------------------
 
     pub async fn get_hygiene_report(&self, user_id: Uuid) -> Result<HygieneReport> {
+        // P5 perf: the ~16 queries below are user_id-scoped and (with one
+        // exception) data-independent. They were previously `.await`ed one
+        // at a time — 80-300ms of serialized round-trips on managed
+        // Postgres. `db_pool` is a `PgPool` (a cloneable shared handle), so
+        // each future inside a `tokio::join!` acquires its OWN pooled
+        // connection and they run concurrently. We batch in groups of ~6 to
+        // stay well under the pool's max connections (~30).
+        //
+        // `tokio::join!` (NOT `try_join!`) is deliberate: every query below
+        // collapses its own errors into a default (`.unwrap_or_default()` /
+        // `.unwrap_or(0)`), so there is no `Result` to short-circuit on and
+        // the swallow-into-default semantics are byte-for-byte preserved.
+        //
+        // The ONLY data dependency is `orphaned_secrets` (#12), which is
+        // gated on `has_wildcard_module` (#11). #11 lives in Batch B, which
+        // completes before #12 runs in Batch C — so the dependency is
+        // honored while everything else parallelizes.
+
         // 1. Undescribed workflows
-        let undescribed: Vec<HygieneWorkflowRow> = sqlx::query(
-            "SELECT id, name, readiness_score, NULL::text AS description, created_at \
+        let undescribed_fut = async {
+            let rows: Vec<HygieneWorkflowRow> = sqlx::query(
+                "SELECT id, name, readiness_score, NULL::text AS description, created_at \
              FROM workflows \
              WHERE user_id = $1 AND is_enabled = true \
                AND (status IS NULL OR status != 'archived') \
@@ -3281,24 +3300,27 @@ impl AnalyticsRepository {
                AND (description IS NULL OR description = '') \
                AND (readiness_score IS NULL OR readiness_score >= 10) \
              ORDER BY readiness_score DESC NULLS LAST LIMIT 25",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| HygieneWorkflowRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            readiness_score: r.try_get("readiness_score").unwrap_or(None),
-            description: r.try_get("description").unwrap_or(None),
-            created_at: r.get("created_at"),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| HygieneWorkflowRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                readiness_score: r.try_get("readiness_score").unwrap_or(None),
+                description: r.try_get("description").unwrap_or(None),
+                created_at: r.get("created_at"),
+            })
+            .collect();
+            rows
+        };
 
         // 2. Uncapabilized workflows
-        let uncapabilized: Vec<HygieneWorkflowRow> = sqlx::query(
-            "SELECT id, name, readiness_score, description, created_at \
+        let uncapabilized_fut = async {
+            let rows: Vec<HygieneWorkflowRow> = sqlx::query(
+                "SELECT id, name, readiness_score, description, created_at \
              FROM workflows \
              WHERE user_id = $1 AND is_enabled = true \
                AND (status IS NULL OR status != 'archived') \
@@ -3306,62 +3328,100 @@ impl AnalyticsRepository {
                AND (capabilities IS NULL OR array_length(capabilities, 1) IS NULL) \
                AND (readiness_score IS NULL OR readiness_score >= 10) \
              ORDER BY readiness_score DESC NULLS LAST LIMIT 25",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| HygieneWorkflowRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            readiness_score: r.try_get("readiness_score").unwrap_or(None),
-            description: r.try_get("description").unwrap_or(None),
-            created_at: r.get("created_at"),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| HygieneWorkflowRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                readiness_score: r.try_get("readiness_score").unwrap_or(None),
+                description: r.try_get("description").unwrap_or(None),
+                created_at: r.get("created_at"),
+            })
+            .collect();
+            rows
+        };
 
         // 3. Suppressed count (internal/test workflow types)
-        let suppressed_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM workflows \
+        let suppressed_count_fut = async {
+            let v: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM workflows \
              WHERE user_id = $1 AND is_enabled = true \
                AND (status IS NULL OR status != 'archived') \
                AND workflow_type IN ('internal', 'test')",
-        )
-        .bind(user_id)
-        .fetch_one(&self.db_pool)
-        .await
-        .unwrap_or(0);
+            )
+            .bind(user_id)
+            .fetch_one(&self.db_pool)
+            .await
+            .unwrap_or(0);
+            v
+        };
 
         // 3b. Suppressed low-score count (drafts with readiness_score < 10 excluded from hygiene)
-        let suppressed_low_score_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM workflows \
+        let suppressed_low_score_count_fut = async {
+            let v: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM workflows \
              WHERE user_id = $1 AND is_enabled = true \
                AND (status IS NULL OR status != 'archived') \
                AND workflow_type IN ('production', 'template') \
                AND readiness_score < 10",
-        )
-        .bind(user_id)
-        .fetch_one(&self.db_pool)
-        .await
-        .unwrap_or(0);
+            )
+            .bind(user_id)
+            .fetch_one(&self.db_pool)
+            .await
+            .unwrap_or(0);
+            v
+        };
 
         // 4. Unembedded count
-        let unembedded_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM workflows WHERE user_id = $1 AND embedding IS NULL",
-        )
-        .bind(user_id)
-        .fetch_one(&self.db_pool)
-        .await
-        .unwrap_or(0);
+        let unembedded_count_fut = async {
+            let v: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM workflows WHERE user_id = $1 AND embedding IS NULL",
+            )
+            .bind(user_id)
+            .fetch_one(&self.db_pool)
+            .await
+            .unwrap_or(0);
+            v
+        };
 
         // 5. Total workflow count
-        let total_workflow_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM workflows WHERE user_id = $1")
-                .bind(user_id)
-                .fetch_one(&self.db_pool)
-                .await
-                .unwrap_or(0);
+        let total_workflow_count_fut = async {
+            let v: i64 =
+                sqlx::query_scalar("SELECT COUNT(*)::bigint FROM workflows WHERE user_id = $1")
+                    .bind(user_id)
+                    .fetch_one(&self.db_pool)
+                    .await
+                    .unwrap_or(0);
+            v
+        };
+
+        // Batch A — 6 independent count/list queries.
+        let (
+            undescribed,
+            uncapabilized,
+            suppressed_count,
+            suppressed_low_score_count,
+            unembedded_count,
+            total_workflow_count,
+        ): (
+            Vec<HygieneWorkflowRow>,
+            Vec<HygieneWorkflowRow>,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = tokio::join!(
+            undescribed_fut,
+            uncapabilized_fut,
+            suppressed_count_fut,
+            suppressed_low_score_count_fut,
+            unembedded_count_fut,
+            total_workflow_count_fut,
+        );
 
         // 6. Orphaned modules — Phase 4 prep: query the unified `modules`
         // table and treat a module as orphan when no workflow graph_json
@@ -3373,8 +3433,9 @@ impl AnalyticsRepository {
         // every reference is canonical and the legacy-alias clauses
         // become structurally redundant — they remain here as a
         // belt-and-suspenders until the column drop in Phase 4 final.
-        let orphaned_modules: Vec<OrphanedModuleRow> = sqlx::query(
-            "SELECT m.id, m.name, m.compiled_at, m.size_bytes \
+        let orphaned_modules_fut = async {
+            let rows: Vec<OrphanedModuleRow> = sqlx::query(
+                "SELECT m.id, m.name, m.compiled_at, m.size_bytes \
              FROM modules m \
              WHERE m.user_id = $1 \
                AND m.compiled_at IS NOT NULL \
@@ -3384,89 +3445,100 @@ impl AnalyticsRepository {
                       AND w.graph_json LIKE '%' || m.id::text || '%' \
                ) \
              ORDER BY m.compiled_at DESC LIMIT 25",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| OrphanedModuleRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            size_bytes: r.try_get("size_bytes").unwrap_or(None),
-            compiled_at: r.get("compiled_at"),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| OrphanedModuleRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                size_bytes: r.try_get("size_bytes").unwrap_or(None),
+                compiled_at: r.get("compiled_at"),
+            })
+            .collect();
+            rows
+        };
 
         // 7. Stale executions
-        let stale_executions: Vec<StaleExecutionRow> = sqlx::query(
-            "SELECT we.id, we.workflow_id, w.name AS workflow_name, we.started_at, we.status \
+        let stale_executions_fut = async {
+            let rows: Vec<StaleExecutionRow> = sqlx::query(
+                "SELECT we.id, we.workflow_id, w.name AS workflow_name, we.started_at, we.status \
              FROM workflow_executions we \
              JOIN workflows w ON w.id = we.workflow_id \
              WHERE we.user_id = $1 AND we.status IN ('running', 'queued', 'resuming') \
                AND we.started_at < NOW() - INTERVAL '2 hours' \
              ORDER BY we.started_at ASC LIMIT 25",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| StaleExecutionRow {
-            id: r.get("id"),
-            workflow_id: r.get("workflow_id"),
-            workflow_name: r.get("workflow_name"),
-            started_at: r.get("started_at"),
-            status: r.get("status"),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| StaleExecutionRow {
+                id: r.get("id"),
+                workflow_id: r.get("workflow_id"),
+                workflow_name: r.get("workflow_name"),
+                started_at: r.get("started_at"),
+                status: r.get("status"),
+            })
+            .collect();
+            rows
+        };
 
         // 8. Dormant workflows
-        let dormant_workflows: Vec<DormantWorkflowRow> = sqlx::query(
-            "SELECT w.id, w.name, w.created_at, MAX(we.started_at) AS last_execution \
+        let dormant_workflows_fut = async {
+            let rows: Vec<DormantWorkflowRow> = sqlx::query(
+                "SELECT w.id, w.name, w.created_at, MAX(we.started_at) AS last_execution \
              FROM workflows w \
              LEFT JOIN workflow_executions we ON we.workflow_id = w.id AND we.user_id = w.user_id \
              WHERE w.user_id = $1 AND w.is_enabled = true AND w.created_at < NOW() - INTERVAL '30 days' \
              GROUP BY w.id, w.name, w.created_at \
              HAVING MAX(we.started_at) IS NULL OR MAX(we.started_at) < NOW() - INTERVAL '30 days' \
              ORDER BY w.created_at ASC LIMIT 25",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| DormantWorkflowRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            created_at: r.get("created_at"),
-            last_execution: r.try_get("last_execution").unwrap_or(None),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| DormantWorkflowRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+                last_execution: r.try_get("last_execution").unwrap_or(None),
+            })
+            .collect();
+            rows
+        };
 
         // 9. Stale draft workflows.
         // M-I: project graph_json so fix_all can run the
         // substantive-draft predicate before recommending deletion.
-        let stale_draft_workflows: Vec<StaleDraftRow> = sqlx::query(
-            "SELECT w.id, w.name, w.created_at, w.graph_json::text AS graph_json \
+        let stale_draft_workflows_fut = async {
+            let rows: Vec<StaleDraftRow> = sqlx::query(
+                "SELECT w.id, w.name, w.created_at, w.graph_json::text AS graph_json \
              FROM workflows w \
              WHERE w.user_id = $1 AND w.status = 'draft' \
                AND NOT EXISTS (SELECT 1 FROM workflow_executions we WHERE we.workflow_id = w.id) \
                AND w.created_at < NOW() - INTERVAL '7 days' \
              ORDER BY w.created_at ASC LIMIT 25",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| StaleDraftRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            created_at: r.get("created_at"),
-            graph_json: r.try_get("graph_json").unwrap_or(None),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| StaleDraftRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+                graph_json: r.try_get("graph_json").unwrap_or(None),
+            })
+            .collect();
+            rows
+        };
 
         // 10. Idle actors
         //
@@ -3480,8 +3552,9 @@ impl AnalyticsRepository {
         // The two NOT EXISTS guards are read-only existence checks against
         // actor_memory + workflows; no decryption happens and the lint rule
         // (raw INSERT/UPDATE/DELETE on actor_memory) does not apply.
-        let idle_actors: Vec<IdleActorRow> = sqlx::query(
-            "SELECT a.id, a.name, a.status, MAX(e.started_at) AS last_active, COUNT(DISTINCT e.id) AS total_executions \
+        let idle_actors_fut = async {
+            let rows: Vec<IdleActorRow> = sqlx::query(
+                "SELECT a.id, a.name, a.status, MAX(e.started_at) AS last_active, COUNT(DISTINCT e.id) AS total_executions \
              FROM actors a \
              LEFT JOIN workflow_executions e ON e.actor_id = a.id \
              WHERE a.user_id = $1 AND a.status = 'active' \
@@ -3491,36 +3564,67 @@ impl AnalyticsRepository {
              HAVING MAX(e.started_at) < now() - interval '30 days' \
                 OR (MAX(e.started_at) IS NULL AND a.created_at < now() - interval '7 days') \
              ORDER BY last_active ASC NULLS FIRST",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| IdleActorRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            status: r.get("status"),
-            last_active: r.try_get("last_active").unwrap_or(None),
-            total_executions: r.try_get("total_executions").unwrap_or(0),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| IdleActorRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                status: r.get("status"),
+                last_active: r.try_get("last_active").unwrap_or(None),
+                total_executions: r.try_get("total_executions").unwrap_or(0),
+            })
+            .collect();
+            rows
+        };
 
         // 11. Wildcard module check + attribution
         // Phase 5: single SELECT on the unified `modules` table.
-        let wildcard_rows = sqlx::query(
-            "SELECT DISTINCT name FROM modules \
+        let wildcard_module_names_fut = async {
+            let names: Vec<String> = sqlx::query(
+                "SELECT DISTINCT name FROM modules \
              WHERE user_id = $1 AND '*' = ANY(allowed_secrets) \
              ORDER BY name",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default();
-        let wildcard_module_names: Vec<String> = wildcard_rows
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
             .iter()
             .filter_map(|r| r.try_get::<String, _>("name").ok())
             .collect();
+            names
+        };
+
+        // Batch B — 6 independent list queries (orphaned modules, stale
+        // executions, dormant/draft workflows, idle actors, wildcard
+        // modules). #11 (wildcard) finishes here so its result gates #12
+        // (orphaned_secrets) in Batch C below.
+        let (
+            orphaned_modules,
+            stale_executions,
+            dormant_workflows,
+            stale_draft_workflows,
+            idle_actors,
+            wildcard_module_names,
+        ): (
+            Vec<OrphanedModuleRow>,
+            Vec<StaleExecutionRow>,
+            Vec<DormantWorkflowRow>,
+            Vec<StaleDraftRow>,
+            Vec<IdleActorRow>,
+            Vec<String>,
+        ) = tokio::join!(
+            orphaned_modules_fut,
+            stale_executions_fut,
+            dormant_workflows_fut,
+            stale_draft_workflows_fut,
+            idle_actors_fut,
+            wildcard_module_names_fut,
+        );
         let has_wildcard_module = !wildcard_module_names.is_empty();
 
         // 12. Orphaned secrets (only when no wildcard module).
@@ -3540,106 +3644,119 @@ impl AnalyticsRepository {
         // Correct implementation in pure SQL is ugly; instead we fetch all of
         // the user's secrets + the union of their grant entries, then filter
         // in Rust using a matcher that mirrors the host-side logic exactly.
-        let orphaned_secrets: Vec<OrphanedSecretRow> = if !has_wildcard_module {
-            let secrets_rows = sqlx::query(
-                "SELECT s.name, s.key_path, s.namespace, s.created_at, s.expires_at \
+        let orphaned_secrets_fut = async {
+            if !has_wildcard_module {
+                // The secrets list and the grants union are independent of
+                // each other — run them concurrently (still gated on
+                // !has_wildcard_module so behavior is unchanged).
+                let secrets_rows_fut = sqlx::query(
+                    "SELECT s.name, s.key_path, s.namespace, s.created_at, s.expires_at \
                  FROM secrets s \
                  WHERE s.created_by = $1 \
                  ORDER BY s.created_at ASC LIMIT 200",
-            )
-            .bind(user_id)
-            .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default();
+                )
+                .bind(user_id)
+                .fetch_all(&self.db_pool);
 
-            // Phase 5: union of grant entries from the unified `modules`
-            // table — every row lives exactly once, so a single SELECT
-            // DISTINCT replaces the old node_templates ∪ wasm_modules UNION.
-            let grants: Vec<String> = sqlx::query_scalar(
-                "SELECT DISTINCT unnest(allowed_secrets) AS g \
+                // Phase 5: union of grant entries from the unified `modules`
+                // table — every row lives exactly once, so a single SELECT
+                // DISTINCT replaces the old node_templates ∪ wasm_modules UNION.
+                let grants_fut = sqlx::query_scalar::<_, String>(
+                    "SELECT DISTINCT unnest(allowed_secrets) AS g \
                  FROM modules WHERE user_id = $1",
-            )
-            .bind(user_id)
-            .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default();
+                )
+                .bind(user_id)
+                .fetch_all(&self.db_pool);
 
-            secrets_rows
-                .into_iter()
-                .filter_map(|r| {
-                    let key_path: String = r.get("key_path");
-                    // Suppress controller-internal paths (LLM provider keys, OAuth
-                    // refresh tokens) — these are by-design absent from every
-                    // module's allowed_secrets grant. Flagging them as orphan
-                    // would suggest an operator delete them and silently break
-                    // the LLM cache or the next OAuth refresh cycle.
-                    if talos_workflow_job_protocol::is_controller_internal_vault_path(&key_path) {
-                        return None;
-                    }
-                    if secret_path_in_any_grant(&grants, &key_path) {
-                        None
-                    } else {
-                        Some(OrphanedSecretRow {
-                            name: r.get("name"),
-                            key_path,
-                            namespace: r.try_get("namespace").unwrap_or(None),
-                            created_at: r.get("created_at"),
-                            expires_at: r.try_get("expires_at").unwrap_or(None),
-                        })
-                    }
-                })
-                .take(25)
-                .collect()
-        } else {
-            Vec::new()
+                let (secrets_rows_res, grants_res) = tokio::join!(secrets_rows_fut, grants_fut);
+                let secrets_rows = secrets_rows_res.unwrap_or_default();
+                let grants: Vec<String> = grants_res.unwrap_or_default();
+
+                secrets_rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        let key_path: String = r.get("key_path");
+                        // Suppress controller-internal paths (LLM provider keys, OAuth
+                        // refresh tokens) — these are by-design absent from every
+                        // module's allowed_secrets grant. Flagging them as orphan
+                        // would suggest an operator delete them and silently break
+                        // the LLM cache or the next OAuth refresh cycle.
+                        if talos_workflow_job_protocol::is_controller_internal_vault_path(&key_path)
+                        {
+                            return None;
+                        }
+                        if secret_path_in_any_grant(&grants, &key_path) {
+                            None
+                        } else {
+                            Some(OrphanedSecretRow {
+                                name: r.get("name"),
+                                key_path,
+                                namespace: r.try_get("namespace").unwrap_or(None),
+                                created_at: r.get("created_at"),
+                                expires_at: r.try_get("expires_at").unwrap_or(None),
+                            })
+                        }
+                    })
+                    .take(25)
+                    .collect()
+            } else {
+                Vec::new()
+            }
         };
 
         // 13. Secrets without expiry
-        let secrets_without_expiry: Vec<SecretWithoutExpiryRow> = sqlx::query(
-            "SELECT name, key_path, created_at FROM secrets \
+        let secrets_without_expiry_fut = async {
+            let rows: Vec<SecretWithoutExpiryRow> = sqlx::query(
+                "SELECT name, key_path, created_at FROM secrets \
              WHERE created_by = $1 AND expires_at IS NULL \
                AND (key_path ILIKE '%key%' OR key_path ILIKE '%token%' OR key_path ILIKE '%api%' \
                     OR key_path ILIKE '%pat%' OR key_path ILIKE '%secret%') \
              ORDER BY created_at ASC LIMIT 25",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| SecretWithoutExpiryRow {
-            name: r.get("name"),
-            key_path: r.get("key_path"),
-            created_at: r.get("created_at"),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| SecretWithoutExpiryRow {
+                name: r.get("name"),
+                key_path: r.get("key_path"),
+                created_at: r.get("created_at"),
+            })
+            .collect();
+            rows
+        };
 
         // 14. Expiring actor memories
-        let expiring_actor_memories: Vec<ExpiringMemoryRow> = sqlx::query(
-            "SELECT m.actor_id, m.key, m.memory_type, m.expires_at, a.name AS actor_name \
+        let expiring_actor_memories_fut = async {
+            let rows: Vec<ExpiringMemoryRow> = sqlx::query(
+                "SELECT m.actor_id, m.key, m.memory_type, m.expires_at, a.name AS actor_name \
              FROM actor_memory m \
              JOIN actors a ON a.id = m.actor_id \
              WHERE a.user_id = $1 AND m.expires_at IS NOT NULL \
                AND m.expires_at > now() AND m.expires_at <= now() + interval '24 hours' \
              ORDER BY m.expires_at ASC LIMIT 50",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| ExpiringMemoryRow {
-            actor_id: r.get("actor_id"),
-            key: r.get("key"),
-            memory_type: r.try_get("memory_type").unwrap_or(None),
-            expires_at: r.get("expires_at"),
-            actor_name: r.get("actor_name"),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| ExpiringMemoryRow {
+                actor_id: r.get("actor_id"),
+                key: r.get("key"),
+                memory_type: r.try_get("memory_type").unwrap_or(None),
+                expires_at: r.get("expires_at"),
+                actor_name: r.get("actor_name"),
+            })
+            .collect();
+            rows
+        };
 
         // 15. Workflows needing schema
-        let workflows_needing_schema: Vec<NeedsSchemaRow> = sqlx::query(
-            "SELECT w.id, w.name, COUNT(e.id)::bigint AS execution_count, MAX(e.started_at) AS last_run \
+        let workflows_needing_schema_fut = async {
+            let rows: Vec<NeedsSchemaRow> = sqlx::query(
+                "SELECT w.id, w.name, COUNT(e.id)::bigint AS execution_count, MAX(e.started_at) AS last_run \
              FROM workflows w \
              JOIN workflow_executions e ON e.workflow_id = w.id AND e.status = 'completed' \
              WHERE w.user_id = $1 AND w.status = 'published' \
@@ -3648,19 +3765,21 @@ impl AnalyticsRepository {
              GROUP BY w.id, w.name \
              HAVING COUNT(e.id) >= 1 \
              ORDER BY COUNT(e.id) DESC LIMIT 20",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| NeedsSchemaRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            execution_count: r.try_get("execution_count").unwrap_or(0),
-            last_run: r.try_get("last_run").unwrap_or(None),
-        })
-        .collect();
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| NeedsSchemaRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                execution_count: r.try_get("execution_count").unwrap_or(0),
+                last_run: r.try_get("last_run").unwrap_or(None),
+            })
+            .collect();
+            rows
+        };
 
         // 16. Untyped serde_json::Value parser lint — performance anti-pattern.
         //
@@ -3707,8 +3826,8 @@ impl AnalyticsRepository {
         //     anti-pattern; the per-line compile-time lint
         //     (`compilation::analyze::lint_source_code`) covers that case
         //     accurately.
-        let untyped_value_modules: Vec<UntypedValueModuleRow> =
-            sqlx::query_as::<_, (Uuid, String)>(
+        let untyped_value_modules_fut = async {
+            let rows: Vec<UntypedValueModuleRow> = sqlx::query_as::<_, (Uuid, String)>(
                 "SELECT id, name FROM modules \
              WHERE user_id = $1 \
                AND kind IN ('sandbox', 'extracted') \
@@ -3728,6 +3847,31 @@ impl AnalyticsRepository {
             .into_iter()
             .map(|(id, name)| UntypedValueModuleRow { id, name })
             .collect();
+            rows
+        };
+
+        // Batch C — #12 (orphaned_secrets, gated on has_wildcard_module from
+        // Batch B) plus 4 remaining independent queries (#13-#16). Five
+        // futures, still well under the pool ceiling.
+        let (
+            orphaned_secrets,
+            secrets_without_expiry,
+            expiring_actor_memories,
+            workflows_needing_schema,
+            untyped_value_modules,
+        ): (
+            Vec<OrphanedSecretRow>,
+            Vec<SecretWithoutExpiryRow>,
+            Vec<ExpiringMemoryRow>,
+            Vec<NeedsSchemaRow>,
+            Vec<UntypedValueModuleRow>,
+        ) = tokio::join!(
+            orphaned_secrets_fut,
+            secrets_without_expiry_fut,
+            expiring_actor_memories_fut,
+            workflows_needing_schema_fut,
+            untyped_value_modules_fut,
+        );
 
         Ok(HygieneReport {
             undescribed,

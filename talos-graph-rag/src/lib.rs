@@ -143,6 +143,35 @@ impl GraphRagService {
         &self.graph
     }
 
+    /// Test-only constructor for exercising the PURE extraction paths
+    /// (`extract_triples_rule_based`, which is `&self` but touches no
+    /// network state for the shapes under test) without a live Neo4j.
+    /// `neo4rs::Graph::connect` builds a deadpool that only dials on the
+    /// first `.run()`/`.execute()`, and these tests never issue one — so
+    /// no database is required. Mirrors the
+    /// `SecretsManager::test_stub_for_cache` pattern: a real struct whose
+    /// I/O handle panics only if actually driven.
+    #[cfg(test)]
+    pub(crate) async fn test_stub_without_neo4j() -> Self {
+        let config = neo4rs::ConfigBuilder::default()
+            .uri("bolt://127.0.0.1:7687")
+            .user("neo4j")
+            .password("test-stub-never-dialed")
+            .max_connections(1)
+            .build()
+            .expect("test stub: failed to build neo4rs config");
+        // `connect` only builds the lazy deadpool — no socket is opened
+        // until the first query, which these tests never issue.
+        let graph = neo4rs::Graph::connect(config)
+            .await
+            .expect("test stub: failed to build lazy neo4rs pool");
+        Self {
+            graph: Arc::new(graph),
+            secrets: None,
+            actor_repo: None,
+        }
+    }
+
     /// Create indexes and constraints for the knowledge graph schema.
     async fn init_schema(&self) -> Result<()> {
         let constraints = [
@@ -255,9 +284,14 @@ impl GraphRagService {
         }
 
         let count = triples.len();
-        for triple in triples {
-            self.upsert_triple(actor_id, memory_key, &triple).await?;
-        }
+        // Batched upsert: instead of one Neo4j round-trip per triple
+        // (the old N+1 — ~80 sequential MERGEs on an 80-issue Jira
+        // sync), group triples by their (subject_label, object_label,
+        // predicate) tuple — the only parts of the Cypher that can't be
+        // parameterized — and emit ONE `UNWIND $rows AS t MERGE ...`
+        // query per group (typically 1-3 groups). MERGE semantics are
+        // byte-for-byte identical to the per-row version.
+        self.upsert_triples(actor_id, memory_key, &triples).await?;
 
         tracing::debug!(
             actor_id = %actor_id,
@@ -410,6 +444,27 @@ impl GraphRagService {
             }
             _ => {}
         }
+
+        // Bound the rule-based path. The Jira issue loop above is
+        // otherwise UNCAPPED — a large sync (e.g. an 80+ issue board)
+        // would emit one MERGE round-trip per issue on every memory
+        // write. Truncate to `MAX_RULE_BASED_TRIPLES` and log loudly so
+        // operators can see when a sync is being clipped (CLAUDE.md:
+        // "no silent caps").
+        if triples.len() > MAX_RULE_BASED_TRIPLES {
+            tracing::warn!(
+                target: "talos_graph_rag",
+                memory_key,
+                extracted = triples.len(),
+                cap = MAX_RULE_BASED_TRIPLES,
+                "Rule-based triple extraction exceeded the per-write cap — \
+                 truncating. The graph will reflect only the first {} \
+                 relationships from this memory write.",
+                MAX_RULE_BASED_TRIPLES
+            );
+            triples.truncate(MAX_RULE_BASED_TRIPLES);
+        }
+
         triples
     }
 
@@ -622,34 +677,57 @@ impl GraphRagService {
         Ok(triples)
     }
 
-    /// Upsert a single triple into Neo4j.
-    async fn upsert_triple(&self, actor_id: Uuid, source_key: &str, triple: &Triple) -> Result<()> {
+    /// Batched upsert of triples into Neo4j.
+    ///
+    /// Replaces the old per-triple N+1 (`upsert_triple` in a loop —
+    /// one `graph.run()` MERGE round-trip per triple, so an 80-issue
+    /// Jira sync was ~80 sequential round-trips on every memory write).
+    ///
+    /// Neo4j node labels and relationship types can NOT be bound as
+    /// `$params` — they're structural Cypher. So we group triples by
+    /// their `(subject_label, object_label, predicate)` tuple (the only
+    /// parts that vary the query text) and emit ONE
+    /// `UNWIND $rows AS t MERGE ...` query per group — typically 1-3
+    /// groups for a real workload — binding the per-row names/source/ts
+    /// as `$rows` parameters. N round-trips collapse to
+    /// number-of-groups. The per-row MERGE inside the UNWIND uses the
+    /// identical match keys (`{actor_id, name}`) and the identical
+    /// SET-both-on-create-and-match behaviour as the old single-triple
+    /// path, so the graph result is byte-for-byte the same.
+    async fn upsert_triples(
+        &self,
+        actor_id: Uuid,
+        source_key: &str,
+        triples: &[Triple],
+    ) -> Result<()> {
+        if triples.is_empty() {
+            return Ok(());
+        }
         let actor_str = actor_id.to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // MERGE both nodes (create if not exists, update if exists).
-        // Then MERGE the relationship.
-        let cypher = format!(
-            "MERGE (s:{} {{actor_id: $actor_id, name: $subject_name}}) \
-             SET s.source_key = $source_key, s.updated_at = $now \
-             MERGE (o:{} {{actor_id: $actor_id, name: $object_name}}) \
-             SET o.source_key = $source_key, o.updated_at = $now \
-             MERGE (s)-[r:{}]->(o) \
-             SET r.source_key = $source_key, r.updated_at = $now",
-            sanitize_label(&triple.subject.label),
-            sanitize_label(&triple.object.label),
-            sanitize_label(&triple.predicate),
-        );
+        for group in group_triples_for_upsert(triples) {
+            // Build the `$rows` list parameter: one map per triple in
+            // this group, carrying just the parameterizable values.
+            let mut rows = neo4rs::BoltList::new();
+            for row in &group.rows {
+                let mut m = neo4rs::BoltMap::default();
+                m.put("subject_name".into(), row.subject_name.as_str().into());
+                m.put("object_name".into(), row.object_name.as_str().into());
+                rows.push(neo4rs::BoltType::Map(m));
+            }
 
-        // Set additional properties on subject node.
-        let q = neo4rs::query(&cypher)
-            .param("actor_id", actor_str.as_str())
-            .param("subject_name", triple.subject.name.as_str())
-            .param("object_name", triple.object.name.as_str())
-            .param("source_key", source_key)
-            .param("now", now.as_str());
+            let q = neo4rs::query(&group.cypher)
+                .param("actor_id", actor_str.as_str())
+                .param("source_key", source_key)
+                .param("now", now.as_str())
+                .param("rows", neo4rs::BoltType::List(rows));
 
-        self.graph.run(q).await.context("Neo4j upsert failed")?;
+            self.graph
+                .run(q)
+                .await
+                .context("Neo4j batched upsert failed")?;
+        }
         Ok(())
     }
 
@@ -842,6 +920,20 @@ impl GraphRagService {
     }
 }
 
+/// Upper bound on triples emitted by `extract_triples_rule_based` per
+/// memory write. The LLM extraction path is already bounded ("Maximum
+/// 20 triples" in the prompt + `.take(20)` on the response), but the
+/// rule-based Jira path (`jira_work_context` / `ticket_classification`)
+/// iterated ALL issues across every status array with no cap — an
+/// 80-issue sync produced ~80 triples, and each was a separate Neo4j
+/// MERGE round-trip on every write (P3 finding). We bound the
+/// rule-based path to the same order of magnitude as the LLM path but
+/// a bit higher (a single Jira sync can legitimately carry more than 20
+/// real tickets). 200 covers realistic sprint/board sizes while
+/// guaranteeing the batched upsert can't be handed unbounded work from
+/// a hostile or runaway upstream. Truncation is logged (no silent cap).
+const MAX_RULE_BASED_TRIPLES: usize = 200;
+
 /// An entity node in the knowledge graph.
 #[derive(Debug, Clone)]
 struct Entity {
@@ -868,6 +960,93 @@ struct Triple {
     subject: Entity,
     predicate: String,
     object: Entity,
+}
+
+/// One parameterizable row inside an UNWIND batch — just the values
+/// that vary per triple within a single `(subject_label, object_label,
+/// predicate)` group. Labels/predicate are baked into the group's
+/// Cypher text (they can't be `$params`), so they're not repeated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpsertRow {
+    subject_name: String,
+    object_name: String,
+}
+
+/// A group of triples that share the same `(subject_label,
+/// object_label, predicate)` tuple and therefore the same Cypher
+/// structure. Upserted in ONE `UNWIND $rows AS t MERGE ...` round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpsertGroup {
+    cypher: String,
+    rows: Vec<UpsertRow>,
+}
+
+/// Pure helper (no Neo4j, no I/O) that turns a flat list of triples
+/// into the minimal set of batched-upsert groups.
+///
+/// Neo4j labels and relationship types are structural — they can NOT
+/// be bound as `$params`. Everything else (the subject/object `name`,
+/// `source_key`, `updated_at`) CAN. So we key each group on the
+/// SANITIZED `(subject_label, object_label, predicate)` tuple (sanitize
+/// FIRST so two raw labels that normalize to the same canonical label
+/// share a group and so the key matches the emitted Cypher exactly),
+/// and within a group every triple becomes one `$rows` entry.
+///
+/// The emitted Cypher per group is the UNWIND form of the original
+/// single-triple MERGE — identical match keys (`{actor_id, name}`) and
+/// identical SET-on-both-create-and-match behaviour — so the resulting
+/// graph is the same as the old per-triple loop, just in 1-3 round
+/// trips instead of N.
+///
+/// Insertion order is preserved (first-seen group ordering, and row
+/// order within a group) so behaviour is deterministic and the
+/// last-writer-wins semantics of MERGE+SET match the old sequential
+/// loop for duplicate (subject, predicate, object) entries.
+fn group_triples_for_upsert(triples: &[Triple]) -> Vec<UpsertGroup> {
+    // (sanitized_subject_label, sanitized_object_label, sanitized_predicate)
+    // -> index into `groups`. Preserves first-seen ordering.
+    let mut index: std::collections::HashMap<(String, String, String), usize> =
+        std::collections::HashMap::new();
+    let mut groups: Vec<UpsertGroup> = Vec::new();
+
+    for triple in triples {
+        let s_label = sanitize_label(&triple.subject.label);
+        let o_label = sanitize_label(&triple.object.label);
+        let pred = sanitize_label(&triple.predicate);
+
+        let key = (s_label.clone(), o_label.clone(), pred.clone());
+        let idx = *index.entry(key).or_insert_with(|| {
+            groups.push(UpsertGroup {
+                cypher: build_unwind_upsert_cypher(&s_label, &o_label, &pred),
+                rows: Vec::new(),
+            });
+            groups.len() - 1
+        });
+        groups[idx].rows.push(UpsertRow {
+            subject_name: triple.subject.name.clone(),
+            object_name: triple.object.name.clone(),
+        });
+    }
+
+    groups
+}
+
+/// Build the per-group batched MERGE. Labels/predicate are already
+/// sanitized by the caller (allowlisted canonical tokens — never raw
+/// input — so they're safe in the un-parameterizable label position;
+/// see `sanitize_label` + `sanitize_label_tests`). `$rows` is a list of
+/// `{subject_name, object_name}` maps; `$actor_id`, `$source_key`,
+/// `$now` are scalars shared across the whole batch.
+fn build_unwind_upsert_cypher(subject_label: &str, object_label: &str, predicate: &str) -> String {
+    format!(
+        "UNWIND $rows AS t \
+         MERGE (s:{subject_label} {{actor_id: $actor_id, name: t.subject_name}}) \
+         SET s.source_key = $source_key, s.updated_at = $now \
+         MERGE (o:{object_label} {{actor_id: $actor_id, name: t.object_name}}) \
+         SET o.source_key = $source_key, o.updated_at = $now \
+         MERGE (s)-[r:{predicate}]->(o) \
+         SET r.source_key = $source_key, r.updated_at = $now"
+    )
 }
 
 /// Escape Lucene special characters in a fulltext query string.
@@ -1157,5 +1336,214 @@ mod tier_gate_tests {
         // ActorRepository::apply_actor_to_engine — never silently
         // promote to Tier2 on infra failure.
         assert!(!tier_decision_for_test(true, Some(Err(()))));
+    }
+}
+
+#[cfg(test)]
+mod batch_upsert_tests {
+    use super::{
+        build_unwind_upsert_cypher, group_triples_for_upsert, Entity, Triple,
+        MAX_RULE_BASED_TRIPLES,
+    };
+
+    // Small constructors so the tests read like the extraction sites.
+    fn ent(label: &str, name: &str) -> Entity {
+        Entity {
+            label: label.to_string(),
+            name: name.to_string(),
+            properties: vec![],
+        }
+    }
+
+    fn triple(s_label: &str, s_name: &str, pred: &str, o_label: &str, o_name: &str) -> Triple {
+        Triple {
+            subject: ent(s_label, s_name),
+            predicate: pred.to_string(),
+            object: ent(o_label, o_name),
+        }
+    }
+
+    #[test]
+    fn empty_input_produces_no_groups() {
+        assert!(group_triples_for_upsert(&[]).is_empty());
+    }
+
+    #[test]
+    fn triples_with_same_label_tuple_collapse_into_one_group() {
+        // The Jira shape: every triple is Ticket -ASSIGNED_TO-> Person.
+        // N issues → ONE group → ONE round-trip (the whole point of the
+        // fix). Each issue still contributes its own param row.
+        let triples = vec![
+            triple("Ticket", "PROJ-1", "ASSIGNED_TO", "Person", "alice"),
+            triple("Ticket", "PROJ-2", "ASSIGNED_TO", "Person", "bob"),
+            triple("Ticket", "PROJ-3", "ASSIGNED_TO", "Person", "Unassigned"),
+        ];
+        let groups = group_triples_for_upsert(&triples);
+        assert_eq!(groups.len(), 1, "one (Ticket,Person,ASSIGNED_TO) group");
+        assert_eq!(groups[0].rows.len(), 3, "one $rows entry per issue");
+        // Param rows carry the per-triple names, in order.
+        assert_eq!(groups[0].rows[0].subject_name, "PROJ-1");
+        assert_eq!(groups[0].rows[0].object_name, "alice");
+        assert_eq!(groups[0].rows[2].object_name, "Unassigned");
+        // Cypher is the UNWIND form binding the names from `t`.
+        assert!(groups[0].cypher.contains("UNWIND $rows AS t"));
+        assert!(groups[0].cypher.contains("name: t.subject_name"));
+        assert!(groups[0].cypher.contains("name: t.object_name"));
+    }
+
+    #[test]
+    fn distinct_label_tuples_split_into_separate_groups_preserving_first_seen_order() {
+        let triples = vec![
+            triple("Ticket", "PROJ-1", "ASSIGNED_TO", "Person", "alice"),
+            triple("Person", "alice", "DISCUSSED_IN", "Email", "subject-x"),
+            triple("Ticket", "PROJ-2", "ASSIGNED_TO", "Person", "bob"), // back to group 0
+            triple(
+                "Meeting",
+                "standup",
+                "RELATED_TO",
+                "Concept",
+                "meeting_prep",
+            ),
+        ];
+        let groups = group_triples_for_upsert(&triples);
+        assert_eq!(groups.len(), 3, "three distinct (s,o,pred) tuples");
+        // First-seen ordering preserved.
+        assert!(groups[0].cypher.contains(":Ticket"));
+        assert!(groups[0].cypher.contains(":Person"));
+        assert!(groups[0].cypher.contains(":ASSIGNED_TO"));
+        assert_eq!(groups[0].rows.len(), 2, "both ASSIGNED_TO triples coalesce");
+        assert!(groups[1].cypher.contains(":Email"));
+        assert!(groups[1].cypher.contains(":DISCUSSED_IN"));
+        assert_eq!(groups[1].rows.len(), 1);
+        assert!(groups[2].cypher.contains(":Meeting"));
+        assert!(groups[2].cypher.contains(":Concept"));
+        assert!(groups[2].cypher.contains(":RELATED_TO"));
+        assert_eq!(groups[2].rows.len(), 1);
+    }
+
+    #[test]
+    fn grouping_keys_on_sanitized_labels_not_raw() {
+        // Two triples whose RAW labels differ only by casing /
+        // unknown-ness but normalize to the SAME canonical token must
+        // share a group, otherwise the group key wouldn't match the
+        // emitted Cypher and we'd over-split. "ticket"/"TICKET" → Ticket;
+        // a bogus subject label → Concept; "assigned_to" → ASSIGNED_TO.
+        let triples = vec![
+            triple("ticket", "A", "assigned_to", "person", "x"),
+            triple("TICKET", "B", "ASSIGNED_TO", "Person", "y"),
+        ];
+        let groups = group_triples_for_upsert(&triples);
+        assert_eq!(groups.len(), 1, "casing/normalization must not over-split");
+        assert_eq!(groups[0].rows.len(), 2);
+        // Canonical casing flows into the Cypher.
+        assert!(groups[0].cypher.contains(":Ticket"));
+        assert!(groups[0].cypher.contains(":Person"));
+        assert!(groups[0].cypher.contains(":ASSIGNED_TO"));
+    }
+
+    #[test]
+    fn cypher_uses_only_sanitized_labels_for_a_cypher_breakout_attempt() {
+        // A label-injection attempt must never reach the emitted Cypher
+        // verbatim — sanitize_label maps it to a safe default. Defense
+        // in depth: the grouping path doesn't re-introduce the raw label.
+        let triples = vec![triple(
+            "Ticket) DETACH DELETE n //",
+            "PROJ-1",
+            "ASSIGNED_TO",
+            "Person",
+            "alice",
+        )];
+        let groups = group_triples_for_upsert(&triples);
+        assert_eq!(groups.len(), 1);
+        assert!(
+            !groups[0].cypher.contains("DETACH DELETE"),
+            "raw injection text leaked into Cypher: {}",
+            groups[0].cypher
+        );
+        // Maps to the safe default node label.
+        assert!(groups[0].cypher.contains(":Concept"));
+    }
+
+    #[test]
+    fn build_unwind_upsert_cypher_matches_single_triple_merge_semantics() {
+        // The batched Cypher must keep the SAME match keys
+        // ({actor_id, name}) and the SAME SET-on-both-create-and-match
+        // clauses as the original single-triple upsert, so the graph
+        // result is identical. We pin the structural pieces.
+        let c = build_unwind_upsert_cypher("Ticket", "Person", "ASSIGNED_TO");
+        assert!(c.starts_with("UNWIND $rows AS t"));
+        assert!(c.contains("MERGE (s:Ticket {actor_id: $actor_id, name: t.subject_name})"));
+        assert!(c.contains("MERGE (o:Person {actor_id: $actor_id, name: t.object_name})"));
+        assert!(c.contains("MERGE (s)-[r:ASSIGNED_TO]->(o)"));
+        // SET clauses on subject, object, and relationship.
+        assert_eq!(
+            c.matches("source_key = $source_key, ").count(),
+            3,
+            "SET on s, o, and r — same as the per-triple path"
+        );
+        assert!(c.contains("s.updated_at = $now"));
+        assert!(c.contains("o.updated_at = $now"));
+        assert!(c.contains("r.updated_at = $now"));
+    }
+
+    #[test]
+    fn rule_based_cap_constant_is_a_sane_bound() {
+        // The cap exists to stop an unbounded Jira sync from emitting
+        // unbounded MERGE work. It must be > the LLM path's 20 (a real
+        // sync can carry more than 20 tickets) but bounded.
+        assert!(MAX_RULE_BASED_TRIPLES > 20);
+        assert!(MAX_RULE_BASED_TRIPLES <= 1000);
+    }
+}
+
+// Pure tests for the rule-based extraction cap. `extract_triples_rule_based`
+// is a `&self` method but touches no async state for the Jira shape, so we
+// exercise it through a test-only constructor that never connects to Neo4j.
+#[cfg(test)]
+mod rule_based_cap_tests {
+    use super::{GraphRagService, MAX_RULE_BASED_TRIPLES};
+
+    // Build a service whose Neo4j handle is never used — the rule-based
+    // extractor is pure over its inputs. We construct the `Arc<Graph>`
+    // lazily via a connection-config that is never driven (no `.run()` in
+    // these tests), so no live database is required.
+    fn jira_value_with_n_issues(n: usize) -> serde_json::Value {
+        let issues: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "key": format!("PROJ-{i}"),
+                    "summary": "do the thing",
+                    "assignee": "alice",
+                    "status": "In Progress",
+                })
+            })
+            .collect();
+        serde_json::json!({ "data": { "issues": issues } })
+    }
+
+    #[tokio::test]
+    async fn jira_sync_is_capped_at_max_rule_based_triples() {
+        // A `Graph` we never call `.run()` on. `connect` is lazy enough
+        // for `neo4rs` 0.8 that constructing it doesn't dial the server;
+        // even if it did, the extractor under test never touches it.
+        let svc = GraphRagService::test_stub_without_neo4j().await;
+
+        // 5x the cap of Jira issues → without the cap this would be 5x
+        // the cap of triples (one ASSIGNED_TO per issue).
+        let value = jira_value_with_n_issues(MAX_RULE_BASED_TRIPLES * 5);
+        let triples = svc.extract_triples_rule_based("jira_work_context", &value);
+        assert_eq!(
+            triples.len(),
+            MAX_RULE_BASED_TRIPLES,
+            "rule-based Jira path must be bounded by the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_jira_sync_is_not_truncated() {
+        let svc = GraphRagService::test_stub_without_neo4j().await;
+        let value = jira_value_with_n_issues(7);
+        let triples = svc.extract_triples_rule_based("jira_work_context", &value);
+        assert_eq!(triples.len(), 7, "under-cap syncs are untouched");
     }
 }

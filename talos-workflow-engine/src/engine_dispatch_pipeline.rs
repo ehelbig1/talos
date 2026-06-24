@@ -36,7 +36,7 @@ impl ParallelWorkflowEngine {
         &self,
         chain: Vec<NodeIndex>,
         chain_input: JsonValue,
-        accumulated_snapshot: Option<JsonValue>,
+        accumulated_snapshot: Option<Arc<JsonValue>>,
         execution_id: Uuid,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
@@ -101,8 +101,16 @@ impl ParallelWorkflowEngine {
             // code read via `reg.get_execution_info`. The Redis cache-warm
             // that used to fire here is dropped: `wasm_bytes` is embedded
             // in the dispatched chain, so the worker doesn't depend on it.
+            // P2: route through the per-execution artifact cache so a module
+            // reused across multiple pipeline steps / branches is fetched (and
+            // its full wasm_bytes blob SELECTed) at most once per run. The Arc
+            // is read-only here (`artifact.as_ref()` everywhere below), so the
+            // cache hand-out is a refcount bump, not a blob clone.
             let (artifact, module_config) = match self.module_fetcher.as_ref() {
-                Some(fetcher) => match fetcher.fetch(step_module_id, uid).await {
+                Some(fetcher) => match self
+                    .fetch_module_artifact_cached(fetcher, step_module_id, uid)
+                    .await
+                {
                     Ok(a) => {
                         let config = a.config.clone().unwrap_or_else(|| serde_json::json!({}));
                         (Some(a), config)
@@ -295,7 +303,9 @@ impl ParallelWorkflowEngine {
             });
             if let Some(ref acc) = accumulated_snapshot {
                 if let Some(obj) = wrapped.as_object_mut() {
-                    obj.insert("__accumulated__".to_string(), acc.clone());
+                    // Deep-clone the shared snapshot only here, at the single
+                    // point it is materialized into the dispatched envelope.
+                    obj.insert("__accumulated__".to_string(), (**acc).clone());
                 }
             }
             if let Some(ref ctx) = self.actor_context {

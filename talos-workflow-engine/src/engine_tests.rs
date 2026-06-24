@@ -612,3 +612,225 @@ fn into_engine_preserves_max_llm_tier() {
         "sub-engine must inherit the parent's Tier1 ceiling"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P1 — accumulated-context snapshot (build + memo)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a `(node_labels, results)` pair for the accumulated-context helpers.
+fn acc_fixture() -> (HashMap<Uuid, String>, HashMap<Uuid, JsonValue>, Uuid, Uuid) {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let trig = Uuid::new_v4();
+    let mut labels = HashMap::new();
+    labels.insert(a, "fetch".to_string());
+    labels.insert(b, "summarize".to_string());
+    labels.insert(trig, "__trigger__".to_string());
+    let mut results = HashMap::new();
+    // `a` carries an internal `__meta` key that must be stripped from the value.
+    results.insert(a, serde_json::json!({ "text": "hi", "__meta": 1 }));
+    results.insert(b, serde_json::json!({ "summary": "ok" }));
+    // Internal node — must be omitted entirely.
+    results.insert(trig, serde_json::json!({ "seed": true }));
+    (labels, results, a, b)
+}
+
+#[test]
+fn build_accumulated_context_strips_and_omits() {
+    let (labels, results, _a, _b) = acc_fixture();
+    let acc = ParallelWorkflowEngine::build_accumulated_context(&labels, &results)
+        .expect("non-empty accumulated context");
+    let obj = acc.as_object().expect("object");
+    // Internal node omitted entirely.
+    assert!(!obj.contains_key("__trigger__"));
+    // Labels are the keys.
+    assert!(obj.contains_key("fetch"));
+    assert!(obj.contains_key("summarize"));
+    // `__`-prefixed keys stripped from the value, real keys preserved.
+    let fetch = obj["fetch"].as_object().unwrap();
+    assert_eq!(fetch.get("text"), Some(&serde_json::json!("hi")));
+    assert!(
+        !fetch.contains_key("__meta"),
+        "internal key must be stripped"
+    );
+}
+
+#[test]
+fn build_accumulated_context_empty_is_none() {
+    let labels: HashMap<Uuid, String> = HashMap::new();
+    let results: HashMap<Uuid, JsonValue> = HashMap::new();
+    assert!(ParallelWorkflowEngine::build_accumulated_context(&labels, &results).is_none());
+
+    // A map containing only internal nodes also collapses to None.
+    let trig = Uuid::new_v4();
+    let mut labels = HashMap::new();
+    labels.insert(trig, "__trigger__".to_string());
+    let mut results = HashMap::new();
+    results.insert(trig, serde_json::json!({ "seed": true }));
+    assert!(
+        ParallelWorkflowEngine::build_accumulated_context(&labels, &results).is_none(),
+        "only-internal results must yield None"
+    );
+}
+
+#[test]
+fn memo_returns_same_content_as_direct_build() {
+    let (labels, results, _a, _b) = acc_fixture();
+    let direct = ParallelWorkflowEngine::build_accumulated_context(&labels, &results);
+    let mut memo = None;
+    let memoed =
+        ParallelWorkflowEngine::build_accumulated_context_memo(&labels, &results, 1, &mut memo);
+    // Byte-for-byte equivalent value.
+    assert_eq!(
+        direct.as_deref(),
+        memoed.as_deref(),
+        "memoized snapshot must equal a direct build"
+    );
+}
+
+#[test]
+fn memo_reuses_arc_on_unchanged_version_and_rebuilds_on_bump() {
+    let (labels, results, _a, _b) = acc_fixture();
+    let mut memo = None;
+
+    let first =
+        ParallelWorkflowEngine::build_accumulated_context_memo(&labels, &results, 7, &mut memo)
+            .expect("some");
+    // Same version → same allocation handed back (refcount bump, no rebuild).
+    let again =
+        ParallelWorkflowEngine::build_accumulated_context_memo(&labels, &results, 7, &mut memo)
+            .expect("some");
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "unchanged version must return the cached Arc, not rebuild"
+    );
+
+    // Bumped version → fresh build (distinct allocation), identical content.
+    let rebuilt =
+        ParallelWorkflowEngine::build_accumulated_context_memo(&labels, &results, 8, &mut memo)
+            .expect("some");
+    assert!(
+        !Arc::ptr_eq(&first, &rebuilt),
+        "version bump must trigger a rebuild"
+    );
+    assert_eq!(*first, *rebuilt, "rebuilt content must be unchanged");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P2 — per-execution module-artifact cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `ModuleFetcher` that records how many times each module_id was fetched,
+/// so a test can prove the per-execution cache elides redundant DB-shaped
+/// round-trips. Local to the test module so the shared test-utils crate stays
+/// untouched.
+#[derive(Clone, Default)]
+struct CountingFetcher {
+    counts: Arc<dashmap::DashMap<Uuid, usize>>,
+}
+
+impl CountingFetcher {
+    fn count_for(&self, module_id: Uuid) -> usize {
+        self.counts.get(&module_id).map(|c| *c).unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl ModuleFetcher for CountingFetcher {
+    async fn fetch(
+        &self,
+        module_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<talos_workflow_engine_core::WasmModuleArtifact, talos_workflow_engine_core::BoxError>
+    {
+        *self.counts.entry(module_id).or_insert(0) += 1;
+        Ok(talos_workflow_engine_core::WasmModuleArtifact {
+            module_id,
+            content_hash: format!("hash-{module_id}"),
+            wasm_bytes: vec![0xAA, 0xBB, 0xCC],
+            oci_url: None,
+            max_fuel: 1_000_000,
+            capability_world: "test".into(),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            integration_name: None,
+            config: None,
+        })
+    }
+
+    async fn load_rate_limits(&self, _module_ids: &[Uuid]) -> HashMap<Uuid, i32> {
+        HashMap::new()
+    }
+}
+
+#[tokio::test]
+async fn module_artifact_cache_dedupes_same_module_across_nodes() {
+    let fetcher = CountingFetcher::default();
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_user_id(Uuid::new_v4());
+    engine.set_module_fetcher(Arc::new(fetcher.clone()));
+
+    // Two distinct graph nodes that resolve to the SAME module_id, plus a
+    // third node on a different module_id.
+    let shared_module = Uuid::new_v4();
+    let other_module = Uuid::new_v4();
+    let n1 = Uuid::new_v4();
+    let n2 = Uuid::new_v4();
+    let n3 = Uuid::new_v4();
+    engine.add_node(n1, Some(shared_module), None, None);
+    engine.add_node(n2, Some(shared_module), None, None);
+    engine.add_node(n3, Some(other_module), None, None);
+
+    let a1 = engine.fetch_module(n1).await.expect("fetch n1");
+    let a2 = engine.fetch_module(n2).await.expect("fetch n2");
+    let a3 = engine.fetch_module(n3).await.expect("fetch n3");
+
+    // The shared module was fetched from the backing store exactly once
+    // despite two nodes dispatching it.
+    assert_eq!(
+        fetcher.count_for(shared_module),
+        1,
+        "shared module must hit the backing fetcher only once per execution"
+    );
+    assert_eq!(
+        fetcher.count_for(other_module),
+        1,
+        "a distinct module is keyed separately and fetched on its own"
+    );
+    // Returned artifacts are content-equivalent for the shared module and
+    // correctly distinct for the other module.
+    assert_eq!(a1.content_hash, a2.content_hash);
+    assert_eq!(a1.content_hash, format!("hash-{shared_module}"));
+    assert_eq!(a3.content_hash, format!("hash-{other_module}"));
+}
+
+#[tokio::test]
+async fn module_artifact_cache_is_per_engine_not_global() {
+    // A second engine instance must not see the first engine's cached fetch:
+    // the cache is scoped to the engine/run instance, so each run re-fetches.
+    let fetcher = CountingFetcher::default();
+    let module = Uuid::new_v4();
+    let node = Uuid::new_v4();
+
+    let mut engine_a = ParallelWorkflowEngine::new();
+    engine_a.set_user_id(Uuid::new_v4());
+    engine_a.set_module_fetcher(Arc::new(fetcher.clone()));
+    engine_a.add_node(node, Some(module), None, None);
+    let _ = engine_a.fetch_module(node).await.expect("fetch a");
+    assert_eq!(fetcher.count_for(module), 1);
+
+    // Fresh engine, same shared backing fetcher: a NEW per-execution cache, so
+    // the module is fetched again (proves no cross-execution leak).
+    let mut engine_b = ParallelWorkflowEngine::new();
+    engine_b.set_user_id(Uuid::new_v4());
+    engine_b.set_module_fetcher(Arc::new(fetcher.clone()));
+    engine_b.add_node(node, Some(module), None, None);
+    let _ = engine_b.fetch_module(node).await.expect("fetch b");
+    assert_eq!(
+        fetcher.count_for(module),
+        2,
+        "a separate engine instance must not reuse another run's artifact cache"
+    );
+}
