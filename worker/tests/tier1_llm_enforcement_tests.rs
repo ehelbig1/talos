@@ -40,7 +40,7 @@ use worker::CapabilityWorld;
 /// rejection MUST come from the tier-1 gate (not from the
 /// allowed_hosts check that would otherwise short-circuit first).
 fn make_tier1_context_with_llm_host(world: CapabilityWorld, llm_host: &str) -> TalosContext {
-    let mut ctx = TalosContext::new(
+    let ctx = TalosContext::new(
         world,
         vec![llm_host.to_string()],
         vec![],
@@ -51,9 +51,13 @@ fn make_tier1_context_with_llm_host(world: CapabilityWorld, llm_host: &str) -> T
         false,
         None,
         Arc::new(ExposeFallback::new()),
+        // S3: pass the Tier-1 ceiling at construction so the per-execution
+        // SSRF resolver is wired into local-egress-only mode AND the host-fn
+        // tier gates read Tier1. (Previously set on the field post-build,
+        // which no longer reconfigures the resolver.)
+        talos_workflow_job_protocol::LlmTier::Tier1,
     )
     .expect("failed to create TalosContext");
-    ctx.max_llm_tier = talos_workflow_job_protocol::LlmTier::Tier1;
     ctx
 }
 

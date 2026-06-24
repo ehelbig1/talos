@@ -2464,6 +2464,8 @@ impl TalosRuntime {
             allow_wasi_network,
             token_sender,
             self.global_expose_fallback.clone(),
+            // S3: Tier-1 wires the SSRF resolver to local-egress-only.
+            max_llm_tier,
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.
@@ -2928,6 +2930,9 @@ impl TalosRuntime {
             allow_wasi_network,
             stdout_sender,
             self.global_expose_fallback.clone(),
+            // run_sandbox / test_module path — operator-invoked, actor-less,
+            // Tier2-default (allowed_hosts is empty/deny-all anyway).
+            talos_workflow_job_protocol::LlmTier::default(),
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.
@@ -3183,6 +3188,9 @@ impl TalosRuntime {
                 allow_wasi_network,
                 None,
                 self.global_expose_fallback.clone(),
+                // S3: pipeline-wide tier ceiling → local-egress-only resolver
+                // for Tier-1, matching the single-node execute_job path.
+                max_llm_tier,
             )?;
             // Attach OpenTelemetry metrics so host functions can record events.
             if let Some(ref m) = self.metrics {
@@ -3753,6 +3761,10 @@ impl TalosRuntime {
             allow_wasi_network,
             None,
             self.global_expose_fallback.clone(),
+            // `execute_precompiled` (the sole caller) is a Tier2-default
+            // AOT path; it passes allow_wasi_network=false. No tier-1 actor
+            // routes through here.
+            talos_workflow_job_protocol::LlmTier::default(),
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.
@@ -3842,68 +3854,6 @@ impl TalosRuntime {
 
         let output: JsonValue = serde_json::from_str(&output_str)?;
         Ok(output)
-    }
-
-    /// Hybrid execution mode: Try AOT first, fallback to JIT.
-    pub async fn execute_hybrid(
-        &self,
-        wasm_bytes: &[u8],
-        precompiled_bytes: Option<&[u8]>,
-        allowed_hosts: Vec<String>,
-        allowed_methods: Vec<String>,
-        max_memory_mb: usize,
-        input: JsonValue,
-    ) -> Result<JsonValue> {
-        if let Some(precompiled) = precompiled_bytes {
-            // Inspect the original WASM bytes (not the precompiled
-            // blob) to determine the capability tier — that's the
-            // source of truth for what the module imports. The cap
-            // is then bound into the HMAC input, so a (precompiled,
-            // wasm_bytes) pair whose caps disagree fails verification
-            // before reaching the unsafe deserialize.
-            let cap = crate::wit_inspector::inspect_component(wasm_bytes).capability_world;
-            match self.load_precompiled(precompiled, cap.clone()) {
-                Ok(component) => {
-                    tracing::info!("AOT: Using pre-compiled module");
-                    // All worlds except Minimal and Unknown allow outbound network access.
-                    // allow-wasi-network-no-tier: execute_hybrid is dead code (zero callers)
-                    // routing through the tier-blind execute_component_internal (Tier2-default).
-                    // If ever wired into a tier-bearing path, thread max_llm_tier through and
-                    // remove this marker so the tier-1 raw-socket gate applies.
-                    let allow_wasi_network =
-                        !matches!(cap, CapabilityWorld::Minimal | CapabilityWorld::Unknown);
-                    return self
-                        .execute_component_internal(
-                            component,
-                            cap.clone(),
-                            allowed_hosts,
-                            allowed_methods,
-                            max_memory_mb,
-                            input,
-                            None,
-                            None,
-                            HashMap::new(),
-                            Duration::from_secs(30),
-                            allow_wasi_network,
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!("AOT load failed, falling back to JIT: {}", e);
-                }
-            }
-        }
-
-        // Fallback to JIT compilation
-        tracing::info!("JIT: Using JIT compilation");
-        self.execute_job(
-            wasm_bytes,
-            allowed_hosts,
-            allowed_methods,
-            max_memory_mb,
-            input,
-        )
-        .await
     }
 
     /// Execute a WASM module with a mock input, capturing stdout for testing.

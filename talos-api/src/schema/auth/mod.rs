@@ -62,6 +62,51 @@ pub fn clear_session_cookies(cookies: &Cookies) {
     cookies.remove(Cookie::build(("talos_refresh_token", "")).path("/").build());
 }
 
+/// S1 (login-CSRF defense, 2026-06-23): cookie name carrying the
+/// browser-session binding for the OAuth `state` nonce. Set at login
+/// (REST `/auth/oauth/{provider}/login` AND the GraphQL `oauthLoginUrl`
+/// query), consumed + cleared on the REST callback. Centralised here so
+/// the REST and GraphQL login paths set byte-identical cookie attributes
+/// — same drift hazard MCP-1040 closed for the session cookies.
+pub const OAUTH_SESSION_BINDING_COOKIE: &str = "talos_oauth_session";
+
+/// Install the OAuth session-binding cookie (S1).
+///
+/// `get_authorization_url` persists only the SHA-256 of `nonce`; the
+/// plaintext lives only in this cookie and is required to match on the
+/// callback. NEVER log `nonce`.
+///
+/// Settings locked here:
+/// - HttpOnly: true (defeats XSS extraction)
+/// - Secure: `is_production()` (HTTPS-only in prod; off in dev)
+/// - SameSite: **Lax** — the provider redirect back to the callback is a
+///   top-level cross-site navigation; `Strict` would withhold the cookie
+///   and break every login. Lax still blocks the cross-site POST/iframe
+///   vectors. (This is the one place auth cookies must NOT be Strict.)
+/// - Path: "/" (callback lives under a different path than login)
+/// - TTL: 10 min (matches the state-token freshness window)
+pub fn set_oauth_session_binding_cookie(cookies: &Cookies, nonce: &str) {
+    let mut binding = Cookie::new(OAUTH_SESSION_BINDING_COOKIE, nonce.to_string());
+    binding.set_http_only(true);
+    binding.set_secure(talos_config::is_production());
+    binding.set_same_site(tower_cookies::cookie::SameSite::Lax);
+    binding.set_path("/");
+    binding.set_max_age(tower_cookies::cookie::time::Duration::minutes(10));
+    cookies.add(binding);
+}
+
+/// Clear the OAuth session-binding cookie (S1). Single-use — removed on
+/// the callback whether or not validation succeeds. Same `Path=/` the
+/// setter used (see [`clear_session_cookies`] for the path-mismatch
+/// failure mode).
+pub fn clear_oauth_session_binding_cookie(cookies: &Cookies) {
+    cookies.remove(
+        Cookie::build((OAUTH_SESSION_BINDING_COOKIE, ""))
+            .path("/")
+            .build(),
+    );
+}
+
 #[cfg(test)]
 mod cookie_security_tests {
     use super::{clear_session_cookies, set_session_cookies, Cookies};

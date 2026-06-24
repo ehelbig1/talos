@@ -29,6 +29,8 @@ fn make_context(world: CapabilityWorld) -> TalosContext {
         false,
         None,
         Arc::new(ExposeFallback::new()),
+        // Tier-2 default (external egress allowed) for these non-tier tests.
+        talos_workflow_job_protocol::LlmTier::Tier2,
     )
     .expect("failed to create TalosContext")
 }

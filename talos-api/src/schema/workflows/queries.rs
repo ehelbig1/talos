@@ -61,7 +61,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let rows = sqlx::query_as::<_, Row>(
             r#"
             SELECT DISTINCT ON (we.workflow_id)
@@ -168,7 +171,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let rows = sqlx::query_as::<_, Row>(
             r#"
             SELECT we.id, we.workflow_id, we.status, we.started_at, we.completed_at,
@@ -268,7 +274,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(*user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let found = sqlx::query_as::<_, Row>(
             r#"
             SELECT id, name, graph_json, user_id, org_id, max_concurrent_executions, intent, actor_id
@@ -343,7 +352,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(*user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let workflows = sqlx::query_as::<_, WorkflowRow>(
             "SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
         )
@@ -490,7 +502,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         let owns = crate::access_check::workflow_accessible_for_user_on_conn(
             uow.conn(),
@@ -521,9 +536,10 @@ impl WorkflowsQueries {
             tracing::error!("Failed to list workflow versions: {}", e);
             async_graphql::Error::new("Failed to list workflow versions").extend_safe()
         })?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(versions.into_iter().map(Into::into).collect())
     }
@@ -552,7 +568,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let version = sqlx::query_as::<_, talos_workflow_versions::WorkflowVersion>(
             "SELECT wv.* FROM workflow_versions wv \
              JOIN workflows w ON wv.workflow_id = w.id \
@@ -590,7 +609,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         let owns = crate::access_check::workflow_accessible_for_user_on_conn(
             uow.conn(),
@@ -614,9 +636,10 @@ impl WorkflowsQueries {
                     tracing::error!("Failed to get active workflow version: {}", e);
                     async_graphql::Error::new("Failed to get active workflow version").extend_safe()
                 })?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(version.map(Into::into))
     }
@@ -643,7 +666,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let row = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
             r#"
             SELECT ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
@@ -758,7 +784,10 @@ impl WorkflowsQueries {
         // read (both tables are RLS-enabled; the query filters w.user_id).
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let rows = sqlx::query_as::<_, StatsRow>(
             r#"
             SELECT w.id, w.name,
@@ -783,9 +812,10 @@ impl WorkflowsQueries {
             tracing::error!("Failed to fetch workflow stats: {}", e);
             async_graphql::Error::new("Failed to fetch workflow stats").extend_safe()
         })?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(rows
             .into_iter()
@@ -821,7 +851,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         let draft_json: Option<String> = sqlx::query_scalar(
             "SELECT graph_json FROM workflows WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))",
@@ -845,9 +878,10 @@ impl WorkflowsQueries {
         .fetch_optional(uow.conn())
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         let published_json = match published_json {
             Some(pj) => pj,
@@ -921,7 +955,10 @@ impl WorkflowsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         let owns = crate::access_check::workflow_accessible_for_user_on_conn(
             uow.conn(),
@@ -950,9 +987,10 @@ impl WorkflowsQueries {
             tracing::error!("Failed to list workflow versions: {}", e);
             async_graphql::Error::new("Failed to list workflow versions").extend_safe()
         })?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         let mut entries = Vec::new();
         for (i, version) in versions.iter().enumerate() {
@@ -1051,7 +1089,10 @@ impl WorkflowsQueries {
         // workflow).
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let rows = sqlx::query(
             r#"
             SELECT a.id, a.workflow_id, a.execution_id, a.node_id, a.required_for, a.status,
@@ -1068,9 +1109,10 @@ impl WorkflowsQueries {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e: sqlx::Error| e.extend_safe())?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(rows
             .into_iter()

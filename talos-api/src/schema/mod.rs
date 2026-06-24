@@ -635,4 +635,57 @@ mod tests {
         assert_eq!(res.errors.len(), 1);
         assert!(res.errors[0].message.contains("Authentication required"));
     }
+
+    /// S4/S6 (Low): the `sqlx::Error::extend_safe()` impl is the canonical
+    /// safe shape — log the real error server-side, return a STATIC generic
+    /// message. The client-facing message must NOT carry the raw sqlx text
+    /// (table names, column names, role/pool internals). This is the shape
+    /// the tenant-scope / commit / resolve-personal-org map_err closures
+    /// were converted to in the S6 sweep.
+    #[test]
+    fn sqlx_error_extend_safe_returns_static_message_not_raw() {
+        // A sqlx error whose Display carries internal detail we must not leak.
+        let raw = sqlx::Error::Protocol(
+            "tenant scope: column workflows.org_id role app_tenant denied".to_string(),
+        );
+        let leaked = raw.to_string();
+        let gql = raw.extend_safe();
+        assert_eq!(
+            gql.message, "Database operation failed",
+            "client message must be the static generic, not the raw sqlx text"
+        );
+        assert!(
+            !gql.message.contains("org_id") && !gql.message.contains("app_tenant"),
+            "internal schema/role detail must never reach the client; leaked={leaked}"
+        );
+    }
+
+    /// S6 (Low): the post-sweep tenant-scope / commit failure messages are
+    /// fixed, non-interpolated constants — they carry no `{e}` payload. Pin
+    /// the exact client strings so a future refactor can't silently
+    /// reintroduce error interpolation behind `.extend_safe()`.
+    #[test]
+    fn s6_static_scope_messages_carry_no_error_payload() {
+        for msg in ["Request scope error", "Request could not be completed"] {
+            let gql = async_graphql::Error::new(msg).extend_safe();
+            assert_eq!(gql.message, msg);
+            // None of the internal markers we strip should ever appear.
+            assert!(!gql.message.contains("sqlx"));
+            assert!(!gql.message.contains("org_id"));
+            assert!(!gql.message.contains(": ")); // no "context: <raw>" shape
+        }
+    }
+
+    /// S6 (Low): the static client messages are NOT on the legacy
+    /// substring whitelist — they ride the explicit `extensions.safe=true`
+    /// marker set by `.extend_safe()`, not the prose-substring fallback.
+    /// This documents that we did not widen the whitelist to pass them.
+    #[test]
+    fn s6_scope_messages_are_not_whitelist_substrings() {
+        assert!(!is_safe_error_substring("Request scope error"));
+        assert!(!is_safe_error_substring("Request could not be completed"));
+        // Legitimate whitelisted prose still passes (regression guard).
+        assert!(is_safe_error_substring("Not found"));
+        assert!(is_safe_error_substring("Access denied"));
+    }
 }

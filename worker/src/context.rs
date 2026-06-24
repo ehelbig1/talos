@@ -508,14 +508,26 @@ pub struct SseEventInternal {
 ///     hosts — every address the OS resolver returns is re-classified
 ///     via `classify_private_ip` BEFORE reqwest connects, closing the
 ///     TOCTOU window between the per-call check and the connect step.
-fn build_per_execution_http_client(allowed_hosts: &[String]) -> reqwest::Client {
+///   * Tier-1 (`local_egress_only`) INVERTS the resolver's default
+///     public-allow posture: any resolved address that is NOT
+///     loopback/private/link-local is denied, enforcing the documented
+///     "data must NOT leave host" contract at the connect point (S3,
+///     2026-06-23). This defeats the DNS hole the name-based
+///     `tier1_egress_deny_reason` gate cannot close.
+fn build_per_execution_http_client(
+    allowed_hosts: &[String],
+    local_egress_only: bool,
+) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("Talos-Worker/1.0")
         .connect_timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(10)
         .dns_resolver(std::sync::Arc::new(
-            crate::ssrf_resolver::SsrfFilteringResolver::for_allowed_hosts(allowed_hosts),
+            crate::ssrf_resolver::SsrfFilteringResolver::for_allowed_hosts(
+                allowed_hosts,
+                local_egress_only,
+            ),
         ))
         .build()
         .expect("worker: failed to build hardened reqwest client with no-redirect policy")
@@ -572,6 +584,11 @@ impl TalosContext {
     ///   component can use `std::net::TcpStream` (WASIP2).
     ///   Only set this for `network-node` or `automation-node`
     ///   components; `minimal-node` components never need it.
+    /// * `max_llm_tier` – the actor's data-egress ceiling. `Tier1`
+    ///   (local-Ollama-only) wires the per-execution SSRF resolver into
+    ///   `local_egress_only` mode, denying any resolved address that is
+    ///   not loopback/private/link-local (S3, 2026-06-23). The field is
+    ///   also stored on the context so the host-fn tier gates read it.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         capability_world: crate::wit_inspector::CapabilityWorld,
@@ -584,6 +601,7 @@ impl TalosContext {
         allow_wasi_network: bool,
         token_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         global_expose_fallback: Arc<crate::expose_fallback::ExposeFallback>,
+        max_llm_tier: talos_workflow_job_protocol::LlmTier,
     ) -> anyhow::Result<Self> {
         // ── Ephemeral sandbox ────────────────────────────────────────────────
         // Create the per-execution temporary directory.  It is automatically
@@ -760,7 +778,14 @@ impl TalosContext {
         // `allowed_hosts` into the struct so the SSRF resolver can be
         // scoped to this execution's explicit hostnames. See the
         // resolver doc-comment for the per-host bypass rationale.
-        let http_client = build_per_execution_http_client(&allowed_hosts);
+        //
+        // S3 (2026-06-23): a Tier-1 actor is "local-Ollama-only — data
+        // must NOT leave host". Wire `local_egress_only` so the resolver
+        // denies every public (globally-routable) resolved address,
+        // regardless of hostname, closing the DNS hole the name-based
+        // `tier1_egress_deny_reason` fast-fail gate cannot.
+        let local_egress_only = matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1);
+        let http_client = build_per_execution_http_client(&allowed_hosts, local_egress_only);
 
         Ok(Self {
             wasi,
@@ -870,7 +895,13 @@ impl TalosContext {
             stderr_capture,
             dry_run: false,
             actor_id: None,
-            max_llm_tier: talos_workflow_job_protocol::LlmTier::default(),
+            // Stamped from the constructor arg so the SSRF resolver's
+            // `local_egress_only` decision (built above) and the host-fn
+            // tier gates agree on the same value from construction. Live
+            // execution paths still re-assign `context.max_llm_tier` after
+            // `new()` (a no-op since they pass the same value); legacy /
+            // test paths that pass `LlmTier::default()` keep Tier-2.
+            max_llm_tier,
         })
     }
 

@@ -107,6 +107,9 @@ async fn test_runtime_resource_limiting() {
         false,
         None,
         Arc::new(ExposeFallback::new()),
+        // Tier-2 default (external egress allowed); this test exercises the
+        // memory limiter, not the tier gate.
+        talos_workflow_job_protocol::LlmTier::Tier2,
     )
     .unwrap();
 

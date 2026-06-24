@@ -379,6 +379,74 @@ pub fn validate_oauth_state_token_format(state_token: &str) -> Result<()> {
     Ok(())
 }
 
+/// S1 (login-CSRF / session-fixation): browser-session binding for the
+/// **pre-auth SSO LOGIN** flow.
+///
+/// The `state` nonce alone proves only "Talos issued this authorize
+/// URL", NOT "issued to THIS browser". Without a per-browser binding an
+/// attacker can run the consent flow against their *own* provider
+/// account, capture the resulting `code` + `state`, and feed the victim
+/// the callback URL — logging the victim's browser in as the attacker
+/// (classic login-CSRF / session fixation). The account-LINK flows
+/// (`talos-slack`/`talos-gmail`/`talos-atlassian`) bind the *already
+/// authenticated* `user_id`; the login flow has no user yet, so it
+/// binds an opaque browser-session nonce instead.
+///
+/// We generate a high-entropy nonce, hand the **plaintext** to the
+/// caller to set as an HttpOnly+Secure+SameSite=Lax cookie, and persist
+/// only its **SHA-256 hash** in the state row. Storing the hash (not the
+/// raw value) means a read-only DB compromise during the ≤10-min row
+/// lifetime never yields a usable cookie value — same `token_hash`
+/// discipline the approval-gate handler uses (lint check 41). On
+/// callback we recompute the hash from the cookie and constant-time
+/// compare it against the stored hash.
+///
+/// `Lax` (not `Strict`) is required: the callback arrives via a
+/// top-level cross-site redirect from the provider, and `Strict` would
+/// withhold the cookie on that navigation, breaking every login.
+/// Returns `(plaintext_nonce, sha256_hex_hash)`.
+pub fn generate_oauth_session_binding() -> (String, String) {
+    // ~244 bits of entropy from two v4 UUIDs (122 bits each), hex-
+    // encoded so the value passes `validate_oauth_state_token_format`'s
+    // charset rules and is a safe cookie value. No new RNG dependency:
+    // `uuid` is already a direct dep and v4 draws from the OS CSPRNG.
+    let nonce = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let hash = hash_oauth_session_binding(&nonce);
+    (nonce, hash)
+}
+
+/// SHA-256 (hex) of a session-binding nonce. The hex digest is what's
+/// persisted in `oauth_state_tokens.session_binding_hash` and what's
+/// recomputed-and-compared on callback.
+pub fn hash_oauth_session_binding(nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(nonce.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Constant-time equality over two hex-encoded SHA-256 digests.
+///
+/// The compared values are hashes (not raw secrets), but the comparison
+/// still gates an auth decision, so we avoid the early-return timing
+/// oracle of `==`/`str::eq` per the CLAUDE.md "constant-time compare for
+/// security-sensitive values" rule. `subtle` is not a workspace dep, so
+/// this is the canonical no-dep XOR-accumulate form. A length mismatch
+/// is folded into the accumulator (rather than short-circuited) so the
+/// caller can't distinguish "wrong length" from "wrong value" by timing.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u8 = (a.len() ^ b.len()) as u8;
+    // Walk the longer of the two so the loop count depends only on the
+    // (public) digest length, never on where the first mismatch is.
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let ab = a.get(i).copied().unwrap_or(0);
+        let bb = b.get(i).copied().unwrap_or(0);
+        diff |= ab ^ bb;
+    }
+    diff == 0
+}
+
 impl OAuthService {
     pub fn new(
         db_pool: Pool<Postgres>,
@@ -459,11 +527,17 @@ impl OAuthService {
     /// `oauth_state_tokens.provider` column.  Using `&str` instead of `&OAuthProvider`
     /// allows integration-specific providers ("gmail") that are separate from the main
     /// authentication provider enum.
+    /// `session_binding_hash` is the SHA-256 hex of the per-browser
+    /// session nonce (see `generate_oauth_session_binding`). `None` is
+    /// accepted only for legacy / non-login callers; the login flow
+    /// (`get_authorization_url`) always supplies it so `validate_state_token`
+    /// can require a matching cookie on callback (S1 login-CSRF fix).
     pub async fn store_state_token(
         &self,
         state_token: &str,
         provider: &str,
         pkce_verifier: Option<&str>,
+        session_binding_hash: Option<&str>,
     ) -> Result<()> {
         // Validate state token format to prevent storage of malformed values.
         // State tokens must be non-empty, within a reasonable length, and
@@ -471,12 +545,13 @@ impl OAuthService {
         validate_oauth_state_token_format(state_token)?;
 
         sqlx::query(
-            "INSERT INTO oauth_state_tokens (state_token, provider, pkce_verifier) \
-             VALUES ($1, $2, $3)",
+            "INSERT INTO oauth_state_tokens (state_token, provider, pkce_verifier, session_binding_hash) \
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(state_token)
         .bind(provider)
         .bind(pkce_verifier)
+        .bind(session_binding_hash)
         .execute(&self.db_pool)
         .await
         .context("Failed to store OAuth state token")?;
@@ -510,7 +585,21 @@ impl OAuthService {
     /// database. Previous code skipped validation for JSON-shaped state values
     /// (e.g. `{"source":"google-calendar"}`); that bypass has been removed because
     /// any caller could craft a `{…}` string to circumvent CSRF protection.
-    pub async fn validate_state_token(&self, state_token: &str, provider: &str) -> Result<()> {
+    ///
+    /// `session_binding` is the plaintext browser-session nonce read from
+    /// the callback request's `talos_oauth_session` cookie (S1 login-CSRF
+    /// fix). When the consumed state row carries a `session_binding_hash`
+    /// (every row written by the login flow does), the cookie is REQUIRED
+    /// and its SHA-256 must match the stored hash — a missing or
+    /// mismatched cookie is rejected with the generic CSRF error. Rows
+    /// with a NULL hash (legacy / non-login callers) skip the check, so
+    /// this is backward compatible.
+    pub async fn validate_state_token(
+        &self,
+        state_token: &str,
+        provider: &str,
+        session_binding: Option<&str>,
+    ) -> Result<()> {
         // MCP-1171 (2026-05-17): format-validate at the START of the
         // callback path, before the expensive Redis EVAL + DB UPDATE
         // ops. Pre-fix this validator accepted any caller-supplied
@@ -605,11 +694,11 @@ impl OAuthService {
         // blocklist). Caller already retrieved the verifier via
         // `get_pkce_verifier` before this UPDATE fires; setting it to
         // NULL here is safe.
-        let result = sqlx::query(
+        let result = sqlx::query_as::<_, (Uuid, Option<String>)>(
             "UPDATE oauth_state_tokens
              SET used = true, pkce_verifier = NULL
              WHERE state_token = $1 AND provider = $2 AND used = false AND expires_at > NOW()
-             RETURNING id",
+             RETURNING id, session_binding_hash",
         )
         .bind(state_token)
         .bind(provider)
@@ -617,10 +706,45 @@ impl OAuthService {
         .await
         .context("Failed to validate OAuth state token")?;
 
-        if result.is_none() {
-            return Err(anyhow!(
-                "Invalid or expired OAuth state token. This may indicate a CSRF attack."
-            ));
+        let (_id, stored_binding_hash) = match result {
+            Some(row) => row,
+            None => {
+                return Err(anyhow!(
+                    "Invalid or expired OAuth state token. This may indicate a CSRF attack."
+                ));
+            }
+        };
+
+        // S1 (login-CSRF / session-fixation): if the row was written with
+        // a browser-session binding, the callback MUST present the
+        // matching cookie. The row is already consumed atomically above
+        // (single-use preserved) — we reject AFTER the consume so a
+        // failed binding check still burns the token, denying an attacker
+        // any retry against the same `state`. The compare is over SHA-256
+        // hex digests, constant-time so it can't be used as a timing
+        // oracle to recover the cookie. Never log either value.
+        if let Some(expected_hash) = stored_binding_hash {
+            let provided_hash = match session_binding {
+                Some(nonce) => hash_oauth_session_binding(nonce),
+                None => {
+                    tracing::warn!(
+                        provider = %provider,
+                        "OAuth callback missing session-binding cookie for a bound state token (possible login-CSRF)"
+                    );
+                    return Err(anyhow!(
+                        "Invalid or expired OAuth state token. This may indicate a CSRF attack."
+                    ));
+                }
+            };
+            if !constant_time_eq(expected_hash.as_bytes(), provided_hash.as_bytes()) {
+                tracing::warn!(
+                    provider = %provider,
+                    "OAuth callback session-binding mismatch (possible login-CSRF)"
+                );
+                return Err(anyhow!(
+                    "Invalid or expired OAuth state token. This may indicate a CSRF attack."
+                ));
+            }
         }
 
         Ok(())
@@ -643,12 +767,23 @@ impl OAuthService {
         Ok(deleted_count)
     }
 
-    /// Generate OAuth authorization URL
+    /// Generate OAuth authorization URL.
+    ///
+    /// Returns `(auth_url, state_token, session_binding_nonce)`.
+    ///
+    /// S1 (login-CSRF / session-fixation): `session_binding_nonce` is an
+    /// opaque per-browser secret. The CALLER MUST set it on the browser
+    /// as an HttpOnly + Secure + SameSite=Lax cookie (suggested name
+    /// `talos_oauth_session`) and pass the cookie value back into
+    /// `handle_callback` on the provider redirect. Only the SHA-256 of
+    /// the nonce is persisted server-side; the plaintext lives only in
+    /// the cookie. This binds the `state` nonce to THIS browser, not just
+    /// "Talos issued it". NEVER log the returned nonce.
     pub async fn get_authorization_url(
         &self,
         provider: OAuthProvider,
         extra_scopes: Option<Vec<String>>,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String, String)> {
         if !self.is_provider_enabled(&provider) {
             return Err(anyhow!(
                 "{} OAuth is not configured. Set environment variables.",
@@ -662,11 +797,20 @@ impl OAuthService {
             OAuthProvider::Snyk => self.get_snyk_auth_url().await,
         }?;
 
-        // Store state token + PKCE verifier for CSRF and code interception protection.
-        self.store_state_token(&csrf_token, provider.as_str(), Some(pkce_verifier.secret()))
-            .await?;
+        // Generate a browser-session binding; persist only its hash.
+        let (session_nonce, session_binding_hash) = generate_oauth_session_binding();
 
-        Ok((auth_url, csrf_token))
+        // Store state token + PKCE verifier + session binding for CSRF,
+        // code-interception, and login-CSRF protection.
+        self.store_state_token(
+            &csrf_token,
+            provider.as_str(),
+            Some(pkce_verifier.secret()),
+            Some(&session_binding_hash),
+        )
+        .await?;
+
+        Ok((auth_url, csrf_token, session_nonce))
     }
 
     /// Google OAuth authorization URL
@@ -817,11 +961,18 @@ impl OAuthService {
     }
 
     /// Handle OAuth callback and get user info
+    /// `session_binding` is the plaintext value of the browser's
+    /// `talos_oauth_session` cookie (set by the caller at
+    /// `get_authorization_url` time). The caller MUST read it from the
+    /// callback request's cookies and pass it here so the S1 login-CSRF
+    /// binding can be enforced. Passing `None` when the consumed state row
+    /// carries a binding hash is rejected as a CSRF attempt.
     pub async fn handle_callback(
         &self,
         provider: OAuthProvider,
         code: String,
         state_token: Option<String>,
+        session_binding: Option<&str>,
     ) -> Result<OAuthUserInfo> {
         // Validate CSRF state token
         let state = state_token.ok_or_else(|| {
@@ -833,7 +984,8 @@ impl OAuthService {
         // fetching first is safer against any future row-deletion changes).
         let pkce_verifier = self.get_pkce_verifier(&state).await?;
 
-        self.validate_state_token(&state, provider.as_str()).await?;
+        self.validate_state_token(&state, provider.as_str(), session_binding)
+            .await?;
 
         match provider {
             OAuthProvider::Google => self.handle_google_callback(code, pkce_verifier).await,
@@ -1468,6 +1620,105 @@ impl OAuthService {
         .ok(); // Don't fail if logging fails
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod session_binding_tests {
+    use super::*;
+
+    /// The verification predicate as it runs inside `validate_state_token`
+    /// after the row is consumed: a stored `Option<hash>` plus the
+    /// plaintext cookie value yields accept/reject. Kept as a free fn so
+    /// the decision logic is exercised by real production code (the same
+    /// `hash_oauth_session_binding` + `constant_time_eq` the handler uses)
+    /// without standing up Postgres.
+    fn binding_accepts(stored_hash: Option<&str>, provided_cookie: Option<&str>) -> bool {
+        match stored_hash {
+            // NULL hash (legacy / non-login row) → no binding required.
+            None => true,
+            Some(expected) => match provided_cookie {
+                None => false,
+                Some(nonce) => {
+                    let provided = hash_oauth_session_binding(nonce);
+                    constant_time_eq(expected.as_bytes(), provided.as_bytes())
+                }
+            },
+        }
+    }
+
+    #[test]
+    fn binding_is_written_as_hash_not_plaintext() {
+        let (nonce, hash) = generate_oauth_session_binding();
+        // What gets persisted must be the hash, never the cookie value.
+        assert_ne!(
+            nonce, hash,
+            "stored value must differ from cookie plaintext"
+        );
+        assert_eq!(hash.len(), 64, "sha256 hex digest is 64 chars");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        // The hash is reproducible from the nonce (callback recompute path).
+        assert_eq!(hash, hash_oauth_session_binding(&nonce));
+        // The nonce itself passes the state-token charset gate so it's a
+        // safe cookie value.
+        assert!(validate_oauth_state_token_format(&nonce).is_ok());
+    }
+
+    #[test]
+    fn nonce_is_high_entropy_and_unique() {
+        let (a, _) = generate_oauth_session_binding();
+        let (b, _) = generate_oauth_session_binding();
+        assert_ne!(a, b, "two generated nonces must not collide");
+        // 2 × 32 hex chars (two v4 UUIDs, hyphenless).
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn happy_path_accepts_matching_cookie() {
+        let (nonce, hash) = generate_oauth_session_binding();
+        assert!(binding_accepts(Some(&hash), Some(&nonce)));
+    }
+
+    #[test]
+    fn mismatched_cookie_rejected() {
+        let (_nonce_a, hash_a) = generate_oauth_session_binding();
+        let (nonce_b, _hash_b) = generate_oauth_session_binding();
+        // Attacker presents a cookie for a different (their own) session.
+        assert!(!binding_accepts(Some(&hash_a), Some(&nonce_b)));
+    }
+
+    #[test]
+    fn missing_cookie_rejected_when_binding_present() {
+        let (_nonce, hash) = generate_oauth_session_binding();
+        // Victim's browser hits the attacker-supplied callback URL with no
+        // matching session cookie → must be refused.
+        assert!(!binding_accepts(Some(&hash), None));
+    }
+
+    #[test]
+    fn null_hash_row_skips_binding_check() {
+        // Legacy / non-login rows (NULL hash) accept regardless of cookie,
+        // preserving backward compatibility.
+        assert!(binding_accepts(None, None));
+        assert!(binding_accepts(None, Some("anything")));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_semantics_of_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        // Length mismatch is a rejection, not a panic or a short-circuit.
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn empty_cookie_does_not_match_a_real_binding() {
+        let (_nonce, hash) = generate_oauth_session_binding();
+        // An empty-string cookie hashes to the SHA-256 of "" which is not
+        // the stored hash → rejected.
+        assert!(!binding_accepts(Some(&hash), Some("")));
     }
 }
 

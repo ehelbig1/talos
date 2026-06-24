@@ -66,9 +66,25 @@ use std::sync::Arc;
 /// caller's `allowed_hosts` with `*` wildcards stripped so a module
 /// declaring `["*"]` cannot also opt into the private-IP bypass. An
 /// empty set means "always filter every private IP regardless of env".
+///
+/// `local_egress_only`: when `true` (a Tier-1, local-Ollama-only actor),
+/// the resolver INVERTS the default public-allow posture and DENIES any
+/// resolved address that is NOT loopback/private/link-local. This closes
+/// the S3 DNS hole (2026-06-23 review): the per-host
+/// `tier1_egress_deny_reason` gate only catches known LLM-provider
+/// hostnames and public IP *literals*, so a Tier-1 actor with a broad
+/// `allowed_hosts` could resolve `data-sink.attacker.com` → a public IP
+/// and POST sensitive data off-host. Enforcing local-only egress at the
+/// connect-time resolver (where the resolved IP is known) aligns the code
+/// with the documented Tier-1 contract — "data must NOT leave host" — and
+/// defeats DNS-rebinding because the gate IS the connect. Local Ollama on
+/// loopback / private-LAN IPs is still reachable.
 #[derive(Debug, Clone, Default)]
 pub struct SsrfFilteringResolver {
     explicit_private_host_allowed: Arc<HashSet<String>>,
+    /// Tier-1 local-only egress: deny every non-private/non-loopback
+    /// resolved address regardless of hostname. See struct doc.
+    local_egress_only: bool,
 }
 
 impl SsrfFilteringResolver {
@@ -77,7 +93,11 @@ impl SsrfFilteringResolver {
     /// not also unlock the private-IP bypass). Hostnames are lowercased
     /// to match the case-insensitive convention used elsewhere in the
     /// worker's HTTP path.
-    pub fn for_allowed_hosts(allowed_hosts: &[String]) -> Self {
+    ///
+    /// `local_egress_only` mirrors the Tier-1 data-egress ceiling — set it
+    /// from `max_llm_tier == Tier1` at the call site so the resolver can
+    /// refuse public egress for privacy-ceiled actors.
+    pub fn for_allowed_hosts(allowed_hosts: &[String], local_egress_only: bool) -> Self {
         let explicit = allowed_hosts
             .iter()
             .filter(|h| h.as_str() != "*")
@@ -85,14 +105,19 @@ impl SsrfFilteringResolver {
             .collect::<HashSet<String>>();
         Self {
             explicit_private_host_allowed: Arc::new(explicit),
+            local_egress_only,
         }
     }
 
     /// Test helper: build a resolver with the bypass available for the
-    /// given hostnames regardless of the env var.
+    /// given hostnames regardless of the env var (Tier-2 / public-allow
+    /// posture).
     #[cfg(test)]
     pub fn with_explicit_hosts(hosts: &[&str]) -> Self {
-        Self::for_allowed_hosts(&hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>())
+        Self::for_allowed_hosts(
+            &hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>(),
+            false,
+        )
     }
 
     /// Pure bypass decision so the scoping is unit-testable without
@@ -127,6 +152,7 @@ impl Resolve for SsrfFilteringResolver {
         let host = name.as_str().to_string();
         let host_lower = host.to_ascii_lowercase();
         let explicit_allowed = self.explicit_private_host_allowed.clone();
+        let local_egress_only = self.local_egress_only;
         Box::pin(async move {
             // The reqwest `Name` carries only the hostname; the port
             // is injected by reqwest's connect layer based on the URL
@@ -159,7 +185,16 @@ impl Resolve for SsrfFilteringResolver {
             // execution's explicit allowed-hosts (no `*`). Same shape
             // as `bypass_allowed_with_prod` so the unit-test pure
             // function agrees with this runtime path.
-            let bypass = env_toggle && !production && explicit_allowed.contains(&host_lower);
+            //
+            // The private-IP bypass is meaningless for a Tier-1
+            // local-egress-only actor (it would only ever re-permit a
+            // private IP that's already permitted), so we never enter it
+            // when `local_egress_only` is set — keep the two postures
+            // disjoint to avoid any "bypass re-permits public" footgun.
+            let bypass = !local_egress_only
+                && env_toggle
+                && !production
+                && explicit_allowed.contains(&host_lower);
 
             let lookup = tokio::net::lookup_host(format!("{}:80", host)).await;
             let addrs = match lookup {
@@ -171,6 +206,33 @@ impl Resolve for SsrfFilteringResolver {
 
             let filtered: Vec<SocketAddr> = if bypass {
                 addrs
+            } else if local_egress_only {
+                // S3 (2026-06-23): Tier-1 = "data must NOT leave host".
+                // INVERT the default posture — keep ONLY loopback /
+                // private / link-local addresses, deny every public
+                // (globally-routable) one regardless of hostname. This
+                // blocks `data-sink.attacker.com → public IP` egress that
+                // the name-based `tier1_egress_deny_reason` gate misses,
+                // and defeats DNS-rebinding because the resolved IP is
+                // re-classified at the connect point. Local Ollama on
+                // loopback / private-LAN still resolves.
+                addrs
+                    .into_iter()
+                    .filter(|sa| match crate::host_impl::classify_private_ip(sa.ip()) {
+                        // Private / loopback / link-local — local egress, allowed.
+                        Some(_) => true,
+                        // Public / globally-routable — denied for Tier-1.
+                        None => {
+                            tracing::warn!(
+                                host = %host,
+                                ip = %sa.ip(),
+                                "SECURITY: Tier-1 local-egress-only — blocked public IP from \
+                                 DNS result (data must not leave host)"
+                            );
+                            false
+                        }
+                    })
+                    .collect()
             } else {
                 addrs
                     .into_iter()
@@ -194,8 +256,8 @@ impl Resolve for SsrfFilteringResolver {
             if filtered.is_empty() {
                 tracing::warn!(
                     host = %host,
-                    "SSRF resolver: every resolved IP was filtered (all private). \
-                     Connection will fail."
+                    local_egress_only,
+                    "SSRF resolver: every resolved IP was filtered. Connection will fail."
                 );
             }
 
@@ -235,7 +297,7 @@ mod tests {
         // unlock the private-IP bypass. The resolver's per-host set
         // is empty after wildcard filtering, so the bypass decision
         // returns false even with the env toggle on.
-        let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()]);
+        let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()], false);
         assert!(!r.bypass_allowed("any-host.example.com", true));
         assert!(!r.bypass_allowed("any-host.example.com", false));
     }
@@ -264,6 +326,86 @@ mod tests {
         let r = SsrfFilteringResolver::default();
         assert!(!r.bypass_allowed("anything", true));
         assert!(!r.bypass_allowed("anything", false));
+    }
+
+    /// S3 (2026-06-23): a Tier-1 local-egress-only resolver must DENY a
+    /// public IP and PERMIT loopback/private/link-local. IP-literal hosts
+    /// are resolved by `tokio::net::lookup_host` without any network I/O,
+    /// so this exercises the real `resolve()` filter deterministically.
+    #[tokio::test]
+    async fn local_egress_only_denies_public_permits_local() {
+        let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()], true);
+
+        // Public IP literal → filtered to empty (deny).
+        let public = r
+            .resolve(Name::from_str("8.8.8.8").expect("name"))
+            .await
+            .expect("resolve");
+        assert!(
+            public.collect::<Vec<SocketAddr>>().is_empty(),
+            "Tier-1 local-egress-only must drop a public IP"
+        );
+
+        // Loopback → permitted.
+        let loopback = r
+            .resolve(Name::from_str("127.0.0.1").expect("name"))
+            .await
+            .expect("resolve");
+        assert!(
+            !loopback.collect::<Vec<SocketAddr>>().is_empty(),
+            "Tier-1 local-egress-only must keep loopback (local Ollama)"
+        );
+
+        // Private LAN (RFC1918) → permitted (host-local Ollama on the LAN).
+        let private = r
+            .resolve(Name::from_str("192.168.1.50").expect("name"))
+            .await
+            .expect("resolve");
+        assert!(
+            !private.collect::<Vec<SocketAddr>>().is_empty(),
+            "Tier-1 local-egress-only must keep a private-LAN address"
+        );
+    }
+
+    /// The Tier-1 inversion must NOT be re-opened by the dev env-var
+    /// bypass: `local_egress_only` forces `bypass = false` even with the
+    /// toggle on and the hostname explicitly listed.
+    #[tokio::test]
+    async fn local_egress_only_ignores_private_host_bypass() {
+        std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
+        let r = SsrfFilteringResolver::for_allowed_hosts(&["8.8.8.8".to_string()], true);
+        let public = r
+            .resolve(Name::from_str("8.8.8.8").expect("name"))
+            .await
+            .expect("resolve");
+        assert!(
+            public.collect::<Vec<SocketAddr>>().is_empty(),
+            "local_egress_only must not be unlocked by the dev bypass toggle"
+        );
+        std::env::remove_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS");
+    }
+
+    /// Tier-2 (default) posture is unchanged by the S3 change: public IPs
+    /// pass, private IPs are filtered.
+    #[tokio::test]
+    async fn tier2_default_permits_public_filters_private() {
+        let r = SsrfFilteringResolver::for_allowed_hosts(&[], false);
+        let public = r
+            .resolve(Name::from_str("8.8.8.8").expect("name"))
+            .await
+            .expect("resolve");
+        assert!(
+            !public.collect::<Vec<SocketAddr>>().is_empty(),
+            "Tier-2 must still reach public hosts"
+        );
+        let private = r
+            .resolve(Name::from_str("127.0.0.1").expect("name"))
+            .await
+            .expect("resolve");
+        assert!(
+            private.collect::<Vec<SocketAddr>>().is_empty(),
+            "Tier-2 default still SSRF-filters private IPs"
+        );
     }
 
     /// wasm-security-review (2026-05-22): production gate refuses the

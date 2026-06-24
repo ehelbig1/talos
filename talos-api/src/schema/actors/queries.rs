@@ -32,7 +32,10 @@ impl ActorsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let rows = sqlx::query(
             r#"SELECT
                 a.id, a.name, a.description, a.status, a.max_capability_world,
@@ -97,7 +100,10 @@ impl ActorsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let row = sqlx::query(
             r#"SELECT
                 a.id, a.name, a.description, a.status, a.max_capability_world, a.metadata,
@@ -177,7 +183,10 @@ impl ActorsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         let actor_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
@@ -203,9 +212,10 @@ impl ActorsQueries {
         .fetch_one(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(ActorExecutionsSummary {
             total_executions: stats.get("total"),
@@ -235,7 +245,10 @@ impl ActorsQueries {
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         let actor_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
@@ -259,9 +272,10 @@ impl ActorsQueries {
         .fetch_one(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(ActorWorkflowsSummary {
             total_workflows: stats.get("total"),
@@ -291,7 +305,10 @@ impl ActorsQueries {
         // user's), so the actors ownership read gets the RLS backstop.
         let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         let actor_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
@@ -317,9 +334,10 @@ impl ActorsQueries {
         .fetch_all(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(rows
             .into_iter()
@@ -374,7 +392,10 @@ impl ActorsQueries {
         // backstop.
         let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         let actor_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
@@ -406,9 +427,10 @@ impl ActorsQueries {
         .fetch_all(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(rows
             .into_iter()
@@ -468,7 +490,10 @@ impl ActorsQueries {
         // decrypt loop below.
         let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
 
         // Verify ownership
         let owned: bool = sqlx::query_scalar(
@@ -505,9 +530,10 @@ impl ActorsQueries {
         .fetch_all(uow.conn())
         .await
         .map_err(|e| e.extend_safe())?;
-        uow.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {

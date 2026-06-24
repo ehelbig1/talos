@@ -159,7 +159,10 @@ impl WebhooksQueries {
         // its own; the gate is `w.user_id = $1` on the joined workflow).
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let rows = sqlx::query(
             r#"
             SELECT d.id, d.workflow_id, d.execution_id, d.node_id, d.error_message, d.payload::text,
@@ -175,9 +178,10 @@ impl WebhooksQueries {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(rows
             .into_iter()
