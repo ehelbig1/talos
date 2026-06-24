@@ -60,14 +60,41 @@ enum SigstorePolicy {
 
 impl SigstorePolicy {
     fn from_env() -> Self {
-        match env::var("TALOS_SIGSTORE_REQUIRED")
-            .unwrap_or_default()
-            .as_str()
-        {
+        Self::from_env_str(&env::var("TALOS_SIGSTORE_REQUIRED").unwrap_or_default())
+    }
+
+    /// Pure parse helper. Mirrors the worker's `SigstorePolicy::from_env_str`
+    /// (worker/src/main.rs) so the controller and worker classify the same
+    /// `TALOS_SIGSTORE_REQUIRED` string identically — including the explicit
+    /// `disabled` opt-out aliases the production gate below keys on.
+    fn from_env_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "required" => Self::Required,
             "audit" | "warn" => Self::Audit,
+            "disabled" | "off" | "0" | "false" | "no" => Self::Disabled,
+            // Anything else (including empty) → Disabled, but the production
+            // gate in `start_registry_sync_loop` refuses to sync in this state.
             _ => Self::Disabled,
         }
+    }
+
+    /// Was the operator EXPLICIT about the Sigstore policy? Distinguishes
+    /// "operator set `=disabled`, accepting the risk" from "operator forgot to
+    /// set anything". Mirrors the worker's `raw_env_is_explicit`.
+    fn raw_env_is_explicit(raw: &str) -> bool {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "true"
+                | "1"
+                | "required"
+                | "audit"
+                | "warn"
+                | "disabled"
+                | "off"
+                | "0"
+                | "false"
+                | "no"
+        )
     }
 }
 
@@ -312,6 +339,32 @@ pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) {
         tracing::info!(
             "TALOS_REGISTRY_URL not set — OCI registry sync disabled. \
              Templates will be served from the disk-seeded set only."
+        );
+        return;
+    };
+
+    // R3 (Sigstore-policy parity): OCI sync is active, so the Sigstore policy
+    // governs whether pulled template/index artifacts are signature-verified.
+    // The worker refuses to BOOT in production unless TALOS_SIGSTORE_REQUIRED is
+    // set explicitly (worker/src/main.rs::enforce_production_sigstore_policy_explicit);
+    // the controller previously had no equivalent, so an unset/typo'd value
+    // silently devolved to `Disabled` and the sync accepted the `_index` and
+    // every template UNVERIFIED — a tampered index could redirect template
+    // name→tag mappings into the discovery surface. Mirror the worker's
+    // discipline here: in production, refuse to RUN the sync (rather than
+    // accept unverified artifacts) unless the operator made an explicit choice.
+    // The controller stays up for everything else; only OCI sync is withheld,
+    // which is fail-safe (no unverified templates) vs. failing the whole pod.
+    let sigstore_raw = env::var("TALOS_SIGSTORE_REQUIRED").unwrap_or_default();
+    if talos_config::is_production() && !SigstorePolicy::raw_env_is_explicit(&sigstore_raw) {
+        tracing::error!(
+            target: "talos_registry",
+            "CRITICAL: TALOS_REGISTRY_URL is set but TALOS_SIGSTORE_REQUIRED is not set \
+             explicitly in production — refusing to start OCI registry sync rather than \
+             accept unverified template/index artifacts. Set TALOS_SIGSTORE_REQUIRED to \
+             `required` (fail-closed verification, recommended), `audit` (verify+log+continue \
+             during a migration window), or `disabled` (explicitly accept the risk of \
+             unsigned artifacts). Disk-seeded templates remain the source of truth meanwhile."
         );
         return;
     };
@@ -943,6 +996,46 @@ mod tests {
         assert_eq!(strip_scheme("https://ghcr.io"), "ghcr.io");
         assert_eq!(strip_scheme("http://registry:5000/"), "registry:5000");
         assert_eq!(strip_scheme("ghcr.io"), "ghcr.io");
+    }
+
+    #[test]
+    fn sigstore_policy_parse_and_explicit_match_worker() {
+        // Parity with the worker's SigstorePolicy classification.
+        assert_eq!(
+            SigstorePolicy::from_env_str("required"),
+            SigstorePolicy::Required
+        );
+        assert_eq!(
+            SigstorePolicy::from_env_str(" REQUIRED "),
+            SigstorePolicy::Required
+        );
+        assert_eq!(SigstorePolicy::from_env_str("audit"), SigstorePolicy::Audit);
+        assert_eq!(
+            SigstorePolicy::from_env_str("disabled"),
+            SigstorePolicy::Disabled
+        );
+        assert_eq!(SigstorePolicy::from_env_str(""), SigstorePolicy::Disabled);
+        assert_eq!(
+            SigstorePolicy::from_env_str("typo"),
+            SigstorePolicy::Disabled
+        );
+
+        // The production gate keys on explicitness: an explicit `disabled` is
+        // accepted, but an empty / unrecognized value is NOT (gate refuses sync).
+        for explicit in [
+            "required", "audit", "disabled", "off", "0", "false", "no", " TRUE ",
+        ] {
+            assert!(
+                SigstorePolicy::raw_env_is_explicit(explicit),
+                "{explicit:?} must count as an explicit operator choice"
+            );
+        }
+        for ambiguous in ["", "   ", "typo", "enabled", "maybe"] {
+            assert!(
+                !SigstorePolicy::raw_env_is_explicit(ambiguous),
+                "{ambiguous:?} must NOT count as explicit (production gate refuses sync)"
+            );
+        }
     }
 
     #[test]

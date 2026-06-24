@@ -206,6 +206,19 @@ spec:
                   exit 1
               fi
 
+              # SECURITY: disable command tracing now that secrets are in
+              # scope. From here on the script EXPANDS $ROOT_TOKEN, $UNSEAL_KEY,
+              # and the minted $CONTROLLER_TOKEN directly into commands (e.g.
+              # `env VAULT_TOKEN="$ROOT_TOKEN" ...`, `vault operator unseal
+              # '$UNSEAL_KEY'`). Under `set -x` those values would be printed to
+              # this Job pod's stdout — and the pod is retained
+              # `ttlSecondsAfterFinished`, so anyone with `kubectl logs` could
+              # recover the Vault root token + unseal key. The `$(...)` captures
+              # above are safe (set -x traces the command, not its output); only
+              # the use-sites below leak, so we fence them off. The earlier
+              # pod-wait / init phases keep tracing for debuggability.
+              set +x
+
               # ── 4. Unseal if needed ─────────────────────────────────
               SEALED="$(kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
                   sh -c 'vault status -format=json 2>&1 | grep -o "\"sealed\":[[:space:]]*true" || true')"

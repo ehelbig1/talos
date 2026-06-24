@@ -323,6 +323,12 @@ else
     JWT_SECRET=$(rand_hex32)
     WORKER_SHARED_KEY=$(rand_hex32)
     AUDIT_SIGNING_KEY=$(rand_hex32)
+    # Worker AOT-cache tamper-protection key (MCP-858). REQUIRED in production:
+    # `worker::runtime::aot_key_ring` panics (→ CrashLoopBackOff, failing the
+    # `helm upgrade --wait`) when RUST_ENV=production and this is unset. The
+    # secretKeyRef is `optional: true`, so an absent key resolves to *unset*
+    # (not empty) and trips the panic — hence it must be provisioned here.
+    AOT_HMAC_KEY=$(rand_hex32)
 
     NATS_USER="talos"
     NATS_PASSWORD=$(rand_b64_pw)
@@ -363,6 +369,7 @@ else
         --from-literal=JWT_SECRET="$JWT_SECRET"
         --from-literal=WORKER_SHARED_KEY="$WORKER_SHARED_KEY"
         --from-literal=TALOS_AUDIT_SIGNING_KEY="$AUDIT_SIGNING_KEY"
+        --from-literal=TALOS_AOT_HMAC_KEY="$AOT_HMAC_KEY"
         --from-literal=MINIO_ROOT_USER="$MINIO_ROOT_USER"
         --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD"
         --from-literal=MINIO_CONTROLLER_USER="$MINIO_CONTROLLER_USER"

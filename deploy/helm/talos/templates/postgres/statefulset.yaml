@@ -218,15 +218,23 @@ spec:
         - name: config
           configMap:
             name: {{ include "talos.componentName" (list . "postgres-config") }}
+            # The `items:` filter belongs to the CONFIG configMap (project only
+            # postgresql.conf). It was previously mis-placed AFTER the tls
+            # if/end below, so with tls.inCluster.enabled=true (the default) it
+            # attached to the `tls` SECRET volume instead — filtering it to a
+            # non-existent `postgresql.conf` key and hiding tls.crt/tls.key, so
+            # Postgres' ssl_cert_file/ssl_key_file pointed at missing files and
+            # in-transit TLS (PR #243/#244) silently broke / the pod failed to
+            # start. Keep it inside the configMap block.
+            items:
+              - key: postgresql.conf
+                path: postgresql.conf
         {{- if .Values.tls.inCluster.enabled }}
         - name: tls
           secret:
             secretName: {{ include "talos.componentName" (list . "postgres-tls") }}
             defaultMode: 0640
         {{- end }}
-            items:
-              - key: postgresql.conf
-                path: postgresql.conf
         {{- if not .Values.postgres.persistence.enabled }}
         # Same emptyDir-fallback shape as neo4j (see MCP-806 comment in
         # neo4j/statefulset.yaml). For ANY non-test deployment leave
