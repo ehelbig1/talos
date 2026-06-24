@@ -25,21 +25,29 @@
 //! legitimate next resumer can BOTH observe `resuming`, but only one holds the
 //! current epoch. See `docs/split-brain-fencing-design.md`.
 //!
-//! ## Scope limitation — fresh runs are NOT actively fenced
+//! ## Fresh-run coverage
 //!
-//! The heartbeat is installed ONLY on the resume path
-//! (`crash_recovery::resume_execution` → [`run_with_seed_fenced`]). The
-//! ORIGINAL fresh-run controller (`trigger.rs` → `run_with_trigger_input_via_nats`)
-//! runs WITHOUT an epoch heartbeat. So if a fresh run goes stale (GC pause /
-//! partition / a node slower than the stale window) and a restarting controller
-//! reclaims it, the original is NOT aborted — it keeps dispatching alongside the
-//! resumer until it next blocks/completes. This is bounded, not unbounded:
-//! terminal writes are status-guarded (no terminal-state corruption or
-//! lost-update on the row), so the only exposure is the at-least-once duplicate
-//! node dispatch the durable-execution contract already documents
-//! (`crash_recovery` module docs). Tightening this — stamping an epoch at fresh
-//! INSERT and fencing the fresh-run path the same way — is a tracked follow-up;
-//! do NOT read this module as fencing the original fresh-run controller today.
+//! Fencing now covers TWO entry paths:
+//! - the resume path (`crash_recovery::resume_execution` → [`run_with_seed_fenced`]); and
+//! - the PRIMARY fresh-run path (`trigger.rs` → [`run_with_trigger_input_fenced`]),
+//!   which observes the row's current `epoch` (0 for a fresh INSERT) and aborts
+//!   if a reclaim bumps it.
+//!
+//! ## Remaining unfenced fresh-run sites
+//!
+//! Other `run_with_trigger_input_via_nats` call sites still dispatch WITHOUT a
+//! fence: `retry.rs`, `replay.rs`, the scheduler (`talos-scheduler`), inbound
+//! webhooks (`talos-webhooks`), continuation/approval resume
+//! (`talos-continuation-trigger`), the MCP trigger handlers (`talos-mcp-handlers`),
+//! and the GraphQL `triggerWorkflow` mutation (`talos-api`). For those, the
+//! exposure is unchanged and bounded: a stale original keeps dispatching
+//! alongside a resumer, but terminal writes are status-guarded (no
+//! terminal-state corruption / lost-update), so the only effect is the
+//! at-least-once duplicate node dispatch the durable-execution contract already
+//! documents (`crash_recovery` module docs). [`run_with_trigger_input_fenced`]
+//! is reusable, so extending each site is a matter of reading the row's epoch
+//! and threading [`was_fenced`] into that site's failure handling — tracked as
+//! follow-up work, done per-site because each owns its own terminal-write logic.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,7 +61,7 @@ use uuid::Uuid;
 use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowEngineError};
 use talos_workflow_engine_core::{WorkerSharedKey, WorkflowContext};
 
-use crate::nats_run::run_with_seed_via_nats;
+use crate::nats_run::{run_with_seed_via_nats, run_with_trigger_input_via_nats};
 
 /// How often the fence heartbeat re-reads the execution's epoch. Short enough
 /// to bound a superseded controller's wasted dispatch to a few nodes, long
@@ -99,6 +107,63 @@ pub async fn run_with_seed_fenced(
 
     // Stop the heartbeat (idempotent — it may have already cancelled to abort
     // a fenced run) and reap the task so it can't outlive the resume.
+    token.cancel();
+    let _ = heartbeat.await;
+
+    result
+}
+
+/// Run a FRESH workflow execution (trigger-input entry path) under an epoch
+/// fence — the same protection [`run_with_seed_fenced`] gives the resume path,
+/// extended to original fresh runs.
+///
+/// A fresh execution row starts at `epoch = 0` (the column default; see
+/// migration `20260602140000`). A crash-recovery claim/reclaim bumps
+/// `epoch + 1`. So if this fresh run goes stale (GC pause / partition / a node
+/// slower than the stale window) and a restarting controller reclaims the row,
+/// the heartbeat sees the epoch advance past `my_epoch` and aborts this
+/// now-superseded original controller — instead of letting it keep dispatching
+/// alongside the resumer (duplicate side effects).
+///
+/// `my_epoch` MUST be the epoch the row currently holds (read it; do NOT
+/// hard-code 0). Passing a value that does not match the row's epoch causes the
+/// heartbeat to abort a healthy run on its first tick — a silent lost execution,
+/// worse than the duplicate-dispatch window this closes. The caller should fall
+/// back to the unfenced path if it can't read the epoch.
+///
+/// A fence abort surfaces as [`WorkflowEngineError::Cancelled`]; test it with
+/// [`was_fenced`] so the caller does NOT mark the row failed — it now belongs to
+/// the resumer (or a reclaim already failed it).
+pub async fn run_with_trigger_input_fenced(
+    engine: &mut ParallelWorkflowEngine,
+    nats_client: Arc<async_nats::Client>,
+    worker_shared_key: Option<WorkerSharedKey>,
+    trigger_input: JsonValue,
+    execution_id: Uuid,
+    pool: Pool<Postgres>,
+    my_epoch: i64,
+) -> Result<WorkflowContext, WorkflowEngineError> {
+    let token = CancellationToken::new();
+    engine.set_cancellation_token(Some(token.clone()));
+
+    let heartbeat = tokio::spawn(epoch_fence_heartbeat(
+        pool,
+        execution_id,
+        my_epoch,
+        token.clone(),
+    ));
+
+    let result = run_with_trigger_input_via_nats(
+        engine,
+        nats_client,
+        worker_shared_key,
+        trigger_input,
+        execution_id,
+    )
+    .await;
+
+    // Stop the heartbeat (idempotent — it may have already cancelled to abort a
+    // fenced run) and reap the task so it can't outlive the run.
     token.cancel();
     let _ = heartbeat.await;
 
@@ -172,4 +237,21 @@ async fn current_epoch(
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|r| r.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `was_fenced` is the contract BOTH fenced paths (resume + fresh-run) rely
+    /// on to decide whether to mark the row failed: a fence abort (Cancelled)
+    /// must NOT be marked failed (another controller owns the row), but any
+    /// other error (e.g. Timeout) MUST still be marked failed. A regression
+    /// here would either clobber a new owner's row (false-true) or leak a
+    /// genuinely-failed execution back into the claimable set (false-false).
+    #[test]
+    fn was_fenced_only_matches_cancellation() {
+        assert!(was_fenced(&WorkflowEngineError::Cancelled));
+        assert!(!was_fenced(&WorkflowEngineError::Timeout { secs: 30 }));
+    }
 }
