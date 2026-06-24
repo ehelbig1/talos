@@ -473,24 +473,29 @@ impl ExecutionOrchestrationService {
         let db_pool_for_fence = self.db_pool.clone();
 
         tokio::spawn(async move {
+            // F4 fresh-run fence (FU-1): read the row's epoch BEFORE the
+            // semaphore park below. The park can block for MINUTES behind the
+            // concurrency cap; reading the epoch AFTER it would observe a value
+            // a crash-recovery reclaim already bumped DURING the wait, and the
+            // heartbeat would then never trip (it would match the already-bumped
+            // epoch — the split-brain this fence exists to close). Reading
+            // before the park captures the true at-dispatch epoch (0 for a fresh
+            // INSERT), so a reclaim during the wait bumps PAST it and the fence
+            // aborts this superseded original on the first tick. We read the
+            // actual epoch (not a hard-coded 0) so a future INSERT that stamps a
+            // non-zero epoch doesn't cause a false abort. A read failure falls
+            // back to the unfenced path (best-effort hardening; status-guarded
+            // terminal writes still prevent corruption).
+            let fence_epoch = exec_repo_for_alert
+                .current_execution_epoch(execution_id)
+                .await;
+
             // Cap concurrent in-flight engine runs. The acquire blocks
             // when the global limit is saturated; tasks queue rather
             // than starting in parallel.
             let _permit = exec_semaphore().acquire().await;
 
-            // F4 fresh-run fence (FU-1): wrap the run in an epoch fence so a
-            // crash-recovery reclaim of this row (which bumps `epoch + 1`)
-            // aborts this original controller instead of letting it keep
-            // dispatching alongside the resumer. We MUST observe the row's
-            // actual current epoch — passing a wrong value would abort a
-            // healthy run on the first heartbeat tick (a silent lost
-            // execution). If the epoch read fails (DB blip), fall back to the
-            // unfenced path: fencing is best-effort hardening, and the
-            // status-guarded terminal writes still prevent corruption.
-            let run_result = match exec_repo_for_alert
-                .current_execution_epoch(execution_id)
-                .await
-            {
+            let run_result = match fence_epoch {
                 Ok(Some(my_epoch)) => {
                     talos_engine::fence::run_with_trigger_input_fenced(
                         &mut engine,

@@ -64,14 +64,23 @@ const CACHE_TTL: Duration = Duration::from_secs(90);
 
 /// Hard cap on cached entries. At the cap a sweep is attempted; if still full,
 /// new results are simply not cached (that job falls back to re-execution on a
-/// retry — no worse than the pre-FU-2 behavior). Bounds worst-case memory to
-/// `MAX_ENTRIES × MAX_CACHED_RESULT_BYTES`.
-const MAX_ENTRIES: usize = 4096;
+/// retry — no worse than the pre-FU-2 behavior).
+///
+/// HARD memory ceiling per cache instance = `MAX_ENTRIES × MAX_CACHED_RESULT_BYTES`
+/// = 2048 × 128 KiB = **256 MiB** worst case (≈512 MiB across the single-job +
+/// pipeline caches combined). Realistic footprint is far smaller: results are
+/// usually KB-scale, and the cache only needs to span the controller's
+/// transport-retry window (seconds — timeouts aren't retried), so even a busy
+/// worker keeps only `rate × ~tens-of-seconds` live entries. The bound was
+/// tightened from 4096 × 256 KiB (1 GiB) after a review flagged that worst case
+/// as too large for a worker pod.
+const MAX_ENTRIES: usize = 2048;
 
 /// Per-result size cap. Results whose serialized form exceeds this are not
-/// cached, so a single huge output can't dominate the budget. 256 KiB covers
-/// the overwhelming majority of module outputs.
-const MAX_CACHED_RESULT_BYTES: usize = 256 * 1024;
+/// cached, so a single huge output can't dominate the budget. 128 KiB covers
+/// the overwhelming majority of module outputs; larger ones fall back to
+/// re-execution on a retry (the rare residual).
+const MAX_CACHED_RESULT_BYTES: usize = 128 * 1024;
 
 struct Entry<V> {
     result: V,

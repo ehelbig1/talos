@@ -2174,73 +2174,36 @@ impl WebhookRouter {
         } else {
             // Async mode: spawn engine, return 202 immediately.
             //
-            // FU-1 fence: this background run is a long-lived `running` row that
-            // can outlast the crash-recovery stale window and be reclaimed by a
-            // restarting controller while it's still dispatching. Fence it on the
-            // row's ACTUAL current epoch (a wrong value would abort a healthy run
-            // on the first heartbeat tick — a silent lost execution), falling
-            // back to the unfenced path on an epoch-read failure. The sync path
-            // above is intentionally NOT fenced — it's bounded by sync_timeout
-            // (≤120s, under the stale window), and a reclaim there would abort
-            // the inline run the caller is waiting on.
-            let db_pool_for_fence = self.db_pool.clone();
+            // NOT epoch-fenced (self-review correction): an earlier change wired
+            // the FU-1 fence here, but it was inert AND unnecessary. The webhook
+            // async path creates the execution row as `Queued` and nothing
+            // transitions it to `running` before the engine writes its terminal
+            // status (only the MCP enqueue path calls
+            // mark_execution_running_from_queued). Crash recovery
+            // (`claim_stuck_execution_for_resume`) only reclaims `running` rows,
+            // so a `queued` webhook run is NEVER reclaimed → there is never a
+            // resumer → there is no split-brain for a fence to close. The fence
+            // therefore protected against nothing (and cost a per-run heartbeat
+            // task). Wiring it in would only have meaning if we ALSO marked the
+            // row `running` — i.e. made webhook runs crash-recoverable — which is
+            // a separate deliberate change, not something to bolt on to justify a
+            // fence. Left unfenced; the run's terminal write is status-guarded.
             tokio::spawn(async move {
-                let fence_epoch = sqlx::query_scalar::<_, i64>(
-                    "SELECT epoch FROM workflow_executions WHERE id = $1",
+                if let Err(e) = talos_engine::nats_run::run_with_trigger_input_via_nats(
+                    &mut engine,
+                    nats,
+                    worker_shared_key,
+                    input_payload,
+                    execution_id,
                 )
-                .bind(execution_id)
-                .fetch_optional(&db_pool_for_fence)
                 .await
-                .ok()
-                .flatten();
-
-                let run_result = match fence_epoch {
-                    Some(epoch) => {
-                        talos_engine::fence::run_with_trigger_input_fenced(
-                            &mut engine,
-                            nats,
-                            worker_shared_key,
-                            input_payload,
-                            execution_id,
-                            db_pool_for_fence,
-                            epoch,
-                        )
-                        .await
-                    }
-                    None => {
-                        tracing::warn!(
-                            execution_id = %execution_id,
-                            "Webhook async: could not read epoch for fresh-run fence; running unfenced"
-                        );
-                        talos_engine::nats_run::run_with_trigger_input_via_nats(
-                            &mut engine,
-                            nats,
-                            worker_shared_key,
-                            input_payload,
-                            execution_id,
-                        )
-                        .await
-                    }
-                };
-
-                if let Err(e) = run_result {
-                    if talos_engine::fence::was_fenced(&e) {
-                        // Reclaimed by crash-recovery (epoch advanced) — the row
-                        // belongs to the resumer now; not a failure of this run.
-                        tracing::warn!(
-                            execution_id = %execution_id,
-                            workflow_id = %workflow_id,
-                            "Webhook async: run fenced — superseded by a crash-recovery \
-                             reclaim; leaving the row to its new owner"
-                        );
-                    } else {
-                        tracing::error!(
-                            execution_id = %execution_id,
-                            workflow_id = %workflow_id,
-                            error = ?e,
-                            "Workflow execution failed (async)"
-                        );
-                    }
+                {
+                    tracing::error!(
+                        execution_id = %execution_id,
+                        workflow_id = %workflow_id,
+                        error = ?e,
+                        "Workflow execution failed (async)"
+                    );
                 }
             });
 

@@ -17,12 +17,21 @@ data:
 
     listener "tcp" {
       address     = "0.0.0.0:8200"
+      {{- if .Values.tls.inCluster.enabled }}
+      # In-transit TLS (companion to the Postgres/Neo4j/NATS #243 set). The
+      # cert+key come from the chart-generated `<release>-vault-tls` Secret
+      # mounted at /vault/tls (see the StatefulSet). KEK wrap/unwrap traffic and
+      # the X-Vault-Token bearer no longer cross the pod network in cleartext.
+      tls_cert_file = "/vault/tls/tls.crt"
+      tls_key_file  = "/vault/tls/tls.key"
+      {{- else }}
       tls_disable = 1
+      {{- end }}
     }
 
     # disable_mlock is safe in Kubernetes — no swap is configured on
     # worker nodes, and IPC_LOCK is granted below as defense-in-depth.
     disable_mlock = true
-    api_addr      = "http://{{ include "talos.componentName" (list . "vault") }}.{{ .Release.Namespace }}.svc.cluster.local:8200"
+    api_addr      = "{{ if .Values.tls.inCluster.enabled }}https{{ else }}http{{ end }}://{{ include "talos.componentName" (list . "vault") }}.{{ .Release.Namespace }}.svc.cluster.local:8200"
     ui            = true
 {{- end }}

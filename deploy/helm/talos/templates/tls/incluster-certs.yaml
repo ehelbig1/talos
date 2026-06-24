@@ -18,7 +18,13 @@ CLIENT VERIFICATION: Postgres clients use `sslmode=require` and Neo4j clients
 use `bolt+ssc://` — both encrypt but do NOT verify the server cert, so a
 self-signed cert needs no CA distribution. (NATS has no "accept self-signed"
 URL scheme; its CA is wired into the controller + worker separately — see the
-NATS TLS change.) For a stricter posture (verify-full / neo4j+s://), supply
+NATS TLS change.) Vault is FULL-VERIFY: the controller's Vault client trusts
+this cert via `VAULT_CACERT` (the chart projects `tls.crt` into the controller
+pod and the kek-provider adds it as a root) — the cert's SAN is the Vault
+service DNS, which is what `VAULT_ADDR` resolves to. The in-pod vault CLI / the
+vault-init Job talk to the loopback listener with `VAULT_SKIP_VERIFY=true` (a
+loopback connection can't be MITM'd, and the cert SAN is the service name not
+127.0.0.1). For a stricter posture (verify-full / neo4j+s://), supply
 operator-managed certs (e.g. cert-manager) in these Secret names instead.
 
 `resource-policy: keep` so `helm uninstall` doesn't wipe the certs; the
@@ -26,11 +32,12 @@ pre-install/pre-upgrade hook + weight -15 ensures the Secret exists before the
 Postgres (-14/-11) and Neo4j StatefulSets mount it.
 */ -}}
 {{- if .Values.tls.inCluster.enabled }}
-{{- range $svc := (list "postgres" "neo4j" "nats") }}
+{{- range $svc := (list "postgres" "neo4j" "nats" "vault") }}
 {{- $needed := false -}}
 {{- if and (eq $svc "postgres") $.Values.postgres.enabled }}{{- $needed = true -}}{{- end }}
 {{- if and (eq $svc "neo4j") $.Values.neo4j.enabled }}{{- $needed = true -}}{{- end }}
 {{- if and (eq $svc "nats") $.Values.nats.enabled }}{{- $needed = true -}}{{- end }}
+{{- if and (eq $svc "vault") $.Values.vault.enabled }}{{- $needed = true -}}{{- end }}
 {{- if $needed }}
 {{- $secretName := printf "%s-tls" (include "talos.componentName" (list $ $svc)) }}
 {{- $cn := include "talos.componentName" (list $ $svc) }}

@@ -108,10 +108,13 @@ keep `bootstrapSecret.enabled: false` and supply the same name.
 {{- end -}}
 {{- end -}}
 
-{{/* Vault address: in-cluster Service DNS or configured override. */}}
+{{/* Vault address: in-cluster Service DNS or configured override. The
+in-cluster Vault speaks HTTPS when tls.inCluster.enabled (the controller
+verifies it via VAULT_CACERT). An external addrOverride keeps whatever scheme
+the operator set. */}}
 {{- define "talos.vaultAddr" -}}
 {{- if .Values.vault.enabled -}}
-http://{{ include "talos.componentName" (list . "vault") }}.{{ .Release.Namespace }}.svc.cluster.local:8200
+{{ if .Values.tls.inCluster.enabled }}https{{ else }}http{{ end }}://{{ include "talos.componentName" (list . "vault") }}.{{ .Release.Namespace }}.svc.cluster.local:8200
 {{- else if .Values.vault.addrOverride -}}
 {{ .Values.vault.addrOverride }}
 {{- else -}}
