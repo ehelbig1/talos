@@ -467,6 +467,10 @@ impl ExecutionOrchestrationService {
         let worker_key = self.worker_shared_key.clone();
         let trigger_input_for_storage = input_payload.clone();
         let trace_actor_id = trigger_agent_id;
+        // F4 fresh-run fence (FU-1): the pool drives the epoch heartbeat that
+        // aborts this run if a crash-recovery reclaim bumps the row's epoch out
+        // from under us. See `talos_engine::fence::run_with_trigger_input_fenced`.
+        let db_pool_for_fence = self.db_pool.clone();
 
         tokio::spawn(async move {
             // Cap concurrent in-flight engine runs. The acquire blocks
@@ -474,15 +478,56 @@ impl ExecutionOrchestrationService {
             // than starting in parallel.
             let _permit = exec_semaphore().acquire().await;
 
-            match run_with_trigger_input_via_nats(
-                &mut engine,
-                nats,
-                worker_key,
-                input_payload,
-                execution_id,
-            )
-            .await
+            // F4 fresh-run fence (FU-1): wrap the run in an epoch fence so a
+            // crash-recovery reclaim of this row (which bumps `epoch + 1`)
+            // aborts this original controller instead of letting it keep
+            // dispatching alongside the resumer. We MUST observe the row's
+            // actual current epoch — passing a wrong value would abort a
+            // healthy run on the first heartbeat tick (a silent lost
+            // execution). If the epoch read fails (DB blip), fall back to the
+            // unfenced path: fencing is best-effort hardening, and the
+            // status-guarded terminal writes still prevent corruption.
+            let run_result = match exec_repo_for_alert
+                .current_execution_epoch(execution_id)
+                .await
             {
+                Ok(Some(my_epoch)) => {
+                    talos_engine::fence::run_with_trigger_input_fenced(
+                        &mut engine,
+                        nats,
+                        worker_key,
+                        input_payload,
+                        execution_id,
+                        db_pool_for_fence,
+                        my_epoch,
+                    )
+                    .await
+                }
+                other => {
+                    if let Err(e) = other {
+                        tracing::warn!(
+                            execution_id = %execution_id,
+                            error = %e,
+                            "trigger: could not read epoch for fresh-run fence; running unfenced"
+                        );
+                    } else {
+                        tracing::warn!(
+                            execution_id = %execution_id,
+                            "trigger: execution row missing when reading epoch for fence; running unfenced"
+                        );
+                    }
+                    run_with_trigger_input_via_nats(
+                        &mut engine,
+                        nats,
+                        worker_key,
+                        input_payload,
+                        execution_id,
+                    )
+                    .await
+                }
+            };
+
+            match run_result {
                 Ok(wf_ctx) => {
                     let output_json = result_collector::collect_success_output(
                         &engine,
@@ -525,6 +570,19 @@ impl ExecutionOrchestrationService {
                             );
                         }
                     }
+                }
+                // F4 fresh-run fence (FU-1): a fence abort means a
+                // crash-recovery reclaim superseded this controller (the row's
+                // epoch advanced). Do NOT mark the row failed — it now belongs
+                // to the resumer, or a reclaim already failed it; clobbering it
+                // would corrupt the new owner's state. Just log and bow out,
+                // mirroring the resume path's `was_fenced` handling.
+                Err(ref e) if talos_engine::fence::was_fenced(e) => {
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        "trigger: fresh run fenced — superseded by a crash-recovery reclaim; \
+                         leaving the row to its new owner"
+                    );
                 }
                 Err(e) => {
                     let fail_output =

@@ -39,6 +39,7 @@ mod circuit_breaker;
 mod context;
 mod expose_fallback;
 mod host_impl;
+mod job_idempotency;
 mod metrics;
 mod metrics_server;
 mod runtime;
@@ -3144,6 +3145,21 @@ async fn main() -> anyhow::Result<()> {
     // but had zero callers.
     circuit_breaker::spawn_periodic_cleanup();
 
+    // FU-2 (R2-5): periodically sweep the job-idempotency cache so expired
+    // completed-result entries don't linger on a worker that goes idle.
+    // Read-path eviction handles active job_ids; this is the companion sweep
+    // (CLAUDE.md cache rule: TTL cache = read-path eviction + periodic sweep).
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+            crate::job_idempotency::SWEEP_INTERVAL_SECS,
+        ));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            crate::job_idempotency::JOB_RESULT_CACHE.sweep();
+        }
+    });
+
     // ========================================================================
     // NATS CONNECTION
     // ========================================================================
@@ -3450,6 +3466,34 @@ async fn main() -> anyhow::Result<()> {
                             );
 
                             tokio::task::spawn(async move {
+                                // FU-2 (R2-5) idempotency: a controller transport-retry re-sends
+                                // the same job_id (with a fresh nonce) AFTER the original
+                                // executed. Re-publish the cached signed result instead of
+                                // re-running the module (which would repeat side effects). The
+                                // cached result is still within the 300s JobResult freshness
+                                // window, so it's re-published as-is. dry_run jobs are never
+                                // cached (no side effects, cheap to re-run).
+                                if !req.dry_run {
+                                    if let Some(cached) =
+                                        crate::job_idempotency::JOB_RESULT_CACHE.get(req.job_id)
+                                    {
+                                        ::tracing::info!(
+                                            job_id = %req.job_id,
+                                            "idempotency: re-publishing cached result for re-seen \
+                                             job_id (transport retry); skipping re-execution"
+                                        );
+                                        if let Err(e) = publish_result_with_retry(
+                                            &nc_clone, &cached, 3, reply_to, &key_clone,
+                                        )
+                                        .await
+                                        {
+                                            ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to publish cached job result");
+                                        }
+                                        drop(permit);
+                                        return;
+                                    }
+                                }
+
                                 let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
 
                                 // L-11: bind worker identity for audit attribution.
@@ -3458,6 +3502,24 @@ async fn main() -> anyhow::Result<()> {
                                     worker_identity(),
                                 ) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign job result");
+                                }
+
+                                // FU-2: cache the SIGNED terminal result BEFORE publishing, so a
+                                // retry that arrives because the *reply* (not the execution)
+                                // failed still finds it. Keyed on job_id; bounded by TTL + size +
+                                // count (see `job_idempotency`).
+                                if !req.dry_run {
+                                    match serde_json::to_vec(&result) {
+                                        Ok(bytes) => crate::job_idempotency::JOB_RESULT_CACHE.put(
+                                            result.job_id,
+                                            result.clone(),
+                                            bytes.len(),
+                                        ),
+                                        Err(e) => ::tracing::warn!(
+                                            job_id = %result.job_id, error = %e,
+                                            "idempotency: could not serialize result for cache sizing; not caching"
+                                        ),
+                                    }
                                 }
 
                                 match result.status {
