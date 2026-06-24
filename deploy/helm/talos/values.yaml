@@ -27,12 +27,18 @@ global:
   namespace: "talos"
 
 # ----------------------------------------------------------------------------
-# In-cluster TLS — terminates TLS on the self-hosted NATS / Neo4j / Postgres
-# services so a RUST_ENV=production install boots through the controller's
+# In-cluster TLS — terminates TLS on the self-hosted NATS / Neo4j / Postgres /
+# Vault services so a RUST_ENV=production install boots through the controller's
 # fail-closed transmission-security gates (PR #243). When enabled the chart
 # generates a self-signed cert+key per in-cluster service (reused across
 # upgrades; see templates/tls/incluster-certs.yaml) and wires the clients to
-# TLS URLs (Postgres sslmode=require, Neo4j bolt+ssc://, NATS tls://).
+# TLS URLs (Postgres sslmode=require, Neo4j bolt+ssc://, NATS tls://, Vault
+# https:// with the controller verifying the cert via VAULT_CACERT). The Vault
+# leg encrypts the master-KEK wrap/unwrap traffic + the X-Vault-Token bearer,
+# which previously crossed the pod network in cleartext. NOTE: the in-cluster
+# Vault TLS leg was verified by `helm template` render only — see
+# docs/security/operational-runbook.md "In-cluster Vault TLS" for the live
+# post-deploy validation checklist before relying on it in production.
 # ----------------------------------------------------------------------------
 tls:
   inCluster:

@@ -70,8 +70,19 @@ spec:
               add: ["IPC_LOCK"]
               {{- end }}
           env:
+            # VAULT_ADDR for the IN-POD vault CLI (used by the vault-init Job's
+            # `kubectl exec ... vault ...` commands, which inherit this env).
+            # With in-cluster TLS this is the loopback HTTPS listener; the cert
+            # SAN is the service DNS, not 127.0.0.1, so the loopback CLI skips
+            # verification (a loopback hop can't be MITM'd). The CONTROLLER's
+            # remote connection is full-verify via VAULT_CACERT — see its
+            # deployment.
             - name: VAULT_ADDR
-              value: "http://0.0.0.0:8200"
+              value: {{ if .Values.tls.inCluster.enabled }}"https://127.0.0.1:8200"{{ else }}"http://0.0.0.0:8200"{{ end }}
+            {{- if .Values.tls.inCluster.enabled }}
+            - name: VAULT_SKIP_VERIFY
+              value: "true"
+            {{- end }}
             - name: SKIP_CHOWN
               value: "true"
             - name: SKIP_SETCAP
@@ -98,6 +109,11 @@ spec:
             httpGet:
               path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
               port: http
+              {{- if .Values.tls.inCluster.enabled }}
+              # The listener is TLS now; kubelet httpGet probes do NOT verify
+              # the server cert, so HTTPS works against the self-signed cert.
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 60
@@ -107,6 +123,9 @@ spec:
             httpGet:
               path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
               port: http
+              {{- if .Values.tls.inCluster.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
@@ -119,6 +138,15 @@ spec:
               mountPath: /vault/file
             - name: logs
               mountPath: /vault/logs
+            {{- if .Values.tls.inCluster.enabled }}
+            # In-transit TLS cert+key; vault.hcl points tls_cert_file /
+            # tls_key_file here. defaultMode 0640 + the chart-default fsGroup
+            # (10001, matching the vault uid 10001) lets the vault process read
+            # the key via group membership — same shape as the postgres mount.
+            - name: tls
+              mountPath: /vault/tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -126,6 +154,12 @@ spec:
         - name: logs
           emptyDir:
             sizeLimit: "256Mi"
+        {{- if .Values.tls.inCluster.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "talos.componentName" (list . "vault-tls") }}
+            defaultMode: 0640
+        {{- end }}
   {{- if .Values.vault.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:

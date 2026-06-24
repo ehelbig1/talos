@@ -97,6 +97,14 @@ spec:
               value: {{ include "talos.neo4jUri" . | quote }}
             - name: VAULT_ADDR
               value: {{ include "talos.vaultAddr" . | quote }}
+            {{- if and .Values.tls.inCluster.enabled .Values.vault.enabled }}
+            # Trust anchor for the in-cluster Vault's self-signed cert. The
+            # kek-provider adds this PEM as a root cert (full verification of the
+            # HTTPS VAULT_ADDR). Only set for the chart-bundled Vault; an
+            # external addrOverride Vault uses its own (public/operator) CA.
+            - name: VAULT_CACERT
+              value: /etc/talos/vault-ca/tls.crt
+            {{- end }}
             - name: AWS_ENDPOINT_URL
               value: {{ include "talos.minioEndpoint" . | quote }}
             - name: MINIO_ENDPOINT
@@ -277,6 +285,11 @@ spec:
               mountPath: /etc/talos/nats-ca
               readOnly: true
             {{- end }}
+            {{- if and .Values.tls.inCluster.enabled .Values.vault.enabled }}
+            - name: vault-ca
+              mountPath: /etc/talos/vault-ca
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -287,6 +300,16 @@ spec:
         - name: nats-ca
           secret:
             secretName: {{ include "talos.componentName" (list . "nats-tls") }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+        {{- end }}
+        {{- if and .Values.tls.inCluster.enabled .Values.vault.enabled }}
+        # Only the cert (the trust anchor) — never the key — is projected, so the
+        # controller can verify the in-cluster Vault's self-signed server cert.
+        - name: vault-ca
+          secret:
+            secretName: {{ include "talos.componentName" (list . "vault-tls") }}
             items:
               - key: tls.crt
                 path: tls.crt

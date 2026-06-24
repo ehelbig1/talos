@@ -134,10 +134,35 @@ impl VaultTransitProvider {
         // pool until DEFAULT_TIMEOUT_SECS fires. Sibling discipline to
         // the canonical talos-atlassian / talos-gmail / talos-slack
         // shape applied workspace-wide in this sweep.
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        // In-cluster TLS trust anchor. When `VAULT_ADDR` is `https://` against a
+        // self-signed in-cluster Vault (the Helm chart's bundled Vault), the
+        // server cert won't chain to a public root, so the operator points
+        // `VAULT_CACERT` at the mounted cert (the chart projects
+        // `<release>-vault-tls`'s `tls.crt` into the controller pod). We ADD it
+        // to the default roots (not replace) so an externally-managed Vault on a
+        // public CA still verifies. If `VAULT_CACERT` is set but unreadable /
+        // not PEM we FAIL CLOSED — silently falling back to system trust would
+        // just produce a confusing verification error at the first transit call
+        // (the master-KEK path), and a misconfigured trust anchor on the
+        // secrets layer must surface loudly at construction, not at request
+        // time. Unset → unchanged behavior (system trust).
+        if let Ok(ca_path) = std::env::var("VAULT_CACERT") {
+            let ca_path = ca_path.trim();
+            if !ca_path.is_empty() {
+                let pem = std::fs::read(ca_path).with_context(|| {
+                    format!("VAULT_CACERT is set ({ca_path}) but the file could not be read")
+                })?;
+                let cert = reqwest::Certificate::from_pem(&pem).with_context(|| {
+                    format!("VAULT_CACERT file ({ca_path}) is not a valid PEM certificate")
+                })?;
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        let client = builder
             .build()
             .context("failed to build Vault HTTP client")?;
         Ok(Self {

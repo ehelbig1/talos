@@ -540,6 +540,88 @@ the original repo's images pass verification on your fork's deploys.
 
 ---
 
+### 4.2 In-cluster Vault TLS — post-deploy validation (REQUIRED)
+
+> ⚠️ **CAVEAT — verified by `helm template` render only.** The in-cluster
+> Vault TLS leg (`tls.inCluster.enabled=true` with `vault.enabled=true`)
+> was authored and verified by chart rendering, **not** by a live cluster
+> deploy. It touches the most blast-radius-sensitive path in the system —
+> the master-KEK wrap/unwrap channel — so a wrong cert SAN, a file-permission
+> mismatch on the mounted key, or an init-Job TLS handshake failure would
+> manifest as the **controller failing its Vault health check at boot
+> (CrashLoopBackOff)**, not at render time. Run this checklist on a
+> **staging** cluster before enabling it in production, and again on the
+> first production rollout.
+
+**What changed (so you know what to inspect):**
+
+- The chart mints a `<release>-vault-tls` self-signed cert (SAN = the Vault
+  Service DNS) alongside the existing postgres/neo4j/nats certs.
+- Vault's listener flips to TLS (`tls_cert_file`/`tls_key_file` at
+  `/vault/tls`); `api_addr` and `VAULT_ADDR` become `https://`.
+- The controller verifies the cert via `VAULT_CACERT=/etc/talos/vault-ca/tls.crt`
+  (the kek-provider adds it as a root cert).
+- The in-pod Vault CLI + the vault-init Job talk to the **loopback** listener
+  with `VAULT_SKIP_VERIFY=true` (a loopback hop can't be MITM'd; the cert SAN
+  is the service name, not 127.0.0.1).
+
+**Validation steps:**
+
+```bash
+NS=talos   # your release namespace
+
+# 1. The cert Secret exists and is a real keypair (created by the pre-install hook).
+kubectl -n "$NS" get secret <release>-talos-vault-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -ext subjectAltName
+#    EXPECT: a cert whose SAN includes <release>-talos-vault.<NS>.svc.cluster.local
+
+# 2. Vault came up sealed-but-Ready over TLS (the readiness probe is HTTPS now).
+kubectl -n "$NS" get pod <release>-talos-vault-0      # EXPECT Running, READY 1/1 after vault-init
+kubectl -n "$NS" logs <release>-talos-vault-0 | grep -i 'listener\|tls'   # EXPECT a tcp listener with tls enabled, NO "tls: ... certificate" errors
+
+# 3. The vault-init Job completed (it speaks TLS-skip-verify to loopback).
+kubectl -n "$NS" logs job/<release>-talos-vault-init | tail -20          # EXPECT it unsealed + minted the talos-controller token, no TLS handshake errors
+
+# 4. THE decisive check — the controller's Vault transit health check passed.
+kubectl -n "$NS" logs deploy/<release>-talos-controller | grep -i vault
+#    EXPECT NO "Vault unreachable", NO "certificate verify failed", NO
+#    "VAULT_CACERT ... could not be read". A clean boot means the controller
+#    encrypted+decrypted against transit over TLS with full cert verification.
+
+# 5. Confirm encryption-at-rest still round-trips (the KEK path is live over TLS).
+make smoke BASE_URL=https://<your-host>     # Phase-B write→read with SMOKE_AGENT_TOKEN/SMOKE_ACTOR_ID
+```
+
+**If the controller CrashLoops with a Vault error:**
+
+- **`VAULT_CACERT ... could not be read` / `not a valid PEM`** — the
+  `vault-ca` volume didn't project `tls.crt`, or the path env is wrong.
+  Check the controller pod's `/etc/talos/vault-ca/tls.crt` and the
+  `<release>-talos-vault-tls` Secret's `tls.crt` key.
+- **`certificate verify failed` / `hostname mismatch`** — the cert SAN
+  doesn't match the `VAULT_ADDR` host. Confirm `VAULT_ADDR` resolves to the
+  Service DNS the cert was minted for (step 1).
+- **Vault pod itself crashes / "permission denied" reading the key** — the
+  `defaultMode: 0640` mount isn't group-readable by the Vault uid. Confirm
+  the pod's `fsGroup` (chart default 10001) matches `runAsUser: 10001`.
+- **init-Job hangs on `vault status`** — the loopback CLI isn't using
+  `VAULT_SKIP_VERIFY`. Confirm `VAULT_ADDR=https://127.0.0.1:8200` and
+  `VAULT_SKIP_VERIFY=true` are on the Vault StatefulSet env.
+
+**Rollback (fast):** set `tls.inCluster.enabled=false` and `helm upgrade`.
+Every in-cluster TLS leg (postgres/neo4j/nats/vault) reverts to plaintext
+together. NOTE: with `RUST_ENV=production` the controller's #243 gates then
+refuse plaintext NATS/Neo4j/Postgres — so a production rollback of *just*
+Vault TLS isn't possible via this toggle; if you must disable Vault TLS in
+prod, point `vault.enabled=false` at an externally-TLS-terminated Vault via
+`vault.addrOverride` instead.
+
+**Stricter posture:** the chart cert is self-signed (10-year). For
+cert-manager / an operator CA, replace the `<release>-talos-vault-tls`
+Secret contents (keep the name) and ensure the cert SAN still covers the
+Vault Service DNS.
+
+---
+
 ## 5. Monitoring + alerts to wire up
 
 The platform records useful signals — what's missing is the alerting
