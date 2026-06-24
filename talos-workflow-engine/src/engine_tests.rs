@@ -342,6 +342,111 @@ fn engine_default_sandbox_root_uses_function() {
 }
 
 #[test]
+fn unblock_child_on_failure_does_not_double_enqueue_early_ready_fanin() {
+    // R2-1 regression: two error-edge parents into one `JoinMode::Any` fan-in
+    // must enqueue the fan-in EXACTLY ONCE. Pre-fix the failure-path loop
+    // decremented + enqueued without removing the `pending` entry on the
+    // 0-transition, so the second parent's unblock re-enqueued the fan-in
+    // (and its whole downstream subgraph) — an exactly-once violation.
+    let mut engine = ParallelWorkflowEngine::new();
+    let p1 = Uuid::new_v4();
+    let p2 = Uuid::new_v4();
+    let fanin = Uuid::new_v4();
+    engine.add_node(p1, Some(Uuid::new_v4()), None, None);
+    engine.add_node(p2, Some(Uuid::new_v4()), None, None);
+    engine.add_node(
+        fanin,
+        None,
+        None,
+        Some(talos_workflow_engine_core::SystemNodeKind::FanIn {
+            join_mode: talos_workflow_engine_core::JoinMode::Any,
+            aggregation_expr: None,
+        }),
+    );
+    let p1_idx = engine.node_map[&p1];
+    let p2_idx = engine.node_map[&p2];
+    let fanin_idx = engine.node_map[&fanin];
+    for src in [p1_idx, p2_idx] {
+        engine.graph.add_edge(
+            src,
+            fanin_idx,
+            EdgeLogic {
+                source_handle: "output".to_string(),
+                target_handle: "input".to_string(),
+                mapping: None,
+                condition: None,
+                edge_type: "error".to_string(),
+            },
+        );
+    }
+
+    let mut pending: HashMap<NodeIndex, usize> = HashMap::new();
+    pending.insert(fanin_idx, 2); // two inbound parents
+    let mut ready: VecDeque<NodeIndex> = VecDeque::new();
+
+    // Both parents fail down the error edge (error-edge path applies early-ready).
+    engine.unblock_child_on_failure(fanin_idx, &mut pending, &mut ready, true);
+    engine.unblock_child_on_failure(fanin_idx, &mut pending, &mut ready, true);
+
+    assert_eq!(
+        ready.iter().filter(|&&n| n == fanin_idx).count(),
+        1,
+        "early-ready fan-in must be enqueued exactly once across two error-edge parents"
+    );
+    assert!(
+        !pending.contains_key(&fanin_idx),
+        "the fan-in's pending entry must be removed on the 0-transition so a late parent can't re-enter"
+    );
+}
+
+#[test]
+fn unblock_child_on_failure_removes_entry_on_all_join_zero_transition() {
+    // The continue_on_error path does NOT apply early-ready (All-style wait),
+    // but MUST still remove the entry on the genuine 0-transition so a later
+    // error-edge parent can't re-enqueue the child.
+    let mut engine = ParallelWorkflowEngine::new();
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    engine.add_node(parent, Some(Uuid::new_v4()), None, None);
+    engine.add_node(child, Some(Uuid::new_v4()), None, None);
+    let parent_idx = engine.node_map[&parent];
+    let child_idx = engine.node_map[&child];
+    engine.graph.add_edge(
+        parent_idx,
+        child_idx,
+        EdgeLogic {
+            source_handle: "output".to_string(),
+            target_handle: "input".to_string(),
+            mapping: None,
+            condition: None,
+            edge_type: Default::default(),
+        },
+    );
+
+    let mut pending: HashMap<NodeIndex, usize> = HashMap::new();
+    pending.insert(child_idx, 2);
+    let mut ready: VecDeque<NodeIndex> = VecDeque::new();
+
+    // First parent: 2 -> 1, not ready yet, not enqueued.
+    engine.unblock_child_on_failure(child_idx, &mut pending, &mut ready, false);
+    assert!(ready.is_empty(), "child must wait for the second parent");
+    assert_eq!(pending.get(&child_idx).copied(), Some(1));
+
+    // Second parent: 1 -> 0, enqueued once and entry removed.
+    engine.unblock_child_on_failure(child_idx, &mut pending, &mut ready, false);
+    assert_eq!(ready.iter().filter(|&&n| n == child_idx).count(), 1);
+    assert!(!pending.contains_key(&child_idx));
+
+    // A spurious third call (e.g. a late error-edge parent) must NOT re-enqueue.
+    engine.unblock_child_on_failure(child_idx, &mut pending, &mut ready, false);
+    assert_eq!(
+        ready.iter().filter(|&&n| n == child_idx).count(),
+        1,
+        "a late parent must not re-enqueue an already-released child"
+    );
+}
+
+#[test]
 fn wait_handler_returns_none_for_non_wait_nodes() {
     // Sanity check: try_dispatch_wait must short-circuit cleanly
     // for any other SystemNodeKind (and for plain module nodes).

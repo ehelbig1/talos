@@ -541,6 +541,30 @@ impl WebhookRouter {
         }
     }
 
+    /// Release a webhook dedup claim taken at arrival (R2-4 begin/abandon).
+    ///
+    /// `is_duplicate` atomically records the dedup key when the delivery
+    /// arrives (which correctly blocks two *concurrent* deliveries of the same
+    /// event from both running). But if processing then fails with a transient,
+    /// retryable error BEFORE the module/workflow actually runs, the sender's
+    /// redelivery would otherwise be suppressed as a "duplicate" and the
+    /// delivery silently lost for the whole window. Callers invoke this ONLY on
+    /// pre-execution failures so the claim is abandoned and the retry honored.
+    /// A claim for an event that actually ran is left recorded. Best-effort:
+    /// a release error is logged, not propagated (worst case reverts to the
+    /// pre-fix suppress-on-retry behavior).
+    async fn release_dedup_claim(&self, trigger_id: Uuid, claim: &Option<String>) {
+        if let (Some(dedup), Some(event_id)) = (&self.dedup, claim) {
+            if let Err(e) = dedup.release(trigger_id, event_id).await {
+                tracing::warn!(
+                    trigger_id = %trigger_id,
+                    "Failed to release webhook dedup claim after a pre-execution \
+                     failure; the sender's redelivery may be suppressed: {e}"
+                );
+            }
+        }
+    }
+
     /// Handle an incoming webhook request
     pub async fn handle_webhook(
         &self,
@@ -1022,6 +1046,12 @@ impl WebhookRouter {
         //    Event fingerprint = first recognizable signature header, else SHA-256 of body.
         //    Using the signature ensures that retries with the same payload are suppressed
         //    without false-positives for intentionally repeated payloads with different content.
+        //
+        // R2-4: `Some(event_id)` once we've taken (recorded) a dedup claim, so a
+        // PRE-EXECUTION failure below can release it (begin/abandon) and let the
+        // sender retry instead of being suppressed as a duplicate. Stays `None`
+        // when no dedup backend is configured or the claim wasn't taken.
+        let mut dedup_claim: Option<String> = None;
         if let Some(ref dedup) = self.dedup {
             let raw_event_id: String = headers
                 .get("x-signature")
@@ -1077,7 +1107,11 @@ impl WebhookRouter {
                     // Return 200 so the sender does not retry; log at INFO not WARN.
                     return Ok((StatusCode::OK, "OK").into_response());
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    // Claim recorded — track it so a pre-execution failure can
+                    // abandon it (R2-4).
+                    dedup_claim = Some(event_id.clone());
+                }
                 Err(e) => {
                     // Dedup backend errored (e.g. Redis down). For GitHub-format
                     // webhooks this is NOT safe to continue through: the GitHub
@@ -1151,6 +1185,9 @@ impl WebhookRouter {
                         Some(&format!("Failed to load module: {}", e)),
                     )
                     .await;
+                    // R2-4: transient pre-execution failure — the module never
+                    // ran, so abandon the dedup claim and let the sender retry.
+                    self.release_dedup_claim(trigger_id, &dedup_claim).await;
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
                         .into_response());
                 }
@@ -1183,6 +1220,9 @@ impl WebhookRouter {
                         Some(&format!("Failed to get module config: {}", e)),
                     )
                     .await;
+                    // R2-4: transient pre-execution failure — the module never
+                    // ran, so abandon the dedup claim and let the sender retry.
+                    self.release_dedup_claim(trigger_id, &dedup_claim).await;
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
                         .into_response());
                 }
@@ -1601,6 +1641,18 @@ impl WebhookRouter {
             }
         } else if let Some(workflow_id) = trigger.workflow_id {
             // Workflow Trigger Path
+            //
+            // R2-4 note: unlike the module path above, this path does NOT
+            // release the dedup claim on failure. `trigger_workflow_execution`
+            // conflates pre-dispatch failures (workflow-not-found, setup error)
+            // with post-spawn outcomes — in sync mode it returns 5xx/504 AFTER
+            // the engine has started running in the background — so a
+            // status-based release here would risk double-executing a workflow
+            // that already had side effects. The dominant pre-dispatch failure
+            // (workflow not found) is permanent and wouldn't benefit from a
+            // retry anyway. Releasing on the rare transient pre-dispatch DB
+            // error would require threading the claim into the spawn boundary;
+            // tracked as a follow-up rather than risk the double-run regression.
             let body_str = std::str::from_utf8(&body).unwrap_or("");
             let input_payload = serde_json::from_str::<serde_json::Value>(body_str)
                 .unwrap_or(serde_json::Value::String(body_str.to_string()));

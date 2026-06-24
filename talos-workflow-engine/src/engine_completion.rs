@@ -416,6 +416,46 @@ impl ParallelWorkflowEngine {
         }
     }
 
+    /// Decrement a child's pending-parent counter on a FAILURE-path unblock
+    /// (error-edge or `continue_on_error`) and enqueue it to `ready` exactly
+    /// once when the join is satisfied.
+    ///
+    /// This mirrors the zero-transition discipline in `handle_node_success`
+    /// (see the removal note there): on the 0-transition the child's `pending`
+    /// entry is REMOVED so that a parent which completes LATER — possible under
+    /// the `Any`/`N`/`Majority` early-ready join modes, which zero the counter
+    /// before every parent finishes — cannot re-enter and re-enqueue the child,
+    /// double-dispatching its entire downstream subgraph. Termination keys on
+    /// `ready`/`executing`, not `pending`, so early removal is safe.
+    ///
+    /// Before this helper the two failure loops decremented + enqueued WITHOUT
+    /// the removal, so two error-edge parents into one early-ready fan-in (or a
+    /// `continue_on_error` parent leaving the entry at 0 for a later error-edge
+    /// parent) double-enqueued the fan-in — an exactly-once violation reachable
+    /// purely in-process. `apply_early_ready` matches the per-branch behavior:
+    /// the error-edge path applies early-ready (like success); the
+    /// `continue_on_error` path historically does not.
+    pub(crate) fn unblock_child_on_failure(
+        &self,
+        child: NodeIndex,
+        pending: &mut HashMap<NodeIndex, usize>,
+        ready: &mut VecDeque<NodeIndex>,
+        apply_early_ready: bool,
+    ) {
+        if let Some(cnt) = pending.get_mut(&child) {
+            if *cnt > 0 {
+                *cnt -= 1;
+            }
+            if apply_early_ready {
+                self.apply_fan_in_early_ready(child, pending);
+            }
+            if pending.get(&child).copied().unwrap_or(1) == 0 {
+                pending.remove(&child);
+                ready.push_back(child);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_node_failure(
         &self,
@@ -515,15 +555,9 @@ impl ParallelWorkflowEngine {
                     continue;
                 }
 
-                if let Some(cnt) = pending.get_mut(&child) {
-                    if *cnt > 0 {
-                        *cnt -= 1;
-                    }
-                    self.apply_fan_in_early_ready(child, pending);
-                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                        ready.push_back(child);
-                    }
-                }
+                // error-edge unblock: apply early-ready (same as the success
+                // path) and remove on the 0-transition to prevent re-enqueue.
+                self.unblock_child_on_failure(child, pending, ready, true);
             }
             return Ok(());
         }
@@ -554,14 +588,10 @@ impl ParallelWorkflowEngine {
                 .graph
                 .neighbors_directed(finished_idx, Direction::Outgoing)
             {
-                if let Some(cnt) = pending.get_mut(&child) {
-                    if *cnt > 0 {
-                        *cnt -= 1;
-                    }
-                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                        ready.push_back(child);
-                    }
-                }
+                // continue_on_error unblock: historically does NOT apply
+                // early-ready, but MUST still remove on the 0-transition so a
+                // later error-edge parent can't re-enqueue the child.
+                self.unblock_child_on_failure(child, pending, ready, false);
             }
             return Ok(());
         }
