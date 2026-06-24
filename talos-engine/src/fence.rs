@@ -40,12 +40,15 @@
 //!
 //! ## Remaining unfenced fresh-run sites
 //!
-//! The inbound-webhook ASYNC path (`talos-webhooks`, `auto_respond=false`) is
-//! also fenced; the webhook SYNC path is intentionally not (bounded by
-//! `sync_timeout` ≤120s, under the stale window, and a reclaim there would abort
-//! the inline run the caller is waiting on).
+//! The inbound-webhook paths are NOT fenced. The SYNC path (`auto_respond=true`)
+//! is bounded by `sync_timeout` (≤120s, under the stale window), and a reclaim
+//! there would abort the inline run the caller is waiting on. The ASYNC path
+//! creates its row as `Queued` and never marks it `running`, and crash recovery
+//! only reclaims `running` rows — so a webhook async run is never reclaimed,
+//! there is never a resumer, and there is no split-brain for a fence to close
+//! (a fence there would be inert and unnecessary).
 //!
-//! Other `run_with_trigger_input_via_nats` call sites still dispatch WITHOUT a
+//! Other `run_with_trigger_input_via_nats` call sites also dispatch WITHOUT a
 //! fence: `retry.rs`, `replay.rs`, continuation/approval resume
 //! (`talos-continuation-trigger`), the MCP trigger handlers
 //! (`talos-mcp-handlers`), and the GraphQL `triggerWorkflow` mutation
@@ -78,6 +81,20 @@ use crate::nats_run::{run_with_seed_via_nats, run_with_trigger_input_via_nats};
 /// enough that the single-row primary-key lookup is negligible load.
 const FENCE_HEARTBEAT_SECS: u64 = 10;
 
+/// Aborts a spawned heartbeat task when dropped — including on a panic unwind
+/// of the run future. Manually reaping the heartbeat after `run(...).await`
+/// (the old `token.cancel(); heartbeat.await`) is skipped if the run PANICS,
+/// orphaning a task that polls the DB every tick forever. A drop guard reaps it
+/// on every exit path. `abort()` is safe for the heartbeat: it's a stateless
+/// poll loop, so a forced cancel at its next await point leaks nothing.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Run a crash-recovery resume under an epoch fence.
 ///
 /// Sets a [`CancellationToken`] on `engine`, spawns a heartbeat that aborts the
@@ -99,12 +116,13 @@ pub async fn run_with_seed_fenced(
     let token = CancellationToken::new();
     engine.set_cancellation_token(Some(token.clone()));
 
-    let heartbeat = tokio::spawn(epoch_fence_heartbeat(
+    // Reaped on EVERY exit (return or panic) via the drop guard — see AbortOnDrop.
+    let _heartbeat = AbortOnDrop(tokio::spawn(epoch_fence_heartbeat(
         pool,
         execution_id,
         my_epoch,
         token.clone(),
-    ));
+    )));
 
     let result = run_with_seed_via_nats(
         engine,
@@ -115,11 +133,8 @@ pub async fn run_with_seed_fenced(
     )
     .await;
 
-    // Stop the heartbeat (idempotent — it may have already cancelled to abort
-    // a fenced run) and reap the task so it can't outlive the resume.
-    token.cancel();
-    let _ = heartbeat.await;
-
+    // `_heartbeat`'s drop aborts the task here (and on a panic unwind). No manual
+    // `token.cancel()` needed — abort stops the poll loop.
     result
 }
 
@@ -156,12 +171,13 @@ pub async fn run_with_trigger_input_fenced(
     let token = CancellationToken::new();
     engine.set_cancellation_token(Some(token.clone()));
 
-    let heartbeat = tokio::spawn(epoch_fence_heartbeat(
+    // Reaped on EVERY exit (return or panic) via the drop guard — see AbortOnDrop.
+    let _heartbeat = AbortOnDrop(tokio::spawn(epoch_fence_heartbeat(
         pool,
         execution_id,
         my_epoch,
         token.clone(),
-    ));
+    )));
 
     let result = run_with_trigger_input_via_nats(
         engine,
@@ -172,11 +188,7 @@ pub async fn run_with_trigger_input_fenced(
     )
     .await;
 
-    // Stop the heartbeat (idempotent — it may have already cancelled to abort a
-    // fenced run) and reap the task so it can't outlive the run.
-    token.cancel();
-    let _ = heartbeat.await;
-
+    // `_heartbeat`'s drop aborts the task here (and on a panic unwind).
     result
 }
 

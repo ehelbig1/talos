@@ -3474,7 +3474,23 @@ async fn main() -> anyhow::Result<()> {
                                 // cached result is still within the 300s JobResult freshness
                                 // window, so it's re-published as-is. dry_run jobs are never
                                 // cached (no side effects, cheap to re-run).
-                                if !req.dry_run {
+                                //
+                                // SECURITY (self-review fix): the cache must ONLY be consulted
+                                // for an AUTHENTICATED request. `execute_job` verifies the
+                                // request HMAC, but it runs AFTER this cache check — so without
+                                // gating here, an on-NATS attacker could send an unsigned
+                                // JobRequest with a known (non-secret) job_id and exfiltrate the
+                                // cached signed result to an attacker-chosen reply inbox,
+                                // bypassing the "no result leaves the worker without a valid
+                                // HMAC" invariant. We pre-verify with the NO-REPLAY variant
+                                // (HMAC + freshness, but NOT the nonce cache) so the cache-miss
+                                // path's `execute_job` → `verify_with_ring` still records the
+                                // nonce exactly once. A forged request fails this pre-check and
+                                // falls through to `execute_job`, which returns the signed
+                                // verification-failure diagnostic without running the module.
+                                let request_authentic =
+                                    req.verify_no_replay_with_ring(&key_clone, 300).is_ok();
+                                if request_authentic && !req.dry_run {
                                     if let Some(cached) =
                                         crate::job_idempotency::JOB_RESULT_CACHE.get(req.job_id)
                                     {
@@ -3624,9 +3640,20 @@ async fn main() -> anyhow::Result<()> {
                                 // the pipeline (which would repeat every step's side effects). The
                                 // bytes are still within the 300s JobResult freshness window, so
                                 // they're re-published as-is. (PipelineJobRequest has no dry_run.)
-                                if let Some(cached) =
-                                    crate::job_idempotency::PIPELINE_PAYLOAD_CACHE.get(req.job_id)
-                                {
+                                //
+                                // SECURITY (self-review fix): only an AUTHENTICATED request may
+                                // consult the cache — otherwise an on-NATS attacker could
+                                // exfiltrate a cached signed pipeline result to an attacker-chosen
+                                // inbox with an unsigned request carrying a known job_id. Pre-verify
+                                // with the NO-REPLAY variant (so the miss-path's full verify still
+                                // records the nonce once); a forged request falls through to
+                                // execute_pipeline_job, which returns a signed verification failure.
+                                let request_authentic =
+                                    req.verify_no_replay_with_ring(&key_clone, 300).is_ok();
+                                if request_authentic {
+                                    if let Some(cached) =
+                                        crate::job_idempotency::PIPELINE_PAYLOAD_CACHE.get(req.job_id)
+                                    {
                                     ::tracing::info!(
                                         job_id = %req.job_id,
                                         "idempotency: re-publishing cached pipeline result for \
@@ -3644,6 +3671,7 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                     drop(permit);
                                     return;
+                                    }
                                 }
 
                                 let mut result =

@@ -121,6 +121,15 @@ pub struct CircuitBreaker {
     /// still-recovering downstream (thundering herd). Reset to 0 on each
     /// Open→HalfOpen transition; capped at `success_threshold` admissions.
     half_open_probes: Arc<RwLock<u32>>,
+    /// When the current half-open probe budget was last (re)armed. Lets the
+    /// half-open state SELF-HEAL: if all admitted probes were dropped before
+    /// reporting (caller cancelled / timed out the operation, so neither
+    /// `record_success` nor `record_failure` ran), the state would otherwise
+    /// stay HalfOpen with the budget exhausted forever — `allow()` returning
+    /// `false` for ALL traffic with no recovery path. After `reset_timeout`
+    /// with no state change, `allow()` re-arms (admits a fresh probe), the same
+    /// "give recovery another chance" cadence the Open→HalfOpen transition uses.
+    half_open_armed_at: Arc<RwLock<Option<Instant>>>,
 }
 
 impl Clone for CircuitBreaker {
@@ -141,6 +150,7 @@ impl Clone for CircuitBreaker {
             success_count: self.success_count.clone(),
             last_failure_time: self.last_failure_time.clone(),
             half_open_probes: self.half_open_probes.clone(),
+            half_open_armed_at: self.half_open_armed_at.clone(),
         }
     }
 }
@@ -155,6 +165,7 @@ impl CircuitBreaker {
             success_count: Arc::new(RwLock::new(0)),
             last_failure_time: Arc::new(RwLock::new(None)),
             half_open_probes: Arc::new(RwLock::new(0)),
+            half_open_armed_at: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -191,6 +202,7 @@ impl CircuitBreaker {
                     // the probe budget at 1 so the cap below is enforced from
                     // the very next concurrent request.
                     *self.half_open_probes.write().await = 1;
+                    *self.half_open_armed_at.write().await = Some(Instant::now());
                     true
                 } else {
                     false
@@ -205,11 +217,27 @@ impl CircuitBreaker {
                 // load onto a downstream that's still proving itself.
                 let cap = self.config.success_threshold.max(1);
                 let mut admitted = self.half_open_probes.write().await;
-                if *admitted >= cap {
-                    false
-                } else {
+                if *admitted < cap {
                     *admitted += 1;
+                    return true;
+                }
+                // Budget spent. SELF-HEAL: if the admitted probes never reported
+                // (dropped/cancelled before record_success|failure) the state
+                // would wedge in HalfOpen forever, failing ALL traffic. After
+                // `reset_timeout` with no state change, re-arm and admit a fresh
+                // probe — the same recovery cadence as the Open→HalfOpen gate.
+                let armed_at = *self.half_open_armed_at.read().await;
+                let stale = armed_at.is_none_or(|t| t.elapsed() >= self.config.reset_timeout);
+                if stale {
+                    tracing::info!(
+                        service = %self.config.name,
+                        "Circuit breaker half-open probe budget stale — re-arming a recovery probe"
+                    );
+                    *admitted = 1;
+                    *self.half_open_armed_at.write().await = Some(Instant::now());
                     true
+                } else {
+                    false
                 }
             }
         }
@@ -481,6 +509,43 @@ mod tests {
         breaker.record_success().await;
         breaker.record_success().await;
         assert_eq!(breaker.state().await, CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn half_open_rearms_when_probes_never_report() {
+        // Self-heal regression: if all admitted half-open probes are dropped
+        // (never call record_success/failure), the circuit must NOT wedge —
+        // after reset_timeout it re-arms and admits a fresh probe.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            reset_timeout: Duration::from_millis(50),
+            success_threshold: 2,
+            name: "test-rearm".to_string(),
+        };
+        let breaker = CircuitBreaker::new(config);
+
+        breaker.record_failure().await; // open
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Enter half-open + spend the whole probe budget, then nothing reports.
+        assert!(breaker.allow().await); // probe 1 (enters half-open)
+        assert!(breaker.allow().await); // probe 2 (budget == success_threshold)
+        assert!(
+            !breaker.allow().await,
+            "budget spent → fail fast immediately"
+        );
+        assert_eq!(breaker.state().await, CircuitState::HalfOpen);
+
+        // Before reset_timeout elapses, still denied (no premature re-arm).
+        assert!(!breaker.allow().await);
+
+        // After reset_timeout with no state change, re-arm admits a fresh probe.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            breaker.allow().await,
+            "stale half-open budget must re-arm so the circuit can recover"
+        );
+        assert_eq!(breaker.state().await, CircuitState::HalfOpen);
     }
 
     #[tokio::test]
