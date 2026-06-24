@@ -1079,28 +1079,79 @@ async fn run_scheduled_execution(
     .await;
 
     let wsk_for_checkpoint = worker_shared_key.clone();
+
+    // FU-1 fresh-run fence extended to the scheduler (the remaining-sites
+    // follow-up): scheduled executions are long-lived `running` rows — the most
+    // likely to outlast the stale window and be reclaimed by crash-recovery
+    // while the scheduler is still dispatching, the exact split-brain the epoch
+    // fence closes. Observe the row's ACTUAL current epoch — passing a wrong
+    // value would abort a healthy run on the first heartbeat tick (a silent
+    // lost execution); on an epoch-read failure we fall back to the unfenced
+    // path (fencing is best-effort hardening, and the status-guarded terminal
+    // writes still prevent corruption). Both the Fresh (trigger-input) and
+    // Resume (seed) dispatches are fenced.
+    let fence_epoch = talos_execution_repository::ExecutionRepository::new(db_pool.clone())
+        .current_execution_epoch(execution_id)
+        .await
+        .ok()
+        .flatten();
+    if fence_epoch.is_none() {
+        tracing::warn!(
+            execution_id = %execution_id,
+            "Scheduler: could not read epoch for fresh-run fence; running unfenced"
+        );
+    }
+
     // See `SchedulerDispatch` for the rationale that pins this decision.
     let run_result = match SchedulerDispatch::for_run(initial_results) {
-        SchedulerDispatch::Fresh { trigger_input } => {
-            talos_engine::nats_run::run_with_trigger_input_via_nats(
-                &mut engine,
-                nats_client,
-                worker_shared_key,
-                trigger_input,
-                execution_id,
-            )
-            .await
-        }
-        SchedulerDispatch::Resume { initial_results } => {
-            talos_engine::nats_run::run_with_seed_via_nats(
-                &engine,
-                nats_client,
-                worker_shared_key,
-                initial_results,
-                execution_id,
-            )
-            .await
-        }
+        SchedulerDispatch::Fresh { trigger_input } => match fence_epoch {
+            Some(epoch) => {
+                talos_engine::fence::run_with_trigger_input_fenced(
+                    &mut engine,
+                    nats_client,
+                    worker_shared_key,
+                    trigger_input,
+                    execution_id,
+                    db_pool.clone(),
+                    epoch,
+                )
+                .await
+            }
+            None => {
+                talos_engine::nats_run::run_with_trigger_input_via_nats(
+                    &mut engine,
+                    nats_client,
+                    worker_shared_key,
+                    trigger_input,
+                    execution_id,
+                )
+                .await
+            }
+        },
+        SchedulerDispatch::Resume { initial_results } => match fence_epoch {
+            Some(epoch) => {
+                talos_engine::fence::run_with_seed_fenced(
+                    &mut engine,
+                    nats_client,
+                    worker_shared_key,
+                    initial_results,
+                    execution_id,
+                    db_pool.clone(),
+                    epoch,
+                )
+                .await
+            }
+            None => {
+                talos_engine::nats_run::run_with_seed_via_nats(
+                    &engine,
+                    nats_client,
+                    worker_shared_key,
+                    initial_results,
+                    execution_id,
+                )
+                .await
+            }
+        },
     };
     match run_result {
         Ok(ctx) => {
@@ -1200,6 +1251,21 @@ async fn run_scheduled_execution(
                 execution_id = %execution_id,
                 schedule_id = %schedule_id,
                 "Scheduled workflow execution completed"
+            );
+        }
+        Err(e) if talos_engine::fence::was_fenced(&e) => {
+            // FU-1 fence: a fence abort means crash-recovery reclaimed this
+            // scheduled run (the row's epoch advanced) — it now belongs to the
+            // resumer (or a reclaim already failed it). Do NOT mark it failed:
+            // the status-guarded UPDATE below would no-op anyway, but bailing
+            // here also skips the failure broadcast/alerts for a run this
+            // controller no longer owns. Mirrors the trigger.rs / crash_recovery
+            // `was_fenced` handling.
+            tracing::warn!(
+                execution_id = %execution_id,
+                schedule_id = %schedule_id,
+                "Scheduler: run fenced — superseded by a crash-recovery reclaim; \
+                 leaving the row to its new owner"
             );
         }
         Err(e) => {
