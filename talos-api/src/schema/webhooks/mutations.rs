@@ -429,7 +429,10 @@ impl WebhooksMutations {
         // backstops the ownership JOIN (the gate is `w.user_id = $2`).
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let row: DlqRow = sqlx::query_as::<_, DlqRow>(
             "SELECT d.execution_id, d.replayed_at \
              FROM dead_letter_queue d \
@@ -444,9 +447,10 @@ impl WebhooksMutations {
         .ok_or_else(|| {
             async_graphql::Error::new("DLQ entry not found or access denied").extend_safe()
         })?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         if row.replayed_at.is_some() {
             return Err(async_graphql::Error::new("Entry has already been replayed").extend_safe());

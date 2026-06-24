@@ -6527,6 +6527,7 @@ async fn oauth_login_handler(
     axum::extract::Path(provider): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<OAuthLoginQuery>,
     Extension(oauth_service): Extension<std::sync::Arc<OAuthService>>,
+    cookies: tower_cookies::Cookies,
 ) -> Result<impl axum::response::IntoResponse, (axum::http::StatusCode, String)> {
     use axum::response::Redirect;
 
@@ -6555,7 +6556,7 @@ async fn oauth_login_handler(
     // extend the same discipline to the controller's
     // `/auth/oauth/{provider}/login` initiator.
     let provider_for_log = format!("{:?}", provider);
-    let (auth_url, _csrf_token) = oauth_service
+    let (auth_url, _csrf_token, session_nonce) = oauth_service
         .get_authorization_url(provider, extra_scopes)
         .await
         .map_err(|e| {
@@ -6570,8 +6571,18 @@ async fn oauth_login_handler(
             )
         })?;
 
-    // Store CSRF token in session/cookie (for production, implement CSRF validation)
-    // For now, redirect to OAuth provider
+    // S1 (login-CSRF / session-fixation defense): bind the OAuth `state`
+    // nonce to THIS browser. `get_authorization_url` persisted only the
+    // SHA-256 of `session_nonce`; we hand the plaintext back to the browser
+    // as an HttpOnly cookie and require it to match on the callback
+    // (`handle_callback` → `validate_state_token`). Without this, a valid
+    // `state` proves only "Talos issued this URL", not "issued to this
+    // browser" — the classic OAuth login-CSRF hole. Cookie attributes are
+    // centralised in talos-api so the REST + GraphQL login paths stay in
+    // lockstep (see `set_oauth_session_binding_cookie`).
+    talos_api::schema::auth::set_oauth_session_binding_cookie(&cookies, &session_nonce);
+
+    // Redirect to OAuth provider.
     Ok(Redirect::temporary(&auth_url))
 }
 
@@ -6629,9 +6640,26 @@ async fn oauth_callback_handler(
 
     let state = params.get("state").map(|s| s.to_string());
 
+    // S1: read the browser-session binding cookie set at login time. The
+    // callback consume path requires it to match the hash stored alongside
+    // the `state` row (login-CSRF defense). Legacy state rows with a NULL
+    // binding hash skip the check, so an in-flight login started before this
+    // change still completes. Clear the cookie regardless — it's single-use.
+    let session_binding = cookies
+        .get(talos_api::schema::auth::OAUTH_SESSION_BINDING_COOKIE)
+        .map(|c| c.value().to_string());
+    if session_binding.is_some() {
+        talos_api::schema::auth::clear_oauth_session_binding_cookie(&cookies);
+    }
+
     // Handle OAuth callback with CSRF validation
     let user_info = match oauth_service
-        .handle_callback(provider_enum.clone(), code.to_string(), state)
+        .handle_callback(
+            provider_enum.clone(),
+            code.to_string(),
+            state,
+            session_binding.as_deref(),
+        )
         .await
     {
         Ok(info) => info,

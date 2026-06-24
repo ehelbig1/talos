@@ -39,7 +39,7 @@ impl ParallelWorkflowEngine {
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         inputs: JsonValue,
-        accumulated_snapshot: Option<JsonValue>,
+        accumulated_snapshot: Option<Arc<JsonValue>>,
         trigger_input: Option<JsonValue>,
         _execution_sandbox: Option<Arc<cap_std::fs::Dir>>,
     ) -> (NodeIndex, Result<JsonValue, String>) {
@@ -175,7 +175,11 @@ impl ParallelWorkflowEngine {
                 merged.insert("input".to_string(), inputs.clone());
             }
             if let Some(acc) = &accumulated_snapshot {
-                merged.insert("__accumulated__".to_string(), acc.clone());
+                // Deep-clone the shared snapshot only here, at the single point
+                // it is materialized into the dispatched envelope. The snapshot
+                // itself was built once per node-step and shared by `Arc` across
+                // every concurrent in-flight dispatch.
+                merged.insert("__accumulated__".to_string(), (**acc).clone());
             }
             if let Some(ref ctx) = self.actor_context {
                 merged.insert("__actor_context__".to_string(), ctx.clone());

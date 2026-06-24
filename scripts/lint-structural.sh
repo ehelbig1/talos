@@ -2021,6 +2021,18 @@ bold "▶ check 25: bare-pool queries on RLS tables in talos-api/src/schema"
 # shape. The ~22-PR S2/S3 conversion reduced this to ZERO; the lint freezes
 # it so new code can't silently regress.
 #
+# Executor-match widening (2026-06-23): the original executor pattern only
+# matched the by-value `(db_pool|pool|&self.db_pool)` forms and was BLIND to
+# the `&`-borrowed shapes — `.execute(&db_pool)` / `.fetch_one(&pool)` /
+# `.fetch_all(& self.db_pool)` — which are the dominant
+# `sqlx::query(...).execute(&db_pool)` idiom and run on the bare pool just
+# the same (RLS is an equal no-op). The grep pattern below makes the leading
+# `&`/whitespace optional and folds `self.` into an optional prefix so
+# `&db_pool`, `&pool`, and the `& self.db_pool` spacing variant are all
+# caught, while `conn_pool` / `pool_handle` / `&mut *tx` stay out (the `(`
+# must be immediately followed by `&?[[:space:]]*(self\.)?` then exactly
+# `db_pool` or `pool`).
+#
 # Opt out — for a query that MUST run unscoped (a genuine cross-tenant
 # platform-admin op, or an internal cross-cutting reader whose
 # authorization is established upstream) — with `// allow-bare-pool-rls:
@@ -2046,7 +2058,19 @@ if [ -d talos-api/src/schema ]; then
         printf '  %s:%s — bare-pool executor on an RLS-table query [%s]\n' \
             "$file" "$lineno" "$tbl"
         BARE_POOL_RLS_VIOLATIONS=$((BARE_POOL_RLS_VIOLATIONS + 1))
-    done < <(grep -rnE '\.(fetch_optional|fetch_one|fetch_all|execute)\((db_pool|pool|&self\.db_pool)\)' \
+        # Executor-match pattern (2026-06-23): an `&`/whitespace-prefixed
+        # borrow of the pool — `.execute(&db_pool)`, `.fetch_one(&pool)`,
+        # `.fetch_all(& self.db_pool)` — runs on the bare pool just like the
+        # by-value `db_pool` form, so RLS is an equal no-op for it. The
+        # original pattern only matched `(db_pool|pool|&self.db_pool)` and was
+        # blind to the `&db_pool` / `&pool` borrow shapes that dominate the
+        # `sqlx::query(...).execute(&db_pool)` idiom. The leading
+        # `&?[[:space:]]*` makes the borrow optional and tolerates the
+        # `& self.db_pool` spacing variant. `db_pool` is matched with a
+        # word-boundary-ish prefix so `&self.db_pool` collapses into the same
+        # alternative (the `self\.` is optional) without also matching unrelated
+        # identifiers like `conn_pool`.
+    done < <(grep -rnE '\.(fetch_optional|fetch_one|fetch_all|execute)\(&?[[:space:]]*(self\.)?(db_pool|pool)\)' \
         talos-api/src/schema 2>/dev/null || true)
 fi
 
@@ -2732,8 +2756,8 @@ bold "▶ check 38: allow_wasi_network grants must gate on max_llm_tier (tier-1 
 # `&& !matches!(max_llm_tier, ...LlmTier::Tier1)` to the `allow_wasi_network` grant.
 # This freezes it: every `allow_wasi_network = ...` grant must reference
 # `max_llm_tier`, or carry an `allow-wasi-network-no-tier:` opt-out within 5 lines
-# above (the Tier2-default sandbox / test / dead-code paths that have no actor tier
-# param — run_sandbox, test_module, execute_hybrid).
+# above (the Tier2-default sandbox / test paths that have no actor tier
+# param — run_sandbox, test_module).
 
 WASI_TIER_VIOLATIONS=0
 if [ -n "$RG_BIN" ]; then

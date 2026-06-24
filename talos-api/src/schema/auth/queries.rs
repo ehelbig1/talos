@@ -96,13 +96,28 @@ impl AuthQueries {
             );
         }
 
-        let (auth_url, _csrf_token) = oauth_service
+        let (auth_url, _csrf_token, session_nonce) = oauth_service
             .get_authorization_url(provider_enum, None)
             .await
             .map_err(|e| {
                 tracing::error!("Failed to generate auth URL: {}", e);
                 async_graphql::Error::new("Failed to generate auth URL").extend_safe()
             })?;
+
+        // S1 (login-CSRF defense): bind the `state` nonce to this browser by
+        // setting the session-binding cookie that the REST callback requires.
+        // Without it, a GraphQL-initiated login would always hit the new
+        // "missing binding cookie" rejection on callback. The Cookies jar is
+        // injected into the GraphQL context (same path `set_session_cookies`
+        // uses in the auth mutations). If absent (non-HTTP context), the
+        // login falls back to a legacy unbound flow on the callback.
+        if let Ok(cookies) = ctx.data::<tower_cookies::Cookies>() {
+            super::set_oauth_session_binding_cookie(cookies, &session_nonce);
+        } else {
+            tracing::warn!(
+                "oauth_login_url: no Cookies in context; state nonce not bound to session"
+            );
+        }
 
         Ok(OAuthAuthUrl { auth_url, provider })
     }

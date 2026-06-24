@@ -644,6 +644,23 @@ pub struct ParallelWorkflowEngine {
     /// round-trip when the module was pre-loaded while a slow predecessor was executing.
     pub(crate) module_prefetch_cache:
         Arc<dashmap::DashMap<Uuid, talos_workflow_engine_core::WasmModuleArtifact>>,
+    /// Per-execution module-artifact cache, keyed by **resolved `module_id`**.
+    ///
+    /// Module bytes (and the rest of [`WasmModuleArtifact`]) are run-invariant:
+    /// a workflow that reuses the same module across M nodes / branches would
+    /// otherwise issue M identical full-`wasm_bytes`-blob SELECTs against
+    /// Postgres per run (see `talos_registry::Registry::get_module`). This cache
+    /// memoizes the fetched artifact for the lifetime of THIS engine instance so
+    /// the blob is loaded at most once per distinct module per execution.
+    ///
+    /// Scoping: a fresh `ParallelWorkflowEngine` is built per execution (and per
+    /// sub-workflow via `execute_subworkflow_graph`), so this `DashMap` never
+    /// outlives a single run — there is no cross-execution leakage. Keyed on the
+    /// resolved `module_id` (which the fetcher returns stably and which encodes
+    /// the module's identity/version), so a node pointing at a different module
+    /// version resolves to a different key and never reuses stale bytes.
+    pub(crate) module_artifact_cache:
+        Arc<dashmap::DashMap<Uuid, Arc<talos_workflow_engine_core::WasmModuleArtifact>>>,
     /// Pre-fetched sub-workflow graphs, keyed by `workflow_id`.
     /// Populated at execution start to avoid N+1 queries during node dispatch.
     /// Workflows referenced by `SubWorkflow`, `AgentLoop`, Ensemble, Judge,
@@ -950,6 +967,7 @@ impl ParallelWorkflowEngine {
             max_llm_tier: talos_workflow_engine_core::LlmTier::Tier1,
             actor_context: None,
             module_prefetch_cache: Arc::new(dashmap::DashMap::new()),
+            module_artifact_cache: Arc::new(dashmap::DashMap::new()),
             sub_workflow_cache: HashMap::new(),
             dry_run: false,
             workflow_id: None,
@@ -2539,29 +2557,83 @@ impl ParallelWorkflowEngine {
                 }),
             "best_of_n" if judge_wf_id_opt.is_some() => {
                 let judge_wf_id = judge_wf_id_opt.unwrap();
+                // P6: the judge sub-workflows are INDEPENDENT (each scores one
+                // candidate in isolation), so run them CONCURRENTLY instead of
+                // sequentially — pre-fix wall-clock was non_error_count ×
+                // judge-latency (5 candidates × ~10s judge ≈ 50s instead of
+                // ~10s). `buffered` PRESERVES candidate order, so the
+                // score→candidate selection below is byte-for-byte equivalent
+                // to the old sequential `for` loop: error candidates are still
+                // skipped (and never eligible to win), a judge that errors
+                // still yields `None` and is skipped from scoring, and the
+                // strict `>` comparison still keeps the FIRST candidate that
+                // attains the max score on a tie. Bounded at
+                // MAX_CONCURRENT_NODE_DISPATCH to match the candidate-generation
+                // fan-out and not stampede the worker fleet.
+                // Own the scored candidates (Vec<JsonValue>, not
+                // Vec<&JsonValue>) so NOTHING borrows `all_results` across the
+                // judge `.await` below. The enclosing `run_inner` future is
+                // boxed as `dyn Future + Send + '_`, so its only across-await
+                // borrow may be `&self` (HRTB lifetime); any *second* live
+                // borrow — `all_results` via a `&JsonValue`, or a lazy
+                // `.map()` iterator that borrows a local — makes the future
+                // fail the "Send is not general enough" check. This mirrors the
+                // working `candidate_futs` fan-out above, which captures only
+                // owned data plus `&self`.
+                let scored_candidates: Vec<JsonValue> = all_results
+                    .iter()
+                    .filter(|candidate| {
+                        !candidate
+                            .get("__error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect();
+                // Eagerly materialize the futures into an owned Vec so
+                // `stream::iter` owns them (no borrow of `scored_candidates`
+                // held across the await); each future owns its candidate clone.
+                let judge_futs: Vec<_> = scored_candidates
+                    .iter()
+                    .map(|candidate| {
+                        let dispatcher = dispatcher.clone();
+                        let wsk = worker_shared_key.clone();
+                        let candidate = candidate.clone();
+                        async move {
+                            let judge_input =
+                                serde_json::json!({ "content": candidate, "rubric": "" });
+                            match self
+                                .execute_subworkflow_graph(
+                                    judge_wf_id,
+                                    judge_input,
+                                    dispatcher,
+                                    wsk,
+                                )
+                                .await
+                            {
+                                Ok(collapsed) => {
+                                    Some(JudgeVerdict::from_collapsed(&collapsed).score)
+                                }
+                                // Judge dispatch failed — preserve the old loop's
+                                // behavior of skipping this candidate from scoring.
+                                Err(_) => None,
+                            }
+                        }
+                    })
+                    .collect();
+                let judge_scores: Vec<Option<f64>> = futures::stream::iter(judge_futs)
+                    .buffered(*MAX_CONCURRENT_NODE_DISPATCH)
+                    .collect()
+                    .await;
+
                 let mut best_result: Option<JsonValue> = None;
                 let mut best_score = f64::NEG_INFINITY;
-                for candidate in &all_results {
-                    if candidate
-                        .get("__error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let judge_input = serde_json::json!({ "content": candidate, "rubric": "" });
-                    if let Ok(collapsed) = self
-                        .execute_subworkflow_graph(
-                            judge_wf_id,
-                            judge_input,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await
-                    {
-                        let verdict = JudgeVerdict::from_collapsed(&collapsed);
-                        if verdict.score > best_score {
-                            best_score = verdict.score;
+                for (candidate, score) in scored_candidates.iter().zip(judge_scores.iter()) {
+                    if let Some(score) = score {
+                        if *score > best_score {
+                            best_score = *score;
+                            // `candidate: &JsonValue` (iter over owned
+                            // Vec<JsonValue>); clone the owned candidate value.
                             best_result = Some(candidate.clone());
                         }
                     }
@@ -3583,6 +3655,14 @@ impl ParallelWorkflowEngine {
             tracing::debug!(node_id = %node_id, "fetch_module: speculative prefetch cache hit");
             return Ok(cached.1);
         }
+        // P2: per-execution artifact cache keyed on the resolved module_id. A
+        // workflow reusing one module across M nodes/branches would otherwise
+        // re-SELECT the full wasm_bytes blob M times per run. Populated lazily
+        // by `fetch_module_artifact_cached`; scoped to this engine instance, so
+        // it never leaks across executions. The speculative-prefetch cache
+        // above is consulted first and remains authoritative for nodes that
+        // were pre-warmed while a slow predecessor ran.
+        let module_id = self.resolve_module_id(node_id);
         let Some(fetcher) = self.module_fetcher.as_ref() else {
             // Dev / smoke-test convenience: a bare `ParallelWorkflowEngine::new()`
             // with no services wired up falls through to a local wasm artifact.
@@ -3595,7 +3675,7 @@ impl ParallelWorkflowEngine {
                     std::fs::read("example-node/target/wasm32-wasi/release/my_first_node.wasm")
                         .map_err(|e| format!("failed to read wasm module: {}", e))?;
                 return Ok(talos_workflow_engine_core::WasmModuleArtifact {
-                    module_id: self.resolve_module_id(node_id),
+                    module_id,
                     content_hash: "example".to_string(),
                     wasm_bytes: bytes,
                     oci_url: None,
@@ -3619,11 +3699,51 @@ impl ParallelWorkflowEngine {
         let user_id = self.user_id.ok_or_else(|| {
             "Module execution requires user context (user_id not set)".to_string()
         })?;
-        let module_id = self.resolve_module_id(node_id);
-        fetcher
+        let artifact = self
+            .fetch_module_artifact_cached(fetcher, module_id, user_id)
+            .await?;
+        // Single-node dispatch wants an owned artifact; deep-clone the cached
+        // value out of the Arc. The expensive DB round-trip is what we cache —
+        // this clone is unavoidable for the owned-artifact callers and is the
+        // same allocation the pre-cache code already made.
+        Ok((*artifact).clone())
+    }
+
+    /// Fetch a module artifact through the per-execution cache (P2).
+    ///
+    /// Caches by **resolved `module_id`** for the lifetime of this engine
+    /// instance: module bytes are run-invariant, so M nodes/branches that
+    /// dispatch the same module incur exactly one `fetcher.fetch` (one
+    /// full-`wasm_bytes` SELECT) per run instead of M. Returns an `Arc` so
+    /// callers that only need to read fields (the pipeline path) share the
+    /// allocation with no clone; the owned-artifact caller (`fetch_module`)
+    /// clones once at the boundary.
+    ///
+    /// Concurrency: two nodes for the same module can race here while the pool
+    /// has free slots. Both may issue a `fetch` on a cold cache; the second
+    /// writer's `insert` simply overwrites with an identical artifact (the
+    /// bytes are run-invariant), so the only cost of the race is a redundant
+    /// fetch, never an inconsistent result. We deliberately don't hold a
+    /// per-key lock across the `.await` to avoid serializing independent module
+    /// loads.
+    pub(crate) async fn fetch_module_artifact_cached(
+        &self,
+        fetcher: &Arc<dyn ModuleFetcher>,
+        module_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Arc<talos_workflow_engine_core::WasmModuleArtifact>, String> {
+        if let Some(cached) = self.module_artifact_cache.get(&module_id) {
+            tracing::debug!(module_id = %module_id, "fetch_module: per-execution artifact cache hit");
+            return Ok(cached.clone());
+        }
+        let artifact = fetcher
             .fetch(module_id, user_id)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let artifact = Arc::new(artifact);
+        self.module_artifact_cache
+            .insert(module_id, artifact.clone());
+        Ok(artifact)
     }
 
     // ── Shared node-type helpers ──────────────────────────────────────────
@@ -3735,10 +3855,19 @@ impl ParallelWorkflowEngine {
     /// output, with engine-internal `__`-prefixed keys stripped from values.
     /// Nodes whose labels start with `__` (engine internals like `__trigger__`)
     /// are omitted entirely. Returns `None` if no user-visible results exist.
+    ///
+    /// The result is wrapped in [`Arc`] so the single per-version build can be
+    /// shared by reference across every node dispatched at that version — the
+    /// per-node envelope only deep-clones the inner value at the point it
+    /// actually injects `__accumulated__`, and concurrent in-flight dispatches
+    /// share one allocation instead of each rebuilding from scratch. The loop
+    /// memoizes the `Arc` against a results-version counter (see
+    /// `build_accumulated_context_memo`), so the O(N) build runs once per
+    /// committed result rather than once per node dispatch (was O(N²·S)).
     fn build_accumulated_context(
         node_labels: &HashMap<Uuid, String>,
         results: &HashMap<Uuid, JsonValue>,
-    ) -> Option<serde_json::Value> {
+    ) -> Option<Arc<serde_json::Value>> {
         let accumulated: Map<String, JsonValue> = results
             .iter()
             .filter_map(|(id, val)| {
@@ -3765,8 +3894,33 @@ impl ParallelWorkflowEngine {
         if accumulated.is_empty() {
             None
         } else {
-            Some(JsonValue::Object(accumulated))
+            Some(Arc::new(JsonValue::Object(accumulated)))
         }
+    }
+
+    /// Memoized wrapper over [`build_accumulated_context`].
+    ///
+    /// The accumulated context is a pure function of `(node_labels, results)`.
+    /// `node_labels` is fixed for the lifetime of a run and `results` only ever
+    /// grows (the reactor loop only ever `insert`s, never removes), so the loop
+    /// bumps `version` on every commit and this helper rebuilds — and clones the
+    /// shared `Arc` for the caller — only when the cached version is stale.
+    /// Behaviour is byte-for-byte identical to calling `build_accumulated_context`
+    /// directly at each dispatch site; only the redundant rebuilds are elided.
+    fn build_accumulated_context_memo(
+        node_labels: &HashMap<Uuid, String>,
+        results: &HashMap<Uuid, JsonValue>,
+        version: u64,
+        memo: &mut Option<(u64, Option<Arc<serde_json::Value>>)>,
+    ) -> Option<Arc<serde_json::Value>> {
+        if let Some((cached_version, cached)) = memo {
+            if *cached_version == version {
+                return cached.clone();
+            }
+        }
+        let built = Self::build_accumulated_context(node_labels, results);
+        *memo = Some((version, built.clone()));
+        built
     }
 
     /// Compute the Synthesize node output.
@@ -4736,6 +4890,28 @@ impl ParallelWorkflowEngine {
         let mut node_timings: HashMap<String, u64> = HashMap::new();
         let mut node_start_times: HashMap<NodeIndex, std::time::Instant> = HashMap::new();
 
+        // P1: monotonic version tag for the `results` map, used to memoize the
+        // Arc-wrapped accumulated-context snapshot so it is rebuilt once per
+        // node-processing step rather than once per node dispatch (was
+        // O(N²·S)). `results` is mutated from several places — the
+        // `commit_result!` macro inline below AND the `route_system_node_output`
+        // / `handle_completed_future` helpers that take `&mut results` — so
+        // rather than chase every insert site, the version is bumped once at the
+        // top of the inner work loop. Each inner iteration processes exactly one
+        // node and ends in `continue`/`break`, so a single bump per iteration
+        // guarantees the snapshot read at a dispatch site always reflects every
+        // mutation committed by prior iterations (over-invalidation only forces a
+        // harmless rebuild — it can never serve stale data). The macro keeps the
+        // commit sites self-documenting and is the natural seam if a future
+        // change needs finer-grained invalidation.
+        let mut results_version: u64 = 0;
+        let mut accumulated_memo: Option<(u64, Option<Arc<JsonValue>>)> = None;
+        macro_rules! commit_result {
+            ($id:expr, $value:expr) => {{
+                results.insert($id, $value);
+            }};
+        }
+
         // M5: ceiling on concurrent node-dispatch futures (see
         // MAX_CONCURRENT_NODE_DISPATCH). Resolved once per run.
         let max_concurrent_nodes = *MAX_CONCURRENT_NODE_DISPATCH;
@@ -4753,6 +4929,14 @@ impl ParallelWorkflowEngine {
                 let Some(node_idx) = ready.pop_front() else {
                     break;
                 };
+                // P1: invalidate the accumulated-context memo once per node
+                // step. Prior iterations may have committed results via the
+                // `commit_result!` macro OR via the `&mut results` completion
+                // helpers; bumping here (before any snapshot read in this
+                // iteration) makes the next `build_accumulated_context_memo`
+                // observe all of them. See the counter's declaration for why a
+                // single bump-per-iteration is sufficient and conservative.
+                results_version += 1;
                 // ── Pipeline dispatch (chain head, fresh runs only) ──────
                 if let Some(&chain_idx) = node_to_chain.get(&node_idx) {
                     // Only dispatch when we're at the chain head; non-
@@ -4763,8 +4947,12 @@ impl ParallelWorkflowEngine {
                     }
                     let chain = chains[chain_idx].clone();
                     let chain_input = self.gather_inputs(node_idx, &results);
-                    let accumulated_snapshot =
-                        Self::build_accumulated_context(&self.node_labels, &results);
+                    let accumulated_snapshot = Self::build_accumulated_context_memo(
+                        &self.node_labels,
+                        &results,
+                        results_version,
+                        &mut accumulated_memo,
+                    );
                     let fut = self.run_pipeline_chain_dispatch(
                         chain,
                         chain_input,
@@ -4786,14 +4974,14 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.check_skip_condition(node_idx, node_id, execution_id, &results)
                 {
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── FanIn aggregation (local computation, no dispatch) ───────
                 if let Some(output) = self.try_dispatch_fan_in(node_idx, node_id, &results) {
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
@@ -4802,7 +4990,7 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.try_dispatch_collect(node_idx, node_id, execution_id, &results)
                 {
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
@@ -4811,7 +4999,7 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.try_dispatch_synthesize(node_idx, node_id, execution_id, &results)
                 {
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
@@ -4832,7 +5020,7 @@ impl ParallelWorkflowEngine {
                 {
                     match verify_outcome {
                         Ok(output) => {
-                            results.insert(node_id, output);
+                            commit_result!(node_id, output);
                             self.unblock_successors(node_idx, &mut pending, &mut ready);
                         }
                         Err(error_msg) => {
@@ -4871,7 +5059,7 @@ impl ParallelWorkflowEngine {
                 if let Some(outcome) = self.try_dispatch_wait(node_id, execution_id) {
                     use crate::scheduler_handlers::WaitOutcome;
                     let WaitOutcome::Pause { waiting_output } = outcome;
-                    results.insert(node_id, waiting_output);
+                    commit_result!(node_id, waiting_output);
                     return Ok(WorkflowContext {
                         results,
                         waiting: true,
@@ -4972,12 +5160,12 @@ impl ParallelWorkflowEngine {
                     use crate::scheduler_handlers::ConfidenceGateOutcome;
                     match outcome {
                         ConfidenceGateOutcome::Proceed(output) => {
-                            results.insert(node_id, output);
+                            commit_result!(node_id, output);
                             self.unblock_successors(node_idx, &mut pending, &mut ready);
                             continue;
                         }
                         ConfidenceGateOutcome::Pause { waiting_output } => {
-                            results.insert(node_id, waiting_output);
+                            commit_result!(node_id, waiting_output);
                             return Ok(WorkflowContext {
                                 results,
                                 waiting: true,
@@ -5086,21 +5274,21 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── WhileLoop dispatch (local computation) ──────────────────
                 if let Some(output) = self.try_dispatch_while_loop(node_idx, node_id, &results) {
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── RepeatLoop dispatch (local computation) ─────────────────
                 if let Some(output) = self.try_dispatch_repeat_loop(node_idx, node_id, &results) {
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
@@ -5171,7 +5359,7 @@ impl ParallelWorkflowEngine {
 
                     for ((idx, id), output) in sub_wf_batch.into_iter().zip(outputs) {
                         if let Some(out) = output {
-                            results.insert(id, out);
+                            commit_result!(id, out);
                             self.unblock_successors(idx, &mut pending, &mut ready);
                         }
                     }
@@ -5201,7 +5389,7 @@ impl ParallelWorkflowEngine {
                 {
                     match outcome {
                         Ok(output) => {
-                            results.insert(node_id, output);
+                            commit_result!(node_id, output);
                             self.unblock_successors(node_idx, &mut pending, &mut ready);
                         }
                         Err(error_msg) => {
@@ -5267,7 +5455,7 @@ impl ParallelWorkflowEngine {
                             "Capability dispatch failed but continue_on_error is set — continuing"
                         );
                     }
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
@@ -5323,28 +5511,32 @@ impl ParallelWorkflowEngine {
                             "Loop body failed but continue_on_error is set — continuing"
                         );
                     }
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── ErrorHandler dispatch (pattern filtering) ───────────────
                 if let Some(output) = self.try_dispatch_error_handler(node_idx, node_id, &results) {
-                    results.insert(node_id, output);
+                    commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── Single-node dispatch ─────────────────────────────────────
                 if let Some(error_envelope) = self.check_rate_limit(node_id).await {
-                    results.insert(node_id, error_envelope);
+                    commit_result!(node_id, error_envelope);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 let inputs = self.gather_inputs(node_idx, &results);
-                let accumulated_snapshot =
-                    Self::build_accumulated_context(&self.node_labels, &results);
+                let accumulated_snapshot = Self::build_accumulated_context_memo(
+                    &self.node_labels,
+                    &results,
+                    results_version,
+                    &mut accumulated_memo,
+                );
                 // `__trigger_input__` is synthesized once from the
                 // synthetic `__trigger__` node output (or unwrapped when
                 // the parent was itself a sub-workflow — see
@@ -5435,6 +5627,11 @@ impl ParallelWorkflowEngine {
 
         // Release unconsumed prefetch cache entries.
         self.module_prefetch_cache.clear();
+        // P2: release the per-execution module-artifact cache (multi-MB wasm
+        // blobs). Per-execution scoping already prevents cross-run reuse, but
+        // an engine handle that outlives its run (e.g. a resumed/seeded
+        // scheduler reused by the caller) shouldn't pin the blobs.
+        self.module_artifact_cache.clear();
 
         Ok(WorkflowContext {
             results,

@@ -1,0 +1,28 @@
+-- S1 (OAuth login-CSRF / session-fixation): bind the pre-auth SSO LOGIN
+-- `state` nonce to the initiating browser.
+--
+-- The `state` nonce alone proves only "Talos issued this authorize URL",
+-- not "issued to THIS browser". Without a per-browser binding an attacker
+-- can run the consent flow against their own provider account and feed the
+-- victim the resulting callback URL (`code` + `state`), logging the victim
+-- in as the attacker (login-CSRF / session fixation).
+--
+-- The login flow (`talos_oauth::OAuthService::get_authorization_url`) now
+-- generates an opaque per-browser session nonce, sets it as an
+-- HttpOnly+Secure+SameSite=Lax cookie, and stores only its SHA-256 hex
+-- digest here. On callback `validate_state_token` recomputes the hash from
+-- the cookie and constant-time compares it. We store the HASH (not the raw
+-- value) so a read-only DB compromise during the row's ≤10-min lifetime
+-- never yields a usable cookie — same `token_hash` discipline as
+-- `workflow_approval_gates.token_hash` (migration 20260608140000).
+--
+-- This is distinct from the existing `user_id` column (added by
+-- 20260410100004) which the account-LINK flows
+-- (slack/gmail/atlassian) use to bind an ALREADY-AUTHENTICATED user; a
+-- pre-auth login has no user yet, and `user_id`'s FK to users(id) forbids
+-- storing a random session nonce there.
+--
+-- NULL is allowed: legacy / non-login rows skip the binding check, so this
+-- is backward compatible during rollout.
+ALTER TABLE oauth_state_tokens
+    ADD COLUMN IF NOT EXISTS session_binding_hash TEXT;

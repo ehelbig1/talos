@@ -348,9 +348,8 @@ pub fn extract_client_ip(
     // O(entries × CIDR), so the collect is cheap) and then cap the
     // EXPENSIVE walk via `.take(MAX_XFF_ENTRIES)` after `.rev()` —
     // preserving the rightmost entries where the legitimate proxy
-    // chain lives. The all-trusted-fallback at the bottom still
-    // points at the leftmost entry (best-effort original-client
-    // claim).
+    // chain lives. The all-trusted-fallback at the bottom returns
+    // the direct socket peer (NOT the leftmost entry — see S4 below).
     let entries: Vec<&str> = s
         .split(',')
         .map(str::trim)
@@ -369,12 +368,15 @@ pub fn extract_client_ip(
         }
     }
 
-    // Every entry parsed as a trusted proxy (all-internal chain). Fall back
-    // to the leftmost as the best-effort original-client claim.
-    entries
-        .first()
-        .and_then(|first| parse_xff_entry(first))
-        .unwrap_or(direct_ip)
+    // S4 (Low): every entry parsed as a trusted proxy (all-internal chain).
+    // Do NOT fall back to the leftmost entry — it is the attacker-controllable
+    // head of the chain (any client behind a trusted proxy can prepend a
+    // forged entry, and on an all-trusted chain the right-to-left walk never
+    // rejects it). The only non-spoofable identity left is the direct socket
+    // peer, which we already know is a trusted proxy but is at least a real,
+    // observed source. Returning it collapses the all-trusted case onto a
+    // single stable bucket rather than letting a request pick its own bucket.
+    direct_ip
 }
 
 /// Rate limiting middleware
@@ -936,16 +938,44 @@ mod tests {
         );
     }
 
+    /// S4 (Low): when EVERY parsed XFF entry is a trusted proxy
+    /// (all-internal chain), the fallback MUST NOT return the leftmost
+    /// entry — it is attacker-controllable (any client behind a trusted
+    /// proxy can prepend a forged head, and on an all-trusted chain the
+    /// right-to-left walk never rejects it, so the leftmost would let a
+    /// request pick its own rate-limit bucket). Fall back to the direct
+    /// socket peer, the only non-spoofable identity available.
     #[test]
-    fn xff_falls_back_to_leftmost_when_chain_all_trusted() {
-        // All entries are inside trusted CIDRs (e.g. service-mesh hop chain).
-        // We have no untrusted entry to anchor on; fall back to the leftmost
-        // claim so we at least key off something stable per upstream.
+    fn xff_all_trusted_chain_falls_back_to_direct_peer_not_leftmost() {
         let direct: IpAddr = "10.42.0.1".parse().unwrap();
+        let leftmost: IpAddr = "10.42.0.7".parse().unwrap();
         let headers = headers_with_xff("10.42.0.7, 10.42.0.5");
         let trusted = trusted("10.42.0.0/16");
-        let leftmost: IpAddr = "10.42.0.7".parse().unwrap();
-        assert_eq!(extract_client_ip(direct, &headers, &trusted), leftmost);
+        let got = extract_client_ip(direct, &headers, &trusted);
+        assert_eq!(
+            got, direct,
+            "all-trusted chain must key off the direct peer"
+        );
+        assert_ne!(
+            got, leftmost,
+            "must NOT return the spoofable leftmost XFF entry"
+        );
+    }
+
+    /// S4 (Low): even when the attacker-controllable leftmost entry is an
+    /// arbitrary spoofed value, the all-trusted fallback ignores it. A
+    /// client prepending "9.9.9.9" cannot move its rate-limit bucket.
+    #[test]
+    fn xff_all_trusted_chain_ignores_spoofed_leftmost() {
+        let direct: IpAddr = "10.42.0.1".parse().unwrap();
+        // Spoofed leftmost is itself a trusted-CIDR-shaped value so the
+        // whole chain parses as trusted, exercising the fallback path.
+        let headers = headers_with_xff("10.42.255.255, 10.42.0.5");
+        let trusted = trusted("10.42.0.0/16");
+        let spoofed: IpAddr = "10.42.255.255".parse().unwrap();
+        let got = extract_client_ip(direct, &headers, &trusted);
+        assert_eq!(got, direct);
+        assert_ne!(got, spoofed);
     }
 
     #[test]
@@ -1009,17 +1039,18 @@ mod tests {
         assert_eq!(extract_client_ip(direct, &headers, &trusted), real);
     }
 
-    /// Defense-in-depth complement: when the rightmost 64 entries are
-    /// ALL trusted (long internal-only chain), the fallback to the
-    /// leftmost entry still works regardless of how many entries
-    /// preceded the cap window.
+    /// S4 (Low) + MCP-1103: when the rightmost 64 entries are ALL trusted
+    /// (long internal-only chain) the right-to-left walk hits the cap
+    /// without finding an untrusted entry and bails. Any IP preceding the
+    /// cap window — including an untrusted-shaped leftmost — is BEYOND the
+    /// walk and was never validated, so it is exactly as attacker-
+    /// controllable as the leftmost in the all-trusted case. The fallback
+    /// returns the direct socket peer, NOT that unvalidated leftmost.
     #[test]
-    fn xff_cap_fallback_to_leftmost_on_all_trusted_window() {
+    fn xff_cap_all_trusted_window_falls_back_to_direct_peer() {
         let direct: IpAddr = "10.42.0.1".parse().unwrap();
         let trusted = trusted("10.42.0.0/16");
-        // Leftmost is an untrusted-shaped IP; the entire chain after it
-        // is trusted. The right-to-left walk hits 64 trusted entries
-        // and bails; fallback returns the leftmost.
+        // Leftmost is an untrusted-shaped IP outside the 64-entry window.
         let leftmost: IpAddr = "203.0.113.50".parse().unwrap();
         let mut parts = vec!["203.0.113.50".to_string()];
         for _ in 0..200 {
@@ -1027,7 +1058,12 @@ mod tests {
         }
         let xff = parts.join(", ");
         let headers = headers_with_xff(&xff);
-        assert_eq!(extract_client_ip(direct, &headers, &trusted), leftmost);
+        let got = extract_client_ip(direct, &headers, &trusted);
+        assert_eq!(got, direct);
+        assert_ne!(
+            got, leftmost,
+            "an entry outside the cap window must not be returned"
+        );
     }
 
     #[test]

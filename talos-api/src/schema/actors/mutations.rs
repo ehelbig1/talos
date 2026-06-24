@@ -311,14 +311,16 @@ impl ActorsMutations {
             talos_organizations::OrganizationService::create_personal_org(db_pool, user_id, None)
                 .await
                 .map_err(|e| {
-                    async_graphql::Error::new(format!("resolve personal org: {e}")).extend_safe()
+                    tracing::error!(error = %e, "graphql: resolve personal org error");
+                    async_graphql::Error::new("Request scope error").extend_safe()
                 })?
                 .id;
         let mut tx =
             talos_db::begin_org_scoped(db_pool, &talos_tenancy::OrgScope::new(org_id, user_id))
                 .await
                 .map_err(|e| {
-                    async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe()
+                    tracing::error!(error = %e, "graphql: tenant scope error");
+                    async_graphql::Error::new("Request scope error").extend_safe()
                 })?;
         sqlx::query(
             "INSERT INTO actors (id, user_id, name, description, max_capability_world, status) \
@@ -335,9 +337,10 @@ impl ActorsMutations {
             tracing::error!("Failed to create actor: {}", e);
             async_graphql::Error::new("Failed to create actor").extend_safe()
         })?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         talos_actor_repository::spawn_log_action(
             db_pool.clone(),
@@ -395,7 +398,10 @@ impl ActorsMutations {
         // the update — the row stays owned by the caller).
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let result = sqlx::query(
             "UPDATE actors SET status = $1, updated_at = now() \
              WHERE id = $2 AND user_id = $3 \
@@ -410,9 +416,10 @@ impl ActorsMutations {
             tracing::error!("Failed to update actor status: {}", e);
             async_graphql::Error::new("Failed to update actor status").extend_safe()
         })?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         if result.rows_affected() == 0 {
             // rows_affected = 0 collapses three cases into one
@@ -469,7 +476,10 @@ impl ActorsMutations {
         // UPDATE (see update_actor_status).
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let result = sqlx::query(
             "UPDATE actors SET status = 'terminated', updated_at = now() WHERE id = $1 AND user_id = $2",
         )
@@ -481,9 +491,10 @@ impl ActorsMutations {
             tracing::error!("Failed to terminate actor: {}", e);
             async_graphql::Error::new("Failed to terminate actor").extend_safe()
         })?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         if result.rows_affected() == 0 {
             return Err(
@@ -692,7 +703,10 @@ impl ActorsMutations {
         // UPDATE (see update_actor_status).
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let mut q = sqlx::query(&sql);
         if let Some(ref n) = name {
             q = q.bind(n.trim());
@@ -720,9 +734,10 @@ impl ActorsMutations {
                     async_graphql::Error::new("Failed to update actor").extend_safe()
                 }
             })?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         if result.rows_affected() == 0 {
             return Err(
@@ -778,7 +793,10 @@ impl ActorsMutations {
         // itself goes through talos_memory).
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let owned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2 AND status != 'terminated')",
         )
@@ -787,9 +805,10 @@ impl ActorsMutations {
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         if !owned {
             return Err(
@@ -916,7 +935,10 @@ impl ActorsMutations {
         // tx so the actors RLS policy backstops the check.
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
-            .map_err(|e| async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
         let owned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2)",
         )
@@ -925,9 +947,10 @@ impl ActorsMutations {
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| e.extend_safe())?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         if !owned {
             return Err(
@@ -975,14 +998,16 @@ impl ActorsMutations {
             talos_organizations::OrganizationService::create_personal_org(db_pool, user_id, None)
                 .await
                 .map_err(|e| {
-                    async_graphql::Error::new(format!("resolve personal org: {e}")).extend_safe()
+                    tracing::error!(error = %e, "graphql: resolve personal org error");
+                    async_graphql::Error::new("Request scope error").extend_safe()
                 })?
                 .id;
         let mut tx =
             talos_db::begin_org_scoped(db_pool, &talos_tenancy::OrgScope::new(org_id, user_id))
                 .await
                 .map_err(|e| {
-                    async_graphql::Error::new(format!("tenant scope: {e}")).extend_safe()
+                    tracing::error!(error = %e, "graphql: tenant scope error");
+                    async_graphql::Error::new("Request scope error").extend_safe()
                 })?;
 
         // Fetch source actor (ownership check)
@@ -1028,9 +1053,10 @@ impl ActorsMutations {
             tracing::error!("clone_actor insert failed: {}", e);
             async_graphql::Error::new("Failed to clone actor").extend_safe()
         })?;
-        tx.commit()
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("commit: {e}")).extend_safe())?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         // Copy semantic (permanent) and episodic (fresh 7-day TTL) memories
         // through the canonical talos_memory entry point — same DEK lineage

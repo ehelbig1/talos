@@ -126,12 +126,62 @@ impl AuditEvent {
 /// This provides tamper detection: an attacker who gains database access
 /// cannot forge events without the signing key.
 ///
+/// Entropy requirement: the key must carry at least 32 bytes (256 bits) of
+/// *effective entropy*. The check decodes hex first — an all-hex value needs
+/// >= 64 hex chars (>= 32 decoded bytes); any other value (raw binary /
+/// base64 / passphrase) needs >= 32 bytes of raw length. A 32-hex-char key
+/// (`openssl rand -hex 16`, only 16 bytes) is REJECTED and signing is
+/// disabled. The canonical full-strength key is `openssl rand -hex 32`
+/// (a 64-char hex string). The accepted key bytes are the raw UTF-8 string
+/// (NOT the hex-decoded form), so this floor never alters an existing
+/// signature.
+///
 /// Key rotation: set `TALOS_AUDIT_SIGNING_KEY_PREVIOUS` (comma-separated)
 /// for verification of events signed with older keys.
 static AUDIT_SIGNING_KEY: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
 
+/// Minimum effective key entropy, in bytes, for HMAC-SHA256 signing.
+/// HMAC-SHA256 needs a full 256-bit key for collision resistance.
+pub(crate) const MIN_KEY_ENTROPY_BYTES: usize = 32;
+
+/// Effective key entropy, in BYTES, of a raw `TALOS_AUDIT_SIGNING_KEY`
+/// string value.
+///
+/// MCP-579 (2026-06-23 floor raise): the original check compared
+/// `k.into_bytes().len() < 32` against the RAW UTF-8 string — so a
+/// 32-hex-char key (`openssl rand -hex 16`, only **16 bytes** of real
+/// entropy) passed, because the ASCII string is 32 chars. Operators almost
+/// universally generate keys as hex (`openssl rand -hex 32` → a 64-char hex
+/// string carrying 32 bytes of entropy), so the right floor is on the
+/// *decoded* entropy:
+/// - all-hex string (even length) → entropy = `len / 2` decoded bytes
+/// - any other string (binary/base64/passphrase) → entropy = byte length
+///
+/// We do NOT hex-decode the key for use — the signing/verification bytes
+/// stay the raw UTF-8 string (`into_bytes()` / `as_bytes()`) so this change
+/// can't alter any already-emitted signature or desync from the raw-bytes
+/// `TALOS_AUDIT_SIGNING_KEY_PREVIOUS` verification path. This function only
+/// decides *acceptance*; the accepted bytes are unchanged.
+pub(crate) fn effective_key_entropy_bytes(raw: &str) -> usize {
+    let is_hex = !raw.is_empty()
+        && raw.len().is_multiple_of(2)
+        && raw.bytes().all(|b| b.is_ascii_hexdigit());
+    if is_hex {
+        raw.len() / 2
+    } else {
+        raw.len()
+    }
+}
+
 /// The current signing key, or `None` when signing is disabled. Used by the
 /// producer to sign and as the first verification key.
+///
+/// A key whose *effective entropy* (see [`effective_key_entropy_bytes`]) is
+/// below [`MIN_KEY_ENTROPY_BYTES`] (32 bytes / 256 bits) is REJECTED — a
+/// 32-hex-char key (16 bytes) returns `None` (signing disabled) rather than
+/// silently signing with a forge-weak key. A 64-hex-char key (the
+/// `openssl rand -hex 32` output) and a >=32-byte raw binary/base64 key are
+/// accepted; the accepted bytes are the raw UTF-8 string unchanged.
 pub fn audit_signing_key() -> &'static Option<Vec<u8>> {
     AUDIT_SIGNING_KEY.get_or_init(|| {
         // MCP-671: route through `talos_config::is_production()` so a
@@ -141,31 +191,43 @@ pub fn audit_signing_key() -> &'static Option<Vec<u8>> {
         let is_production = talos_config::is_production();
         match std::env::var("TALOS_AUDIT_SIGNING_KEY") {
             Ok(k) if !k.is_empty() => {
-                let key_bytes = k.into_bytes();
-                if key_bytes.len() < 32 {
-                    // MCP-579: a < 32-byte HMAC-SHA256 key is a forge-risk
-                    // surface. Loud at ERROR in production (SIEM alert),
+                let entropy = effective_key_entropy_bytes(&k);
+                if entropy < MIN_KEY_ENTROPY_BYTES {
+                    // MCP-579: a < 32-byte-effective-entropy HMAC-SHA256 key
+                    // is a forge-risk surface. A 32-hex-char key (16 bytes
+                    // decoded) is the canonical trap. REJECT it (fail closed
+                    // to unsigned + the same loud-in-prod alert below) rather
+                    // than sign with a weak key — a forgeable signature is
+                    // worse than an explicit "unsigned" posture the verifier
+                    // can detect. Loud at ERROR in production (SIEM alert),
                     // WARN in dev (test harnesses use short keys).
                     if is_production {
                         tracing::error!(
                             target: "talos_audit",
                             event_kind = "audit_signing_key_weak_in_production",
-                            key_len = key_bytes.len(),
-                            "TALOS_AUDIT_SIGNING_KEY is only {} bytes in production — \
-                             HMAC-SHA256 requires 32+ bytes for full collision resistance. \
-                             Tamper-detection on audit events is materially weakened until \
-                             the key is rotated. Generate via: openssl rand -hex 32",
-                            key_bytes.len()
+                            key_len = k.len(),
+                            effective_entropy_bytes = entropy,
+                            "TALOS_AUDIT_SIGNING_KEY has only {} bytes of effective entropy in \
+                             production (raw length {} chars) — HMAC-SHA256 requires 32+ bytes \
+                             (256 bits). The key is REJECTED and audit events will NOT be signed \
+                             until it is rotated. A 32-hex-char key is only 16 bytes of entropy; \
+                             generate a full-strength key via: openssl rand -hex 32",
+                            entropy,
+                            k.len()
                         );
                     } else {
                         tracing::warn!(
-                            "TALOS_AUDIT_SIGNING_KEY is only {} bytes — 32+ bytes recommended for HMAC-SHA256",
-                            key_bytes.len()
+                            "TALOS_AUDIT_SIGNING_KEY has only {} bytes of effective entropy \
+                             (raw length {} chars) — 32+ bytes required for HMAC-SHA256; \
+                             key REJECTED, signing disabled. Generate via: openssl rand -hex 32",
+                            entropy,
+                            k.len()
                         );
                     }
+                    return None;
                 }
                 tracing::info!("Audit event signing enabled");
-                Some(key_bytes)
+                Some(k.into_bytes())
             }
             _ => {
                 // MCP-579: unsigned audit events in production = no tamper

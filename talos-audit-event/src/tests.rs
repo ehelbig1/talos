@@ -239,3 +239,86 @@ fn verify_chain_checks_signatures_when_keys_present() {
         .iter()
         .any(|b| matches!(b, ChainBreak::Unsigned { seq: 2 })));
 }
+
+// ── audit_signing_key entropy floor (MCP-579 floor raise, 2026-06-23) ──
+//
+// These exercise the real production decision helpers
+// (`effective_key_entropy_bytes` + `MIN_KEY_ENTROPY_BYTES`) used by
+// `audit_signing_key()` — NOT a test-local shadow. The loader itself can't
+// be unit-tested in isolation (process-global `OnceLock` + env var +
+// `is_production()`), so the floor logic is extracted and tested directly.
+// `accepts(k)` mirrors the loader's accept/reject predicate exactly.
+fn accepts(k: &str) -> bool {
+    !k.is_empty() && effective_key_entropy_bytes(k) >= MIN_KEY_ENTROPY_BYTES
+}
+
+#[test]
+fn entropy_floor_rejects_32_hex_char_key() {
+    // 32 hex chars = `openssl rand -hex 16` = only 16 bytes of real entropy.
+    // This is the exact trap the old `len() < 32` raw-string check missed.
+    let k = "0123456789abcdef0123456789abcdef"; // 32 chars, all hex
+    assert_eq!(k.len(), 32);
+    assert_eq!(effective_key_entropy_bytes(k), 16);
+    assert!(!accepts(k), "16-byte-entropy hex key must be REJECTED");
+}
+
+#[test]
+fn entropy_floor_accepts_64_hex_char_key() {
+    // 64 hex chars = `openssl rand -hex 32` = 32 bytes of entropy — the
+    // canonical full-strength operator key.
+    let k = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(k.len(), 64);
+    assert_eq!(effective_key_entropy_bytes(k), 32);
+    assert!(accepts(k), "64-hex-char key must be ACCEPTED");
+}
+
+#[test]
+fn entropy_floor_accepts_32_byte_non_hex_key() {
+    // A 32-char NON-hex string (e.g. base64-ish / passphrase) has 32 bytes
+    // of raw entropy and must NOT be hex-folded down to 16 — the `g`/`-`
+    // make it non-hex so entropy = full byte length.
+    let k = "this-is-a-32-byte-raw-secret!!gg"; // 32 chars, contains non-hex
+    assert_eq!(k.len(), 32);
+    assert!(!k.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(effective_key_entropy_bytes(k), 32);
+    assert!(accepts(k), "32-byte raw non-hex key must be ACCEPTED");
+}
+
+#[test]
+fn entropy_floor_rejects_short_raw_key() {
+    // A short non-hex key (16 chars raw) is below the 32-byte floor.
+    let k = "short-raw-key-xy"; // 16 chars, non-hex ('s','r','k','y','-')
+    assert_eq!(k.len(), 16);
+    assert!(!k.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(effective_key_entropy_bytes(k), 16);
+    assert!(!accepts(k), "16-byte raw key must be REJECTED");
+
+    // Boundary: 31 raw bytes rejected, 32 raw bytes accepted.
+    let raw31: String = "z".repeat(31); // 'z' is non-hex
+    let raw32: String = "z".repeat(32);
+    assert!(!accepts(&raw31), "31-byte raw key must be REJECTED");
+    assert!(accepts(&raw32), "32-byte raw key must be ACCEPTED");
+}
+
+#[test]
+fn entropy_floor_hex_boundary_is_64_chars() {
+    // 62 hex chars = 31 decoded bytes -> rejected; 64 -> 32 bytes -> accepted.
+    let hex62: String = "a".repeat(62);
+    let hex64: String = "a".repeat(64);
+    assert_eq!(effective_key_entropy_bytes(&hex62), 31);
+    assert_eq!(effective_key_entropy_bytes(&hex64), 32);
+    assert!(
+        !accepts(&hex62),
+        "62-hex-char key (31 bytes) must be REJECTED"
+    );
+    assert!(
+        accepts(&hex64),
+        "64-hex-char key (32 bytes) must be ACCEPTED"
+    );
+
+    // Odd-length all-hex-digit string is NOT treated as hex (can't decode to
+    // whole bytes) -> falls through to raw-length entropy. 33 'a' chars is
+    // odd, so entropy = 33 raw bytes (accepted, but via the raw path).
+    let odd: String = "a".repeat(33);
+    assert_eq!(effective_key_entropy_bytes(&odd), 33);
+}
