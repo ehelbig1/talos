@@ -40,10 +40,15 @@
 //!
 //! ## Remaining unfenced fresh-run sites
 //!
+//! The inbound-webhook ASYNC path (`talos-webhooks`, `auto_respond=false`) is
+//! also fenced; the webhook SYNC path is intentionally not (bounded by
+//! `sync_timeout` ≤120s, under the stale window, and a reclaim there would abort
+//! the inline run the caller is waiting on).
+//!
 //! Other `run_with_trigger_input_via_nats` call sites still dispatch WITHOUT a
-//! fence: `retry.rs`, `replay.rs`, inbound webhooks (`talos-webhooks`),
-//! continuation/approval resume (`talos-continuation-trigger`), the MCP trigger
-//! handlers (`talos-mcp-handlers`), and the GraphQL `triggerWorkflow` mutation
+//! fence: `retry.rs`, `replay.rs`, continuation/approval resume
+//! (`talos-continuation-trigger`), the MCP trigger handlers
+//! (`talos-mcp-handlers`), and the GraphQL `triggerWorkflow` mutation
 //! (`talos-api`). For those, the exposure is unchanged and bounded: a stale
 //! original keeps dispatching alongside a resumer, but terminal writes are
 //! status-guarded (no terminal-state corruption / lost-update), so the only
