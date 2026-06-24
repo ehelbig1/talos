@@ -27,27 +27,32 @@
 //!
 //! ## Fresh-run coverage
 //!
-//! Fencing now covers TWO entry paths:
-//! - the resume path (`crash_recovery::resume_execution` → [`run_with_seed_fenced`]); and
+//! Fencing now covers THREE entry paths:
+//! - the resume path (`crash_recovery::resume_execution` → [`run_with_seed_fenced`]);
 //! - the PRIMARY fresh-run path (`trigger.rs` → [`run_with_trigger_input_fenced`]),
 //!   which observes the row's current `epoch` (0 for a fresh INSERT) and aborts
-//!   if a reclaim bumps it.
+//!   if a reclaim bumps it; and
+//! - the SCHEDULER (`talos-scheduler` → both [`run_with_trigger_input_fenced`]
+//!   and [`run_with_seed_fenced`]). Scheduled runs are long-lived `running`
+//!   rows — the likeliest to outlast the stale window and be reclaimed while
+//!   the scheduler is still dispatching — so they're the highest-value
+//!   non-resume site.
 //!
 //! ## Remaining unfenced fresh-run sites
 //!
 //! Other `run_with_trigger_input_via_nats` call sites still dispatch WITHOUT a
-//! fence: `retry.rs`, `replay.rs`, the scheduler (`talos-scheduler`), inbound
-//! webhooks (`talos-webhooks`), continuation/approval resume
-//! (`talos-continuation-trigger`), the MCP trigger handlers (`talos-mcp-handlers`),
-//! and the GraphQL `triggerWorkflow` mutation (`talos-api`). For those, the
-//! exposure is unchanged and bounded: a stale original keeps dispatching
-//! alongside a resumer, but terminal writes are status-guarded (no
-//! terminal-state corruption / lost-update), so the only effect is the
-//! at-least-once duplicate node dispatch the durable-execution contract already
-//! documents (`crash_recovery` module docs). [`run_with_trigger_input_fenced`]
-//! is reusable, so extending each site is a matter of reading the row's epoch
-//! and threading [`was_fenced`] into that site's failure handling — tracked as
-//! follow-up work, done per-site because each owns its own terminal-write logic.
+//! fence: `retry.rs`, `replay.rs`, inbound webhooks (`talos-webhooks`),
+//! continuation/approval resume (`talos-continuation-trigger`), the MCP trigger
+//! handlers (`talos-mcp-handlers`), and the GraphQL `triggerWorkflow` mutation
+//! (`talos-api`). For those, the exposure is unchanged and bounded: a stale
+//! original keeps dispatching alongside a resumer, but terminal writes are
+//! status-guarded (no terminal-state corruption / lost-update), so the only
+//! effect is the at-least-once duplicate node dispatch the durable-execution
+//! contract already documents (`crash_recovery` module docs).
+//! [`run_with_trigger_input_fenced`] is reusable, so extending each site is a
+//! matter of reading the row's epoch and threading [`was_fenced`] into that
+//! site's failure handling — tracked as follow-up work, done per-site because
+//! each owns its own terminal-write logic.
 
 use std::collections::HashMap;
 use std::sync::Arc;
