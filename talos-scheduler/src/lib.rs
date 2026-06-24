@@ -925,8 +925,17 @@ async fn run_scheduled_execution(
         "schedule_id": schedule_id.to_string(),
     });
     let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-    let rows_affected = match workflow_repo
-        .create_execution_with_lineage(
+    // R3 (concurrency-cap fix): route through `create_execution_under_concurrency_limit`
+    // — the SAME TOCTOU-safe gate (`SELECT max_concurrent_executions ... FOR
+    // UPDATE` + running-count + INSERT in one tx) the manual trigger / webhook
+    // paths use. Pre-fix the scheduler used `create_execution_with_lineage`,
+    // which never reads `max_concurrent_executions`, so a frequent cron firing a
+    // slow workflow piled up unbounded concurrent runs past a cap that manual
+    // triggers correctly enforced. The ownership gate is now the tx's
+    // `fetch_one ... WHERE id=$1 AND user_id=$2 FOR UPDATE` (a deleted/foreign
+    // workflow returns Err here, replacing the old rows_affected==0 sentinel).
+    let admission = match workflow_repo
+        .create_execution_under_concurrency_limit(
             execution_id,
             workflow_id,
             user_id,
@@ -936,29 +945,36 @@ async fn run_scheduled_execution(
             Some(&provenance),
             None, // parent_execution_id — top-level run
             None, // root_execution_id — top-level run
+            talos_workflow_repository::InitialExecutionStatus::Running,
         )
         .await
     {
-        Ok(n) => n,
+        Ok(a) => a,
         Err(e) => {
             tracing::error!(
                 execution_id = %execution_id,
-                "Scheduler: failed to create execution record: {}",
+                workflow_id = %workflow_id,
+                "Scheduler: failed to create execution record (workflow likely deleted mid-fire): {}",
                 e
             );
             return;
         }
     };
-    if rows_affected == 0 {
-        // Defense-in-depth: ownership EXISTS gate inside
-        // create_execution_with_lineage didn't match. We just
-        // confirmed the workflow exists for this user above, so
-        // this only fires on a race (workflow deleted between the
-        // SELECT and the INSERT). Bail rather than continue.
-        tracing::error!(
+    if let talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running } =
+        admission
+    {
+        // Respect the per-workflow concurrency cap. `next_trigger_at` was
+        // already advanced before this spawn (commit-before-dispatch), so a
+        // skipped fire simply drops to the next occurrence — consistent with the
+        // scheduler's skip-to-next philosophy (no catch-up storm) and the
+        // MCP-708 auth-gate skip semantics already in this function.
+        tracing::warn!(
             execution_id = %execution_id,
             workflow_id = %workflow_id,
-            "Scheduler: ownership-gated INSERT produced 0 rows — workflow likely deleted mid-fire"
+            limit,
+            running,
+            "Scheduler: skipping fire — per-workflow max_concurrent_executions reached; \
+             the next scheduled occurrence will retry"
         );
         return;
     }
