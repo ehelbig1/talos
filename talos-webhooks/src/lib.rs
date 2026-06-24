@@ -1642,17 +1642,12 @@ impl WebhookRouter {
         } else if let Some(workflow_id) = trigger.workflow_id {
             // Workflow Trigger Path
             //
-            // R2-4 note: unlike the module path above, this path does NOT
-            // release the dedup claim on failure. `trigger_workflow_execution`
-            // conflates pre-dispatch failures (workflow-not-found, setup error)
-            // with post-spawn outcomes — in sync mode it returns 5xx/504 AFTER
-            // the engine has started running in the background — so a
-            // status-based release here would risk double-executing a workflow
-            // that already had side effects. The dominant pre-dispatch failure
-            // (workflow not found) is permanent and wouldn't benefit from a
-            // retry anyway. Releasing on the rare transient pre-dispatch DB
-            // error would require threading the claim into the spawn boundary;
-            // tracked as a follow-up rather than risk the double-run regression.
+            // FU-3: the dedup claim is threaded in so `trigger_workflow_execution`
+            // can release it on its TRANSIENT pre-dispatch failures only (it
+            // knows exactly which exits are above the run/spawn boundary). A
+            // status-based release HERE would be unsafe — sync mode returns
+            // 5xx/504 AFTER the engine ran — so the decision lives inside the
+            // method where pre- vs post-dispatch is unambiguous.
             let body_str = std::str::from_utf8(&body).unwrap_or("");
             let input_payload = serde_json::from_str::<serde_json::Value>(body_str)
                 .unwrap_or(serde_json::Value::String(body_str.to_string()));
@@ -1664,6 +1659,7 @@ impl WebhookRouter {
                 trigger_id,
                 trigger.auto_respond,
                 trigger.sync_timeout_secs,
+                &dedup_claim,
             )
             .await
         } else {
@@ -1691,6 +1687,16 @@ impl WebhookRouter {
     /// correctly). The previous implementation seeded with a random
     /// UUID, which silently produced workflows that never saw the
     /// webhook input.
+    /// `dedup_claim` (FU-3): the webhook dedup claim taken at arrival, or `None`
+    /// (DLQ replay / no dedup backend). On a TRANSIENT pre-dispatch failure —
+    /// one that happens BEFORE the engine starts and could succeed on a retry
+    /// (auth DB error, execution-row create failure, concurrency limit, engine
+    /// build failure) — the claim is released so the sender's redelivery isn't
+    /// suppressed as a duplicate. It is NOT released on permanent denials
+    /// (workflow-not-found / actor / capability — retrying is futile, so leaving
+    /// the duplicate suppressed is correct) and NOT on any POST-dispatch outcome
+    /// (the engine already ran; releasing would risk a double-run). The
+    /// invariant: any release MUST be at an exit ABOVE the run/spawn boundary.
     async fn trigger_workflow_execution(
         &self,
         workflow_id: Uuid,
@@ -1699,6 +1705,7 @@ impl WebhookRouter {
         trigger_id: Uuid,
         auto_respond: bool,
         sync_timeout_secs: i32,
+        dedup_claim: &Option<String>,
     ) -> Result<Response> {
         let execution_id = Uuid::new_v4();
 
@@ -1815,6 +1822,9 @@ impl WebhookRouter {
                         error = %e,
                         "MCP-565: webhook dispatch authorization DB error — failing closed"
                     );
+                    // FU-3: transient pre-dispatch failure — engine never ran;
+                    // release the dedup claim so the sender's retry is honored.
+                    self.release_dedup_claim(trigger_id, dedup_claim).await;
                     return Err(anyhow::anyhow!("Internal authorization error"));
                 }
             }
@@ -1856,12 +1866,17 @@ impl WebhookRouter {
             Ok(a) => a,
             Err(e) => {
                 tracing::error!("Failed to create execution record: {}", e);
+                // FU-3: transient pre-dispatch failure — engine never ran.
+                self.release_dedup_claim(trigger_id, dedup_claim).await;
                 return Err(anyhow::anyhow!("Internal server error"));
             }
         };
         if let talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, .. } =
             admission
         {
+            // FU-3: transient pre-dispatch failure — a concurrency slot may free
+            // up, so a later retry can succeed; release the dedup claim.
+            self.release_dedup_claim(trigger_id, dedup_claim).await;
             return Ok((
                 StatusCode::TOO_MANY_REQUESTS,
                 format!("Concurrency limit reached: {}", limit),
@@ -1942,6 +1957,9 @@ impl WebhookRouter {
                         "Failed to mark webhook execution failed after graph-load error — execution row left in queued state",
                     );
                 }
+                // FU-3: transient pre-dispatch failure (registry/secrets/graph
+                // build hiccup) — engine never ran; release the dedup claim.
+                self.release_dedup_claim(trigger_id, dedup_claim).await;
                 return Ok((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to load workflow graph",
@@ -2667,6 +2685,8 @@ impl WebhookRouter {
                 trigger_id,
                 false, // auto_respond: replay never waits inline
                 trigger.sync_timeout_secs,
+                // DLQ replay has no inbound dedup claim to release.
+                &None,
             )
             .await?;
         } else if let Some(module_id) = trigger.module_id {
