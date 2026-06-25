@@ -656,11 +656,24 @@ async fn run_single_workflow_chain(
         // redact at the sink as defence-in-depth so a future caller
         // that forgets to redact doesn't open a leak.
         let redacted = talos_dlp_provider::redact_str(&err_msg);
+        // Race-safe finalize via upsert. The `'running'` INSERT for this
+        // execution runs in a fire-and-forget tokio::spawn above (L-29 latency
+        // optimization), so on this fast trigger-error path a plain UPDATE could
+        // run BEFORE that INSERT commits — matching zero rows and orphaning the
+        // execution at `'running'` (force-failed only ~30 min later by the stale
+        // sweep). Upserting records `'failed'` regardless of insert/finalize
+        // ordering; the spawned INSERT's `ON CONFLICT DO NOTHING` then preserves
+        // it. The conflict-update WHERE keeps the existing terminal-state guard.
         if let Err(db_err) = sqlx::query(
-            "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $1 WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
+            "INSERT INTO workflow_executions (id, workflow_id, user_id, status, started_at, completed_at, error_message) \
+             VALUES ($2, $3, $4, 'failed', NOW(), NOW(), $1) \
+             ON CONFLICT (id) DO UPDATE SET status = 'failed', completed_at = NOW(), error_message = $1 \
+             WHERE workflow_executions.status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
         )
         .bind(&redacted)
         .bind(execution_id)
+        .bind(workflow_id)
+        .bind(user_id)
         .execute(db_pool)
         .await {
             tracing::error!("Database operation failed in engine: {}", db_err);
@@ -706,11 +719,21 @@ async fn run_single_workflow_chain(
             // persistence. Mirrors the success path which already
             // uses redact_json above (line ~475).
             let redacted = talos_dlp_provider::redact_str(&e.to_string());
+            // Race-safe finalize via upsert (see the trigger-error path above):
+            // run_with_seed_via_nats can fail fast (NATS unavailable, invalid
+            // graph) before the spawned `'running'` INSERT commits, so a plain
+            // UPDATE could orphan the row at `'running'`. Upsert is correct in
+            // either ordering.
             if let Err(db_err) = sqlx::query(
-                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $1 WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
+                "INSERT INTO workflow_executions (id, workflow_id, user_id, status, started_at, completed_at, error_message) \
+                 VALUES ($2, $3, $4, 'failed', NOW(), NOW(), $1) \
+                 ON CONFLICT (id) DO UPDATE SET status = 'failed', completed_at = NOW(), error_message = $1 \
+                 WHERE workflow_executions.status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
             )
             .bind(&redacted)
             .bind(execution_id)
+            .bind(workflow_id)
+            .bind(user_id)
             .execute(db_pool)
             .await {
     tracing::error!("Database operation failed in engine: {}", db_err);
