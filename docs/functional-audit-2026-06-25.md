@@ -11,7 +11,7 @@ systemic bug *classes* identified, swept to exhaustion, and now **frozen with
 structural lints** (checks 46/47, #272); and ~30 surfaces verified clean
 (including the full OAuth CSRF/state boundary, the MCP untrusted-compile path,
 sub-workflow dispatch, the loop/collect/capability-dispatch structural nodes,
-and the LLM dispatch kinds on tier-1 local Ollama).** This
+the LLM dispatch kinds on tier-1 local Ollama, and the judge/reflective-retry/agent-loop orchestration nodes).** This
 doc captures the bugs, the two classes (and the lints that freeze them), and the
 negative results (so they aren't re-investigated).
 
@@ -371,3 +371,16 @@ squash merge.
   - *Note:* `judge`/`reflection` with a real LLM is covered by composition — the
     LLM module returns the verdict JSON and the judge contract parse +
     single-terminal collapse are already verified above.
+- **LLM-orchestration nodes** (judge / reflective_retry / agent_loop). Built each
+  with its graph-mutation tool and ran the parent end-to-end (tier-1 Ollama):
+  - *judge node* — gates on `pass_threshold` against a judge workflow's verdict:
+    score 0.9 vs threshold 0.5 → pass (stamps `__judge_score__` /
+    `__judge_passed__` and passes the upstream output through); 0.9 vs 0.95 →
+    fail (`on_failure: error` → `__error` → execution `failed`).
+  - *reflective_retry* — child that always fails with `max_retries: 2` → runs the
+    attempts, invokes the reflection workflow between them, and on exhaustion
+    fails with a clear "Reflective retry exhausted 2 attempts. Last error: …"
+    message (no hang, no silent pass).
+  - *agent_loop* — a real-LLM body workflow with `max_iterations: 2` → ran 2
+    iterations, accumulated `__agent_history__` (2 entries), capped at the limit
+    (`finished: false`, `iterations: 2`), `final_output` carried the LLM answer.
