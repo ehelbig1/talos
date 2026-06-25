@@ -1,0 +1,24 @@
+-- Drop the ON DELETE CASCADE foreign key from secret_audit_log -> secrets.
+--
+-- An append-only audit log must NOT be FK-bound to the deletable entity it
+-- records. `secret_audit_log.secret_id` was declared
+-- `REFERENCES secrets(id) ON DELETE CASCADE` (001_initial_schema.sql), but
+-- `secret_audit_log` also carries the `prevent_audit_modification` trigger
+-- (BEFORE DELETE OR UPDATE) from 20260408000001_audit_log_immutability.sql.
+-- The two are mutually exclusive:
+--   * deleting a secret tried to CASCADE-delete its audit rows -> the
+--     immutability trigger raised -> the whole DELETE aborted, so
+--     `deleteSecret` could NEVER succeed for any secret that had an audit row
+--     (creation writes one, so: every secret); and
+--   * `delete_secret` then inserts a "delete" audit row referencing the
+--     just-removed secret, which the FK would also reject.
+-- `ON DELETE SET NULL` is no fix either — the SET-NULL is an UPDATE, which the
+-- same trigger blocks.
+--
+-- Removing the FK lets `secret_id` remain a nullable historical reference: the
+-- audit row survives the secret's deletion (the point of an audit log), the
+-- immutability trigger is never invoked on the secret-delete path, and
+-- `deleteSecret` works. Audit reads should LEFT JOIN secrets (rows for deleted
+-- secrets simply have no joinable parent).
+ALTER TABLE secret_audit_log
+    DROP CONSTRAINT IF EXISTS secret_audit_log_secret_id_fkey;
