@@ -6,12 +6,12 @@ goal was to exercise the data-plane and governance paths a real operator hits an
 find correctness bugs that pass `cargo check` and the unit suite but break at
 request time.
 
-**Outcome: 12 real bugs found and fixed (all live-verified and merged); two
+**Outcome: 13 real bugs found and fixed (all live-verified and merged); two
 systemic bug *classes* identified, swept to exhaustion, and now **frozen with
-structural lints** (checks 46/47, #272); and ~28 surfaces verified clean
+structural lints** (checks 46/47, #272); and ~30 surfaces verified clean
 (including the full OAuth CSRF/state boundary, the MCP untrusted-compile path,
-sub-workflow dispatch, and the loop/collect/capability-dispatch structural
-nodes).** This
+sub-workflow dispatch, the loop/collect/capability-dispatch structural nodes,
+and the LLM dispatch kinds on tier-1 local Ollama).** This
 doc captures the bugs, the two classes (and the lints that freeze them), and the
 negative results (so they aren't re-investigated).
 
@@ -179,6 +179,20 @@ to the check's `AUDIT_TABLES`.
     shared dependency cache. Verified live: parallel compiles now yield distinct
     `content_hash`es.
 
+13. **#281 — fresh `make up` baked a 768-dim embedder against 1024-dim runtime**
+    (completes #265). #265 fixed the *runtime* embedding config
+    (`EMBEDDING_MODEL=mxbai-embed-large`, `EMBEDDING_DIMENSIONS=1024`) but left
+    the docker-compose `EMBED_MODEL` *build-arg* default at `nomic-embed-text`
+    (768-dim), overriding `Dockerfile.ollama`'s own `mxbai` default. Since
+    `ollama_data` is a named volume seeded from the baked image, a fresh clone
+    baked a 768-dim embedder while the controller requests
+    `mxbai-embed-large` (1024) → every semantic / actor-memory write fails
+    (model-not-present on the OpenAI-compat embeddings endpoint, or pgvector's
+    dimension check). Same dimension-mismatch class as #265, surviving on the
+    bake side. Fixed the compose default to `mxbai-embed-large` so baked model +
+    runtime model + dimensions + column dim are all 1024 in lockstep. Found while
+    wiring up local Ollama to test the LLM dispatch kinds.
+
 Plus **#262** — restored four onboarding fixes (`/auth/csrf` dev proxy, catalog
 seeding default, self-loop edge guard, frontend port docs) dropped by #259's
 squash merge.
@@ -338,3 +352,22 @@ squash merge.
   confirmed live: disallowed dependency rejected; a type error returns a clean
   **pre-compile lint** error (skips the ~30–60 s doomed compile); invalid
   `capability_world` rejected with the valid-values list.
+- **LLM dispatch kinds (tier-1 local Ollama).** After fixing the embedder bake
+  (#281), pulled `llama3.2:1b` into the dev Ollama and exercised the LLM paths
+  with **no external API key** (tier-1, data stays on-host):
+  - *direct `llm::complete`* — an `agent-node` module calling
+    `talos::core::llm::complete` with `provider: ollama, model: llama3.2:1b`
+    runs real inference: "What is 2+2?" → "4", `completed`.
+  - *ensemble* — `add_ensemble_node` over the chat workflow ×3 with
+    `majority_vote` consensus → "Paris.", output stamped `__ensemble_method__` /
+    `__ensemble_size__`. (Consensus is validated: `majority`→ rejected, only
+    `majority_vote` / `best_of_n` / `first_pass` accepted.)
+  - *llm_dispatch* — an LLM classifier workflow returns `{class}`; the dispatch
+    routes to the matching route workflow and runs it, stamping
+    `__dispatched_class__` / `__dispatched_workflow_id__` ("Capital of Japan?" →
+    "Tokyo." via the `general` route). Routing is faithful to whatever class the
+    classifier returns (the 1b model's occasional misclassification is model
+    quality, not a dispatch bug).
+  - *Note:* `judge`/`reflection` with a real LLM is covered by composition — the
+    LLM module returns the verdict JSON and the judge contract parse +
+    single-terminal collapse are already verified above.
