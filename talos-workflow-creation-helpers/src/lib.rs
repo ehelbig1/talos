@@ -263,6 +263,70 @@ pub fn validate_edge_targets(edges: &[Value], all_node_ids: &HashSet<&str>) -> R
     Ok(())
 }
 
+/// Reject directed cycles across the full edge set.
+///
+/// `validate_edge_targets` only rejects the trivial self-edge case
+/// (`n -> n`); a multi-node cycle (`a -> b -> a`) slips past it. The
+/// workflow engine requires a DAG — `is_cyclic_directed` fails the run
+/// with "workflow graph contains a cycle" — and both the `add_edge` and
+/// from-description authoring paths already reject cycles up front. This
+/// closes the gap on `create_workflow`, which otherwise persists an
+/// unexecutable workflow whose only error surfaces at trigger time.
+///
+/// Pure (no `petgraph` dependency in this crate): iterative three-colour
+/// DFS over an adjacency map keyed by node id. Only edges whose endpoints
+/// are both declared nodes are considered — call AFTER
+/// `validate_edge_targets`, which guarantees that.
+pub fn validate_acyclic(edges: &[Value], node_ids: &HashSet<&str>) -> Result<(), String> {
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in edges {
+        let src = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let tgt = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        if node_ids.contains(src) && node_ids.contains(tgt) {
+            adj.entry(src.to_string())
+                .or_default()
+                .push(tgt.to_string());
+        }
+    }
+
+    // colour: absent/0 = unvisited, 1 = on the current DFS path, 2 = done.
+    // Iterative (explicit stack) so a pathological chain can't overflow.
+    let mut color: HashMap<String, u8> = HashMap::new();
+    for start in node_ids {
+        if color.get(*start).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        let mut stack: Vec<(String, usize)> = vec![(start.to_string(), 0)];
+        color.insert(start.to_string(), 1);
+        while let Some((node, idx)) = stack.last().map(|(n, i)| (n.clone(), *i)) {
+            let next = adj.get(&node).and_then(|ch| ch.get(idx)).cloned();
+            match next {
+                Some(child) => {
+                    stack.last_mut().unwrap().1 += 1;
+                    match color.get(&child).copied().unwrap_or(0) {
+                        1 => {
+                            return Err(format!(
+                                "Workflow graph contains a cycle involving node '{child}'. \
+                                 Cycles are not allowed — the workflow engine requires a DAG.",
+                            ));
+                        }
+                        0 => {
+                            color.insert(child.clone(), 1);
+                            stack.push((child, 0));
+                        }
+                        _ => {}
+                    }
+                }
+                None => {
+                    color.insert(node, 2);
+                    stack.pop();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Cap edge `condition` strings at 2000 characters. Long Rhai
 /// expressions inflate `graph_json` rapidly and the engine truncates at
 /// the same boundary; rejecting up-front gives a clearer error.
@@ -1585,6 +1649,76 @@ pub fn build_add_node_payload(inputs: AddNodeInputs<'_>) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn ids<'a>(v: &[&'a str]) -> HashSet<&'a str> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn acyclic_linear_chain_ok() {
+        let edges = vec![
+            json!({"source": "a", "target": "b"}),
+            json!({"source": "b", "target": "c"}),
+        ];
+        assert!(validate_acyclic(&edges, &ids(&["a", "b", "c"])).is_ok());
+    }
+
+    #[test]
+    fn acyclic_diamond_dag_ok() {
+        // a -> b, a -> c, b -> d, c -> d  (fan-out/fan-in, no cycle)
+        let edges = vec![
+            json!({"source": "a", "target": "b"}),
+            json!({"source": "a", "target": "c"}),
+            json!({"source": "b", "target": "d"}),
+            json!({"source": "c", "target": "d"}),
+        ];
+        assert!(validate_acyclic(&edges, &ids(&["a", "b", "c", "d"])).is_ok());
+    }
+
+    #[test]
+    fn acyclic_two_node_cycle_rejected() {
+        let edges = vec![
+            json!({"source": "a", "target": "b"}),
+            json!({"source": "b", "target": "a"}),
+        ];
+        let err = validate_acyclic(&edges, &ids(&["a", "b"])).unwrap_err();
+        assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    #[test]
+    fn acyclic_three_node_cycle_rejected() {
+        let edges = vec![
+            json!({"source": "a", "target": "b"}),
+            json!({"source": "b", "target": "c"}),
+            json!({"source": "c", "target": "a"}),
+        ];
+        assert!(validate_acyclic(&edges, &ids(&["a", "b", "c"])).is_err());
+    }
+
+    #[test]
+    fn acyclic_self_loop_rejected() {
+        let edges = vec![json!({"source": "a", "target": "a"})];
+        assert!(validate_acyclic(&edges, &ids(&["a"])).is_err());
+    }
+
+    #[test]
+    fn acyclic_disconnected_and_empty_ok() {
+        assert!(validate_acyclic(&[], &ids(&["a", "b"])).is_ok());
+        // two independent edges, no shared cycle
+        let edges = vec![
+            json!({"source": "a", "target": "b"}),
+            json!({"source": "c", "target": "d"}),
+        ];
+        assert!(validate_acyclic(&edges, &ids(&["a", "b", "c", "d"])).is_ok());
+    }
+
+    #[test]
+    fn acyclic_ignores_edges_to_undeclared_nodes() {
+        // edge into a node not in the declared set is ignored (validate_edge_targets
+        // owns that rejection); cycle detection must not panic or false-positive.
+        let edges = vec![json!({"source": "a", "target": "ghost"})];
+        assert!(validate_acyclic(&edges, &ids(&["a"])).is_ok());
+    }
 
     #[test]
     fn partition_separates_structural_from_regular() {
