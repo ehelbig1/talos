@@ -6,9 +6,11 @@ goal was to exercise the data-plane and governance paths a real operator hits an
 find correctness bugs that pass `cargo check` and the unit suite but break at
 request time.
 
-**Outcome: 9 real bugs found and fixed (all live-verified, all merged); two
-systemic bug *classes* identified, swept to exhaustion, and now **frozen with
-structural lints** (checks 46/47, #272); and ~18 surfaces verified clean.** This
+**Outcome: 10 real bugs found and fixed (all live-verified; #261–#271 merged,
+#275 open); two systemic bug *classes* identified, swept to exhaustion, and now
+**frozen with structural lints** (checks 46/47, #272); and ~23 surfaces verified
+clean (including the full OAuth CSRF/state boundary and the MCP untrusted-compile
+path).** This
 doc captures the bugs, the two classes (and the lints that freeze them), and the
 negative results (so they aren't re-investigated).
 
@@ -134,6 +136,21 @@ to the check's `AUDIT_TABLES`.
    `ctx.waiting`), and the finalizers accept `status IN ('running','resuming')`.
    Opt-in feature, but broke resume completion entirely when enabled.
 
+10. **#275 — `compile_custom_sandbox` pointed callers at a dead execution path.**
+    The MCP tool's success message told the caller to run the freshly-compiled
+    module via a `sandbox_<short_id>-v1` tool that can never resolve: the
+    `short_id` comes from a throwaway `Uuid::new_v4()` that's never persisted
+    (the module is stored in the unified `modules` table under a *separate*
+    `module_id`, returned as "Template ID"); user-compiled sandboxes aren't
+    registered in `tools/list` at all (only catalog templates are); and the
+    generic `*-v1` dispatcher routes every such call to
+    `install_module_from_catalog`, whose slug lookup fails with
+    `"Module 'sandbox-<short_id>' not found in catalog"`. An MCP agent following
+    the tool's own guidance hit a wall. Reproduced live, then repointed the
+    message at the two paths that actually work (`module_id` in a workflow, or
+    `test_module(module_id)` for a direct one-shot — both verified executing).
+    *(PR open at time of writing, not yet merged.)*
+
 Plus **#262** — restored four onboarding fixes (`/auth/csrf` dev proxy, catalog
 seeding default, self-loop edge guard, frontend port docs) dropped by #259's
 squash merge.
@@ -226,3 +243,26 @@ squash merge.
     real provider token exchange → user create/link → session issuance —
     requires a registered provider OAuth app + `*_CLIENT_ID`/`*_CLIENT_SECRET`
     in env. See `docs/OAUTH_SETUP.md`.
+- **MCP server / untrusted-compile path.** Driven end-to-end through the real
+  JSON-RPC `/mcp` endpoint. Auth chain: GraphQL signup → admin API key →
+  `register_mcp_agent` → agent Bearer token (a *separate* `mcp_agents` identity,
+  not the GraphQL `X-API-Key`). All paths below verified against the running
+  stack; the one bug found is #275 above.
+  - *Auth* — `/mcp` with no token → 401; agent Bearer token authenticates; 376
+    tools enumerated.
+  - *Valid compile* — `compile_custom_sandbox` (minimal-node) compiles real Rust
+    → WASM and persists to the unified `modules` table (owned by the caller,
+    content-hashed, ~106 KB), runnable.
+  - *Dependency allowlist* — disallowed crate (`reqwest`), wildcard version
+    (`serde = "*"`), and wrong-shape `dependencies` (string instead of object,
+    MCP-307) all rejected before the build, with clear messages.
+  - *Capability gating* — invalid `capability_world` rejected; the per-role
+    ceiling is enforced (the rejection surfaces the role's allowed capability
+    set).
+  - *Runtime* — `run_sandbox` (inline compile + execute) and
+    `test_module(module_id)` (execute a *stored* module) both run with fuel
+    accounting (`__fuel_consumed__`).
+  - *Persistence* — compiled sandboxes land in `modules` (Phase-5.1 unified the
+    legacy `node_templates` / `wasm_modules` tables away); the returned
+    "Template ID" is `modules.id` and drives both the workflow and `test_module`
+    paths.
