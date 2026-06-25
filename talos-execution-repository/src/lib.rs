@@ -1317,7 +1317,7 @@ impl ExecutionRepository {
                  SET status = 'waiting', output_data = NULL, \
                      output_data_enc = $1, output_enc_key_id = $2, \
                      output_data_format = $3 \
-                 WHERE id = $4 AND status = 'running'",
+                 WHERE id = $4 AND status IN ('running', 'resuming')",
             )
             .bind(&enc_bytes)
             .bind(key_id)
@@ -1334,7 +1334,7 @@ impl ExecutionRepository {
             let redacted = talos_dlp_provider::redact_json(output);
             sqlx::query(
                 "UPDATE workflow_executions SET status = 'waiting', output_data = $2 \
-                 WHERE id = $1 AND status = 'running'",
+                 WHERE id = $1 AND status IN ('running', 'resuming')",
             )
             .bind(exec_id)
             .bind(&redacted)
@@ -1367,7 +1367,7 @@ impl ExecutionRepository {
                  SET status = 'completed', output_data = NULL, \
                      output_data_enc = $1, output_enc_key_id = $2, \
                      output_data_format = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status = 'running'",
+                 WHERE id = $4 AND status IN ('running', 'resuming')",
             )
             .bind(&enc_bytes)
             .bind(key_id)
@@ -1382,7 +1382,7 @@ impl ExecutionRepository {
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'completed', output_data = $1, completed_at = NOW() \
-                 WHERE id = $2 AND status = 'running'",
+                 WHERE id = $2 AND status IN ('running', 'resuming')",
             )
             .bind(&redacted)
             .bind(exec_id)
@@ -1465,7 +1465,7 @@ impl ExecutionRepository {
                  SET status = 'failed', error_message = $1, output_data = NULL, \
                      output_data_enc = $2, output_enc_key_id = $3, \
                      output_data_format = $4, completed_at = NOW() \
-                 WHERE id = $5 AND status = 'running'",
+                 WHERE id = $5 AND status IN ('running', 'resuming')",
             )
             .bind(&redacted_error)
             .bind(enc_bytes.as_deref())
@@ -1481,7 +1481,7 @@ impl ExecutionRepository {
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'failed', error_message = $1, output_data = $2, completed_at = NOW() \
-                 WHERE id = $3 AND status = 'running'",
+                 WHERE id = $3 AND status IN ('running', 'resuming')",
             )
             .bind(&redacted_error)
             .bind(redacted_output.as_ref())

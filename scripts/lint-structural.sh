@@ -3124,6 +3124,104 @@ else
 fi
 echo
 
+bold "▶ check 46: execution finalizers must accept 'resuming', not only 'running'"
+
+# A terminal-status writer on `workflow_executions` guarded
+# `WHERE id = $N AND status = 'running'` (NOT including 'resuming') cannot
+# finalize a crash-recovery-claimed row. The recovery sweep flips a stalled
+# `running` row to `resuming` (claim_stuck_execution_for_resume) BEFORE re-running
+# it, so a `running`-only completer / failer / waiter no-ops and the resumed
+# execution sticks in `resuming` forever (force-failed only by the 30-min stale
+# sweep) — PR #271. fence.rs documents these writes as
+# `WHERE status = 'running' (or 'resuming')`; the safe guard is
+# `status IN ('running', 'resuming')`. This freezes it: any single-line
+# `WHERE id = $N AND status = 'running'` in the execution-status repos fails.
+# (The `queued -> running` promotion guards on `status = 'queued'`, and the
+# child-row cleanup keys on `workflow_execution_id` — both out of scope by shape.)
+# Opt-out: `// allow-running-only-finalize: <reason>` within 4 lines above.
+
+RESUME_FINALIZE_VIOLATIONS=0
+rf_matches=$(grep -rnE --include='*.rs' \
+    "WHERE id = [\$][0-9]+ AND status = 'running'" \
+    talos-workflow-repository talos-execution-repository 2>/dev/null || true)
+if [ -n "$rf_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        [ -f "$file" ] || continue
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q 'allow-running-only-finalize'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        RESUME_FINALIZE_VIOLATIONS=$((RESUME_FINALIZE_VIOLATIONS + 1))
+    done <<< "$rf_matches"
+fi
+
+if [ "$RESUME_FINALIZE_VIOLATIONS" -gt 0 ]; then
+    red "✗ $RESUME_FINALIZE_VIOLATIONS execution finalizer guard(s) accept only 'running', not 'resuming'"
+    yellow "  → widen to status IN ('running', 'resuming') so crash-recovery resumes finalize (PR #271)."
+    yellow "  → or // allow-running-only-finalize: <reason> if the write must target 'running' exclusively."
+    EXIT_CODE=1
+else
+    green "✓ execution finalizers accept 'resuming' (crash-recovery resumes can finalize)"
+fi
+echo
+
+bold "▶ check 47: append-only audit tables must not gain CASCADE/SET NULL FKs"
+
+# A table carrying the prevent_audit_modification trigger (BEFORE DELETE OR
+# UPDATE) MUST NOT have an incoming FK with ON DELETE CASCADE or SET NULL: both
+# fire a DELETE/UPDATE on the immutable audit row and abort the parent's
+# deletion. secret_audit_log -> secrets CASCADE made every secret undeletable
+# (#264); auth_audit_log / admin_event_log -> users SET NULL made users
+# undeletable (#266). Audit rows must hold the parent id as a plain (nullable)
+# historical reference. This freezes it: a CREATE/ALTER of an append-only audit
+# table that adds `ON DELETE CASCADE|SET NULL` fails. Pre-fix history is
+# grandfathered by timestamp — those bad FKs are dropped by 20260625140000 /
+# 20260625150000; only migrations newer than the last fix are scanned. Adding a
+# NEW append-only audit table? Append its name to AUDIT_TABLES below.
+
+AUDIT_FK_VIOLATIONS=0
+AUDIT_TABLES='admin_event_log audit_events auth_audit_log secret_audit_log'
+AUDIT_FK_CUTOFF=20260625150000
+for mig in "$ROOT"/migrations/*.sql; do
+    [ -f "$mig" ] || continue
+    ts=$(basename "$mig" | grep -oE '^[0-9]{14}' || true)
+    [ -n "$ts" ] || ts=0
+    # Grandfather everything at/before the last audit-FK fix migration.
+    if [ "$ts" -le "$AUDIT_FK_CUTOFF" ] 2>/dev/null; then
+        continue
+    fi
+    for tbl in $AUDIT_TABLES; do
+        hit=$(awk -v t="$tbl" '
+            BEGIN { inblk = 0 }
+            (/CREATE TABLE/ || /ALTER TABLE/) && index($0, t) { inblk = 1 }
+            inblk && (/ON DELETE CASCADE/ || /ON DELETE SET NULL/) { print NR ": " $0 }
+            inblk && /;/ { inblk = 0 }
+        ' "$mig" 2>/dev/null || true)
+        if [ -n "$hit" ]; then
+            while IFS= read -r h; do
+                printf '  %s:%s  [%s]\n' "$(basename "$mig")" "$h" "$tbl"
+                AUDIT_FK_VIOLATIONS=$((AUDIT_FK_VIOLATIONS + 1))
+            done <<< "$hit"
+        fi
+    done
+done
+
+if [ "$AUDIT_FK_VIOLATIONS" -gt 0 ]; then
+    red "✗ $AUDIT_FK_VIOLATIONS append-only audit-table FK(s) with ON DELETE CASCADE/SET NULL"
+    yellow "  → an append-only audit row must reference its parent WITHOUT an enforced delete action,"
+    yellow "    or the parent becomes undeletable (immutability trigger blocks the cascade) — #264/#266."
+    EXIT_CODE=1
+else
+    green "✓ no append-only audit table gains a CASCADE/SET NULL FK"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
