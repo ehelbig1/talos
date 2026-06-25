@@ -14,7 +14,8 @@ starts the stack and waits for it to report healthy. The first build compiles
 the ~100-crate Rust workspace, so it takes a while; later runs are cached.
 
 **Access:**
-- Frontend (start with `docker compose up -d frontend`): http://localhost:3000
+- Frontend (start with `docker compose up -d frontend`): http://localhost:3002
+  (note: **3002**, not 3000 — the compose dev stack publishes it there)
 - API: http://localhost:8000
 - GraphiQL (dev only): http://localhost:8000/graphql
 - Health: http://localhost:8000/health
@@ -101,7 +102,7 @@ unset, so it's enabled. If you set it, unset it and `make restart SERVICE=contro
 
 ### Port already in use
 ```bash
-lsof -i :3000   # frontend
+lsof -i :3002   # frontend (compose publishes it on 3002)
 lsof -i :8000   # API
 lsof -i :5432   # postgres (only if you exposed it)
 ```

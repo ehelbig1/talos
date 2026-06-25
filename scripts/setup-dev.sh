@@ -52,8 +52,10 @@ GRAFANA_PASSWORD=admin
 DATABASE_URL=postgres://talos:__PGPW__@postgres:5432/talos
 RUST_LOG=info,controller=debug
 BASE_URL=http://localhost:8000
-FRONTEND_URL=http://localhost:3000
-ALLOWED_ORIGIN=http://localhost:3000
+# Frontend is published on host port 3002 by docker-compose.yml (which also
+# hardcodes these two for the controller container; set here for host-run dev).
+FRONTEND_URL=http://localhost:3002
+ALLOWED_ORIGIN=http://localhost:3002
 TRUSTED_IPS=127.0.0.1,::1
 
 # ─── Optional ───────────────────────────────────────────────────────────────
@@ -88,7 +90,7 @@ cat <<'EOF'
 
 ✅ Setup complete!
 
-  Frontend (optional):  docker compose up -d frontend   → http://localhost:3000
+  Frontend (optional):  docker compose up -d frontend   → http://localhost:3002
   API / GraphiQL:       http://localhost:8000/graphql
   Health:               http://localhost:8000/health
 
