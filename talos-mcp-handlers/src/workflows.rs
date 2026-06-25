@@ -1685,6 +1685,18 @@ async fn handle_create_workflow(
         connect_from_edges,
     );
 
+    // Reject directed cycles over the FULL edge set (explicit edges +
+    // connect_from/connect_to shorthand). `validate_edge_targets` above
+    // only catches the trivial self-edge; a multi-node cycle
+    // (a -> b -> a) would otherwise be persisted as an unexecutable
+    // workflow that fails only at trigger time with "workflow graph
+    // contains a cycle". The add_edge and from-description authoring
+    // paths already gate on this — close the gap on create_workflow.
+    if let Err(msg) = talos_workflow_creation_helpers::validate_acyclic(&graph_edges, &all_node_ids)
+    {
+        return mcp_error(req_id, -32602, &msg);
+    }
+
     let mut graph_json_value = serde_json::json!({ "nodes": graph_nodes, "edges": graph_edges });
     // MCP-239 (2026-05-08): MCP-227 family — pre-fix `as_u64()` returned
     // None for negative / fractional / wrong-type, the `if let Some`
