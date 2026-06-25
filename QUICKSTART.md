@@ -62,8 +62,9 @@ Run `make help` for the full target list.
 
 ## LLM models
 
-- **Embeddings / semantic search work out of the box** — the small
-  `nomic-embed-text` model (~274 MB) is baked into the `ollama` image.
+- **Embeddings / semantic search work out of the box** — the
+  `mxbai-embed-large` model (~670 MB, 1024-dim) is baked into the `ollama`
+  image; its dimension matches the `vector(1024)` embedding columns.
 - **Tier-2 (external) LLM** nodes need a provider key. Add to `.env`:
   ```
   ANTHROPIC_API_KEY=sk-ant-...

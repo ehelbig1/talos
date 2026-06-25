@@ -3,8 +3,14 @@ FROM ollama/ollama:0.5.1@sha256:722ce8caba5f8b8bd2ee654b2e29466415be3071a704e3f4
 # Models baked into the image at build time.
 #
 # DEFAULT (dev onboarding): only the embedding model is baked — it's small
-# (~274 MB), so `make up` succeeds on any machine without a large Docker disk.
+# (~670 MB), so `make up` succeeds on any machine without a large Docker disk.
 # Semantic search and actor-memory embeddings work out of the box.
+#
+# The embedding model MUST match the embedding columns' dimension. The
+# `vector(...)` columns are 1024-dim (migration 20260429120000, Voyage), and
+# mxbai-embed-large emits 1024 dims — they agree. If you switch EMBED_MODEL,
+# keep EMBEDDING_MODEL/EMBEDDING_DIMENSIONS (docker-compose.yml) and the column
+# dimension in lockstep, or pgvector rejects every write at INSERT time.
 #
 # Tier-1 LOCAL LLM models (qwen2.5:32b etc.) are OPT-IN. They are huge — baking
 # qwen2.5:32b into the image needs ~30 GB of free Docker-VM disk, and a fresh
@@ -24,8 +30,9 @@ FROM ollama/ollama:0.5.1@sha256:722ce8caba5f8b8bd2ee654b2e29466415be3071a704e3f4
 #   TIER1_MODEL=llama3.3:70b
 # All expose the same OpenAI-compatible API the controller already uses.
 
-# Embedding model — always baked; small and required for semantic search.
-ARG EMBED_MODEL=nomic-embed-text
+# Embedding model — always baked; required for semantic search. 1024-dim to
+# match the embedding columns (see note above).
+ARG EMBED_MODEL=mxbai-embed-large
 ENV EMBED_MODEL=${EMBED_MODEL}
 
 # Tier-1 local LLM models — comma-separated, OPT-IN, empty by default.
