@@ -727,8 +727,13 @@ services:
       context: .
       dockerfile: Dockerfile.ollama
       args:
-        # Embedding model (~274 MB) is always baked — required for semantic search.
-        EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+        # Embedding model (~669 MB) is always baked — required for semantic search.
+        # MUST be 1024-dim to match the runtime EMBEDDING_MODEL (mxbai-embed-large),
+        # EMBEDDING_DIMENSIONS=1024, and the vector(1024) columns. A 768-dim model
+        # (e.g. nomic-embed-text) bakes an image whose embeddings pgvector rejects
+        # at INSERT — the #265 dimension-mismatch class. Keep in lockstep with
+        # EMBEDDING_MODEL above and Dockerfile.ollama's ARG default.
+        EMBED_MODEL: ${EMBED_MODEL:-mxbai-embed-large}
         # Tier-1 local LLM models are OPT-IN (huge). Set TIER1_MODEL in .env
         # (e.g. qwen2.5:32b) and `make rebuild SERVICE=ollama` to bake them in.
         # Empty default keeps the image small so `make up` never blows the disk.
