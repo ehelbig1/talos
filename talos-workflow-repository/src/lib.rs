@@ -1428,6 +1428,30 @@ impl WorkflowRepository {
         Ok(())
     }
 
+    /// Transition a `queued` execution to `running`. Returns `true` if a row
+    /// was promoted, `false` if the execution was not `queued` (already
+    /// running/terminal, or claimed by another dispatcher).
+    ///
+    /// The GraphQL `trigger_workflow` path creates the row as `queued` and
+    /// dispatches the engine in a `tokio::spawn`; it MUST call this before the
+    /// engine runs. Otherwise the row stays `queued`, and the success-path
+    /// `mark_execution_completed` (guarded `WHERE status = 'running'`) silently
+    /// no-ops — leaving every successful run stuck at `queued` until the
+    /// stuck-execution sweep force-fails it. Mirrors
+    /// `ExecutionRepository::mark_execution_running_from_queued` (the
+    /// `enqueue_workflow` dispatch path); kept here so this crate's callers
+    /// don't take a dependency on `talos-execution-repository`.
+    pub async fn mark_execution_running_from_queued(&self, execution_id: Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workflow_executions SET status = 'running', started_at = NOW() \
+             WHERE id = $1 AND status = 'queued'",
+        )
+        .bind(execution_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Mark an execution as completed with its output JSON.
     ///
     /// N T5-N1: encrypts `output_data` at rest when `with_encryption`

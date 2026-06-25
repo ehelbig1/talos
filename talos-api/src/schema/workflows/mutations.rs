@@ -287,6 +287,39 @@ impl WorkflowsMutations {
                 return;
             }
 
+            // Promote queued -> running now that we hold the dispatch lock.
+            // trigger_workflow creates the row as `queued` so it doesn't
+            // advertise `running` before the engine actually starts. The
+            // success-path `mark_execution_completed` is guarded
+            // `WHERE status = 'running'`, so WITHOUT this promotion it matches
+            // zero rows and silently no-ops — every successful run then sticks
+            // at `queued` until the stuck-execution sweep force-fails it
+            // (observed: 0 executions ever reaching `completed`). `false` means
+            // the row is no longer `queued` (already claimed by another
+            // dispatcher, or terminal) — abort rather than double-run.
+            let dispatch_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+            match dispatch_repo
+                .mark_execution_running_from_queued(execution_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        "Execution no longer queued (already claimed or terminal); skipping dispatch"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        execution_id = %execution_id,
+                        error = %e,
+                        "Failed to promote execution queued -> running; aborting dispatch"
+                    );
+                    return;
+                }
+            }
+
             // Create secrets_manager with proper error handling.
             // allow-secrets-manager-new: defensive fallback. Production
             // GraphQL context always supplies the shared instance via
