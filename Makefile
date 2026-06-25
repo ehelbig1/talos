@@ -23,7 +23,7 @@ SERVICE            ?= controller
 export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
-.PHONY: help up down rebuild restart logs ps shell \
+.PHONY: help setup up down rebuild restart logs ps shell \
         check build lint lint-frontend hooks test test-integration coverage-html audit check-catalog ci \
         drill clean nuke smoke rls-preflight _wait-healthy
 
@@ -37,7 +37,14 @@ help: ## Print this help message
 	@printf '\nService-parameterised targets accept SERVICE=<name> (default: controller).\n'
 	@printf 'Example: make logs SERVICE=postgres\n\n'
 
+setup: ## First-time setup — generate .env with secrets, then build + start
+	@bash scripts/setup-dev.sh
+
 up: ## Build + start the full dev stack, wait for health
+	@test -f .env || { \
+	    printf '\033[1;31m✗ no .env found.\033[0m Run `make setup` to generate one (or see QUICKSTART.md).\n'; \
+	    exit 1; \
+	}
 	@docker compose build controller worker migrate
 	@docker compose up -d --scale worker=1
 	@$(MAKE) _wait-healthy

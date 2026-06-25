@@ -1,140 +1,106 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+#
+# Talos one-command dev setup.
+#
+# Generates a complete .env with secure random secrets (covering every variable
+# docker-compose.yml marks as required), then hands off to `make up`, which
+# builds + starts the stack in Docker. No host Rust toolchain is needed just to
+# run Talos — everything builds inside containers.
+#
+# Idempotent: if .env already exists it is left untouched.
+set -euo pipefail
 
-echo "🔧 Talos Development Environment Setup"
-echo "======================================"
+cd "$(dirname "$0")/.."
+
+echo "🔧 Talos dev setup"
+echo "=================="
 echo ""
 
-# Check if .env exists
 if [ -f .env ]; then
-    echo "✅ .env file already exists"
-    source .env
+    echo "✅ .env already exists — leaving it untouched."
 else
-    echo "📝 Creating .env file with secure random secrets..."
+    echo "📝 Generating .env with secure random secrets..."
 
-    # Generate secure random secrets
-    POSTGRES_PASSWORD=$(openssl rand -hex 32)
-    TALOS_MASTER_KEY=$(openssl rand -hex 32)
-    JWT_SECRET=$(openssl rand -hex 32)
-
-    # Create .env file
+    # TALOS_MASTER_KEY and WORKER_SHARED_KEY MUST be 64 hex chars (32 bytes) —
+    # the config validator rejects anything else. The rest are arbitrary strings.
     cat > .env <<EOF
-# Database Configuration
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-DATABASE_URL=postgres://talos:${POSTGRES_PASSWORD}@localhost:5432/talos
-DB_MAX_CONNECTIONS=30
+# ─── Crypto keys — MUST be 64 hex chars (openssl rand -hex 32) ───────────────
+TALOS_MASTER_KEY=$(openssl rand -hex 32)
+WORKER_SHARED_KEY=$(openssl rand -hex 32)
+JWT_SECRET=$(openssl rand -hex 32)
 
-# Controller Configuration
+# ─── Datastore credentials ──────────────────────────────────────────────────
+POSTGRES_PASSWORD=$(openssl rand -hex 16)
+REDIS_PASSWORD=$(openssl rand -hex 16)
+NATS_USER=talos
+NATS_PASSWORD=$(openssl rand -hex 16)
+NEO4J_PASSWORD=$(openssl rand -hex 16)
+
+# ─── Object store (MinIO) ───────────────────────────────────────────────────
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=$(openssl rand -hex 16)
+MINIO_CONTROLLER_USER=talos-controller
+MINIO_CONTROLLER_PASSWORD=$(openssl rand -hex 16)
+MINIO_WORKER_USER=talos-worker
+MINIO_WORKER_PASSWORD=$(openssl rand -hex 16)
+
+# ─── Observability ──────────────────────────────────────────────────────────
+GRAFANA_PASSWORD=admin
+
+# ─── App config (dev defaults) ──────────────────────────────────────────────
+# DATABASE_URL host is 'postgres' (the compose service), not localhost.
+DATABASE_URL=postgres://talos:__PGPW__@postgres:5432/talos
 RUST_LOG=info,controller=debug
 BASE_URL=http://localhost:8000
-
-# Frontend Configuration
-VITE_API_URL=http://localhost:8000
 FRONTEND_URL=http://localhost:3000
-
-# Security Configuration
-JWT_SECRET=${JWT_SECRET}
-TALOS_MASTER_KEY=${TALOS_MASTER_KEY}
 ALLOWED_ORIGIN=http://localhost:3000
-BCRYPT_COST=12
-
-# Rate Limiting - Whitelist localhost for development
 TRUSTED_IPS=127.0.0.1,::1
 
-# OAuth Configuration (optional - leave empty if not using)
+# ─── Optional ───────────────────────────────────────────────────────────────
+# Tier-2 (external) LLM — uncomment + set to use Anthropic for LLM nodes:
+# ANTHROPIC_API_KEY=
+#
+# Tier-1 (on-host) LLM via Ollama — OPT-IN, large download. Set the model then
+# run \`make rebuild SERVICE=ollama\`. Embeddings already work without this.
+# TIER1_MODEL=qwen2.5:32b
+#
+# OAuth integrations (Gmail / Google Calendar / Slack) — leave blank if unused:
 # GOOGLE_CLIENT_ID=
 # GOOGLE_CLIENT_SECRET=
 # GOOGLE_REDIRECT_URI=http://localhost:8000/auth/oauth/google/callback
 EOF
 
-    echo "✅ Created .env file with secure random secrets"
-    source .env
+    # Stitch the generated Postgres password into DATABASE_URL (portable sed:
+    # write to a temp file rather than relying on GNU/BSD -i differences).
+    PGPW="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)"
+    sed "s|__PGPW__|${PGPW}|" .env > .env.tmp && mv .env.tmp .env
+
+    echo "✅ Created .env"
 fi
 
 echo ""
-echo "🐘 Starting PostgreSQL database..."
-docker-compose up -d postgres
+echo "🚀 Building and starting the stack (first build compiles the Rust"
+echo "   workspace — this takes a while; subsequent runs are cached)..."
+echo ""
+make up
 
-echo ""
-echo "⏳ Waiting for database to be ready..."
-sleep 5
+cat <<'EOF'
 
-# Check if database is ready
-until docker exec talos-postgres pg_isready -U talos > /dev/null 2>&1; do
-    echo "   Waiting for database..."
-    sleep 2
-done
+✅ Setup complete!
 
-echo "✅ Database is ready"
+  Frontend (optional):  docker compose up -d frontend   → http://localhost:3000
+  API / GraphiQL:       http://localhost:8000/graphql
+  Health:               http://localhost:8000/health
 
-echo ""
-echo "🗄️  Running database migrations..."
-if ! command -v sqlx &> /dev/null; then
-    echo "   Installing sqlx-cli..."
-    cargo install sqlx-cli --no-default-features --features postgres
-fi
+Day-to-day:
+  make ps                       Service health + DB row counts
+  make logs SERVICE=controller  Tail one service
+  make rebuild SERVICE=controller   Hot-rebuild after a code change
+  make down                     Stop (preserves data volumes)
+  make nuke                     Wipe everything incl. volumes (needs TALOS_NUKE=yes)
 
-sqlx migrate run
-
-echo ""
-echo "📦 Preparing sqlx offline query cache..."
-cargo sqlx prepare --workspace
-
-echo ""
-echo "🔗 Checking linker (mold)..."
-# .cargo/config.toml pins the mold linker for Linux (-fuse-ld=mold) — a big
-# speedup on a 100+-crate workspace. If it's missing, cargo fails the FINAL
-# LINK with a confusing "linking with `cc` failed" on trivial build scripts
-# (proc-macro2, libc), which looks like a toolchain break but isn't. Catch it
-# here with an actionable message instead.
-if [ "$(uname -s)" = "Linux" ] && ! command -v mold &> /dev/null; then
-    echo "   ⚠️  mold not found — .cargo/config.toml requires it on Linux."
-    if command -v apt-get &> /dev/null; then
-        echo "   Installing mold via apt-get..."
-        sudo apt-get install -y mold || true
-    elif command -v dnf &> /dev/null; then
-        echo "   Installing mold via dnf..."
-        sudo dnf install -y mold || true
-    elif command -v pacman &> /dev/null; then
-        echo "   Installing mold via pacman..."
-        sudo pacman -S --noconfirm mold || true
-    fi
-    if ! command -v mold &> /dev/null; then
-        echo "   Could not auto-install mold. Either install it manually"
-        echo "   (https://github.com/rui314/mold) or build without it:"
-        echo "       RUSTFLAGS=\"\" cargo build --workspace"
-    fi
-fi
-
-echo ""
-echo "🔨 Building workspace..."
-cargo build --workspace
-
-echo ""
-echo "✅ Setup complete!"
-echo ""
-echo "Next steps:"
-echo "  1. Start all services:  docker-compose up -d"
-echo "  2. View logs:           docker-compose logs -f"
-echo "  3. Access frontend:     http://localhost:3000"
-echo "  4. Access API:          http://localhost:8000"
-echo "  5. GraphiQL (dev):      http://localhost:8000/graphql"
-echo ""
-echo "Useful commands:"
-echo "  cargo test              Run tests"
-echo "  make status             Show database row counts (confirm data survived a rebuild)"
-echo "  make down               Stop all services (preserves data)"
-echo "  make clean              Remove containers + local images (preserves data)"
-echo "  make rc                 Hot-rebuild controller only (~60s, preserves data)"
-echo "  make reset-db           Drop and recreate database (⚠️  deletes all data)"
-echo "  make nuke               Remove everything including volumes (⚠️  deletes all data)"
-echo ""
-echo "Start-from-scratch recovery (without losing workflow definitions):"
-echo "  1. In the MCP client, run: export_platform_state"
-echo "     Save the JSON manifest to a file (e.g. talos_state.json)"
-echo "  2. Run: make nuke && make up-dev"
-echo "  3. Re-provision secrets: set_secret for each entry in secret_references"
-echo "  4. In the MCP client, run: import_platform_state with the saved manifest"
-echo "     Catalog modules (llm-inference, http-request, etc.) are auto-remapped by name."
-echo "     Custom sandboxes must be recompiled: run compile_custom_sandbox for each."
-echo ""
+LLM notes:
+  • Embeddings / semantic search work out of the box (nomic-embed-text).
+  • Tier-2 LLM nodes need ANTHROPIC_API_KEY in .env.
+  • Tier-1 on-host LLM needs TIER1_MODEL set + `make rebuild SERVICE=ollama`.
+EOF

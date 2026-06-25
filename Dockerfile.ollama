@@ -1,28 +1,46 @@
 FROM ollama/ollama:0.5.1@sha256:722ce8caba5f8b8bd2ee654b2e29466415be3071a704e3f4db1702b83c885f76
 
-# Models baked into the image so they're available on first boot.
+# Models baked into the image at build time.
 #
-# - nomic-embed-text: 768-dim embeddings for semantic search (~274 MB).
-# - qwen2.5:32b (default): Tier-1 LLM for agents that must keep data on-host
-#   (sensitive actors: medical, financial, relationship content). Qwen 2.5 32B
-#   is best-in-class for agent tool-use + JSON-mode output at this size and
-#   fits in 32GB RAM with Q4_K_M quantization (~20 GB on disk).
+# DEFAULT (dev onboarding): only the embedding model is baked — it's small
+# (~274 MB), so `make up` succeeds on any machine without a large Docker disk.
+# Semantic search and actor-memory embeddings work out of the box.
 #
-# Larger hardware upgrade path: build with
-#   docker compose build --build-arg TIER1_MODEL=llama3.3:70b ollama
-# Needs ~64GB RAM; stronger on complex reasoning at ~3x slower token generation.
-# Both expose the same OpenAI-compatible API the controller already uses.
-ARG TIER1_MODEL=qwen2.5:32b
+# Tier-1 LOCAL LLM models (qwen2.5:32b etc.) are OPT-IN. They are huge — baking
+# qwen2.5:32b into the image needs ~30 GB of free Docker-VM disk, and a fresh
+# `make up` without that headroom used to fail mid-build with a cryptic
+# "no space left on device" (and leave a 24 GB half-built image behind). They're
+# only needed by agents that must keep data on-host (sensitive actors: medical,
+# financial, relationship content), so they default OFF.
+#
+# Enable tier-1 local LLM (set in .env, then `make rebuild SERVICE=ollama`):
+#   TIER1_MODEL=qwen2.5:32b        # ~20 GB on disk, fits 32 GB RAM (Q4_K_M)
+# Or directly:
+#   docker compose build --build-arg TIER1_MODEL=qwen2.5:32b ollama
+# Multiple models — comma-separated (include `mistral` if workflows hardcode it,
+# since the Ollama provider falls back to `mistral` when no model is specified):
+#   TIER1_MODEL=qwen2.5:32b,mistral
+# Larger hardware (~64 GB RAM; stronger reasoning, ~3x slower generation):
+#   TIER1_MODEL=llama3.3:70b
+# All expose the same OpenAI-compatible API the controller already uses.
+
+# Embedding model — always baked; small and required for semantic search.
+ARG EMBED_MODEL=nomic-embed-text
+ENV EMBED_MODEL=${EMBED_MODEL}
+
+# Tier-1 local LLM models — comma-separated, OPT-IN, empty by default.
+ARG TIER1_MODEL=
 ENV TIER1_MODEL=${TIER1_MODEL}
 
-RUN ollama serve & \
-    SERVER_PID=$! && \
-    sleep 5 && \
-    ollama pull nomic-embed-text && \
-    ollama pull "${TIER1_MODEL}" && \
-    # Keep `mistral` available too so existing workflows that hardcoded it
-    # continue to work during the default-model migration window.
-    # Remove from this image once all module configs have been flipped to
-    # the new default. Small enough (~4 GB) to keep around.
-    ollama pull mistral && \
-    kill $SERVER_PID 2>/dev/null || true
+# `set -eu` so a failed embed-model pull aborts the build loudly rather than
+# producing an image that silently can't embed. The trailing `kill ... || true`
+# must not abort, so it's guarded.
+RUN set -eu; \
+    ollama serve & \
+    SERVER_PID=$!; \
+    sleep 5; \
+    ollama pull "${EMBED_MODEL}"; \
+    for m in $(echo "${TIER1_MODEL}" | tr ',' ' '); do \
+        if [ -n "$m" ]; then ollama pull "$m"; fi; \
+    done; \
+    kill "$SERVER_PID" 2>/dev/null || true

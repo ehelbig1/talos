@@ -713,6 +713,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ollama
+      args:
+        # Embedding model (~274 MB) is always baked — required for semantic search.
+        EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+        # Tier-1 local LLM models are OPT-IN (huge). Set TIER1_MODEL in .env
+        # (e.g. qwen2.5:32b) and `make rebuild SERVICE=ollama` to bake them in.
+        # Empty default keeps the image small so `make up` never blows the disk.
+        TIER1_MODEL: ${TIER1_MODEL:-}
     container_name: talos-ollama
     # Port 11434 is NOT exposed to the host to prevent conflicts with host Ollama.
     # The controller accesses this service via http://ollama:11434 within the Docker network.
