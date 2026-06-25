@@ -1527,6 +1527,40 @@ impl WebhookRouter {
                 }
             };
 
+            // Finalize the `module_executions` row INSERTed as `running` above.
+            // Without this the webhook-fired module's tracking row sticks at
+            // `running` forever — even on success — because the webhook path
+            // consumes the worker JobResult inline (request/reply) and there is
+            // no result-subscriber to finalize it (the workflow-dispatch path
+            // finalizes via the engine's module_execution_store). Best-effort:
+            // a finalize failure must not change the webhook response.
+            if let Some(svc) = &self.module_execution_service {
+                let finalize = if success {
+                    svc.complete_execution_from_worker(
+                        job_id,
+                        serde_json::from_str::<serde_json::Value>(&response_body).ok(),
+                    )
+                    .await
+                } else {
+                    svc.fail_execution_from_worker(
+                        job_id,
+                        error_msg
+                            .clone()
+                            .unwrap_or_else(|| "webhook module execution failed".to_string()),
+                        None,
+                    )
+                    .await
+                };
+                if let Err(e) = finalize {
+                    tracing::warn!(
+                        trigger_id = %trigger_id,
+                        job_id = %job_id,
+                        error = %e,
+                        "failed to finalize webhook module_executions row (left at 'running')"
+                    );
+                }
+            }
+
             // MCP-961 sibling: see wasm_duration_ms above — saturating
             // u128→i32 conversion bounds the column under any future
             // timeout policy change.
