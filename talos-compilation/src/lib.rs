@@ -1655,8 +1655,23 @@ impl CompilationService {
         tokio::fs::create_dir_all(&workspace).await?;
 
         // Sanitize name for Cargo package (replace spaces and invalid chars)
-        // Use hyphens (kebab-case) as required by cargo-component
-        let raw_package_name = name
+        // Use hyphens (kebab-case) as required by cargo-component.
+        //
+        // CONCURRENCY (correctness-critical): the cargo package name becomes
+        // the output artifact filename (`<package>.wasm`). All compiles share
+        // one `CARGO_TARGET_DIR` (e.g. `/tmp/cargo-target`) to keep the
+        // dependency build cache warm. Callers pass a FIXED `name`
+        // ("custom_sandbox") for every sandbox compile, so without a
+        // per-job suffix every build wrote the SAME
+        // `target/.../custom_sandbox.wasm`. Two concurrent compiles then
+        // clobbered that single file and the mtime-based read handed BOTH
+        // jobs whichever finished last — module B silently persisted with
+        // module A's WASM (content_hash no longer matched its source).
+        // Folding the unique `job_id` into the package name gives every
+        // build its own artifact path; the shared target dir still caches
+        // dependencies (keyed by their own fingerprints, unaffected by the
+        // user crate's name).
+        let raw_package_name = format!("{}-{}", name, job_id.simple())
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '-' })
             .collect::<String>()
