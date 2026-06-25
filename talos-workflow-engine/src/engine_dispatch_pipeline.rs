@@ -323,7 +323,7 @@ impl ParallelWorkflowEngine {
         // targets the right row by id.
         let mut step_exec_ids = Vec::new();
         if let Some(ref store) = self.module_execution_store {
-            for (i, &step_node_id) in chain_node_ids.iter().enumerate() {
+            for (i, &actual_mid) in chain_module_ids.iter().enumerate() {
                 let step_exec_id = Uuid::new_v4();
                 step_exec_ids.push(step_exec_id);
                 let input_for_db = if i == 0 {
@@ -331,7 +331,16 @@ impl ParallelWorkflowEngine {
                 } else {
                     serde_json::json!(null)
                 };
-                let actual_mid = store.resolve_module_id(step_node_id).await;
+                // `module_id` MUST be the resolved MODULE id. `chain_module_ids`
+                // already maps each graph node id -> module id via the engine's
+                // resolver (graph node ids are SHA256-derived from the label and
+                // never match a `modules` row). The prior
+                // `store.resolve_module_id(step_node_id)` passed the NODE id to
+                // the store's identity-fn resolver, so a node id was inserted
+                // into `module_executions.module_id` — violating the FK to
+                // `modules.id` and dropping per-step tracking on EVERY
+                // multi-node (pipeline) execution (the single-node path was
+                // unaffected; it already passes a resolved module id).
                 if let Err(db_err) = store
                     .record_started(ExecutionStartedContext {
                         id: step_exec_id,
