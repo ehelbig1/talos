@@ -6,11 +6,11 @@ goal was to exercise the data-plane and governance paths a real operator hits an
 find correctness bugs that pass `cargo check` and the unit suite but break at
 request time.
 
-**Outcome: 8 real bugs found and fixed (all live-verified, all merged), two
-systemic bug *classes* identified and swept to exhaustion, and ~16 surfaces
-verified clean.** This doc captures the bugs, the two classes (so they can be
-frozen with structural lints), and the negative results (so they aren't
-re-investigated).
+**Outcome: 9 real bugs found and fixed (all live-verified, all merged); two
+systemic bug *classes* identified, swept to exhaustion, and now **frozen with
+structural lints** (checks 46/47, #272); and ~18 surfaces verified clean.** This
+doc captures the bugs, the two classes (and the lints that freeze them), and the
+negative results (so they aren't re-investigated).
 
 > Method note: every fix was verified against the running stack (trigger →
 > observe DB/worker state), not just compiled. The full Rust test suite was
@@ -32,7 +32,7 @@ MUST guarantee that the same logical operation later transitions it to a termina
 status (`completed`/`failed`/`cancelled`) — and the create MUST be ordered-before
 (awaited, not raced-with) the finalizer.
 
-Five bugs, each a different way to violate it:
+Five bugs, each a different way to violate it (plus the freeze + a sibling fix it surfaced):
 
 | PR | Path | Violation |
 |----|------|-----------|
@@ -40,6 +40,8 @@ Five bugs, each a different way to violate it:
 | #263 | engine pipeline dispatch | wrote a **node id** into `module_executions.module_id` (FK violation) → per-step tracking dropped |
 | #267 | webhook-fired module | INSERTed `module_executions` `running`, **never finalized** (inline request/reply, no result subscriber) |
 | #268 | workflow-chain dispatch | the `'running'` INSERT ran in a fire-and-forget `tokio::spawn`, **racing** the inline fast-fail finalizer; finalizer won the race → orphaned `running` |
+| #271 | crash-recovery resume | claimed `running → resuming` and re-ran the graph, but `resume_one` never finalized (assumed the engine did) **and** the finalizers were guarded `WHERE status='running'` (don't match `resuming`) → stuck `resuming` forever |
+| #272 | freeze + sibling fix | added check 46 to freeze the class; it immediately surfaced that #271 only widened `talos-workflow-repository` — so widened `talos-execution-repository`'s sibling finalizers too |
 | (n/a) | scheduler, actor-handoff, retry, replay | **audited — clean**: all *await* the create/transition-to-`running` before spawning the run, and finalize both arms |
 
 **Why the unit suite missed all five:** the MCP / `ExecutionOrchestrationService`
@@ -47,12 +49,14 @@ path creates rows as `running` (not `queued`) and finalizes synchronously, so
 MCP-driven tests pass. The bugs lived only on the GraphQL/webhook/chain dispatch
 paths.
 
-**Recommended structural lint:** for each `INSERT INTO {workflow,module}_executions`
-that sets a non-terminal status, require a matching terminal-status writer
-reachable in the same module/path; flag any INSERT inside a `tokio::spawn` whose
-finalizer is outside that spawn (the #268 race shape). At minimum, a `// allow-…`
--gated grep that pairs each such INSERT with a `mark_execution_{completed,failed}`
-/ `complete_execution_from_worker` / upsert finalizer.
+**Structural lint — implemented (check 46, #272):** flags any single-line
+`WHERE id = $N AND status = 'running'` finalizer guard in the execution-status
+repos (it must be `status IN ('running','resuming')` so a crash-recovery-claimed
+row can finalize — the #271 shape). Opt-out: `// allow-running-only-finalize`.
+The broader sub-shapes — an `INSERT` with no finalizer at all (#267) and a
+spawned `INSERT` racing an inline finalizer (#268) — resist a precise static
+grep, so they're guarded by this doc + code review rather than lint; the
+audited-clean callers above are the reference pattern.
 
 ### Class B — append-only audit tables FK-bound to deletable parents
 
@@ -68,9 +72,12 @@ the parent id as a plain (nullable) historical reference, not an enforced FK.
 | #266 | `auth_audit_log` / `admin_event_log` → `users` | `ON DELETE SET NULL` | user deletion blocked (SET-NULL is an UPDATE, also trigger-blocked) — latent (no delete-user API yet) |
 | (n/a) | `audit_events` | no such FK | clean |
 
-**Recommended structural lint:** fail if any table with the
-`prevent_audit_modification` trigger has an incoming FK with `confdeltype IN ('c','n')`.
-A migration-time check (the four audit tables are a closed set today).
+**Structural lint — implemented (check 47, #272):** scans migrations newer than
+the last fix for a `CREATE`/`ALTER` of an append-only audit table that adds
+`ON DELETE CASCADE | SET NULL`. Pre-fix history is grandfathered by timestamp
+(the bad FKs are dropped by `20260625140000`/`150000`), so no false positives on
+immutable migrations. The four audit tables are a closed set; a new one → add it
+to the check's `AUDIT_TABLES`.
 
 ---
 
@@ -115,6 +122,18 @@ A migration-time check (the four audit tables are a closed set today).
    → every approval returned "not found" → the protected module could never run.
    Fixed by resolving the real `workflow_id` from the in-flight execution row.
 
+9. **#271 — crash-recovered executions stuck `resuming`.** With
+   `EXECUTION_CHECKPOINTING_ENABLED` on (durable execution, off by default), the
+   startup recovery sweep claimed orphaned `running` rows (`running → resuming`)
+   and re-ran the graph, but nothing finalized them: `resume_one`'s Ok arm
+   assumed the engine writes the terminal status (no run path does — every other
+   caller finalizes afterward), **and** the finalizers were guarded
+   `WHERE status='running'` (don't match `resuming`). So a resumed run executed
+   but stuck in `resuming` forever. Fixed both halves: `resume_one` now finalizes
+   from `ctx` (`mark_execution_completed`, or `mark_execution_waiting` when
+   `ctx.waiting`), and the finalizers accept `status IN ('running','resuming')`.
+   Opt-in feature, but broke resume completion entirely when enabled.
+
 Plus **#262** — restored four onboarding fixes (`/auth/csrf` dev proxy, catalog
 seeding default, self-loop edge guard, frontend port docs) dropped by #259's
 squash merge.
@@ -146,8 +165,18 @@ squash merge.
 ## Verified clean (negative results — don't re-investigate)
 
 - **Class A remainder:** scheduler, actor-handoff, retry, replay all finalize
-  correctly (await create-to-`running` before spawning the run).
+  correctly (await create-to-`running` before spawning the run). Crash-recovery
+  resume did **not** — that was #271 (above); after the fix, verified live
+  (orphan → `resuming` → `completed`).
 - **Class B remainder:** `audit_events` has no cascade/set-null FK.
+- **Cross-tenant isolation (RLS):** a second user was denied on every vector —
+  reading/triggering another user's workflow, listing their secrets/actors,
+  reading their execution history, and *using their private module* (user-scoped
+  module resolution → "module not found") — while retaining access to its own.
+  Enforced at the **application layer** (every query/mutation gates on
+  `user_id`/org membership); the DB RLS `SET ROLE` backstop is documented as
+  not-yet-active, so those app-layer gates are currently the sole line — they
+  held on every path tried.
 - **Capability-ceiling lattice gate:** rejects over-ceiling modules
   (`database-node` vs `minimal-node`, clear actionable error) and allows
   within-ceiling, stamping `actor_id`. Reads each module's *stored*
