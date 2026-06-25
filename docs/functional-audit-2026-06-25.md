@@ -191,3 +191,38 @@ squash merge.
 - **Other surfaces exercised working:** signup/login/session, CSRF seeding,
   template catalog seeding, catalog module install/compile (source → WASM),
   WebSocket transport handshake (101 + auth/origin).
+- **OAuth security boundary (no-creds audit):** the entire OAuth CSRF/state
+  surface is exercisable without real provider credentials because state
+  validation runs *before* the provider code exchange
+  (`talos-oauth::handle_callback` → `validate_state_token` → provider call).
+  All paths verified clean against the running stack:
+  - *Login init* — invalid provider → 400; unconfigured provider (google/okta/
+    snyk) → 500 with the generic "OAuth login unavailable" message, **no
+    config-state leak** (MCP-995).
+  - *Callback* — invalid provider → 400; missing `code` → `?error=missing_code`;
+    provider-supplied error with a `<script>` payload → sanitized to
+    `oauth_error` (MCP-1094); missing `state` and forged `state` → both
+    `csrf_mismatch`.
+  - *Open-redirect* — `next` / `redirect_uri` / `state=//evil.com` request
+    params cannot move the post-callback redirect off the validated frontend
+    host; target comes from `get_frontend_url()` server-side config, not request
+    input (MCP-623 / MCP-1000).
+  - *Session-binding (#249 login-CSRF)* — for a state row written with a
+    `session_binding_hash`: a callback with **no** binding cookie is rejected
+    (`missing session-binding cookie` warn), a **wrong** cookie is rejected
+    (`session-binding mismatch` warn, constant-time compare), and the **correct**
+    cookie passes the gate. Critically, the token is consumed *before* the
+    binding check fails — every tested row ended `used=true`, so a failed
+    binding check still burns the `state` and denies an attacker any retry.
+    (Method note: the Redis replay layer also bit the test itself — reusing one
+    `state` across the three cases let the first consume the Redis nonce and
+    short-circuit the other two at replay-detection; distinct tokens per case
+    were required. That's the replay defense working as intended.)
+  - *Integration callbacks* (gmail/slack/atlassian, separate `/api/*/callback`
+    routes) — missing/forged params produce a graceful `*_error=` redirect to
+    the validated frontend host with a generic "Failed to connect" message, no
+    internal-detail leak.
+  - **Not covered (credential-gated):** the happy path *past* the CSRF gate —
+    real provider token exchange → user create/link → session issuance —
+    requires a registered provider OAuth app + `*_CLIENT_ID`/`*_CLIENT_SECRET`
+    in env. See `docs/OAUTH_SETUP.md`.
