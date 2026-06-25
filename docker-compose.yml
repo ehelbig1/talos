@@ -336,8 +336,15 @@ services:
       # Embeddings — Ollama (OpenAI-compatible API, local, no API key required).
       # Override EMBEDDING_API_URL / EMBEDDING_API_KEY to switch providers (Azure, OpenAI, Jina…).
       EMBEDDING_API_URL: "http://ollama:11434/v1/embeddings"
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
-      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-768}
+      # mxbai-embed-large emits 1024-dim vectors, matching the `vector(1024)`
+      # embedding columns (migration 20260429120000 resized them for the Voyage
+      # provider). The previous default, nomic-embed-text, emits 768 dims, so
+      # every semantic write failed pgvector's dimension check ("expected 1024,
+      # not 768") and actor-memory / workflow / semantic-cache embedding
+      # coverage stayed at 0 on a default deploy. Override both together if you
+      # point EMBEDDING_API_URL at a different provider/model.
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
       # Ollama (Tier 1 — local LLM inference)
       OLLAMA_URL: "http://ollama:11434"
       # Neo4j (Knowledge Graph)
