@@ -330,3 +330,11 @@ squash merge.
     workflow and runs it, stamping `__dispatched_workflow_id__` /
     `__matched_capabilities` on the output; no match + no `fallback_workflow_id`
     → fail-closed (`status: failed`, null output), not a hang or silent pass.
+- **`add_node_to_workflow` inline-Rust path** (`InlineCompileService`). Adding a
+  node with `rust_code` compiles + persists a per-node module and wires it in
+  one call; verified end-to-end (a doubling module compiled, persisted, and ran
+  → `doubled=14`). Shares the `create_workspace` chokepoint, so the #278
+  concurrency fix covers it. Same security gates as `compile_custom_sandbox`,
+  confirmed live: disallowed dependency rejected; a type error returns a clean
+  **pre-compile lint** error (skips the ~30–60 s doomed compile); invalid
+  `capability_world` rejected with the valid-values list.
