@@ -100,18 +100,30 @@ impl ApprovalGate for PostgresApprovalGate {
             _ => { /* No record — create one */ }
         }
 
-        // Insert a pending approval request (idempotent).
-        // Uses execution_id in both workflow_id and execution_id slots
-        // to match the pre-extraction behavior — the real workflow_id
-        // is not always threaded through at this call site; mismatched
-        // slots would break downstream approval queries that join on
-        // (workflow_id, execution_id).
+        // Insert a pending approval request (idempotent). The
+        // `workflow_id` column MUST hold the real workflow id, not the
+        // execution id: `approve_execution` / `deny_execution` authorize via
+        // `JOIN workflows w ON w.id = execution_approvals.workflow_id AND
+        // w.user_id = $caller`. The pre-extraction code bound execution_id
+        // into the workflow_id slot (the workflow id "wasn't threaded through
+        // at this call site"), so that join never matched — making every
+        // module-level approval request permanently un-approvable (and the
+        // protected module un-runnable). Resolve the real workflow_id from the
+        // execution row (which exists — the execution is in flight); fall back
+        // to execution_id only if it's somehow absent (no worse than before).
+        let resolved_workflow_id: Uuid = sqlx::query_scalar::<_, Uuid>(
+            "SELECT workflow_id FROM workflow_executions WHERE id = $1",
+        )
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(execution_id);
         let insert_result = sqlx::query(
             "INSERT INTO execution_approvals (workflow_id, execution_id, node_id, required_for) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT DO NOTHING",
         )
-        .bind(execution_id)
+        .bind(resolved_workflow_id)
         .bind(execution_id)
         .bind(node_id)
         .bind(required_for)
