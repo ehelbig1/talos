@@ -1482,7 +1482,7 @@ impl WorkflowRepository {
                  SET status = 'completed', output_data = NULL, \
                      output_data_enc = $1, output_enc_key_id = $2, \
                      output_data_format = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status = 'running'",
+                 WHERE id = $4 AND status IN ('running', 'resuming')",
             )
             .bind(&enc_bytes)
             .bind(key_id)
@@ -1506,7 +1506,7 @@ impl WorkflowRepository {
                  SET status = 'completed', output_data = $1, \
                      output_data_enc = NULL, output_enc_key_id = NULL, \
                      completed_at = NOW() \
-                 WHERE id = $2 AND status = 'running'",
+                 WHERE id = $2 AND status IN ('running', 'resuming')",
             )
             .bind(&redacted)
             .bind(execution_id)
@@ -1542,7 +1542,7 @@ impl WorkflowRepository {
                  SET status = 'waiting', output_data = NULL, \
                      output_data_enc = $1, output_enc_key_id = $2, \
                      output_data_format = $3 \
-                 WHERE id = $4 AND status = 'running'",
+                 WHERE id = $4 AND status IN ('running', 'resuming')",
             )
             .bind(&enc_bytes)
             .bind(key_id)
@@ -1561,7 +1561,7 @@ impl WorkflowRepository {
                 "UPDATE workflow_executions \
                  SET status = 'waiting', output_data = $1, \
                      output_data_enc = NULL, output_enc_key_id = NULL \
-                 WHERE id = $2 AND status = 'running'",
+                 WHERE id = $2 AND status IN ('running', 'resuming')",
             )
             .bind(&redacted)
             .bind(execution_id)
@@ -1647,7 +1647,7 @@ impl WorkflowRepository {
                  SET status = 'failed', error_message = $1, output_data = NULL, \
                      output_data_enc = $2, output_enc_key_id = $3, \
                      output_data_format = $4, completed_at = NOW() \
-                 WHERE id = $5 AND status = 'running'",
+                 WHERE id = $5 AND status IN ('running', 'resuming')",
             )
             .bind(&redacted_error)
             .bind(enc_bytes.as_deref())
@@ -1667,7 +1667,7 @@ impl WorkflowRepository {
                  SET status = 'failed', error_message = $1, output_data = $2, \
                      output_data_enc = NULL, output_enc_key_id = NULL, \
                      completed_at = NOW() \
-                 WHERE id = $3 AND status = 'running'",
+                 WHERE id = $3 AND status IN ('running', 'resuming')",
             )
             .bind(&redacted_error)
             .bind(redacted_output.as_ref())
@@ -1771,7 +1771,7 @@ impl WorkflowRepository {
                      output_data_enc = $2, output_enc_key_id = $3, \
                      output_data_format = $4, \
                      error_message = $5, completed_at = NOW() \
-                 WHERE id = $6 AND status = 'running'",
+                 WHERE id = $6 AND status IN ('running', 'resuming')",
             )
             .bind(status)
             .bind(enc_bytes.as_deref())
@@ -1788,7 +1788,7 @@ impl WorkflowRepository {
                  SET status = $1, output_data = $2, \
                      output_data_enc = NULL, output_enc_key_id = NULL, \
                      error_message = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status = 'running'",
+                 WHERE id = $4 AND status IN ('running', 'resuming')",
             )
             .bind(status)
             .bind(output)

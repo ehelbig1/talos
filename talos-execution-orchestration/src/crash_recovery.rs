@@ -23,9 +23,11 @@
 //!   attempt, then terminal, no infinite resume loop.
 //! - **Terminal on dispatch failure.** Any error before/at hand-off (deleted
 //!   workflow, engine build failure, NATS dispatch failure) flips the row
-//!   `resuming -> failed` so it never leaks back into the claimable set. The
-//!   engine itself owns the terminal write on a *successful* hand-off (its bare
-//!   `UPDATE ... WHERE id = $1` moves the row out of `resuming`).
+//!   `resuming -> failed` so it never leaks back into the claimable set. On a
+//!   *successful* run, `resume_one` writes the terminal status itself
+//!   (`mark_execution_{completed,waiting}`, which accept `resuming` as well as
+//!   `running`) — the engine run does not persist execution status; every run
+//!   caller finalizes afterward.
 //! - **Actor / tier re-stamp.** The original `actor_id` (or the workflow's bound
 //!   default) is re-applied so the `max_llm_tier` data-egress ceiling survives
 //!   the restart — a tier-1 execution must not resume as tier-2.
@@ -246,11 +248,44 @@ async fn resume_one(deps: RecoveryDeps, row: StuckExecutionForResume) {
     )
     .await
     {
-        // The engine wrote the terminal status (completed / failed / waiting),
-        // moving the row out of `resuming`.
-        Ok(_ctx) => {
+        // Finalize the resumed run. `run_with_seed_via_nats` (run under the
+        // fence) does NOT write the execution's terminal status — every other
+        // run caller (trigger / scheduler / retry / replay) finalizes after the
+        // run returns, and the resume path must too. Without this the row stays
+        // `resuming` forever (the worker re-runs the graph, but nothing moves
+        // the execution out of `resuming` → it's eventually force-failed by the
+        // stale sweep). `mark_execution_{completed,waiting}` accept `resuming`
+        // as well as `running` (talos-workflow-repository) so this finalize
+        // matches the claimed row. `ctx.waiting` distinguishes a run that
+        // yielded (sub-workflow / approval / sleep) from one that finished.
+        Ok(ctx) => {
+            let mut aggregated = serde_json::Map::new();
+            for (node_id, output) in &ctx.results {
+                aggregated.insert(node_id.to_string(), output.clone());
+            }
+            let output_json = serde_json::Value::Object(aggregated);
+            let wf_repo = talos_workflow_repository::WorkflowRepository::new(deps.db_pool.clone())
+                .with_encryption(deps.secrets_manager.clone());
+            let finalize = if ctx.waiting {
+                wf_repo.mark_execution_waiting(exec_id, &output_json).await
+            } else {
+                wf_repo
+                    .mark_execution_completed(exec_id, &output_json)
+                    .await
+            };
+            if let Err(e) = finalize {
+                tracing::error!(
+                    execution_id = %exec_id,
+                    error = %e,
+                    "crash-recovery: failed to finalize resumed execution — row may remain 'resuming'"
+                );
+            }
             record_outcome("resumed", 1);
-            tracing::info!(execution_id = %exec_id, "crash-recovery: execution resumed");
+            tracing::info!(
+                execution_id = %exec_id,
+                waiting = ctx.waiting,
+                "crash-recovery: execution resumed"
+            );
         }
         // Fenced: another controller superseded this resume (epoch advanced).
         // Do NOT mark the row failed — it now belongs to the new owner, or a
