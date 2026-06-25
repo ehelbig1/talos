@@ -6,11 +6,11 @@ goal was to exercise the data-plane and governance paths a real operator hits an
 find correctness bugs that pass `cargo check` and the unit suite but break at
 request time.
 
-**Outcome: 10 real bugs found and fixed (all live-verified; #261–#271 merged,
-#275 open); two systemic bug *classes* identified, swept to exhaustion, and now
-**frozen with structural lints** (checks 46/47, #272); and ~23 surfaces verified
-clean (including the full OAuth CSRF/state boundary and the MCP untrusted-compile
-path).** This
+**Outcome: 12 real bugs found and fixed (all live-verified and merged); two
+systemic bug *classes* identified, swept to exhaustion, and now **frozen with
+structural lints** (checks 46/47, #272); and ~25 surfaces verified clean
+(including the full OAuth CSRF/state boundary, the MCP untrusted-compile path,
+and sub-workflow dispatch).** This
 doc captures the bugs, the two classes (and the lints that freeze them), and the
 negative results (so they aren't re-investigated).
 
@@ -149,7 +149,34 @@ to the check's `AUDIT_TABLES`.
     the tool's own guidance hit a wall. Reproduced live, then repointed the
     message at the two paths that actually work (`module_id` in a workflow, or
     `test_module(module_id)` for a direct one-shot — both verified executing).
-    *(PR open at time of writing, not yet merged.)*
+
+11. **#277 — `create_workflow` accepted multi-node cycles.** The plain
+    authoring path only rejected the trivial self-edge (`n -> n`) via
+    `validate_edge_targets`; a multi-node cycle (`a -> b -> a`) passed and was
+    persisted. The engine requires a DAG and fails such a run at trigger time
+    with "workflow graph contains a cycle" — so the workflow was created
+    successfully but unexecutable. Both the `add_edge` and
+    `create_workflow_from_description` paths already gated on
+    `petgraph::is_cyclic_directed`; the plain path was the gap. Fixed with a
+    pure-Rust `validate_acyclic` helper (iterative three-colour DFS, 7 unit
+    tests) over the full edge set. Verified live: self-loop + 2-/3-node cycles
+    rejected, linear + diamond DAGs still accepted.
+
+12. **#278 — concurrent compiles cross-contaminated WASM artifacts.** Two
+    `compile_custom_sandbox` calls running concurrently could persist module B
+    with module A's compiled WASM (its stored `content_hash` no longer matching
+    its own source). Root cause: all compiles share one `CARGO_TARGET_DIR` (to
+    keep the dependency cache warm) AND every sandbox compile uses a *fixed*
+    cargo package name (`custom_sandbox`), so the artifact is always
+    `custom_sandbox.wasm`; concurrent builds clobber that one file and the
+    mtime-based read hands both jobs whichever finished last. Found while
+    testing sub-workflow dispatch — two judge modules compiled in parallel came
+    out byte-identical; compiling either alone was correct. It also silently
+    corrupted the `node_result_cache` (keyed on `module_hash`). Fixed by folding
+    the unique per-call `job_id` into the cargo package name in
+    `create_workspace`, isolating each build's artifact while preserving the
+    shared dependency cache. Verified live: parallel compiles now yield distinct
+    `content_hash`es.
 
 Plus **#262** — restored four onboarding fixes (`/auth/csrf` dev proxy, catalog
 seeding default, self-loop edge guard, frontend port docs) dropped by #259's
@@ -266,3 +293,26 @@ squash merge.
     legacy `node_templates` / `wasm_modules` tables away); the returned
     "Template ID" is `modules.id` and drives both the workflow and `test_module`
     paths.
+- **Sub-workflow dispatch.** The dispatcher machinery
+  (`execute_subworkflow_graph` → `collapse_subworkflow_output` →
+  per-contract interpretation) is sound — the one bug in this area was the
+  compile-concurrency issue (#278), which *masked* itself here (two judge
+  sub-workflows compiled in parallel returned the same verdict because they
+  shared WASM). With that fixed, every path verified live via
+  `test_subworkflow_contract` + a full parent run:
+  - *judge* — single-terminal collapse + `JudgeVerdict::from_collapsed`: a valid
+    `{score,passed,reasoning,feedback}` parses with `malformed_fields=0`; a
+    verdict missing `passed`+`feedback` parses with `malformed_fields=2`
+    (defaults applied, surfaced loudly).
+  - *classifier* — extracts the class string (`classifier_class="urgent"`),
+    `passed=true`.
+  - *subworkflow* / *reflection* — pass when there's no `__error` envelope.
+  - *collapse* — single terminal → its unwrapped output; **multiple terminals →
+    label-keyed map** (`{leftnode:{…}, rightnode:{…}}`), the documented diamond
+    fallback.
+  - *parent → sub_workflow* — a parent with an `add_sub_workflow_node` node runs
+    the child end-to-end; output flows back keyed by the node label
+    (`{"sw":{"fib":34}}`), status `completed`.
+  - *Not covered (LLM-gated):* `ensemble` and `llm_dispatch` need a live LLM
+    provider for the synthesis/judge step (no key configured); `test_subworkflow_contract`
+    doesn't expose those contracts.
