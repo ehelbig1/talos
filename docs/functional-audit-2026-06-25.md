@@ -8,9 +8,10 @@ request time.
 
 **Outcome: 12 real bugs found and fixed (all live-verified and merged); two
 systemic bug *classes* identified, swept to exhaustion, and now **frozen with
-structural lints** (checks 46/47, #272); and ~25 surfaces verified clean
+structural lints** (checks 46/47, #272); and ~28 surfaces verified clean
 (including the full OAuth CSRF/state boundary, the MCP untrusted-compile path,
-and sub-workflow dispatch).** This
+sub-workflow dispatch, and the loop/collect/capability-dispatch structural
+nodes).** This
 doc captures the bugs, the two classes (and the lints that freeze them), and the
 negative results (so they aren't re-investigated).
 
@@ -316,3 +317,24 @@ squash merge.
   - *Not covered (LLM-gated):* `ensemble` and `llm_dispatch` need a live LLM
     provider for the synthesis/judge step (no key configured); `test_subworkflow_contract`
     doesn't expose those contracts.
+- **Structural execution nodes** (loop / collect / capability_dispatch). Built
+  each with the graph-mutation tools and ran the parent end-to-end:
+  - *loop* — re-dispatches a body node while a Rhai condition holds, capped by
+    `max_iterations`. `count < 3` → 3 iterations, `termination_reason:
+    condition_false`; `true` with max 5 → 5 iterations, `max_iterations` (the
+    infinite-loop guard fires); `false` → 1 iteration (body runs once, condition
+    checked after).
+  - *collect* — fan-in from two branches gathers `{items: [...], count: N}`
+    (per-item `__fuel_consumed__` envelope stripped).
+  - *capability_dispatch* — match → routes to the best capability-tagged
+    workflow and runs it, stamping `__dispatched_workflow_id__` /
+    `__matched_capabilities` on the output; no match + no `fallback_workflow_id`
+    → fail-closed (`status: failed`, null output), not a hang or silent pass.
+- **`add_node_to_workflow` inline-Rust path** (`InlineCompileService`). Adding a
+  node with `rust_code` compiles + persists a per-node module and wires it in
+  one call; verified end-to-end (a doubling module compiled, persisted, and ran
+  → `doubled=14`). Shares the `create_workspace` chokepoint, so the #278
+  concurrency fix covers it. Same security gates as `compile_custom_sandbox`,
+  confirmed live: disallowed dependency rejected; a type error returns a clean
+  **pre-compile lint** error (skips the ~30–60 s doomed compile); invalid
+  `capability_world` rejected with the valid-values list.
