@@ -65,6 +65,26 @@ describe("workflowStore", () => {
     expect(state.edges[0].target).toBe(nodes[1].id);
   });
 
+  it("should reject a self-loop edge (source === target)", () => {
+    // A node connecting to itself is a 1-node cycle; the engine rejects the
+    // whole graph with "workflow graph contains a cycle". React Flow allows
+    // dragging an output handle back onto the same node, so the store must
+    // drop it. Regression: a single-node workflow saved with a self-edge.
+    const { addNode, connectNodes } = useWorkflowStore.getState();
+
+    addNode("m1", "N1", { x: 0, y: 0 });
+    const nodeId = useWorkflowStore.getState().nodes[0].id;
+
+    connectNodes({
+      source: nodeId,
+      target: nodeId,
+      sourceHandle: "out",
+      targetHandle: "in",
+    });
+
+    expect(useWorkflowStore.getState().edges).toHaveLength(0);
+  });
+
   it("should update node data", () => {
     const { addNode, updateNodeData } = useWorkflowStore.getState();
     addNode("m1", "N1", { x: 0, y: 0 });

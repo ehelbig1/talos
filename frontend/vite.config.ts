@@ -59,6 +59,25 @@ export default defineConfig({
           });
         },
       },
+      // /auth/csrf seeds the talos_csrf_token cookie (graphqlClient.seedCsrfCookie
+      // GETs it before any mutation). It MUST reach the controller, not the SPA —
+      // an unproxied /auth/csrf returns index.html with no Set-Cookie, so every
+      // signup/login fails with "CSRF token required (cookie missing)". In prod
+      // nginx proxies all of /auth/*; this mirrors that for dev. Keep it a
+      // specific path so client-side /auth routes (OAuth callback) aren't captured.
+      '/auth/csrf': {
+        target: process.env.API_PROXY_TARGET || 'http://localhost:8000',
+        changeOrigin: true,
+        secure: process.env.NODE_ENV === 'production',
+        cookieDomainRewrite: 'localhost',
+        configure: (proxy, _options) => {
+          proxy.on('proxyReq', (proxyReq, req, _res) => {
+            if (req.headers.cookie) {
+              proxyReq.setHeader('cookie', req.headers.cookie);
+            }
+          });
+        },
+      },
       '/ws': {
         target: process.env.API_PROXY_TARGET || 'http://localhost:8000',
         changeOrigin: true,
