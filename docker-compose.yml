@@ -281,7 +281,13 @@ services:
       # talos.pipeline.jobs, and every dispatch fails with "no responders".
       WORKFLOW_NATS_PREFIX: talos
       RUST_LOG: info,controller=debug,audit_ledger=info
-      TALOS_REGISTRY_URL: http://registry:5000
+      # Template catalog source. UNSET by default => the controller disk-seeds
+      # the ~60 templates baked into its image (module-templates/), so the
+      # Catalog is populated out of the box. Setting this (e.g. to the bundled
+      # `registry` service at http://registry:5000) switches to OCI mode and
+      # DISABLES disk seeding — only do that after publishing templates to that
+      # registry, else the Catalog is empty and workflows can't add any nodes.
+      TALOS_REGISTRY_URL: ${TALOS_REGISTRY_URL:-}
       BASE_URL: ${BASE_URL:-http://localhost:8000}
       ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY:-}
       # Gate for admin-only operator endpoints (gcal watch create/stop-all,
