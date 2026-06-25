@@ -1257,7 +1257,6 @@ async fn handle_compile_custom_sandbox(
                 );
             }
 
-            let tool_name = format!("sandbox_{}-v1", short_id);
             let template_id_str = module_id.to_string();
 
             // Surface lint warnings (non-blocking) in the success response
@@ -1288,15 +1287,24 @@ async fn handle_compile_custom_sandbox(
                 )
             };
 
+            // The compiled sandbox is persisted to the unified `modules`
+            // table under `module_id`; the caller drives it by that id.
+            // Earlier revisions advertised a `sandbox_<short_id>-v1` tool
+            // name here, but that path is dead: user-compiled sandboxes are
+            // never registered in `tools/list` (only catalog templates are),
+            // and the generic `*-v1` dispatcher routes every such call to
+            // `install_module_from_catalog`, which fails with "not found in
+            // catalog" because the name maps to no catalog slug. Point the
+            // caller at the two paths that actually work — `module_id` in a
+            // workflow, or `test_module` for a direct one-shot execution.
             let success_text = format!(
                 "Compilation successful!\n\
                  \n\
                  Template ID: {}\n\
-                 Tool name: {}\n\
                  \n\
-                 To use this module in a workflow, pass the Template ID as the `module_id` in create_workflow.\n\
-                 To execute it directly, call tools/list to refresh available tools, then call {}.{}",
-                template_id_str, tool_name, tool_name, warning_text
+                 To use this module in a workflow, pass the Template ID as the `module_id` in create_workflow / add_node_to_workflow.\n\
+                 To execute it directly, call test_module with module_id: {}.{}",
+                template_id_str, template_id_str, warning_text
             );
 
             JsonRpcResponse {
