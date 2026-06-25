@@ -146,6 +146,12 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   connectNodes: (connection, edgeType?) => {
     if (!connection.source || !connection.target) return;
 
+    // A node may not connect to itself. React Flow lets you drag an output
+    // handle back onto the same node's input by default; that self-edge is a
+    // 1-node cycle and the engine rejects the whole graph with "workflow graph
+    // contains a cycle". Drop it silently instead of poisoning the workflow.
+    if (connection.source === connection.target) return;
+
     // Prevent duplicate edges
     const exists = get().edges.some(
       (e) =>
