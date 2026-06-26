@@ -209,6 +209,17 @@ async fn test_approval_queue_and_resource_quotas() {
     .await
     .unwrap();
 
+    // Phase E: module_executions.actor_id is NOT NULL. Give the user a default
+    // actor so the trg_set_default_actor trigger stamps it onto the execution.
+    sqlx::query(
+        "INSERT INTO actors (id, user_id, name, max_capability_world, is_default) \
+         VALUES (gen_random_uuid(), $1, 'Default', 'network-node', true)",
+    )
+    .bind(user_id)
+    .execute(&ctx.db_pool)
+    .await
+    .unwrap();
+
     let execution_id = Uuid::new_v4();
     sqlx::query("INSERT INTO module_executions (id, module_id, user_id, status, trigger_type) VALUES ($1, $2, $3, $4, $5)")
         .bind(execution_id)

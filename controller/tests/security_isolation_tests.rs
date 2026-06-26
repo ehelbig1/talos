@@ -95,6 +95,17 @@ async fn test_dataloader_leakage_module_logs() {
     .await
     .unwrap();
 
+    // Phase E: module_executions.actor_id is NOT NULL. Give user B a default
+    // actor so the trg_set_default_actor trigger stamps it onto the execution.
+    sqlx::query(
+        "INSERT INTO actors (id, user_id, name, max_capability_world, is_default) \
+         VALUES (gen_random_uuid(), $1, 'Default', 'network-node', true)",
+    )
+    .bind(user_b_id)
+    .execute(&ctx.db_pool)
+    .await
+    .unwrap();
+
     // Now insert the execution
     sqlx::query("INSERT INTO module_executions (id, module_id, user_id, status, trigger_type) VALUES ($1, $2, $3, 'completed', 'manual')")
         .bind(execution_id)

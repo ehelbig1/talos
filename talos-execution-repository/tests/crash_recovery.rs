@@ -47,6 +47,17 @@ async fn seed_running_exec(pool: &Pool<Postgres>, age_minutes: i64) -> (Uuid, Uu
         .execute(pool)
         .await
         .unwrap();
+    // Phase E: workflow_executions.actor_id is NOT NULL. Give the seed user a
+    // default actor so the trg_set_default_actor trigger stamps it onto every
+    // execution row this helper (and the tests reusing this user) inserts.
+    sqlx::query(
+        "INSERT INTO actors (id,user_id,name,max_capability_world,is_default) \
+         VALUES (gen_random_uuid(),$1,'Default','network-node',true)",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO workflows (id,user_id,name,module_uri,graph_json) \
          VALUES ($1,$2,'cr-wf','mod://x','{\"nodes\":[]}'::jsonb)",
