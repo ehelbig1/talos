@@ -303,12 +303,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "actor_id": { "type": "string" },
                     "max_executions_per_hour": { "type": "number", "description": "ENFORCED (atomic at trigger time). Omit for unlimited." },
                     "max_executions_total": { "type": "number", "description": "ENFORCED (atomic at trigger time). Omit for unlimited." },
-                    "max_fuel_per_execution": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited." },
+                    "max_fuel_per_execution": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED (per-execution fuel ceiling is applied from module/node config, not this actor field). Omit for unlimited." },
                     "max_fuel_per_hour": { "type": "number", "description": "ENFORCED — rolling per-hour fuel-sum cap (atomic at trigger time; refuses a new run once the actor has burned its hourly fuel budget). Omit for unlimited." },
-                    "max_outbound_requests_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited." },
+                    "max_outbound_requests_per_hour": { "type": "number", "description": "RESERVED — not enforceable as a per-actor cap today: outbound HTTP runs in the credential-free worker (no DB), and requests aren't actor-attributed, so there is no per-actor count to gate on. Enforcing it needs a worker→controller counter AND per-actor attribution of outbound calls (or reframing as a per-user/per-agent cap). Omit for unlimited." },
                     "max_workflow_count": { "type": "number", "description": "ENFORCED (at create time). Omit for unlimited." },
                     "max_workflows_per_minute": { "type": "number", "description": "ENFORCED per-actor trigger-rate cap (atomic at trigger time). Stored default 10 if omitted." },
-                    "max_compilations_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Stored default 20 if omitted." },
+                    "max_compilations_per_hour": { "type": "number", "description": "RESERVED — not enforceable as a per-actor cap today: compiles (compile_custom_sandbox / run_sandbox / inline rust_code) are agent/user actions and carry actor_id only optionally (for memory scoping), so most have no actor_budget_policies row to gate on; there is also no per-actor compile-event record to count. Enforcing it needs compile-event tracking AND actor attribution of compiles (or reframing as a per-user/per-agent cap). Stored default 20 if omitted." },
                     "on_budget_exceeded": { "type": "string", "description": "suspend (default) | alert | block" }
                 },
                 "required": ["actor_id"]
