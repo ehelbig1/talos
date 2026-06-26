@@ -6,12 +6,15 @@ goal was to exercise the data-plane and governance paths a real operator hits an
 find correctness bugs that pass `cargo check` and the unit suite but break at
 request time.
 
-**Outcome: 13 real bugs found and fixed (all live-verified and merged); two
+**Outcome: 14 real bugs found and fixed (all live-verified and merged); two
 systemic bug *classes* identified, swept to exhaustion, and now **frozen with
-structural lints** (checks 46/47, #272); and ~30 surfaces verified clean
-(including the full OAuth CSRF/state boundary, the MCP untrusted-compile path,
-sub-workflow dispatch, the loop/collect/capability-dispatch structural nodes,
-the LLM dispatch kinds on tier-1 local Ollama, and the judge/reflective-retry/agent-loop orchestration nodes).** This
+structural lints** (checks 46/47, #272); a battle-hardening phase that closed an
+actor-budget TOCTOU race (#284) and made 2 of 4 inert governance caps real
+(#285–#288); and ~34 surfaces verified clean (including the full OAuth CSRF/state
+boundary, the MCP untrusted-compile path, sub-workflow dispatch, the
+loop/collect/capability-dispatch structural nodes, the LLM dispatch kinds on
+tier-1 local Ollama, the judge/reflective-retry/agent-loop orchestration nodes,
+the concurrency primitives, and input-boundary + fail-open sweeps).** This
 doc captures the bugs, the two classes (and the lints that freeze them), and the
 negative results (so they aren't re-investigated).
 
@@ -193,11 +196,43 @@ to the check's `AUDIT_TABLES`.
     runtime model + dimensions + column dim are all 1024 in lockstep. Found while
     wiring up local Ollama to test the LLM dispatch kinds.
 
+14. **#284 — actor execution-budget TOCTOU (governance/cost-control bypass).**
+    `max_executions_per_hour` / `_total` were enforced check-then-act:
+    `authorize_workflow_trigger` `COUNT`s recent executions, but the execution
+    INSERT happens separately with no lock spanning both. Under concurrent
+    triggers every request reads `count < cap` before any INSERT commits, so they
+    all pass. Reproduced live: a `max_executions_per_hour=2` actor admitted **10**
+    (up to 19) under a barrier-synchronised 20-way fire. The workflow
+    concurrency-limit path already serialised with `SELECT … FOR UPDATE`; the
+    actor-budget path had no equivalent. Fixed by re-checking the budget *inside*
+    `create_execution_under_concurrency_limit` under a per-actor
+    `pg_advisory_xact_lock` (atomic with the INSERT). Post-fix: exactly 2 of 25
+    admitted. *(Shell `&` concurrency didn't expose it — the barrier harness did;
+    a reminder that TOCTOU repro needs true window alignment.)*
+
 Plus **#262** — restored four onboarding fixes (`/auth/csrf` dev proxy, catalog
 seeding default, self-loop edge guard, frontend port docs) dropped by #259's
 squash merge.
 
 ---
+
+## Battle-hardening phase — actor-budget enforcement
+
+After #284 fixed the budget *race*, a sibling-hunt found a second class: **four
+actor budget dimensions were stored, settable, returned, and documented as
+"platform safety caps with implicit defaults" — but enforced nowhere** (operators
+relied on phantom protection). The enforceable ones were made real; the rest
+honestly relabelled.
+
+| PR | Cap | Outcome |
+|----|-----|---------|
+| #285 | (all four) | relabelled **RESERVED — NOT YET ENFORCED** (honesty; zero behaviour change) |
+| #286 | `max_workflows_per_minute` | **enforced** — atomic per-actor trigger-rate cap in the same advisory-lock block; verified cap=3 → exactly 3 of 15 concurrent |
+| #287 | `max_fuel_per_hour` | **enforced** — rolling per-hour `SUM(fuel_consumed)` from `execution_cost_rollup`; verified blocked after the hourly fuel was burned. (`::bigint` cast needed — Postgres `SUM(bigint)`→`numeric` errored every trigger until caught live) |
+| #288 | `max_compilations_per_hour`, `max_outbound_requests_per_hour`, `max_fuel_per_execution` | **documented unenforceable as per-actor caps** — compiles/outbound aren't actor-attributed (no row to gate on); would need attribution + tracking, or reframing per-user/agent |
+
+Net: 4 of 7 budget dimensions now genuinely enforced (atomic, race-safe); the
+rest accurately labelled.
 
 ## Open follow-ups (noted, not yet fixed)
 
@@ -384,3 +419,30 @@ squash merge.
   - *agent_loop* — a real-LLM body workflow with `max_iterations: 2` → ran 2
     iterations, accumulated `__agent_history__` (2 entries), capped at the limit
     (`finished: false`, `iterations: 2`), `final_output` carried the LLM answer.
+- **Concurrency primitives** (battle-hardening sweep). Every contended path other
+  than the actor budget (#284) was already serialised correctly:
+  - *workflow concurrency limit* — `SELECT max_concurrent_executions … FOR UPDATE`
+    on the workflow row (check-and-insert atomic).
+  - *webhook duplicate-delivery dedup* — `talos_idempotency`'s `is_duplicate` is
+    an atomic Redis `SET … NX EX` claim; concurrent identical deliveries → one
+    wins. Race-safe by construction.
+  - *approval submit* — `UPDATE … WHERE status='pending'` + `rows_affected`; the
+    inline NATS reply-topic is consumed once. Double-submit can't double-resume.
+  - *crash-recovery claim* — `FOR UPDATE SKIP LOCKED` (exactly-once across
+    replicas).
+- **Input-boundary fuzzing** (no crashes / no internal-detail 500s / no
+  silent-accept-of-invalid). `create_workflow`: 100 KB name → "max 200 chars";
+  5000 nodes → "exceeds 500 node limit"; `\x01` / `\0` in name → rejected;
+  `NaN` / `Infinity` in numeric fields → rejected at JSON parse (400);
+  negative/huge/`1e18` timeout → range-rejected; wrong-type `nodes` → rejected;
+  empty name → rejected. `trigger_workflow` input: 200-level nesting and
+  `Infinity` rejected at parse (never reach the `MAX_CANONICAL_DEPTH=128` signing
+  guard); 100 K-element arrays / 500 KB strings complete or fail gracefully at the
+  worker input limit; bare-array / bare-string / huge-int inputs accepted and run.
+- **Fail-open hunt** (dependency-error → permissive-default class, MCP-366/535/999
+  lineage). Grepped the gate/auth/budget/dedup/rate-limit crates for
+  `.unwrap_or(false|None|0|true)` on dependency results — no live instances; the
+  only hits are display-count defaults and a correct in-memory circuit-breaker
+  default. The class is held by lint check 10 + the prior fix history. The new
+  #286/#287 gates are fail-closed (the in-tx `COUNT`/`SUM` errors propagate via
+  `?`, rolling back the create).
