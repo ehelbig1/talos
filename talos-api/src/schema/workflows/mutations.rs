@@ -252,14 +252,9 @@ impl WorkflowsMutations {
                 limit,
                 count,
             }) => {
-                let window = match kind {
-                    "per_minute" => "in the last minute",
-                    "per_hour" => "in the last hour",
-                    _ => "total",
-                };
-                return Err(async_graphql::Error::new(format!(
-                    "Actor budget exceeded: {count} executions {window} (limit: {limit})."
-                ))
+                return Err(async_graphql::Error::new(
+                    talos_workflow_repository::actor_budget_exceeded_message(kind, limit, count),
+                )
                 .extend_safe());
             }
             Err(e) => {
