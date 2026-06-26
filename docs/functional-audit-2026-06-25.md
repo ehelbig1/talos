@@ -236,12 +236,30 @@ rest accurately labelled.
 
 ## Open follow-ups (noted, not yet fixed)
 
-- **Module-approval status semantics.** The module-level `requires_approval_for`
-  path marks the execution `failed` (with an "Execution paused…" message) and
-  relies on *fail → approve → retry*, whereas the confidence-gate path *suspends*
-  to `waiting` and resumes. After #269 the approve step works, but the two
-  approval mechanisms should be reconciled — `failed` is a misleading status for
-  "pending approval", and a `failed` row is what dashboards/alerts surface.
+- **Module-approval status semantics** *(investigated 2026-06-26 — NOT a safe
+  quick fix; needs a scoped design task).* The module-level `requires_approval_for`
+  path (engine_dispatch_single/pipeline) returns a plain `Err("Execution paused…")`
+  on `ApprovalStatus::Pending`, so the run loop fails the node → execution
+  `failed`; recovery is *fail → approve → retry*. The confidence-gate path
+  (`engine.rs`) instead returns an `Err(json!({"__waiting__": true, …}))` envelope
+  that the run loop maps to `ctx.waiting → mark_execution_waiting`, and resume is
+  driven by a **separate suspension/continuation subsystem**
+  (`talos-continuation-trigger::trigger_continuation_workflow` dispatches a
+  continuation workflow when the gate is satisfied) — NOT a checkpoint restore.
+  So the two are different subsystems, and `failed`→retry is the *deliberate*
+  no-suspension design. **Do not naively flip module-approval to `waiting`:** a
+  `waiting` row with no suspension/continuation hook never resumes (and crash
+  recovery, which loads `status='waiting'`, would mishandle it) — strictly worse
+  than the cosmetic `failed` status. A proper fix routes module-approval through
+  the suspension/continuation machinery (emit `__waiting__`, register a
+  suspension, wire the approve→continuation resume), or — lower-risk — adds an
+  `error_type`/marker column (migration) so dashboards can filter
+  "pending approval" from genuine failures without touching resume semantics.
+  **Interim mitigation shipped:** both module-approval pending messages now carry
+  a stable `[APPROVAL_PENDING]` prefix, so alerting can exclude them
+  (`error_message NOT LIKE '[APPROVAL_PENDING]%'`) without a schema or
+  resume-semantics change. The full suspend/continuation reconcile remains the
+  proper (scoped) fix.
 - ~~**Webhook FK-routing log noise.**~~ **RESOLVED.** The WASM-log handler
   routed `workflow_execution_logs` vs `module_execution_logs` by attempting the
   workflow insert and catching the FK violation — which Postgres logged as an
