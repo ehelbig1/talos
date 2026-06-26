@@ -55,6 +55,36 @@ pub enum ConcurrencyAdmission {
     /// `running` is the count observed inside the transaction
     /// (always `>= limit`).
     LimitReached { limit: i32, running: i64 },
+    /// The triggering actor's execution budget (per-hour or total)
+    /// would be exceeded. No row was written. `kind` is `"per_hour"`
+    /// or `"total"`; `limit` is the configured cap; `count` is the
+    /// count observed inside the transaction (always `>= limit`).
+    ///
+    /// This is the ATOMIC backstop for the actor-budget gate: the
+    /// fast-fail pre-check in `authorize_workflow_trigger` is lock-free
+    /// check-then-act, so under concurrent triggers every request could
+    /// read `count < cap` before any INSERT committed and blow past the
+    /// cap (observed: a `max_executions_per_hour=2` actor admitted 10
+    /// under a 20-way barrier-synchronised fire). The re-check below runs
+    /// inside the row-creation transaction under a per-actor advisory
+    /// lock, so it's atomic with the INSERT.
+    ActorBudgetExceeded {
+        kind: &'static str,
+        limit: i32,
+        count: i64,
+    },
+}
+
+/// Derive a stable per-actor key for `pg_advisory_xact_lock(bigint)` from
+/// the actor UUID. Transaction-scoped advisory locks serialise execution
+/// creation for the same actor so the in-transaction budget re-check in
+/// [`WorkflowRepository::create_execution_under_concurrency_limit`] is
+/// atomic with the INSERT (closes the actor-budget TOCTOU). A 64-bit
+/// collision would merely serialise two unrelated actors together
+/// occasionally — correctness-safe, perf-only.
+pub(crate) fn actor_advisory_lock_key(actor_id: Uuid) -> i64 {
+    let b = actor_id.as_bytes();
+    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
 /// Outcome of [`WorkflowRepository::create_executions_batch_under_concurrency_limit`].
@@ -92,6 +122,27 @@ pub(crate) fn compute_batch_admit_count(
             let headroom = (limit_i64 - running).max(0) as usize;
             headroom.min(requested)
         }
+    }
+}
+
+#[cfg(test)]
+mod actor_lock_key_tests {
+    use super::actor_advisory_lock_key;
+    use uuid::Uuid;
+
+    #[test]
+    fn key_is_deterministic_and_distinct() {
+        let a = Uuid::parse_str("d8aaa59a-bab7-4a7e-9c21-8ba041543403").unwrap();
+        let b = Uuid::parse_str("cd4ac0f1-9a4b-425b-9434-c0dda50e0049").unwrap();
+        // Same UUID → same key (serialises the same actor across calls).
+        assert_eq!(actor_advisory_lock_key(a), actor_advisory_lock_key(a));
+        // Different UUIDs → different keys (no spurious cross-actor serialisation).
+        assert_ne!(actor_advisory_lock_key(a), actor_advisory_lock_key(b));
+    }
+
+    #[test]
+    fn nil_uuid_maps_to_zero() {
+        assert_eq!(actor_advisory_lock_key(Uuid::nil()), 0);
     }
 }
 
@@ -1159,6 +1210,71 @@ impl WorkflowRepository {
         initial_status: InitialExecutionStatus,
     ) -> Result<ConcurrencyAdmission> {
         let mut tx = self.db_pool.begin().await?;
+
+        // Actor-budget atomic backstop (battle-hardening). The fast-fail
+        // pre-check in `authorize_workflow_trigger` is lock-free
+        // check-then-act, so concurrent triggers can all read
+        // `count < cap` before any INSERT commits and exceed the actor's
+        // `max_executions_per_hour` / `max_executions_total` cap. Take a
+        // transaction-scoped advisory lock keyed on the actor FIRST (a
+        // stable lock order — actor before the workflow row below — so no
+        // deadlock vs. a no-actor trigger that only takes the row lock),
+        // then re-evaluate the budget inside the same transaction so the
+        // check is atomic with the INSERT. Serialises execution creation
+        // per-actor across ALL workflows, which the workflow-row lock
+        // alone can't (different workflows → different rows). The pre-check
+        // stays as a fast-fail + owner of the `on_budget_exceeded=suspend`
+        // side-effect; this is the pure hard-cap race-closer.
+        if let Some(aid) = actor_id {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(actor_advisory_lock_key(aid))
+                .execute(&mut *tx)
+                .await?;
+
+            let policy: Option<(Option<i32>, Option<i32>)> = sqlx::query_as(
+                "SELECT max_executions_per_hour, max_executions_total \
+                 FROM actor_budget_policies WHERE actor_id = $1",
+            )
+            .bind(aid)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some((per_hour, total)) = policy {
+                if let Some(limit) = per_hour {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM workflow_executions \
+                         WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 hour'",
+                    )
+                    .bind(aid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if count >= i64::from(limit) {
+                        tx.rollback().await?;
+                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
+                            kind: "per_hour",
+                            limit,
+                            count,
+                        });
+                    }
+                }
+                if let Some(limit) = total {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM workflow_executions WHERE actor_id = $1",
+                    )
+                    .bind(aid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if count >= i64::from(limit) {
+                        tx.rollback().await?;
+                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
+                            kind: "total",
+                            limit,
+                            count,
+                        });
+                    }
+                }
+            }
+        }
 
         // Lock the workflow row. Concurrent triggers against the same
         // workflow_id wait here until our transaction commits (or

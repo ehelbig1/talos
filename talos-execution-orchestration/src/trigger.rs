@@ -357,6 +357,24 @@ impl ExecutionOrchestrationService {
                     running, limit
                 )));
             }
+            talos_workflow_repository::ConcurrencyAdmission::ActorBudgetExceeded {
+                kind,
+                limit,
+                count,
+            } => {
+                // Atomic backstop fired (the fast-fail pre-check let a
+                // concurrent burst slip through). Surface the same
+                // budget-exceeded shape the pre-check uses.
+                let window = if kind == "per_hour" {
+                    "in the last hour"
+                } else {
+                    "total"
+                };
+                return Err(OrchestrationError::AuthorizationDenied(format!(
+                    "Actor budget exceeded: {} executions {} (limit: {})",
+                    count, window, limit
+                )));
+            }
         }
 
         // 12. Best-effort analytics + audit log. Both are advisory —

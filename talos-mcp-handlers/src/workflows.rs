@@ -4103,6 +4103,22 @@ async fn handle_call_workflow(
                 ),
             ));
         }
+        Ok(talos_workflow_repository::ConcurrencyAdmission::ActorBudgetExceeded {
+            kind,
+            limit,
+            count,
+        }) => {
+            let window = if kind == "per_hour" {
+                "in the last hour"
+            } else {
+                "total"
+            };
+            return Some(mcp_error(
+                req_id.clone(),
+                -32000,
+                &format!("Actor budget exceeded: {count} executions {window} (limit: {limit})."),
+            ));
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "Failed to create execution record: {}", e);
             return Some(mcp_error(
@@ -4965,6 +4981,24 @@ async fn handle_bulk_trigger_workflow(
                 }));
                 continue;
             }
+            Ok(talos_workflow_repository::ConcurrencyAdmission::ActorBudgetExceeded {
+                kind,
+                limit,
+                count,
+            }) => {
+                let window = if kind == "per_hour" {
+                    "in the last hour"
+                } else {
+                    "total"
+                };
+                results.push(serde_json::json!({
+                    "input_index": idx,
+                    "execution_id": serde_json::Value::Null,
+                    "status": "budget_blocked",
+                    "error": format!("Actor budget exceeded: {count} executions {window} (limit: {limit})"),
+                }));
+                continue;
+            }
             Err(e) => {
                 tracing::error!(execution_id = %exec_id, "bulk_trigger: failed to create execution record: {}", e);
                 results.push(serde_json::json!({
@@ -5331,6 +5365,24 @@ async fn handle_trigger_workflow_as_actors(
                     "error": format!(
                         "max_concurrent_executions reached: {running} running (limit: {limit})"
                     ),
+                }));
+                continue;
+            }
+            Ok(talos_workflow_repository::ConcurrencyAdmission::ActorBudgetExceeded {
+                kind,
+                limit,
+                count,
+            }) => {
+                let window = if kind == "per_hour" {
+                    "in the last hour"
+                } else {
+                    "total"
+                };
+                results.push(serde_json::json!({
+                    "actor_id": actor_id.to_string(),
+                    "execution_id": serde_json::Value::Null,
+                    "status": "budget_blocked",
+                    "error": format!("Actor budget exceeded: {count} executions {window} (limit: {limit})"),
                 }));
                 continue;
             }
