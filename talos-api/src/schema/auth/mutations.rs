@@ -68,6 +68,21 @@ impl AuthMutations {
             {
                 tracing::error!(user_id = %user_id, "Failed to create personal org at signup (will be repaired): {e}");
             }
+
+            // Phase D2.3 of "every execution gets an actor": provision the
+            // user's default actor at signup. It's the fallback principal the
+            // `trg_set_default_actor` trigger stamps onto any actor-less
+            // execution insert — so once `actor_id` becomes NOT NULL (Phase E),
+            // a brand-new user can't insert a NULL-actor row before their first
+            // `resolve_effective_actor` call. Best-effort + idempotent, mirroring
+            // the personal-org provisioning above (created AFTER it so the org
+            // exists for the org-scoped write); a transient failure must not fail
+            // an otherwise-successful signup — the lazy get_or_create path repairs
+            // a miss.
+            let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+            if let Err(e) = actor_repo.get_or_create_default_actor(user_id).await {
+                tracing::error!(user_id = %user_id, "Failed to create default actor at signup (will be repaired): {e}");
+            }
         }
 
         // Generate access token (short-lived: 15 minutes)
