@@ -1231,15 +1231,39 @@ impl WorkflowRepository {
                 .execute(&mut *tx)
                 .await?;
 
-            let policy: Option<(Option<i32>, Option<i32>)> = sqlx::query_as(
-                "SELECT max_executions_per_hour, max_executions_total \
+            let policy: Option<(Option<i32>, Option<i32>, Option<i32>)> = sqlx::query_as(
+                "SELECT max_executions_per_hour, max_executions_total, max_workflows_per_minute \
                  FROM actor_budget_policies WHERE actor_id = $1",
             )
             .bind(aid)
             .fetch_optional(&mut *tx)
             .await?;
 
-            if let Some((per_hour, total)) = policy {
+            if let Some((per_hour, total, per_minute)) = policy {
+                // Per-minute trigger-rate cap. Counts only rows that carry
+                // this actor_id — top-level triggers (bulk_trigger /
+                // trigger_as_actors included). Sub-workflow chain rows are
+                // inserted with actor_id = NULL and in-process sub-workflow
+                // dispatch creates no execution rows, so neither inflates
+                // this count. Same advisory-lock serialisation as the
+                // per-hour / total caps above → atomic with the INSERT.
+                if let Some(limit) = per_minute {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM workflow_executions \
+                         WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 minute'",
+                    )
+                    .bind(aid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if count >= i64::from(limit) {
+                        tx.rollback().await?;
+                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
+                            kind: "per_minute",
+                            limit,
+                            count,
+                        });
+                    }
+                }
                 if let Some(limit) = per_hour {
                     let count: i64 = sqlx::query_scalar(
                         "SELECT COUNT(*) FROM workflow_executions \

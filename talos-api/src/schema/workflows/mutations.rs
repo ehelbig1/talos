@@ -252,10 +252,10 @@ impl WorkflowsMutations {
                 limit,
                 count,
             }) => {
-                let window = if kind == "per_hour" {
-                    "in the last hour"
-                } else {
-                    "total"
+                let window = match kind {
+                    "per_minute" => "in the last minute",
+                    "per_hour" => "in the last hour",
+                    _ => "total",
                 };
                 return Err(async_graphql::Error::new(format!(
                     "Actor budget exceeded: {count} executions {window} (limit: {limit})."
