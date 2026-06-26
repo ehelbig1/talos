@@ -765,6 +765,19 @@ async fn workflow_executions_permissive_rls_member_sees_shared_stranger_blocked(
     .execute(&su)
     .await
     .expect("insert workflow");
+    // Phase E: workflow_executions.actor_id is NOT NULL. Give each user that
+    // owns an execution below a default actor so the trg_set_default_actor
+    // trigger stamps it (seeded as superuser, like the rest of this setup).
+    for u in [owner, teammate] {
+        sqlx::query(
+            "INSERT INTO actors (id, user_id, name, max_capability_world, is_default) \
+             VALUES (gen_random_uuid(), $1, 'Default', 'network-node', true)",
+        )
+        .bind(u)
+        .execute(&su)
+        .await
+        .expect("insert default actor");
+    }
     for (eid, u) in [(exec_owner, owner), (exec_mate, teammate)] {
         sqlx::query(
             "INSERT INTO workflow_executions (id, workflow_id, user_id, status) \
