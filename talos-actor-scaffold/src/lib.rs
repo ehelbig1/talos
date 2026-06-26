@@ -389,7 +389,10 @@ pub async fn scaffold_actor(
     // ── 4. Budget (best effort) ──────────────────────────────────────────
     if let Some(b) = &req.budget {
         let on_exceeded = b.on_budget_exceeded.as_deref().unwrap_or("suspend");
-        // Same platform-default safety nets as handle_set_actor_budget.
+        // Stored defaults matching handle_set_actor_budget. NOTE: these two
+        // are RESERVED — persisted but NOT YET ENFORCED (no enforcement path
+        // consumes max_workflows_per_minute / max_compilations_per_hour). The
+        // enforced caps are max_executions_per_hour / max_executions_total.
         let wpm = b.max_workflows_per_minute.unwrap_or(10);
         let cph = b.max_compilations_per_hour.unwrap_or(20);
         match deps

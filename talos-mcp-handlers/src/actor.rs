@@ -290,10 +290,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "set_actor_budget",
             "description": "Create or replace the budget policy for an actor. All limits are optional — \
-                omitting a field means unlimited (no cap), EXCEPT max_workflows_per_minute (default 10) \
-                and max_compilations_per_hour (default 20) which have implicit platform safety defaults \
-                even when not specified. on_budget_exceeded: 'suspend' (default), 'alert', or 'block'. \
-                The response includes defaults_applied listing which fields used their implicit defaults.",
+                omitting a field means unlimited (no cap). ENFORCED caps: max_executions_per_hour, \
+                max_executions_total (both atomic at trigger time), and max_workflow_count (at create time). \
+                RESERVED / NOT YET ENFORCED (stored + returned but no enforcement path consumes them): \
+                max_workflows_per_minute (stored default 10), max_compilations_per_hour (stored default 20), \
+                max_outbound_requests_per_hour, max_fuel_per_hour — do NOT rely on these for safety yet. \
+                on_budget_exceeded: 'suspend' (default), 'alert', or 'block'. \
+                The response includes defaults_applied listing which fields used their stored defaults.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -301,11 +304,11 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "max_executions_per_hour": { "type": "number", "description": "Omit for unlimited" },
                     "max_executions_total": { "type": "number", "description": "Omit for unlimited" },
                     "max_fuel_per_execution": { "type": "number", "description": "Omit for unlimited" },
-                    "max_fuel_per_hour": { "type": "number", "description": "Omit for unlimited" },
-                    "max_outbound_requests_per_hour": { "type": "number", "description": "Omit for unlimited" },
+                    "max_fuel_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited. (Per-hour aggregate fuel is not currently rate-checked; only max_executions_per_hour / max_executions_total are enforced.)" },
+                    "max_outbound_requests_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited. (Outbound-request volume is not currently rate-checked.)" },
                     "max_workflow_count": { "type": "number", "description": "Omit for unlimited" },
-                    "max_workflows_per_minute": { "type": "number", "description": "Platform safety cap on workflow trigger rate. Implicit default: 10 if omitted." },
-                    "max_compilations_per_hour": { "type": "number", "description": "Platform safety cap on WASM compilations. Implicit default: 20 if omitted." },
+                    "max_workflows_per_minute": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Per-minute trigger rate is not currently rate-checked (no enforcement path consumes this value); the enforced volume caps are max_executions_per_hour / max_executions_total. Stored default 10 if omitted." },
+                    "max_compilations_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. WASM compilations are not currently rate-checked. Stored default 20 if omitted." },
                     "on_budget_exceeded": { "type": "string", "description": "suspend (default) | alert | block" }
                 },
                 "required": ["actor_id"]
