@@ -242,12 +242,17 @@ rest accurately labelled.
   to `waiting` and resumes. After #269 the approve step works, but the two
   approval mechanisms should be reconciled — `failed` is a misleading status for
   "pending approval", and a `failed` row is what dashboards/alerts surface.
-- **Webhook FK-routing log noise.** The WASM-log handler routes
-  `workflow_execution_logs` vs `module_execution_logs` by attempting the workflow
-  insert and catching the FK violation. Functionally correct + documented as
-  intentional, but it emits a Postgres `ERROR` line per standalone-module log —
-  noisy for log-based alerting. Optional: a cheap `EXISTS` pre-check, or tag the
-  log's execution kind on the wire.
+- ~~**Webhook FK-routing log noise.**~~ **RESOLVED.** The WASM-log handler
+  routed `workflow_execution_logs` vs `module_execution_logs` by attempting the
+  workflow insert and catching the FK violation — which Postgres logged as an
+  `ERROR` per standalone-module log. `add_workflow_log` now does a
+  `WHERE EXISTS (… workflow_executions …)`-guarded insert and returns
+  `Ok(false)` (a clean 0-row no-op) for a non-workflow id, so the subscriber
+  routes to the module-log table on the boolean instead of on an FK error. No
+  Postgres ERROR, single round trip for the common case; genuine failures (the
+  5000-entry rate-limit trigger, DB outage) still surface as `Err` so a real
+  workflow log isn't misrouted. DB-verified: guarded insert is `INSERT 0 0` for
+  a fake id (no error) vs `INSERT 0 1` for a real one.
 - **Budget USD cap is inert.** `check_execution_allowed` enforces actor status +
   per-hour rate at trigger time, but the lifetime-USD cap depends on consumption
   tracking that is documented as *"Always 0 until budget tracking is wired."*
