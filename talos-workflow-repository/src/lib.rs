@@ -382,6 +382,11 @@ pub struct ActorRow {
     pub max_workflow_count: Option<i32>,
     pub max_executions_per_hour: Option<i32>,
     pub max_executions_total: Option<i64>,
+    /// True for the user's auto-provisioned default actor. The
+    /// trigger-authorization gate enforces budget/status/tier against it but
+    /// SKIPS the capability-ceiling check (it's an identity/budget bucket, not
+    /// a capability sandbox — the module's compiled world is the real bound).
+    pub is_default: bool,
 }
 
 // `ActorMemory` struct removed alongside its sole consumer
@@ -2070,7 +2075,7 @@ impl WorkflowRepository {
     /// Fetch an actor record with its budget policy. Returns None if not found / wrong owner.
     pub async fn get_actor(&self, actor_id: Uuid, user_id: Uuid) -> Result<Option<ActorRow>> {
         let row = sqlx::query(
-            "SELECT a.id, a.name, a.status, \
+            "SELECT a.id, a.name, a.status, a.is_default, \
                     abp.max_workflow_count, abp.max_executions_per_hour, \
                     abp.max_executions_total \
              FROM actors a \
@@ -2089,6 +2094,7 @@ impl WorkflowRepository {
             max_workflow_count: r.try_get("max_workflow_count").unwrap_or(None),
             max_executions_per_hour: r.try_get("max_executions_per_hour").unwrap_or(None),
             max_executions_total: r.try_get("max_executions_total").unwrap_or(None),
+            is_default: r.try_get("is_default").unwrap_or(false),
         }))
     }
 
