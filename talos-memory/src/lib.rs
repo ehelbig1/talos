@@ -1628,15 +1628,22 @@ pub async fn measure_value_bytes_in_tx<'c>(
 /// written.
 ///
 /// **Caller must verify both actors belong to the same user before
-/// invoking.** DEKs are scoped per-user (`value_key_id` references the
-/// owning user's DEK lineage), so a cross-user copy would produce rows
-/// the destination owner cannot decrypt. `talos-memory` has no notion of
-/// user identity — that ownership check stays where it is, in the
+/// invoking.** This is a TENANCY boundary, not a crypto one: it stops one
+/// user's agent memory from being copied into another user's agent. (The
+/// DEK is a single system-wide key — there is no per-user DEK — so a
+/// cross-user copy would in fact decrypt fine; we forbid it for privacy,
+/// not because the destination "couldn't decrypt".) `talos-memory` has no
+/// notion of user identity — that ownership check stays where it is, in the
 /// MCP/GraphQL layer.
 ///
-/// Source ciphertext is passed through verbatim — no decrypt /
-/// re-encrypt round-trip — which is correct precisely because the DEK
-/// lineage matches and is faster than per-row crypto. `metadata` is
+/// Crypto handling depends on the row's AEAD format. The per-row subkey is
+/// `HKDF(global DEK, info = build_memory_aad(actor_id, key))`, so the
+/// derivation (and the bound AAD) is tied to the SOURCE actor_id and must be
+/// re-based on copy:
+/// * v0 rows (no AAD) → ciphertext copied verbatim — cheap, no crypto.
+/// * v1 / v3 rows → DECRYPTED under the source AAD and RE-ENCRYPTED under the
+///   target AAD per row (see the per-format branch in the body), because the
+///   AAD's actor_id changes. `metadata` is
 /// preserved so cloned memories retain their `kind` tags + provenance.
 /// Embeddings are NOT copied: they are lossy (1024-dim float vectors)
 /// and the cheaper rebuild path is to spawn

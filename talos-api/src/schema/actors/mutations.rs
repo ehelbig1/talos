@@ -1059,9 +1059,11 @@ impl ActorsMutations {
         })?;
 
         // Copy semantic (permanent) and episodic (fresh 7-day TTL) memories
-        // through the canonical talos_memory entry point — same DEK lineage
-        // (per-user) so ciphertext passthrough is safe and avoids a per-row
-        // decrypt/re-encrypt round-trip. Failures are logged but not fatal:
+        // through the canonical talos_memory entry point. The same-user gate it
+        // enforces is a tenancy boundary, not a crypto one (the DEK is global,
+        // not per-user); v1/v3 rows are decrypt+re-encrypted on copy to re-base
+        // their actor_id-bound AAD, v0 rows pass ciphertext through. Failures
+        // are logged but not fatal:
         // the actor itself was already inserted above and the response
         // includes `memories_copied=0` so the caller can detect partial
         // success. (Pre-Phase-B regression class: silent SQL errors here
