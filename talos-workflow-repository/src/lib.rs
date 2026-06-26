@@ -3233,13 +3233,34 @@ impl WorkflowRepository {
     /// `is_compiled` is true when `wasm_bytes` is populated. `category`
     /// prefers the persisted Phase 1.5 column, falling back to `kind` so
     /// sandbox / extracted rows still label sensibly.
-    pub async fn list_scaffolding_templates(&self) -> Result<Vec<ScaffoldingTemplateRow>> {
+    pub async fn list_scaffolding_templates(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<ScaffoldingTemplateRow>> {
+        // Tenant scoping (mirrors `find_compiled_template_by_name`): system
+        // catalog entries (`user_id IS NULL`, `kind='catalog'`) PLUS the
+        // caller's own `sandbox`/`extracted` modules. WITHOUT the `user_id`
+        // predicate this `SELECT … FROM modules` returned EVERY user's private
+        // modules, leaking their names + descriptions into the requesting
+        // user's scaffolding LLM context (module names routinely encode what
+        // someone is building). The explicit-modules path still wires an
+        // explicitly-named ID via its shorthand second pass even when the row
+        // isn't in this list, so scoping can't break a user referencing their
+        // own module by id.
+        //
+        // `LIMIT` is a safety bound on an otherwise-unbounded read (the
+        // "no unbounded in-memory collections" rule). Both consumers degrade
+        // gracefully past it: the LLM catalog only needs a representative
+        // sample, and the explicit-modules path falls back to the id shorthand.
         let rows = sqlx::query(
             "SELECT id, name, \
                     COALESCE(category, kind) AS category, description, \
                     (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled \
-             FROM modules ORDER BY name",
+             FROM modules \
+             WHERE (user_id IS NULL OR user_id = $1) \
+             ORDER BY name LIMIT 1000",
         )
+        .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
 

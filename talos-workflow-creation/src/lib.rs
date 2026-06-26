@@ -335,7 +335,7 @@ impl WorkflowCreationService {
         // aware SELECT). lint-check-8 class.
         let templates = self
             .workflow_repo
-            .list_scaffolding_templates()
+            .list_scaffolding_templates(req.user_id)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
