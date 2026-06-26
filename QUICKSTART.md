@@ -49,12 +49,18 @@ To rotate everything, delete `.env` and re-run `make setup`.
 ## Day-to-day
 
 ```bash
+make doctor                      # preflight: stale images vs source, disk pressure, stack health
 make ps                          # service health + DB row counts
 make logs SERVICE=controller     # tail one service (omit value for all)
 make rebuild SERVICE=controller  # hot-rebuild one service after a code change
 make down                        # stop (preserves data volumes)
 make nuke                        # ⚠️ wipe everything incl. volumes (needs TALOS_NUKE=yes)
 ```
+
+**Run `make doctor` before live-testing.** It catches the trap where you edit
+Rust, forget to rebuild, and `make up`'s cached image runs *old* code — plus
+Docker-VM disk pressure (which otherwise surfaces as confusing Redis/DB errors,
+not an obvious "out of space").
 
 Run `make help` for the full target list.
 
@@ -96,6 +102,7 @@ or add the missing key (see the table above).
 Docker's disk is full. Reclaim with `docker builder prune -f` and
 `docker image prune -f`, or raise Docker Desktop's disk-image size limit.
 (If you opted into a large `TIER1_MODEL`, that image alone can be ~20 GB+.)
+`make doctor` warns when the build cache is getting large *before* it bites.
 
 ### GraphiQL not accessible
 GraphiQL is disabled when `RUST_ENV=production`. The generated `.env` leaves it

@@ -23,7 +23,7 @@ SERVICE            ?= controller
 export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
-.PHONY: help setup up down rebuild restart logs ps shell \
+.PHONY: help setup up down rebuild restart logs ps shell doctor \
         check build lint lint-frontend hooks test test-integration coverage-html audit check-catalog ci \
         drill clean nuke smoke rls-preflight _wait-healthy
 
@@ -76,6 +76,9 @@ ps: ## Show service health and database row counts
 	    ) t ORDER BY table_name;" 2>/dev/null \
 	  | awk -F'|' '{printf "  %-22s %s\n", $$1, $$2}' \
 	  || printf '  (database unreachable — run `make up` first)\n'
+
+doctor: ## Preflight: stale images vs source, Docker disk pressure, stack health — run before live-testing
+	@bash scripts/doctor.sh
 
 shell: ## Open a shell in a running service (SERVICE=...)
 	@docker compose exec -- "$(SERVICE)" /bin/bash 2>/dev/null \
