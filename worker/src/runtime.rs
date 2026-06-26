@@ -149,7 +149,20 @@ pub struct SecurityPolicy {
 ///             reconfigured engine — `Component::deserialize` UB.
 ///             Operators with V4 AOT caches will see them rejected;
 ///             modules recompile on next use.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV5";
+///   TALOSV6 — 2026-06-26: corrected the engine-config fingerprint's
+///             `wasmtime=` line, which had silently rotted to `43.0.2`
+///             while the crate moved to 44.x. Nothing tied the string to
+///             the real dependency, so the 43→44 upgrade did NOT
+///             invalidate the AOT cache at the Talos layer — it leaned
+///             entirely on wasmtime's own deserialize version check. The
+///             line now reads 44.0.2 and a new test
+///             (`fingerprint_wasmtime_version_matches_cargo_toml`) asserts
+///             it matches worker/Cargo.toml, so the next bump can't rot
+///             silently. The corrected fingerprint changes the HMAC for
+///             every blob; bumping the header to V6 gives operators a
+///             clean version-mismatch rejection of V5 blobs rather than a
+///             cryptic HMAC failure.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV6";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -182,8 +195,16 @@ const AOT_HMAC_LEN: usize = 32;
 /// they vary per-deploy (prod vs dev). They're documented at the
 /// Config call site as "log-only / diagnostic" — they don't affect
 /// serialized-component compatibility.
+// The `wasmtime=` line MUST match the declared dependency in
+// worker/Cargo.toml. wasmtime exposes no runtime VERSION constant, so it's
+// hand-maintained here — but `fingerprint_wasmtime_version_matches_cargo_toml`
+// asserts the two agree, so a bump that forgets this line fails the test
+// instead of silently rotting (the line sat at 43.0.2 long after the crate
+// moved to 44.x, defeating Talos-layer AOT-cache invalidation on the bump —
+// wasmtime's own deserialize version check was the only thing still catching
+// stale blobs).
 const ENGINE_CONFIG_FINGERPRINT: &[u8] = b"talos-engine-config-v1\n\
-    wasmtime=43.0.2\n\
+    wasmtime=44.0.2\n\
     concurrency_support=true\n\
     consume_fuel=true\n\
     op_cost.memory_grow=255\n\
@@ -226,6 +247,14 @@ const ENGINE_CONFIG_FINGERPRINT: &[u8] = b"talos-engine-config-v1\n\
 /// across every AOT sign/verify call. `OnceLock` keeps the cost to a
 /// single hash at startup — every subsequent `aot_hmac_input` call
 /// just memcpys the cached 32-byte digest into the HMAC input buffer.
+///
+/// The wasmtime version is one of the fingerprint lines (it changes
+/// serialized-component compatibility). wasmtime exposes no runtime
+/// `VERSION` constant, so the line is hand-maintained — but
+/// `fingerprint_wasmtime_version_matches_cargo_toml` ties it to the
+/// declared dependency so a wasmtime bump that forgets to update the
+/// fingerprint fails CI loudly instead of silently skipping AOT-cache
+/// invalidation (the 43.x→44.x rot that prompted this).
 fn engine_config_fingerprint_hash() -> &'static [u8; 32] {
     use sha2::{Digest, Sha256};
     static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
@@ -384,26 +413,30 @@ mod aot_hmac_input_tests {
 
     /// 2026-05-22 wasm-security review (L-2): pin the SHA-256 of
     /// `ENGINE_CONFIG_FINGERPRINT` to a known value. This test FAILS
-    /// when a maintainer edits the fingerprint string (intended or
-    /// not) — forcing conscious acknowledgment that AOT blobs in the
-    /// fleet are about to invalidate. To update:
+    /// when a maintainer edits the fingerprint string (a `Config::` knob
+    /// OR the `wasmtime=` version line) — forcing conscious acknowledgment
+    /// that AOT blobs in the fleet are about to invalidate. To update:
     ///   1. Confirm the `Config::` builder change in
-    ///      `TalosRuntime::with_resources` is correct.
+    ///      `TalosRuntime::with_resources` is correct — OR confirm the
+    ///      wasmtime version bump is intended (and update the `wasmtime=`
+    ///      line, which `fingerprint_wasmtime_version_matches_cargo_toml`
+    ///      separately ties to Cargo.toml).
     ///   2. Update the matching line in `ENGINE_CONFIG_FINGERPRINT`.
     ///   3. Re-run this test to read the new hash from the failure
     ///      message, then paste it into `EXPECTED` below.
     ///   4. Mention the change in `AOT_VERSION_HDR`'s History section
-    ///      so operators can correlate the cache flush.
+    ///      so operators can correlate the cache flush, and bump the
+    ///      header so V(n) blobs reject cleanly.
     ///
-    /// The 4-step ritual is the whole point — it converts "silent UB
-    /// from forgotten config bump" into "explicit test failure that
-    /// teaches the maintainer the contract."
+    /// The ritual is the whole point — it converts "silent UB from a
+    /// forgotten config OR wasmtime bump" into "explicit test failure
+    /// that teaches the maintainer the contract."
     #[test]
     fn engine_config_fingerprint_is_pinned() {
         // Pinned SHA-256 of the canonical fingerprint constant.
-        // If this fails, ENGINE_CONFIG_FINGERPRINT was edited.
-        // See test doc for the update procedure.
-        const EXPECTED: &str = "637f69bd756f8c07ee378f4870fbada7809c23080685da82d290536aff02f924";
+        // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
+        // or the wasmtime= line). See test doc for the update procedure.
+        const EXPECTED: &str = "f291bd8aa34f3c4e85ead8addc5500463ac63b4785ba179a3a0fdf4ae9a6378c";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,
@@ -411,6 +444,57 @@ mod aot_hmac_input_tests {
              AND consider whether to bump AOT_VERSION_HDR so operators see a clean \
              version-mismatch error in their logs instead of an HMAC verification \
              failure on stale cached blobs."
+        );
+    }
+
+    /// Tie the fingerprint's `wasmtime=` line to the DECLARED dependency
+    /// in worker/Cargo.toml. This is the regression test for the exact
+    /// rot that prompted the V6 bump: the line said `43.0.2` long after
+    /// Cargo.toml moved to 44.x, so a wasmtime upgrade silently skipped
+    /// Talos-layer AOT-cache invalidation. wasmtime exposes no runtime
+    /// VERSION constant, so we read the manifest at test time (source-tree
+    /// only — never a runtime path dependency) and assert the fingerprint
+    /// carries the same version. A future bump that updates Cargo.toml but
+    /// forgets the fingerprint now fails here instead of rotting.
+    ///
+    /// Granularity note: this pins to the Cargo.toml caret pin
+    /// (`44.0.2`), not the lock-resolved patch (`44.0.3`). A lock-only
+    /// `cargo update` within the caret won't trip this — but wasmtime's
+    /// own `Component::deserialize` version check is the hard backstop for
+    /// that residual case (it rejects any cross-version blob), so the
+    /// Talos fingerprint only needs to track the declared pin.
+    #[test]
+    fn fingerprint_wasmtime_version_matches_cargo_toml() {
+        let manifest = include_str!("../Cargo.toml");
+        // Find the `wasmtime = { version = "X.Y.Z", ... }` line (the base
+        // crate, not wasmtime-wasi / wasmtime-wasi-http).
+        let version = manifest
+            .lines()
+            .find_map(|line| {
+                let line = line.trim_start();
+                let rest = line.strip_prefix("wasmtime ")?;
+                // Skip `wasmtime-wasi`, `wasmtime-wasi-http`, etc. — those
+                // don't have a space before `=` after the crate name here,
+                // but guard anyway by requiring the next token to be `=`.
+                let rest = rest.trim_start();
+                if !rest.starts_with('=') {
+                    return None;
+                }
+                let vstart = rest.find("version = \"")? + "version = \"".len();
+                let vend = rest[vstart..].find('"')? + vstart;
+                Some(rest[vstart..vend].to_string())
+            })
+            .expect("could not find `wasmtime = { version = \"...\" }` in worker/Cargo.toml");
+
+        let fingerprint = std::str::from_utf8(super::ENGINE_CONFIG_FINGERPRINT).unwrap();
+        let expected_line = format!("wasmtime={version}");
+        assert!(
+            fingerprint.contains(&expected_line),
+            "ENGINE_CONFIG_FINGERPRINT is missing `{expected_line}` — the declared \
+             wasmtime dep in worker/Cargo.toml is {version} but the fingerprint says \
+             otherwise. Update the `wasmtime=` line in ENGINE_CONFIG_FINGERPRINT (and \
+             re-pin engine_config_fingerprint_is_pinned + bump AOT_VERSION_HDR) so the \
+             version bump invalidates the AOT cache at the Talos layer."
         );
     }
 
@@ -1796,10 +1880,11 @@ impl TalosRuntime {
 
         let engine = Engine::new(&config)?;
         tracing::info!(
-            // Keep this in sync with worker/Cargo.toml's wasmtime dep
-            // when bumping the version. wasmtime doesn't expose a
-            // runtime VERSION constant, so the value is a literal here.
-            wasmtime_version = "43.0.2",
+            // Keep in sync with worker/Cargo.toml's wasmtime dep when
+            // bumping. wasmtime exposes no runtime VERSION constant, so this
+            // is a literal; `fingerprint_wasmtime_version_matches_cargo_toml`
+            // guards the matching fingerprint line against the same drift.
+            wasmtime_version = "44.0.2",
             allocator = if disable_pooling {
                 "on-demand (TALOS_DISABLE_POOLING=true)"
             } else {
