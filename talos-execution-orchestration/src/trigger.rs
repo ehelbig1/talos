@@ -222,18 +222,33 @@ impl ExecutionOrchestrationService {
         // `create_execution_under_concurrency_limit`); we still want
         // authorization to fail fast before any further DB work, so
         // it's promoted here.
-        if let Err(e) = talos_workflow_authorization::authorize_workflow_trigger(
-            &self.workflow_repo,
-            &self.actor_repo,
-            &self.db_pool,
-            trigger_agent_id,
-            user_id,
-            &graph_json,
-        )
-        .await
-        {
-            return Err(map_trigger_auth_error(e));
-        }
+        // Phase D2: resolve the effective actor ONCE — the gate returns it, and
+        // we stamp the execution row + build the engine with the SAME value so
+        // authorization, attribution, and runtime tier can't diverge. We pass
+        // the explicit-or-workflow actor in; the gate (Phase D1) falls back to
+        // the user's default actor when both are None, so this is never None on
+        // success.
+        let effective_actor: Option<Uuid> =
+            match talos_workflow_authorization::authorize_workflow_trigger(
+                &self.workflow_repo,
+                &self.actor_repo,
+                &self.db_pool,
+                trigger_agent_id.or(wf_record.actor_id),
+                user_id,
+                &graph_json,
+            )
+            .await
+            {
+                Ok(talos_workflow_authorization::TriggerAuthorization::Authorized { actor_id }) => {
+                    Some(actor_id)
+                }
+                // Phase D1 no longer returns Unbound, but match exhaustively;
+                // if it ever surfaces, fall back to the pre-D2 value.
+                Ok(talos_workflow_authorization::TriggerAuthorization::Unbound) => {
+                    trigger_agent_id.or(wf_record.actor_id)
+                }
+                Err(e) => return Err(map_trigger_auth_error(e)),
+            };
 
         // 6. Input schema validation. The validation service handles
         // dry-run vs. dispatch-mode internally; we surface the four
@@ -340,7 +355,7 @@ impl ExecutionOrchestrationService {
                 user_id,
                 version_id,
                 Some(&priority),
-                trigger_agent_id,
+                effective_actor,
                 trigger_provenance.as_ref(),
                 parent_execution_id,
                 root_execution_id,
@@ -400,11 +415,12 @@ impl ExecutionOrchestrationService {
             );
         }
 
-        // 13. Unbound-actor warning. Only fires when no actor resolves
-        // (neither caller-arg nor workflow default) AND the graph has
-        // at least one memory-write node — that's the gap that would
-        // silently drop __memory_write__ envelopes at execution time.
-        let effective_actor_id = trigger_agent_id.or(wf_record.actor_id);
+        // 13. Unbound-actor warning. Post-D2 `effective_actor` is the
+        // gate-resolved actor (default-actor fallback included), so this now
+        // only fires in the rare resolution-failure case where it stayed None
+        // AND the graph has a memory-write node — the gap that would silently
+        // drop __memory_write__ envelopes at execution time.
+        let effective_actor_id = effective_actor;
         if effective_actor_id.is_none() {
             let unbound = count_memory_write_nodes(&graph_json);
             if unbound > 0 {
@@ -433,7 +449,10 @@ impl ExecutionOrchestrationService {
             .clone();
 
         let opts = EngineOpts::for_run(workflow_id, graph_json)
-            .with_effective_actor(trigger_agent_id, wf_record.actor_id)
+            // Phase D2: the gate-resolved actor (already incorporates the
+            // explicit→workflow→default fallback) so the engine tier matches
+            // the stamped execution row.
+            .with_effective_actor(effective_actor, None)
             .with_actor_context(lifted_actor_context)
             .with_dry_run(dry_run);
         let workflow_repo_for_task = self.workflow_repo.clone();
