@@ -6719,6 +6719,17 @@ async fn oauth_callback_handler(
         {
             tracing::error!(user_id = %user_id, "Failed to create personal org for new OAuth user (will be repaired): {e}");
         }
+
+        // Phase D2.3: provision the default actor for brand-new OAuth users
+        // too (same rationale as the GraphQL signup path — the fallback
+        // principal the trg_set_default_actor trigger stamps onto actor-less
+        // execution inserts). Best-effort + idempotent; created after the
+        // personal org so the org-scoped write has its org.
+        let actor_repo =
+            talos_actor_repository::ActorRepository::new(google_calendar_service.db_pool.clone());
+        if let Err(e) = actor_repo.get_or_create_default_actor(user_id).await {
+            tracing::error!(user_id = %user_id, "Failed to create default actor for new OAuth user (will be repaired): {e}");
+        }
     }
 
     // Check if this is a Google OAuth callback with Calendar scopes
