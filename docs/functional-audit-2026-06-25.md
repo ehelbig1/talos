@@ -402,6 +402,41 @@ sustained multi-node load (requires a real cluster); the per-subject NATS
 queue has no explicit depth bound beyond the semaphore (callers must carry
 their own request timeout — they do, per the per-subject timeout table).
 
+### Frontend review (2026-06-26)
+
+First security pass over the React/TS frontend (`frontend/src`). **Code: clean**
+across every class checked — no `dangerouslySetInnerHTML` / `innerHTML` /
+`eval` / `new Function` anywhere; auth lives in **httpOnly cookies** (no JWT in
+`localStorage`/`sessionStorage`); CSRF token read from cookie and sent as
+`X-CSRF-Token` on every mutation through the one `graphqlRequest` chokepoint;
+all error text passes `sanitizeErrorMessage` (strips tags + dangerous URL
+schemes); every `target="_blank"` carries `rel="noopener noreferrer"`; no
+`postMessage` listeners; no `javascript:`/`data:` hrefs; trace/Jaeger URLs
+gated behind a hex-only regex.
+
+Notably, **app navigation is all hardcoded relative paths** and OAuth redirects
+go through a `validateOAuthUrl()` HTTPS-provider allowlist — so the react-router
+open-redirect advisory below is **NOT reachable via app code** (no user input
+reaches `navigate()`/`window.location`). That materially lowers its urgency.
+
+**Dependencies: real `npm audit` findings, remediation deferred to the dev
+environment** (lockfile-only surgery here re-resolves the whole tree
+unpredictably — a partial bump pushed the count 11→31, so it was reverted; the
+fixes need a real `npm install` + `npm run build` + `vitest run`):
+- *Runtime-shipped, fixable within the existing major (caret-compatible, low
+  risk):* `react-router-dom`/`react-router` (open-redirect + turbo-stream
+  deserialization — not reachable per above, but worth patching),
+  `dompurify` (XSS; transitive). Command: `cd frontend && npm install
+  react-router-dom@7 && npm run build && npx vitest run`.
+- *Dev/build tooling only (don't ship to users):* `vite`, `vitest`,
+  `@vitest/coverage-v8`, `@graphql-codegen/*`, `@ardatan/relay-compiler`,
+  `@apollo/server` (a dev/mock dep), `lodash`/`shell-quote`/`ws`/`undici` via
+  those. `npm audit fix` clears the non-major ones; `@apollo/server@5` and
+  `@graphql-codegen@7` are deliberate major upgrades to schedule separately.
+- *Recommendation:* add `npm audit` to the frontend CI gate (`quality.yml`)
+  the way `cargo audit` guards the Rust side, so these don't silently
+  accumulate.
+
 ---
 
 ## Verified clean (negative results — don't re-investigate)
