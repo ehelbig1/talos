@@ -3268,9 +3268,11 @@ async fn main() -> anyhow::Result<()> {
                                 //     (the common case — every run via trigger_workflow / call_workflow / scheduled)
                                 //   - module_execution_logs when exec_id is a module_executions.id
                                 //     (standalone module runs via webhook / test_module)
-                                // Try workflow path first, fall back on FK violation. The table
-                                // routing is determined by which FK lookup succeeds, which is
-                                // O(1) — no extra round trip.
+                                // `add_workflow_log` does a `WHERE EXISTS`-guarded insert and
+                                // returns `Ok(false)` (rather than tripping the FK constraint)
+                                // when exec_id isn't a workflow execution — so the standalone-
+                                // module case no longer emits a Postgres FK-violation ERROR per
+                                // log line. Single round trip for the common (workflow) case.
                                 let level_upper = match level {
                                     LogLevel::Debug => "DEBUG",
                                     LogLevel::Info => "INFO",
@@ -3287,12 +3289,22 @@ async fn main() -> anyhow::Result<()> {
                                     )
                                     .await
                                 {
-                                    Ok(_) => {}
-                                    Err(_) => {
-                                        // Not a workflow execution; try module-execution path.
+                                    Ok(true) => {} // landed in workflow_execution_logs
+                                    Ok(false) => {
+                                        // Not a workflow execution → standalone module run.
                                         exec_service_for_logs
                                             .add_log_best_effort(exec_id, level, message, metadata)
                                             .await;
+                                    }
+                                    Err(e) => {
+                                        // exec_id IS a workflow execution but the insert failed
+                                        // (5000-entry rate-limit trigger, DB outage). Don't
+                                        // misroute a real workflow log to the module table.
+                                        tracing::debug!(
+                                            %exec_id,
+                                            error = %e,
+                                            "workflow_execution_logs insert failed (capped or DB error)"
+                                        );
                                     }
                                 }
                             } else {

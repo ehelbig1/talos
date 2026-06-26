@@ -149,8 +149,17 @@ impl ExecutionRepository {
     }
 
     /// Append a worker-emitted log line to `workflow_execution_logs`.
-    /// Returns Err on FK violation (caller can fall back to module path) or
-    /// on the per-execution rate-limit trigger (5000 entries).
+    ///
+    /// Returns `Ok(true)` when the row was written, `Ok(false)` when
+    /// `execution_id` is NOT a `workflow_executions` row (the caller should
+    /// fall back to the module-log table). The insert is guarded by
+    /// `WHERE EXISTS (… workflow_executions …)` so a standalone-module
+    /// `execution_id` is a clean 0-row no-op instead of tripping the FK
+    /// constraint — Postgres logged the latter as an `ERROR` line per
+    /// standalone-module log, which was noisy for log-based alerting.
+    /// Genuine failures (the per-execution 5000-entry rate-limit trigger,
+    /// DB outage) still surface as `Err` so the caller doesn't misroute a
+    /// real workflow log to the module table.
     pub async fn add_workflow_log(
         &self,
         execution_id: Uuid,
@@ -158,7 +167,7 @@ impl ExecutionRepository {
         level: &str,
         message: &str,
         metadata: Option<&serde_json::Value>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Caller-side defense in depth: trigger enforces 5000-entry cap;
         // we cap individual messages here so a single rogue log line
         // can't bloat the table. Keep in sync with module_executions::MAX_LOG_MESSAGE_LENGTH.
@@ -237,10 +246,14 @@ impl ExecutionRepository {
             metadata.and_then(talos_dlp_provider::redact_json_bounded)
         };
 
-        sqlx::query(
+        // Guarded insert (see method doc): write only when execution_id is
+        // really a workflow_executions row, so a standalone-module id is a
+        // 0-row no-op rather than an FK-violation ERROR in the Postgres log.
+        let result = sqlx::query(
             "INSERT INTO workflow_execution_logs \
                  (execution_id, node_id, level, message, metadata) \
-             VALUES ($1, $2, $3, $4, $5)",
+             SELECT $1, $2, $3, $4, $5 \
+             WHERE EXISTS (SELECT 1 FROM workflow_executions WHERE id = $1)",
         )
         .bind(execution_id)
         .bind(node_id)
@@ -249,7 +262,7 @@ impl ExecutionRepository {
         .bind(scrubbed_metadata)
         .execute(&self.db_pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Tail logs for a workflow execution. Filters by optional node_id /
