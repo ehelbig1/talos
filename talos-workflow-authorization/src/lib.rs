@@ -443,10 +443,16 @@ pub fn extract_graph_module_ids(graph_json: &str) -> Vec<Uuid> {
 /// 1. Actor exists, is owned by `user_id`, is not in a terminal state.
 /// 2. `ActorRepository::check_execution_allowed` (budget + status broader gate).
 /// 3. Every module in the workflow's graph fits under the actor's
-///    `max_capability_world` ceiling.
+///    `max_capability_world` ceiling — SKIPPED for the auto-provisioned default
+///    actor (ceiling-exempt; see step 3 in the body).
 ///
-/// Returns [`TriggerAuthorization::Unbound`] when `trigger_agent_id` is
-/// `None` — manual triggers without an owning actor skip all three gates.
+/// Phase D: when `trigger_agent_id` is `None` the gate falls back to the user's
+/// **default actor** (`get_or_create_default_actor`) rather than skipping —
+/// enforcement is universal. The default actor is capless + active + Tier-2 +
+/// ceiling-exempt, so an unbound trigger is non-breaking by default but now has
+/// a real principal an operator can attach caps to. `TriggerAuthorization::
+/// Unbound` is therefore no longer returned (the variant is retained for
+/// wire/source compatibility).
 ///
 /// Mirrors [`authorize_workflow_creator`] in shape; differences are
 /// documented at the module level above. Reuses [`check_capability_ceiling`]
@@ -466,8 +472,20 @@ pub async fn authorize_workflow_trigger(
     user_id: Uuid,
     graph_json: &str,
 ) -> Result<TriggerAuthorization, TriggerAuthError> {
-    let Some(agent_id) = trigger_agent_id else {
-        return Ok(TriggerAuthorization::Unbound);
+    // Phase D — universal enforcement. When the caller passes no actor (an
+    // unbound workflow trigger), fall back to the user's default actor so the
+    // gate ALWAYS runs. The default actor is capless (no budget-policy row →
+    // `check_execution_allowed` passes), active, Tier-2, and capability-ceiling
+    // EXEMPT (step 3) — so this is non-breaking by default; it's simply the
+    // place an operator's caps now bite once they configure them. Callers that
+    // genuinely have no user context still can't reach here (user_id is
+    // required), so there is no remaining "unbound" trigger path.
+    let agent_id = match trigger_agent_id {
+        Some(a) => a,
+        None => actor_repo
+            .get_or_create_default_actor(user_id)
+            .await
+            .map_err(TriggerAuthError::Database)?,
     };
 
     // 1. Identity + ownership + terminal-state distinction.
@@ -492,6 +510,14 @@ pub async fn authorize_workflow_trigger(
     //    workflow's stored graph (not caller-supplied) — keeps the gate
     //    honest against post-create graph edits.
     //
+    //    SKIPPED for the auto-provisioned default actor (Phase D,
+    //    "ceiling-exempt default"): it's an identity/budget/tier bucket, not a
+    //    capability sandbox — the module's own compiled world (enforced by the
+    //    worker) is the real bound, and explicitly-created actors are how a
+    //    user sandboxes capability. Without this exemption, every
+    //    previously-unbound workflow using a module above the default actor's
+    //    `network-node` ceiling would suddenly be rejected.
+    //
     // MCP-545: use `try_get_actor_max_world` (Result) instead of the
     // lenient `get_actor_max_world` (returns None on DB error). Pre-fix
     // a transient Postgres error here returned None, which caused this
@@ -502,60 +528,62 @@ pub async fn authorize_workflow_trigger(
     // as `TriggerAuthError::Database` so the trigger refuses cleanly
     // rather than silently downgrading the gate. The `Ok(None)` case
     // (no grant row — permissive default) keeps the existing behaviour.
-    let max_world_opt = match actor_repo.try_get_actor_max_world(agent_id).await {
-        Ok(opt) => opt,
-        Err(e) => return Err(TriggerAuthError::Database(e)),
-    };
-    if let Some(max_world) = max_world_opt {
-        let module_ids = extract_graph_module_ids(graph_json);
-        tracing::debug!(
-            agent_id = %agent_id,
-            max_world = %max_world,
-            graph_module_count = module_ids.len(),
-            "trigger_workflow: enforcing capability ceiling"
-        );
-        if !module_ids.is_empty() {
-            let module_worlds_map = workflow_repo
-                .get_module_capability_worlds(&module_ids)
-                .await
-                .map_err(TriggerAuthError::Database)?;
+    if !actor.is_default {
+        let max_world_opt = match actor_repo.try_get_actor_max_world(agent_id).await {
+            Ok(opt) => opt,
+            Err(e) => return Err(TriggerAuthError::Database(e)),
+        };
+        if let Some(max_world) = max_world_opt {
+            let module_ids = extract_graph_module_ids(graph_json);
             tracing::debug!(
                 agent_id = %agent_id,
-                found_worlds = module_worlds_map.len(),
-                "trigger_workflow: resolved module capability worlds"
+                max_world = %max_world,
+                graph_module_count = module_ids.len(),
+                "trigger_workflow: enforcing capability ceiling"
             );
-            let module_worlds: Vec<(Uuid, String)> = module_worlds_map.into_iter().collect();
-            // Reuse the pure check; map CreatorAuthError → TriggerAuthError so
-            // the trigger-side error type stays distinct.
-            if let Err(creator_err) = check_capability_ceiling(&max_world, &module_worlds) {
-                if let CreatorAuthError::CapabilityCeilingViolation {
-                    module_id,
-                    module_world,
-                    max_world,
-                    req_rank,
-                    max_rank,
-                } = creator_err
-                {
-                    tracing::warn!(
-                        agent_id = %agent_id,
-                        module_id = %module_id,
-                        module_world = %module_world,
-                        req_rank = req_rank,
-                        max_rank = max_rank,
-                        max_world = %max_world,
-                        "trigger_workflow: BLOCKED — capability ceiling violation"
-                    );
-                    return Err(TriggerAuthError::CapabilityCeilingViolation {
+            if !module_ids.is_empty() {
+                let module_worlds_map = workflow_repo
+                    .get_module_capability_worlds(&module_ids)
+                    .await
+                    .map_err(TriggerAuthError::Database)?;
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    found_worlds = module_worlds_map.len(),
+                    "trigger_workflow: resolved module capability worlds"
+                );
+                let module_worlds: Vec<(Uuid, String)> = module_worlds_map.into_iter().collect();
+                // Reuse the pure check; map CreatorAuthError → TriggerAuthError so
+                // the trigger-side error type stays distinct.
+                if let Err(creator_err) = check_capability_ceiling(&max_world, &module_worlds) {
+                    if let CreatorAuthError::CapabilityCeilingViolation {
                         module_id,
                         module_world,
                         max_world,
                         req_rank,
                         max_rank,
-                    });
+                    } = creator_err
+                    {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            module_id = %module_id,
+                            module_world = %module_world,
+                            req_rank = req_rank,
+                            max_rank = max_rank,
+                            max_world = %max_world,
+                            "trigger_workflow: BLOCKED — capability ceiling violation"
+                        );
+                        return Err(TriggerAuthError::CapabilityCeilingViolation {
+                            module_id,
+                            module_world,
+                            max_world,
+                            req_rank,
+                            max_rank,
+                        });
+                    }
+                    // The pure helper only emits CapabilityCeilingViolation, but
+                    // be explicit so a future variant addition surfaces here.
+                    unreachable!("check_capability_ceiling only emits CapabilityCeilingViolation");
                 }
-                // The pure helper only emits CapabilityCeilingViolation, but
-                // be explicit so a future variant addition surfaces here.
-                unreachable!("check_capability_ceiling only emits CapabilityCeilingViolation");
             }
         }
     }

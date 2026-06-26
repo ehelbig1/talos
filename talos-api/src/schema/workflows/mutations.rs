@@ -2525,14 +2525,28 @@ impl WorkflowsMutations {
 
         let execution_id = Uuid::new_v4();
 
+        // Phase C3 of "every execution gets an actor": resolve the effective
+        // actor for this test run — the workflow's own actor if it has one,
+        // else the user's default actor — so the test execution row is
+        // attributed and the engine below runs at the actor's tier. Fail OPEN
+        // to actor-less (today's behaviour) if resolution errors, so a DB
+        // hiccup never blocks a test. Note: this does NOT add budget/ceiling
+        // enforcement for previously-unbound workflows — that gate (above)
+        // still only fires for `wf_for_test.actor_id`; Phase D universalizes it.
+        let test_effective_actor = talos_actor_repository::ActorRepository::new(db_pool.clone())
+            .resolve_effective_actor(user_id, wf_for_test.actor_id)
+            .await
+            .ok();
+
         // Create a test execution record (marked as test)
         sqlx::query(
             // allow-bare-pool-rls: row is stamped with the authenticated user_id ($3) for a workflow_id already gated by workflow_accessible_for_user (line ~2346) + authorize_workflow_trigger; revisit on RLS SET-ROLE rollout
-            "INSERT INTO workflow_executions (id, workflow_id, user_id, status, is_test_execution) VALUES ($1, $2, $3, 'running', true)"
+            "INSERT INTO workflow_executions (id, workflow_id, user_id, status, is_test_execution, actor_id) VALUES ($1, $2, $3, 'running', true, $4)"
         )
         .bind(execution_id)
         .bind(workflow_id)
         .bind(user_id)
+        .bind(test_effective_actor)
         .execute(&db_pool)
         .await
         .map_err(|e: sqlx::Error| {
@@ -2571,7 +2585,13 @@ impl WorkflowsMutations {
             secrets_manager,
             test_actor_repo,
             user_id,
-            talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json.clone()),
+            // Phase C3: run the test at the resolved actor's tier (the builder
+            // calls apply_actor_to_engine, fail-closed to Tier-1 on error). For
+            // the common Tier-2 case this is unchanged; a Tier-1-actor workflow
+            // now correctly tests with on-host-only LLM egress instead of the
+            // pre-existing actor-less Tier-2 default.
+            talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json.clone())
+                .with_effective_actor(test_effective_actor, None),
         )
         .await
         {
