@@ -714,6 +714,16 @@ impl GraphRagService {
                 let mut m = neo4rs::BoltMap::default();
                 m.put("subject_name".into(), row.subject_name.as_str().into());
                 m.put("object_name".into(), row.object_name.as_str().into());
+                // Sanitized, bound property maps consumed by
+                // `SET s/o += t.*_props`. Empty maps are no-ops.
+                m.put(
+                    "subject_props".into(),
+                    neo4rs::BoltType::Map(build_property_bolt_map(&row.subject_props)),
+                );
+                m.put(
+                    "object_props".into(),
+                    neo4rs::BoltType::Map(build_property_bolt_map(&row.object_props)),
+                );
                 rows.push(neo4rs::BoltType::Map(m));
             }
 
@@ -939,18 +949,19 @@ const MAX_RULE_BASED_TRIPLES: usize = 200;
 struct Entity {
     label: String,
     name: String,
-    // MCP-953 (2026-05-15): Properties are populated at extract time
-    // (e.g. Ticket.summary/status, Email.category — see `triples.push`
-    // sites in `extract_triples`) but `upsert_triple` does NOT
-    // currently propagate them into the Neo4j MERGE — the cypher only
-    // sets `source_key` and `updated_at`. Field is real data that gets
-    // dropped on persist. Wiring `properties` through to a SET clause
-    // (per the misleading "Set additional properties on subject node"
-    // comment at the upsert site) is non-trivial because property keys
-    // are user-derived and need sanitisation against Cypher injection.
-    // Tracking as deferred fix; field kept so the call sites stay
-    // ready for that follow-up.
-    #[allow(dead_code)]
+    // Extra key/value properties populated at extract time (e.g.
+    // Ticket.summary/status, Email.category — see the `triples.push`
+    // sites in `extract_triples_rule_based`). These ARE persisted onto
+    // the node (resolved MCP-953 deferral): `upsert_triples` threads them
+    // through the batched MERGE as a parameterized map and applies
+    // `SET n += t.props`. Because the map is a *bound parameter*, property
+    // keys arrive as data — never interpolated into Cypher text — so
+    // Cypher injection is structurally impossible. The residual risk of a
+    // bound map is *reserved-key overwrite* (a property literally named
+    // `actor_id` would move the node into another tenant's namespace), so
+    // `sanitize_property_key` drops the reserved structural keys and
+    // charset-normalizes the rest. Keys are user/LLM-derived; values are
+    // length-capped.
     properties: Vec<(String, String)>,
 }
 
@@ -966,10 +977,18 @@ struct Triple {
 /// that vary per triple within a single `(subject_label, object_label,
 /// predicate)` group. Labels/predicate are baked into the group's
 /// Cypher text (they can't be `$params`), so they're not repeated here.
+///
+/// `subject_props`/`object_props` carry the entities' extra properties
+/// verbatim (raw, unsanitized) so the grouping logic stays a pure,
+/// easily-tested transform; sanitization (`sanitize_property_key` +
+/// value-length cap) is applied at BoltMap-build time in `upsert_triples`,
+/// right before the values cross into Neo4j as a bound `$rows` parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpsertRow {
     subject_name: String,
     object_name: String,
+    subject_props: Vec<(String, String)>,
+    object_props: Vec<(String, String)>,
 }
 
 /// A group of triples that share the same `(subject_label,
@@ -1025,6 +1044,8 @@ fn group_triples_for_upsert(triples: &[Triple]) -> Vec<UpsertGroup> {
         groups[idx].rows.push(UpsertRow {
             subject_name: triple.subject.name.clone(),
             object_name: triple.object.name.clone(),
+            subject_props: triple.subject.properties.clone(),
+            object_props: triple.object.properties.clone(),
         });
     }
 
@@ -1035,14 +1056,24 @@ fn group_triples_for_upsert(triples: &[Triple]) -> Vec<UpsertGroup> {
 /// sanitized by the caller (allowlisted canonical tokens — never raw
 /// input — so they're safe in the un-parameterizable label position;
 /// see `sanitize_label` + `sanitize_label_tests`). `$rows` is a list of
-/// `{subject_name, object_name}` maps; `$actor_id`, `$source_key`,
-/// `$now` are scalars shared across the whole batch.
+/// `{subject_name, object_name, subject_props, object_props}` maps;
+/// `$actor_id`, `$source_key`, `$now` are scalars shared across the whole
+/// batch.
+///
+/// `SET s += t.subject_props` applies the entity's extra properties from a
+/// *bound map* — keys arrive as data, so this can't inject Cypher. It is
+/// emitted BEFORE the structural `SET s.source_key/updated_at` so the
+/// provenance columns always win even if a property key collided with one
+/// (defense in depth; `sanitize_property_key` already drops the reserved
+/// keys). An empty props map makes `SET s += {}` a harmless no-op.
 fn build_unwind_upsert_cypher(subject_label: &str, object_label: &str, predicate: &str) -> String {
     format!(
         "UNWIND $rows AS t \
          MERGE (s:{subject_label} {{actor_id: $actor_id, name: t.subject_name}}) \
+         SET s += t.subject_props \
          SET s.source_key = $source_key, s.updated_at = $now \
          MERGE (o:{object_label} {{actor_id: $actor_id, name: t.object_name}}) \
+         SET o += t.object_props \
          SET o.source_key = $source_key, o.updated_at = $now \
          MERGE (s)-[r:{predicate}]->(o) \
          SET r.source_key = $source_key, r.updated_at = $now"
@@ -1162,6 +1193,97 @@ fn sanitize_label(label: &str) -> String {
             "Concept".to_string()
         }
     }
+}
+
+/// Structural property keys that MUST NOT be settable from extracted
+/// entity properties. `actor_id` is the tenant boundary (overwriting it
+/// would move the node into another actor's subgraph); `name` is the
+/// MERGE identity; `source_key`/`updated_at` are provenance written by
+/// the upsert itself. A `SET n += $props` with a bound map can't inject
+/// Cypher, but it CAN clobber these if the map carries them — so they're
+/// dropped here (case-insensitive, after charset normalization).
+const RESERVED_PROPERTY_KEYS: &[&str] = &["actor_id", "name", "source_key", "updated_at"];
+
+/// Max sanitized property-key length. Neo4j has no hard limit, but a
+/// bound keeps a hostile/runaway extractor from minting absurd keys.
+const MAX_PROPERTY_KEY_LEN: usize = 64;
+
+/// Max stored property-value length (chars). Values are bound `$params`
+/// (injection-safe) but still need a size bound so a single property
+/// can't bloat a node unboundedly.
+const MAX_PROPERTY_VALUE_LEN: usize = 1024;
+
+/// Max number of properties persisted per node. Caps total node width
+/// regardless of how many (key,value) pairs the extractor emitted.
+const MAX_PROPERTIES_PER_NODE: usize = 16;
+
+/// Validate and sanitize a user/LLM-derived property key for safe Neo4j
+/// persistence via `SET n += $props`. Returns `None` when the key must be
+/// dropped.
+///
+/// Even though the property map is a bound parameter (so keys can't break
+/// out into Cypher), an attacker-influenced key set still needs guarding
+/// against *reserved-key overwrite*. The rules:
+/// 1. Charset-normalize to `[A-Za-z0-9_]` (drop every other char).
+/// 2. Reject empty / over-length results.
+/// 3. Require a leading letter or `_` (Neo4j identifier shape; also bars
+///    all-digit keys).
+/// 4. Reject the reserved structural keys (tenant/identity/provenance).
+fn sanitize_property_key(key: &str) -> Option<String> {
+    let normalized: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+
+    if normalized.is_empty() || normalized.len() > MAX_PROPERTY_KEY_LEN {
+        return None;
+    }
+    let first = normalized.as_bytes()[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    if RESERVED_PROPERTY_KEYS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(&normalized))
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Apply `sanitize_property_key` + value-length cap + per-node count cap
+/// to a raw `(key, value)` list, yielding the pairs actually persisted.
+/// Last-writer-wins on keys that normalize to the same token (matches the
+/// MERGE/SET last-write semantics for duplicate triples). Pure (no I/O)
+/// so it's unit-tested directly.
+fn sanitized_property_pairs(properties: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in properties {
+        let Some(key) = sanitize_property_key(k) else {
+            continue;
+        };
+        let val: String = v.chars().take(MAX_PROPERTY_VALUE_LEN).collect();
+        if let Some(existing) = out.iter_mut().find(|(ek, _)| *ek == key) {
+            existing.1 = val; // last-writer-wins
+        } else {
+            if out.len() >= MAX_PROPERTIES_PER_NODE {
+                continue;
+            }
+            out.push((key, val));
+        }
+    }
+    out
+}
+
+/// Build the bound `BoltMap` of sanitized properties for one node, ready
+/// to drop into a `$rows` entry as `t.subject_props` / `t.object_props`.
+/// An empty map makes the corresponding `SET n += {}` a no-op.
+fn build_property_bolt_map(properties: &[(String, String)]) -> neo4rs::BoltMap {
+    let mut m = neo4rs::BoltMap::default();
+    for (key, val) in sanitized_property_pairs(properties) {
+        m.put(key.into(), val.as_str().into());
+    }
+    m
 }
 
 /// Recognise common placeholder values for LLM API keys so the graph
@@ -1484,6 +1606,41 @@ mod batch_upsert_tests {
         assert!(c.contains("s.updated_at = $now"));
         assert!(c.contains("o.updated_at = $now"));
         assert!(c.contains("r.updated_at = $now"));
+        // Bound property maps applied to the nodes (not the relationship).
+        assert!(c.contains("SET s += t.subject_props"));
+        assert!(c.contains("SET o += t.object_props"));
+        // Property SET must precede the provenance SET so source_key /
+        // updated_at always win on a key collision (defense in depth).
+        let s_props = c.find("SET s += t.subject_props").unwrap();
+        let s_prov = c.find("SET s.source_key").unwrap();
+        assert!(
+            s_props < s_prov,
+            "props SET must come before provenance SET"
+        );
+    }
+
+    #[test]
+    fn group_triples_threads_entity_properties_into_rows_raw() {
+        // The grouping transform carries properties through verbatim;
+        // sanitization happens later at BoltMap-build time. Here we pin
+        // that the (raw) pairs survive grouping in row order.
+        let mut subj = ent("Ticket", "PROJ-1");
+        subj.properties = vec![
+            ("summary".to_string(), "ship the thing".to_string()),
+            ("status".to_string(), "In Progress".to_string()),
+        ];
+        let triples = vec![Triple {
+            subject: subj,
+            predicate: "ASSIGNED_TO".to_string(),
+            object: ent("Person", "alice"),
+        }];
+        let groups = group_triples_for_upsert(&triples);
+        assert_eq!(groups[0].rows[0].subject_props.len(), 2);
+        assert_eq!(groups[0].rows[0].subject_props[0].0, "summary");
+        assert!(
+            groups[0].rows[0].object_props.is_empty(),
+            "object had no properties"
+        );
     }
 
     #[test]
@@ -1493,6 +1650,150 @@ mod batch_upsert_tests {
         // sync can carry more than 20 tickets) but bounded.
         assert!(MAX_RULE_BASED_TRIPLES > 20);
         assert!(MAX_RULE_BASED_TRIPLES <= 1000);
+    }
+}
+
+#[cfg(test)]
+mod property_sanitization_tests {
+    use super::{
+        sanitize_property_key, sanitized_property_pairs, MAX_PROPERTIES_PER_NODE,
+        MAX_PROPERTY_KEY_LEN, MAX_PROPERTY_VALUE_LEN,
+    };
+
+    // `sanitize_property_key` is the guard between user/LLM-derived entity
+    // property keys and the `SET n += $props` map. The map is a bound
+    // parameter, so a key can't break out into Cypher — but it CAN clobber
+    // a structural property (tenant `actor_id`, MERGE `name`, provenance)
+    // if not filtered. These pin both layers: charset normalization and
+    // reserved-key rejection.
+
+    #[test]
+    fn reserved_structural_keys_are_dropped_case_insensitively() {
+        // The whole point: a property literally named actor_id must NOT be
+        // settable — it would move the node into another tenant's subgraph.
+        for raw in [
+            "actor_id",
+            "ACTOR_ID",
+            "Actor_Id",
+            "name",
+            "NAME",
+            "source_key",
+            "updated_at",
+            // charset-normalization must not let a spaced variant sneak the
+            // exact reserved token past the filter.
+            " actor_id ",
+            "actor_id\n",
+        ] {
+            assert_eq!(
+                sanitize_property_key(raw),
+                None,
+                "reserved key {raw:?} must be dropped"
+            );
+        }
+
+        // Sibling keys that normalize to a DIFFERENT token are NOT reserved
+        // — `actorid`/`actorId` are distinct property names from the
+        // structural `actor_id` and are safe to persist.
+        assert_eq!(
+            sanitize_property_key("actor-id"),
+            Some("actorid".to_string())
+        );
+        assert_eq!(
+            sanitize_property_key("actorId"),
+            Some("actorId".to_string())
+        );
+    }
+
+    #[test]
+    fn cypher_breakout_keys_are_neutralized_or_dropped() {
+        // Even though keys are bound (not interpolated), the charset filter
+        // is defense in depth: nothing Cypher-significant survives.
+        for raw in [
+            "summary`) DETACH DELETE n //",
+            "foo} SET n.actor_id =",
+            "a:b;DROP",
+            "key with spaces",
+        ] {
+            if let Some(k) = sanitize_property_key(raw) {
+                assert!(
+                    k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                    "sanitized key {k:?} leaked a Cypher-significant char"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_all_punctuation_and_leading_digit_keys_are_dropped() {
+        assert_eq!(sanitize_property_key(""), None);
+        assert_eq!(sanitize_property_key("   "), None);
+        assert_eq!(sanitize_property_key("!@#$%"), None);
+        // Leading digit → dropped (Neo4j identifier shape, also bars all-digit).
+        assert_eq!(sanitize_property_key("1foo"), None);
+        assert_eq!(sanitize_property_key("123"), None);
+    }
+
+    #[test]
+    fn valid_keys_pass_through_normalized() {
+        assert_eq!(
+            sanitize_property_key("summary"),
+            Some("summary".to_string())
+        );
+        assert_eq!(sanitize_property_key("status"), Some("status".to_string()));
+        assert_eq!(
+            sanitize_property_key("_internal"),
+            Some("_internal".to_string())
+        );
+        // Punctuation stripped, alphanumerics kept.
+        assert_eq!(
+            sanitize_property_key("due-date!"),
+            Some("duedate".to_string())
+        );
+    }
+
+    #[test]
+    fn over_length_keys_are_dropped() {
+        let long = "a".repeat(MAX_PROPERTY_KEY_LEN + 1);
+        assert_eq!(sanitize_property_key(&long), None);
+        let ok = "a".repeat(MAX_PROPERTY_KEY_LEN);
+        assert_eq!(sanitize_property_key(&ok), Some(ok));
+    }
+
+    #[test]
+    fn pairs_apply_value_cap_count_cap_and_last_writer_wins() {
+        // Value-length cap.
+        let huge_val = "x".repeat(MAX_PROPERTY_VALUE_LEN + 50);
+        let pairs = sanitized_property_pairs(&[("k".to_string(), huge_val)]);
+        assert_eq!(pairs[0].1.chars().count(), MAX_PROPERTY_VALUE_LEN);
+
+        // Per-node count cap: emit more distinct keys than allowed.
+        let many: Vec<(String, String)> = (0..(MAX_PROPERTIES_PER_NODE + 5))
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let pairs = sanitized_property_pairs(&many);
+        assert_eq!(pairs.len(), MAX_PROPERTIES_PER_NODE);
+
+        // Last-writer-wins on keys that normalize to the same token, and
+        // a dropped reserved key in the middle doesn't consume a slot.
+        let pairs = sanitized_property_pairs(&[
+            ("status".to_string(), "old".to_string()),
+            ("actor_id".to_string(), "evil-tenant".to_string()), // dropped
+            ("status".to_string(), "new".to_string()),
+        ]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("status".to_string(), "new".to_string()));
+    }
+
+    #[test]
+    fn reserved_key_never_survives_into_persisted_pairs() {
+        let pairs = sanitized_property_pairs(&[
+            ("actor_id".to_string(), "attacker".to_string()),
+            ("name".to_string(), "spoof".to_string()),
+            ("source_key".to_string(), "x".to_string()),
+            ("updated_at".to_string(), "y".to_string()),
+            ("category".to_string(), "real".to_string()),
+        ]);
+        assert_eq!(pairs, vec![("category".to_string(), "real".to_string())]);
     }
 }
 
