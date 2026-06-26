@@ -77,6 +77,7 @@ async fn main() -> Result<()> {
             Some(trigger.clone()),
             Some(input.clone()),
             None,
+            None,
         )
         .await?;
     println!("✓ create_execution wrote row {exec_id}");
