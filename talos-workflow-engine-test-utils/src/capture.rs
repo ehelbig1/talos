@@ -283,6 +283,8 @@ pub enum ExecutionStoreCall {
         trigger_type: String,
         /// Whether the caller requested race-safe status inheritance.
         race_safe_status: bool,
+        /// Owning actor inherited from the engine (`None` if actor-less).
+        actor_id: Option<Uuid>,
     },
     /// `record_completed` — post-dispatch status + output.
     Completed {
@@ -381,6 +383,7 @@ impl ModuleExecutionStore for CaptureModuleExecutionStore {
                 input: ctx.input.clone(),
                 trigger_type: ctx.trigger_type.to_string(),
                 race_safe_status: ctx.race_safe_status,
+                actor_id: ctx.actor_id,
             });
         Ok(())
     }

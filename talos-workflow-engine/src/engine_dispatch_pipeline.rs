@@ -353,6 +353,8 @@ impl ParallelWorkflowEngine {
                         // Pipeline steps dispatch as a unit — no concurrent
                         // sibling to race against.
                         race_safe_status: false,
+                        // Attribute the step's module run to the workflow's actor.
+                        actor_id: self.actor_id,
                     })
                     .await
                 {

@@ -63,6 +63,12 @@ pub struct ExecutionStartedContext<'a> {
     /// steps (which dispatch atomically as a unit) set this false —
     /// there's no concurrent sibling to race against.
     pub race_safe_status: bool,
+    /// Owning actor for this dispatch, inherited from the workflow's
+    /// engine (`self.actor_id`). `None` for actor-less paths (the
+    /// engine was built without an actor); stores persist it verbatim so
+    /// an in-workflow module execution is directly attributable to the
+    /// actor without a JOIN through `workflow_execution_id`.
+    pub actor_id: Option<Uuid>,
 }
 
 impl std::fmt::Debug for ExecutionStartedContext<'_> {

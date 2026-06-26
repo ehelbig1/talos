@@ -253,6 +253,8 @@ impl ParallelWorkflowEngine {
                     // than 'running', closing the race with the
                     // failure-path UPDATE.
                     race_safe_status: true,
+                    // Attribute the module run to the workflow's actor.
+                    actor_id: self.actor_id,
                 })
                 .await
             {
