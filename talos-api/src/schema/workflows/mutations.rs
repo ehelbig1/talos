@@ -247,6 +247,21 @@ impl WorkflowsMutations {
                 ))
                 .extend_safe());
             }
+            Ok(talos_workflow_repository::ConcurrencyAdmission::ActorBudgetExceeded {
+                kind,
+                limit,
+                count,
+            }) => {
+                let window = if kind == "per_hour" {
+                    "in the last hour"
+                } else {
+                    "total"
+                };
+                return Err(async_graphql::Error::new(format!(
+                    "Actor budget exceeded: {count} executions {window} (limit: {limit})."
+                ))
+                .extend_safe());
+            }
             Err(e) => {
                 tracing::error!("Failed to create execution: {}", e);
                 return Err(async_graphql::Error::new("Internal database error").extend_safe());
