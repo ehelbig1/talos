@@ -31,6 +31,7 @@ talos-integration-helpers = { path = "../talos-integration-helpers" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
 talos-module-executions = { path = "../talos-module-executions" }
+talos-actor-repository = { path = "../talos-actor-repository" }
 talos-oauth = { path = "../talos-oauth" }
 talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }

@@ -319,6 +319,7 @@ impl ModuleExecutionService {
         trigger_metadata: Option<JsonValue>,
         input_data: Option<JsonValue>,
         workflow_execution_id: Option<Uuid>,
+        actor_id: Option<Uuid>,
     ) -> Result<Uuid> {
         // MCP-1163 (2026-05-17): validate size BEFORE redact_json.
         // Pre-fix the redact pass ran on the FULL input_data even
@@ -363,9 +364,9 @@ impl ModuleExecutionService {
                 trigger_metadata, input_data,
                 trigger_metadata_enc, input_data_enc, payload_enc_key_id,
                 payload_format,
-                workflow_execution_id
+                workflow_execution_id, actor_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
         .bind(execution_id)
@@ -389,6 +390,7 @@ impl ModuleExecutionService {
         .bind(key_id)
         .bind(payload_format)
         .bind(workflow_execution_id)
+        .bind(actor_id)
         .execute(&self.db_pool)
         .await
         .context("Failed to create module execution")?;

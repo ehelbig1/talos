@@ -996,6 +996,32 @@ pub async fn process_webhook_events(
         }
     };
 
+    // Phase C of "every execution gets an actor": resolve an owning actor ONCE
+    // for this batch of events. Calendar watches carry no actor, so this is the
+    // user's default actor; its `max_llm_tier` then travels with each job. Fail
+    // OPEN to actor-less Tier-2 (today's behaviour) on any resolution error so a
+    // transient DB hiccup never drops inbound calendar events.
+    let actor_repo = talos_actor_repository::ActorRepository::new(service.db_pool.clone());
+    let (resolved_actor, actor_tier) = match actor_repo.resolve_effective_actor(user_id, None).await
+    {
+        Ok(aid) => {
+            let tier = actor_repo
+                .get_actor_max_llm_tier(aid)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
+            (Some(aid), tier)
+        }
+        Err(e) => {
+            tracing::warn!(
+                %user_id, error = %e,
+                "gcal dispatch: default-actor resolution failed; dispatching actor-less (Tier-2)"
+            );
+            (None, talos_workflow_job_protocol::LlmTier::default())
+        }
+    };
+
     // 3. DEDUPLICATION: Filter out events that were already processed
     // This prevents duplicate execution when multiple watch channels exist for the same calendar
     let deduplicated_events = if let Some(ref redis) = redis_client {
@@ -1155,6 +1181,7 @@ pub async fn process_webhook_events(
                     Some(event.clone()),
                     Some(trigger_metadata),
                     None,
+                    resolved_actor,
                 )
                 .await
             {
@@ -1280,10 +1307,12 @@ pub async fn process_webhook_events(
             cancellation_token: None,
             signature: vec![],
             job_nonce: String::new(),
-            // Module-bound dispatch (no owning actor) — see gmail/dispatch.rs
-            // for the same rationale. Wrap in a workflow + actor for tier
-            // enforcement on calendar-triggered processing.
-            max_llm_tier: talos_workflow_job_protocol::LlmTier::default(),
+            // Phase C: the resolved actor's tier travels with the job. Defaults
+            // to Tier-2 (the default actor is Tier-2) so it's non-breaking; an
+            // operator who sets their default actor to `tier1` now gets tier
+            // enforcement on calendar-triggered processing without the
+            // wrap-in-a-workflow workaround.
+            max_llm_tier: actor_tier,
             wasm_bytes: None, // PERFORMANCE: Include bytes directly (avoids file I/O)
             capability_world: None,
             // MCP-1090 (2026-05-16): propagate per-module integration_name
@@ -1304,7 +1333,7 @@ pub async fn process_webhook_events(
             max_fuel: exec_info.max_fuel,
             dry_run: false,
             reply_topic: None,
-            actor_id: None,
+            actor_id: resolved_actor,
             user_id,
         };
 

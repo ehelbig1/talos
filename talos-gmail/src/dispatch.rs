@@ -200,6 +200,32 @@ async fn dispatch_single_message(
         "thread_id": msg.thread_id,
         "history_id": row.history_id,
     });
+    // Phase C of "every execution gets an actor": resolve an owning actor for
+    // this push dispatch. Gmail watches carry no actor, so this is the user's
+    // default actor; its `max_llm_tier` then travels with the job below. Fail
+    // OPEN to actor-less Tier-2 (today's behaviour) on any resolution error so
+    // a transient DB hiccup never drops an inbound message.
+    let actor_repo = talos_actor_repository::ActorRepository::new(ctx.db_pool.clone());
+    let (resolved_actor, actor_tier) = match actor_repo.resolve_effective_actor(user_id, None).await
+    {
+        Ok(aid) => {
+            let tier = actor_repo
+                .get_actor_max_llm_tier(aid)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
+            (Some(aid), tier)
+        }
+        Err(e) => {
+            tracing::warn!(
+                %user_id, error = %e,
+                "gmail dispatch: default-actor resolution failed; dispatching actor-less (Tier-2)"
+            );
+            (None, talos_workflow_job_protocol::LlmTier::default())
+        }
+    };
+
     let execution_id = ctx
         .execution_service
         .create_execution(
@@ -210,6 +236,7 @@ async fn dispatch_single_message(
             Some(data.clone()),
             Some(trigger_metadata),
             None,
+            resolved_actor,
         )
         .await
         .context("create execution record for gmail message")?;
@@ -262,13 +289,12 @@ async fn dispatch_single_message(
         cancellation_token: None,
         signature: vec![],
         job_nonce: String::new(),
-        // Gmail push-notification dispatch fires a configured module
-        // directly — there's no owning actor in the data model. The
-        // tier ceiling concept applies at the workflow/actor level, so
-        // we pass Tier2 here. Operators who need data-egress control
-        // for inbound-mail processing should wrap the module in a
-        // workflow with an actor that has `max_llm_tier=tier1`.
-        max_llm_tier: talos_workflow_job_protocol::LlmTier::default(),
+        // Phase C: the resolved actor's tier travels with the job. Defaults to
+        // Tier-2 (the user's default actor is Tier-2), so this is non-breaking;
+        // an operator who sets their default actor to `tier1` now gets
+        // data-egress control for inbound-mail processing without the
+        // wrap-in-a-workflow workaround.
+        max_llm_tier: actor_tier,
         wasm_bytes: None,
         capability_world: None,
         integration_name: exec_info.integration_name.clone(),
@@ -285,7 +311,7 @@ async fn dispatch_single_message(
         max_fuel: exec_info.max_fuel,
         dry_run: false,
         reply_topic: None,
-        actor_id: None,
+        actor_id: resolved_actor,
         user_id,
     };
 
