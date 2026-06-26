@@ -274,6 +274,21 @@ pub struct ActorFullSummary {
 // Repository
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Description stamped on every auto-provisioned default actor (kept in one
+/// place so the lazy `insert_default_actor` path and the backfill migration
+/// read identically).
+const DEFAULT_ACTOR_DESCRIPTION: &str =
+    "Auto-provisioned fallback actor — ensures every execution has an owning actor.";
+
+/// True when an `anyhow` error wraps a Postgres unique-constraint violation.
+/// Used to distinguish a lost create-race / name collision from a real error
+/// in `get_or_create_default_actor`.
+fn is_unique_violation(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<sqlx::Error>()
+        .and_then(|se| se.as_database_error())
+        .is_some_and(|db| db.is_unique_violation())
+}
+
 pub struct ActorRepository {
     db_pool: PgPool,
     /// Optional SecretsManager — when set, `complete_execution` encrypts
@@ -375,6 +390,91 @@ impl ActorRepository {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Find the user's auto-provisioned default actor, if it exists.
+    pub async fn find_default_actor(&self, user_id: Uuid) -> Result<Option<Uuid>> {
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM actors WHERE user_id = $1 AND is_default LIMIT 1")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Insert one default actor (`is_default = true`). Policy defaults
+    /// (Tier-2 + network-node) are baked in here so creation is consistent
+    /// across the lazy path and the backfill migration. Propagates the raw
+    /// error so the caller can distinguish a unique-constraint collision.
+    async fn insert_default_actor(&self, actor_id: Uuid, user_id: Uuid, name: &str) -> Result<()> {
+        let mut tx = self.begin_personal_org_write(user_id).await?;
+        sqlx::query(
+            "INSERT INTO actors \
+             (id, user_id, name, description, max_capability_world, max_llm_tier, is_default) \
+             VALUES ($1, $2, $3, $4, 'network-node', 'tier2', true)",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .bind(name)
+        .bind(DEFAULT_ACTOR_DESCRIPTION)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Return the user's default actor id, creating it on first call.
+    ///
+    /// The default actor is the fallback principal so that every execution has
+    /// an owning actor (see [`resolve_effective_actor`]). Idempotent and
+    /// race-safe: the `idx_one_default_actor_per_user` partial unique index
+    /// guarantees a single winner; a losing racer re-selects the winner's row.
+    /// If a *non-default* actor literally named `Default` already occupies the
+    /// `(user_id, name)` slot, this falls back to a uniquely-named default.
+    ///
+    /// [`resolve_effective_actor`]: Self::resolve_effective_actor
+    pub async fn get_or_create_default_actor(&self, user_id: Uuid) -> Result<Uuid> {
+        if let Some(id) = self.find_default_actor(user_id).await? {
+            return Ok(id);
+        }
+        let actor_id = Uuid::new_v4();
+        match self
+            .insert_default_actor(actor_id, user_id, "Default")
+            .await
+        {
+            Ok(()) => Ok(actor_id),
+            Err(e) if is_unique_violation(&e) => {
+                // Either another racer created the default (partial-default
+                // index), or a non-default actor named 'Default' holds the
+                // (user_id, name) slot. Prefer an existing default…
+                if let Some(id) = self.find_default_actor(user_id).await? {
+                    return Ok(id);
+                }
+                // …otherwise it was the name collision — retry once, unique name.
+                let alt = Uuid::new_v4();
+                let alt_name = format!("Default ({})", &alt.to_string()[..8]);
+                self.insert_default_actor(alt, user_id, &alt_name).await?;
+                Ok(alt)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolve the effective actor for a dispatch: the caller's explicit actor
+    /// if supplied, otherwise the user's default actor. NEVER returns `None` —
+    /// this is the core of "every execution gets an actor". Callers that today
+    /// pass `actor_id: None` into a job/execution should route through here.
+    pub async fn resolve_effective_actor(
+        &self,
+        user_id: Uuid,
+        explicit: Option<Uuid>,
+    ) -> Result<Uuid> {
+        match explicit {
+            Some(a) => Ok(a),
+            None => self.get_or_create_default_actor(user_id).await,
+        }
     }
 
     /// List actors for a user with optional status and inactivity filters.
