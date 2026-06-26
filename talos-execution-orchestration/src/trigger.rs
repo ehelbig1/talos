@@ -365,15 +365,9 @@ impl ExecutionOrchestrationService {
                 // Atomic backstop fired (the fast-fail pre-check let a
                 // concurrent burst slip through). Surface the same
                 // budget-exceeded shape the pre-check uses.
-                let window = match kind {
-                    "per_minute" => "in the last minute",
-                    "per_hour" => "in the last hour",
-                    _ => "total",
-                };
-                return Err(OrchestrationError::AuthorizationDenied(format!(
-                    "Actor budget exceeded: {} executions {} (limit: {})",
-                    count, window, limit
-                )));
+                return Err(OrchestrationError::AuthorizationDenied(
+                    talos_workflow_repository::actor_budget_exceeded_message(kind, limit, count),
+                ));
             }
         }
 

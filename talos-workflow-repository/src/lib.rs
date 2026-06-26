@@ -55,10 +55,13 @@ pub enum ConcurrencyAdmission {
     /// `running` is the count observed inside the transaction
     /// (always `>= limit`).
     LimitReached { limit: i32, running: i64 },
-    /// The triggering actor's execution budget (per-hour or total)
-    /// would be exceeded. No row was written. `kind` is `"per_hour"`
-    /// or `"total"`; `limit` is the configured cap; `count` is the
-    /// count observed inside the transaction (always `>= limit`).
+    /// The triggering actor's budget would be exceeded. No row was
+    /// written. `kind` is `"per_minute"` / `"per_hour"` / `"total"`
+    /// (execution-count caps) or `"fuel_per_hour"` (rolling fuel sum);
+    /// `limit` is the configured cap; `count` is the value observed
+    /// inside the transaction (always `>= limit`) — an execution count
+    /// for the count caps, a summed fuel total for `fuel_per_hour`.
+    /// `limit` is `i64` so it can carry fuel caps that exceed `i32`.
     ///
     /// This is the ATOMIC backstop for the actor-budget gate: the
     /// fast-fail pre-check in `authorize_workflow_trigger` is lock-free
@@ -70,9 +73,29 @@ pub enum ConcurrencyAdmission {
     /// lock, so it's atomic with the INSERT.
     ActorBudgetExceeded {
         kind: &'static str,
-        limit: i32,
+        limit: i64,
         count: i64,
     },
+}
+
+/// Render the human-facing message for a
+/// [`ConcurrencyAdmission::ActorBudgetExceeded`] outcome. Centralised so the
+/// four trigger paths (orchestration, GraphQL, MCP trigger/bulk/as-actors)
+/// share one wording — and so the fuel cap (count = fuel units, not
+/// executions) doesn't get the execution-count phrasing.
+pub fn actor_budget_exceeded_message(kind: &str, limit: i64, count: i64) -> String {
+    match kind {
+        "fuel_per_hour" => format!(
+            "Actor fuel budget exceeded: {count} fuel consumed in the last hour (limit: {limit})"
+        ),
+        "per_minute" => {
+            format!("Actor budget exceeded: {count} executions in the last minute (limit: {limit})")
+        }
+        "per_hour" => {
+            format!("Actor budget exceeded: {count} executions in the last hour (limit: {limit})")
+        }
+        _ => format!("Actor budget exceeded: {count} executions total (limit: {limit})"),
+    }
 }
 
 /// Derive a stable per-actor key for `pg_advisory_xact_lock(bigint)` from
@@ -143,6 +166,25 @@ mod actor_lock_key_tests {
     #[test]
     fn nil_uuid_maps_to_zero() {
         assert_eq!(actor_advisory_lock_key(Uuid::nil()), 0);
+    }
+
+    #[test]
+    fn budget_message_distinguishes_fuel_from_counts() {
+        use super::actor_budget_exceeded_message;
+        // Fuel cap: count is fuel units, not executions, and the limit can be
+        // large (i64) — must not say "executions".
+        let m = actor_budget_exceeded_message("fuel_per_hour", 5_000_000_000, 6_000_000_000);
+        assert!(m.contains("fuel"), "got: {m}");
+        assert!(!m.contains("executions"), "got: {m}");
+        assert!(
+            m.contains("6000000000") && m.contains("5000000000"),
+            "got: {m}"
+        );
+        // Count caps: distinct windows, phrased as executions.
+        assert!(actor_budget_exceeded_message("per_minute", 10, 11).contains("in the last minute"));
+        assert!(actor_budget_exceeded_message("per_hour", 10, 11).contains("in the last hour"));
+        assert!(actor_budget_exceeded_message("total", 10, 11).contains("total"));
+        assert!(actor_budget_exceeded_message("per_hour", 10, 11).contains("executions"));
     }
 }
 
@@ -1231,15 +1273,17 @@ impl WorkflowRepository {
                 .execute(&mut *tx)
                 .await?;
 
-            let policy: Option<(Option<i32>, Option<i32>, Option<i32>)> = sqlx::query_as(
-                "SELECT max_executions_per_hour, max_executions_total, max_workflows_per_minute \
-                 FROM actor_budget_policies WHERE actor_id = $1",
-            )
-            .bind(aid)
-            .fetch_optional(&mut *tx)
-            .await?;
+            let policy: Option<(Option<i32>, Option<i32>, Option<i32>, Option<i64>)> =
+                sqlx::query_as(
+                    "SELECT max_executions_per_hour, max_executions_total, \
+                     max_workflows_per_minute, max_fuel_per_hour \
+                     FROM actor_budget_policies WHERE actor_id = $1",
+                )
+                .bind(aid)
+                .fetch_optional(&mut *tx)
+                .await?;
 
-            if let Some((per_hour, total, per_minute)) = policy {
+            if let Some((per_hour, total, per_minute, fuel_per_hour)) = policy {
                 // Per-minute trigger-rate cap. Counts only rows that carry
                 // this actor_id — top-level triggers (bulk_trigger /
                 // trigger_as_actors included). Sub-workflow chain rows are
@@ -1259,7 +1303,7 @@ impl WorkflowRepository {
                         tx.rollback().await?;
                         return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
                             kind: "per_minute",
-                            limit,
+                            limit: i64::from(limit),
                             count,
                         });
                     }
@@ -1276,7 +1320,7 @@ impl WorkflowRepository {
                         tx.rollback().await?;
                         return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
                             kind: "per_hour",
-                            limit,
+                            limit: i64::from(limit),
                             count,
                         });
                     }
@@ -1292,8 +1336,36 @@ impl WorkflowRepository {
                         tx.rollback().await?;
                         return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
                             kind: "total",
-                            limit,
+                            limit: i64::from(limit),
                             count,
+                        });
+                    }
+                }
+                // Rolling per-hour FUEL cap. Sums fuel already consumed by the
+                // actor's executions in the last hour (execution_cost_rollup is
+                // written per-node during execution by talos-engine's node_hook;
+                // it carries actor_id + recorded_at and is covered by the partial
+                // index idx_cost_rollup_actor). Pre-execution gate: refuse to
+                // START another run once the actor has burned its hourly fuel
+                // budget. fuel_consumed/cap are i64 (bigint); the cap can exceed
+                // i32, which is why ActorBudgetExceeded.limit is i64.
+                if let Some(limit) = fuel_per_hour {
+                    // `::bigint` cast is required: Postgres SUM(bigint) returns
+                    // NUMERIC, which sqlx can't decode into i64 — without the
+                    // cast the whole create transaction errors out.
+                    let used: i64 = sqlx::query_scalar(
+                        "SELECT COALESCE(SUM(fuel_consumed), 0)::bigint FROM execution_cost_rollup \
+                         WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '1 hour'",
+                    )
+                    .bind(aid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if used >= limit {
+                        tx.rollback().await?;
+                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
+                            kind: "fuel_per_hour",
+                            limit,
+                            count: used,
                         });
                     }
                 }

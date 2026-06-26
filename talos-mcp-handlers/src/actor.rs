@@ -291,10 +291,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "name": "set_actor_budget",
             "description": "Create or replace the budget policy for an actor. All limits are optional — \
                 omitting a field means unlimited (no cap). ENFORCED caps: max_executions_per_hour, \
-                max_executions_total, and max_workflows_per_minute (all atomic at trigger time), plus \
-                max_workflow_count (at create time). RESERVED / NOT YET ENFORCED (stored + returned but \
-                no enforcement path consumes them): max_compilations_per_hour (stored default 20), \
-                max_outbound_requests_per_hour, max_fuel_per_hour, max_fuel_per_execution. \
+                max_executions_total, max_workflows_per_minute, and max_fuel_per_hour (all atomic at trigger \
+                time), plus max_workflow_count (at create time). RESERVED / NOT YET ENFORCED (stored + \
+                returned but no enforcement path consumes them): max_compilations_per_hour (stored \
+                default 20), max_outbound_requests_per_hour, max_fuel_per_execution. \
                 on_budget_exceeded: 'suspend' (default), 'alert', or 'block'. \
                 The response includes defaults_applied listing which fields used their stored defaults.",
             "inputSchema": {
@@ -304,7 +304,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "max_executions_per_hour": { "type": "number", "description": "ENFORCED (atomic at trigger time). Omit for unlimited." },
                     "max_executions_total": { "type": "number", "description": "ENFORCED (atomic at trigger time). Omit for unlimited." },
                     "max_fuel_per_execution": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited." },
-                    "max_fuel_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited." },
+                    "max_fuel_per_hour": { "type": "number", "description": "ENFORCED — rolling per-hour fuel-sum cap (atomic at trigger time; refuses a new run once the actor has burned its hourly fuel budget). Omit for unlimited." },
                     "max_outbound_requests_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited." },
                     "max_workflow_count": { "type": "number", "description": "ENFORCED (at create time). Omit for unlimited." },
                     "max_workflows_per_minute": { "type": "number", "description": "ENFORCED per-actor trigger-rate cap (atomic at trigger time). Stored default 10 if omitted." },
