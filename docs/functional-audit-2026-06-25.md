@@ -359,6 +359,49 @@ gates were all present and recently hardened:
   whichever version it fetched), just latest-version semantics; documented as an
   accepted latency trade-off.
 
+### DoS / resource-exhaustion posture (2026-06-26)
+
+A true sustained multi-node load test needs a real cluster (single-node dev
+here can't represent it), so this is a **code-level posture verification** of
+every resource bound, not a load run. **Every mapped resource is bounded**;
+there is no unbounded sink at the platform layer:
+
+- **NATS-RPC in-flight** — per-subject semaphores (memory.op 16, graph.search
+  8, database.query 8, state.write 32, integration_state 8); over-cap callers
+  block (backpressure), not OOM. Per-request result/row/byte/query-len caps on
+  each subject.
+- **Worker job concurrency** — 100 single-node / 20 pipeline semaphore permits;
+  wasmtime pooling allocator caps instances (500) and per-instance memory
+  (128 MiB). OCI layer decompression capped (32 MiB).
+- **HTTP** — per-IP (100/min API, 60/min webhook, 5/min auth) + global
+  (1000/min) governor limits; `FailClosed` in prod on Redis outage; per-IP
+  DashMaps swept every 5 min (`retain_recent` + `shrink_to_fit`). XFF walk
+  capped at 64 entries. Probe paths exempt.
+- **Scheduler / execution** — `SCHEDULER_MAX_CONCURRENT_EXECUTIONS` (16) and
+  `TALOS_MAX_CONCURRENT_EXECUTIONS` (3) semaphores, both `=0`-clamped to 1.
+- **Per-actor** — executions/hr + total, workflows/min, fuel/hr, fuel/exec,
+  workflow_count all enforced in-transaction (fail-closed on DB error).
+- **Connection pools** — Postgres/Neo4j/Redis bounded with acquire/op
+  timeouts; pool exhaustion → reject (503), not hang.
+- **Payload caps** — 1 MiB trigger/replay/graph, 65 KiB memory value, 64 KiB
+  SQL, 1 MiB webhook; rejected before buffering.
+- **Keyed caches all have eviction** — rate-limit DashMaps (5-min sweep), RPC
+  nonce cache (rotating two-gen + soft cap), embedding in-flight dedupe (RAII),
+  CSRF grace tokens (rotation), registry module cache (LRU).
+
+One flagged item — the worker `in_memory_result_cache` (initial sweep marked
+it "likely unbounded") — was **checked and is bounded**: capacity-based
+eviction (`WASM_RESULT_CACHE_CAPACITY`, default 256) evicting the
+closest-to-expiry entry, plus per-entry TTL freshness on read (MCP-1092,
+`insert_to_cache` at `worker/src/runtime.rs`). False alarm; no fix needed.
+
+Failure modes degrade gracefully: semaphore-full → queue, rate-limit → 429,
+pool-exhausted → 503, payload-oversized → reject, actor-budget → reject/
+auto-suspend, fuel-exhausted → clean node failure. *Not exercised:* genuine
+sustained multi-node load (requires a real cluster); the per-subject NATS
+queue has no explicit depth bound beyond the semaphore (callers must carry
+their own request timeout — they do, per the per-subject timeout table).
+
 ---
 
 ## Verified clean (negative results — don't re-investigate)
