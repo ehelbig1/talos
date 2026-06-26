@@ -305,6 +305,60 @@ The areas flagged above were then exercised — **still no exploitable findings*
 
 *Scope not deeply exercised (recommended follow-ups):* wasmtime sandbox runtime-escape fuzzing; sustained DoS/resource-exhaustion load; crypto-primitive review of the HMAC/AEAD/nonce paths beyond code reading; and a watch on the deferred graph-RAG `Entity.properties` persistence (must add Cypher-key sanitisation before it's wired).
 
+### Dependency CVE sweep (2026-06-26)
+
+`cargo audit` across the 948-crate workspace surfaced one live advisory:
+**RUSTSEC-2026-0185** — `quinn-proto 0.11.14`, "Remote memory exhaustion from
+unbounded out-of-order stream reassembly," **CVSS 7.5 (High)**, disclosed
+2026-06-22. Fixed by a lockfile-only bump to `0.11.15`
+(`cargo update -p quinn-proto --precise 0.11.15`); `cargo audit` then reports
+**0 vulnerabilities** and `cargo check --workspace` is clean. Shipped as
+**PR #294**. (quinn is a transitive QUIC dep; no Talos source change needed.)
+The systematic monthly `cargo audit` is the control that caught a 4-day-old
+advisory — keep it on the `make audit` / `quality.yml` cadence.
+
+### Remaining-subsystem review sweep (2026-06-26)
+
+Three parallel code-review passes over the subsystems not yet exercised by the
+pentest — **org/RBAC privilege model**, **async/eventing surfaces**, and
+**audit-integrity + workflow-versioning**. **No exploitable findings.** The
+gates were all present and recently hardened:
+
+- **Org/RBAC.** Rank-tiered member ops (an Admin can't remove/demote an Owner,
+  MCP-996); Owner promotion only via `transfer_ownership`, never
+  `add_member`/`update_member_role` (MCP-818); cross-user capability grants and
+  the `capability_grants` *query* both gate on the dedicated
+  `users.is_platform_admin` flag, not org-admin (MCP-998); actor/user ceiling
+  raises use the canonical `ceiling_permits` *lattice* subset check (partial
+  order — incomparable sibling worlds can't cross-grant), not a linear rank.
+  RLS `SET ROLE` is the documented-latent backstop; the app-layer gates are the
+  current sole line and held on every path.
+- **Async/eventing.** A2A endpoint: SSRF triple-layered (call-time check +
+  connect-time `ControllerSsrfResolver` for the DNS-rebinding TOCTOU +
+  no-redirect) and response/​input body-capped. DLQ subscription refreshes
+  `is_admin`+org-membership every 60 s (MCP-985, bounded stale window); DLQ
+  replay is ownership-gated. Continuation-trigger and scheduler both re-run the
+  **full** `authorize_workflow_trigger` (actor status + budget + capability
+  ceiling) on every fire (MCP-708) and fail-closed on DB error — an operator
+  ceiling-downgrade mid-flight can't be raced. Suspension/approval resume tokens
+  are 256-bit random + atomic single-use claim (replay-proof). Inbound webhooks:
+  HMAC constant-time verify, fail-closed on undecryptable secret (no silent
+  downgrade to the static token, MCP-913/923), GitHub-format requires Redis
+  dedup or is rejected (MCP-862/887).
+- **Audit-integrity + versioning.** Hash chain is length-prefix-encoded
+  (delimiter-injection-proof), each event commits to the prior hash, HMAC
+  verified constant-time; producer and offline verifier share one
+  `talos-audit-event` implementation (no drift). Audit tables carry a
+  `BEFORE UPDATE OR DELETE` immutability trigger; TRUNCATE is separately blocked
+  by the SQL validator. Version publish/rollback/replay are ownership-gated
+  (org-role-filtered, excludes Viewer, MCP-594); replay re-authorizes budget +
+  capability ceiling against the pinned graph. One **LOW/acceptable** note: a
+  TOCTOU window on active-version selection (a version published between
+  fetch-and-execute means the in-flight trigger runs the previously-active
+  version) — not a security gap (execution is still correctly pinned + auth'd to
+  whichever version it fetched), just latest-version semantics; documented as an
+  accepted latency trade-off.
+
 ---
 
 ## Verified clean (negative results — don't re-investigate)
