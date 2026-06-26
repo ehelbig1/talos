@@ -291,6 +291,18 @@ A focused security engagement: 3 parallel code-review passes (IDOR / secret-expo
 - **Secret exposure — clean.** GraphQL `Secret` has no `value` field; logs record `key_hash`/`key_path` not values; DLP `redact_json` at the persistence boundary; worker hands WASM an opaque `u64` handle (never the plaintext); tier-1 actors can't resolve external-provider keys.
 - **Rate-limit fallback — correct (not a finding).** `DistributedRateLimiter::auto()` is environment-aware: **`FailClosed` in production** (rejects on Redis loss), `FailOpen` only in dev (per-instance in-memory fallback).
 
+### Deep specialist follow-up (2026-06-26)
+
+The areas flagged above were then exercised — **still no exploitable findings**:
+
+- **WASM sandbox escape (live, minimal-node).** Filesystem read of `/etc/passwd` → blocked (WASI `ENOENT`, no preopened dirs); host environment → **0 vars** visible to the guest (no `DATABASE_URL`/`VAULT_TOKEN` leak); raw `std::net::TcpStream` to the cloud-metadata IP `169.254.169.254` and to `1.1.1.1` → "operation not supported" (no socket capability).
+- **Capability-world boundary.** A `minimal-node` module importing `talos::core::http` fails to compile (`error[E0432]: unresolved import`) — least privilege is enforced at the binding level, not just at runtime. The http binding only exists in `http-node`+.
+- **Egress allowlist / SSRF gate (http-node).** With `allowed_hosts=[example.com]`, fetches to `169.254.169.254` (metadata) and `1.1.1.1` are rejected at the gate (`invalidurl`), while the allowlisted host passes the gate to the network layer (distinct `networkerror`, i.e. environmental — the dev worker has no outbound internet). Selective allowlist + SSRF block confirmed.
+- **Resource / DoS caps.** A `black_box`-guarded true-infinite loop and an unbounded-`Vec` memory bomb are both trapped in ~0-1 s by the fuel cap ("WASM fuel exhausted after 10000000 instructions") - CPU and allocation are bounded; no worker hang.
+- **Crypto primitives (review).** HMAC NATS-RPC signing uses constant-time compare + an unambiguous canonical form; the nonce-replay cache's minimum lifetime matches the 60 s freshness window; at-rest AEAD binds AAD to row identity with per-context HKDF subkeys (~1 message/key); checkpoint/envelope AEAD fold execution/job ids; bcrypt cost 12; TOTP replay-guarded (`SET NX`, fail-closed in prod). No high/critical; only doc/deprecated-path nits.
+
+*Still not exercised:* wasmtime CVE-class escapes (a wasmtime-version audit, separate from the capability gating verified above); sustained multi-node DoS load; and the deferred graph-RAG `Entity.properties` (still dropped on persist - add Cypher-key sanitisation before wiring).
+
 *Scope not deeply exercised (recommended follow-ups):* wasmtime sandbox runtime-escape fuzzing; sustained DoS/resource-exhaustion load; crypto-primitive review of the HMAC/AEAD/nonce paths beyond code reading; and a watch on the deferred graph-RAG `Entity.properties` persistence (must add Cypher-key sanitisation before it's wired).
 
 ---
