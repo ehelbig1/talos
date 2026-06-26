@@ -279,6 +279,22 @@ rest accurately labelled.
 
 ---
 
+## Penetration test (2026-06-26)
+
+A focused security engagement: 3 parallel code-review passes (IDOR / secret-exposure / injection) plus live exploitation against the running stack with two real tenant users. **No exploitable vulnerabilities found** — the high-value attack surface is well-defended. Findings:
+
+- **Broken access control / IDOR — clean.** Code review found consistent `user_id`/org gating (mutation WHERE-clauses + RFC-0004/0005 tenant-scoped RLS tx as a backstop). Live: user B could not read/update/delete/trigger user A's workflow (all "not found / access denied"), read/delete A's secret ("Secret not found"), or read A's `module_execution_logs` ("permission denied"); B's `workflows`/`secrets` list queries returned **zero** of A's resources (no enumeration). A's resources stayed intact.
+- **Cross-org injection — blocked.** B creating a workflow pinned to a foreign `organizationId` → "You do not have write access to that organization" (the RFC-0006 org-pin RLS WITH CHECK).
+- **AuthN — solid.** `me` query with no token → "Not authenticated"; tampered-signature JWT → rejected; classic **`alg:none` forgery** → rejected. Signature verification holds.
+- **AuthZ — solid.** MCP secrets are read-only at runtime (`set_secret` → "Unknown tool"); capability-ceiling + LLM-tier gates verified earlier in this audit.
+- **Injection — clean.** SQL fully parameterized; Cypher uses param bindings + a label/predicate allowlist (`sanitize_label`, breakout-tested) with user-derived `Entity.properties` *dropped* on persist (deferred, not exposed); Rust codegen gated by capability-world validation + scaffold caps; Rhai sandboxed (`set_max_operations`/`call_levels`/`string_size`, `eval` disabled, no module resolver); container commands use `Command::arg` (no shell) with image-name allowlists.
+- **Secret exposure — clean.** GraphQL `Secret` has no `value` field; logs record `key_hash`/`key_path` not values; DLP `redact_json` at the persistence boundary; worker hands WASM an opaque `u64` handle (never the plaintext); tier-1 actors can't resolve external-provider keys.
+- **Rate-limit fallback — correct (not a finding).** `DistributedRateLimiter::auto()` is environment-aware: **`FailClosed` in production** (rejects on Redis loss), `FailOpen` only in dev (per-instance in-memory fallback).
+
+*Scope not deeply exercised (recommended follow-ups):* wasmtime sandbox runtime-escape fuzzing; sustained DoS/resource-exhaustion load; crypto-primitive review of the HMAC/AEAD/nonce paths beyond code reading; and a watch on the deferred graph-RAG `Entity.properties` persistence (must add Cypher-key sanitisation before it's wired).
+
+---
+
 ## Verified clean (negative results — don't re-investigate)
 
 - **Class A remainder:** scheduler, actor-handoff, retry, replay all finalize
