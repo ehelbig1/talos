@@ -2113,12 +2113,14 @@ impl ActorRepository {
     /// Clone semantic + episodic memories from one actor to another.
     /// Thin delegate to [`talos_memory::clone_memories`].
     ///
-    /// **L T4-1: same-user invariant enforced at the SQL boundary.**
-    /// Per CLAUDE.md the DEK lineage is per-user — a cross-user clone
-    /// would do ciphertext passthrough of rows wrapped under the source
-    /// user's DEK to a target user who can't decrypt them, silently
-    /// corrupting the target's memory. Both actors must belong to
-    /// `user_id`; mismatch fails closed with `anyhow::bail!`.
+    /// **L T4-1: same-user invariant enforced at the SQL boundary.** This is a
+    /// TENANCY/privacy boundary, NOT a crypto one — don't copy one user's agent
+    /// memory into another user's agent. (Crypto would not stop it: the DEK is
+    /// a single system-wide key, not per-user, so a cross-user copy would
+    /// decrypt fine — `clone_memories` re-bases each v1/v3 row's AAD on copy
+    /// regardless. The earlier "DEK lineage is per-user / target can't decrypt"
+    /// rationale was inaccurate.) Both actors must belong to `user_id`;
+    /// mismatch fails closed with `anyhow::bail!`.
     pub async fn clone_actor_memories(
         &self,
         user_id: Uuid,
