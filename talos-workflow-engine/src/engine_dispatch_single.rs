@@ -78,8 +78,9 @@ impl ParallelWorkflowEngine {
                         return (
                             node_idx,
                             Err(format!(
-                                "Execution paused: module {} requires approval for {:?}. \
-                             An approval request has been created.",
+                                "[APPROVAL_PENDING] Execution paused: module {} requires approval for {:?}. \
+                             Not a genuine failure — an approval request has been created; approve it, then retry. \
+                             (Dashboards/alerts can filter on the [APPROVAL_PENDING] prefix.)",
                                 node_id, wasm_module.requires_approval_for
                             )),
                         );

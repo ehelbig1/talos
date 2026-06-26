@@ -146,8 +146,9 @@ impl ParallelWorkflowEngine {
                             return (
                             chain_tail,
                             Err(format!(
-                                "Execution paused: module {step_node_id} requires approval for {requires_approval:?}. \
-                                 An approval request has been created."
+                                "[APPROVAL_PENDING] Execution paused: module {step_node_id} requires approval for {requires_approval:?}. \
+                                 Not a genuine failure — an approval request has been created; approve it, then retry. \
+                                 (Dashboards/alerts can filter on the [APPROVAL_PENDING] prefix.)"
                             )),
                         );
                         }
