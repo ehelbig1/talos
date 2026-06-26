@@ -291,24 +291,24 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "name": "set_actor_budget",
             "description": "Create or replace the budget policy for an actor. All limits are optional — \
                 omitting a field means unlimited (no cap). ENFORCED caps: max_executions_per_hour, \
-                max_executions_total (both atomic at trigger time), and max_workflow_count (at create time). \
-                RESERVED / NOT YET ENFORCED (stored + returned but no enforcement path consumes them): \
-                max_workflows_per_minute (stored default 10), max_compilations_per_hour (stored default 20), \
-                max_outbound_requests_per_hour, max_fuel_per_hour — do NOT rely on these for safety yet. \
+                max_executions_total, and max_workflows_per_minute (all atomic at trigger time), plus \
+                max_workflow_count (at create time). RESERVED / NOT YET ENFORCED (stored + returned but \
+                no enforcement path consumes them): max_compilations_per_hour (stored default 20), \
+                max_outbound_requests_per_hour, max_fuel_per_hour, max_fuel_per_execution. \
                 on_budget_exceeded: 'suspend' (default), 'alert', or 'block'. \
                 The response includes defaults_applied listing which fields used their stored defaults.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "actor_id": { "type": "string" },
-                    "max_executions_per_hour": { "type": "number", "description": "Omit for unlimited" },
-                    "max_executions_total": { "type": "number", "description": "Omit for unlimited" },
-                    "max_fuel_per_execution": { "type": "number", "description": "Omit for unlimited" },
-                    "max_fuel_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited. (Per-hour aggregate fuel is not currently rate-checked; only max_executions_per_hour / max_executions_total are enforced.)" },
-                    "max_outbound_requests_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited. (Outbound-request volume is not currently rate-checked.)" },
-                    "max_workflow_count": { "type": "number", "description": "Omit for unlimited" },
-                    "max_workflows_per_minute": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Per-minute trigger rate is not currently rate-checked (no enforcement path consumes this value); the enforced volume caps are max_executions_per_hour / max_executions_total. Stored default 10 if omitted." },
-                    "max_compilations_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. WASM compilations are not currently rate-checked. Stored default 20 if omitted." },
+                    "max_executions_per_hour": { "type": "number", "description": "ENFORCED (atomic at trigger time). Omit for unlimited." },
+                    "max_executions_total": { "type": "number", "description": "ENFORCED (atomic at trigger time). Omit for unlimited." },
+                    "max_fuel_per_execution": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited." },
+                    "max_fuel_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited." },
+                    "max_outbound_requests_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Omit for unlimited." },
+                    "max_workflow_count": { "type": "number", "description": "ENFORCED (at create time). Omit for unlimited." },
+                    "max_workflows_per_minute": { "type": "number", "description": "ENFORCED per-actor trigger-rate cap (atomic at trigger time). Stored default 10 if omitted." },
+                    "max_compilations_per_hour": { "type": "number", "description": "RESERVED — stored but NOT YET ENFORCED. Stored default 20 if omitted." },
                     "on_budget_exceeded": { "type": "string", "description": "suspend (default) | alert | block" }
                 },
                 "required": ["actor_id"]

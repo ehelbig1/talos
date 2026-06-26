@@ -365,10 +365,10 @@ impl ExecutionOrchestrationService {
                 // Atomic backstop fired (the fast-fail pre-check let a
                 // concurrent burst slip through). Surface the same
                 // budget-exceeded shape the pre-check uses.
-                let window = if kind == "per_hour" {
-                    "in the last hour"
-                } else {
-                    "total"
+                let window = match kind {
+                    "per_minute" => "in the last minute",
+                    "per_hour" => "in the last hour",
+                    _ => "total",
                 };
                 return Err(OrchestrationError::AuthorizationDenied(format!(
                     "Actor budget exceeded: {} executions {} (limit: {})",

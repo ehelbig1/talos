@@ -4108,10 +4108,10 @@ async fn handle_call_workflow(
             limit,
             count,
         }) => {
-            let window = if kind == "per_hour" {
-                "in the last hour"
-            } else {
-                "total"
+            let window = match kind {
+                "per_minute" => "in the last minute",
+                "per_hour" => "in the last hour",
+                _ => "total",
             };
             return Some(mcp_error(
                 req_id.clone(),
@@ -4986,10 +4986,10 @@ async fn handle_bulk_trigger_workflow(
                 limit,
                 count,
             }) => {
-                let window = if kind == "per_hour" {
-                    "in the last hour"
-                } else {
-                    "total"
+                let window = match kind {
+                    "per_minute" => "in the last minute",
+                    "per_hour" => "in the last hour",
+                    _ => "total",
                 };
                 results.push(serde_json::json!({
                     "input_index": idx,
@@ -5373,10 +5373,10 @@ async fn handle_trigger_workflow_as_actors(
                 limit,
                 count,
             }) => {
-                let window = if kind == "per_hour" {
-                    "in the last hour"
-                } else {
-                    "total"
+                let window = match kind {
+                    "per_minute" => "in the last minute",
+                    "per_hour" => "in the last hour",
+                    _ => "total",
                 };
                 results.push(serde_json::json!({
                     "actor_id": actor_id.to_string(),
