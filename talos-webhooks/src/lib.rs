@@ -1305,11 +1305,43 @@ impl WebhookRouter {
             } else {
                 Some(talos_dlp_provider::redact_json(&payload_value))
             };
+
+            // Phase C of "every execution gets an actor": resolve an owning
+            // actor for this bare-module webhook dispatch. Webhook triggers
+            // carry no actor → the user's default actor; its max_llm_tier then
+            // travels with the job below. Fail OPEN to actor-less Tier-2
+            // (today's behaviour) on any resolution error so a transient DB
+            // hiccup never drops an inbound webhook.
+            let (resolved_actor, actor_tier) = {
+                let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
+                match actor_repo
+                    .resolve_effective_actor(trigger.user_id, None)
+                    .await
+                {
+                    Ok(aid) => {
+                        let tier = actor_repo
+                            .get_actor_max_llm_tier(aid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
+                        (Some(aid), tier)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %trigger.user_id, error = %e,
+                            "webhook dispatch: default-actor resolution failed; dispatching actor-less (Tier-2)"
+                        );
+                        (None, talos_workflow_job_protocol::LlmTier::default())
+                    }
+                }
+            };
+
             if let Err(e) = sqlx::query(
                 "INSERT INTO module_executions (id, module_id, user_id, status, \
                   input_data, input_data_enc, payload_enc_key_id, payload_format, \
-                  workflow_execution_id, trigger_type, started_at)
-                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, 'webhook', NOW())
+                  workflow_execution_id, actor_id, trigger_type, started_at)
+                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, $9, 'webhook', NOW())
                  ON CONFLICT DO NOTHING",
             )
             .bind(job_id)
@@ -1320,6 +1352,7 @@ impl WebhookRouter {
             .bind(payload_bundle.key_id)
             .bind(payload_bundle.format_version)
             .bind(None::<Uuid>)
+            .bind(resolved_actor)
             .execute(&self.db_pool)
             .await
             {
@@ -1397,13 +1430,13 @@ impl WebhookRouter {
                         deadline_unix_secs: 0,
                         cancellation_token: None,
                         signature: vec![],
-                        // Webhook-trigger module dispatch — module-bound
-                        // (the webhook fires a configured module, not an
-                        // actor's workflow). Tier ceiling does not apply
-                        // at this layer; see gmail/dispatch.rs for the
-                        // same rationale and the recommended workflow-
-                        // wrapper approach for tier-1 use cases.
-                        max_llm_tier: talos_workflow_job_protocol::LlmTier::default(),
+                        // Phase C: the resolved actor's tier travels with the
+                        // job. Defaults to Tier-2 (the default actor is Tier-2)
+                        // so it's non-breaking; an operator who sets their
+                        // default actor to `tier1` now gets tier enforcement on
+                        // webhook-triggered module dispatch without the
+                        // wrap-in-a-workflow workaround.
+                        max_llm_tier: actor_tier,
                         job_nonce: String::new(),
                         wasm_bytes: None,
                         capability_world: None,
@@ -1419,7 +1452,7 @@ impl WebhookRouter {
                         max_fuel: exec_info.max_fuel,
                         dry_run: false,
                         reply_topic: None,
-                        actor_id: None,
+                        actor_id: resolved_actor,
                         user_id,
                     };
 
@@ -2757,6 +2790,32 @@ impl WebhookRouter {
             let worker_shared_key_clone = self.worker_shared_key.clone();
             let user_id = trigger.user_id;
 
+            // Phase C: resolve an owning actor for the DLQ replay (same shape as
+            // the live webhook path above). Webhook triggers carry no actor →
+            // the user's default actor; its tier travels with the re-dispatched
+            // job. Fail OPEN to actor-less Tier-2 on any resolution error.
+            let (resolved_actor, actor_tier) = {
+                let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
+                match actor_repo.resolve_effective_actor(user_id, None).await {
+                    Ok(aid) => {
+                        let tier = actor_repo
+                            .get_actor_max_llm_tier(aid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
+                        (Some(aid), tier)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %user_id, error = %e,
+                            "DLQ replay: default-actor resolution failed; dispatching actor-less (Tier-2)"
+                        );
+                        (None, talos_workflow_job_protocol::LlmTier::default())
+                    }
+                }
+            };
+
             tokio::spawn(async move {
                 let exec_info = match registry.get_execution_info(module_id, user_id).await {
                     Ok(info) => info,
@@ -2803,11 +2862,10 @@ impl WebhookRouter {
                     cancellation_token: None,
                     signature: vec![],
                     job_nonce: String::new(),
-                    // DLQ replay path — module-bound dispatch (no actor
-                    // context). The original failed dispatch already had
-                    // its tier resolved in the live path; the replay
-                    // re-runs the same module without actor binding.
-                    max_llm_tier: talos_workflow_job_protocol::LlmTier::default(),
+                    // Phase C: the resolved actor's tier travels with the
+                    // re-dispatched job (Tier-2 default → non-breaking; the
+                    // user's default actor at tier1 gives egress control).
+                    max_llm_tier: actor_tier,
                     wasm_bytes: None,
                     capability_world: None,
                     // MCP-1090: propagate integration_name (DLQ replay).
@@ -2817,7 +2875,7 @@ impl WebhookRouter {
                     max_fuel: exec_info.max_fuel,
                     dry_run: false,
                     reply_topic: None,
-                    actor_id: None,
+                    actor_id: resolved_actor,
                     user_id,
                 };
 
