@@ -10,11 +10,11 @@ request time.
 systemic bug *classes* identified, swept to exhaustion, and now **frozen with
 structural lints** (checks 46/47, #272); a battle-hardening phase that closed an
 actor-budget TOCTOU race (#284) and made 2 of 4 inert governance caps real
-(#285–#288); and ~34 surfaces verified clean (including the full OAuth CSRF/state
+(#285–#288); and ~37 surfaces verified clean (including the full OAuth CSRF/state
 boundary, the MCP untrusted-compile path, sub-workflow dispatch, the
 loop/collect/capability-dispatch structural nodes, the LLM dispatch kinds on
 tier-1 local Ollama, the judge/reflective-retry/agent-loop orchestration nodes,
-the concurrency primitives, and input-boundary + fail-open sweeps).** This
+the concurrency primitives, input-boundary + fail-open sweeps, and live dependency failure-injection (NATS/Redis/worker)).** This
 doc captures the bugs, the two classes (and the lints that freeze them), and the
 negative results (so they aren't re-investigated).
 
@@ -446,3 +446,18 @@ rest accurately labelled.
   default. The class is held by lint check 10 + the prior fix history. The new
   #286/#287 gates are fail-closed (the in-tx `COUNT`/`SUM` errors propagate via
   `?`, rolling back the create).
+- **Dependency failure-injection** (live: stop a service mid-operation, observe,
+  restart, confirm recovery). All three degrade gracefully / fail-closed — no
+  stuck rows, no crash, no fail-open:
+  - *NATS down → trigger* — the execution row is created `running`, the NATS
+    client buffers the publish, and the run **completes ~10 s later when NATS
+    returns** (the `wait_ms` window just expires first). No stuck row; resilient
+    reconnect.
+  - *Redis down* — `/live` `/ready` `/health` all stay 200 (Redis degraded is
+    non-fatal by design; `/ready` 503s only on Postgres loss), and core triggers
+    still **complete** (Redis isn't on the execution critical path). Clean
+    recovery on restart.
+  - *Worker down → trigger* — the execution finalizes **`failed`** on the
+    dispatch timeout (NOT a stuck `running` — the Class A finalization invariant
+    holding under dependency failure). No leak.
+  - Full stack recovered after all three; end-to-end control trigger COMPLETED.
