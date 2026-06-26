@@ -67,6 +67,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
             input,
             trigger_type,
             race_safe_status,
+            actor_id,
         } = ctx;
 
         // The race-safe variant uses INSERT...SELECT with a CASE WHEN
@@ -131,13 +132,13 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
                 "INSERT INTO module_executions \
                  (id, module_id, user_id, status, \
                   input_data, input_data_enc, payload_enc_key_id, payload_format, \
-                  workflow_execution_id, trigger_type, started_at) \
+                  workflow_execution_id, trigger_type, actor_id, started_at) \
                  SELECT $1, $2, $3, \
                      CASE WHEN EXISTS( \
                          SELECT 1 FROM workflow_executions \
                          WHERE id = $8 AND status IN ('failed', 'cancelled') \
                      ) THEN 'cancelled' ELSE 'running' END, \
-                     $4, $5, $6, $7, $8, $9, NOW() \
+                     $4, $5, $6, $7, $8, $9, $10, NOW() \
                  ON CONFLICT DO NOTHING",
             )
             .bind(id)
@@ -149,6 +150,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
             .bind(payload_format)
             .bind(workflow_execution_id)
             .bind(trigger_type)
+            .bind(actor_id)
             .execute(&self.pool)
             .await
         } else {
@@ -158,8 +160,8 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
                 "INSERT INTO module_executions \
                  (id, module_id, user_id, status, \
                   input_data, input_data_enc, payload_enc_key_id, payload_format, \
-                  workflow_execution_id, trigger_type, started_at) \
-                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, $9, NOW()) \
+                  workflow_execution_id, trigger_type, actor_id, started_at) \
+                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, $9, $10, NOW()) \
                  ON CONFLICT DO NOTHING",
             )
             .bind(id)
@@ -171,6 +173,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
             .bind(payload_format)
             .bind(workflow_execution_id)
             .bind(trigger_type)
+            .bind(actor_id)
             .execute(&self.pool)
             .await
         };
