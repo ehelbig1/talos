@@ -302,19 +302,19 @@ jobs:
       - name: Unit tests
         run: npx vitest run
 
-      - name: Dependency audit (advisory)
-        # Surfaces `npm audit` findings on every PR so frontend dependency
-        # CVEs don't silently accumulate — they had (11, incl. runtime-shipped
-        # react-router open-redirect + dompurify XSS; see
-        # docs/functional-audit-2026-06-25.md "Frontend review"). This is the
-        # frontend mirror of the Rust side's `make audit` (cargo-deny) gate.
+      - name: Dependency audit (blocking)
+        # Blocks the job on any high/critical frontend advisory, so dependency
+        # CVEs can't silently accumulate (they had — 33, incl. runtime-shipped
+        # react-router open-redirect; see docs/functional-audit-2026-06-25.md
+        # "Frontend review"). The frontend mirror of the Rust side's
+        # `make audit` (cargo-deny) gate.
         #
-        # ADVISORY for now (continue-on-error) because the existing backlog
-        # would red every build. The intended progression: (1) this step makes
-        # NEW vulns visible in CI today; (2) once the backlog is cleared
-        # (`npm audit fix` for the non-major set + scheduled @apollo/server@5
-        # and @graphql-codegen@7 major upgrades), flip it to blocking by
-        # removing `continue-on-error` — at which point `--audit-level=high`
-        # fails the job on any new high/critical advisory.
-        continue-on-error: true
+        # Now BLOCKING (was advisory): the backlog was cleared in #301
+        # (33 → 2, 0 high/critical), so `--audit-level=high` passes on main and
+        # fails the job only on a NEWLY introduced high/critical advisory. The
+        # two residual MODERATE/LOW (dompurify bundled in monaco-editor) sit
+        # below this threshold — they're tracked for the monaco major bump, and
+        # deliberately don't block here. Tighten to `--audit-level=moderate`
+        # once monaco is bumped. The nightly schedule re-runs this so a
+        # freshly-disclosed advisory surfaces within 24h even with no PR.
         run: npm audit --audit-level=high
