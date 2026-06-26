@@ -24,7 +24,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor \
-        check build lint lint-frontend hooks test test-integration coverage-html audit check-catalog ci \
+        check build lint lint-frontend hooks test test-changed test-integration coverage-html audit check-catalog ci \
         drill clean nuke smoke rls-preflight _wait-healthy
 
 ## ──── Dev ──────────────────────────────────────────────────────────
@@ -127,6 +127,9 @@ test: ## Run the full test suite with cargo-nextest (fast local)
 	@command -v cargo-nextest >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ cargo-nextest missing\033[0m — install: cargo install cargo-nextest --locked\n'; exit 1; }
 	@cargo nextest run --workspace
+
+test-changed: ## Run nextest for ONLY crates changed vs BASE (default origin/main); ARGS=--list to just list. Fast inner loop, NOT a CI substitute
+	@bash scripts/test-changed.sh $(ARGS)
 
 test-integration: ## Run env-gated integration tests against disposable Redis+Postgres (needs Docker)
 	@command -v docker >/dev/null 2>&1 \
