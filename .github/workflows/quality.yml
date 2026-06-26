@@ -301,3 +301,20 @@ jobs:
 
       - name: Unit tests
         run: npx vitest run
+
+      - name: Dependency audit (advisory)
+        # Surfaces `npm audit` findings on every PR so frontend dependency
+        # CVEs don't silently accumulate — they had (11, incl. runtime-shipped
+        # react-router open-redirect + dompurify XSS; see
+        # docs/functional-audit-2026-06-25.md "Frontend review"). This is the
+        # frontend mirror of the Rust side's `make audit` (cargo-deny) gate.
+        #
+        # ADVISORY for now (continue-on-error) because the existing backlog
+        # would red every build. The intended progression: (1) this step makes
+        # NEW vulns visible in CI today; (2) once the backlog is cleared
+        # (`npm audit fix` for the non-major set + scheduled @apollo/server@5
+        # and @graphql-codegen@7 major upgrades), flip it to blocking by
+        # removing `continue-on-error` — at which point `--audit-level=high`
+        # fails the job on any new high/critical advisory.
+        continue-on-error: true
+        run: npm audit --audit-level=high
