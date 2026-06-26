@@ -279,6 +279,88 @@ rest accurately labelled.
 
 ---
 
+## Penetration test (2026-06-26)
+
+A focused security engagement: 3 parallel code-review passes (IDOR / secret-exposure / injection) plus live exploitation against the running stack with two real tenant users. **No exploitable vulnerabilities found** — the high-value attack surface is well-defended. Findings:
+
+- **Broken access control / IDOR — clean.** Code review found consistent `user_id`/org gating (mutation WHERE-clauses + RFC-0004/0005 tenant-scoped RLS tx as a backstop). Live: user B could not read/update/delete/trigger user A's workflow (all "not found / access denied"), read/delete A's secret ("Secret not found"), or read A's `module_execution_logs` ("permission denied"); B's `workflows`/`secrets` list queries returned **zero** of A's resources (no enumeration). A's resources stayed intact.
+- **Cross-org injection — blocked.** B creating a workflow pinned to a foreign `organizationId` → "You do not have write access to that organization" (the RFC-0006 org-pin RLS WITH CHECK).
+- **AuthN — solid.** `me` query with no token → "Not authenticated"; tampered-signature JWT → rejected; classic **`alg:none` forgery** → rejected. Signature verification holds.
+- **AuthZ — solid.** MCP secrets are read-only at runtime (`set_secret` → "Unknown tool"); capability-ceiling + LLM-tier gates verified earlier in this audit.
+- **Injection — clean.** SQL fully parameterized; Cypher uses param bindings + a label/predicate allowlist (`sanitize_label`, breakout-tested) with user-derived `Entity.properties` *dropped* on persist (deferred, not exposed); Rust codegen gated by capability-world validation + scaffold caps; Rhai sandboxed (`set_max_operations`/`call_levels`/`string_size`, `eval` disabled, no module resolver); container commands use `Command::arg` (no shell) with image-name allowlists.
+- **Secret exposure — clean.** GraphQL `Secret` has no `value` field; logs record `key_hash`/`key_path` not values; DLP `redact_json` at the persistence boundary; worker hands WASM an opaque `u64` handle (never the plaintext); tier-1 actors can't resolve external-provider keys.
+- **Rate-limit fallback — correct (not a finding).** `DistributedRateLimiter::auto()` is environment-aware: **`FailClosed` in production** (rejects on Redis loss), `FailOpen` only in dev (per-instance in-memory fallback).
+
+### Deep specialist follow-up (2026-06-26)
+
+The areas flagged above were then exercised — **still no exploitable findings**:
+
+- **WASM sandbox escape (live, minimal-node).** Filesystem read of `/etc/passwd` → blocked (WASI `ENOENT`, no preopened dirs); host environment → **0 vars** visible to the guest (no `DATABASE_URL`/`VAULT_TOKEN` leak); raw `std::net::TcpStream` to the cloud-metadata IP `169.254.169.254` and to `1.1.1.1` → "operation not supported" (no socket capability).
+- **Capability-world boundary.** A `minimal-node` module importing `talos::core::http` fails to compile (`error[E0432]: unresolved import`) — least privilege is enforced at the binding level, not just at runtime. The http binding only exists in `http-node`+.
+- **Egress allowlist / SSRF gate (http-node).** With `allowed_hosts=[example.com]`, fetches to `169.254.169.254` (metadata) and `1.1.1.1` are rejected at the gate (`invalidurl`), while the allowlisted host passes the gate to the network layer (distinct `networkerror`, i.e. environmental — the dev worker has no outbound internet). Selective allowlist + SSRF block confirmed.
+- **Resource / DoS caps.** A `black_box`-guarded true-infinite loop and an unbounded-`Vec` memory bomb are both trapped in ~0-1 s by the fuel cap ("WASM fuel exhausted after 10000000 instructions") - CPU and allocation are bounded; no worker hang.
+- **Crypto primitives (review).** HMAC NATS-RPC signing uses constant-time compare + an unambiguous canonical form; the nonce-replay cache's minimum lifetime matches the 60 s freshness window; at-rest AEAD binds AAD to row identity with per-context HKDF subkeys (~1 message/key); checkpoint/envelope AEAD fold execution/job ids; bcrypt cost 12; TOTP replay-guarded (`SET NX`, fail-closed in prod). No high/critical; only doc/deprecated-path nits.
+
+*Still not exercised:* wasmtime CVE-class escapes (a wasmtime-version audit, separate from the capability gating verified above); sustained multi-node DoS load; and the deferred graph-RAG `Entity.properties` (still dropped on persist - add Cypher-key sanitisation before wiring).
+
+*Scope not deeply exercised (recommended follow-ups):* wasmtime sandbox runtime-escape fuzzing; sustained DoS/resource-exhaustion load; crypto-primitive review of the HMAC/AEAD/nonce paths beyond code reading; and a watch on the deferred graph-RAG `Entity.properties` persistence (must add Cypher-key sanitisation before it's wired).
+
+### Dependency CVE sweep (2026-06-26)
+
+`cargo audit` across the 948-crate workspace surfaced one live advisory:
+**RUSTSEC-2026-0185** — `quinn-proto 0.11.14`, "Remote memory exhaustion from
+unbounded out-of-order stream reassembly," **CVSS 7.5 (High)**, disclosed
+2026-06-22. Fixed by a lockfile-only bump to `0.11.15`
+(`cargo update -p quinn-proto --precise 0.11.15`); `cargo audit` then reports
+**0 vulnerabilities** and `cargo check --workspace` is clean. Shipped as
+**PR #294**. (quinn is a transitive QUIC dep; no Talos source change needed.)
+The systematic monthly `cargo audit` is the control that caught a 4-day-old
+advisory — keep it on the `make audit` / `quality.yml` cadence.
+
+### Remaining-subsystem review sweep (2026-06-26)
+
+Three parallel code-review passes over the subsystems not yet exercised by the
+pentest — **org/RBAC privilege model**, **async/eventing surfaces**, and
+**audit-integrity + workflow-versioning**. **No exploitable findings.** The
+gates were all present and recently hardened:
+
+- **Org/RBAC.** Rank-tiered member ops (an Admin can't remove/demote an Owner,
+  MCP-996); Owner promotion only via `transfer_ownership`, never
+  `add_member`/`update_member_role` (MCP-818); cross-user capability grants and
+  the `capability_grants` *query* both gate on the dedicated
+  `users.is_platform_admin` flag, not org-admin (MCP-998); actor/user ceiling
+  raises use the canonical `ceiling_permits` *lattice* subset check (partial
+  order — incomparable sibling worlds can't cross-grant), not a linear rank.
+  RLS `SET ROLE` is the documented-latent backstop; the app-layer gates are the
+  current sole line and held on every path.
+- **Async/eventing.** A2A endpoint: SSRF triple-layered (call-time check +
+  connect-time `ControllerSsrfResolver` for the DNS-rebinding TOCTOU +
+  no-redirect) and response/​input body-capped. DLQ subscription refreshes
+  `is_admin`+org-membership every 60 s (MCP-985, bounded stale window); DLQ
+  replay is ownership-gated. Continuation-trigger and scheduler both re-run the
+  **full** `authorize_workflow_trigger` (actor status + budget + capability
+  ceiling) on every fire (MCP-708) and fail-closed on DB error — an operator
+  ceiling-downgrade mid-flight can't be raced. Suspension/approval resume tokens
+  are 256-bit random + atomic single-use claim (replay-proof). Inbound webhooks:
+  HMAC constant-time verify, fail-closed on undecryptable secret (no silent
+  downgrade to the static token, MCP-913/923), GitHub-format requires Redis
+  dedup or is rejected (MCP-862/887).
+- **Audit-integrity + versioning.** Hash chain is length-prefix-encoded
+  (delimiter-injection-proof), each event commits to the prior hash, HMAC
+  verified constant-time; producer and offline verifier share one
+  `talos-audit-event` implementation (no drift). Audit tables carry a
+  `BEFORE UPDATE OR DELETE` immutability trigger; TRUNCATE is separately blocked
+  by the SQL validator. Version publish/rollback/replay are ownership-gated
+  (org-role-filtered, excludes Viewer, MCP-594); replay re-authorizes budget +
+  capability ceiling against the pinned graph. One **LOW/acceptable** note: a
+  TOCTOU window on active-version selection (a version published between
+  fetch-and-execute means the in-flight trigger runs the previously-active
+  version) — not a security gap (execution is still correctly pinned + auth'd to
+  whichever version it fetched), just latest-version semantics; documented as an
+  accepted latency trade-off.
+
+---
+
 ## Verified clean (negative results — don't re-investigate)
 
 - **Class A remainder:** scheduler, actor-handoff, retry, replay all finalize
