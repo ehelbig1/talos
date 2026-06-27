@@ -4635,6 +4635,75 @@ impl SecretsManager {
         })
     }
 
+    /// Per-org DEK migration status: per encrypted table, how many rows STILL
+    /// reference the global DEK but COULD be moved to a per-org DEK (i.e. the
+    /// remaining work for the `re_encrypt_*_to_org` sweeps). When every count
+    /// reaches 0, the only global-DEK rows left are legitimately org-less
+    /// (e.g. personal secrets, standalone module executions) and the global DEK
+    /// is no longer load-bearing for migratable data.
+    ///
+    /// Each `pending` count uses the SAME predicate as that table's sweep, so
+    /// "run the sweep until pending = 0" is exact. The personal tables
+    /// (totp / webhook signing secret / audit headers) have no sweep — they
+    /// migrate lazily on next write — so their `pending` is informational
+    /// (`has_sweep = false`): it shrinks as users naturally re-write, and only
+    /// a future sweep (or forced re-save) drives it to 0.
+    ///
+    /// This is an OPS/observability read that deliberately spans tables owned by
+    /// other crates — it reports DEK state, which is this manager's domain.
+    /// Platform-admin gated at the GraphQL layer.
+    pub async fn dek_migration_status(&self) -> Result<Vec<DekTableMigrationStatus>> {
+        use sqlx::Row as _;
+        let rows = sqlx::query(
+            r#"
+            SELECT 'secrets' AS tbl, true AS has_sweep, COUNT(*) AS pending
+              FROM secrets
+             WHERE org_id IS NOT NULL AND encryption_format_version <> 4
+            UNION ALL
+            SELECT 'actor_memory', true, COUNT(*)
+              FROM actor_memory am JOIN actors a ON a.id = am.actor_id
+             WHERE am.value_format <> 4 AND a.org_id IS NOT NULL
+            UNION ALL
+            SELECT 'workflow_executions.output', true, COUNT(*)
+              FROM workflow_executions we JOIN workflows w ON w.id = we.workflow_id
+             WHERE we.output_data_enc IS NOT NULL AND we.output_data_format <> 4
+               AND w.org_id IS NOT NULL
+            UNION ALL
+            SELECT 'module_executions.payloads', true, COUNT(*)
+              FROM module_executions me
+              JOIN workflow_executions we ON we.id = me.workflow_execution_id
+              JOIN workflows w ON w.id = we.workflow_id
+             WHERE me.payload_format <> 4 AND w.org_id IS NOT NULL
+               AND (me.input_data_enc IS NOT NULL OR me.output_data_enc IS NOT NULL
+                    OR me.trigger_metadata_enc IS NOT NULL)
+            UNION ALL
+            SELECT 'users.totp_secret', false, COUNT(*)
+              FROM users
+             WHERE totp_secret IS NOT NULL AND totp_secret_format <> 4
+            UNION ALL
+            SELECT 'webhook_triggers.signing_secret', false, COUNT(*)
+              FROM webhook_triggers
+             WHERE signing_secret_enc IS NOT NULL AND signing_secret_format <> 4
+            UNION ALL
+            SELECT 'user_audit_settings.auth_headers', false, COUNT(*)
+              FROM user_audit_settings
+             WHERE auth_headers_encrypted IS NOT NULL AND auth_headers_format <> 4
+            "#,
+        )
+        .fetch_all(&self.db_pool)
+        .await
+        .context("dek_migration_status: count query failed")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| DekTableMigrationStatus {
+                table: r.get::<String, _>("tbl"),
+                has_sweep: r.get::<bool, _>("has_sweep"),
+                pending: r.get::<i64, _>("pending"),
+            })
+            .collect())
+    }
+
     /// Rotate the master key used for envelope encryption of DEKs.
     ///
     /// This re-encrypts ALL DEKs in the `encryption_keys` table from the old
@@ -4965,6 +5034,20 @@ pub struct ReEncryptStats {
     pub re_encrypted: u64,
     pub failed: u64,
     pub failed_ids: Vec<Uuid>,
+}
+
+/// One row of [`SecretsManager::dek_migration_status`] — a per-table count of
+/// rows still on the global DEK that could be migrated to a per-org DEK.
+#[derive(Debug, Clone)]
+pub struct DekTableMigrationStatus {
+    /// Logical table/column label (e.g. `secrets`, `module_executions.payloads`).
+    pub table: String,
+    /// Whether a `re_encrypt_*_to_org` sweep drives this to 0 (true) or it
+    /// migrates lazily on next write (false — the personal tables).
+    pub has_sweep: bool,
+    /// Rows still on the global DEK that have a resolvable org (the remaining
+    /// sweep work). 0 means migration is complete for this table.
+    pub pending: i64,
 }
 
 #[derive(Debug, Clone)]

@@ -642,3 +642,76 @@ async fn re_encrypt_secrets_to_org_migrates_v3_global_rows_to_v4() {
     assert_eq!(fmt2, 4);
     assert_eq!(stats2.failed, 0);
 }
+
+// ── DEK migration status (operational completeness check) ──────────────────
+
+#[tokio::test]
+async fn dek_migration_status_reports_and_tracks_pending() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    // Structure: all 7 tables present; sweep flags correct.
+    let baseline = manager.dek_migration_status().await.unwrap();
+    assert!(
+        baseline.iter().any(|e| e.table == "secrets" && e.has_sweep),
+        "secrets is sweep-driven"
+    );
+    assert!(
+        baseline
+            .iter()
+            .any(|e| e.table == "users.totp_secret" && !e.has_sweep),
+        "personal tables are lazy (has_sweep=false)"
+    );
+    assert!(
+        baseline
+            .iter()
+            .any(|e| e.table == "module_executions.payloads"),
+        "module payloads tracked"
+    );
+    let secrets_before = baseline
+        .iter()
+        .find(|e| e.table == "secrets")
+        .map(|e| e.pending)
+        .unwrap();
+
+    // Craft an org-scoped v3 secret (migratable, not yet v4).
+    let org = create_test_org(&pool).await;
+    let kp = format!("dek/status/{}", Uuid::new_v4());
+    let sid = manager
+        .create_secret("S", &kp, "v", None, SYSTEM_USER_ID, vec![], None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE secrets SET org_id = $1 WHERE id = $2")
+        .bind(org)
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let after = manager.dek_migration_status().await.unwrap();
+    let secrets_after = after
+        .iter()
+        .find(|e| e.table == "secrets")
+        .map(|e| e.pending)
+        .unwrap();
+    assert_eq!(
+        secrets_after,
+        secrets_before + 1,
+        "the crafted org-scoped v3 secret is counted as pending"
+    );
+
+    // Sweep clears it → status reflects completion.
+    manager.re_encrypt_secrets_to_org().await.unwrap();
+    let done = manager.dek_migration_status().await.unwrap();
+    let secrets_done = done
+        .iter()
+        .find(|e| e.table == "secrets")
+        .map(|e| e.pending)
+        .unwrap();
+    assert_eq!(
+        secrets_done, secrets_before,
+        "after the sweep, our row is no longer pending"
+    );
+}
