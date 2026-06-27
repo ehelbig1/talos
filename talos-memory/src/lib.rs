@@ -1938,6 +1938,118 @@ pub async fn refresh_ttl(
 // Operations
 // ============================================================================
 
+/// Outcome of [`re_encrypt_memories_to_org`].
+#[derive(Debug, Clone, Default)]
+pub struct MemoryReEncryptStats {
+    pub re_encrypted: u64,
+    pub failed: u64,
+}
+
+/// Per-org DEK arc: migrate EXISTING `actor_memory` rows to their actor's org
+/// root DEK (format v4). The cutover only converts NEW writes; this sweep brings
+/// stored rows over, so the global DEK can retire for memory. Operator/background
+/// invoked — sibling of `SecretsManager::re_encrypt_secrets_to_org`.
+///
+/// Selects rows whose actor HAS an org (`actors.org_id IS NOT NULL`) and that are
+/// not already v4, decrypts via the registered hook (version-aware), and
+/// re-encrypts under the actor's org DEK, stamping `actor_memory.org_id`. Rows
+/// whose actor has no org keep their current (global) DEK. Same lost-write guard
+/// as the secrets sweep: the UPDATE only fires while the row is still on the
+/// `(value_key_id, value_format)` pair we decrypted from. No-op when no crypto
+/// hook is registered.
+pub async fn re_encrypt_memories_to_org(pool: &Pool<Postgres>) -> Result<MemoryReEncryptStats> {
+    let Some(hook) = MEMORY_CRYPTO_HOOK.get().cloned() else {
+        return Ok(MemoryReEncryptStats::default());
+    };
+    // 4 = talos_secrets_manager::SecretsManager::AAD_FORMAT_V4_ORG_DERIVED
+    // (literal to avoid a talos-memory → talos-secrets-manager dependency).
+    const V4: i16 = 4;
+
+    let rows = sqlx::query(
+        "SELECT am.actor_id, am.key, am.value_enc, am.value_key_id, am.value_format, a.org_id \
+         FROM actor_memory am JOIN actors a ON a.id = am.actor_id \
+         WHERE am.value_format <> $1 AND a.org_id IS NOT NULL",
+    )
+    .bind(V4)
+    .fetch_all(pool)
+    .await
+    .context("re_encrypt_memories_to_org: select stale rows")?;
+
+    let mut re_encrypted = 0u64;
+    let mut failed = 0u64;
+    for r in rows {
+        let actor_id: Uuid = r.get("actor_id");
+        let key: String = r.get("key");
+        let value_enc: Vec<u8> = r.get("value_enc");
+        let value_key_id: Uuid = r.get("value_key_id");
+        let src_format: i16 = r.get("value_format");
+        let org_id: Uuid = r.get("org_id");
+
+        let aad = build_memory_aad(actor_id, &key);
+        let plaintext = match hook
+            .decrypt(value_key_id, value_enc, aad.clone(), src_format)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(%actor_id, %key, "memory per-org sweep: decrypt failed: {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        let (new_key_id, new_ct, new_format) = match hook
+            .encrypt(plaintext.to_string(), Some(org_id), aad)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(%actor_id, %key, "memory per-org sweep: re-encrypt failed: {e}");
+                failed += 1;
+                continue;
+            }
+        };
+
+        match sqlx::query(
+            "UPDATE actor_memory \
+             SET value_enc = $1, value_key_id = $2, value_format = $3, org_id = $4, updated_at = now() \
+             WHERE actor_id = $5 AND key = $6 AND value_key_id = $7 AND value_format = $8",
+        )
+        .bind(new_ct.as_slice())
+        .bind(new_key_id)
+        .bind(new_format)
+        .bind(org_id)
+        .bind(actor_id)
+        .bind(&key)
+        .bind(value_key_id)
+        .bind(src_format)
+        .execute(pool)
+        .await
+        {
+            Ok(res) => {
+                if res.rows_affected() > 0 {
+                    re_encrypted += 1;
+                } else {
+                    tracing::debug!(%actor_id, %key, "memory per-org sweep: row concurrently re-keyed; skipped");
+                }
+            }
+            Err(e) => {
+                tracing::error!(%actor_id, %key, "memory per-org sweep: update failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        re_encrypted,
+        failed,
+        "Per-org actor_memory re-encryption sweep complete"
+    );
+    Ok(MemoryReEncryptStats {
+        re_encrypted,
+        failed,
+    })
+}
+
 pub async fn backfill_embeddings(pool: &Pool<Postgres>, limit: i64) -> Result<usize> {
     backfill_embeddings_filtered(pool, None, limit).await
 }
