@@ -87,8 +87,12 @@ pub(crate) const BLOCKED_TABLES_LIST: &[&str] = &[
     //   * `google_calendar_watch_channels` — still-PLAINTEXT
     //     `verification_token TEXT NOT NULL` (the per-channel webhook secret,
     //     mig 010_watch_channel_security).
-    //   * `workspace_oci_settings` — `password_encrypted` BYTEA /
-    //     `password_nonce` for the private OCI-registry credential (mig 032).
+    //   * `workspace_oci_settings` — DROPPED as dead/never-wired schema
+    //     (mig 20260627120000; it had `password_encrypted`/`password_nonce`
+    //     columns but no crypto code ever populated them — OCI creds come from
+    //     env vars). The deny-list entry is RETAINED as forward-protection: if
+    //     the per-workspace-creds feature is ever rebuilt, it stays
+    //     export-blocked by default.
     // Deliberately NOT added: `gmail_integrations` and
     // `google_calendar_integrations` — both plaintext AND encrypted token
     // columns were dropped from these (036/20260310001300 +
