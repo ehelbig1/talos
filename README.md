@@ -193,6 +193,7 @@ The differentiators are the credential-isolation primitive and the signed data p
 
 ## Documentation
 
+- `docs/examples/ai-pr-review.md` — **Worked example:** an AI pull-request reviewer end-to-end (what Talos is for)
 - `deploy/k3s/README.md` — Single-VM production runbook
 - `docs/deployment.md` — Service inventory, env-var reference, Vault/KEK rotation
 - `docs/security/architecture.md` — Security architecture with diagrams
