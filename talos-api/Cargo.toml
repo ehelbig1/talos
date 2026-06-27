@@ -42,6 +42,7 @@ talos-execution-orchestration = { path = "../talos-execution-orchestration" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-tenancy = { path = "../talos-tenancy" }
 talos-memory = { path = "../talos-memory" }
+talos-execution-repository = { path = "../talos-execution-repository" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tower-cookies = "0.11"

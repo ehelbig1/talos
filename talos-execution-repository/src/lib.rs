@@ -130,6 +130,13 @@ pub struct LoopCappedWorkflowRow {
     pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Outcome of [`ExecutionRepository::re_encrypt_outputs_to_org`].
+#[derive(Debug, Clone, Default)]
+pub struct OutputReEncryptStats {
+    pub re_encrypted: u64,
+    pub failed: u64,
+}
+
 impl ExecutionRepository {
     pub fn new(db_pool: PgPool) -> Self {
         Self {
@@ -417,6 +424,100 @@ impl ExecutionRepository {
             .decrypt_versioned(key_id, encrypted, exec_id.as_bytes(), format_version)
             .await?;
         serde_json::from_str(&json_str).map_err(Into::into)
+    }
+
+    /// Per-org DEK arc: migrate EXISTING encrypted execution outputs to their
+    /// workflow's org root DEK (format v4). Sibling of the secrets / actor_memory
+    /// sweeps; the cutover only converts NEW writes, this brings stored rows over
+    /// so the global DEK can retire for execution output.
+    ///
+    /// Selects rows with an encrypted output not already on v4 whose workflow has
+    /// an org, then decrypts + re-encrypts via the SAME helpers the live write
+    /// path uses — `encrypt_output` resolves the workflow's org (the execution
+    /// tenant). Outputs whose workflow has no org stay on the global DEK.
+    /// `workflow_executions.org_id` is left as-is (the high-write perf exclusion);
+    /// the org is authoritative via the workflow join. Lost-write guard: the
+    /// UPDATE only fires while the row is still on the (key, format) we read.
+    /// No-op when no SecretsManager is wired.
+    pub async fn re_encrypt_outputs_to_org(&self) -> Result<OutputReEncryptStats> {
+        if self.secrets_manager.is_none() {
+            return Ok(OutputReEncryptStats::default());
+        }
+
+        let rows = sqlx::query(
+            "SELECT we.id, we.output_data_enc, we.output_enc_key_id, we.output_data_format \
+             FROM workflow_executions we JOIN workflows w ON w.id = we.workflow_id \
+             WHERE we.output_data_enc IS NOT NULL \
+               AND we.output_data_format <> $1 \
+               AND w.org_id IS NOT NULL",
+        )
+        .bind(talos_secrets_manager::SecretsManager::AAD_FORMAT_V4_ORG_DERIVED)
+        .fetch_all(&self.db_pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("re_encrypt_outputs_to_org: select stale rows: {e}"))?;
+
+        let mut re_encrypted = 0u64;
+        let mut failed = 0u64;
+        for r in &rows {
+            let exec_id: Uuid = r.get("id");
+            let enc: Vec<u8> = r.get("output_data_enc");
+            let key_id: Uuid = r.get("output_enc_key_id");
+            let fmt: i16 = r.get("output_data_format");
+
+            let value = match self.decrypt_output(exec_id, key_id, &enc, fmt).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(%exec_id, "output per-org sweep: decrypt failed: {e}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            let (new_key_id, new_enc, new_fmt) = match self.encrypt_output(exec_id, &value).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(%exec_id, "output per-org sweep: re-encrypt failed: {e}");
+                    failed += 1;
+                    continue;
+                }
+            };
+
+            match sqlx::query(
+                "UPDATE workflow_executions \
+                 SET output_data_enc = $1, output_enc_key_id = $2, output_data_format = $3 \
+                 WHERE id = $4 AND output_enc_key_id = $5 AND output_data_format = $6",
+            )
+            .bind(&new_enc)
+            .bind(new_key_id)
+            .bind(new_fmt)
+            .bind(exec_id)
+            .bind(key_id)
+            .bind(fmt)
+            .execute(&self.db_pool)
+            .await
+            {
+                Ok(res) => {
+                    if res.rows_affected() > 0 {
+                        re_encrypted += 1;
+                    } else {
+                        tracing::debug!(%exec_id, "output per-org sweep: row concurrently re-keyed; skipped");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%exec_id, "output per-org sweep: update failed: {e}");
+                    failed += 1;
+                }
+            }
+        }
+
+        tracing::info!(
+            re_encrypted,
+            failed,
+            "Per-org execution-output re-encryption sweep complete"
+        );
+        Ok(OutputReEncryptStats {
+            re_encrypted,
+            failed,
+        })
     }
 
     /// Read output_data from a row, transparently decrypting if stored encrypted.

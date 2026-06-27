@@ -7246,6 +7246,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-engine",
  "talos-execution-orchestration",
+ "talos-execution-repository",
  "talos-google-calendar",
  "talos-http-utils",
  "talos-integrations",
