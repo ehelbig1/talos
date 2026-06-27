@@ -488,17 +488,21 @@ impl TotpService {
     /// Returns the encoded ciphertext string AND the AAD format version
     /// that must be persisted to `users.totp_secret_format` alongside it.
     ///
-    /// MCP-S2: writes always use v1 with AAD bound to `users.id` so an
-    /// attacker with DB write access can't swap one user's TOTP
-    /// ciphertext onto another row (the pre-fix swap was a silent
-    /// 2FA bypass). v0 reads are preserved (see `decrypt_totp_secret`)
-    /// for backward compatibility on existing rows that haven't been
-    /// re-encrypted yet.
+    /// MCP-S2: writes bind AAD to `users.id` so an attacker with DB write
+    /// access can't swap one user's TOTP ciphertext onto another row (the
+    /// pre-fix swap was a silent 2FA bypass). v0/v1/v3 reads are preserved (see
+    /// `decrypt_totp_secret`) for backward compatibility on existing rows.
+    ///
+    /// Per-org DEK arc: writes now use v4 — encrypted under the user's PERSONAL
+    /// org root DEK (TOTP is inherently personal; its `org_id` is stamped from
+    /// the personal org by `set_org_id_from_personal_org`, so the DEK scope
+    /// matches). Decrypt is unchanged: v4 routes through the same per-context
+    /// derived path as v3 (the row's `key_id` names the org DEK).
     async fn encrypt_totp_secret(&self, secret: &str, user_id: Uuid) -> Result<(String, i16)> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let (key_id, encrypted_bytes, version) = self
             .secrets_manager
-            .encrypt_value_aad_v3(secret, user_id.as_bytes())
+            .encrypt_value_aad_v4_for_user(secret, user_id, user_id.as_bytes())
             .await?;
         // Encode as: key_id_hex:base64(nonce||ciphertext)
         let encoded = format!("{}:{}", key_id, STANDARD.encode(&encrypted_bytes));
