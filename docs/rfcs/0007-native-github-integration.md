@@ -1,6 +1,6 @@
 # RFC 0007 — Native GitHub integration (Phase A: event-typed triggers)
 
-**Status:** In progress (A.1 engine-side filter + matcher ✓; A.2 GraphQL create CRUD + write-time validation ✓; remaining: read-back on list query + MCP create wiring + `__webhook__` metadata)
+**Status:** In progress (A.1 engine-side filter + matcher ✓; A.2 GraphQL create CRUD + write-time validation ✓; A.3 MCP `create_webhook` wiring ✓; remaining: read-back of `event_filter` on list queries + `__webhook__` event metadata)
 **Author:** Claude (paired with Evan)
 **Date:** 2026-06-27
 
