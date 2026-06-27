@@ -460,6 +460,124 @@ pub(crate) fn event_filter_matches(
     true
 }
 
+/// RFC 0007 D6: validate an `event_filter` at WRITE time so a malformed filter
+/// never persists. This is the fail-CLOSED counterpart to the fail-OPEN
+/// [`event_filter_matches`] (which fires on a malformed stored filter rather
+/// than silently dropping a delivery) — write-time validation is the primary
+/// guard, so the trigger-CRUD surface must call this before persisting.
+///
+/// The accepted shape mirrors exactly what the matcher interprets:
+/// ```jsonc
+/// { "header": "X-GitHub-Event",                 // optional; REQUIRED if `values` is non-empty
+///   "values": ["pull_request"],                 // optional; non-empty strings
+///   "payload_match": { "action": ["opened"] } } // optional; {key: [non-empty strings]}
+/// ```
+/// Unknown top-level keys are rejected (catches `value` vs `values` typos that
+/// would otherwise silently match nothing / everything). A filter with no active
+/// clause is rejected — an empty filter matches every delivery, so it's almost
+/// certainly a mistake; the caller should omit `event_filter` instead.
+pub fn validate_event_filter(filter: &serde_json::Value) -> Result<(), String> {
+    // Size cap: bounds the stored row AND the per-fire match cost. 8 KiB is far
+    // above any realistic header/action allow-list.
+    const MAX_BYTES: usize = 8 * 1024;
+    let encoded = serde_json::to_string(filter)
+        .map_err(|_| "event_filter is not serializable".to_string())?;
+    if encoded.len() > MAX_BYTES {
+        return Err(format!(
+            "event_filter must be ≤ {MAX_BYTES} bytes (got {})",
+            encoded.len()
+        ));
+    }
+
+    let obj = filter
+        .as_object()
+        .ok_or_else(|| "event_filter must be a JSON object".to_string())?;
+
+    for k in obj.keys() {
+        if !matches!(k.as_str(), "header" | "values" | "payload_match") {
+            return Err(format!(
+                "event_filter: unknown key '{k}'; allowed keys are header, values, payload_match"
+            ));
+        }
+    }
+
+    if let Some(h) = obj.get("header") {
+        let s = h
+            .as_str()
+            .ok_or_else(|| "event_filter.header must be a string".to_string())?;
+        if s.trim().is_empty() {
+            return Err("event_filter.header must be a non-empty string".to_string());
+        }
+    }
+
+    if let Some(v) = obj.get("values") {
+        let arr = v
+            .as_array()
+            .ok_or_else(|| "event_filter.values must be an array of strings".to_string())?;
+        for item in arr {
+            let s = item
+                .as_str()
+                .ok_or_else(|| "event_filter.values entries must be strings".to_string())?;
+            if s.is_empty() {
+                return Err("event_filter.values entries must be non-empty".to_string());
+            }
+        }
+        // A non-empty `values` clause is matched against the request header named
+        // by `header`; without `header` the matcher has nothing to compare.
+        if !arr.is_empty() && obj.get("header").is_none() {
+            return Err(
+                "event_filter.values requires event_filter.header (the request header that \
+                 carries the event type, e.g. \"X-GitHub-Event\")"
+                    .to_string(),
+            );
+        }
+    }
+
+    if let Some(pm) = obj.get("payload_match") {
+        let pmobj = pm
+            .as_object()
+            .ok_or_else(|| "event_filter.payload_match must be an object".to_string())?;
+        for (key, allowed) in pmobj {
+            if key.is_empty() {
+                return Err("event_filter.payload_match keys must be non-empty".to_string());
+            }
+            let arr = allowed.as_array().ok_or_else(|| {
+                format!("event_filter.payload_match.{key} must be an array of strings")
+            })?;
+            for item in arr {
+                let s = item.as_str().ok_or_else(|| {
+                    format!("event_filter.payload_match.{key} entries must be strings")
+                })?;
+                if s.is_empty() {
+                    return Err(format!(
+                        "event_filter.payload_match.{key} entries must be non-empty"
+                    ));
+                }
+            }
+        }
+    }
+
+    let has_values = obj
+        .get("values")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let has_payload = obj
+        .get("payload_match")
+        .and_then(|v| v.as_object())
+        .map(|o| !o.is_empty())
+        .unwrap_or(false);
+    if !has_values && !has_payload {
+        return Err(
+            "event_filter must specify at least one of a non-empty `values` or `payload_match` \
+             (an empty filter matches every delivery — omit event_filter instead)"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Absolute difference in seconds between `now_secs` and a caller-supplied
 /// `ts_secs` (a webhook timestamp header), using overflow-free `i64::abs_diff`.
 ///
@@ -3940,7 +4058,7 @@ mod auth_downgrade_tests {
 
 #[cfg(test)]
 mod event_filter_tests {
-    use super::event_filter_matches;
+    use super::{event_filter_matches, validate_event_filter};
     use serde_json::json;
 
     // Canonical GitHub PR filter: only pull_request opened/synchronize/reopened.
@@ -4039,6 +4157,94 @@ mod event_filter_tests {
         let f = json!({ "header": "X-GitHub-Event", "values": ["push"] });
         assert!(event_filter_matches(&f, Some("push"), &json!({})));
         assert!(!event_filter_matches(&f, Some("pull_request"), &json!({})));
+    }
+
+    // ---- validate_event_filter (RFC 0007 D6, write-time fail-CLOSED) ----
+
+    #[test]
+    fn validate_accepts_github_pr_filter() {
+        assert!(validate_event_filter(&gh_pr_filter()).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_payload_match_only() {
+        // No header/values is fine when payload_match carries the constraint.
+        let f = json!({ "payload_match": { "action": ["opened"] } });
+        assert!(validate_event_filter(&f).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_values_with_header() {
+        let f = json!({ "header": "X-GitHub-Event", "values": ["push", "pull_request"] });
+        assert!(validate_event_filter(&f).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_object() {
+        assert!(validate_event_filter(&json!("pull_request")).is_err());
+        assert!(validate_event_filter(&json!(["pull_request"])).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_filter() {
+        // Empty object matches everything → almost certainly a mistake.
+        assert!(validate_event_filter(&json!({})).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_key() {
+        // Classic `value` vs `values` typo — must not persist silently.
+        let f = json!({ "header": "X-GitHub-Event", "value": ["push"] });
+        assert!(validate_event_filter(&f).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_values_without_header() {
+        let f = json!({ "values": ["pull_request"] });
+        assert!(validate_event_filter(&f).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_string_values() {
+        let f = json!({ "header": "X-GitHub-Event", "values": [42] });
+        assert!(validate_event_filter(&f).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_string_values() {
+        let f = json!({ "header": "X-GitHub-Event", "values": [""] });
+        assert!(validate_event_filter(&f).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_payload_match_non_array() {
+        let f = json!({ "payload_match": { "action": "opened" } });
+        assert!(validate_event_filter(&f).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_payload_match_non_string_entry() {
+        let f = json!({ "payload_match": { "action": ["opened", 7] } });
+        assert!(validate_event_filter(&f).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_header_only_no_clause() {
+        // header present but no values + no payload_match → no active clause.
+        let f = json!({ "header": "X-GitHub-Event" });
+        assert!(validate_event_filter(&f).is_err());
+        // header + empty values is the same no-op.
+        let f2 = json!({ "header": "X-GitHub-Event", "values": [] });
+        assert!(validate_event_filter(&f2).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_oversize_filter() {
+        let big: Vec<String> = (0..2000)
+            .map(|i| format!("event_type_number_{i}"))
+            .collect();
+        let f = json!({ "header": "X-GitHub-Event", "values": big });
+        assert!(validate_event_filter(&f).is_err());
     }
 }
 

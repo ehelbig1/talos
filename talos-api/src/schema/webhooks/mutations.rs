@@ -215,6 +215,17 @@ impl WebhooksMutations {
         }
         let rpm_resolved = input.max_requests_per_minute.unwrap_or(100);
 
+        // RFC 0007 D6: validate the event_filter shape at write time so a
+        // malformed filter never persists (the fire-time matcher is fail-OPEN,
+        // so write-time is the primary guard). `validate_event_filter` returns
+        // a precise, operator-facing message — safe to surface via extend_safe
+        // (it's a caller-input validation error, not an internal detail).
+        if let Some(ref filter) = input.event_filter {
+            talos_webhooks::validate_event_filter(filter).map_err(|e| {
+                async_graphql::Error::new(format!("Invalid event_filter: {e}")).extend_safe()
+            })?;
+        }
+
         // Generate verification token if not provided
         let verification_token = input.verification_token.unwrap_or_else(|| {
             use rand::RngCore;
@@ -269,9 +280,9 @@ impl WebhooksMutations {
             INSERT INTO webhook_triggers (
                 id, name, module_id, verification_token,
                 signing_secret_enc, signing_key_id, signing_secret_format,
-                max_requests_per_minute, enabled, allowed_ips, user_id
+                max_requests_per_minute, enabled, allowed_ips, user_id, event_filter
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id
             "#,
         )
@@ -286,6 +297,7 @@ impl WebhooksMutations {
         .bind(enabled)
         .bind(allowed_ips)
         .bind(user_id)
+        .bind(input.event_filter.as_ref())
         .fetch_one(db_pool)
         .await?;
 
