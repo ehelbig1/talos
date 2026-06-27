@@ -478,6 +478,47 @@ impl SecurityMutations {
         })
     }
 
+    /// Per-org DEK arc: migrate existing module-execution payloads to their
+    /// workflow's org root DEK (format v4). Last of the per-org sweeps; org-less
+    /// / standalone payloads stay on the global DEK.
+    async fn re_encrypt_module_payloads_to_org(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<ReEncryptionResult> {
+        require_2fa(ctx)?;
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        // System-wide: migrates every org-scoped module execution's payloads.
+        require_platform_admin(ctx).await?;
+
+        let service = ctx.data::<Arc<talos_module_executions::ModuleExecutionService>>()?;
+        let stats = service
+            .re_encrypt_module_payloads_to_org()
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to re-encrypt module payloads to org DEKs: {}", e);
+                async_graphql::Error::new("Failed to re-encrypt module payloads to org DEKs")
+                    .extend_safe()
+            })?;
+
+        let message = if stats.failed == 0 {
+            format!(
+                "{} module-execution payloads migrated to per-org DEKs",
+                stats.re_encrypted
+            )
+        } else {
+            format!(
+                "{} migrated, {} failed (still on the prior DEK). Inspect server logs and re-run.",
+                stats.re_encrypted, stats.failed
+            )
+        };
+        Ok(ReEncryptionResult {
+            re_encrypted_count: stats.re_encrypted,
+            failed_count: stats.failed,
+            failed_ids: Vec::new(),
+            message,
+        })
+    }
+
     async fn rotate_master_key(
         &self,
         ctx: &Context<'_>,
