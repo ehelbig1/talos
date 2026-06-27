@@ -368,6 +368,15 @@ impl ExecutionRepository {
     /// format_version). MCP-S2: `exec_id` is bound as AAD so an attacker
     /// with DB write capability can't swap user B's output_data_enc onto
     /// user A's execution row to leak it through the read path.
+    ///
+    /// Per-org DEK arc: encrypts under the execution's tenant org root DEK (v4).
+    /// The execution's tenant IS the workflow's org (RFC 0004/0005), so resolve
+    /// it via the WORKFLOW — `workflows.org_id` is stamped at every insert site,
+    /// whereas `workflow_executions.org_id` is intentionally NOT auto-stamped
+    /// (high-write perf exclusion, migration 20260529140000) and is usually NULL
+    /// on new rows. `None` (no workflow org) → v3 global. The returned
+    /// `format_version` (3 or 4) is bound by every caller, so a v4 row is never
+    /// mislabeled. AAD stays = exec_id; decrypt keys off the stored key_id.
     async fn encrypt_output(
         &self,
         exec_id: Uuid,
@@ -378,7 +387,16 @@ impl ExecutionRepository {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SecretsManager not available for output encryption"))?;
         let json_str = serde_json::to_string(output)?;
-        sm.encrypt_value_aad_v3(&json_str, exec_id.as_bytes()).await
+        let org_row: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT w.org_id FROM workflow_executions we \
+             JOIN workflows w ON w.id = we.workflow_id WHERE we.id = $1",
+        )
+        .bind(exec_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        let org_id = org_row.flatten();
+        sm.encrypt_value_aad_v4_or_global(&json_str, org_id, exec_id.as_bytes())
+            .await
     }
 
     /// Decrypt encrypted output bytes back to JSON. Dispatches on the
