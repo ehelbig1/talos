@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, name, module_id,\n                   enabled as \"enabled!\",\n                   max_requests_per_minute as \"max_requests_per_minute!\",\n                   trigger_count as \"trigger_count!\",\n                   success_count as \"success_count!\",\n                   error_count as \"error_count!\",\n                   last_triggered_at\n            FROM webhook_triggers\n            WHERE user_id = $1\n            ORDER BY created_at DESC, id DESC\n            LIMIT $2 OFFSET $3\n            ",
+  "query": "\n            SELECT id, name, module_id,\n                   enabled as \"enabled!\",\n                   max_requests_per_minute as \"max_requests_per_minute!\",\n                   trigger_count as \"trigger_count!\",\n                   success_count as \"success_count!\",\n                   error_count as \"error_count!\",\n                   last_triggered_at,\n                   event_filter\n            FROM webhook_triggers\n            WHERE user_id = $1\n            ORDER BY created_at DESC, id DESC\n            LIMIT $2 OFFSET $3\n            ",
   "describe": {
     "columns": [
       {
@@ -47,6 +47,11 @@
         "ordinal": 8,
         "name": "last_triggered_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "event_filter",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -65,8 +70,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "0fb024ccd90e65249cb1f8554741addc453646e16d0fe58c530cf1cddf07effd"
+  "hash": "2e35d816f1086b8d95de20a3948e516ebb2e906ed1142774d5f1412b02dc79a9"
 }
