@@ -401,6 +401,42 @@ impl SecurityMutations {
         })
     }
 
+    /// Per-org DEK arc: migrate existing `actor_memory` rows to their actor's
+    /// org root DEK (format v4). Memory sibling of `reEncryptSecretsToOrg`;
+    /// rows whose actor has no org stay on the global DEK.
+    async fn re_encrypt_memories_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
+        require_2fa(ctx)?;
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        // System-wide: migrates every org-scoped actor's memory in the deployment.
+        require_platform_admin(ctx).await?;
+
+        let pool = ctx.data::<sqlx::PgPool>()?;
+        let stats = talos_memory::re_encrypt_memories_to_org(pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to re-encrypt memories to org DEKs: {}", e);
+                async_graphql::Error::new("Failed to re-encrypt memories to org DEKs").extend_safe()
+            })?;
+
+        let message = if stats.failed == 0 {
+            format!(
+                "{} actor_memory rows migrated to per-org DEKs",
+                stats.re_encrypted
+            )
+        } else {
+            format!(
+                "{} migrated, {} failed (still on the prior DEK). Inspect server logs and re-run.",
+                stats.re_encrypted, stats.failed
+            )
+        };
+        Ok(ReEncryptionResult {
+            re_encrypted_count: stats.re_encrypted,
+            failed_count: stats.failed,
+            failed_ids: Vec::new(),
+            message,
+        })
+    }
+
     async fn rotate_master_key(
         &self,
         ctx: &Context<'_>,
