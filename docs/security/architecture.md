@@ -116,15 +116,25 @@
                                                        workflow_executions.output_data_enc
 ```
 
-**Per-context key derivation (format v3, finding #1).** The cached DEK is the
-derivation *root*, not the data key. Each row is sealed under a per-context
-subkey `HKDF-SHA256(ikm = DEK, salt = label, info = aad_context)`, where the
-context is the row's identity (secret_id / actor_id‖key / execution_id /
-per-slot tag) — the same bytes bound as AES-GCM AAD. This keeps the per-key
-message count at ~1, so the random-96-bit-nonce birthday bound is never
-approached, and a leaked single-row subkey can't decrypt any other context. A
-per-row `encryption_format_version` selects the scheme; legacy v0/v1/v2 rows
-still decrypt under lazy migration (`SecretsManager::decrypt_versioned`).
+**Per-context key derivation + per-ORG root DEKs (formats v3/v4).** A DEK is the
+derivation *root*, not the data key. Each row is sealed under a per-context subkey
+`HKDF-SHA256(ikm = DEK, salt = label, info = aad_context)`, where the context is
+the row's identity (secret_id / actor_id‖key / execution_id / per-slot tag) — the
+same bytes bound as AES-GCM AAD. This keeps the per-key message count at ~1, so
+the random-96-bit-nonce birthday bound is never approached, and a leaked
+single-row subkey can't decrypt any other context.
+
+**DEKs are scoped per-organization** (`encryption_keys.org_id`): one global DEK
+(`org_id IS NULL`) plus one active DEK per org. A writer seals under its org's DEK
+(format `v4`) when an org is resolvable, else the global DEK (`v3`) for
+legitimately org-less rows — so **a compromised root DEK is bounded to one tenant,
+not the whole deployment.** Decrypt is identical for v3/v4 (the row's `*_key_id`
+names the DEK); a per-row `*_format` column selects the scheme and
+`SecretsManager::decrypt_versioned` handles v0/v1/v2/v3/v4 under lazy migration.
+Existing rows move to per-org via `re_encrypt_*_to_org` sweeps; the
+`dekMigrationStatus` query reports remaining work. (Checkpoint / worker-envelope /
+OTLP-header encryption use a separate `WORKER_SHARED_KEY`/`user_id` root, not the
+DEK, and are not per-org.)
 
 The `KekProvider` abstraction means every encrypted column above
 behaves identically regardless of whether the KEK is a local AES key
@@ -137,8 +147,8 @@ See `docs/deployment.md` for the env→Vault migration procedure
 | Step | Action | Location | Security Control |
 |------|--------|----------|-----------------|
 | 1. Creation | User provides secret value via API | Controller | Input validation; TLS in transit |
-| 2. DEK retrieval | Active DEK fetched (cache or DB) | SecretsManager | DashMap cache with 5-min TTL; Zeroizing memory |
-| 3. Encryption | Secret encrypted under a per-context HKDF subkey of the DEK | SecretsManager | AES-256-GCM (format v3); AAD-bound to secret_id; per-context subkey so each key encrypts ~1 message; random 12-byte nonce prepended to ciphertext |
+| 2. DEK retrieval | The org's active DEK fetched (cache or DB), or the global DEK for org-less rows | SecretsManager | DashMap cache (per-org + global) with 5-min TTL; Zeroizing memory |
+| 3. Encryption | Secret encrypted under a per-context HKDF subkey of the org's DEK (v4) or the global DEK (v3) | SecretsManager | AES-256-GCM; AAD-bound to secret_id; per-context subkey so each key encrypts ~1 message; random 12-byte nonce prepended to ciphertext |
 | 4. Storage | Encrypted blob stored in DB | PostgreSQL | Parameterized INSERT; `key_path` indexed for lookup |
 | 5. Audit | Access logged to `secret_audit_log` | Controller | Append-only table; immutability trigger; DLP redaction on payload |
 | 6. Retrieval | Module requests secret by key_path | Worker host | `allowed_secrets` allowlist check; deny-all default |

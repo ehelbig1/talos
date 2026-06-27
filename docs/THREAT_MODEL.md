@@ -198,7 +198,7 @@ This is the highest-risk attack surface. Users submit arbitrary Rust source code
 
 ### Information Disclosure
 - **Threat:** Secret values exfiltrated from database dump.
-- **Mitigation:** AES-256-GCM envelope encryption. DEK encrypted by master KEK (`TALOS_MASTER_KEY`). Master key from env/file, never stored in DB. DEK cached with Zeroizing memory. Each AEAD operation encrypts under a **per-context HKDF subkey** of the DEK (per secret / actor-key / execution / tenant), not the shared DEK directly — the per-key message count is ~1, so the random-96-bit-nonce birthday bound is unreachable (finding #1).
+- **Mitigation:** AES-256-GCM envelope encryption. DEKs are **per-organization** (`encryption_keys.org_id`; one global DEK + one active per org), each wrapped by the master KEK (`TALOS_MASTER_KEY` dev / Vault transit prod), never stored in DB plaintext. A row seals under its org's DEK (format v4) when an org is resolvable, else the global DEK (v3) — so a compromised root DEK is bounded to one tenant. DEKs cached (per-org + global) with Zeroizing memory. Within an org, each AEAD operation encrypts under a **per-context HKDF subkey** of the DEK (per secret / actor-key / execution / per-slot), not the shared DEK directly — the per-key message count is ~1, so the random-96-bit-nonce birthday bound is unreachable. (Checkpoint / worker-envelope / OTLP encryption use a separate `WORKER_SHARED_KEY`/`user_id` root, not the DEK.)
 - **File:** `controller/src/db.rs`, `talos-secrets-manager`
 
 ### Denial of Service
@@ -260,7 +260,7 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 | CSRF | Double-submit cookies, constant-time comparison | `controller/src/csrf.rs` |
 | Security headers | CSP, X-Frame-Options, HSTS, X-Content-Type-Options | `controller/src/security_headers.rs` |
 | SSRF protection | RFC1918/link-local/metadata endpoint blocking | `controller/src/mcp/utils.rs` |
-| Secret encryption | AES-256-GCM envelope encryption, master KEK, per-context HKDF subkey derivation (per secret/actor/execution/tenant; ~1 message per key), Zeroizing DEK cache | `controller/src/db.rs`, `talos-secrets-manager` |
+| Secret encryption | AES-256-GCM envelope encryption, master KEK, **per-organization DEKs** (one global + one per org; format v4/v3), per-context HKDF subkey derivation (per secret/actor/execution/per-slot; ~1 message per key), Zeroizing DEK cache | `talos-secrets-manager` |
 
 ---
 
