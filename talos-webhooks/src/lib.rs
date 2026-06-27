@@ -578,6 +578,53 @@ pub fn validate_event_filter(filter: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// RFC 0007 D5: build the `__webhook__` metadata object surfaced to the workflow
+/// alongside the body. It exposes the inbound *event type* + *delivery id* (which
+/// live in request HEADERS — otherwise invisible to a workflow, which only sees
+/// the body) plus the body's `action`, so a workflow reads the event type from
+/// one authoritative place rather than re-parsing headers it can't reach.
+///
+/// **Curated, not a header dump.** Only three named fields are surfaced — never
+/// arbitrary headers — so signature/auth headers (`X-Hub-Signature-256`,
+/// `Authorization`, `X-Verification-Token`, …) can't leak into trigger input.
+/// Each field is `null` when absent (stable shape for `{{__trigger_input__.__webhook__.event}}`).
+///
+/// `event` reads the header named by the trigger's `event_filter.header` when a
+/// filter is set (the same header the server matched on — one source of truth),
+/// else the conventional GitHub `X-GitHub-Event`.
+fn build_webhook_meta(
+    headers: &HeaderMap,
+    event_filter: Option<&serde_json::Value>,
+    body: &serde_json::Value,
+) -> serde_json::Value {
+    let event_header_name = event_filter
+        .and_then(|f| f.get("header"))
+        .and_then(|h| h.as_str())
+        .unwrap_or("X-GitHub-Event");
+    let event = headers.get(event_header_name).and_then(|v| v.to_str().ok());
+    let delivery = headers
+        .get("X-GitHub-Delivery")
+        .and_then(|v| v.to_str().ok());
+    let action = body.get("action").and_then(|v| v.as_str());
+    serde_json::json!({
+        "event": event,
+        "delivery": delivery,
+        "action": action,
+    })
+}
+
+/// Inject the RFC 0007 D5 `__webhook__` metadata as a reserved top-level key in
+/// the trigger-input body. Only applies when `target` is a JSON object — a
+/// non-object body (a bare string / array) has no field-access surface for a
+/// workflow anyway, so there's nothing to attach the key to. The key is
+/// reserved: a body that legitimately carries `__webhook__` is overwritten
+/// (documented; real providers don't send it).
+fn inject_webhook_meta(target: &mut serde_json::Value, meta: serde_json::Value) {
+    if let Some(obj) = target.as_object_mut() {
+        obj.insert("__webhook__".to_string(), meta);
+    }
+}
+
 /// Absolute difference in seconds between `now_secs` and a caller-supplied
 /// `ts_secs` (a webhook timestamp header), using overflow-free `i64::abs_diff`.
 ///
@@ -1460,8 +1507,16 @@ impl WebhookRouter {
                     );
                 }
             };
-            let payload_value = serde_json::from_str::<serde_json::Value>(&body_str)
+            let mut payload_value = serde_json::from_str::<serde_json::Value>(&body_str)
                 .unwrap_or(serde_json::Value::String(body_str.clone()));
+
+            // RFC 0007 D5: surface inbound event metadata (event type + delivery
+            // id from headers, body `action`) as a reserved `__webhook__` key so
+            // both `input` and `__trigger_input__` below carry it. Built BEFORE
+            // injection so `action` reads the original body.
+            let webhook_meta =
+                build_webhook_meta(headers, trigger.event_filter.as_ref(), &payload_value);
+            inject_webhook_meta(&mut payload_value, webhook_meta);
 
             // Wrap webhook payload with config. `__trigger_input__` honors the
             // scaffold contract that original trigger fields are ALWAYS reachable
@@ -1938,8 +1993,16 @@ impl WebhookRouter {
             // 5xx/504 AFTER the engine ran — so the decision lives inside the
             // method where pre- vs post-dispatch is unambiguous.
             let body_str = std::str::from_utf8(&body).unwrap_or("");
-            let input_payload = serde_json::from_str::<serde_json::Value>(body_str)
+            let mut input_payload = serde_json::from_str::<serde_json::Value>(body_str)
                 .unwrap_or(serde_json::Value::String(body_str.to_string()));
+
+            // RFC 0007 D5: surface inbound event metadata to the workflow as a
+            // reserved `__webhook__` key inside the trigger seed (the workflow
+            // reads `{{__trigger_input__.__webhook__.event}}`). Built before
+            // injection so `action` reads the original body.
+            let webhook_meta =
+                build_webhook_meta(headers, trigger.event_filter.as_ref(), &input_payload);
+            inject_webhook_meta(&mut input_payload, webhook_meta);
 
             self.trigger_workflow_execution(
                 workflow_id,
@@ -4058,7 +4121,10 @@ mod auth_downgrade_tests {
 
 #[cfg(test)]
 mod event_filter_tests {
-    use super::{event_filter_matches, validate_event_filter};
+    use super::{
+        build_webhook_meta, event_filter_matches, inject_webhook_meta, validate_event_filter,
+    };
+    use http::HeaderMap;
     use serde_json::json;
 
     // Canonical GitHub PR filter: only pull_request opened/synchronize/reopened.
@@ -4245,6 +4311,94 @@ mod event_filter_tests {
             .collect();
         let f = json!({ "header": "X-GitHub-Event", "values": big });
         assert!(validate_event_filter(&f).is_err());
+    }
+
+    // ---- build_webhook_meta / inject_webhook_meta (RFC 0007 D5) ----
+
+    fn headers_of(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn meta_reads_github_headers_and_action() {
+        let h = headers_of(&[
+            ("X-GitHub-Event", "pull_request"),
+            ("X-GitHub-Delivery", "abc-123"),
+        ]);
+        let body = json!({ "action": "opened", "number": 7 });
+        let meta = build_webhook_meta(&h, None, &body);
+        assert_eq!(meta["event"], json!("pull_request"));
+        assert_eq!(meta["delivery"], json!("abc-123"));
+        assert_eq!(meta["action"], json!("opened"));
+    }
+
+    #[test]
+    fn meta_header_lookup_is_case_insensitive() {
+        // HeaderMap is case-insensitive; the conventional default still resolves.
+        let h = headers_of(&[("x-github-event", "push")]);
+        let meta = build_webhook_meta(&h, None, &json!({}));
+        assert_eq!(meta["event"], json!("push"));
+    }
+
+    #[test]
+    fn meta_event_uses_filter_configured_header() {
+        // When a filter names a custom header, `event` reads THAT header — one
+        // source of truth with what the server matched on.
+        let h = headers_of(&[("X-Custom-Event", "deploy")]);
+        let filter = json!({ "header": "X-Custom-Event", "values": ["deploy"] });
+        let meta = build_webhook_meta(&h, Some(&filter), &json!({}));
+        assert_eq!(meta["event"], json!("deploy"));
+    }
+
+    #[test]
+    fn meta_absent_fields_are_null_stable_shape() {
+        let meta = build_webhook_meta(&HeaderMap::new(), None, &json!({}));
+        assert_eq!(meta["event"], json!(null));
+        assert_eq!(meta["delivery"], json!(null));
+        assert_eq!(meta["action"], json!(null));
+    }
+
+    #[test]
+    fn meta_does_not_surface_signature_or_auth_headers() {
+        // Curated allowlist: secret-bearing headers must never appear.
+        let h = headers_of(&[
+            ("X-Hub-Signature-256", "sha256=deadbeef"),
+            ("Authorization", "Bearer sk-secret"),
+            ("X-Verification-Token", "tok-secret"),
+            ("X-GitHub-Event", "pull_request"),
+        ]);
+        let meta = build_webhook_meta(&h, None, &json!({}));
+        let s = serde_json::to_string(&meta).unwrap();
+        assert!(!s.contains("deadbeef"));
+        assert!(!s.contains("sk-secret"));
+        assert!(!s.contains("tok-secret"));
+        assert_eq!(meta["event"], json!("pull_request"));
+    }
+
+    #[test]
+    fn inject_adds_reserved_key_to_object() {
+        let mut body = json!({ "action": "opened" });
+        inject_webhook_meta(&mut body, json!({ "event": "pull_request" }));
+        assert_eq!(body["action"], json!("opened"));
+        assert_eq!(body["__webhook__"]["event"], json!("pull_request"));
+    }
+
+    #[test]
+    fn inject_is_noop_on_non_object() {
+        // A bare string/array body has no field surface — leave it untouched.
+        let mut s = json!("raw text body");
+        inject_webhook_meta(&mut s, json!({ "event": "x" }));
+        assert_eq!(s, json!("raw text body"));
+        let mut arr = json!([1, 2, 3]);
+        inject_webhook_meta(&mut arr, json!({ "event": "x" }));
+        assert_eq!(arr, json!([1, 2, 3]));
     }
 }
 
