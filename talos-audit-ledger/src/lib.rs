@@ -79,7 +79,7 @@ fn verify_audit_message(
 // NOT depend on the env master key: a Vault-only deployment that has dropped
 // TALOS_MASTER_KEY still encrypts and decrypts these headers.
 //
-// Write path: `talos-api` update_audit_settings → `encrypt_otlp_auth_headers_v3`.
+// Write path: `talos-api` update_audit_settings → `encrypt_otlp_auth_headers`.
 // Read path: `OTLPCache::get_tracer` → `SecretsManager::decrypt_versioned`,
 // keyed on the stored `auth_headers_enc_key_id` + `auth_headers_format`. The
 // `user_id` AAD means a DB-write attacker can't transpose one tenant's header
@@ -88,29 +88,35 @@ fn verify_audit_message(
 // (The earlier bespoke env-master-key HKDF scheme was removed once it had no
 // rows to support — there is exactly one encryption path now.)
 
-/// v3 envelope encrypt for OTLP auth headers via [`SecretsManager`] — the
+/// Envelope encrypt for OTLP auth headers via [`SecretsManager`] — the
 /// KEK-backed path that does **not** depend on the env master key. The DEK is
 /// unwrapped through whatever `KekProvider` is configured (env OR Vault
 /// transit), so a Vault-only deployment that has dropped `TALOS_MASTER_KEY`
 /// can still encrypt the per-tenant headers.
 ///
+/// Per-org DEK arc: writes format v4 — per-context key derived from the owning
+/// user's PERSONAL-org root DEK (OTLP audit settings are per-user;
+/// `user_audit_settings` is user-keyed). Decrypt is unchanged — `get_tracer`'s
+/// `decrypt_versioned` routes v4 through the same per-context derived path as v3
+/// (the row's `auth_headers_enc_key_id` names the org DEK). Existing v3 rows
+/// keep decrypting.
+///
 /// Returns `(key_id, ciphertext_blob, format_version)` for the
 /// `auth_headers_enc_key_id` / `auth_headers_encrypted` / `auth_headers_format`
-/// columns. The blob is `[12-byte nonce][AES-256-GCM ciphertext+tag]` exactly
-/// like every other SecretsManager v3 column — the nonce is embedded in the
-/// blob, never stored separately. AAD = the owning tenant's `user_id` bytes, so
-/// a blob can't be transposed between tenants.
+/// columns. The blob is `[12-byte nonce][AES-256-GCM ciphertext+tag]` — the
+/// nonce is embedded in the blob, never stored separately. AAD = the owning
+/// tenant's `user_id` bytes, so a blob can't be transposed between tenants.
 ///
 /// [`SecretsManager`]: talos_secrets_manager::SecretsManager
-pub async fn encrypt_otlp_auth_headers_v3(
+pub async fn encrypt_otlp_auth_headers(
     secrets_manager: &talos_secrets_manager::SecretsManager,
     plaintext: &str,
     user_id: Uuid,
 ) -> Result<(Uuid, Vec<u8>, i16), String> {
     secrets_manager
-        .encrypt_value_aad_v3(plaintext, user_id.as_bytes())
+        .encrypt_value_aad_v4_for_user(plaintext, user_id, user_id.as_bytes())
         .await
-        .map_err(|e| format!("OTLP auth-header v3 encrypt failed: {e}"))
+        .map_err(|e| format!("OTLP auth-header encrypt failed: {e}"))
 }
 
 /// S3 Object-Lock retention applied per audit batch upload when
