@@ -19,6 +19,10 @@ pub struct WebhookListRow {
     pub enabled: bool,
     pub max_requests_per_minute: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// RFC 0007: the trigger's event filter, if any (NULL = fire on every
+    /// verified delivery). Surfaced read-only so operators can confirm what
+    /// they set; evaluated server-side in `talos_webhooks::event_filter_matches`.
+    pub event_filter: Option<serde_json::Value>,
 }
 
 /// 24-hour security stats per webhook trigger. Used by
@@ -182,7 +186,7 @@ impl WebhookRepository {
     /// List a user's webhooks (most recent first, capped at `limit`).
     pub async fn list_for_user(&self, user_id: Uuid, limit: i64) -> Result<Vec<WebhookListRow>> {
         let rows = sqlx::query(
-            "SELECT id, name, module_id, enabled, max_requests_per_minute, created_at \
+            "SELECT id, name, module_id, enabled, max_requests_per_minute, created_at, event_filter \
              FROM webhook_triggers WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
         )
         .bind(user_id)
@@ -228,7 +232,7 @@ impl WebhookRepository {
             return Ok(vec![]);
         }
         let rows = sqlx::query(
-            "SELECT id, name, module_id, enabled, max_requests_per_minute, created_at \
+            "SELECT id, name, module_id, enabled, max_requests_per_minute, created_at, event_filter \
              FROM webhook_triggers \
              WHERE module_id = ANY($1) AND user_id = $2 \
              ORDER BY created_at DESC LIMIT $3",
@@ -292,5 +296,6 @@ fn row_to_webhook(row: &sqlx::postgres::PgRow) -> WebhookListRow {
         enabled: row.get("enabled"),
         max_requests_per_minute: row.get("max_requests_per_minute"),
         created_at: row.get("created_at"),
+        event_filter: row.get("event_filter"),
     }
 }

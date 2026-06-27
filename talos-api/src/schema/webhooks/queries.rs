@@ -51,7 +51,8 @@ impl WebhooksQueries {
                    trigger_count as "trigger_count!",
                    success_count as "success_count!",
                    error_count as "error_count!",
-                   last_triggered_at
+                   last_triggered_at,
+                   event_filter
             FROM webhook_triggers
             WHERE user_id = $1
             ORDER BY created_at DESC, id DESC
@@ -78,6 +79,7 @@ impl WebhooksQueries {
                 success_count: l.success_count,
                 error_count: l.error_count,
                 last_triggered_at: l.last_triggered_at.map(|dt| dt.to_rfc3339()),
+                event_filter: l.event_filter,
             })
             .collect())
     }

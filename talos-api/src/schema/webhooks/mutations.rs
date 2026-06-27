@@ -313,6 +313,7 @@ impl WebhooksMutations {
             success_count: 0,
             error_count: 0,
             last_triggered_at: None,
+            event_filter: input.event_filter,
         })
     }
 

@@ -62,6 +62,9 @@ pub struct WebhookTrigger {
     pub success_count: i32,
     pub error_count: i32,
     pub last_triggered_at: Option<String>,
+    /// RFC 0007: the trigger's event filter, if any (null = fire on every
+    /// verified delivery). Read-only; set via `createWebhookTrigger`.
+    pub event_filter: Option<serde_json::Value>,
 }
 #[ComplexObject]
 impl WebhookTrigger {

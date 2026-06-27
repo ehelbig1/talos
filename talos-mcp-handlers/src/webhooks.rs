@@ -501,6 +501,7 @@ async fn handle_list_webhooks(
                         "enabled": r.enabled,
                         "max_requests_per_minute": r.max_requests_per_minute,
                         "created_at": r.created_at.to_rfc3339(),
+                        "event_filter": r.event_filter,
                     })
                 })
                 .collect();
@@ -692,6 +693,7 @@ async fn handle_list_workflow_webhooks(
                         "enabled": r.enabled,
                         "max_requests_per_minute": r.max_requests_per_minute,
                         "created_at": r.created_at.to_rfc3339(),
+                        "event_filter": r.event_filter,
                     })
                 })
                 .collect();
