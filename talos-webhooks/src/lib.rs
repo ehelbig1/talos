@@ -1272,6 +1272,9 @@ impl WebhookRouter {
             let payload_bundle = match talos_module_payload_encryption::encrypt_payload_bundle(
                 Some(&self.secrets_manager),
                 job_id,
+                // Standalone webhook module dispatch — no parent workflow
+                // execution, so no org to scope to → global DEK (v3).
+                None,
                 Some(&payload_value),
                 None,
                 None,

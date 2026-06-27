@@ -175,6 +175,7 @@ impl ModuleExecutionService {
     async fn encrypt_payload_bundle(
         &self,
         module_execution_id: Uuid,
+        workflow_execution_id: Option<Uuid>,
         input: Option<&JsonValue>,
         output: Option<&JsonValue>,
         trigger: Option<&JsonValue>,
@@ -188,6 +189,7 @@ impl ModuleExecutionService {
         let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
             self.secrets_manager.as_ref(),
             module_execution_id,
+            workflow_execution_id,
             input,
             output,
             trigger,
@@ -350,6 +352,7 @@ impl ModuleExecutionService {
         let (key_id, input_enc, _output_enc, trigger_enc, payload_format) = self
             .encrypt_payload_bundle(
                 execution_id,
+                workflow_execution_id,
                 input_data.as_ref(),
                 None,
                 trigger_metadata.as_ref(),
@@ -455,9 +458,12 @@ impl ModuleExecutionService {
         // ciphertext under the same key.
         //
         // MCP-S2: AAD = execution_id, matching the row that
-        // create_execution populated.
+        // create_execution populated. Per-org DEK arc: pass
+        // workflow_execution_id = None so encrypt_payload_bundle resolves the
+        // SAME org from the existing row (create_execution already created it),
+        // keeping the shared payload_enc_key_id consistent.
         let (key_id, _input_enc, output_enc, _trigger_enc, payload_format) = self
-            .encrypt_payload_bundle(execution_id, None, output_data.as_ref(), None)
+            .encrypt_payload_bundle(execution_id, None, None, output_data.as_ref(), None)
             .await?;
         let encrypting = key_id.is_some();
 

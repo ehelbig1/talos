@@ -128,9 +128,49 @@ pub async fn decrypt_payload_slot(
 /// ciphertext to its column so a within-row swap now fails tag verification.
 /// Existing v1 rows stay readable (readers dispatch on the per-row
 /// `payload_format`).
+/// Resolve the org a module-execution's payloads encrypt under — the execution's
+/// TENANT org = the workflow's org (matching workflow-output crypto, #326). Prefer
+/// the caller-supplied `workflow_execution_id` (available at record_started);
+/// otherwise fall back to the existing `module_executions` row (record_completed,
+/// where the row exists but the parent id isn't in scope). `None` (standalone /
+/// webhook / org-less) → the global DEK. Because both the started and completed
+/// writes of one row resolve the SAME org, the shared `payload_enc_key_id` stays
+/// consistent across slots. Best-effort: a DB error degrades to None (global)
+/// rather than failing the encrypt.
+async fn resolve_workflow_org(
+    sm: &talos_secrets_manager::SecretsManager,
+    workflow_execution_id: Option<Uuid>,
+    module_execution_id: Uuid,
+) -> Option<Uuid> {
+    let pool = sm.db_pool();
+    let row: std::result::Result<Option<Option<Uuid>>, sqlx::Error> = match workflow_execution_id {
+        Some(wei) => {
+            sqlx::query_scalar(
+                "SELECT w.org_id FROM workflow_executions we \
+                 JOIN workflows w ON w.id = we.workflow_id WHERE we.id = $1",
+            )
+            .bind(wei)
+            .fetch_optional(pool)
+            .await
+        }
+        None => {
+            sqlx::query_scalar(
+                "SELECT w.org_id FROM module_executions me \
+                 JOIN workflow_executions we ON we.id = me.workflow_execution_id \
+                 JOIN workflows w ON w.id = we.workflow_id WHERE me.id = $1",
+            )
+            .bind(module_execution_id)
+            .fetch_optional(pool)
+            .await
+        }
+    };
+    row.ok().flatten().flatten()
+}
+
 pub async fn encrypt_payload_bundle(
     secrets_manager: Option<&Arc<talos_secrets_manager::SecretsManager>>,
     module_execution_id: Uuid,
+    workflow_execution_id: Option<Uuid>,
     input: Option<&JsonValue>,
     output: Option<&JsonValue>,
     trigger: Option<&JsonValue>,
@@ -143,13 +183,18 @@ pub async fn encrypt_payload_bundle(
     }
 
     let mut bundle = EncryptedPayloadBundle::default();
-    // v3: per-context-derived key (finding #1) on top of the v2 per-slot
-    // AAD binding. `payload_slot_aad` includes the slot tag for any
-    // `format_version >= V2`, so v3 keeps the within-row swap resistance;
-    // the derived key additionally bounds the random-nonce birthday budget
-    // to one (module_execution_id, slot) context. Readers dispatch on the
-    // per-row `payload_format`, so existing v1/v2 rows stay readable.
-    let format_version = talos_secrets_manager::SecretsManager::AAD_FORMAT_V3_DERIVED;
+    // Per-org DEK arc: encrypt under the execution's tenant org (the workflow's
+    // org, resolved below); org-less / standalone payloads stay on the global DEK.
+    // v3/v4 share the same per-slot AAD (`payload_slot_aad` includes the slot tag
+    // for any format >= V2) and the per-context-derived key — v4 only differs in
+    // using the org's root DEK as IKM. Readers dispatch on the per-row
+    // `payload_format`, so existing v0/v1/v2/v3 rows stay readable.
+    let org_id = resolve_workflow_org(sm, workflow_execution_id, module_execution_id).await;
+    let format_version = if org_id.is_some() {
+        talos_secrets_manager::SecretsManager::AAD_FORMAT_V4_ORG_DERIVED
+    } else {
+        talos_secrets_manager::SecretsManager::AAD_FORMAT_V3_DERIVED
+    };
     bundle.format_version = format_version;
     for (slot, value) in [
         (PayloadSlot::Input, input),
@@ -161,7 +206,7 @@ pub async fn encrypt_payload_bundle(
             .with_context(|| format!("payload_encryption: serialize {slot:?}"))?;
         let aad = payload_slot_aad(module_execution_id, slot, format_version);
         let (kid, ciphertext, _version) = sm
-            .encrypt_value_aad_v3(&plain, &aad)
+            .encrypt_value_aad_v4_or_global(&plain, org_id, &aad)
             .await
             .with_context(|| format!("payload_encryption: encrypt {slot:?}"))?;
         if let Some(prev) = bundle.key_id {
