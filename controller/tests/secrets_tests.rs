@@ -232,3 +232,143 @@ async fn test_secret_extraction_and_resolution() {
     assert_eq!(resolved["WEBHOOK_TOKEN"], "xoxb-test-456");
     assert_eq!(resolved["REGULAR"], "some_value");
 }
+
+// ── Per-tenant (per-org) root DEKs — Phase 1 foundation ────────────────────
+// These exercise the controller-side per-org DEK machinery end-to-end against
+// a real DB. Env-gated like the rest of this suite (run in quality.yml).
+
+fn set_master_key_for_dek_tests() {
+    std::env::set_var(
+        "TALOS_MASTER_KEY",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+}
+
+async fn create_test_org(pool: &sqlx::Pool<sqlx::Postgres>) -> Uuid {
+    // owner_id is NOT NULL (FK -> users); reuse the test system user.
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, is_active) \
+         VALUES ($1, 'system@talos.test', 'not-a-real-hash', true) ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(SYSTEM_USER_ID)
+    .execute(pool)
+    .await
+    .expect("seed system user");
+
+    let tag = Uuid::new_v4();
+    sqlx::query_scalar(
+        "INSERT INTO organizations (name, slug, owner_id) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(format!("dek-test-{tag}"))
+    .bind(format!("dek-test-{tag}"))
+    .bind(SYSTEM_USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("create org")
+}
+
+#[tokio::test]
+async fn per_org_dek_lifecycle_and_isolation() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    let org_a = create_test_org(&pool).await;
+    let org_b = create_test_org(&pool).await;
+
+    // Lazy provisioning is idempotent: same org -> same active DEK id.
+    let dek_a1 = manager.get_or_create_dek_for_org(org_a).await.unwrap();
+    let dek_a2 = manager.get_or_create_dek_for_org(org_a).await.unwrap();
+    assert_eq!(
+        dek_a1.id, dek_a2.id,
+        "second get_or_create must reuse org A's active DEK"
+    );
+
+    // Distinct org -> distinct root DEK.
+    let dek_b = manager.get_or_create_dek_for_org(org_b).await.unwrap();
+    assert_ne!(dek_a1.id, dek_b.id, "each org must get its own root DEK");
+
+    // The GLOBAL path is unaffected: get_active_dek returns the org_id-IS-NULL
+    // key, never an org DEK (the coexistence-scoping fix).
+    let global = manager.get_active_dek().await.unwrap();
+    assert_ne!(
+        global.id, dek_a1.id,
+        "global active DEK must not be an org DEK"
+    );
+    assert_ne!(
+        global.id, dek_b.id,
+        "global active DEK must not be an org DEK"
+    );
+
+    // v4 round-trip: encrypt under org A, decrypt via the versioned dispatch.
+    let ctx = Uuid::new_v4();
+    let (kid, ct, ver) = manager
+        .encrypt_value_aad_v4_org("org-A-topsecret", org_a, ctx.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(ver, 4, "v4 writer must stamp format 4");
+    assert_eq!(
+        kid, dek_a1.id,
+        "v4 ciphertext must reference org A's DEK id"
+    );
+    let dec = manager
+        .decrypt_versioned(kid, &ct, ctx.as_bytes(), ver)
+        .await
+        .unwrap();
+    assert_eq!(dec.as_str(), "org-A-topsecret");
+
+    // Wrong AAD context fails closed (no oracle).
+    let wrong_ctx = Uuid::new_v4();
+    assert!(
+        manager
+            .decrypt_versioned(kid, &ct, wrong_ctx.as_bytes(), ver)
+            .await
+            .is_err(),
+        "v4 decrypt must fail under a different AAD context"
+    );
+}
+
+#[tokio::test]
+async fn per_org_dek_rotation_preserves_old_ciphertext_and_global() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    let org = create_test_org(&pool).await;
+    let dek1 = manager.get_or_create_dek_for_org(org).await.unwrap();
+    let global_before = manager.get_active_dek().await.unwrap();
+
+    // Encrypt a v4 row under the first org DEK.
+    let ctx = Uuid::new_v4();
+    let (kid1, ct, ver) = manager
+        .encrypt_value_aad_v4_org("before-rotation", org, ctx.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(kid1, dek1.id);
+
+    // Rotate the org's DEK: active flips to a new key.
+    let new_id = manager.rotate_dek_for_org(org, None).await.unwrap();
+    assert_ne!(new_id, dek1.id, "rotation must mint a new active DEK");
+    let active_after = manager.get_active_dek_for_org(org).await.unwrap().unwrap();
+    assert_eq!(
+        active_after.id, new_id,
+        "org's active DEK must be the rotated one"
+    );
+
+    // The pre-rotation ciphertext still decrypts — it pins the old DEK by
+    // key_id (re-encryption to the new key is the later-phase sweep's job).
+    let dec = manager
+        .decrypt_versioned(kid1, &ct, ctx.as_bytes(), ver)
+        .await
+        .unwrap();
+    assert_eq!(dec.as_str(), "before-rotation");
+
+    // The GLOBAL DEK is untouched by a per-org rotation.
+    let global_after = manager.get_active_dek().await.unwrap();
+    assert_eq!(
+        global_before.id, global_after.id,
+        "per-org rotation must not touch the global DEK"
+    );
+}
