@@ -562,3 +562,83 @@ async fn personal_secret_stays_v3_global() {
         .unwrap();
     assert_eq!(got, "p-val");
 }
+
+// ── per-org re-encrypt sweep: migrate existing org-scoped v3 rows → v4 ──────
+
+#[tokio::test]
+async fn re_encrypt_secrets_to_org_migrates_v3_global_rows_to_v4() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    // Create a personal/global secret (v3, org_id NULL), then simulate a
+    // pre-cutover backfilled org-scoped row by stamping org_id — i.e. a row
+    // that SHOULD be v4 but is still on the global DEK.
+    let org = create_test_org(&pool).await;
+    let kp = format!("dek/sweep/{}", Uuid::new_v4());
+    let sid = manager
+        .create_secret(
+            "SweepSecret",
+            &kp,
+            "legacy-val",
+            None,
+            SYSTEM_USER_ID,
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE secrets SET org_id = $1 WHERE id = $2")
+        .bind(org)
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Before: v3 (global DEK).
+    let (fmt0,): (i16,) =
+        sqlx::query_as("SELECT encryption_format_version FROM secrets WHERE id=$1")
+            .bind(sid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(fmt0, 3, "precondition: row is v3 global");
+
+    // Run the per-org sweep.
+    let stats = manager.re_encrypt_secrets_to_org().await.unwrap();
+    assert!(
+        stats.re_encrypted >= 1,
+        "sweep must migrate at least our row"
+    );
+    assert_eq!(stats.failed, 0, "no failures expected");
+
+    // After: v4 under the org's DEK, and still decryptable.
+    let (fmt, kid): (i16, Uuid) = sqlx::query_as(
+        "SELECT encryption_format_version, encryption_key_id FROM secrets WHERE id=$1",
+    )
+    .bind(sid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fmt, 4, "sweep must upgrade the row to v4");
+    let org_dek = manager.get_active_dek_for_org(org).await.unwrap().unwrap();
+    assert_eq!(kid, org_dek.id, "row must now reference the org DEK");
+
+    let got = manager
+        .get_secret(&kp, SecretRequestor::System, &[])
+        .await
+        .unwrap();
+    assert_eq!(got, "legacy-val", "value must survive the sweep");
+
+    // Idempotent: a second sweep does not touch our now-v4 row.
+    let stats2 = manager.re_encrypt_secrets_to_org().await.unwrap();
+    let (fmt2,): (i16,) =
+        sqlx::query_as("SELECT encryption_format_version FROM secrets WHERE id=$1")
+            .bind(sid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(fmt2, 4);
+    assert_eq!(stats2.failed, 0);
+}
