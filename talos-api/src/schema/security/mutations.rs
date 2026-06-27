@@ -437,6 +437,47 @@ impl SecurityMutations {
         })
     }
 
+    /// Per-org DEK arc: migrate existing encrypted execution outputs to their
+    /// workflow's org root DEK (format v4). Execution-output sibling of
+    /// `reEncryptSecretsToOrg` / `reEncryptMemoriesToOrg`; outputs whose workflow
+    /// has no org stay on the global DEK.
+    async fn re_encrypt_outputs_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
+        require_2fa(ctx)?;
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        // System-wide: migrates every org-scoped execution's output.
+        require_platform_admin(ctx).await?;
+
+        let pool = ctx.data::<sqlx::PgPool>()?.clone();
+        let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
+        let repo = talos_execution_repository::ExecutionRepository::with_encryption(
+            pool,
+            secrets_manager.clone(),
+        );
+        let stats = repo.re_encrypt_outputs_to_org().await.map_err(|e| {
+            tracing::error!("Failed to re-encrypt execution outputs to org DEKs: {}", e);
+            async_graphql::Error::new("Failed to re-encrypt execution outputs to org DEKs")
+                .extend_safe()
+        })?;
+
+        let message = if stats.failed == 0 {
+            format!(
+                "{} execution outputs migrated to per-org DEKs",
+                stats.re_encrypted
+            )
+        } else {
+            format!(
+                "{} migrated, {} failed (still on the prior DEK). Inspect server logs and re-run.",
+                stats.re_encrypted, stats.failed
+            )
+        };
+        Ok(ReEncryptionResult {
+            re_encrypted_count: stats.re_encrypted,
+            failed_count: stats.failed,
+            failed_ids: Vec::new(),
+            message,
+        })
+    }
+
     async fn rotate_master_key(
         &self,
         ctx: &Context<'_>,
