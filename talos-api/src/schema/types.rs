@@ -311,6 +311,13 @@ pub struct CreateWebhookTriggerInput {
     pub max_requests_per_minute: Option<i32>,
     pub enabled: Option<bool>,
     pub allowed_ips: Option<Vec<String>>,
+    /// RFC 0007: optional provider-agnostic event filter, evaluated AFTER
+    /// signature verification. A non-matching delivery is acknowledged 200 with
+    /// no dispatch (so it doesn't burn an execution). Omit to fire on every
+    /// verified delivery. Shape (validated via `talos_webhooks::validate_event_filter`):
+    /// `{ "header": "X-GitHub-Event", "values": ["pull_request"],
+    ///    "payload_match": { "action": ["opened","synchronize","reopened"] } }`.
+    pub event_filter: Option<serde_json::Value>,
 }
 
 #[derive(InputObject)]
