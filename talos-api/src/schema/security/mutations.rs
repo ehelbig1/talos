@@ -362,6 +362,45 @@ impl SecurityMutations {
         })
     }
 
+    /// Per-org DEK arc: migrate existing org-scoped secrets to their org's root
+    /// DEK (format v4). The complement of `reEncryptSecrets` (which keeps the
+    /// global-DEK rows current); together they let the global DEK retire for the
+    /// secrets table. Personal/org-less secrets are intentionally left global.
+    async fn re_encrypt_secrets_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
+        require_2fa(ctx)?;
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        // System-wide: migrates every org-scoped secret in the deployment.
+        require_platform_admin(ctx).await?;
+
+        let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
+
+        let stats = secrets_manager
+            .re_encrypt_secrets_to_org()
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to re-encrypt secrets to org DEKs: {}", e);
+                async_graphql::Error::new("Failed to re-encrypt secrets to org DEKs").extend_safe()
+            })?;
+
+        let message = if stats.failed == 0 {
+            format!(
+                "{} org-scoped secrets migrated to per-org DEKs",
+                stats.re_encrypted
+            )
+        } else {
+            format!(
+                "{} migrated, {} failed (still on the prior DEK). Inspect server logs and re-run.",
+                stats.re_encrypted, stats.failed
+            )
+        };
+        Ok(ReEncryptionResult {
+            re_encrypted_count: stats.re_encrypted,
+            failed_count: stats.failed,
+            failed_ids: stats.failed_ids,
+            message,
+        })
+    }
+
     async fn rotate_master_key(
         &self,
         ctx: &Context<'_>,

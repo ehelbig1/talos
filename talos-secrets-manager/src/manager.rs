@@ -4510,6 +4510,131 @@ impl SecretsManager {
         })
     }
 
+    /// Per-org DEK arc: migrate EXISTING org-scoped secrets to format v4 (their
+    /// org's root DEK). The cutover only converts NEW writes; this is the sweep
+    /// that brings already-stored rows over, so the global DEK can eventually
+    /// retire for the `secrets` table. Operator/background-invoked, sibling of
+    /// [`Self::re_encrypt_secrets`] (the global sweep, which now skips v4).
+    ///
+    /// Selects secrets with `org_id IS NOT NULL` not already on v4, decrypts via
+    /// the version-aware dispatch (v0/v1/v3), and re-encrypts under the ROW's org
+    /// DEK. `org_id IS NULL` (personal/global) secrets are intentionally left on
+    /// the global DEK — they have no org to scope to. Same MCP-464 lost-write
+    /// guard as the global sweep: the UPDATE only fires while the row is still on
+    /// the (old_key, old_format) pair we decrypted from.
+    pub async fn re_encrypt_secrets_to_org(&self) -> Result<ReEncryptStats> {
+        use sqlx::Row as _;
+
+        const FAILED_IDS_CAP: usize = 100;
+        let mut re_encrypted = 0u64;
+        let mut failed = 0u64;
+        let mut failed_ids: Vec<Uuid> = Vec::new();
+        let record_failure = |id: Uuid, failed: &mut u64, failed_ids: &mut Vec<Uuid>| {
+            *failed += 1;
+            if failed_ids.len() < FAILED_IDS_CAP {
+                failed_ids.push(id);
+            }
+        };
+
+        // Org-scoped rows not yet on v4. (A v4 row whose key_id is a STALE org
+        // DEK — after a per-org rotation — is intentionally NOT swept here; v4
+        // rows decrypt by key_id regardless. Re-keying rotated org rows can be a
+        // later refinement.)
+        let stale_rows = sqlx::query(
+            "SELECT id, org_id, encrypted_value, encryption_key_id, encryption_format_version \
+             FROM secrets \
+             WHERE org_id IS NOT NULL AND encryption_format_version <> $1",
+        )
+        .bind(Self::AAD_FORMAT_V4_ORG_DERIVED)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        for row in &stale_rows {
+            let secret_id: Uuid = row.get("id");
+            let org_id: Uuid = row.get("org_id");
+            let encrypted_value: Vec<u8> = row.get("encrypted_value");
+            let encryption_key_id: Uuid = row.get("encryption_key_id");
+            let encryption_format_version: i16 = row.get("encryption_format_version");
+
+            if encrypted_value.len() < 12 {
+                tracing::warn!(secret_id = %secret_id, "per-org sweep: skipping secret with invalid ciphertext (too short)");
+                record_failure(secret_id, &mut failed, &mut failed_ids);
+                continue;
+            }
+
+            let plaintext = match self
+                .decrypt_secret_record(
+                    secret_id,
+                    encryption_key_id,
+                    &encrypted_value,
+                    encryption_format_version,
+                )
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(secret_id = %secret_id, "per-org sweep: decrypt failed: {e}");
+                    record_failure(secret_id, &mut failed, &mut failed_ids);
+                    continue;
+                }
+            };
+
+            let (new_key_id, new_stored, new_format) = match self
+                .encrypt_value_aad_v4_org(&plaintext, org_id, secret_id.as_bytes())
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(secret_id = %secret_id, "per-org sweep: re-encrypt failed: {e}");
+                    record_failure(secret_id, &mut failed, &mut failed_ids);
+                    continue;
+                }
+            };
+
+            // MCP-464 lost-write guard: only update while the row is still on
+            // the (old_key, old_format) pair we decrypted from.
+            match sqlx::query(
+                "UPDATE secrets SET encrypted_value = $1, encryption_key_id = $2, \
+                                    encryption_format_version = $3, updated_at = NOW() \
+                 WHERE id = $4 AND encryption_key_id = $5 AND encryption_format_version = $6",
+            )
+            .bind(&new_stored)
+            .bind(new_key_id)
+            .bind(new_format)
+            .bind(secret_id)
+            .bind(encryption_key_id)
+            .bind(encryption_format_version)
+            .execute(&self.db_pool)
+            .await
+            {
+                Ok(result) => {
+                    if result.rows_affected() == 0 {
+                        tracing::debug!(secret_id = %secret_id, "per-org sweep: row concurrently re-keyed; skipped");
+                    } else {
+                        re_encrypted += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(secret_id = %secret_id, "per-org sweep: update failed: {e}");
+                    record_failure(secret_id, &mut failed, &mut failed_ids);
+                }
+            }
+        }
+
+        tracing::info!(
+            re_encrypted,
+            failed,
+            total = stale_rows.len(),
+            "Per-org secret re-encryption sweep complete"
+        );
+
+        Ok(ReEncryptStats {
+            re_encrypted,
+            failed,
+            failed_ids,
+        })
+    }
+
     /// Rotate the master key used for envelope encryption of DEKs.
     ///
     /// This re-encrypts ALL DEKs in the `encryption_keys` table from the old
