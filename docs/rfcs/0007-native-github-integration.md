@@ -1,6 +1,6 @@
 # RFC 0007 — Native GitHub integration (Phase A: event-typed triggers)
 
-**Status:** Phase A complete (A.1 engine-side filter + matcher ✓; A.2 GraphQL create CRUD + write-time validation ✓; A.3 MCP `create_webhook` wiring ✓; A.4 read-back of `event_filter` on GraphQL + MCP list queries ✓; A.5 `__webhook__` event metadata to the trigger input — RFC D5 ✓). Phase B (GitHub App OAuth) is a separate future RFC.
+**Status:** Phase A complete (A.1 engine-side filter + matcher ✓; A.2 GraphQL create CRUD + write-time validation ✓; A.3 MCP `create_webhook` wiring ✓; A.4 read-back of `event_filter` on GraphQL + MCP list queries ✓; A.5 `__webhook__` event metadata to the trigger input — RFC D5 ✓). Phase B (GitHub App authentication) is [RFC 0008](0008-github-app-authentication.md).
 **Author:** Claude (paired with Evan)
 **Date:** 2026-06-27
 
@@ -137,12 +137,12 @@ user.)
    - *Rollback:* the column is nullable and ignored when absent; revert the
      handler block and `event_filter` becomes inert data. No data migration.
 
-**Phase B — GitHub App auth (separate RFC).** OAuth/App flow: App JWT (signed
-with the App private key) → installation access token (hourly) → refresh; a
-`connect GitHub` UX that registers the repo webhook via the API and stores the
-installation. Follows `oauth_provider_guide.md` + `integration-pattern.md`, but
-the App-token mint differs from a standard OAuth refresh — it deserves its own
-RFC. The PAT path keeps working in the meantime.
+**Phase B — GitHub App authentication → [RFC 0008](0008-github-app-authentication.md).**
+App JWT (RS256-signed with the App private key) → 1-hour installation access token
+(re-minted, not OAuth-refreshed) → a `connect GitHub` install UX; App-level
+webhook delivery; PAT fallback during migration. Split out because the App-token
+mint differs from the standard OAuth refresh path. The PAT path keeps working in
+the meantime.
 
 **Out of scope.** Any change to signature/replay/dedup (already correct);
 GitHub-specific receiver code; retiring the PAT modules.
