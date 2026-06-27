@@ -92,8 +92,17 @@ pub struct SecretsManager {
     /// TTL: 5 minutes (configurable via DEK_CACHE_TTL_SECS env var)
     /// Thread-safe with Arc<DashMap<>>
     dek_cache: Arc<DashMap<Uuid, CachedDek>>,
-    /// Active DEK cache (special case - only one active DEK at a time)
+    /// Active GLOBAL DEK cache (the legacy `org_id IS NULL` key — only one
+    /// active global DEK at a time, so a single slot).
     active_dek_cache: Arc<RwLock<Option<CachedDek>>>,
+    /// Active PER-ORG DEK cache, keyed by `org_id`. Sibling of
+    /// `active_dek_cache` for the per-tenant root DEKs (format v4). Each org
+    /// has at most one active DEK (enforced by `idx_one_active_dek_per_org`),
+    /// so the value is that org's current active DEK. Invalidated per-org by
+    /// `rotate_dek_for_org`; entries for other orgs are untouched. Same TTL as
+    /// the global cache. By-id lookups still go through `dek_cache` (a v4 row's
+    /// `key_id` names the org DEK directly, so decrypt never needs this map).
+    active_org_dek_cache: Arc<DashMap<Uuid, CachedDek>>,
     /// Cache TTL in seconds (default: 300 = 5 minutes)
     cache_ttl: Duration,
     /// Per-user cache of LLM provider keys
@@ -478,6 +487,7 @@ impl SecretsManager {
             kek_legacy: std::sync::RwLock::new(kek_legacy),
             dek_cache: Arc::new(DashMap::new()),
             active_dek_cache: Arc::new(RwLock::new(None)),
+            active_org_dek_cache: Arc::new(DashMap::new()),
             cache_ttl: Duration::from_secs(cache_ttl_secs),
             llm_keys_cache: Arc::new(DashMap::new()),
         })
@@ -629,6 +639,7 @@ impl SecretsManager {
             kek_legacy: std::sync::RwLock::new(None),
             dek_cache: Arc::new(DashMap::new()),
             active_dek_cache: Arc::new(RwLock::new(None)),
+            active_org_dek_cache: Arc::new(DashMap::new()),
             cache_ttl: Duration::from_secs(300),
             llm_keys_cache: Arc::new(DashMap::new()),
         }
@@ -742,13 +753,18 @@ impl SecretsManager {
 
     /// Initialize the secrets system (create initial DEK if needed)
     pub async fn initialize(&self) -> Result<()> {
-        // Check if we have an active DEK
-        let existing = sqlx::query!("SELECT id FROM encryption_keys WHERE active = true LIMIT 1")
-            .fetch_optional(&self.db_pool)
-            .await?;
+        // Check if we have an active GLOBAL DEK. Scoped to `org_id IS NULL`:
+        // per-org DEKs (Phase 1+) are also `active`, so an unqualified
+        // `WHERE active` could now see an org DEK and wrongly skip creating
+        // the global one.
+        let existing = sqlx::query(
+            "SELECT id FROM encryption_keys WHERE active = true AND org_id IS NULL LIMIT 1",
+        )
+        .fetch_optional(&self.db_pool)
+        .await?;
 
         if existing.is_none() {
-            // Create initial DEK
+            // Create initial GLOBAL DEK
             self.create_new_dek().await?;
             tracing::info!("Created initial data encryption key");
         }
@@ -796,16 +812,22 @@ impl SecretsManager {
             }
         }
 
-        // 2️⃣ Cache miss - fetch from database and decrypt
+        // 2️⃣ Cache miss - fetch from database and decrypt. Scoped to the
+        // GLOBAL key (`org_id IS NULL`): this returns the system-wide DEK that
+        // backs every v0/v1/v3 write. Per-org actives are fetched via
+        // `get_active_dek_for_org`; without the `org_id IS NULL` filter this
+        // `LIMIT 1` could now return an org DEK.
         tracing::trace!("Active DEK cache miss - fetching from database");
-        let record = sqlx::query!(
-            "SELECT id, encrypted_key FROM encryption_keys WHERE active = true ORDER BY created_at DESC LIMIT 1"
+        let record = sqlx::query(
+            "SELECT id, encrypted_key FROM encryption_keys WHERE active = true AND org_id IS NULL ORDER BY created_at DESC LIMIT 1"
         )
         .fetch_one(&self.db_pool)
         .await
         .context("No active encryption key found. Run initialize() first")?;
 
-        let dek = self.decrypt_dek(record.id, &record.encrypted_key).await?;
+        let id: Uuid = record.try_get("id")?;
+        let encrypted_key: Vec<u8> = record.try_get("encrypted_key")?;
+        let dek = self.decrypt_dek(id, &encrypted_key).await?;
 
         // 3️⃣ Cache the decrypted DEK (write lock — exclusive access)
         {
@@ -879,6 +901,137 @@ impl SecretsManager {
         );
 
         Ok(dek)
+    }
+
+    /// Domain-separated advisory-lock CLASS for per-org DEK provisioning and
+    /// rotation. Uses the TWO-int `pg_advisory_xact_lock(class, key)` form — a
+    /// distinct lock space from the single-bigint `ROTATE_DEK_LOCK_KEY` used by
+    /// the global `rotate_dek`, so a global rotation and a per-org rotation
+    /// never serialize against each other. ('DKOR' in ASCII.)
+    const PER_ORG_DEK_LOCK_CLASS: i32 = 0x444B_4F52;
+
+    /// Stable i32 advisory-lock key for an org (first 4 bytes of the UUID, LE).
+    /// Cross-org collisions only cause occasional serialization, never
+    /// incorrectness — the in-lock re-check + `idx_one_active_dek_per_org`
+    /// remain the authoritative single-active-per-org guards.
+    fn org_dek_lock_key(org_id: Uuid) -> i32 {
+        let b = org_id.as_bytes();
+        i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    /// Fetch the active root DEK for `org_id`, or `None` if this org has not
+    /// been provisioned a DEK yet. Cached per-org in `active_org_dek_cache`
+    /// (same TTL as the global active cache). Sibling of [`Self::get_active_dek`]
+    /// for the per-tenant (format v4) root keys.
+    pub async fn get_active_dek_for_org(&self, org_id: Uuid) -> Result<Option<DataEncryptionKey>> {
+        let now = Instant::now();
+
+        // 1️⃣ Per-org cache check (drop the guard before any expiry remove —
+        // same DashMap discipline as `get_dek` / MCP-1093).
+        let mut expired = false;
+        if let Some(cached) = self.active_org_dek_cache.get(&org_id) {
+            if now.duration_since(cached.cached_at) < self.cache_ttl {
+                tracing::trace!(%org_id, "Active per-org DEK cache hit");
+                return Ok(Some(cached.dek.clone()));
+            }
+            expired = true;
+        }
+        if expired {
+            self.active_org_dek_cache.remove(&org_id);
+        }
+
+        // 2️⃣ Cache miss — fetch the org's active DEK (None if unprovisioned).
+        let record = sqlx::query(
+            "SELECT id, encrypted_key FROM encryption_keys WHERE active = true AND org_id = $1 LIMIT 1",
+        )
+        .bind(org_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let id: Uuid = record.try_get("id")?;
+        let encrypted_key: Vec<u8> = record.try_get("encrypted_key")?;
+        let dek = self.decrypt_dek(id, &encrypted_key).await?;
+
+        // 3️⃣ Cache it under the org slot.
+        self.active_org_dek_cache.insert(
+            org_id,
+            CachedDek {
+                dek: dek.clone(),
+                cached_at: now,
+            },
+        );
+        Ok(Some(dek))
+    }
+
+    /// Create the first active root DEK for `org_id`. Idempotent under
+    /// concurrency: serialized by a per-org advisory lock + an in-lock
+    /// re-check, with `idx_one_active_dek_per_org` as the ultimate guard.
+    /// Returns the active DEK id (existing-after-race or newly created).
+    /// Mirrors [`Self::rotate_dek`]'s wrap-before-lock discipline so the slow
+    /// KMS round-trip isn't held across the advisory lock.
+    async fn create_new_dek_for_org(&self, org_id: Uuid) -> Result<Uuid> {
+        let mut dek_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut dek_bytes);
+        let active_wrap = self.current_kek()?.wrap_dek(&dek_bytes).await?;
+
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("Failed to begin per-org DEK transaction")?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(Self::PER_ORG_DEK_LOCK_CLASS)
+            .bind(Self::org_dek_lock_key(org_id))
+            .execute(&mut *tx)
+            .await
+            .context("Failed to acquire per-org DEK advisory lock")?;
+
+        // Re-check inside the lock: a concurrent writer may have provisioned
+        // this org's DEK between our cache miss and acquiring the lock.
+        if let Some(row) = sqlx::query(
+            "SELECT id FROM encryption_keys WHERE active = true AND org_id = $1 LIMIT 1",
+        )
+        .bind(org_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let existing: Uuid = row.try_get("id")?;
+            tx.commit().await?;
+            return Ok(existing);
+        }
+
+        let new_dek_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO encryption_keys (id, encrypted_key, algorithm, active, org_id) \
+             VALUES ($1, $2, 'AES-256-GCM', true, $3)",
+        )
+        .bind(new_dek_id)
+        .bind(&active_wrap)
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to insert new per-org DEK")?;
+        tx.commit()
+            .await
+            .context("Failed to commit per-org DEK creation")?;
+
+        tracing::info!(%org_id, new_dek_id = %new_dek_id, "Provisioned per-org root DEK");
+        Ok(new_dek_id)
+    }
+
+    /// Get the org's active root DEK, lazily provisioning one on first use.
+    /// This is the canonical entry point for v4 (per-org) encryption.
+    pub async fn get_or_create_dek_for_org(&self, org_id: Uuid) -> Result<DataEncryptionKey> {
+        if let Some(dek) = self.get_active_dek_for_org(org_id).await? {
+            return Ok(dek);
+        }
+        self.create_new_dek_for_org(org_id).await?;
+        self.get_active_dek_for_org(org_id).await?.ok_or_else(|| {
+            anyhow!("per-org DEK missing immediately after provisioning for org {org_id}")
+        })
     }
 
     /// Decrypt a DEK using the configured KEK provider.
@@ -1533,6 +1686,26 @@ impl SecretsManager {
     /// REQUIRES a non-empty AAD (an empty context defeats the partition).
     pub const AAD_FORMAT_V3_DERIVED: i16 = 3;
 
+    /// AAD format version 4: per-context key-derived from a **per-organization
+    /// root DEK** rather than the single global DEK.
+    ///
+    /// Mechanically v4 is IDENTICAL to v3 — same wire format, same HKDF
+    /// per-context subkey derivation (`derive_per_context_subkey`), same AAD
+    /// bound into the GCM tag. The ONLY difference is at *encrypt* time: the
+    /// IKM is the writer-org's active DEK (`get_or_create_dek_for_org`) instead
+    /// of the global active DEK. Per-org root-key isolation is what bounds a
+    /// root-key compromise to one tenant; the per-context AAD still provides the
+    /// intra-DEK swap-resistance it does for v3.
+    ///
+    /// Because a v4 row stores its org DEK's `key_id` like any other row,
+    /// DECRYPT needs no org awareness — `decrypt_versioned` routes v4 straight
+    /// through the v3 derived path (`get_dek(key_id)` fetches the org DEK by
+    /// id, the subkey re-derives from the same AAD). The distinct version
+    /// number exists so operators and the (later-phase) re-encrypt sweep can
+    /// tell a per-org row from a global one by the format column alone, without
+    /// joining to `encryption_keys.org_id`.
+    pub const AAD_FORMAT_V4_ORG_DERIVED: i16 = 4;
+
     /// HKDF-SHA256 salt / domain-separation label for v3 per-context DEK
     /// subkey derivation. Distinct from any other HKDF label in the
     /// workspace so a v3 subkey can never collide with the checkpoint /
@@ -1639,15 +1812,21 @@ impl SecretsManager {
             // per-context HKDF subkey of the DEK rather than the DEK
             // itself. The AAD is reconstructed identically by the caller
             // and used both to derive the key AND as the GCM tag binding.
-            v if v == Self::AAD_FORMAT_V3_DERIVED => {
+            // v3 and v4 decrypt IDENTICALLY: both re-derive the per-context
+            // subkey from the DEK named by the row's `key_id` (v3 → the global
+            // DEK, v4 → a per-org DEK) and the same AAD. The org scoping lives
+            // entirely in WHICH DEK `key_id` points at, which `get_dek` resolves
+            // by id — so decrypt needs no org awareness. See AAD_FORMAT_V4_ORG_DERIVED.
+            v if v == Self::AAD_FORMAT_V3_DERIVED || v == Self::AAD_FORMAT_V4_ORG_DERIVED => {
                 self.decrypt_value_derived_with_aad(key_id, encrypted, aad)
                     .await
             }
             other => Err(anyhow!(
-                "unknown encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), {} (v2 slot-bound AAD), and {} (v3 per-context-derived). Caller may be reading rows written by a newer code version.",
+                "unknown encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), {} (v2 slot-bound AAD), {} (v3 per-context-derived), and {} (v4 per-org per-context-derived). Caller may be reading rows written by a newer code version.",
                 Self::AAD_FORMAT_V1,
                 Self::AAD_FORMAT_V2,
-                Self::AAD_FORMAT_V3_DERIVED
+                Self::AAD_FORMAT_V3_DERIVED,
+                Self::AAD_FORMAT_V4_ORG_DERIVED
             )),
         }
     }
@@ -1727,6 +1906,42 @@ impl SecretsManager {
         let mut stored = nonce_bytes.to_vec();
         stored.extend_from_slice(&ciphertext);
         Ok((dek.id, stored, Self::AAD_FORMAT_V3_DERIVED))
+    }
+
+    /// v4 encrypt: per-context key-derived from the **org's root DEK**. Drop-in
+    /// sibling of [`Self::encrypt_value_aad_v3`] with the same
+    /// `(key_id, ciphertext, version)` return shape and byte-identical wire
+    /// format — the only difference is the IKM is `org_id`'s active DEK
+    /// (lazily provisioned via [`Self::get_or_create_dek_for_org`]) instead of
+    /// the global DEK. The returned `key_id` is that org DEK's id, so decrypt
+    /// (`decrypt_versioned` → v3/v4 derived path) resolves it by id with no org
+    /// awareness needed. Requires a non-empty `aad` (same partition rationale
+    /// as v3). See [`Self::AAD_FORMAT_V4_ORG_DERIVED`].
+    pub async fn encrypt_value_aad_v4_org(
+        &self,
+        value: &str,
+        org_id: Uuid,
+        aad: &[u8],
+    ) -> Result<(Uuid, Vec<u8>, i16)> {
+        if aad.is_empty() {
+            return Err(anyhow!(
+                "v4 per-context encryption requires a non-empty AAD context"
+            ));
+        }
+        let dek = self.get_or_create_dek_for_org(org_id).await?;
+        let subkey = Self::derive_per_context_subkey(&dek.key, aad)?;
+        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())?;
+        let nonce_bytes = Self::generate_nonce();
+        let payload = aes_gcm::aead::Payload {
+            msg: value.as_bytes(),
+            aad,
+        };
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), payload)
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+        let mut stored = nonce_bytes.to_vec();
+        stored.extend_from_slice(&ciphertext);
+        Ok((dek.id, stored, Self::AAD_FORMAT_V4_ORG_DERIVED))
     }
 
     /// Decrypt a v3 (`AAD_FORMAT_V3_DERIVED`) blob: re-derive the
@@ -3865,13 +4080,17 @@ impl SecretsManager {
             .await
             .context("Failed to acquire rotate_dek advisory lock")?;
 
-        // Deactivate current active DEK
-        sqlx::query("UPDATE encryption_keys SET active = false WHERE active = true")
-            .execute(&mut *tx)
-            .await
-            .context("Failed to deactivate current DEK")?;
+        // Deactivate current active GLOBAL DEK. Scoped to `org_id IS NULL`:
+        // an unqualified deactivate would clear EVERY org's active DEK too,
+        // since per-org root DEKs (Phase 1+) are also `active`.
+        sqlx::query(
+            "UPDATE encryption_keys SET active = false WHERE active = true AND org_id IS NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("Failed to deactivate current DEK")?;
 
-        // Insert new active DEK
+        // Insert new active GLOBAL DEK (org_id left NULL).
         let new_dek_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO encryption_keys (id, encrypted_key, algorithm, active) \
@@ -3912,6 +4131,81 @@ impl SecretsManager {
             "DEK rotated successfully"
         );
 
+        Ok(new_dek_id)
+    }
+
+    /// Rotate the active root DEK for ONE organization. Per-org sibling of
+    /// [`Self::rotate_dek`]: deactivates that org's current active DEK and
+    /// inserts a fresh one, leaving every other org and the global DEK
+    /// untouched. Existing v4 rows keep decrypting — they pin the old DEK by
+    /// `key_id` (re-encryption to the new key is the later-phase sweep's job).
+    ///
+    /// Serialized by the per-org advisory lock (distinct lock space from the
+    /// global `ROTATE_DEK_LOCK_KEY`); `idx_one_active_dek_per_org` is the
+    /// schema-level backstop. Wraps the new key BEFORE the lock (KMS round-trip
+    /// off the lock) exactly like `rotate_dek`.
+    pub async fn rotate_dek_for_org(&self, org_id: Uuid, auditor: Option<Uuid>) -> Result<Uuid> {
+        let mut new_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut new_key);
+        let active_wrap = self.current_kek()?.wrap_dek(&new_key).await?;
+
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("Failed to begin per-org DEK rotation transaction")?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(Self::PER_ORG_DEK_LOCK_CLASS)
+            .bind(Self::org_dek_lock_key(org_id))
+            .execute(&mut *tx)
+            .await
+            .context("Failed to acquire per-org DEK rotation advisory lock")?;
+
+        sqlx::query(
+            "UPDATE encryption_keys SET active = false WHERE active = true AND org_id = $1",
+        )
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to deactivate current per-org DEK")?;
+
+        let new_dek_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO encryption_keys (id, encrypted_key, algorithm, active, org_id) \
+             VALUES ($1, $2, 'AES-256-GCM', true, $3)",
+        )
+        .bind(new_dek_id)
+        .bind(&active_wrap)
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to insert new per-org DEK")?;
+
+        // Audit inside the same tx (mirrors rotate_dek's L-5). secret_id NULL.
+        Self::log_audit_in_tx(
+            &mut tx,
+            None,
+            "DEK_ROTATED_ORG",
+            "system",
+            auditor,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .context("Failed to insert audit row for rotate_dek_for_org")?;
+
+        tx.commit()
+            .await
+            .context("Failed to commit per-org DEK rotation")?;
+
+        // Invalidate ONLY this org's active-DEK cache entry; other orgs and the
+        // global cache are untouched. Old DEKs age out of `dek_cache` by TTL.
+        self.active_org_dek_cache.remove(&org_id);
+
+        tracing::info!(%org_id, new_dek_id = %new_dek_id, auditor = ?auditor, "Per-org DEK rotated");
         Ok(new_dek_id)
     }
 
@@ -5143,6 +5437,56 @@ mod per_context_subkey_tests {
                 )
                 .is_err(),
             "ciphertext must not decrypt under a different context's derived key"
+        );
+    }
+
+    #[test]
+    fn v4_org_isolation_is_distinct_root_dek_per_context_subkey() {
+        // v4 == v3 derivation, but the IKM is a PER-ORG root DEK. Its tenant
+        // isolation is exactly the "different root DEK => different per-context
+        // subkey" property: two orgs, same context AAD, different roots => org B
+        // cannot open org A's v4 ciphertext even at the identical context. That
+        // is the blast-radius bound — compromising one org's root DEK yields
+        // nothing for any other org's rows.
+        assert_eq!(SecretsManager::AAD_FORMAT_V4_ORG_DERIVED, 4);
+
+        let root_org_a = root_dek();
+        let mut root_org_b = root_dek();
+        root_org_b[0] ^= 0xFF; // distinct org roots (root_dek() is a constant)
+
+        let ctx = Uuid::new_v4();
+        let key_a = SecretsManager::derive_per_context_subkey(&root_org_a, ctx.as_bytes()).unwrap();
+        let key_b = SecretsManager::derive_per_context_subkey(&root_org_b, ctx.as_bytes()).unwrap();
+        assert_ne!(
+            key_a.as_slice(),
+            key_b.as_slice(),
+            "distinct org roots must yield distinct per-context subkeys"
+        );
+
+        let cipher_a = Aes256Gcm::new_from_slice(key_a.as_slice()).unwrap();
+        let nonce = Nonce::from_slice(&[7u8; 12]);
+        let ct = cipher_a
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: b"org A v4 secret",
+                    aad: ctx.as_bytes(),
+                },
+            )
+            .unwrap();
+
+        let cipher_b = Aes256Gcm::new_from_slice(key_b.as_slice()).unwrap();
+        assert!(
+            cipher_b
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: ct.as_ref(),
+                        aad: ctx.as_bytes(),
+                    },
+                )
+                .is_err(),
+            "org B's root-derived key must not open org A's v4 ciphertext"
         );
     }
 }
