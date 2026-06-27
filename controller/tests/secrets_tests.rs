@@ -456,3 +456,109 @@ async fn v4_for_user_fails_closed_without_personal_org() {
         "must fail closed when the user has no personal org"
     );
 }
+
+// ── secrets per-org cutover: org-scoped → v4, personal/global → v3 ──────────
+
+#[tokio::test]
+async fn org_scoped_secret_is_v4_under_org_dek_and_round_trips() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    let org = create_test_org(&pool).await; // owned by SYSTEM_USER (seeded inside)
+    let kp = format!("dek/org/{}", Uuid::new_v4());
+    let sid = manager
+        .create_secret(
+            "OrgSecret",
+            &kp,
+            "org-val",
+            None,
+            SYSTEM_USER_ID,
+            vec![],
+            Some(org),
+        )
+        .await
+        .unwrap();
+
+    // Row is v4, keyed by the org's DEK.
+    let (fmt, kid): (i16, Uuid) = sqlx::query_as(
+        "SELECT encryption_format_version, encryption_key_id FROM secrets WHERE id=$1",
+    )
+    .bind(sid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fmt, 4, "org-scoped secret must be format v4");
+    let org_dek = manager.get_active_dek_for_org(org).await.unwrap().unwrap();
+    assert_eq!(kid, org_dek.id, "org secret must use the org's DEK");
+
+    // Reads back through decrypt_secret_record's v4 arm.
+    let got = manager
+        .get_secret(&kp, SecretRequestor::System, &[])
+        .await
+        .unwrap();
+    assert_eq!(got, "org-val");
+
+    // Update preserves the org scope (still v4, same DEK).
+    manager
+        .update_secret(&kp, "org-val-2", None, &[])
+        .await
+        .unwrap();
+    let (fmt2, kid2): (i16, Uuid) = sqlx::query_as(
+        "SELECT encryption_format_version, encryption_key_id FROM secrets WHERE id=$1",
+    )
+    .bind(sid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fmt2, 4, "update must keep the org secret v4");
+    assert_eq!(kid2, org_dek.id, "update must keep the same org DEK");
+    let got2 = manager
+        .get_secret(&kp, SecretRequestor::System, &[])
+        .await
+        .unwrap();
+    assert_eq!(got2, "org-val-2");
+}
+
+#[tokio::test]
+async fn personal_secret_stays_v3_global() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+    // Seed the creator (created_by FK).
+    sqlx::query("INSERT INTO users (id,email,password_hash,is_active) VALUES ($1,'system@talos.test','h',true) ON CONFLICT (id) DO NOTHING")
+        .bind(SYSTEM_USER_ID).execute(&pool).await.unwrap();
+
+    let kp = format!("dek/personal/{}", Uuid::new_v4());
+    let sid = manager
+        .create_secret(
+            "PersonalSecret",
+            &kp,
+            "p-val",
+            None,
+            SYSTEM_USER_ID,
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (fmt, kid): (i16, Uuid) = sqlx::query_as(
+        "SELECT encryption_format_version, encryption_key_id FROM secrets WHERE id=$1",
+    )
+    .bind(sid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fmt, 3, "personal/org-less secret stays v3 (global DEK)");
+    let global = manager.get_active_dek().await.unwrap();
+    assert_eq!(kid, global.id, "personal secret must use the global DEK");
+
+    let got = manager
+        .get_secret(&kp, SecretRequestor::System, &[])
+        .await
+        .unwrap();
+    assert_eq!(got, "p-val");
+}
