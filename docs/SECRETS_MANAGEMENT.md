@@ -104,19 +104,28 @@ CREATE INDEX idx_audit_log_timestamp ON secret_audit_log(timestamp);
 
 ## Encryption Strategy
 
-> **Current state (finding #1 / format v3).** The code samples below are
-> illustrative and predate two changes — read them as the *shape*, not the
+> **Current state (per-ORG root DEKs, formats v3/v4).** The code samples below
+> are illustrative and predate three changes — read them as the *shape*, not the
 > literal current implementation:
-> 1. **Per-context key derivation.** The active DEK is the derivation *root*,
->    not the data key. Each row is sealed under a per-context subkey
->    `HKDF-SHA256(ikm = DEK, salt = label, info = aad_context)` where the
->    context is the row's identity (secret_id / actor_id‖key / execution_id /
->    per-slot tag) — the same bytes bound as AES-GCM AAD. This bounds the
->    per-key message count to ~1 so the random-96-bit-nonce birthday limit is
->    never approached. A per-row `encryption_format_version` column selects the
->    scheme (`AAD_FORMAT_V3_DERIVED = 3`); v0/v1/v2 rows still decrypt via
->    `SecretsManager::decrypt_versioned` (lazy migration, zero backfill).
-> 2. **Plaintext hygiene.** Decrypted values and derived subkeys are held in
+> 1. **Per-context key derivation.** A DEK is the derivation *root*, not the data
+>    key. Each row is sealed under a per-context subkey
+>    `HKDF-SHA256(ikm = DEK, salt = label, info = aad_context)` where the context
+>    is the row's identity (secret_id / actor_id‖key / execution_id / per-slot
+>    tag) — the same bytes bound as AES-GCM AAD. Bounds the per-key message count
+>    to ~1 so the random-96-bit-nonce birthday limit is never approached.
+> 2. **Per-ORGANIZATION root DEKs.** `encryption_keys.org_id` scopes DEKs: one
+>    global DEK (`org_id IS NULL`) plus one active DEK per organization. Writers
+>    seal under the writer-org's DEK (format `AAD_FORMAT_V4_ORG_DERIVED = 4`) when
+>    an org is resolvable, else the global DEK (`AAD_FORMAT_V3_DERIVED = 3`) — so a
+>    compromised root key is bounded to one tenant, not the whole deployment.
+>    Decrypt is identical for v3/v4 (the row's `*_key_id` names the DEK); a per-row
+>    `*_format` column selects the scheme and `SecretsManager::decrypt_versioned`
+>    handles v0/v1/v2/v3/v4 (lazy migration, zero backfill). Existing rows migrate
+>    via per-table `re_encrypt_*_to_org` sweeps (platform-admin mutations); the
+>    `dekMigrationStatus` query reports remaining work. NOTE: checkpoint + worker
+>    secret-envelope + OTLP-header encryption use a *separate* root
+>    (`WORKER_SHARED_KEY` / `user_id`), not the DEK, and are NOT per-org.
+> 3. **Plaintext hygiene.** Decrypted values and derived subkeys are held in
 >    `Zeroizing` so they are wiped on drop, including error branches.
 
 ### Envelope Encryption Pattern
@@ -138,6 +147,8 @@ CREATE INDEX idx_audit_log_timestamp ON secret_audit_log(timestamp);
     ┌───────────────────────────────────┐
     │  Data Encryption Keys (DEKs)      │
     │  - Stored in encryption_keys      │
+    │  - PER-ORG (encryption_keys.      │
+    │    org_id) + a global fallback    │
     │  - Wrapped opaquely by KEK        │
     │    provider (wire format =        │
     │    provider's choice)             │

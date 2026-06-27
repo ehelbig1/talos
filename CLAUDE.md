@@ -47,7 +47,7 @@ Efficient flow for Claude Code specifically: (a) spawn an **Explore** subagent i
 
 **Verify-once rule for signed NATS messages** (`talos-workflow-engine/talos-workflow-job-protocol`, learned the hard way r300 / r301, 2026-05-05). Every signed message type (`JobResult`, `PipelineJobResult`, …) MUST have **exactly one primary `verify()` caller per controller process**. Passive observers (audit subscribers, metrics emitters, anything whose only side effect is an idempotent DB write) MUST use `verify_no_replay()` — HMAC + freshness without touching the process-local `JOB_NONCE_CACHE`. Two `verify()` calls against the same signed message will deterministically fail with `"result_nonce already seen"` because both insert into the same shared cache. The worker MUST single-publish each result to ONE NATS subject (reply inbox OR global audit topic, branched on `reply_topic` presence) — dual-publishing primes the cache race even when both consumers correctly use the split API. Background incident: see `memory/rpc_dual_verify_pattern.md`. Adding a new signed message type? Add both `verify()` and `verify_no_replay()` together up front; the prophylactic split is cheap, the regression is total (every job fails).
 
-**Anything that needs to read or write `actor_memory` MUST go through `talos_memory::*` functions** — do not write inline `INSERT INTO actor_memory` SQL anywhere. The service is the only path that computes embeddings and runs graph-RAG entity extraction. Bulk clone is `talos_memory::clone_memories(pool, source_actor, target_actor)` — copies the live semantic+episodic memories (v0 rows pass ciphertext through; v1/v3 rows are decrypt+re-encrypted to re-base their `actor_id`-bound AAD), preserves `metadata`. Caller must verify both actors belong to the same user before invoking — this is a **tenancy/privacy** rule (don't copy one user's agent memory into another's), NOT a crypto one. (The DEK is a single global, system-wide key — there is no per-user DEK; per-actor isolation comes from the per-`(actor_id,key)` HKDF-derived AEAD subkey, so a cross-user copy would in fact decrypt fine. The previous "DEK lineage is per-user" wording here was inaccurate.)
+**Anything that needs to read or write `actor_memory` MUST go through `talos_memory::*` functions** — do not write inline `INSERT INTO actor_memory` SQL anywhere. The service is the only path that computes embeddings and runs graph-RAG entity extraction. Bulk clone is `talos_memory::clone_memories(pool, source_actor, target_actor)` — copies the live semantic+episodic memories (v0 rows pass ciphertext through; v1/v3/v4 rows are decrypt+re-encrypted to re-base their `actor_id`-bound AAD AND re-key onto the TARGET actor's org DEK), preserves `metadata`. Caller must verify both actors belong to the same user before invoking — this is a **tenancy/privacy** rule (don't copy one user's agent memory into another's), NOT a crypto one. (DEKs are per-ORGANIZATION, with a global DEK fallback for org-less data — there is no per-USER DEK; per-actor isolation comes from the per-`(actor_id,key)` HKDF-derived AEAD subkey under the actor's org DEK, so a cross-user copy would in fact decrypt fine. See the "Per-context AEAD subkeys + per-ORG root DEKs" section below.)
 
 **This rule is now lint-enforced.** `make lint` runs `scripts/lint-structural.sh`, which fails on raw `INSERT/UPDATE/DELETE` against `actor_memory` outside `talos-memory/`, and on the legacy `value, value_enc` column projection (the pattern that broke 7 sites during Phase B's column drop). If you have a documented reason to write raw SQL, add `// allow-actor-memory-sql: <reason>` within 8 lines above the SQL — but the default path is `talos_memory::recall_*` / `persist_memory` / `clone_memories`.
 
@@ -157,23 +157,57 @@ tier-1 ceiling to tier-2 without invalidating the signature.
 - Audit logs record `key_hash` (SHA-256 of path), never the value.
 - Error messages reference `key_path`/`name` only, never decrypted content.
 
-**Per-context AEAD subkeys (format v3, finding #1).** Every AES-GCM path
-derives a PER-CONTEXT key — `HKDF-SHA256(ikm = root, salt = label, info = aad_context)`
-— rather than encrypting many rows under one shared key. DB-backed paths
-(`SecretsManager`: secrets / actor_memory / TOTP / webhook secrets / exec
-output / module payloads) use `AAD_FORMAT_V3_DERIVED = 3` keyed on the row's
-identity (the same bytes bound as AAD); checkpoints fold `execution_id`
-(`checkpoint-aead/v2-per-execution`), the worker secret-envelope folds the
-per-job AAD (`envelope-aead/v2-per-job`), OTLP headers fold `user_id`. This
-keeps the per-key message count at ~1 so the random-96-bit-nonce birthday
-bound is unreachable. Migration is lazy/fail-closed: readers dispatch on the
-per-row `*_format` column via `decrypt_versioned` (v0/v1/v2 still decrypt);
-adding a new AEAD writer? use `encrypt_value_aad_v3` and widen that table's
-format CHECK constraint. **Envelope deploy ordering:** workers must roll
-first/together with controllers — a v1-only worker can't open a v2-sealed
-envelope (the v2→v1 decrypt fallback only covers the reverse). New AEAD
-format versions need the format CHECK widened in a migration (see
-`20260617120000`).
+**Per-context AEAD subkeys + per-ORG root DEKs (formats v3/v4).** Every AES-GCM
+path derives a PER-CONTEXT key — `HKDF-SHA256(ikm = a DEK, salt = label, info =
+aad_context)` — rather than encrypting many rows under one shared key (keeps the
+per-key message count ~1, so the random-96-bit-nonce birthday bound is
+unreachable). **There are two DEK scopes** (`encryption_keys.org_id`): one
+**global** DEK (`org_id IS NULL`) and one **per-organization** root DEK per org
+(`org_id` set; exactly one active per org, lazily provisioned on first use). Both
+partial-unique-indexed. So:
+- **v3** = per-context subkey from the GLOBAL DEK.
+- **v4** = the SAME derivation but from the writer-org's root DEK — so a
+  compromised root key is bounded to one tenant, not the whole system.
+
+DB-backed paths (`SecretsManager`: secrets / actor_memory / TOTP / webhook
+secrets / exec output / module payloads) write **v4** when an org is resolvable,
+falling back to **v3 (global)** for legitimately org-less rows (personal secrets,
+standalone module executions). **Decrypt is IDENTICAL for v3 and v4** — the row's
+`*_key_id` names the DEK (`get_dek` resolves global-or-org by id) and the subkey
+re-derives from the same AAD; `decrypt_versioned` dispatches v0/v1/v2/v3/v4 on the
+per-row `*_format` column. Only ENCRYPT differs (which DEK is the IKM).
+
+**Adding a new AEAD writer?** Call `encrypt_value_aad_v4_or_global(value,
+target_org, aad)` and resolve `target_org` from context — the workflow's org for
+executions, the actor's org for memory, the secret's `org_id`. For
+personal/user-keyed tables use `encrypt_value_aad_v4_for_user(value, user_id,
+aad)` (resolves the user's personal org). **Bind the RETURNED format version,
+never hardcode 3/4** (a v4 row mislabeled v3 fails to decrypt), and widen that
+table's `*_format` CHECK to include 4. If a table has its OWN decrypt dispatch
+(e.g. `decrypt_secret_record`) add the v4 arm there too, and guard any global
+re-encrypt sweep to skip `format = 4` (don't downgrade org rows).
+
+**Migrating EXISTING rows to per-org** (the cutover only converts NEW writes):
+per-table sweeps `SecretsManager::re_encrypt_*_to_org` /
+`ModuleExecutionService::re_encrypt_module_payloads_to_org` /
+`talos_memory::re_encrypt_memories_to_org`, exposed as platform-admin mutations
+`reEncrypt{Secrets,Memories,Outputs,ModulePayloads}ToOrg`. Poll the
+`dekMigrationStatus` query until each `pending` is 0 → the global DEK is no longer
+load-bearing for migratable data (org-less rows stay global by design). The
+personal tables (totp/webhook/audit) have no sweep — they migrate lazily on next
+write.
+
+**Separate, NON-DEK derivations (NOT per-org, do not "fix"):** checkpoints fold
+`execution_id` from the `WORKER_SHARED_KEY` (`checkpoint-aead/v2-per-execution`);
+the worker secret-envelope folds the per-job AAD from the WSK
+(`envelope-aead/v2-per-job`); OTLP headers fold `user_id`. These don't use the DEK
+at all, so they're already isolated from a DEK compromise.
+
+**Envelope deploy ordering:** workers must roll first/together with controllers —
+a v1-only worker can't open a v2-sealed envelope (the v2→v1 decrypt fallback only
+covers the reverse). New AEAD format versions need the format CHECK widened in a
+migration (`20260617120000` introduced v3; the `2026062612*`–`2026062624*` set
+introduced per-org v4 per table).
 
 **Worker-side secret isolation:**
 - `check_secret_allowlist(key_path)` enforces BOTH the per-module `allowed_secrets` grant AND the host-reserved deny-list (`is_reserved_host_secret_path`). The deny-list blocks LLM provider keys even with `allowed_secrets: ["*"]`.
