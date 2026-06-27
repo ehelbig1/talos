@@ -1944,6 +1944,35 @@ impl SecretsManager {
         Ok((dek.id, stored, Self::AAD_FORMAT_V4_ORG_DERIVED))
     }
 
+    /// v4 encrypt for a PERSONAL / user-owned row: resolves the user's personal
+    /// org and encrypts under that org's root DEK (lazily provisioned). For
+    /// tables whose `org_id` is stamped from the personal org by the
+    /// `set_org_id_from_personal_org` trigger (totp, user_audit_settings,
+    /// webhook signing secrets), this keeps the DEK's org scope consistent with
+    /// the row's stamped `org_id`. Tables that already have an explicit
+    /// (possibly *shared*) org in scope must call
+    /// [`Self::encrypt_value_aad_v4_org`] directly instead.
+    ///
+    /// Fails closed if the user has no personal org — that is an invariant
+    /// violation (every user gets one at signup / via the personal-org
+    /// backfill), NOT a silently-degrade-to-the-global-DEK condition.
+    pub async fn encrypt_value_aad_v4_for_user(
+        &self,
+        value: &str,
+        user_id: Uuid,
+        aad: &[u8],
+    ) -> Result<(Uuid, Vec<u8>, i16)> {
+        let org_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 AND is_personal")
+                .bind(user_id)
+                .fetch_optional(&self.db_pool)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("no personal org for user {user_id}; cannot derive per-org DEK")
+                })?;
+        self.encrypt_value_aad_v4_org(value, org_id, aad).await
+    }
+
     /// Decrypt a v3 (`AAD_FORMAT_V3_DERIVED`) blob: re-derive the
     /// per-context subkey from the DEK named by `key_id` and the `aad`,
     /// then AES-GCM-decrypt with that subkey and the same AAD bound into

@@ -372,3 +372,87 @@ async fn per_org_dek_rotation_preserves_old_ciphertext_and_global() {
         "per-org rotation must not touch the global DEK"
     );
 }
+
+// ── v4_for_user (personal-org resolution) — used by totp/audit/webhook cutovers ─
+
+async fn create_user_with_personal_org(pool: &sqlx::Pool<sqlx::Postgres>) -> (Uuid, Uuid) {
+    let uid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, is_active) VALUES ($1, $2, 'h', true)",
+    )
+    .bind(uid)
+    .bind(format!("v4user-{uid}@talos.test"))
+    .execute(pool)
+    .await
+    .expect("create user");
+    let tag = Uuid::new_v4();
+    let org: Uuid = sqlx::query_scalar(
+        "INSERT INTO organizations (name, slug, owner_id, is_personal) VALUES ($1, $2, $3, true) RETURNING id",
+    )
+    .bind(format!("personal-{tag}"))
+    .bind(format!("personal-{tag}"))
+    .bind(uid)
+    .fetch_one(pool)
+    .await
+    .expect("create personal org");
+    (uid, org)
+}
+
+#[tokio::test]
+async fn v4_for_user_encrypts_under_personal_org_dek_and_round_trips() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    let (uid, personal_org) = create_user_with_personal_org(&pool).await;
+
+    // TOTP-style call: AAD bound to user_id (as encrypt_totp_secret does).
+    let (kid, ct, ver) = manager
+        .encrypt_value_aad_v4_for_user("totp-seed-abc", uid, uid.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(ver, 4, "v4_for_user must stamp format 4");
+
+    // It must encrypt under the USER'S PERSONAL ORG's root DEK.
+    let org_dek = manager
+        .get_active_dek_for_org(personal_org)
+        .await
+        .unwrap()
+        .expect("personal org DEK was lazily provisioned");
+    assert_eq!(kid, org_dek.id, "must use the personal-org DEK id");
+
+    let dec = manager
+        .decrypt_versioned(kid, &ct, uid.as_bytes(), ver)
+        .await
+        .unwrap();
+    assert_eq!(dec.as_str(), "totp-seed-abc");
+}
+
+#[tokio::test]
+async fn v4_for_user_fails_closed_without_personal_org() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    // A user with NO personal org is an invariant violation — fail closed,
+    // never silently fall back to the global DEK.
+    let uid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, is_active) VALUES ($1, $2, 'h', true)",
+    )
+    .bind(uid)
+    .bind(format!("noorg-{uid}@talos.test"))
+    .execute(&pool)
+    .await
+    .expect("create user");
+
+    assert!(
+        manager
+            .encrypt_value_aad_v4_for_user("x", uid, uid.as_bytes())
+            .await
+            .is_err(),
+        "must fail closed when the user has no personal org"
+    );
+}
