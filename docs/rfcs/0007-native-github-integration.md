@@ -1,6 +1,6 @@
 # RFC 0007 — Native GitHub integration (Phase A: event-typed triggers)
 
-**Status:** In progress (A.1 engine-side filter + matcher ✓; A.2 GraphQL create CRUD + write-time validation ✓; A.3 MCP `create_webhook` wiring ✓; A.4 read-back of `event_filter` on GraphQL + MCP list queries ✓; remaining: `__webhook__` event metadata to the trigger input — RFC D5)
+**Status:** Phase A complete (A.1 engine-side filter + matcher ✓; A.2 GraphQL create CRUD + write-time validation ✓; A.3 MCP `create_webhook` wiring ✓; A.4 read-back of `event_filter` on GraphQL + MCP list queries ✓; A.5 `__webhook__` event metadata to the trigger input — RFC D5 ✓). Phase B (GitHub App OAuth) is a separate future RFC.
 **Author:** Claude (paired with Evan)
 **Date:** 2026-06-27
 
@@ -99,6 +99,22 @@ invisible.
 `__webhook__ = { event, delivery, action }` alongside the existing body in the
 trigger input, so both the filter and the workflow read the event type from one
 authoritative place (rather than re-parsing the body).
+
+*Implemented (A.5):* `__webhook__` is injected as a reserved top-level key inside
+the trigger-input body (the workflow reads `{{__trigger_input__.__webhook__.event}}`;
+modules also see it under `input`). It's a **curated allowlist, not a header
+dump** — only `event` / `delivery` / `action` are surfaced, so signature/auth
+headers (`X-Hub-Signature-256`, `Authorization`, `X-Verification-Token`, …) can
+never leak into trigger input. `event` reads the header named by the trigger's
+`event_filter.header` when a filter is set (the same header the server matched
+on — one source of truth), else GitHub's `X-GitHub-Event`; `delivery` reads
+`X-GitHub-Delivery`; each field is `null` when absent (stable interpolation
+shape). Injection applies only when the body is a JSON object (a bare
+string/array body has no field surface). **Caveat:** DLQ replay
+(`dispatch_replay`) does NOT reconstruct `__webhook__` — the original request
+headers aren't stored with the dead-lettered body, so a replayed delivery has no
+header-derived metadata. (Live deliveries are the overwhelmingly common path;
+storing headers for replay is deferred.)
 
 **D6. Validate the filter at write time; fail-OPEN at fire time.** The trigger
 create/update surface (GraphQL/MCP) validates `event_filter` shape + caps its
