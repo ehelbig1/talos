@@ -341,6 +341,13 @@ pub struct WebhookTrigger {
     /// Maximum seconds to wait for workflow completion in sync mode.
     /// Returns HTTP 504 Gateway Timeout if exceeded.
     pub sync_timeout_secs: i32,
+    /// RFC 0007: optional provider-agnostic event filter. When set, the handler
+    /// evaluates it AFTER signature verification and skips (200, no dispatch)
+    /// deliveries that don't match. `NULL` = fire on every verified delivery.
+    /// Shape: `{ "header": "X-GitHub-Event", "values": [...], "payload_match":
+    /// { "action": [...] } }`. See `event_filter_matches`.
+    #[sqlx(default)]
+    pub event_filter: Option<serde_json::Value>,
 }
 
 // Custom Debug so a stray `{:?}` never prints the trigger's auth material:
@@ -394,6 +401,63 @@ pub(crate) fn webhook_must_fail_closed_on_hmac(
     hmac_secret_resolved: bool,
 ) -> bool {
     hmac_configured && !hmac_secret_resolved
+}
+
+/// RFC 0007: does a verified delivery match the trigger's `event_filter`?
+///
+/// `filter` is the JSONB from `webhook_triggers.event_filter`; `header_value` is
+/// the request header named by `filter.header` (resolved by the caller, since the
+/// matcher is DB/HeaderMap-free for testability); `body` is the parsed JSON body.
+///
+/// Match = (header clause) AND (payload_match clause). A clause that is absent
+/// passes. Semantics:
+/// - `values` (array): if present and non-empty, `header_value` MUST be one of
+///   them — an absent header when `values` is required is a non-match.
+/// - `payload_match` (object `{key: [allowed]}`): for EACH key with a non-empty
+///   allowed list, the body's top-level `key` (as a string) MUST be one of the
+///   allowed values; a missing/non-string field is a non-match for that key.
+///   All keys are ANDed.
+///
+/// Fail-OPEN on a malformed filter (not an object) — per RFC 0007 D6, silently
+/// dropping a delivery is worse than an occasional over-fire, and write-time
+/// validation is the primary guard. Returns `true` (fire) for `{}`.
+pub(crate) fn event_filter_matches(
+    filter: &serde_json::Value,
+    header_value: Option<&str>,
+    body: &serde_json::Value,
+) -> bool {
+    let Some(obj) = filter.as_object() else {
+        return true; // malformed → fire (D6)
+    };
+
+    // Header clause.
+    if let Some(values) = obj.get("values").and_then(|v| v.as_array()) {
+        if !values.is_empty() {
+            let Some(hv) = header_value else { return false };
+            if !values.iter().any(|v| v.as_str() == Some(hv)) {
+                return false;
+            }
+        }
+    }
+
+    // payload_match clause (AND over keys).
+    if let Some(pm) = obj.get("payload_match").and_then(|v| v.as_object()) {
+        for (key, allowed) in pm {
+            let Some(allowed) = allowed.as_array() else {
+                continue;
+            };
+            if allowed.is_empty() {
+                continue;
+            }
+            let actual = body.get(key).and_then(|v| v.as_str());
+            match actual {
+                Some(a) if allowed.iter().any(|v| v.as_str() == Some(a)) => {}
+                _ => return false,
+            }
+        }
+    }
+
+    true
 }
 
 /// Absolute difference in seconds between `now_secs` and a caller-supplied
@@ -1039,6 +1103,43 @@ impl WebhookRouter {
                 )
                 .await;
                 return Ok((StatusCode::UNAUTHORIZED, "Invalid verification token").into_response());
+            }
+        }
+
+        // 4b. RFC 0007 event filter. Evaluated AFTER all signature / verification-
+        //     token auth (so unverified input never reaches filter logic) and
+        //     BEFORE dedup/dispatch. A non-matching delivery is ACKNOWLEDGED with
+        //     200 and NO workflow execution — GitHub (and most senders) retry
+        //     non-2xx, so an intentionally-ignored event must not 4xx, and it must
+        //     not burn an execution's budget/audit row. The skip is still
+        //     `log_request`-recorded (observable) and rate-limiting already applied.
+        if let Some(ref filter) = trigger.event_filter {
+            let parsed_body: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            let header_value = filter
+                .get("header")
+                .and_then(|h| h.as_str())
+                .and_then(|name| headers.get(name))
+                .and_then(|v| v.to_str().ok());
+            if !event_filter_matches(filter, header_value, &parsed_body) {
+                tracing::debug!(
+                    trigger_id = %trigger_id,
+                    "event_filter: delivery did not match; acknowledging 200 without dispatch"
+                );
+                self.log_request(
+                    trigger_id,
+                    headers,
+                    &body,
+                    source_ip,
+                    StatusCode::OK.as_u16() as i32,
+                    None,
+                    0,
+                    0,
+                    true,
+                    Some("event filtered (no dispatch)"),
+                )
+                .await;
+                return Ok((StatusCode::OK, "Event ignored (filtered)").into_response());
             }
         }
 
@@ -2299,7 +2400,8 @@ impl WebhookRouter {
                    signing_secret_enc, signing_key_id, signing_secret_format,
                    allowed_ips, enabled, auto_respond, queue_events, max_requests_per_minute,
                    COALESCE(sync_response, false) as sync_response,
-                   COALESCE(sync_timeout_secs, 30) as sync_timeout_secs
+                   COALESCE(sync_timeout_secs, 30) as sync_timeout_secs,
+                   event_filter
             FROM webhook_triggers
             WHERE id = $1
             "#,
@@ -3833,6 +3935,110 @@ mod auth_downgrade_tests {
         // Degenerate (resolved-but-not-configured) is impossible in practice
         // but must also not fail closed.
         assert!(!webhook_must_fail_closed_on_hmac(false, true));
+    }
+}
+
+#[cfg(test)]
+mod event_filter_tests {
+    use super::event_filter_matches;
+    use serde_json::json;
+
+    // Canonical GitHub PR filter: only pull_request opened/synchronize/reopened.
+    fn gh_pr_filter() -> serde_json::Value {
+        json!({
+            "header": "X-GitHub-Event",
+            "values": ["pull_request"],
+            "payload_match": { "action": ["opened", "synchronize", "reopened"] }
+        })
+    }
+
+    #[test]
+    fn empty_filter_fires() {
+        assert!(event_filter_matches(&json!({}), Some("push"), &json!({})));
+    }
+
+    #[test]
+    fn malformed_filter_fails_open() {
+        // D6: a non-object filter fires rather than silently dropping.
+        assert!(event_filter_matches(&json!("nonsense"), None, &json!({})));
+        assert!(event_filter_matches(&json!([1, 2, 3]), None, &json!({})));
+    }
+
+    #[test]
+    fn github_pr_opened_matches() {
+        let f = gh_pr_filter();
+        assert!(event_filter_matches(
+            &f,
+            Some("pull_request"),
+            &json!({ "action": "opened", "number": 7 })
+        ));
+    }
+
+    #[test]
+    fn wrong_event_header_no_match() {
+        let f = gh_pr_filter();
+        // `push` is not in values → skip even though there's no `action`.
+        assert!(!event_filter_matches(
+            &f,
+            Some("push"),
+            &json!({ "ref": "refs/heads/main" })
+        ));
+    }
+
+    #[test]
+    fn right_event_wrong_action_no_match() {
+        let f = gh_pr_filter();
+        // pull_request but action=closed → not in the allowed actions.
+        assert!(!event_filter_matches(
+            &f,
+            Some("pull_request"),
+            &json!({ "action": "closed" })
+        ));
+    }
+
+    #[test]
+    fn required_header_absent_no_match() {
+        let f = gh_pr_filter();
+        assert!(!event_filter_matches(
+            &f,
+            None,
+            &json!({ "action": "opened" })
+        ));
+    }
+
+    #[test]
+    fn missing_payload_field_no_match() {
+        let f = gh_pr_filter();
+        // Header matches but the body has no `action` → payload clause fails.
+        assert!(!event_filter_matches(
+            &f,
+            Some("pull_request"),
+            &json!({ "number": 1 })
+        ));
+    }
+
+    #[test]
+    fn empty_values_array_is_no_header_constraint() {
+        // values: [] means "don't constrain the header" — only payload_match gates.
+        let f = json!({ "header": "X-GitHub-Event", "values": [], "payload_match": { "action": ["opened"] } });
+        assert!(event_filter_matches(
+            &f,
+            Some("anything"),
+            &json!({ "action": "opened" })
+        ));
+        assert!(!event_filter_matches(
+            &f,
+            Some("anything"),
+            &json!({ "action": "closed" })
+        ));
+    }
+
+    #[test]
+    fn header_only_filter_ignores_body() {
+        // No payload_match → only the event type gates; body is irrelevant.
+        let f = json!({ "header": "X-GitHub-Event", "values": ["push"] });
+        assert!(event_filter_matches(&f, Some("push"), &json!({})));
+        assert!(!event_filter_matches(&f, Some("pull_request"), &json!({})));
     }
 }
 
