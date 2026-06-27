@@ -5,7 +5,20 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::schema::types::*;
-use crate::schema::{require_scope, SafeErrorExtensions};
+use crate::schema::{require_platform_admin, require_scope, SafeErrorExtensions};
+
+/// Per-table per-org DEK migration status (one entry per encrypted table).
+#[derive(async_graphql::SimpleObject)]
+pub struct DekMigrationStatusEntry {
+    /// Logical table/column label.
+    pub table: String,
+    /// True when a `reEncrypt…ToOrg` sweep drives `pending` to 0; false for the
+    /// personal tables that migrate lazily on next write.
+    pub has_sweep: bool,
+    /// Rows still on the global DEK that have a resolvable org (remaining sweep
+    /// work). 0 = migration complete for this table.
+    pub pending: i64,
+}
 // use crate::schema::user_accessible_org_ids; // unused
 // use talos_compilation::CompilationService; // unused
 // use talos_registry::ModuleRegistry; // unused
@@ -57,6 +70,34 @@ impl SecurityQueries {
             created_at: r.created_at.to_rfc3339(),
             updated_at: r.updated_at.to_rfc3339(),
         }))
+    }
+
+    /// Per-org DEK migration status — per encrypted table, how many rows still
+    /// reference the global DEK but could be migrated to a per-org DEK (the
+    /// remaining work for the `reEncrypt…ToOrg` sweeps). When every `pending` is
+    /// 0, the global DEK is no longer load-bearing for migratable data.
+    /// Platform-admin only (reveals system-wide counts across all orgs).
+    async fn dek_migration_status(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<DekMigrationStatusEntry>> {
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        require_platform_admin(ctx).await?;
+
+        let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
+        let rows = secrets_manager.dek_migration_status().await.map_err(|e| {
+            tracing::error!("dek_migration_status failed: {}", e);
+            async_graphql::Error::new("Failed to read DEK migration status").extend_safe()
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| DekMigrationStatusEntry {
+                table: r.table,
+                has_sweep: r.has_sweep,
+                pending: r.pending,
+            })
+            .collect())
     }
 
     async fn api_keys(
