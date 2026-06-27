@@ -81,6 +81,11 @@ impl WebhookRepository {
         auto_respond: bool,
         sync_timeout_secs: i32,
         signing_secret: Option<&str>,
+        // RFC 0007: pre-validated event filter (the caller validates shape via
+        // `talos_webhooks::validate_event_filter` — this method only persists
+        // it, so the repository crate stays free of a dep on talos-webhooks).
+        // None → NULL → fire on every verified delivery.
+        event_filter: Option<&serde_json::Value>,
         secrets_manager: &talos_secrets_manager::SecretsManager,
         cap: i64,
     ) -> Result<Option<i64>> {
@@ -144,8 +149,8 @@ impl WebhookRepository {
             "INSERT INTO webhook_triggers \
              (id, user_id, name, module_id, workflow_id, verification_token, \
               max_requests_per_minute, auto_respond, sync_response, sync_timeout_secs, \
-              signing_secret_enc, signing_key_id, signing_secret_format, enabled, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true, NOW())",
+              signing_secret_enc, signing_key_id, signing_secret_format, event_filter, enabled, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, NOW())",
         )
         .bind(webhook_id)
         .bind(user_id)
@@ -162,6 +167,7 @@ impl WebhookRepository {
         .bind(signing_secret_enc.as_deref())
         .bind(signing_key_id)
         .bind(signing_secret_format)
+        .bind(event_filter)
         .execute(&mut *tx)
         .await
         .context("Failed to insert webhook under cap lock")?;

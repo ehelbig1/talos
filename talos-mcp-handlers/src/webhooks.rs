@@ -19,7 +19,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "auto_respond": { "type": "boolean", "description": "When true, the HTTP response body is the module/workflow's execution result (JSON). When false (default), the body is 'OK' and the work runs async. Use true for synchronous-response patterns (Slack /command, ChatOps). Honors sync_timeout_secs." },
                     "sync_timeout_secs": { "type": "number", "description": "Max seconds to wait for synchronous response when auto_respond=true (default: 30, max: 120). Exceeded requests return 504." },
                     "signing_secret": { "type": "string", "description": "Optional HMAC signing secret. When set, incoming POSTs must include ONE of: X-Slack-Signature (v0= prefix + X-Slack-Request-Timestamp), X-Hub-Signature-256 (sha256= prefix), or X-Signature (+ X-Webhook-Timestamp for replay protection). All HMACs are SHA-256 with this secret as the key. When omitted, the webhook uses static-token auth (X-Verification-Token) only." },
-                    "max_requests_per_minute": { "type": "number", "description": "Rate limit for incoming requests (default: 100, max: 10000)" }
+                    "max_requests_per_minute": { "type": "number", "description": "Rate limit for incoming requests (default: 100, max: 10000)" },
+                    "event_filter": { "type": "object", "description": "Optional event-type filter, evaluated AFTER signature verification. A non-matching delivery is acknowledged 200 with NO dispatch (so it doesn't burn an execution) — use it so a GitHub repo webhook fires only for, e.g., pull_request opened/synchronize and ignores push/star/etc. Omit to fire on every verified delivery. Shape: { \"header\": \"X-GitHub-Event\", \"values\": [\"pull_request\"], \"payload_match\": { \"action\": [\"opened\",\"synchronize\",\"reopened\"] } } — `header`+`values` gate on a request header; `payload_match` gates on top-level body fields; both are ANDed. At least one of a non-empty `values` or `payload_match` is required." }
                 },
                 "required": ["name"]
             }
@@ -290,6 +291,21 @@ async fn handle_create_webhook(
         Some(s) => Some(s.to_string()),
     };
 
+    // RFC 0007: optional event filter. Validated via the canonical
+    // `talos_webhooks::validate_event_filter` so the MCP and GraphQL create
+    // surfaces enforce ONE shape contract (matcher/validator drift is a
+    // documented hazard). Fail-CLOSED here (reject malformed) — the fire-time
+    // matcher is fail-OPEN. Absent/null → fire on every verified delivery.
+    let event_filter_opt: Option<serde_json::Value> = match args.get("event_filter") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            if let Err(e) = talos_webhooks::validate_event_filter(v) {
+                return mcp_error(req_id, -32602, &format!("Invalid event_filter: {e}"));
+            }
+            Some(v.clone())
+        }
+    };
+
     // Pre-flight: verify whichever target the caller specified actually exists
     // AND that this user can dispatch it. A bare `module_exists` would let an
     // attacker bind a webhook to another user's private module — the dispatch
@@ -378,6 +394,7 @@ async fn handle_create_webhook(
             auto_respond,
             sync_timeout_secs,
             signing_secret_opt.as_deref(),
+            event_filter_opt.as_ref(),
             &state.secrets_manager,
             MAX_WEBHOOKS_PER_USER,
         )
@@ -438,6 +455,7 @@ async fn handle_create_webhook(
                     "sync_timeout_secs": sync_timeout_secs,
                     "hmac_enabled": signing_secret_opt.is_some(),
                     "enabled": true,
+                    "event_filter": event_filter_opt,
                     "usage": {
                         "method": "POST",
                         "auth": auth_note,
