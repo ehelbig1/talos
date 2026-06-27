@@ -1114,9 +1114,14 @@ impl SecretsManager {
         // 1. Pre-generate secret_id so it's available as AAD.
         let secret_id = Uuid::new_v4();
 
-        // 2. Encrypt with secret_id bytes as AAD + per-context-derived key (v3).
-        let (key_id, stored_value, _version) = self
-            .encrypt_value_aad_v3(value, secret_id.as_bytes())
+        // 2. Encrypt under the row's org (per-org DEK arc): the INSERT binds
+        //    `org_id` ($11) as-is, so the row's org IS this param — Some(org) →
+        //    v4 under that org's DEK, None → v3 global DEK. (Personal secrets
+        //    stay global for now; org-pinning them would change the secrets RLS
+        //    path, out of scope here.) AAD stays = secret_id; decrypt keys off
+        //    the stored key_id regardless of org_id.
+        let (key_id, stored_value, version) = self
+            .encrypt_value_aad_v4_or_global(value, org_id, secret_id.as_bytes())
             .await?;
         // Extract the 12-byte nonce prefix back out for the legacy
         // `nonce` column (kept for backward-compat with operator
@@ -1174,7 +1179,7 @@ impl SecretsManager {
         .bind(creator_user_id)
         .bind(&allowed_modules)
         .bind(org_id)
-        .bind(Self::AAD_FORMAT_V3_DERIVED)
+        .bind(version)
         .fetch_one(&mut *tx)
         .await;
 
@@ -1488,19 +1493,20 @@ impl SecretsManager {
         // None on "not found or access denied" (preserved from the
         // pre-fix RETURNING semantics; existence-leak protection is
         // intact because the gate is in this WHERE clause).
-        let row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
-            r#"SELECT id, owner_user_id FROM secrets
+        let row: Option<(Uuid, Option<Uuid>, Option<Uuid>)> =
+            sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<Uuid>)>(
+                r#"SELECT id, owner_user_id, org_id FROM secrets
                WHERE key_path = $1
                  AND ($2::uuid IS NULL OR owner_user_id = $2::uuid OR org_id = ANY($3))
                FOR UPDATE"#,
-        )
-        .bind(key_path)
-        .bind(updater_user_id)
-        .bind(accessible_org_ids)
-        .fetch_optional(&mut *tx)
-        .await?;
+            )
+            .bind(key_path)
+            .bind(updater_user_id)
+            .bind(accessible_org_ids)
+            .fetch_optional(&mut *tx)
+            .await?;
 
-        let (secret_id, owner_user_id_for_cache) = match row {
+        let (secret_id, owner_user_id_for_cache, row_org_id) = match row {
             Some(r) => r,
             None => {
                 tracing::warn!(
@@ -1512,19 +1518,21 @@ impl SecretsManager {
             }
         };
 
-        // Encrypt with secret_id bytes as AAD + per-context-derived key (v3).
-        let (key_id, stored_value, _version) = self
-            .encrypt_value_aad_v3(new_value, secret_id.as_bytes())
+        // Re-encrypt under the row's EXISTING org (per-org DEK arc): a v4 secret
+        // stays under its org's DEK, a global (NULL-org) secret stays global.
+        // AAD stays = secret_id.
+        let (key_id, stored_value, version) = self
+            .encrypt_value_aad_v4_or_global(new_value, row_org_id, secret_id.as_bytes())
             .await?;
         let nonce_bytes = stored_value.get(..12).ok_or_else(|| {
-            anyhow!("encrypt_value_aad_v3 returned a ciphertext shorter than the nonce prefix")
+            anyhow!("encrypt returned a ciphertext shorter than the nonce prefix")
         })?;
 
-        // Apply the update. The CHECK on encryption_format_version is
-        // upgraded to 3 unconditionally — a row written via this path
-        // is always v3 going forward. The pre-fetch SELECT FOR UPDATE
-        // already locked the row; the UPDATE cannot miss under that
-        // lock, so we don't need RETURNING — `secret_id` and
+        // Apply the update. `version` is the format actually written (3 = global
+        // DEK, 4 = per-org DEK), bound from the encrypt result — never hardcoded,
+        // or a v4 row would be mislabeled v3 and fail to decrypt. The pre-fetch
+        // SELECT FOR UPDATE already locked the row; the UPDATE cannot miss under
+        // that lock, so we don't need RETURNING — `secret_id` and
         // `owner_user_id_for_cache` are already in scope.
         sqlx::query(
             r#"UPDATE secrets
@@ -1535,7 +1543,7 @@ impl SecretsManager {
         .bind(&stored_value)
         .bind(key_id)
         .bind(nonce_bytes)
-        .bind(Self::AAD_FORMAT_V3_DERIVED)
+        .bind(version)
         .bind(secret_id)
         .execute(&mut *tx)
         .await?;
@@ -1752,15 +1760,19 @@ impl SecretsManager {
                 self.decrypt_value_by_key_with_aad(key_id, encrypted, secret_id.as_bytes())
                     .await
             }
-            // v3: per-context-derived key bound to secret_id (same AAD as v1).
-            v if v == Self::AAD_FORMAT_V3_DERIVED => {
+            // v3 and v4 decrypt identically: per-context-derived key bound to
+            // secret_id (same AAD as v1). v4's only difference is the IKM is a
+            // per-org DEK named by `key_id`, which `get_dek` resolves by id — so
+            // the read path needs no org awareness. See AAD_FORMAT_V4_ORG_DERIVED.
+            v if v == Self::AAD_FORMAT_V3_DERIVED || v == Self::AAD_FORMAT_V4_ORG_DERIVED => {
                 self.decrypt_value_derived_with_aad(key_id, encrypted, secret_id.as_bytes())
                     .await
             }
             other => Err(anyhow!(
-                "unknown secrets encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), and {} (v3 per-context-derived). Row may have been written by a newer code version.",
+                "unknown secrets encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), {} (v3 per-context-derived), and {} (v4 per-org per-context-derived). Row may have been written by a newer code version.",
                 Self::SECRETS_AAD_FORMAT_V1,
-                Self::AAD_FORMAT_V3_DERIVED
+                Self::AAD_FORMAT_V3_DERIVED,
+                Self::AAD_FORMAT_V4_ORG_DERIVED
             )),
         }
     }
@@ -1962,15 +1974,43 @@ impl SecretsManager {
         user_id: Uuid,
         aad: &[u8],
     ) -> Result<(Uuid, Vec<u8>, i16)> {
-        let org_id: Uuid =
+        let org_id = self
+            .resolve_personal_org_id(user_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!("no personal org for user {user_id}; cannot derive per-org DEK")
+            })?;
+        self.encrypt_value_aad_v4_org(value, org_id, aad).await
+    }
+
+    /// Resolve a user's PERSONAL org id (the `owner_id = $1 AND is_personal`
+    /// row — unique per owner). `None` if the user has none (e.g. a synthetic
+    /// system user). The single source of truth for the
+    /// `set_org_id_from_personal_org` trigger's behaviour in Rust, so the DEK
+    /// scope a writer picks matches the org_id the trigger will stamp.
+    pub async fn resolve_personal_org_id(&self, user_id: Uuid) -> Result<Option<Uuid>> {
+        Ok(
             sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 AND is_personal")
                 .bind(user_id)
                 .fetch_optional(&self.db_pool)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!("no personal org for user {user_id}; cannot derive per-org DEK")
-                })?;
-        self.encrypt_value_aad_v4_org(value, org_id, aad).await
+                .await?,
+        )
+    }
+
+    /// v4-or-global encrypt: `Some(org)` → encrypt under that org's root DEK
+    /// (v4); `None` → encrypt under the global DEK (v3). The canonical primitive
+    /// for shared-org tables whose row may be org-scoped OR org-less — it keeps
+    /// the DEK scope identical to the row's `org_id` (NULL org ⇔ global DEK).
+    pub async fn encrypt_value_aad_v4_or_global(
+        &self,
+        value: &str,
+        target_org: Option<Uuid>,
+        aad: &[u8],
+    ) -> Result<(Uuid, Vec<u8>, i16)> {
+        match target_org {
+            Some(org_id) => self.encrypt_value_aad_v4_org(value, org_id, aad).await,
+            None => self.encrypt_value_aad_v3(value, aad).await,
+        }
     }
 
     /// Decrypt a v3 (`AAD_FORMAT_V3_DERIVED`) blob: re-derive the
@@ -3143,11 +3183,11 @@ impl SecretsManager {
             .await
             .context("Failed to acquire upsert advisory lock")?;
 
-        // Look up the existing row's id (if any). The advisory lock
+        // Look up the existing row's id + org (if any). The advisory lock
         // ensures no concurrent upsert of this key can interleave
         // between this SELECT and the subsequent write.
-        let existing_id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM secrets \
+        let existing: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, org_id FROM secrets \
              WHERE namespace = $1 AND key_path = $2 AND created_by = $3",
         )
         .bind(namespace)
@@ -3157,17 +3197,20 @@ impl SecretsManager {
         .await
         .context("Failed to look up existing secret for upsert")?;
 
-        let (secret_id, was_inserted) = match existing_id {
-            Some(id) => (id, false),
-            None => (Uuid::new_v4(), true),
+        // Per-org DEK arc: scope the DEK to the row's org. Update → the
+        // existing row's org; insert → the `org_id` param (what the INSERT
+        // binds). Some → v4 under that org, None → v3 global.
+        let (secret_id, was_inserted, target_org) = match existing {
+            Some((id, existing_org)) => (id, false, existing_org),
+            None => (Uuid::new_v4(), true, org_id),
         };
 
-        // Encrypt with the row's id as AAD + per-context-derived key (v3).
-        let (key_id, stored_value, _version) = self
-            .encrypt_value_aad_v3(value, secret_id.as_bytes())
+        // Encrypt under the row's org. AAD = secret_id.
+        let (key_id, stored_value, version) = self
+            .encrypt_value_aad_v4_or_global(value, target_org, secret_id.as_bytes())
             .await?;
         let nonce_bytes = stored_value.get(..12).ok_or_else(|| {
-            anyhow!("encrypt_value_aad_v3 returned a ciphertext shorter than the nonce prefix")
+            anyhow!("encrypt returned a ciphertext shorter than the nonce prefix")
         })?;
 
         if was_inserted {
@@ -3192,7 +3235,7 @@ impl SecretsManager {
             .bind(creator_user_id)
             .bind(&allowed_modules)
             .bind(org_id)
-            .bind(Self::AAD_FORMAT_V3_DERIVED)
+            .bind(version)
             .execute(&mut *tx)
             .await
             .map_err(|e| anyhow::Error::new(e).context("upsert_secret INSERT failed"))?;
@@ -3215,7 +3258,7 @@ impl SecretsManager {
             .bind(key_id)
             .bind(nonce_bytes)
             .bind(description)
-            .bind(Self::AAD_FORMAT_V3_DERIVED)
+            .bind(version)
             .bind(secret_id)
             .execute(&mut *tx)
             .await
@@ -3512,15 +3555,27 @@ impl SecretsManager {
         new_value: &str,
     ) -> Result<Option<RotatedSecret>> {
         // N T2-N1: bind `secret_id` as AAD on the rotated ciphertext.
-        // Caller already supplies `secret_id` (typically resolved via
-        // `resolve_to_id`), so the AAD is known at encrypt time
-        // without a pre-fetch. The post-rotate row is v3 format
-        // (AAD-bound + per-context-derived key).
-        let (key_id, stored_value, _version) = self
-            .encrypt_value_aad_v3(new_value, secret_id.as_bytes())
+        // Caller already supplies `secret_id`, so the AAD is known at encrypt
+        // time. Per-org DEK arc: re-encrypt under the row's EXISTING org so the
+        // rotated ciphertext stays in the same DEK scope. Pre-fetch the org
+        // (scoped to created_by, matching the UPDATE guard below); no row →
+        // stale id / foreign tenant → return None like the UPDATE does.
+        let target_org: Option<Uuid> = match sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT org_id FROM secrets WHERE id = $1 AND created_by = $2",
+        )
+        .bind(secret_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?
+        {
+            Some(org) => org,
+            None => return Ok(None),
+        };
+        let (key_id, stored_value, version) = self
+            .encrypt_value_aad_v4_or_global(new_value, target_org, secret_id.as_bytes())
             .await?;
         let nonce_bytes = stored_value.get(..12).ok_or_else(|| {
-            anyhow!("encrypt_value_aad_v3 returned a ciphertext shorter than the nonce prefix")
+            anyhow!("encrypt returned a ciphertext shorter than the nonce prefix")
         })?;
 
         // UPDATE + audit row in a single transaction (L-5) so the
@@ -3540,7 +3595,7 @@ impl SecretsManager {
         .bind(&stored_value)
         .bind(key_id)
         .bind(nonce_bytes)
-        .bind(Self::AAD_FORMAT_V3_DERIVED)
+        .bind(version)
         .bind(secret_id)
         .bind(user_id)
         .fetch_optional(&mut *tx)
@@ -4277,15 +4332,22 @@ impl SecretsManager {
         // DEK AND v3 format. Binding the target version (V3) means a row
         // freshly written as v3 on a STALE dek is still selected (key
         // mismatch) and re-written as v3 — never downgraded.
+        //
+        // Per-org DEK arc: this is the GLOBAL-DEK sweep. EXCLUDE v4 (per-org)
+        // rows — their key_id is an org DEK (≠ the global active_dek), so they'd
+        // otherwise match `encryption_key_id != $1` and get DOWNGRADED back to
+        // the global DEK. Re-keying org rows is the (future) per-org sweep's job.
         let stale_rows = sqlx::query(
             r#"
             SELECT id, encrypted_value, encryption_key_id, encryption_format_version
             FROM secrets
-            WHERE encryption_key_id != $1 OR encryption_format_version < $2
+            WHERE (encryption_key_id != $1 OR encryption_format_version < $2)
+              AND encryption_format_version <> $3
             "#,
         )
         .bind(active_dek.id)
         .bind(Self::AAD_FORMAT_V3_DERIVED)
+        .bind(Self::AAD_FORMAT_V4_ORG_DERIVED)
         .fetch_all(&self.db_pool)
         .await
         .context("Failed to fetch secrets for re-encryption")?;
