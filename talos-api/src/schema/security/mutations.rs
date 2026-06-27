@@ -599,18 +599,16 @@ impl SecurityMutations {
                     .map_err(|_| {
                         async_graphql::Error::new("Secrets manager not configured").extend_safe()
                     })?;
-                let (key_id, ciphertext, format) =
-                    talos_audit_ledger::encrypt_otlp_auth_headers_v3(
-                        secrets_manager,
-                        &headers,
-                        *user_id,
-                    )
-                    .await
-                    .map_err(|_| {
-                        // Opaque message — never leak crypto/internal detail.
-                        async_graphql::Error::new("Failed to encrypt audit auth headers")
-                            .extend_safe()
-                    })?;
+                let (key_id, ciphertext, format) = talos_audit_ledger::encrypt_otlp_auth_headers(
+                    secrets_manager,
+                    &headers,
+                    *user_id,
+                )
+                .await
+                .map_err(|_| {
+                    // Opaque message — never leak crypto/internal detail.
+                    async_graphql::Error::new("Failed to encrypt audit auth headers").extend_safe()
+                })?;
                 encrypted_headers = Some(ciphertext);
                 headers_enc_key_id = Some(key_id);
                 headers_format = format;
