@@ -59,7 +59,12 @@ mod test_crypto {
     struct TestMemoryCrypto;
 
     impl talos_memory::MemoryCryptoHook for TestMemoryCrypto {
-        fn encrypt(&self, plaintext: String, aad: Vec<u8>) -> talos_memory::EncryptFuture {
+        fn encrypt(
+            &self,
+            plaintext: String,
+            _org_id: Option<uuid::Uuid>,
+            aad: Vec<u8>,
+        ) -> talos_memory::EncryptFuture {
             Box::pin(async move {
                 let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&TEST_KEY));
                 // Random 12-byte nonce, prepended to the ciphertext so decrypt

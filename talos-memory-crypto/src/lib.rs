@@ -25,11 +25,11 @@ use uuid::Uuid;
 use talos_secrets_manager::SecretsManager;
 
 /// Adapter from `talos_memory::MemoryCryptoHook` to `SecretsManager`.
-/// Delegates `encrypt` to `SecretsManager::encrypt_value_aad_v3`
-/// (per-context-derived key + AAD-bound; returns
-/// `(key_id, ciphertext, version)`) and `decrypt` to
+/// Delegates `encrypt` to `SecretsManager::encrypt_value_aad_v4_or_global`
+/// (per-context-derived key + AAD-bound; `Some(org)` → that org's root DEK
+/// = format v4, `None` → the global DEK = v3) and `decrypt` to
 /// `SecretsManager::decrypt_versioned` (which dispatches on the stored
-/// `value_format`, so legacy v1 rows keep decrypting).
+/// `value_format`, so legacy v0/v1/v3 + new v4 rows all decrypt).
 pub struct SecretsManagerMemoryCrypto {
     secrets: Arc<SecretsManager>,
 }
@@ -45,10 +45,15 @@ impl talos_memory::MemoryCryptoHook for SecretsManagerMemoryCrypto {
     fn encrypt(
         &self,
         plaintext: String,
+        org_id: Option<Uuid>,
         aad: Vec<u8>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(Uuid, Vec<u8>, i16)>> + Send>> {
         let secrets = self.secrets.clone();
-        Box::pin(async move { secrets.encrypt_value_aad_v3(&plaintext, &aad).await })
+        Box::pin(async move {
+            secrets
+                .encrypt_value_aad_v4_or_global(&plaintext, org_id, &aad)
+                .await
+        })
     }
 
     fn decrypt(
