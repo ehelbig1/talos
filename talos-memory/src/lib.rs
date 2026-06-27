@@ -213,7 +213,12 @@ pub trait MemoryCryptoHook: Send + Sync + 'static {
     /// `value_key_id` (silent cross-actor / cross-key data leak).
     /// The format_version is persisted to `actor_memory.value_format`
     /// alongside the ciphertext.
-    fn encrypt(&self, plaintext: String, aad: Vec<u8>) -> EncryptFuture;
+    ///
+    /// Per-org DEK arc: `org_id` is the actor's org (resolved by the persist /
+    /// clone caller). `Some(org)` → encrypt under that org's root DEK (format
+    /// v4); `None` → the global DEK (v3). The DEK scope matches the row's
+    /// stamped `actor_memory.org_id`.
+    fn encrypt(&self, plaintext: String, org_id: Option<Uuid>, aad: Vec<u8>) -> EncryptFuture;
 
     /// Decrypt ciphertext using the DEK referenced by `key_id`,
     /// dispatching on the per-row `value_format` column (0 = legacy
@@ -285,13 +290,30 @@ pub fn memory_crypto_enabled() -> bool {
 /// to avoid redundant `serde_json::to_string` round-trips per write.
 pub(crate) async fn maybe_encrypt_value_serialized(
     plaintext: String,
+    org_id: Option<Uuid>,
     aad: Vec<u8>,
 ) -> anyhow::Result<Option<(Uuid, Vec<u8>, i16)>> {
     let Some(hook) = MEMORY_CRYPTO_HOOK.get().cloned() else {
         return Ok(None);
     };
-    let (key_id, ciphertext, version) = hook.encrypt(plaintext, aad).await?;
+    let (key_id, ciphertext, version) = hook.encrypt(plaintext, org_id, aad).await?;
     Ok(Some((key_id, ciphertext, version)))
+}
+
+/// Resolve the org an actor belongs to, for per-org DEK scoping at memory-write
+/// time. `actors.org_id` is set for every actor (the actor arc + org backfill),
+/// so this is normally `Some`. `None` (missing actor / NULL org) falls back to
+/// the global DEK in `encrypt_value_aad_v4_or_global`. The resolved org is also
+/// stamped onto the `actor_memory` row so the row's `org_id` matches its DEK.
+pub(crate) async fn resolve_actor_org_id(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+) -> anyhow::Result<Option<Uuid>> {
+    let org: Option<Option<Uuid>> = sqlx::query_scalar("SELECT org_id FROM actors WHERE id = $1")
+        .bind(actor_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(org.flatten())
 }
 
 /// Resolve a stored memory value: prefer ciphertext (`value_enc` +
@@ -612,20 +634,24 @@ pub async fn persist_memory_with_metadata(
     // ciphertext to its composite primary key. An attacker with DB
     // write capability who swaps `value_enc` onto a different
     // (actor_id, key) row will fail AES-GCM tag verification on read.
+    // Per-org DEK arc: encrypt under the actor's org root DEK (v4), and stamp
+    // that org on the row so its org_id matches its DEK scope.
+    let org_id = resolve_actor_org_id(pool, actor_id).await?;
     let aad = build_memory_aad(actor_id, key);
-    let (key_id, ciphertext, value_format) = maybe_encrypt_value_serialized(serialized, aad)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "actor_memory write attempted without crypto hook registered — \
+    let (key_id, ciphertext, value_format) =
+        maybe_encrypt_value_serialized(serialized, org_id, aad)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "actor_memory write attempted without crypto hook registered — \
              ensure register_memory_crypto_hook() runs at startup before any write"
-            )
-        })?;
+                )
+            })?;
 
     sqlx::query(
         "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, metadata, org_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (actor_id, key) DO UPDATE SET \
              value_enc     = EXCLUDED.value_enc, \
              value_key_id  = EXCLUDED.value_key_id, \
@@ -634,6 +660,7 @@ pub async fn persist_memory_with_metadata(
              expires_at    = EXCLUDED.expires_at, \
              embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
              metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
+             org_id        = EXCLUDED.org_id, \
              updated_at    = now()",
     )
     .bind(actor_id)
@@ -645,6 +672,7 @@ pub async fn persist_memory_with_metadata(
     .bind(expires_at)
     .bind(embedding)
     .bind(metadata)
+    .bind(org_id)
     .execute(pool)
     .await
     .context("Failed to persist actor memory")?;
@@ -748,20 +776,29 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     // Same Phase-B always-encrypt path as persist_memory.
     // MCP-S2: AAD binding to composite (actor_id, key) — see
     // persist_memory above for the rationale.
+    // Per-org DEK arc: resolve the actor's org ON THE TX (consistent snapshot
+    // with the write), encrypt under its root DEK (v4), and stamp it on the row.
+    let org_row: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT org_id FROM actors WHERE id = $1")
+            .bind(actor_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let org_id = org_row.flatten();
     let aad = build_memory_aad(actor_id, key);
-    let (key_id, ciphertext, value_format) = maybe_encrypt_value_serialized(serialized, aad)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "actor_memory write attempted without crypto hook registered — \
+    let (key_id, ciphertext, value_format) =
+        maybe_encrypt_value_serialized(serialized, org_id, aad)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "actor_memory write attempted without crypto hook registered — \
              ensure register_memory_crypto_hook() runs at startup before any write"
-            )
-        })?;
+                )
+            })?;
 
     sqlx::query(
         "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, metadata, org_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (actor_id, key) DO UPDATE SET \
              value_enc     = EXCLUDED.value_enc, \
              value_key_id  = EXCLUDED.value_key_id, \
@@ -770,6 +807,7 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
              expires_at    = EXCLUDED.expires_at, \
              embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
              metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
+             org_id        = EXCLUDED.org_id, \
              updated_at    = now()",
     )
     .bind(actor_id)
@@ -781,6 +819,7 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     .bind(expires_at)
     .bind(embedding)
     .bind(metadata)
+    .bind(org_id)
     .execute(&mut **tx)
     .await
     .context("Failed to persist actor memory (in tx)")?;
@@ -1668,13 +1707,17 @@ pub async fn clone_memories(
     source_actor_id: Uuid,
     target_actor_id: Uuid,
 ) -> Result<i64> {
-    // MCP-S2: v1 ciphertexts bind AAD = build_memory_aad(actor_id, key)
+    // MCP-S2: v1/v3/v4 ciphertexts bind AAD = build_memory_aad(actor_id, key)
     // so a raw SQL ciphertext-passthrough across actors would produce
     // rows whose AAD bytes don't match their new actor_id, breaking
-    // decryption. Three paths:
-    //   1. v0 rows (no AAD) — safe to bulk-copy ciphertext directly.
-    //   2. v1 rows — must be DECRYPTED with the source AAD, then
-    //      RE-ENCRYPTED with the target AAD, then written.
+    // decryption. Paths:
+    //   1. v0 rows (no AAD) — safe to bulk-copy ciphertext directly (stay
+    //      global-DEK, org_id NULL).
+    //   2. v1/v3/v4 rows — DECRYPTED with the source AAD (using each row's own
+    //      format), then RE-ENCRYPTED under the TARGET actor's org root DEK
+    //      (per-org DEK arc) with the target AAD, then written with org_id =
+    //      target's org. (v3 rows were previously DROPPED here — the old SELECT
+    //      matched only value_format = 1; this also closes that gap.)
     //   3. Rows without a crypto hook (test/standalone) — copy plaintext
     //      legacy column unchanged (current legacy behaviour).
     //
@@ -1698,19 +1741,23 @@ pub async fn clone_memories(
     // semantically "no rows changed" rather than "some rows changed,
     // some didn't."
 
-    // ── Pre-fetch v1 source rows + do crypto work (NO tx held) ────
+    // Per-org DEK arc: re-encrypt the cloned rows under the TARGET actor's org
+    // root DEK (resolved once), and stamp that org on the cloned rows.
+    let target_org = resolve_actor_org_id(pool, target_actor_id).await?;
+
+    // ── Pre-fetch AAD-bound source rows (v1/v3/v4) + do crypto work (NO tx held) ──
     let v1_rows = sqlx::query(
         "SELECT key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata \
          FROM actor_memory \
          WHERE actor_id = $1 \
-           AND value_format = 1 \
+           AND value_format IN (1, 3, 4) \
            AND memory_type IN ('semantic', 'episodic') \
            AND (expires_at IS NULL OR expires_at > NOW())",
     )
     .bind(source_actor_id)
     .fetch_all(pool)
     .await
-    .context("clone_memories: select v1 source rows")?;
+    .context("clone_memories: select AAD-bound (v1/v3/v4) source rows")?;
 
     // Buffer the decrypted+re-encrypted v1 rows in memory so the
     // transaction below holds only DB-write work, not crypto.
@@ -1736,20 +1783,23 @@ pub async fn clone_memories(
             let key: String = r.get("key");
             let value_enc: Vec<u8> = r.get("value_enc");
             let value_key_id: Uuid = r.get("value_key_id");
+            let src_format: i16 = r.get("value_format");
             let memory_type: String = r.get("memory_type");
             let metadata: Option<serde_json::Value> = r.try_get("metadata").ok();
-            // Decrypt under SOURCE AAD.
+            // Decrypt under SOURCE AAD, using the row's OWN format (v1/v3/v4 all
+            // decrypt via the versioned dispatch).
             let source_aad = build_memory_aad(source_actor_id, &key);
             let plaintext = hook
-                .decrypt(value_key_id, value_enc, source_aad, 1)
+                .decrypt(value_key_id, value_enc, source_aad, src_format)
                 .await
-                .with_context(|| format!("clone_memories: decrypt v1 source row key={key}"))?;
-            // Re-encrypt under TARGET AAD.
+                .with_context(|| format!("clone_memories: decrypt source row key={key}"))?;
+            // Re-encrypt under the TARGET actor's org DEK + TARGET AAD. new_format
+            // is 4 (target has an org) or 3 (global) — stamped from the result.
             let target_aad = build_memory_aad(target_actor_id, &key);
             let (new_key_id, new_ciphertext, new_format) = hook
-                .encrypt(plaintext.to_string(), target_aad)
+                .encrypt(plaintext.to_string(), target_org, target_aad)
                 .await
-                .with_context(|| format!("clone_memories: re-encrypt v1 row key={key}"))?;
+                .with_context(|| format!("clone_memories: re-encrypt row key={key}"))?;
             let new_expires_at: Option<chrono::DateTime<chrono::Utc>> = match memory_type.as_str() {
                 "semantic" => None,
                 "episodic" => Some(chrono::Utc::now() + chrono::Duration::days(7)),
@@ -1808,8 +1858,8 @@ pub async fn clone_memories(
     let mut v1_count: i64 = 0;
     for row in v1_buffered {
         sqlx::query(
-            "INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \
+            "INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, org_id, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) \
              ON CONFLICT (actor_id, key) DO UPDATE \
                SET value_enc = EXCLUDED.value_enc, \
                    value_key_id = EXCLUDED.value_key_id, \
@@ -1817,6 +1867,7 @@ pub async fn clone_memories(
                    memory_type = EXCLUDED.memory_type, \
                    expires_at = EXCLUDED.expires_at, \
                    metadata = EXCLUDED.metadata, \
+                   org_id = EXCLUDED.org_id, \
                    updated_at = NOW()",
         )
         .bind(target_actor_id)
@@ -1827,6 +1878,7 @@ pub async fn clone_memories(
         .bind(&row.memory_type)
         .bind(row.new_expires_at)
         .bind(row.metadata)
+        .bind(target_org)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("clone_memories: insert v1 target row key={}", row.key))?;
