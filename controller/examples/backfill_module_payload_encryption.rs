@@ -91,6 +91,10 @@ async fn main() -> Result<()> {
             let bundle = encrypt_payload_bundle(
                 Some(&secrets),
                 id,
+                // Backfill of existing rows — pass None so the org is resolved
+                // from the existing module_executions row (workflow's org → v4,
+                // or global v3 for standalone rows).
+                None,
                 input.as_ref(),
                 output.as_ref(),
                 trigger.as_ref(),

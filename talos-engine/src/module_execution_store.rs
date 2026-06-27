@@ -92,6 +92,9 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
             self.secrets_manager.as_ref(),
             id,
+            // Per-org DEK arc: scope to the execution's tenant org via the parent
+            // workflow execution (resolved inside encrypt_payload_bundle).
+            Some(workflow_execution_id),
             Some(input),
             None,
             None,
@@ -198,6 +201,10 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
             self.secrets_manager.as_ref(),
             id,
+            // record_completed: workflow_execution_id isn't in scope; pass None so
+            // encrypt_payload_bundle resolves the SAME org from the existing row
+            // (keeps the shared payload_enc_key_id consistent with record_started).
+            None,
             None,
             Some(output),
             None,
