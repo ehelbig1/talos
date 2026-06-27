@@ -235,11 +235,18 @@ impl WebhooksMutations {
         // Encrypt signing secret at rest using envelope encryption (AES-256-GCM).
         // The plaintext signing_secret column is set to NULL; only the encrypted
         // column is populated for new triggers.
+        //
+        // Per-org DEK arc: writes format v4 — encrypted under the owner's
+        // PERSONAL-org root DEK (webhook_triggers.org_id is stamped from the
+        // owner's personal org by set_org_id_from_personal_org, so the DEK scope
+        // matches). AAD stays bound to trigger_id (the row id, swap-resistance);
+        // only the DEK selection changes. Decrypt is unchanged — the fire path's
+        // decrypt_versioned routes v4 through the v3 derived path.
         let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
         let (signing_secret_enc, signing_key_id, signing_secret_format) =
             if let Some(ref secret) = input.signing_secret {
                 let (key_id, encrypted, version) = secrets_manager
-                    .encrypt_value_aad_v3(secret, trigger_id.as_bytes())
+                    .encrypt_value_aad_v4_for_user(secret, *user_id, trigger_id.as_bytes())
                     .await
                     .map_err(|e| {
                         tracing::error!("Failed to encrypt webhook signing_secret: {}", e);
