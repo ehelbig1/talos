@@ -50,7 +50,8 @@ Four-digit, zero-padded, allocated in order. Never reused.
 | [0004](0004-tenant-equals-organization.md) | Tenant = Organization | In progress | The tenant is the organization; membership-union policy, GUC primitives, permissive rollout (M1 landing) |
 | [0005](0005-tenant-isolation-target-architecture.md) | Tenant-isolation target architecture | Draft | End-state RLS: dual-role via `SET LOCAL ROLE`, request-scoped unit-of-work, fail-closed `WITH CHECK`; executed in stages |
 | [0006](0006-org-scoped-write-isolation-pins-org-not-user.md) | Org-scoped write isolation pins `org_id`, not `user_id` | In progress | Decided (enterprise): `secrets` gets a per-user owner pin (Option B, implemented); `workflows`/`actors` stay org-pinned only. Latent until RLS enforcement is on + secret writes wired to `begin_org_scoped` |
-| [0007](0007-native-github-integration.md) | Native GitHub integration | Phase A complete | Server-side event-type filtering shipped: `event_filter` on `webhook_triggers` (create+validate+read-back across GraphQL & MCP) + `__webhook__` event metadata to the trigger input. Phase B (separate future RFC): GitHub App OAuth vs PATs |
+| [0007](0007-native-github-integration.md) | Native GitHub integration | Phase A complete | Server-side event-type filtering shipped: `event_filter` on `webhook_triggers` (create+validate+read-back across GraphQL & MCP) + `__webhook__` event metadata to the trigger input. Phase B → RFC 0008 |
+| [0008](0008-github-app-authentication.md) | GitHub App authentication | Draft | Phase B of native GitHub. Replace long-lived PATs with a GitHub App: 1-hour auto-rotating installation tokens minted from an RS256 App JWT (NOT the OAuth refresh path → needs its own renewal arm), App-level webhook delivery, click-to-connect, PAT fallback during migration |
 
 ## Template for new RFCs
 

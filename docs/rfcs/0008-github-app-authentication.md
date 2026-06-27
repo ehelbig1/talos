@@ -1,0 +1,214 @@
+# RFC 0008 — GitHub App authentication (Phase B of native GitHub integration)
+
+**Status:** Draft
+**Author:** Claude (paired with Evan)
+**Date:** 2026-06-27
+**Follows:** [RFC 0007](0007-native-github-integration.md) (Phase A — event-typed webhook triggers, shipped)
+
+## TL;DR
+
+Phase A made inbound GitHub webhooks first-class (signature verify + replay/dedup
+already existed; we added server-side event-type filtering + `__webhook__`
+metadata). The remaining gap is **outbound auth**: the `github-pr-reviewer` /
+`github-analyzer` modules call the GitHub API with a long-lived **Personal Access
+Token (PAT)** stored as a secret. PATs are coarse-grained, manually rotated, and
+tied to a human account.
+
+Phase B replaces them with a **GitHub App**: short-lived (1-hour), per-repo-scoped,
+**auto-rotating installation access tokens** minted from the App's private key,
+plus a click-to-connect install flow. The PAT path keeps working as a fallback
+during migration.
+
+**Why a separate RFC (not just "add a provider"):** GitHub App auth is **not** the
+OAuth authorization-code + refresh-token flow that Talos's centralized OAuth
+refresh (`talos-oauth`) implements. Installation tokens are minted from an App
+JWT (RS256-signed with the App private key) and are **not refreshable** — you
+re-mint them. That breaks the core assumption of `refresh_oauth_token_if_needed`
+and needs its own renewal arm. The shape is different enough to design before
+coding.
+
+## Context
+
+**What exists today:**
+
+- **Inbound (Phase A, shipped #337–#341):** `talos-webhooks` verifies GitHub's
+  `X-Hub-Signature-256`, dedups on `X-GitHub-Delivery`, filters by event type
+  (`event_filter`), and surfaces `__webhook__ = {event, delivery, action}` to the
+  workflow.
+- **Outbound:** `module-templates/github-pr-reviewer` + `github-analyzer` call
+  `api.github.com` with a PAT supplied as a module secret. No App, no scoped
+  tokens, no connect-UX.
+- **OAuth infrastructure (reuse where it fits):**
+  - `talos-oauth/src/credentials.rs` — `OAuthCredentialService` (tokens live in
+    `integration_credentials`, never in the provider's own table) +
+    `refresh_oauth_token_if_needed` (per-provider OAuth refresh-token exchange).
+  - `talos-oauth/src/refresh_task.rs` — `proactive_token_refresh_task`, polls
+    `integration_credentials` every ~5 min, renews tokens expiring within ~10 min.
+  - `talos-integrations/src/provider_config.rs` — the `PROVIDERS` registry the
+    frontend auto-discovers (`/api/integrations/providers`).
+  - Gold-standard providers to mirror: `talos-atlassian` (PKCE, metadata-only
+    table), `talos-gmail` (dual-write), `talos-google-calendar`.
+  - Vault path convention: `oauth/{provider}/{user_id}/{provider_key}/access_token`.
+  - Renewal-failure classification: `talos_integration_helpers::RenewalFailure` +
+    `looks_like_oauth_failure` (see `docs/integration-pattern.md`).
+- There is **no `talos-github` crate** yet.
+
+**Why PATs are insufficient:** long-lived (no forced expiry), coarse (user-scoped,
+usually all of a user's repos), manually rotated, and bound to a person — when
+they leave or rotate the token, every workflow breaks. A compromised PAT is a
+broad, durable credential.
+
+**The GitHub App token model (the crux):** two distinct credentials.
+
+1. **App JWT** — a short-lived (≤10 min) JWT **RS256-signed with the App's private
+   key**, `iss = App ID`. Identifies the App itself. Used *only* to mint
+   installation tokens.
+2. **Installation access token** — `POST /app/installations/{installation_id}/access_tokens`
+   (authorized by the App JWT) returns a token that expires in **1 hour**, scoped
+   to that installation's repositories + permissions. **It is not refreshable via
+   an OAuth `refresh_token` grant** — when it expires you mint a new App JWT and
+   request a fresh installation token.
+
+(GitHub Apps *also* support a user-to-server OAuth flow — authorization code +
+refresh token — for acting *as* the connecting user. That's the flow
+`talos-oauth` already models, but it's **not** what webhook-triggered automation
+wants. See Non-goals.)
+
+## Decisions
+
+**D1. Use server-to-server installation tokens, not user-to-server OAuth.**
+Webhook-triggered automation runs with no interactive user in the loop, so the
+installation token (acting as the App, scoped to the installation) is the correct
+credential. User-to-server OAuth is deferred (D-NG1).
+
+**D2. App config is a platform/operator secret; installation state is per-connection
+metadata.** The App **private key + App ID + webhook secret** are a *single*
+operator-provided config (one self-hosted Talos operator registers one GitHub
+App), stored in the platform secret namespace via `SecretsManager` (encrypted at
+rest; per-org DEK v4 where an org is resolvable, else global v3). Per connection
+we persist only **metadata** — `installation_id`, the GitHub account/org, granted
+permissions + repo selection — mirroring the Atlassian "metadata-only table"
+pattern. **No private key or token columns in the provider table.**
+
+**D3. Installation tokens are minted + cached, renewed by a NEW arm — not the OAuth
+refresh path.** A new minter (in a `talos-github` crate) produces: App JWT (RS256)
+→ installation token. Cache the installation token with its 1-hour expiry in
+`integration_credentials` (keyed by `installation_id`). Extend
+`proactive_token_refresh_task` to recognize `provider = "github_app"` and call the
+minter **instead of** `refresh_oauth_token_if_needed` (which does an OAuth
+refresh-token exchange GitHub App installations don't have). Reuse the task's
+scheduling + `RenewalFailure` / `looks_like_oauth_failure` classification; branch
+only the actual mint call.
+
+**D4. Webhook delivery via the App-level webhook, not per-repo registration.** A
+GitHub App has **one** configured webhook URL; GitHub auto-delivers events for
+*every* installation to it. So "connect" = install the App — **no per-repo
+`POST /repos/{}/hooks` calls**, no per-repo webhook state to manage. The App
+webhook secret is **App-level** (one HMAC secret for all deliveries). Reconcile
+with Phase A: the App secret verifies the delivery (the existing
+`X-Hub-Signature-256` path already does HMAC-SHA256 over the raw body — it just
+reads the secret from a different place); routing to a specific workflow is by
+installation/repo rather than per-trigger `signing_secret`.
+*Alternative — repository webhooks via API per repo:* rejected — more API calls,
+more renewal-sensitive state, and GitHub recommends App webhooks for App
+integrations. (Keep per-repo as an escape hatch only if a use case demands
+repo-granular routing.)
+
+**D5. Click-to-connect = the App install flow (not authorization-code OAuth).**
+Redirect the user to `https://github.com/apps/{app_slug}/installations/new`;
+GitHub handles repo selection and redirects back to a callback with
+`installation_id` + `setup_action`. Persist the installation metadata (D2).
+Follow `docs/integration-pattern.md`'s file shape where it maps, but note the
+install flow differs from the PKCE authorization-code flow the gold-standard
+providers use — there is no `code`→token exchange; the `installation_id` is the
+durable handle and tokens are minted on demand (D3).
+
+**D6. Migration is additive: PAT keeps working, App is opt-in then default.** The
+GitHub modules resolve a token at run time: **prefer** an App installation token
+for the repo's owner when an installation is connected; **fall back** to the
+existing PAT secret otherwise. No flag-day; an operator with no App configured is
+unaffected.
+
+**D7. Installation tokens obey the existing secret + host + tier gates.** The
+minted token is a secret: vault-stored, never logged (presence only), DLP-redacted
+in any persisted output, and it reaches the worker only through the standard
+AES-256-GCM `encrypted_secrets` envelope / `vault://` header resolution — never as
+plaintext on the wire. Outbound calls stay gated by `allowed_hosts`
+(`api.github.com`) and the actor's `max_llm_tier` path (GitHub is not an LLM host,
+so no tier-1 deny, but the dispatch path is unchanged).
+
+## Migration plan
+
+Each phase independently shippable; PAT path intact throughout.
+
+- **B1. `talos-github` crate — token minting.** App JWT (RS256) + installation-token
+  mint + 1-hour cache. JWT signing is pure given (private key, App ID, clock), so
+  it's unit-tested without network (inject the clock; assert header/claims/`exp`).
+  *Rollback:* crate unused until B3 wires it.
+- **B2. Connect flow + provider registry + installation table.** Migration:
+  `github_app_installations (user_id/org, installation_id UNIQUE, account_login,
+  permissions JSONB, repo_selection, is_active, created/updated)` — **no token
+  columns**. Add a `PROVIDERS` entry; add the install-redirect + callback handlers.
+  *Rollback:* table is additive; routes behind the registry entry.
+- **B3. Renewal arm.** Branch `proactive_token_refresh_task` on
+  `provider = "github_app"` → call B1's minter; cache result in
+  `integration_credentials`. *Rollback:* the arm only fires for github_app rows,
+  which don't exist until B2 connects one.
+- **B4. Module token resolution (App-first, PAT-fallback).** `github-pr-reviewer` /
+  `github-analyzer` resolve an installation token for the repo owner, else the PAT
+  secret. *Rollback:* default to PAT if no installation resolves.
+- **B5. App-level webhook secret verification.** Point the Phase-A HMAC verify at
+  the App webhook secret for App-delivered events; keep per-trigger
+  `signing_secret` for non-App webhooks. *Rollback:* App webhooks simply aren't
+  verified-as-App until this lands (don't enable App webhook delivery before B5).
+
+## Non-goals
+
+- **(D-NG1) User-to-server OAuth** (acting *as* the connecting GitHub user, with a
+  user refresh token). Separate future work if "attribute the action to the user"
+  semantics are needed; installation tokens act as the App.
+- **GitHub Enterprise Server (self-hosted GHES)** — different API base URL +
+  host-allowlist entries. Note as a follow-up; Phase B targets github.com.
+- **Retiring PATs.** They remain the documented fallback (D6); deprecation is a
+  later decision once App coverage is proven.
+- Any change to Phase A's inbound filter/replay/dedup (already shipped + correct).
+
+## Open questions
+
+1. **Platform-global vs per-org App.** Assumption: one operator-registered App per
+   Talos deployment; installations are per connecting GitHub account/org. Confirm
+   this fits the multi-tenant model (vs. each org bringing its own App ID/key —
+   more config, stronger isolation).
+2. **Where exactly App config lives.** Platform secret namespace + key names for
+   App ID / private key (PEM) / webhook secret; who can read/rotate them (the
+   `require_2fa + SecretsWrite` discipline applies).
+3. **RS256 dependency.** Add a JWT/RS256 signer (e.g. `jsonwebtoken`) to the
+   dependency allowlist; confirm it's WASM-irrelevant (controller-side only — the
+   worker never holds the App key, consistent with the credential-free-worker
+   invariant).
+4. **Token cache scope.** Reuse `integration_credentials` (1h expiry rows) vs a
+   dedicated short-TTL cache; either way the read-path + proactive renewal must
+   not thunder on a popular installation.
+
+## Success criteria
+
+- A connected repository fires Talos workflows with **no PAT** anywhere in the
+  path.
+- Installation tokens **auto-rotate hourly** with zero manual operator action;
+  a forced clock-advance test shows a fresh token minted before expiry.
+- **Revoking the App installation on GitHub immediately stops access** (next mint
+  fails closed; cached token expires within the hour).
+- The worker never holds the App private key; minting + token resolution are
+  controller-side only (credential-free-worker invariant preserved).
+- PAT-configured deployments are byte-for-byte unaffected until they opt in.
+
+## See also
+
+- [RFC 0007](0007-native-github-integration.md) — Phase A (inbound, shipped).
+- `docs/integration-pattern.md` — the 10-file push-notification shape +
+  `RenewalFailure` / `looks_like_oauth_failure`.
+- `memory/oauth_provider_guide.md` (session memory) — the Atlassian gold-standard
+  OAuth pattern (note: the *install* flow here differs — no code→token exchange).
+- `talos-oauth/src/{credentials.rs,refresh_task.rs}`, `talos-integrations/src/provider_config.rs`.
+- `module-templates/github-pr-reviewer`, `module-templates/github-analyzer` — the
+  PAT consumers B4 migrates.
