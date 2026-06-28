@@ -23,9 +23,13 @@ ignore = [
     # on opentelemetry-prometheus releasing prometheus 0.14 support.
     "RUSTSEC-2024-0437",
 
-    # rsa Marvin-attack timing sidechannel. Pulled by jsonwebtoken 10.x.
-    # Our JWT stack uses HS256 (HMAC) — RS256 RSA path not reachable. No
-    # upstream fix available. Re-evaluate if we ever switch to RS256.
+    # rsa Marvin-attack timing sidechannel (RSA private-key sign/decrypt).
+    # Pulled by jsonwebtoken 10.x. The vulnerable OP is never invoked:
+    # session JWTs are HS256; RS256 verify (gmail) is a public-key op;
+    # RS256 signing (GitHub App JWTs, talos-github) uses `ring`
+    # (constant-time), with `rsa` used only to parse the key PEM. No
+    # upstream fix. Re-evaluate only if sign/decrypt is ever routed
+    # through the rsa crate. Full rationale: deny.toml.
     "RUSTSEC-2023-0071",
 
     # rustls-webpki 0.101.x — URI name-constraints accepted. Pulled by
