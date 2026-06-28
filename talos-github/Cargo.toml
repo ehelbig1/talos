@@ -1,0 +1,31 @@
+[package]
+name = "talos-github"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# RS256 signing for GitHub App JWTs is done with `ring` (constant-time RSA,
+# NOT affected by RUSTSEC-2023-0071 / the Marvin timing sidechannel). The
+# `rsa` crate is used ONLY to parse/normalize the App private key PEM
+# (PKCS#1 → PKCS#8) — never for the private-key signing/decryption operation
+# the advisory covers. See docs/rfcs/0008-github-app-authentication.md (D3) and
+# the RUSTSEC-2023-0071 note in deny.toml.
+base64 = "0.22"
+chrono = { workspace = true }
+ring = "0.17"
+rsa = { version = "0.9", features = ["std", "pem"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+# Cross-check: sign with ring, VERIFY with jsonwebtoken (independent impl).
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+rand = "0.8"
+
+[lints]
+workspace = true

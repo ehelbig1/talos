@@ -66,15 +66,24 @@ ignore = [
     # Cargo.toml (prometheus = "0.14").
 
     { id = "RUSTSEC-2023-0071", reason = """
-Marvin Attack timing sidechannel in `rsa` crate. Pulled by
-`jsonwebtoken` 10.x for RS256 signing support. Our JWT stack uses
-HS256 (symmetric HMAC) — configured via the `JWT_ALGORITHM` env var
-which defaults to HS256 and is not set to RS256 anywhere in our
-deployment. The vulnerable RSA signing code path is NOT reachable.
-If we ever switch to RS256, this exemption must be revisited — no
-upstream fix is available per the advisory text ("No safe upgrade").
-Mitigation: enforce HS256-only via a boot-time check before removing
-this exemption's scope assumption.
+Marvin Attack timing sidechannel in the `rsa` crate's RSA PRIVATE-KEY
+operations (decryption / signing). The `rsa` crate is pulled by
+`jsonwebtoken` 10.x (rust_crypto feature). Our exposure to the
+VULNERABLE operation is nil — it is never invoked:
+  * Session JWTs use HS256 (symmetric HMAC) — no RSA at all.
+  * RS256 VERIFICATION (gmail Pub/Sub push) is an RSA PUBLIC-key
+    operation, which the Marvin sidechannel does not affect.
+  * RS256 SIGNING (GitHub App JWTs — talos-github, RFC 0008) is done
+    with `ring` (constant-time, blinded), NOT the `rsa` crate. The
+    `rsa` crate is used in talos-github ONLY to parse/normalize the
+    App private-key PEM to PKCS#8 (a parse/encode operation), never a
+    private-key sign/decrypt op.
+So the `rsa` crate's vulnerable private-key code path is not reached
+anywhere. No upstream fix is available per the advisory ("No safe
+upgrade"). Re-evaluate ONLY if a signing/decryption op is ever routed
+THROUGH the `rsa` crate (i.e. `jsonwebtoken` RS256 *signing*, or a
+direct `RsaPrivateKey::{sign,decrypt}`) — switch such a path to `ring`
+or `aws-lc-rs` instead.
 """ },
 
     # NOTE (2026-06-02): the four rustls-webpki 0.101/0.102 exemptions

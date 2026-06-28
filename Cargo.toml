@@ -97,6 +97,7 @@ members = [
     "talos-integration-helpers",
     "talos-google-calendar",
     "talos-gmail",
+    "talos-github",
     "talos-continuation-trigger",
     "talos-webhooks",
     "talos-validation",

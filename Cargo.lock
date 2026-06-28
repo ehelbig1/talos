@@ -7735,6 +7735,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-github"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "jsonwebtoken",
+ "rand 0.8.6",
+ "ring",
+ "rsa",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "talos-gmail"
 version = "0.1.0"
 dependencies = [
