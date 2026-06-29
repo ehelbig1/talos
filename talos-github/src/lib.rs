@@ -41,6 +41,7 @@ mod installation;
 mod installation_token;
 #[cfg(feature = "client")]
 mod token_cache;
+mod webhook;
 
 pub use app_jwt::{AppSigningKey, MAX_APP_JWT_TTL_SECS};
 #[cfg(feature = "client")]
@@ -55,3 +56,4 @@ pub use installation_token::{
 };
 #[cfg(feature = "client")]
 pub use token_cache::{InstallationTokenCache, REFRESH_MARGIN_SECS};
+pub use webhook::verify_app_webhook_signature;

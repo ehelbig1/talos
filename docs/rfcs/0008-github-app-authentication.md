@@ -158,10 +158,15 @@ Each phase independently shippable; PAT path intact throughout.
 - **B4. Module token resolution (App-first, PAT-fallback).** `github-pr-reviewer` /
   `github-analyzer` resolve an installation token for the repo owner, else the PAT
   secret. *Rollback:* default to PAT if no installation resolves.
-- **B5. App-level webhook secret verification.** Point the Phase-A HMAC verify at
-  the App webhook secret for App-delivered events; keep per-trigger
-  `signing_secret` for non-App webhooks. *Rollback:* App webhooks simply aren't
-  verified-as-App until this lands (don't enable App webhook delivery before B5).
+- **B5. App-level webhook secret verification.** The verifier
+  (`talos_github::verify_app_webhook_signature`) is shipped: the same Phase-A
+  `X-Hub-Signature-256` scheme — `HMAC-SHA256(secret, raw_body)`, constant-time —
+  pointed at `GithubAppConfig::webhook_secret`, fail-closed, unit-tested. **Remaining
+  (B5-wiring):** an App-webhook RECEIVER endpoint that calls it and routes the
+  verified delivery to a workflow by installation/repo. That routing is a new
+  App-event-driven trigger surface (bigger than auth) — likely its own follow-up.
+  Per-trigger `signing_secret` webhooks (Phase A) are unaffected. *Rollback:* the
+  verifier is unused until a receiver calls it.
 
 ## Non-goals
 

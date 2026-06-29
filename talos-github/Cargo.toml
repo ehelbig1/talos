@@ -15,7 +15,12 @@ publish.workspace = true
 # the RUSTSEC-2023-0071 note in deny.toml.
 base64 = "0.22"
 chrono = { workspace = true }
+# Webhook signature verification (B5) — same primitives as talos-webhooks.
+hex = "0.4"
+hmac = "0.12"
 ring = "0.17"
+sha2 = "0.10"
+subtle = "2.4"
 rsa = { version = "0.9", features = ["std", "pem"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
