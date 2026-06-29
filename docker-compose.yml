@@ -383,6 +383,13 @@ services:
       ATLASSIAN_CLIENT_ID: ${ATLASSIAN_CLIENT_ID:-}
       ATLASSIAN_CLIENT_SECRET: ${ATLASSIAN_CLIENT_SECRET:-}
       ATLASSIAN_REDIRECT_URI: ${ATLASSIAN_REDIRECT_URI:-http://localhost:8000/api/atlassian/callback}
+      # GitHub App (RFC 0008). All four blank by default => feature disabled
+      # (GITHUB_APP_ID blank). Set them in .env to enable the connect flow; the
+      # App's Setup URL should point at http://localhost:8000/api/github/setup.
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_WEBHOOK_SECRET: ${GITHUB_APP_WEBHOOK_SECRET:-}
       # The controller embeds its own WasmRuntime (used by run_sandbox / compile_custom_sandbox).
       # Disable pooling here too — same reason as the worker service above.
       TALOS_DISABLE_POOLING: "true"
