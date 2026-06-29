@@ -34,6 +34,7 @@
 mod app_jwt;
 #[cfg(feature = "client")]
 mod client;
+mod config;
 mod error;
 mod installation;
 mod installation_token;
@@ -41,6 +42,7 @@ mod installation_token;
 pub use app_jwt::{AppSigningKey, MAX_APP_JWT_TTL_SECS};
 #[cfg(feature = "client")]
 pub use client::GithubAppClient;
+pub use config::GithubAppConfig;
 pub use error::GithubAppError;
 pub use installation::{parse_installation_info, InstallationInfo};
 pub use installation_token::{

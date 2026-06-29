@@ -21,4 +21,8 @@ pub enum GithubAppError {
     /// The `POST .../access_tokens` response body could not be parsed.
     #[error("failed to parse installation-token response: {0}")]
     ParseResponse(String),
+
+    /// GitHub App platform configuration is missing/blank/inconsistent.
+    #[error("GitHub App configuration error: {0}")]
+    Config(String),
 }
