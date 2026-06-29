@@ -7728,6 +7728,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-github-connect"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "talos-config",
+ "talos-github",
+ "talos-github-repository",
+ "talos-oauth",
+ "tracing",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "talos-github-repository"
 version = "0.1.0"
 dependencies = [
