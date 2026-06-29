@@ -162,7 +162,13 @@ pub struct SecurityPolicy {
 ///             every blob; bumping the header to V6 gives operators a
 ///             clean version-mismatch rejection of V5 blobs rather than a
 ///             cryptic HMAC failure.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV6";
+///   TALOSV7 — 2026-06-29: wasmtime 44→45 security bump (RUSTSEC-2026-0188:
+///             WASI hard-link/rename FilePerms bypass; patched in
+///             wasmtime-wasi 45.0.3). The `wasmtime=` fingerprint line now
+///             reads 45.0.3, changing the HMAC for every blob; bumping the
+///             header to V7 rejects V6 blobs cleanly on the fleet rather
+///             than surfacing an HMAC failure on stale precompiled bytes.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV7";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -204,7 +210,7 @@ const AOT_HMAC_LEN: usize = 32;
 // wasmtime's own deserialize version check was the only thing still catching
 // stale blobs).
 const ENGINE_CONFIG_FINGERPRINT: &[u8] = b"talos-engine-config-v1\n\
-    wasmtime=44.0.2\n\
+    wasmtime=45.0.3\n\
     concurrency_support=true\n\
     consume_fuel=true\n\
     op_cost.memory_grow=255\n\
@@ -436,7 +442,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
         // or the wasmtime= line). See test doc for the update procedure.
-        const EXPECTED: &str = "f291bd8aa34f3c4e85ead8addc5500463ac63b4785ba179a3a0fdf4ae9a6378c";
+        const EXPECTED: &str = "d3032116fc2bfe18650320141743d0f6ec6cec635191f873ee78d7947a2d7ca9";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,
@@ -1884,7 +1890,7 @@ impl TalosRuntime {
             // bumping. wasmtime exposes no runtime VERSION constant, so this
             // is a literal; `fingerprint_wasmtime_version_matches_cargo_toml`
             // guards the matching fingerprint line against the same drift.
-            wasmtime_version = "44.0.2",
+            wasmtime_version = "45.0.3",
             allocator = if disable_pooling {
                 "on-demand (TALOS_DISABLE_POOLING=true)"
             } else {

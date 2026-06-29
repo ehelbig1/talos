@@ -27,8 +27,8 @@ talos-nats-tls = { path = "../talos-nats-tls" }
 #   API changes (verified — worker compiles + full lib suite green).
 # Also brings: per-operator fuel costs, Store::try_new (OOM-safe), WASIp3 preview.
 # Pinning to the exact version ensures reproducible builds.
-wasmtime = { version = "44.0.2", features = ["async", "component-model", "parallel-compilation", "memory-protection-keys"] }
-wasmtime-wasi = "44.0.2"
+wasmtime = { version = "45.0.3", features = ["async", "component-model", "parallel-compilation", "memory-protection-keys"] }
+wasmtime-wasi = "45.0.3"
 
 # Core utilities
 anyhow = "1.0"
@@ -115,7 +115,7 @@ prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, 
                     # rate limiting as defence-in-depth.
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 tracing-opentelemetry = "0.33"
-wasmtime-wasi-http = "44.0.2"
+wasmtime-wasi-http = "45.0.3"
 oci-distribution = "0.11.0"
 bytes = "1.11.1"
 thiserror = "2.0.18"
