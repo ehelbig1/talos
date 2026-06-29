@@ -10,6 +10,7 @@ import { validateOAuthUrl, loadOAuthHosts } from "@/lib/oauthUtils";
 import { toast } from "sonner";
 import {
   Calendar,
+  Github,
   LayoutGrid,
   Mail,
   MessageSquare,
@@ -167,6 +168,8 @@ export function IntegrationsManager() {
       { param: "atlassian_error", label: "Jira", isError: true },
       { param: "gmail_connected", label: "Gmail", isError: false },
       { param: "gmail_error", label: "Gmail", isError: true },
+      { param: "github_connected", label: "GitHub", isError: false },
+      { param: "github_error", label: "GitHub", isError: true },
     ];
     for (const { param, label, isError } of legacyKeys) {
       const val = params.get(param);
@@ -312,6 +315,43 @@ export function IntegrationsManager() {
     } catch (err) {
       if (import.meta.env.DEV) console.error("Connect service error:", err);
       toast.error(`Error connecting ${type}`);
+    }
+  };
+
+  // GitHub App install flow (RFC 0008). Unlike OAuth providers, the backend
+  // returns a GitHub *install* URL (not an authorization_url) which we navigate
+  // to; GitHub then redirects back to /api/github/setup. A 503 means the App
+  // isn't configured on this server.
+  const handleConnectGithub = async () => {
+    try {
+      const res = await authedFetch("/api/github/connect");
+      if (!res.ok) {
+        toast.error(
+          res.status === 503
+            ? "GitHub App is not configured on this server"
+            : `Service error: ${res.status}`,
+        );
+        return;
+      }
+      const d = await res.json();
+      const url: unknown = d?.install_url;
+      // Precise validation: the install URL is always a github.com App page.
+      if (
+        d?.success &&
+        typeof url === "string" &&
+        url.startsWith("https://github.com/apps/")
+      ) {
+        window.location.href = url;
+      } else {
+        toast.error(
+          sanitizeErrorMessage(
+            `Connect failed: ${d?.error || "Unknown error"}`,
+          ),
+        );
+      }
+    } catch (err) {
+      if (import.meta.env.DEV) console.error("GitHub connect error:", err);
+      toast.error("Error connecting GitHub");
     }
   };
 
@@ -494,6 +534,50 @@ export function IntegrationsManager() {
           ))}
         </div>
       )}
+
+      {/* GitHub App (RFC 0008) — not a registry OAuth provider; bespoke card.
+          Initiates the App install flow; the result toast is handled by the
+          github_connected / github_error query-param effect above. */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+        <div className="bg-surface-3/30 border border-white/5 rounded-[2rem] p-6 transition-premium hover:border-white/10 hover:shadow-2xl hover:shadow-primary/5 group relative overflow-hidden flex flex-col h-full">
+          <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
+          <div className="flex items-start justify-between mb-8 relative z-10">
+            <div className="flex items-center gap-5">
+              <div
+                className="w-14 h-14 rounded-2xl flex items-center justify-center text-white shadow-2xl transition-premium group-hover:scale-110 group-hover:rotate-3"
+                style={{
+                  background: "linear-gradient(135deg, #24292f, #24292fdd)",
+                  boxShadow: "0 10px 25px -5px #24292f44",
+                }}
+              >
+                <Github size={28} />
+              </div>
+              <div>
+                <h3 className="text-xl font-black text-white tracking-tight">
+                  GitHub App
+                </h3>
+                <p className="text-[10px] text-muted-foreground/60 font-black uppercase tracking-widest mt-0.5">
+                  Scoped, auto-rotating repo access
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={handleConnectGithub}
+              className="p-2.5 bg-white/5 border border-white/5 hover:bg-primary/10 hover:border-primary/20 hover:text-primary transition-premium rounded-xl active:scale-90"
+              title="Install GitHub App"
+            >
+              <Plus size={18} />
+            </button>
+          </div>
+          <div className="space-y-3 mt-auto relative z-10">
+            <div className="h-[68px] border border-dashed border-white/5 rounded-[1.5rem] flex items-center justify-center bg-black/10 group-hover:bg-black/20 transition-premium px-4">
+              <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.25em] text-center leading-relaxed">
+                Install to grant short-lived, per-repo tokens
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
 
       {/* Per-channel management for Google Calendar */}
       <div className="animate-in fade-in duration-700 delay-300">
