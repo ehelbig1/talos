@@ -23,16 +23,26 @@
 //! tokens flow to module dispatch later (B4), through the existing encrypted
 //! `vault://` secret path.
 //!
-//! The live HTTP call + the 1-hour token cache (wired into the proactive
-//! refresh task) land in B3 — kept out here so this crate stays fully
-//! unit-testable without a network or an HTTP-client dependency.
+//! The async [`GithubAppClient`] (feature `client`) wraps the live HTTP calls —
+//! `mint_installation_token` (B3 renewal / B4 dispatch) and `get_installation`
+//! (B2b connect callback). It's feature-gated so the crypto/parse core stays
+//! `reqwest`-free and fully unit-testable; the request building + every response
+//! parser are always-compiled and tested here, so the gated client is a thin
+//! wrapper over covered code. The 1-hour token CACHE (wired into the proactive
+//! refresh task) is still B3.
 
 mod app_jwt;
+#[cfg(feature = "client")]
+mod client;
 mod error;
+mod installation;
 mod installation_token;
 
 pub use app_jwt::{AppSigningKey, MAX_APP_JWT_TTL_SECS};
+#[cfg(feature = "client")]
+pub use client::GithubAppClient;
 pub use error::GithubAppError;
+pub use installation::{parse_installation_info, InstallationInfo};
 pub use installation_token::{
     installation_token_request, parse_installation_token_response, InstallationToken,
     GITHUB_API_BASE,
