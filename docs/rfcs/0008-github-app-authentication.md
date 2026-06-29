@@ -150,10 +150,11 @@ Each phase independently shippable; PAT path intact throughout.
   permissions JSONB, repo_selection, is_active, created/updated)` — **no token
   columns**. Add a `PROVIDERS` entry; add the install-redirect + callback handlers.
   *Rollback:* table is additive; routes behind the registry entry.
-- **B3. Renewal arm.** Branch `proactive_token_refresh_task` on
-  `provider = "github_app"` → call B1's minter; cache result in
-  `integration_credentials`. *Rollback:* the arm only fires for github_app rows,
-  which don't exist until B2 connects one.
+- **B3. Token cache + rotation.** ✅ Shipped as `talos_github::InstallationTokenCache`
+  (feature `client`): in-memory, single-flight, on-demand re-mint within 5 min of
+  expiry (see open-question 4). No `proactive_token_refresh_task` branch /
+  `integration_credentials` row needed — the token never touches the DB.
+  *Rollback:* the cache is only constructed where a configured App exists.
 - **B4. Module token resolution (App-first, PAT-fallback).** `github-pr-reviewer` /
   `github-analyzer` resolve an installation token for the repo owner, else the PAT
   secret. *Rollback:* default to PAT if no installation resolves.
@@ -194,9 +195,18 @@ Each phase independently shippable; PAT path intact throughout.
    Marvin-resistant) — see RFC §D3 + the RUSTSEC-2023-0071 note in `deny.toml`.
    Controller-side only; the worker never holds the App key (credential-free-worker
    invariant preserved).
-4. **Token cache scope.** Reuse `integration_credentials` (1h expiry rows) vs a
-   dedicated short-TTL cache; either way the read-path + proactive renewal must
-   not thunder on a popular installation.
+4. **Token cache scope.** ✅ **Resolved (B3 — `InstallationTokenCache`):** the
+   **dedicated short-TTL cache** branch, in-memory rather than
+   `integration_credentials`. Rationale: the installation token is a secret, so
+   keeping it only in a `Zeroizing` in-memory cell (never written to the DB)
+   shrinks the secret-exposure surface — and the App private key can always
+   re-mint, so nothing durable is worth persisting. Rotation is **on-demand**:
+   the cache re-mints once a token is within `REFRESH_MARGIN_SECS` (5 min) of
+   expiry, so no separate proactive-refresh task / `proactive_token_refresh_task`
+   branch is needed. The "must not thunder" requirement is met by **single-flight
+   per installation** (a per-installation async lock → exactly one mint under a
+   concurrent burst). Multi-replica controllers mint independently (≤ replica
+   count mints/hour per installation) — well within GitHub's limits.
 
 ## Success criteria
 

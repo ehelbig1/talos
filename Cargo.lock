@@ -7716,6 +7716,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "dashmap 6.2.1",
  "jsonwebtoken",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -7725,6 +7726,7 @@ dependencies = [
  "serde_json",
  "talos-http-body",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "zeroize",
 ]
