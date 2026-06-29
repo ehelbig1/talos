@@ -22,6 +22,18 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { version = "1.8", features = ["derive"] }
 
+# Optional — only the async `client` feature (controller-side HTTP). The
+# crypto/parse core builds without these.
+anyhow = { workspace = true, optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+talos-http-body = { path = "../talos-http-body", optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+# Async GitHub App API client (mint installation token, get installation).
+# Off by default so the crypto/parse core stays reqwest-free.
+client = ["dep:anyhow", "dep:reqwest", "dep:talos-http-body", "dep:tracing"]
+
 [dev-dependencies]
 # Cross-check: sign with ring, VERIFY with jsonwebtoken (independent impl).
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
