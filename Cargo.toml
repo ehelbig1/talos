@@ -99,6 +99,7 @@ members = [
     "talos-gmail",
     "talos-github",
     "talos-github-repository",
+    "talos-github-connect",
     "talos-continuation-trigger",
     "talos-webhooks",
     "talos-validation",
