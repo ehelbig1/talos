@@ -155,9 +155,22 @@ Each phase independently shippable; PAT path intact throughout.
   expiry (see open-question 4). No `proactive_token_refresh_task` branch /
   `integration_credentials` row needed — the token never touches the DB.
   *Rollback:* the cache is only constructed where a configured App exists.
-- **B4. Module token resolution (App-first, PAT-fallback).** `github-pr-reviewer` /
-  `github-analyzer` resolve an installation token for the repo owner, else the PAT
-  secret. *Rollback:* default to PAT if no installation resolves.
+- **B4. Module token resolution (App-first, PAT-fallback).**
+  - *B4-core (shipped):* `talos_github_connect::GithubTokenResolver` composes the
+    installation registry (B2a) + the mint cache (B3): `token_for_owner(owner)` →
+    `Ok(Some(token))` if an active installation exists, `Ok(None)` if not /
+    App-disabled (→ caller falls back to PAT), `Err` only if minting fails for an
+    existing installation. Opt-in is **explicit** via a secret-path scheme:
+    `github_app:<owner>` (parsed by `parse_github_app_secret_path`, charset-guarded)
+    selects the App token; any other path stays a PAT/vault secret. No module-code
+    change — the operator just sets the module's `GITHUB_TOKEN_SECRET` config to
+    `github_app:<owner>`.
+  - *B4-wiring (remaining):* call the resolver from the controller's per-module
+    secret prefetch (`build_encrypted_secrets`) — for each requested secret path
+    matching the scheme, resolve + inject the minted token under that key (falling
+    back to the existing PAT resolution on `Ok(None)`). Touches the
+    security-critical secret-prefetch path → best validated against a live
+    workflow run. *Rollback:* default to PAT if no installation resolves.
 - **B5. App-level webhook secret verification.** The verifier
   (`talos_github::verify_app_webhook_signature`) is shipped: the same Phase-A
   `X-Hub-Signature-256` scheme — `HMAC-SHA256(secret, raw_body)`, constant-time —
