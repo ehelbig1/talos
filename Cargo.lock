@@ -1723,6 +1723,8 @@ dependencies = [
  "talos-execution-orchestration",
  "talos-execution-repository",
  "talos-feature-flags",
+ "talos-github",
+ "talos-github-connect",
  "talos-gmail",
  "talos-google-calendar",
  "talos-graph-rag",
