@@ -46,6 +46,8 @@ client = ["dep:anyhow", "dep:dashmap", "dep:reqwest", "dep:talos-http-body", "de
 # Cross-check: sign with ring, VERIFY with jsonwebtoken (independent impl).
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 rand = "0.8"
+# Runtime for the `app_smoke` example (live GitHub App credential check).
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
