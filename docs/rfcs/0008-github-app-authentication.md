@@ -179,13 +179,21 @@ Each phase independently shippable; PAT path intact throughout.
    Talos deployment; installations are per connecting GitHub account/org. Confirm
    this fits the multi-tenant model (vs. each org bringing its own App ID/key —
    more config, stronger isolation).
-2. **Where exactly App config lives.** Platform secret namespace + key names for
-   App ID / private key (PEM) / webhook secret; who can read/rotate them (the
-   `require_2fa + SecretsWrite` discipline applies).
-3. **RS256 dependency.** Add a JWT/RS256 signer (e.g. `jsonwebtoken`) to the
-   dependency allowlist; confirm it's WASM-irrelevant (controller-side only — the
-   worker never holds the App key, consistent with the credential-free-worker
-   invariant).
+2. **Where exactly App config lives.** ✅ **Resolved (talos-github `GithubAppConfig`):**
+   the App credentials are PLATFORM-level (one operator App per deployment), so
+   they're provisioned the same way as the other platform credentials (master DEK,
+   LLM keys, Vault token) — the **bootstrap / k8s Secret surfaced as env vars**,
+   NOT the per-user `SecretsManager` vault (which is for user/module secrets).
+   Vars: `GITHUB_APP_ID` (presence = enabled), `GITHUB_APP_SLUG` (non-secret),
+   `GITHUB_APP_PRIVATE_KEY` (PEM, secret), `GITHUB_APP_WEBHOOK_SECRET` (secret).
+   Secrets are held in `Zeroizing` + redacted from `Debug`; blank = unset;
+   half-configured fails loudly at load. The k8s Secret is the at-rest store
+   (encrypted in etcd, RBAC'd, helm-managed, auto-bounced on rotation per
+   MCP-1231). Helm/deploy wiring for these vars is part of B2b.
+3. **RS256 dependency.** ✅ **Resolved (B1):** signing uses `ring` (constant-time,
+   Marvin-resistant) — see RFC §D3 + the RUSTSEC-2023-0071 note in `deny.toml`.
+   Controller-side only; the worker never holds the App key (credential-free-worker
+   invariant preserved).
 4. **Token cache scope.** Reuse `integration_credentials` (1h expiry rows) vs a
    dedicated short-TTL cache; either way the read-path + proactive renewal must
    not thunder on a popular installation.
