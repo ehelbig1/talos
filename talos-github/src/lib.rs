@@ -39,6 +39,8 @@ mod connect;
 mod error;
 mod installation;
 mod installation_token;
+#[cfg(feature = "client")]
+mod token_cache;
 
 pub use app_jwt::{AppSigningKey, MAX_APP_JWT_TTL_SECS};
 #[cfg(feature = "client")]
@@ -51,3 +53,5 @@ pub use installation_token::{
     installation_token_request, parse_installation_token_response, InstallationToken,
     GITHUB_API_BASE,
 };
+#[cfg(feature = "client")]
+pub use token_cache::{InstallationTokenCache, REFRESH_MARGIN_SECS};
