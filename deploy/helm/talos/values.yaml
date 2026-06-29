@@ -1125,6 +1125,13 @@ bootstrapSecret:
     SLACK_CLIENT_SECRET: ""
     ATLASSIAN_CLIENT_ID: ""
     ATLASSIAN_CLIENT_SECRET: ""
+    # RFC 0008 — GitHub App (optional). Set all four to enable the connect flow;
+    # leave blank to disable (GITHUB_APP_ID blank = feature off). PRIVATE_KEY is
+    # the PEM (PKCS#1 or PKCS#8); WEBHOOK_SECRET is the App's webhook HMAC secret.
+    GITHUB_APP_ID: ""
+    GITHUB_APP_SLUG: ""
+    GITHUB_APP_PRIVATE_KEY: ""
+    GITHUB_APP_WEBHOOK_SECRET: ""
     OKTA_DOMAIN: ""
     OKTA_CLIENT_ID: ""
     OKTA_CLIENT_SECRET: ""

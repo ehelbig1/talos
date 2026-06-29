@@ -706,6 +706,20 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!("Gmail integration service initialized (token encryption + dual-write enabled)");
 
+    // ---------- GitHub App connect service (RFC 0008 Phase B) ----------
+    // Optional: enabled only when GITHUB_APP_ID (+ companions) are set. A
+    // half-configured App (id set but a required field missing/blank, or an
+    // unparseable key) fails loudly here so the controller doesn't silently boot
+    // with a broken connect flow.
+    let github_app_config = talos_github::GithubAppConfig::from_env()
+        .map_err(|e| anyhow::anyhow!("Invalid GitHub App configuration: {}", e))?;
+    if github_app_config.is_some() {
+        tracing::info!("GitHub App connect flow enabled (RFC 0008)");
+    }
+    let github_connect_service = std::sync::Arc::new(
+        talos_github_connect::GithubConnectService::new(db_pool.clone(), github_app_config),
+    );
+
     // ---------- Gmail push-notification (watch) service ----------
     // Optional. Requires an operator-created Pub/Sub topic + push
     // subscription. If GMAIL_PUBSUB_TOPIC is unset, push receiving
@@ -4010,6 +4024,32 @@ async fn main() -> anyhow::Result<()> {
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));
 
+    // GitHub App connect — initiate (authenticated). Returns the install URL.
+    let github_connect_route = Router::new()
+        .route(
+            "/api/github/connect",
+            get(talos_github_connect::connect_github_handler),
+        )
+        .with_state(github_connect_service.clone())
+        .layer(from_fn(rest_auth_middleware)) // injects Extension<Uuid>
+        .layer(Extension(auth_service.clone()))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // GitHub App Setup-URL callback — NO auth middleware. A cross-site redirect
+    // from github.com carries no SameSite=Strict session cookie; the user is
+    // recovered from the single-use state token instead (B2b-2).
+    let github_setup_callback_route = Router::new()
+        .route(
+            "/api/github/setup",
+            get(talos_github_connect::github_setup_callback_handler),
+        )
+        .with_state(github_connect_service.clone())
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
     // Gmail watch-channel management routes (user-scoped). Only wired
     // when the push service is configured — otherwise the state
     // doesn't exist to manage.
@@ -4519,7 +4559,9 @@ async fn main() -> anyhow::Result<()> {
         .merge(admin_routes)
         .merge(gmail_api_routes)
         .merge(gmail_integration_routes)
-        .merge(gmail_callback_route);
+        .merge(gmail_callback_route)
+        .merge(github_connect_route)
+        .merge(github_setup_callback_route);
     // Optional gmail push routes — `None` when GMAIL_PUBSUB_TOPIC
     // wasn't configured at startup.
     let app = if let Some(r) = gmail_watch_channel_routes {
