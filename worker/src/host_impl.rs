@@ -22,6 +22,10 @@ use crate::bindings::talos::core::{
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+#[path = "host_impl_tests.rs"]
+mod host_impl_tests;
+
 /// Maximum HTTP fetch calls per execution (prevents external API flooding).
 const MAX_HTTP_CALLS_PER_EXECUTION: u64 = 1000;
 /// M-6: maximum HTTP fetch calls to a SINGLE upstream host per execution.
@@ -934,7 +938,7 @@ fn ollama_base_url() -> &'static str {
 /// local provider only. Redirects are disabled so a compromised local endpoint
 /// can't bounce the request elsewhere. External providers keep using the
 /// SSRF-filtered `self.http_client`.
-fn local_llm_http_client() -> &'static reqwest::Client {
+pub(crate) fn local_llm_http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
