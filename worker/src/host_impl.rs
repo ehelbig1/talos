@@ -919,6 +919,32 @@ fn ollama_base_url() -> &'static str {
             .unwrap_or_else(|| "http://ollama:11434".to_string())
     })
 }
+
+/// Dedicated HTTP client for LOCAL LLM-provider calls (Ollama).
+///
+/// The per-execution `self.http_client` carries the guest SSRF resolver, which
+/// filters private/RFC1918 IPs to stop a guest's `http::fetch` from reaching
+/// internal services. But the local LLM provider (Ollama) IS an internal service
+/// on a private IP (`ollama:11434` → 172.x), so routing the `llm::complete` call
+/// through that client makes a Tier-2 actor's local inference fail with
+/// "every resolved IP was filtered". The provider URL here is host-configured
+/// (`OLLAMA_URL`, fixed), NOT guest-supplied, and the per-provider tier ceiling
+/// is already enforced upstream by `decide_llm_tier_access` (Tier-1 ⇒ Ollama
+/// only), so this dedicated client safely bypasses the guest SSRF filter for the
+/// local provider only. Redirects are disabled so a compromised local endpoint
+/// can't bounce the request elsewhere. External providers keep using the
+/// SSRF-filtered `self.http_client`.
+fn local_llm_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Talos-Worker/1.0")
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("worker: failed to build local-LLM reqwest client")
+    })
+}
 /// Maximum event payload size (1 MiB).
 const MAX_EVENT_PAYLOAD_BYTES: usize = 1_048_576;
 /// MCP-600 (2026-05-12): Maximum metadata size for `events::emit_with_metadata`
@@ -9500,7 +9526,14 @@ impl wit_llm::Host for TalosContext {
             "LLM completion request"
         );
 
-        let client = self.http_client.clone();
+        // Local provider (Ollama) bypasses the guest SSRF resolver — see
+        // local_llm_http_client(). External providers keep the SSRF-filtered
+        // per-execution client (public IPs, retains the guest egress gate).
+        let client = if is_local {
+            local_llm_http_client().clone()
+        } else {
+            self.http_client.clone()
+        };
         // MCP-1213 (2026-05-18): one timeout for the FULL exchange
         // (send + body read), not just `.send()`. Pre-fix the outer
         // timeout wrapped only header receipt — once headers arrived,
