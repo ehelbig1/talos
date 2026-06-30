@@ -2,31 +2,32 @@
   "name": "github-pr-reviewer",
   "version": "v1.0.0",
   "display_name": "GitHub PR Reviewer",
-  "description": "Automatically review GitHub pull requests using an LLM. Posts review comments directly to the PR via the GitHub API.",
+  "description": "Automatically review GitHub pull requests using an LLM (any host provider, incl. local Ollama). Posts review comments directly to the PR via the GitHub API.",
   "category": "Development",
   "capability_world": "secrets-node",
-  "allowed_hosts": ["api.github.com", "api.openai.com"],
-  "requires_secrets": ["github/token", "llm/api_key"],
+  "allowed_hosts": ["api.github.com"],
+  "requires_secrets": ["github/token"],
   "requires_approval_for": [],
   "config_schema": {
     "type": "object",
-    "required": ["GITHUB_TOKEN_SECRET", "LLM_API_KEY_SECRET", "REPOSITORY"],
+    "required": ["GITHUB_TOKEN_SECRET", "REPOSITORY"],
     "properties": {
       "GITHUB_TOKEN_SECRET": {
         "type": "string",
         "description": "Secret path for the GitHub token. Either a PAT secret path (e.g. 'github/token'), OR a GitHub App installation token via 'github_app:<owner>' (e.g. 'github_app:ehelbig1') — the controller mints a short-lived, repo-scoped installation token (RFC 0008). For the App scheme, also grant the module allowed_secrets: ['github_app:<owner>']."
       },
-      "LLM_API_KEY_SECRET": {
-        "type": "string",
-        "description": "Secret path for the LLM API key used for review generation (e.g. 'llm/api_key')"
-      },
       "REPOSITORY": {
         "type": "string",
         "description": "GitHub repository in owner/repo format (e.g. 'myorg/myrepo'). Used as a scope guard: PR events for any other repository are skipped."
       },
+      "LLM_PROVIDER": {
+        "type": "string",
+        "enum": ["anthropic", "openai", "gemini", "ollama"],
+        "description": "LLM provider for review generation. Optional — if unset, the host's configured default is used. 'ollama' runs a LOCAL model with NO API key (also forced automatically for Tier-1 actors). For external providers the key is resolved from the platform vault (e.g. 'anthropic/api_key') — it is NOT a module secret, so no LLM key is configured here."
+      },
       "LLM_MODEL": {
         "type": "string",
-        "description": "OpenAI chat model for review generation (default: 'gpt-4o-mini'). Optional."
+        "description": "Model name for review generation (e.g. 'gpt-4o-mini', 'claude-sonnet-4-20250514', 'llama3'). Optional — defaults per provider."
       }
     }
   },
@@ -38,8 +39,8 @@
     },
     {
       "step": 2,
-      "title": "Store an LLM API key as a secret",
-      "detail": "Get an OpenAI API key (https://platform.openai.com/api-keys) and store it: set_secret key_path='llm/api_key', value='sk-...'. Set LLM_API_KEY_SECRET to that path."
+      "title": "Choose an LLM (no module key needed)",
+      "detail": "Review generation goes through the host LLM service, which resolves provider keys from the platform vault and enforces the actor's tier ceiling. For a LOCAL model with no API key, set LLM_PROVIDER='ollama' (or run the workflow under a Tier-1 actor, which forces local). For an external provider, set LLM_PROVIDER='anthropic'|'openai'|'gemini' and ensure that provider's key exists in the platform vault (e.g. 'anthropic/api_key') — it is NOT configured on this module. Leave LLM_PROVIDER unset to use the host default."
     },
     {
       "step": 3,
