@@ -22,30 +22,29 @@
       },
       "REPOSITORY": {
         "type": "string",
-        "description": "GitHub repository in owner/repo format (e.g. 'myorg/myrepo')"
+        "description": "GitHub repository in owner/repo format (e.g. 'myorg/myrepo'). Used as a scope guard: PR events for any other repository are skipped."
+      },
+      "LLM_MODEL": {
+        "type": "string",
+        "description": "OpenAI chat model for review generation (default: 'gpt-4o-mini'). Optional."
       }
     }
   },
   "setup_instructions": [
     {
       "step": 1,
-      "title": "Create a GitHub Personal Access Token",
-      "detail": "In GitHub, go to Settings > Developer settings > Personal access tokens > Tokens (classic). Create a token with 'repo' scope (or 'pull_requests:write' for fine-grained tokens)."
+      "title": "Provide a GitHub credential",
+      "detail": "Either (a) a Personal Access Token with 'repo' / 'pull_requests:write' scope stored as a secret (set_secret key_path='github/token'), or (b) a GitHub App installation via 'github_app:<owner>' — set GITHUB_TOKEN_SECRET to 'github_app:<owner>' and grant the module allowed_secrets: ['github_app:<owner>']. Posting review comments requires WRITE (pull_requests) permission; a read-only App fetches the diff and generates the review but cannot post (the node output still contains the review)."
     },
     {
       "step": 2,
-      "title": "Store GitHub token as secret",
-      "detail": "Use set_secret: key_path='github/token', value='ghp_your-token-here'."
+      "title": "Store an LLM API key as a secret",
+      "detail": "Get an OpenAI API key (https://platform.openai.com/api-keys) and store it: set_secret key_path='llm/api_key', value='sk-...'. Set LLM_API_KEY_SECRET to that path."
     },
     {
       "step": 3,
-      "title": "Obtain an LLM API key",
-      "detail": "Get an API key from your LLM provider (e.g. OpenAI at https://platform.openai.com/api-keys)."
-    },
-    {
-      "step": 4,
-      "title": "Store LLM API key as secret",
-      "detail": "Use set_secret: key_path='llm/api_key', value='sk-your-api-key-here'."
+      "title": "Trigger on pull_request events",
+      "detail": "This module reads the PR event from the node INPUT (envelope.input), not config. Wire it to a GitHub 'pull_request' webhook trigger, or — to test manually — pass a sample PR 'opened'/'synchronize' event JSON as the node input. With no input it returns a 'nothing to review' message instead of failing."
     }
   ]
 }
