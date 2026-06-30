@@ -52,7 +52,11 @@ struct Payload {
     config: Option<HttpRequestConfig>,
 }
 
-#[talos_module(world = "network-node")]
+// Least privilege: this module only uses `talos::core::http`, which `http-node`
+// provides. `network-node` is a superset (adds graphql/email/state/http-stream/…)
+// none of which are used here. Keep this in sync with talos.json `capability_world`
+// — lint-structural.sh check 48 enforces the match.
+#[talos_module(world = "http-node")]
 fn run(input: String) -> Result<String, String> {
     use talos::core::http::{Request, Method};
 

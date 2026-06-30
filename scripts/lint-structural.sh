@@ -3222,6 +3222,75 @@ else
 fi
 echo
 
+bold "▶ check 48: template macro world must match talos.json capability_world"
+
+# A pre-baked template's WIT capability world is selected by the
+# `#[talos_node|talos_module|talos_agent(world = "...")]` macro attribute — the
+# compilation scaffold reads it via extract_wit_world to drive bindgen. The
+# `capability_world` in talos.json is only catalog metadata. When the two
+# disagree the MACRO wins, and the mismatch surfaces as a confusing
+# `unresolved import talos::core::http` (when the macro under-grants) or a
+# silent over-grant of host capabilities (when the macro over-grants).
+# github-pr-reviewer shipped with talos.json=secrets-node but a BARE
+# `#[talos_node]` (→ minimal-node), so it failed to install with
+# `unresolved import talos::core::{http,secrets}` (#361). http-request shipped
+# the inverse: talos.json=http-node, macro=network-node — a least-privilege
+# over-grant. This freezes both: every module-templates/*/ entry must declare an
+# EXPLICIT world in its macro that equals talos.json's capability_world.
+# Opt-out: `// allow-world-mismatch: <reason>` anywhere in the template .rs.
+
+WORLD_MATCH_VIOLATIONS=0
+for tj in "$ROOT"/module-templates/*/talos.json; do
+    [ -f "$tj" ] || continue
+    dir="$(dirname "$tj")"
+    name="$(basename "$dir")"
+
+    cw="$(grep -oE '"capability_world"[[:space:]]*:[[:space:]]*"[^"]*"' "$tj" \
+            | grep -oE '"[^"]*"$' | tr -d '"' | head -1)"
+    # No declared capability_world → nothing to compare against. Skip.
+    [ -n "$cw" ] || continue
+
+    # The .rs file carrying the entry-point macro (template.rs or src/lib.rs).
+    rs="$(grep -rlE '#\[(talos_sdk_macros::)?talos_(node|module|agent)' \
+            "$dir" --include='*.rs' 2>/dev/null | head -1)"
+    # A talos.json with no macro'd source is a data-only / non-Rust template.
+    [ -n "$rs" ] || continue
+
+    # Documented exception.
+    if grep -q 'allow-world-mismatch' "$rs"; then
+        continue
+    fi
+
+    # Extract the explicit `world = "..."` (or `world: "..."`) from the macro.
+    mw="$(grep -oE 'talos_(node|module|agent)\([^)]*world[[:space:]]*[=:][[:space:]]*"[^"]*"' "$rs" \
+            | grep -oE '"[^"]*"$' | tr -d '"' | head -1)"
+
+    if [ -z "$mw" ]; then
+        printf '  %s: bare macro (defaults to minimal-node) but talos.json says "%s"\n' \
+            "$name" "$cw"
+        printf '    → add an explicit world = "%s" to the macro in %s\n' \
+            "$cw" "${rs#"$ROOT"/}"
+        WORLD_MATCH_VIOLATIONS=$((WORLD_MATCH_VIOLATIONS + 1))
+    elif [ "$mw" != "$cw" ]; then
+        printf '  %s: macro world = "%s" but talos.json capability_world = "%s"\n' \
+            "$name" "$mw" "$cw"
+        printf '    → reconcile %s and talos.json (the macro is what actually compiles)\n' \
+            "${rs#"$ROOT"/}"
+        WORLD_MATCH_VIOLATIONS=$((WORLD_MATCH_VIOLATIONS + 1))
+    fi
+done
+
+if [ "$WORLD_MATCH_VIOLATIONS" -gt 0 ]; then
+    red "✗ $WORLD_MATCH_VIOLATIONS template(s) with macro/talos.json world drift"
+    yellow "  → the #[talos_*(world=…)] attribute drives bindgen; talos.json is metadata."
+    yellow "  → make them equal (least-privilege: pick the smallest world your imports need)."
+    yellow "  → or add // allow-world-mismatch: <reason> in the template .rs."
+    EXIT_CODE=1
+else
+    green "✓ template macro worlds match talos.json capability_world"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
