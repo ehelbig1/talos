@@ -25,6 +25,60 @@ fn extract_attr(attr_str: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Entry-point macro for a Talos WASM module whose `run` takes typed config
+/// fields (one fn argument per `config` key, auto-deserialized).
+///
+/// # The `world` attribute selects your capabilities — and it is the ONLY thing
+/// that does.
+///
+/// ```ignore
+/// #[talos_node(world = "secrets-node")]   // ← this drives everything
+/// fn run(repo: String, token_secret: String) -> Result<String, String> { ... }
+/// ```
+///
+/// The `world` string picks the WIT *capability world* the module is compiled
+/// against. The compilation scaffold reads it straight out of this attribute
+/// (`talos-compilation`'s `extract_wit_world`) to generate `bindings.rs`, so it
+/// decides which `talos::core::*` interfaces exist. It is **NOT** read from
+/// `talos.json` — `capability_world` there is metadata for the catalog UI and
+/// MUST be kept identical to this attribute (enforced by `lint-structural.sh`
+/// check 48). If they disagree, the macro wins and you get a confusing
+/// `unresolved import talos::core::http` instead of a clear error.
+///
+/// **Omitting `world` defaults to `minimal-node`** (least privilege: `logging`,
+/// `json`, `datetime`, `crypto`, `env` only — JSON in/out, no `http`/`secrets`).
+/// Always declare it explicitly; a bare `#[talos_node]` that imports
+/// `talos::core::http` will fail to compile because `minimal-node` has no `http`.
+///
+/// # Available worlds (least → most privileged)
+/// | world | adds on top of minimal |
+/// |---|---|
+/// | `minimal-node` | — (logging, json, datetime, crypto, env) |
+/// | `http-node` | `http`, `webhook` |
+/// | `secrets-node` | `http`, `secrets` (GitHub/OpenAI tokens via `get_secret`) |
+/// | `network-node` | `http`, `graphql`, `email`, `state`, `http-stream`, … |
+/// | `database-node` | `database` (sandbox SQL) |
+/// | `llm-node` | `llm` host functions |
+/// | `cache-node`, `messaging-node`, `filesystem-node`, `governance-node`, `agent-node`, `automation-node` | see `wit/talos.wit` |
+///
+/// Pick the *smallest* world that satisfies your imports. The exact interface
+/// set per world is the source of truth in `wit/talos.wit`.
+///
+/// # Example
+/// ```ignore
+/// use talos::core::http::{fetch, Method, Request};
+/// use talos::core::secrets::get_secret;
+///
+/// #[talos_node(world = "secrets-node")]
+/// fn run(repo: String, token_secret: String) -> Result<String, String> {
+///     let token = get_secret(&token_secret)?;
+///     // ... fetch + return JSON string ...
+///     Ok("{}".into())
+/// }
+/// ```
+///
+/// See also [`talos_module`] (free-form `run(input: String)` signature) and
+/// [`talos_agent`] (LLM agent scaffold).
 #[proc_macro_attribute]
 pub fn talos_node(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed_fn = parse_macro_input!(item as ItemFn);
@@ -137,6 +191,32 @@ pub fn talos_node(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Entry-point macro for a Talos WASM module whose `run` takes the raw envelope
+/// `String` (you parse `{config, input, ...}` yourself). Use [`talos_node`]
+/// instead if you want typed config arguments.
+///
+/// # The `world` attribute selects your capabilities
+///
+/// Identical contract to [`talos_node`]: the `world = "..."` string picks the
+/// WIT capability world the module compiles against (read by the compilation
+/// scaffold's `extract_wit_world`), which determines the available
+/// `talos::core::*` interfaces. It is **NOT** taken from `talos.json` — keep
+/// `talos.json`'s `capability_world` identical to this attribute
+/// (`lint-structural.sh` check 48 enforces the match). Omitting `world` defaults
+/// to `minimal-node` (no `http`/`secrets`), so a bare `#[talos_module]` that
+/// imports `talos::core::http` fails to compile.
+///
+/// See [`talos_node`] for the full world table and a worked example.
+///
+/// # Example
+/// ```ignore
+/// #[talos_module(world = "http-node")]
+/// fn run(input: String) -> Result<String, String> {
+///     use talos::core::http::{Method, Request};
+///     // ... parse `input`, fetch, return JSON string ...
+///     Ok("{}".into())
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn talos_module(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed_fn = parse_macro_input!(item as ItemFn);
