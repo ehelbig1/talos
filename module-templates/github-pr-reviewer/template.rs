@@ -1,24 +1,28 @@
 #![allow(warnings)]
 use serde_json::Value;
 use talos::core::http::{fetch_with_bearer, Method, Request};
+use talos::core::llm::{self, CompletionRequest, Message, Provider, Role};
 use talos::core::logging::{self, Level};
 use talos::core::secrets::get_secret;
 use talos_sdk_macros::talos_module;
 
 // Capability world is selected by THIS macro attribute (it drives WIT bindgen via
 // the scaffold's extract_wit_world), NOT by talos.json. `secrets-node` gives us
-// `http` + `secrets`. Keep in sync with talos.json `capability_world`
+// `http` + `secrets` + `llm`. Keep in sync with talos.json `capability_world`
 // (lint-structural.sh check 48 enforces the match).
 //
 // This module is a PR reviewer triggered by a GitHub `pull_request` webhook. The
-// event payload arrives as the node INPUT (`envelope.input`), and credentials +
-// settings arrive as the node CONFIG (`envelope.config`). It must therefore use
-// `talos_module` (raw envelope) — NOT `talos_node`, whose typed args are all read
-// from `config` and so cannot receive runtime webhook input.
+// event payload arrives as the node INPUT (`envelope.input`), and settings arrive
+// as the node CONFIG (`envelope.config`). It must therefore use `talos_module`
+// (raw envelope) — NOT `talos_node`, whose typed args are all read from `config`
+// and so cannot receive runtime webhook input.
 //
-// Secret note: `get_secret` returns a Tier-1 host-side SLOT HANDLE (u64), never
-// the plaintext token. Authenticated calls go through `fetch_with_bearer(slot, req)`
-// so the real secret is injected host-side and never enters the WASM sandbox.
+// LLM: review generation goes through the host `llm::complete` function, which
+// resolves the provider's API key host-side (vault-first) and enforces the actor's
+// tier ceiling. A Tier-1 actor (or LLM_PROVIDER=ollama) runs a LOCAL model with NO
+// API key — this module never reads an LLM secret. Only the GitHub token is a
+// module secret, resolved to a Tier-1 host-side slot handle (never plaintext in
+// WASM) and used via `fetch_with_bearer`.
 #[talos_module(world = "secrets-node")]
 fn run(input: String) -> Result<String, String> {
     // Engine envelope: { "config": {...}, "input": <PR webhook event>, ... }
@@ -33,17 +37,35 @@ fn run(input: String) -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .ok_or("Missing 'GITHUB_TOKEN_SECRET' config — a PAT secret path (e.g. 'github/token') \
                 or a GitHub App installation via 'github_app:<owner>'")?;
-    let llm_key_secret = config
-        .get("LLM_API_KEY_SECRET")
+
+    // LLM provider/model are OPTIONAL. The host resolves any required API key
+    // vault-first and enforces the tier ceiling — no LLM secret is read here.
+    //  • unset    → the host's configured default provider (+ tier enforcement)
+    //  • ollama   → LOCAL model, no API key (also forced for Tier-1 actors)
+    //  • external → key resolved from the platform vault (e.g. anthropic/api_key)
+    let provider_str = config
+        .get("LLM_PROVIDER")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or("Missing 'LLM_API_KEY_SECRET' config — set it to the vault path of your LLM \
-                API key (e.g. 'llm/api_key')")?;
-    let llm_model = config
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let provider = match provider_str.as_str() {
+        "" => None,
+        "anthropic" => Some(Provider::Anthropic),
+        "openai" => Some(Provider::Openai),
+        "gemini" => Some(Provider::Gemini),
+        "ollama" | "local" => Some(Provider::Ollama),
+        other => {
+            return Err(format!(
+                "Unknown LLM_PROVIDER '{}' — use one of: anthropic, openai, gemini, ollama",
+                other
+            ))
+        }
+    };
+    let model = config
         .get("LLM_MODEL")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .unwrap_or("gpt-4o-mini");
+        .map(|s| s.to_string());
     let expected_repo = config
         .get("REPOSITORY")
         .and_then(|v| v.as_str())
@@ -105,16 +127,14 @@ fn run(input: String) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or("No comments_url in payload")?;
 
-    // Resolve secrets to host-side slot handles (Tier-1 safe — plaintext never
-    // enters WASM; `fetch_with_bearer` injects the real token host-side).
+    // Resolve the GitHub token to a host-side slot handle (Tier-1 safe — plaintext
+    // never enters WASM; `fetch_with_bearer` injects the real token host-side).
     let github_slot = get_secret(github_token_secret).map_err(|e| {
         format!(
             "Failed to resolve GitHub token '{}': {:?}",
             github_token_secret, e
         )
     })?;
-    let llm_slot = get_secret(llm_key_secret)
-        .map_err(|e| format!("Failed to resolve LLM key '{}': {:?}", llm_key_secret, e))?;
 
     logging::log(Level::Info, &format!("Reviewing PR #{}", pr_number));
 
@@ -156,39 +176,29 @@ fn run(input: String) -> Result<String, String> {
         diff_text.push_str("\n…[diff truncated for review]…");
     }
 
-    // ── 2. Generate the review (OpenAI chat completions) ───────────────
+    // ── 2. Generate the review via the host LLM ────────────────────────
+    // Key resolution + provider egress happen host-side; a Tier-1 actor (or
+    // LLM_PROVIDER=ollama) runs locally with no API key.
     let system_prompt = "You are an expert, strict senior engineer. Review the code diff for bugs, \
         security issues, performance problems, and bad practices. Respond with a concise, polite \
         Markdown comment. Include code snippets for any suggested changes.";
-    let llm_body = serde_json::json!({
-        "model": llm_model,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": format!("Here is the PR diff:\n```diff\n{}\n```", diff_text) }
-        ],
-        "max_tokens": 1500
-    });
-    let llm_req = Request {
-        method: Method::Post,
-        url: "https://api.openai.com/v1/chat/completions".to_string(),
-        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
-        body: serde_json::to_vec(&llm_body).map_err(|e| format!("encode LLM body: {}", e))?,
-        timeout_ms: Some(60000),
+    let review_req = CompletionRequest {
+        provider,
+        model,
+        messages: vec![Message {
+            role: Role::User,
+            content: format!("Here is the PR diff:\n```diff\n{}\n```", diff_text),
+        }],
+        max_tokens: Some(1500),
+        temperature: Some(0.2),
+        system_prompt: Some(system_prompt.to_string()),
     };
-    let llm_resp =
-        fetch_with_bearer(llm_slot, &llm_req).map_err(|e| format!("Failed to call the LLM: {:?}", e))?;
-    if llm_resp.status != 200 {
-        return Err(format!(
-            "LLM API returned status {} ({})",
-            llm_resp.status,
-            String::from_utf8_lossy(&llm_resp.body)
-        ));
+    let completion =
+        llm::complete(&review_req).map_err(|e| format!("LLM completion failed: {:?}", e))?;
+    let review = completion.text;
+    if review.trim().is_empty() {
+        return Err("LLM returned an empty review".to_string());
     }
-    let llm_json: Value = serde_json::from_slice(&llm_resp.body)
-        .map_err(|_| "Failed to parse LLM JSON response".to_string())?;
-    let review = llm_json["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or("LLM response missing choices[0].message.content")?;
 
     logging::log(Level::Info, "Generated review; posting comment to GitHub.");
 
@@ -224,7 +234,7 @@ fn run(input: String) -> Result<String, String> {
 
     Ok(serde_json::json!({
         "pr_number": pr_number,
-        "model": llm_model,
+        "model": completion.model,
         "posted": posted,
         "post_status": post.status,
         "review": review,
