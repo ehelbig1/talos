@@ -4243,15 +4243,16 @@ impl wit_http::Host for TalosContext {
                 tracing::warn!(slot, error = %e, "fetch-with-bearer: slot lookup failed");
                 wit_http::Error::Networkerror
             })?;
-        // L-4: build "Bearer <token>" via push so the auth_value
-        // Zeroizing wrapper drops + wipes immediately after we've
-        // built the header string. The header string itself is then
-        // moved into req.headers (and ultimately into reqwest's
-        // HeaderValue buffer) — once that move completes there's only
-        // one plaintext copy in flight.
-        let mut header = String::with_capacity("Bearer ".len() + auth_value.len());
-        header.push_str("Bearer ");
-        header.push_str(auth_value.as_str());
+        // `into_auth_header` ALREADY applies the case-insensitive "Bearer " scheme
+        // prefix when the header name is "Authorization" (and is idempotent — it
+        // won't double up if the secret already carries a Bearer/Basic scheme). Use
+        // the returned value verbatim. A second manual "Bearer " here produced
+        // `Authorization: Bearer Bearer <token>`, which every upstream rejects with
+        // 401 (first observed against api.github.com via the github-pr-reviewer
+        // module — the first end-to-end fetch_with_bearer exercise in the stack).
+        // L-4: copy out of the Zeroizing buffer, then drop it so the plaintext is
+        // wiped; the owned String is moved into req.headers (one copy in flight).
+        let header = auth_value.as_str().to_string();
         drop(auth_value);
         req.headers.insert(0, ("Authorization".to_string(), header));
         // Dispatch through the standard fetch path; all security checks apply.
