@@ -4,7 +4,7 @@
   "display_name": "GitHub PR Reviewer",
   "description": "Automatically review GitHub pull requests using an LLM. Posts review comments directly to the PR via the GitHub API.",
   "category": "Development",
-  "capability_world": "network-node",
+  "capability_world": "secrets-node",
   "allowed_hosts": ["api.github.com", "api.openai.com"],
   "requires_secrets": ["github/token", "llm/api_key"],
   "requires_approval_for": [],
