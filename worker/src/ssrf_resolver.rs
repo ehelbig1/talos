@@ -196,6 +196,10 @@ impl Resolve for SsrfFilteringResolver {
                 && !production
                 && explicit_allowed.contains(&host_lower);
 
+            // `lookup_host` needs a port to return SocketAddrs; this `:80` is a
+            // throwaway placeholder. The real port is selected by the connector
+            // AFTER we zero it out below (see the `set_port(0)` at the return) —
+            // do NOT treat this 80 as meaningful, it leaks to the wire otherwise.
             let lookup = tokio::net::lookup_host(format!("{}:80", host)).await;
             let addrs = match lookup {
                 Ok(it) => it.collect::<Vec<SocketAddr>>(),
@@ -261,7 +265,21 @@ impl Resolve for SsrfFilteringResolver {
                 );
             }
 
-            let iter: Addrs = Box::new(filtered.into_iter());
+            // Zero the port on every returned address. The reqwest `Resolve`
+            // contract (matching reqwest's own GaiResolver, which queries with
+            // port 0) is that the resolver returns the IP and the connector fills
+            // in the scheme-default port — 443 for https, 80 for http. hyper-util
+            // only performs that substitution when the resolved port is 0; a
+            // NON-zero port (the `:80` placeholder we pass to `lookup_host` so it
+            // returns SocketAddrs at all) is trusted verbatim and leaks, so an
+            // https URL connects to :80 and the TLS handshake fails with a bare
+            // "networkerror". Resetting to 0 hands port selection back to the
+            // connector. (The SSRF/private-IP classification above is on the IP
+            // only and is unaffected by the port.)
+            let iter: Addrs = Box::new(filtered.into_iter().map(|mut sa| {
+                sa.set_port(0);
+                sa
+            }));
             Ok(iter)
         })
     }
