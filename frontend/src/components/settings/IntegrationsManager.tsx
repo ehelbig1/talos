@@ -61,6 +61,14 @@ interface ProviderInfo {
   connect_url: string;
 }
 
+/** Shape returned by GET /api/github/installations (RFC 0008). */
+interface GithubInstallation {
+  installation_id: number;
+  account_login: string;
+  account_type?: string | null;
+  repository_selection?: string | null;
+}
+
 /** Maps an icon name string from the API to the corresponding Lucide component. */
 const ICON_MAP: Record<string, LucideIcon> = {
   Calendar,
@@ -96,6 +104,20 @@ export function IntegrationsManager() {
   const [disconnecting, setDisconnecting] = useState(false);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const pollTimerRef = React.useRef<number | null>(null);
+
+  // Connected GitHub App installations (RFC 0008) — react-query owns the state
+  // so the card can show the linked account without a setState-in-effect.
+  const { data: githubInstallations = [], refetch: refetchGithub } = useQuery<
+    GithubInstallation[]
+  >({
+    queryKey: ["githubInstallations"],
+    queryFn: async () => {
+      const res = await authedFetch("/api/github/installations");
+      if (!res.ok) return [];
+      const d = await res.json();
+      return Array.isArray(d?.installations) ? d.installations : [];
+    },
+  });
 
   // Clear any in-flight OAuth popup poller on unmount.
   useEffect(() => {
@@ -181,6 +203,7 @@ export function IntegrationsManager() {
         } else {
           toast.success(`${label} connected: ${val}`);
           refetchIntegrations();
+          if (param === "github_connected") refetchGithub();
         }
         params.delete(param);
         dirty = true;
@@ -194,7 +217,7 @@ export function IntegrationsManager() {
         `${window.location.pathname}${params.toString() ? `?${params}` : ""}`,
       );
     }
-  }, [providers, refetchIntegrations]);
+  }, [providers, refetchIntegrations, refetchGithub]);
 
   // Disconnect Service
   const handleDisconnectService = async () => {
@@ -570,11 +593,34 @@ export function IntegrationsManager() {
             </button>
           </div>
           <div className="space-y-3 mt-auto relative z-10">
-            <div className="h-[68px] border border-dashed border-white/5 rounded-[1.5rem] flex items-center justify-center bg-black/10 group-hover:bg-black/20 transition-premium px-4">
-              <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.25em] text-center leading-relaxed">
-                Install to grant short-lived, per-repo tokens
-              </p>
-            </div>
+            {githubInstallations.length > 0 ? (
+              githubInstallations.map((inst) => (
+                <div
+                  key={inst.installation_id}
+                  className="bg-black/20 border border-white/5 rounded-2xl px-5 py-4 flex items-center justify-between shadow-inner"
+                >
+                  <div className="flex flex-col">
+                    <span className="text-[11px] font-black text-white/80 tracking-tight">
+                      {inst.account_login}
+                    </span>
+                    <div className="flex items-center gap-2 mt-1">
+                      <div className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />
+                      <span className="text-[8px] text-success font-black uppercase tracking-widest">
+                        {inst.repository_selection === "all"
+                          ? "All repositories"
+                          : "Selected repositories"}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="h-[68px] border border-dashed border-white/5 rounded-[1.5rem] flex items-center justify-center bg-black/10 group-hover:bg-black/20 transition-premium px-4">
+                <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.25em] text-center leading-relaxed">
+                  Install to grant short-lived, per-repo tokens
+                </p>
+              </div>
+            )}
           </div>
         </div>
       </div>

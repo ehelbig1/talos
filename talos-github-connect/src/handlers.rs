@@ -60,6 +60,32 @@ pub async fn connect_github_handler(
     }
 }
 
+/// `GET /api/github/installations` — list the user's connected installations
+/// (for the Integrations UI). Authenticated; returns `{ installations: [...] }`.
+pub async fn list_github_installations_handler(
+    State(svc): State<Arc<GithubConnectService>>,
+    axum::Extension(user_id): axum::Extension<Uuid>,
+) -> impl IntoResponse {
+    match svc.list_installations(user_id).await {
+        Ok(installations) => Json(serde_json::json!({
+            "success": true,
+            "installations": installations,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, error = %e, "GitHub App: list installations failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Failed to list GitHub installations",
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SetupParams {
     pub installation_id: Option<String>,
