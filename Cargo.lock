@@ -7740,6 +7740,7 @@ name = "talos-github-connect"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "serde",
@@ -7749,6 +7750,7 @@ dependencies = [
  "talos-github",
  "talos-github-repository",
  "talos-oauth",
+ "talos-workflow-engine-core",
  "tracing",
  "urlencoding",
  "uuid",

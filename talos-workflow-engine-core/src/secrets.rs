@@ -102,3 +102,20 @@ pub trait SecretsResolver: Send + Sync {
     /// log internally.
     async fn refresh_vault_paths(&self, _paths: &[String]) {}
 }
+
+/// Resolves a GitHub App installation token for a repo owner (RFC 0008 B4).
+///
+/// Injected into a [`SecretsResolver`] so a module secret path of the form
+/// `github_app:<owner>` resolves to a freshly-minted, short-lived installation
+/// token instead of a static vault secret. It lives in this low-level crate
+/// (rather than the GitHub crates) so the resolver crate can hold a `dyn`
+/// reference to it without a dependency cycle.
+#[async_trait]
+pub trait GithubInstallationTokenProvider: Send + Sync {
+    /// * `Ok(Some(token))` — an active installation exists for `owner`; a fresh
+    ///   (cached / re-minted) installation token.
+    /// * `Ok(None)` — no installation (or App disabled); the secret is simply not
+    ///   injected, so the module fails closed on the missing secret.
+    /// * `Err` — an installation exists but minting failed.
+    async fn installation_token(&self, owner: &str) -> Result<Option<String>, BoxError>;
+}

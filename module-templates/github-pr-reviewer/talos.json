@@ -14,7 +14,7 @@
     "properties": {
       "GITHUB_TOKEN_SECRET": {
         "type": "string",
-        "description": "Secret path for the GitHub Personal Access Token (e.g. 'github/token')"
+        "description": "Secret path for the GitHub token. Either a PAT secret path (e.g. 'github/token'), OR a GitHub App installation token via 'github_app:<owner>' (e.g. 'github_app:ehelbig1') — the controller mints a short-lived, repo-scoped installation token (RFC 0008). For the App scheme, also grant the module allowed_secrets: ['github_app:<owner>']."
       },
       "LLM_API_KEY_SECRET": {
         "type": "string",

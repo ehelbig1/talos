@@ -165,12 +165,22 @@ Each phase independently shippable; PAT path intact throughout.
     selects the App token; any other path stays a PAT/vault secret. No module-code
     change — the operator just sets the module's `GITHUB_TOKEN_SECRET` config to
     `github_app:<owner>`.
-  - *B4-wiring (remaining):* call the resolver from the controller's per-module
-    secret prefetch (`build_encrypted_secrets`) — for each requested secret path
-    matching the scheme, resolve + inject the minted token under that key (falling
-    back to the existing PAT resolution on `Ok(None)`). Touches the
-    security-critical secret-prefetch path → best validated against a live
-    workflow run. *Rollback:* default to PAT if no installation resolves.
+  - *B4-wiring (shipped):* the controller's secret resolver
+    (`talos_oauth::resolver::ControllerSecretsResolver::resolve_by_paths`) now
+    splits `github_app:<owner>` paths from ordinary vault paths and resolves the
+    former via an injected `GithubInstallationTokenProvider` (the `GithubTokenResolver`,
+    set once at controller startup through a `OnceLock` — the App is a deployment
+    singleton, so this avoids threading a `dyn` through the whole engine-builder
+    dispatch tree). The provider trait lives in `talos-workflow-engine-core` so the
+    resolver crate holds it without a cycle. Because a module's `allowed_secrets`
+    flow through `resolve_by_paths` already, **no change to `build_encrypted_secrets`
+    or its call sites** was needed.
+    - *Operator setup:* grant the module `allowed_secrets: ["github_app:<owner>"]`
+      and set its token-secret config (e.g. `GITHUB_TOKEN_SECRET`) to
+      `github_app:<owner>`. The module reads it via `get_secret(...)` unchanged and
+      gets a minted installation token. `Ok(None)` (no installation) → the secret
+      isn't injected, so the module fails closed; an operator who wants the PAT
+      simply keeps the PAT path. *Rollback:* unset the provider / use the PAT path.
 - **B5. App-level webhook secret verification.** The verifier
   (`talos_github::verify_app_webhook_signature`) is shipped: the same Phase-A
   `X-Hub-Signature-256` scheme — `HMAC-SHA256(secret, raw_body)`, constant-time —

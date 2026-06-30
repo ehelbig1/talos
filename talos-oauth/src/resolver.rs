@@ -17,11 +17,29 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use talos_workflow_engine_core::{BoxError, SecretsResolver};
+use talos_workflow_engine_core::{BoxError, GithubInstallationTokenProvider, SecretsResolver};
 use uuid::Uuid;
 
 use crate::OAuthCredentialService;
 use talos_secrets_manager::SecretsManager;
+
+/// Secret-path scheme that resolves to a GitHub App installation token
+/// (RFC 0008 B4): `github_app:<owner>`.
+const GITHUB_APP_SCHEME: &str = "github_app:";
+
+/// Process-wide GitHub App installation-token provider, injected once at
+/// controller startup via [`set_github_installation_token_provider`]. The App is
+/// a deployment singleton (one App config), so a set-once global is the
+/// least-invasive injection — threading a `dyn` through every engine-builder
+/// call site would touch the whole dispatch tree. Unset (tests, App disabled) →
+/// `github_app:` paths simply aren't resolved (fail-safe).
+static GITHUB_PROVIDER: OnceLock<Arc<dyn GithubInstallationTokenProvider>> = OnceLock::new();
+
+/// Inject the GitHub App installation-token provider (RFC 0008 B4). Idempotent:
+/// the first call wins; later calls are ignored.
+pub fn set_github_installation_token_provider(provider: Arc<dyn GithubInstallationTokenProvider>) {
+    let _ = GITHUB_PROVIDER.set(provider);
+}
 
 /// Adapter exposing [`SecretsManager`] through the
 /// [`SecretsResolver`] trait.
@@ -92,10 +110,54 @@ impl SecretsResolver for ControllerSecretsResolver {
         paths: &[String],
         user_id: Option<Uuid>,
     ) -> Result<HashMap<String, String>, BoxError> {
-        self.sm
-            .get_secrets_by_paths(paths, user_id)
-            .await
-            .map_err(boxed)
+        // RFC 0008 B4: split `github_app:<owner>` paths from ordinary vault
+        // paths. The App tokens are minted on demand; everything else resolves
+        // through SecretsManager exactly as before.
+        let (github_paths, vault_paths): (Vec<String>, Vec<String>) = paths
+            .iter()
+            .cloned()
+            .partition(|p| p.starts_with(GITHUB_APP_SCHEME));
+
+        let mut out = if vault_paths.is_empty() {
+            HashMap::new()
+        } else {
+            self.sm
+                .get_secrets_by_paths(&vault_paths, user_id)
+                .await
+                .map_err(boxed)?
+        };
+
+        if !github_paths.is_empty() {
+            match GITHUB_PROVIDER.get() {
+                Some(provider) => {
+                    for path in github_paths {
+                        let owner = &path[GITHUB_APP_SCHEME.len()..];
+                        match provider.installation_token(owner).await {
+                            // Key by the full `github_app:<owner>` path: that's
+                            // what the module reads via get_secret(...).
+                            Ok(Some(token)) => {
+                                out.insert(path.clone(), token);
+                            }
+                            Ok(None) => tracing::warn!(
+                                %owner,
+                                "no active GitHub App installation; github_app secret not injected (module will fail closed)"
+                            ),
+                            Err(e) => tracing::error!(
+                                %owner,
+                                error = %e,
+                                "GitHub App installation-token mint failed"
+                            ),
+                        }
+                    }
+                }
+                None => tracing::warn!(
+                    count = github_paths.len(),
+                    "github_app:<owner> secret requested but no GitHub App provider is configured"
+                ),
+            }
+        }
+
+        Ok(out)
     }
 
     async fn resolve_llm_keys(

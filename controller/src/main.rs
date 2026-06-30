@@ -716,6 +716,13 @@ async fn main() -> anyhow::Result<()> {
     if github_app_config.is_some() {
         tracing::info!("GitHub App connect flow enabled (RFC 0008)");
     }
+    // B4-wiring: inject the App installation-token provider into the engine's
+    // secret resolver so a module secret path `github_app:<owner>` resolves to a
+    // minted installation token. Set-once global; no-op when the App is disabled.
+    let github_token_resolver = std::sync::Arc::new(
+        talos_github_connect::GithubTokenResolver::new(db_pool.clone(), github_app_config.clone()),
+    );
+    talos_oauth::resolver::set_github_installation_token_provider(github_token_resolver);
     let github_connect_service = std::sync::Arc::new(
         talos_github_connect::GithubConnectService::new(db_pool.clone(), github_app_config),
     );

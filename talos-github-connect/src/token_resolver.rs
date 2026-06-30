@@ -99,6 +99,27 @@ impl GithubTokenResolver {
     }
 }
 
+/// Bridge to the engine's secret-resolution path (B4-wiring): a module secret
+/// path `github_app:<owner>` resolves to an installation token. The provider
+/// trait lives in `talos-workflow-engine-core` so the resolver crate can hold a
+/// `dyn` reference without depending on this crate (no cycle).
+#[async_trait::async_trait]
+impl talos_workflow_engine_core::GithubInstallationTokenProvider for GithubTokenResolver {
+    async fn installation_token(
+        &self,
+        owner: &str,
+    ) -> Result<Option<String>, talos_workflow_engine_core::BoxError> {
+        match self.token_for_owner(owner).await {
+            // Deref the zeroizing buffer to a plaintext String — same pattern as
+            // ControllerSecretsResolver::resolve_llm_keys. It lives only until the
+            // engine seals it into the job's encrypted_secrets (microseconds).
+            Ok(Some(token)) => Ok(Some(token.as_str().to_string())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("{e:#}").into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
