@@ -4032,10 +4032,15 @@ async fn main() -> anyhow::Result<()> {
         .layer(Extension(whitelist.clone()));
 
     // GitHub App connect — initiate (authenticated). Returns the install URL.
+    // Plus the authenticated installations list (for the Integrations UI).
     let github_connect_route = Router::new()
         .route(
             "/api/github/connect",
             get(talos_github_connect::connect_github_handler),
+        )
+        .route(
+            "/api/github/installations",
+            get(talos_github_connect::list_github_installations_handler),
         )
         .with_state(github_connect_service.clone())
         .layer(from_fn(rest_auth_middleware)) // injects Extension<Uuid>

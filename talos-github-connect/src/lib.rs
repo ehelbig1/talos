@@ -17,6 +17,9 @@ mod handlers;
 mod service;
 mod token_resolver;
 
-pub use handlers::{connect_github_handler, github_setup_callback_handler, SetupParams};
-pub use service::{GithubConnectService, SetupOutcome};
+pub use handlers::{
+    connect_github_handler, github_setup_callback_handler, list_github_installations_handler,
+    SetupParams,
+};
+pub use service::{GithubConnectService, InstallationSummary, SetupOutcome};
 pub use token_resolver::{parse_github_app_secret_path, GithubTokenResolver, GITHUB_APP_SCHEME};

@@ -21,6 +21,16 @@ pub struct SetupOutcome {
     pub account_login: String,
 }
 
+/// A connected installation, surfaced to the UI so the Integrations page can
+/// show that GitHub is linked (and to which account).
+#[derive(serde::Serialize)]
+pub struct InstallationSummary {
+    pub installation_id: i64,
+    pub account_login: String,
+    pub account_type: Option<String>,
+    pub repository_selection: Option<String>,
+}
+
 struct ConfiguredApp {
     client: GithubAppClient,
     app_slug: String,
@@ -57,6 +67,27 @@ impl GithubConnectService {
 
     pub fn is_configured(&self) -> bool {
         self.app.is_some()
+    }
+
+    /// List the user's ACTIVE installations (for the Integrations UI). This is a
+    /// plain DB read, so it works even if the App client isn't configured — a
+    /// previously-connected installation should still be visible.
+    pub async fn list_installations(&self, user_id: Uuid) -> Result<Vec<InstallationSummary>> {
+        let repo = GithubAppInstallationRepository::new(self.db_pool.clone());
+        let rows = repo
+            .list_for_user(user_id)
+            .await
+            .context("list GitHub App installations")?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.is_active)
+            .map(|r| InstallationSummary {
+                installation_id: r.installation_id,
+                account_login: r.account_login,
+                account_type: r.account_type,
+                repository_selection: r.repository_selection,
+            })
+            .collect())
     }
 
     fn app(&self) -> Result<&ConfiguredApp> {
