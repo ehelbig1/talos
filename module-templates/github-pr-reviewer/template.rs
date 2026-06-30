@@ -5,7 +5,11 @@ use talos::core::logging::{self, Level};
 use talos::core::secrets::get_secret;
 use talos_sdk_macros::talos_node;
 
-#[talos_node]
+// The capability world is selected by THIS attribute (it drives WIT bindgen),
+// not by talos.json. Bare `#[talos_node]` defaults to `minimal-node`, which has
+// no `http` / `secrets` interfaces — so the `talos::core::{http,secrets}` imports
+// above won't resolve. This module needs both (GitHub + OpenAI HTTP, get_secret).
+#[talos_node(world = "secrets-node")]
 pub fn run(
     github_webhook_payload: String,
     github_token_secret: String,
