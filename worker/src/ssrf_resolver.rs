@@ -426,6 +426,42 @@ mod tests {
         );
     }
 
+    /// Regression: every resolved `SocketAddr` must carry port 0 so the
+    /// connector substitutes the scheme-default port.
+    ///
+    /// WHY: `tokio::net::lookup_host` needs a port to produce a
+    /// `SocketAddr`, so `resolve()` queries with a throwaway `:80`. The
+    /// reqwest/hyper-util `Resolve` contract is that the resolver returns
+    /// the IP and the *connector* fills in the scheme port (443 for https,
+    /// 80 for http) — but hyper-util only performs that substitution when
+    /// the resolved port is 0. If a NON-zero port leaks (the `:80`
+    /// placeholder), it is trusted verbatim: an https URL connects to :80
+    /// and the TLS handshake fails with a bare "networkerror". The fix maps
+    /// `set_port(0)` over every returned addr; this test pins that so the
+    /// placeholder port can never leak again. (IP literal → no network I/O,
+    /// fully deterministic; mirrors `tier2_default_permits_public_filters_private`.)
+    #[tokio::test]
+    async fn resolve_returns_zero_port_so_connector_picks_scheme_port() {
+        let r = SsrfFilteringResolver::for_allowed_hosts(&[], false);
+        let addrs: Vec<SocketAddr> = r
+            .resolve(Name::from_str("1.1.1.1").expect("name"))
+            .await
+            .expect("resolve")
+            .collect();
+        assert!(
+            !addrs.is_empty(),
+            "Tier-2 must resolve a public IP literal (1.1.1.1)"
+        );
+        for sa in &addrs {
+            assert_eq!(
+                sa.port(),
+                0,
+                "resolver must zero the port so the connector picks the scheme-default \
+                 (443 for https); a non-zero port leaks and https connects to :80"
+            );
+        }
+    }
+
     /// wasm-security-review (2026-05-22): production gate refuses the
     /// bypass regardless of env toggle + allowlist hit.
     #[test]
