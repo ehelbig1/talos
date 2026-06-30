@@ -27,6 +27,11 @@ const ENV_PRIVATE_KEY: &str = "GITHUB_APP_PRIVATE_KEY";
 const ENV_WEBHOOK_SECRET: &str = "GITHUB_APP_WEBHOOK_SECRET";
 
 /// Resolved, validated GitHub App platform config.
+///
+/// `Clone` is derived (the secret fields are `Zeroizing`, which clones) so the
+/// controller can hand the same config to both the connect service and the
+/// token resolver. Both copies zeroize on drop.
+#[derive(Clone)]
 pub struct GithubAppConfig {
     pub app_id: String,
     pub app_slug: String,
