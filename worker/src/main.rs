@@ -2474,8 +2474,11 @@ async fn execute_job(
     // MCP-642 (2026-05-13): if WASM_EXECUTION_TIMEOUT_SECS=0 AND the
     // caller didn't specify req.timeout_ms, the job timeout below
     // becomes 0ms → every job times out instantly. Same MCP-639 class.
+    // 120s default kept in lockstep with DEFAULT_NODE_TIMEOUT_SECS
+    // (talos-workflow-engine) and get_wasm_config so the worker's fallback job
+    // timeout matches the controller's reply-wait and the operator-reported value.
     let worker_fallback_secs: u64 =
-        crate::runtime::nonzero_env_or_default("WASM_EXECUTION_TIMEOUT_SECS", 60);
+        crate::runtime::nonzero_env_or_default("WASM_EXECUTION_TIMEOUT_SECS", 120);
     let job_timeout_ms: u64 = if req.timeout_ms > 0 {
         req.timeout_ms
     } else {

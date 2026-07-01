@@ -285,11 +285,14 @@ async fn handle_get_wasm_config(
         "max_memory_mb": nonzero_u64("WASM_MAX_MEMORY_MB", 128),
         "max_fuel": nonzero_u64("WASM_FUEL_LIMIT", 10_000_000),
         // Default is 60s (was 30s). Raised 2026-04-14 because agent-node modules
-        // calling `llm::complete` routinely need 20–45s for Ollama synthesis and
-        // can exceed 30s on Anthropic for larger prompts. 60s covers both without
-        // blessing truly-runaway workflows; operators can still override via
-        // WASM_EXECUTION_TIMEOUT_SECS or the set_wasm_config tool.
-        "execution_timeout_secs": nonzero_u64("WASM_EXECUTION_TIMEOUT_SECS", 60),
+        // calling `llm::complete` routinely need 20–45s for Ollama synthesis (and
+        // longer on CPU-bound local models), can exceed 30s on Anthropic for larger
+        // prompts, and a single module commonly chains HTTP + LLM + HTTP. 120s
+        // matches the worker's single-op ceiling (EXTERNAL_LLM/HTTP = 120s) so the
+        // controller doesn't abandon a still-working node; operators can still
+        // override via WASM_EXECUTION_TIMEOUT_SECS or the set_wasm_config tool.
+        // Keep in lockstep with DEFAULT_NODE_TIMEOUT_SECS (talos-workflow-engine).
+        "execution_timeout_secs": nonzero_u64("WASM_EXECUTION_TIMEOUT_SECS", 120),
         "max_result_rows": nonzero_u64("WASM_MAX_RESULT_ROWS", 1000),
         "max_result_size_bytes": nonzero_u64("WASM_MAX_RESULT_SIZE_BYTES", 1_048_576),
     });

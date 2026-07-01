@@ -127,20 +127,28 @@ pub fn global_rate_limit_entry_count() -> usize {
 /// Default per-node execution timeout (in seconds) applied when a node's
 /// graph data doesn't carry an explicit `timeout_secs`.
 ///
-/// 60s covers both simple HTTP fetches (sub-second typical) and LLM synthesis
-/// against Ollama (20-45s typical) without requiring every agent-node module
-/// author to set a custom timeout. Individual nodes can still raise or lower
-/// via `add_node_to_workflow(timeout_secs:…)`; there is no implicit clamp.
+/// 120s is the controller's reply-wait for a node's worker job. It MUST be
+/// >= the worker's own maximum per-operation budget, or the controller abandons
+/// a node that is still legitimately working: the worker allows up to
+/// `EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS` (120s) for an external LLM exchange,
+/// `MAX_HTTP_TIMEOUT_MS` (120s) for a single `http::fetch`, and 60s for a local
+/// Ollama exchange — and a single module commonly chains several (e.g.
+/// github-pr-reviewer does HTTP diff fetch + LLM review + HTTP comment post).
+/// The previous 60s default was shorter than even one external-LLM/HTTP op, so a
+/// slow-but-valid node (large diff + slow/CPU-bound model) was dropped mid-flight
+/// while the worker kept running — wasting the work and stranding the execution.
+/// 120s matches the worker's single-op ceiling and still covers the common chain.
+/// Individual nodes can still raise or lower via
+/// `add_node_to_workflow(timeout_secs:…)`; there is no implicit clamp.
 ///
 /// Respects `WASM_EXECUTION_TIMEOUT_SECS` env var for operator override —
 /// matches `get_wasm_config`'s default so the tool output and actual
-/// runtime behavior agree. Previously these defaults were hardcoded `30` at
-/// five call sites and diverged from the configurable env default.
+/// runtime behavior agree.
 pub static DEFAULT_NODE_TIMEOUT_SECS: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("WASM_EXECUTION_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(60)
+        .unwrap_or(120)
 });
 
 /// M5 (2026-05-28 review): maximum number of node-dispatch futures the reactor
