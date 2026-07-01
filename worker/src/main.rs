@@ -996,10 +996,23 @@ async fn publish_bytes_with_retry(
 ) -> Result<(), String> {
     let mut backoff_ms = 100u64;
     for attempt in 0..max_attempts {
-        match nc.publish(topic.clone(), payload.clone()).await {
-            Ok(_) => {
+        // `publish()` only enqueues into the client's outbound buffer — it returns
+        // Ok before the server has seen the message. Every caller of this helper is
+        // delivering a signed JobResult / reply, and the controller's reply-inbox
+        // await has no independent timeout floor, so a message dropped between the
+        // local buffer and the broker (connection blip, buffer discard) is a SILENT
+        // loss that hangs the execution until the 30-min stale sweep. `flush()`
+        // drains the buffer to the server and awaits acceptance, turning that loss
+        // into a retriable error instead of a false success. Cost is one round-trip
+        // per job result (infrequent) — acceptable for delivery-critical results.
+        let sent = match nc.publish(topic.clone(), payload.clone()).await {
+            Ok(()) => nc.flush().await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match sent {
+            Ok(()) => {
                 if attempt > 0 {
-                    ::tracing::info!(topic, attempt, "Published after retries");
+                    ::tracing::info!(topic, attempt, "Published (flushed) after retries");
                 }
                 return Ok(());
             }
@@ -1010,13 +1023,13 @@ async fn publish_bytes_with_retry(
                         attempt = attempt + 1,
                         max_attempts,
                         error = %e,
-                        "Failed to publish, retrying"
+                        "Failed to publish+flush, retrying"
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(5_000);
                 } else {
                     return Err(format!(
-                        "Failed to publish to {} after {} attempts: {}",
+                        "Failed to publish+flush to {} after {} attempts: {}",
                         topic, max_attempts, e
                     ));
                 }
