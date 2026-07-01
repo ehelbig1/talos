@@ -3450,6 +3450,16 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Fleet-wide job idempotency tier (2026-07-01): jobs arrive via a NATS
+    // queue group, so a controller transport-retry can land on a DIFFERENT
+    // worker whose in-process result cache is cold — re-executing side
+    // effects. Backing the cache with the same Redis makes dedup fleet-wide;
+    // absent/unreachable Redis degrades to same-worker-only (the old
+    // behavior), never an error.
+    if let Some(ref client) = redis_client {
+        crate::job_idempotency::init_redis(client.as_ref().clone()).await;
+    }
+
     // PostgreSQL connection block removed Phase 2.10. Worker is now
     // credential-free: the WIT `database::execute_query` host
     // function dispatches via signed NATS-RPC to the controller
@@ -3604,9 +3614,47 @@ async fn main() -> anyhow::Result<()> {
                                 let request_authentic =
                                     req.verify_no_replay_with_ring(&key_clone, 300).is_ok();
                                 if request_authentic && !req.dry_run {
-                                    if let Some(cached) =
-                                        crate::job_idempotency::JOB_RESULT_CACHE.get(req.job_id)
+                                    // Tier 1: in-process (same-worker retry, free).
+                                    // Tier 2: Redis (queue-group retry landed on a
+                                    // DIFFERENT worker). Redis-sourced bytes are NOT
+                                    // trusted blindly — the result's own HMAC is
+                                    // re-verified and its job_id matched before
+                                    // re-publish, so a Redis compromise can neither
+                                    // inject forged results nor cross-wire jobs;
+                                    // verification failure falls through to normal
+                                    // re-execution.
+                                    let cached = match crate::job_idempotency::JOB_RESULT_CACHE
+                                        .get(req.job_id)
                                     {
+                                        Some(c) => Some(c),
+                                        None => crate::job_idempotency::shared_get(
+                                            crate::job_idempotency::REDIS_JOB_PREFIX,
+                                            req.job_id,
+                                        )
+                                        .await
+                                        .and_then(|bytes| {
+                                            match serde_json::from_slice::<JobResult>(&bytes) {
+                                                Ok(r)
+                                                    if r.job_id == req.job_id
+                                                        && r.verify_no_replay_with_ring(
+                                                            &key_clone, 300,
+                                                        )
+                                                        .is_ok() =>
+                                                {
+                                                    Some(r)
+                                                }
+                                                _ => {
+                                                    ::tracing::warn!(
+                                                        job_id = %req.job_id,
+                                                        "idempotency: shared Redis entry failed \
+                                                         verification — ignoring, re-executing"
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        }),
+                                    };
+                                    if let Some(cached) = cached {
                                         ::tracing::info!(
                                             job_id = %req.job_id,
                                             "idempotency: re-publishing cached result for re-seen \
@@ -3637,14 +3685,24 @@ async fn main() -> anyhow::Result<()> {
                                 // FU-2: cache the SIGNED terminal result BEFORE publishing, so a
                                 // retry that arrives because the *reply* (not the execution)
                                 // failed still finds it. Keyed on job_id; bounded by TTL + size +
-                                // count (see `job_idempotency`).
+                                // count (see `job_idempotency`). Written to BOTH tiers: the
+                                // in-process map (same-worker retry) and Redis (retry landing on
+                                // a sibling queue-group worker).
                                 if !req.dry_run {
                                     match serde_json::to_vec(&result) {
-                                        Ok(bytes) => crate::job_idempotency::JOB_RESULT_CACHE.put(
-                                            result.job_id,
-                                            result.clone(),
-                                            bytes.len(),
-                                        ),
+                                        Ok(bytes) => {
+                                            crate::job_idempotency::JOB_RESULT_CACHE.put(
+                                                result.job_id,
+                                                result.clone(),
+                                                bytes.len(),
+                                            );
+                                            crate::job_idempotency::shared_put(
+                                                crate::job_idempotency::REDIS_JOB_PREFIX,
+                                                result.job_id,
+                                                &bytes,
+                                            )
+                                            .await;
+                                        }
                                         Err(e) => ::tracing::warn!(
                                             job_id = %result.job_id, error = %e,
                                             "idempotency: could not serialize result for cache sizing; not caching"
@@ -3764,8 +3822,43 @@ async fn main() -> anyhow::Result<()> {
                                 let request_authentic =
                                     req.verify_no_replay_with_ring(&key_clone, 300).is_ok();
                                 if request_authentic {
-                                    if let Some(cached) =
-                                        crate::job_idempotency::PIPELINE_PAYLOAD_CACHE.get(req.job_id)
+                                    // Tier 1: in-process; tier 2: Redis (retry on a
+                                    // sibling queue-group worker). Redis bytes are
+                                    // deserialized + HMAC-verified + job_id-matched
+                                    // before the ORIGINAL bytes are re-published —
+                                    // same trust model as the single-job path.
+                                    let cached = match crate::job_idempotency::PIPELINE_PAYLOAD_CACHE
+                                        .get(req.job_id)
+                                    {
+                                        Some(c) => Some(c),
+                                        None => crate::job_idempotency::shared_get(
+                                            crate::job_idempotency::REDIS_PIPELINE_PREFIX,
+                                            req.job_id,
+                                        )
+                                        .await
+                                        .and_then(|bytes| {
+                                            match serde_json::from_slice::<PipelineJobResult>(&bytes) {
+                                                Ok(r)
+                                                    if r.job_id == req.job_id
+                                                        && r.verify_no_replay_with_ring(
+                                                            &key_clone, 300,
+                                                        )
+                                                        .is_ok() =>
+                                                {
+                                                    Some(bytes::Bytes::from(bytes))
+                                                }
+                                                _ => {
+                                                    ::tracing::warn!(
+                                                        job_id = %req.job_id,
+                                                        "idempotency: shared Redis pipeline entry \
+                                                         failed verification — ignoring, re-executing"
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        }),
+                                    };
+                                    if let Some(cached) = cached
                                     {
                                     ::tracing::info!(
                                         job_id = %req.job_id,
@@ -3871,12 +3964,19 @@ async fn main() -> anyhow::Result<()> {
                                 // FU-2: cache the final signed payload bytes BEFORE publishing, so
                                 // a retry that arrives because the *reply* (not the execution)
                                 // failed re-publishes the identical bytes instead of re-running the
-                                // pipeline. `Bytes::clone` is a cheap refcount bump.
+                                // pipeline. `Bytes::clone` is a cheap refcount bump. Written to
+                                // BOTH tiers (in-process + Redis) — see the single-job put site.
                                 crate::job_idempotency::PIPELINE_PAYLOAD_CACHE.put(
                                     result.job_id,
                                     payload.clone(),
                                     payload.len(),
                                 );
+                                crate::job_idempotency::shared_put(
+                                    crate::job_idempotency::REDIS_PIPELINE_PREFIX,
+                                    result.job_id,
+                                    &payload,
+                                )
+                                .await;
 
                                 // Single-publish architecture (mirrors single-job
                                 // results, see publish_result_with_retry above for
