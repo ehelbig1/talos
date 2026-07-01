@@ -24,12 +24,7 @@ use std::sync::LazyLock;
 /// rustls/TLS stack surfaces loudly at startup rather than
 /// indefinitely-retrying refresh tasks.
 static REFRESH_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("Atlassian OAuth: failed to build hardened reqwest client")
+    talos_http_utils::trusted_client::build_integration_client(std::time::Duration::from_secs(15))
 });
 use uuid::Uuid;
 

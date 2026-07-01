@@ -115,12 +115,9 @@ impl GmailWatchApiClient {
         // MCP-534: same Mode-B hardening as GmailApiClient — Bearer
         // token on every users.watch / users.stop / history.list call.
         Self {
-            client: reqwest::Client::builder()
-                .timeout(super::GMAIL_HTTP_TIMEOUT)
-                .connect_timeout(super::GMAIL_CONNECT_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("GmailWatchApiClient: failed to build hardened reqwest client"),
+            client: talos_http_utils::trusted_client::build_integration_client(
+                super::GMAIL_HTTP_TIMEOUT,
+            ),
             base_url: GMAIL_BASE.to_string(),
         }
     }

@@ -180,12 +180,12 @@ impl PubsubJwtVerifier {
             // auth header here doesn't reopen the credential-leak
             // surface; replace the `unwrap_or_else(Client::new)`
             // anti-pattern with a loud `.expect()` per the convention.
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(JWK_FETCH_TIMEOUT_SECS))
-                .connect_timeout(Duration::from_secs(2))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("PubsubJwtVerifier: failed to build hardened reqwest client"),
+            http: talos_http_utils::trusted_client::hardened_client_builder(Duration::from_secs(
+                JWK_FETCH_TIMEOUT_SECS,
+            ))
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .expect("PubsubJwtVerifier: failed to build hardened reqwest client"),
             expected_audience,
             expected_email,
         }

@@ -3299,6 +3299,57 @@ else
 fi
 echo
 
+# ── 49. Integration crates must build HTTP clients via the shared builder ──
+bold "▶ check 49: integration crates must use talos_http_utils::trusted_client (no raw reqwest client builder)"
+# Every OAuth/integration crate calls FIXED, TRUSTED hosts (accounts.google.com,
+# auth.atlassian.com, slack.com, googleapis.com, api.atlassian.com) carrying a
+# Bearer / X-*-Token credential. A hand-rolled `reqwest::Client::builder()` is
+# exactly where `redirect(Policy::none())` (credential-leak-via-3xx, MCP-533/571)
+# and `connect_timeout` (black-holed-host hang, MCP-1034) get forgotten — the
+# class we had to fix crate-by-crate. Route every such client through
+# talos_http_utils::trusted_client::{hardened_client_builder, build_integration_client}
+# so a NEW integration is hardened by construction. (User/caller-supplied URLs are
+# a different concern — those use talos_http_utils::outbound::* with the SSRF
+# resolver, per check 40.) Opt-out for a genuinely special client with
+# `// allow-raw-integration-client: <reason>` within 4 lines above.
+INTEG_CLIENT_VIOLATIONS=0
+integ_client_matches=$(grep -rnE 'reqwest::Client::builder\(\)' \
+    talos-gmail/src talos-google-calendar/src talos-slack/src \
+    talos-atlassian/src talos-oauth/src 2>/dev/null \
+    | grep -vE '/tests/|_tests\.rs' || true)
+if [ -n "$integ_client_matches" ]; then
+    while IFS= read -r line; do
+        file=$(echo "$line" | cut -d: -f1)
+        lineno=$(echo "$line" | cut -d: -f2)
+        body=$(echo "$line" | cut -d: -f3-)
+        [ -f "$file" ] || continue
+        # Skip full-line comments / doc comments.
+        if echo "$body" | grep -qE '^\s*//|^\s*\*|//!'; then
+            continue
+        fi
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '// allow-raw-integration-client:'; then
+                continue
+            fi
+        fi
+        printf '  %s\n' "$line"
+        INTEG_CLIENT_VIOLATIONS=$((INTEG_CLIENT_VIOLATIONS + 1))
+    done <<< "$integ_client_matches"
+fi
+
+if [ "$INTEG_CLIENT_VIOLATIONS" -gt 0 ]; then
+    red "✗ $INTEG_CLIENT_VIOLATIONS raw reqwest::Client::builder() in integration crate(s)"
+    yellow "  → use talos_http_utils::trusted_client::build_integration_client(timeout) or"
+    yellow "    hardened_client_builder(timeout) (redirect-none + connect-timeout baked in)."
+    yellow "  → Opt out (genuinely special client): // allow-raw-integration-client: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ integration crates build HTTP clients via the shared hardened builder"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"

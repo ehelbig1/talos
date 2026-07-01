@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+talos-http-utils = { path = "../talos-http-utils" }
 anyhow.workspace = true
 async-trait = "0.1"
 bcrypt = "0.18"

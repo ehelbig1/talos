@@ -21,3 +21,4 @@ pub mod outbound;
 pub mod request_id;
 pub mod sanitization;
 pub mod ssrf;
+pub mod trusted_client;

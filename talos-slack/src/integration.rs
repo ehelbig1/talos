@@ -18,12 +18,7 @@ use std::sync::LazyLock;
 /// redirect::Policy::none() (form bodies aren't stripped on
 /// same-origin redirects).
 static OAUTH_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("Slack OAuth: failed to build hardened reqwest client")
+    talos_http_utils::trusted_client::build_integration_client(std::time::Duration::from_secs(15))
 });
 use uuid::Uuid;
 
