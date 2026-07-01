@@ -379,8 +379,7 @@ impl GmailIntegrationService {
             expires_in: Option<u64>,
         }
 
-        let token_data: TokenResponse = token_resp
-            .json()
+        let token_data: TokenResponse = talos_http_body::read_json_capped(token_resp)
             .await
             .context("Failed to parse Gmail token response")?;
 
@@ -398,13 +397,13 @@ impl GmailIntegrationService {
         // hardening as the token-exchange POST above.
         // Perf#9: route through the shared OAUTH_HTTP_CLIENT.
         let user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo";
-        let user_info: serde_json::Value = OAUTH_HTTP_CLIENT
+        let user_info_resp = OAUTH_HTTP_CLIENT
             .get(user_info_url)
             .bearer_auth(&access_token)
             .send()
-            .await?
-            .json()
             .await?;
+        let user_info: serde_json::Value =
+            talos_http_body::read_json_capped(user_info_resp).await?;
 
         let email_address = user_info["email"]
             .as_str()

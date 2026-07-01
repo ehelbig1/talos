@@ -329,43 +329,52 @@ impl GmailWatchService {
     /// find the matching (user, watch row). Used by the Pub/Sub
     /// handler in commit 3.
     pub(crate) async fn find_by_email(&self, email: &str) -> Result<Option<(Uuid, GmailWatchRow)>> {
-        // Resolve email → user_id via gmail_integrations. This table
-        // is already indexed on email_address. A single user owns
-        // exactly one gmail_integrations row per email, so the look-
-        // up is unambiguous even with many Talos users.
-        let user_id: Option<Uuid> = sqlx::query_scalar(
+        // Resolve email → owning user(s) via gmail_integrations. IMPORTANT: the
+        // table is UNIQUE(user_id, email_address), NOT unique on email alone — the
+        // SAME mailbox can be connected by multiple Talos users. A bare `LIMIT 1`
+        // with no tiebreaker would dispatch the push to a Postgres-arbitrary user
+        // (their module / token / history), a cross-tenant confusion. Enumerate
+        // all active owners deterministically, warn on the ambiguous case, and
+        // return the first owner that actually has a watch row for this mailbox
+        // (an owner with no active watch can't be the push's target). A fuller fix
+        // would resolve by the watch's channel/topic identity rather than email.
+        let user_ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT user_id FROM gmail_integrations \
-             WHERE email_address = $1 AND is_active = true LIMIT 1",
+             WHERE email_address = $1 AND is_active = true ORDER BY user_id",
         )
         .bind(email)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        let Some(user_id) = user_id else {
-            return Ok(None);
-        };
 
-        let filter = ListFilter {
-            idx_str_1_eq: Some(email.to_string()),
-            ..Default::default()
-        };
-        match execute_op(
-            &self.pool,
-            GMAIL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::List { filter, limit: 1 },
-        )
-        .await
-        {
-            Ok(IntegrationOpResult::Entries { entries }) => {
+        if user_ids.len() > 1 {
+            // owner_count only — never log the email (PII).
+            tracing::warn!(
+                owner_count = user_ids.len(),
+                "gmail push mailbox connected by multiple Talos users; dispatching to \
+                 the first owner with an active watch (deterministic by user_id)"
+            );
+        }
+
+        for user_id in user_ids {
+            let filter = ListFilter {
+                idx_str_1_eq: Some(email.to_string()),
+                ..Default::default()
+            };
+            if let Ok(IntegrationOpResult::Entries { entries }) = execute_op(
+                &self.pool,
+                GMAIL_INTEGRATION_NAME,
+                user_id,
+                IntegrationOp::List { filter, limit: 1 },
+            )
+            .await
+            {
                 if let Some(entry) = entries.into_iter().next() {
                     let row = decode_row(&entry)?;
-                    Ok(Some((user_id, row)))
-                } else {
-                    Ok(None)
+                    return Ok(Some((user_id, row)));
                 }
             }
-            _ => Ok(None),
         }
+        Ok(None)
     }
 
     /// Advance the stored cursor + updated_at after successful

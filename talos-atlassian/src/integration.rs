@@ -291,8 +291,7 @@ impl AtlassianIntegrationService {
             scope: Option<String>,
         }
 
-        let token_data: TokenResponse = token_resp
-            .json()
+        let token_data: TokenResponse = talos_http_body::read_json_capped(token_resp)
             .await
             .context("Failed to parse Atlassian token response")?;
 
@@ -327,10 +326,10 @@ impl AtlassianIntegrationService {
             .await
             .context("Failed to fetch Atlassian accessible resources")?;
 
-        let mut resources: Vec<AccessibleResource> = resources_resp
-            .json()
-            .await
-            .context("Failed to parse Atlassian accessible resources")?;
+        let mut resources: Vec<AccessibleResource> =
+            talos_http_body::read_json_capped(resources_resp)
+                .await
+                .context("Failed to parse Atlassian accessible resources")?;
 
         // Cap the number of entries to prevent excessive memory use from
         // unexpectedly large responses — we only need the first site.
@@ -591,8 +590,7 @@ impl AtlassianIntegrationService {
             scope: Option<String>,
         }
 
-        let token_resp: RefreshResponse = resp
-            .json()
+        let token_resp: RefreshResponse = talos_http_body::read_json_capped(resp)
             .await
             .context("Failed to parse Atlassian refresh response")?;
 

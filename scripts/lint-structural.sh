@@ -2429,14 +2429,22 @@ bold "▶ check 31: outbound HTTP response bodies must be read through talos-htt
 
 UNBOUNDED_READ_VIOLATIONS=0
 if [ -n "$RG_BIN" ]; then
-    ur_matches=$("$RG_BIN" -n --no-heading \
+    # `-U` (multiline): `\s*` spans a newline, so the split-line form
+    # `.json()\n.await` is caught alongside the single-line `.json().await`
+    # (this is how several unbounded reads previously evaded the check). The
+    # `.await` anchor is REQUIRED — so string-iterator calls like
+    # `owner.bytes().all(..)` (no following `.await`) never match. The trailing
+    # `grep` keeps only the anchor line (the method call), so a bare `.await`
+    # continuation line isn't double-counted and line numbers point at the read.
+    ur_matches=$("$RG_BIN" -Un --no-heading \
         -g '*.rs' \
         -g '!talos-http-body/**' \
         -g '!**/tests/**' -g '!**/*_tests.rs' \
-        -e '\.(json|text|bytes)\(\)\.await' \
-        -e '\.json::<.+>\(\)\.await' \
-        . 2>/dev/null || true)
+        -e '\.(json|text|bytes)\(\)\s*\.await' \
+        -e '\.json::<.+>\(\)\s*\.await' \
+        . 2>/dev/null | grep -E '\.(json|text|bytes)(::<[^>]*>)?\(\)' || true)
 else
+    # grep fallback can't do multiline — single-line form only (degraded; CI uses rg).
     ur_matches=$(grep -rnE --include='*.rs' \
         -e '\.(json|text|bytes)\(\)\.await' \
         -e '\.json::<.+>\(\)\.await' \
