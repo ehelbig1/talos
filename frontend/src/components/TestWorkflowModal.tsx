@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -14,24 +14,53 @@ import {
   Play,
   Terminal,
   Activity,
+  PauseCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import {
-  useTestWorkflowMutation,
-  TestWorkflowMutation,
-} from "@/generated/graphql";
+import { useTestWorkflowMutation } from "@/generated/graphql";
+import { subscribeExecution, type ExecutionUpdate } from "@/lib/graphqlClient";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { Dialog } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 
-type NodeTrace = TestWorkflowMutation["testWorkflow"]["nodeTraces"][0];
-type TestResult = TestWorkflowMutation["testWorkflow"];
+/** Terminal phases of a detached test run (driven by executionUpdates). */
+type RunPhase = "idle" | "running" | "completed" | "failed" | "waiting";
 
-function formatJson(raw: string): string {
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2);
-  } catch {
-    return raw;
+/** Per-node display status derived from the `ExecutionStatus` wire enum. */
+type NodeStatus =
+  | "completed"
+  | "failed"
+  | "running"
+  | "skipped"
+  | "waiting"
+  | "pending";
+
+/**
+ * A per-node view folded from the live `executionUpdates` stream. The subscription
+ * carries status + logMessage + durationMs per node (not the full output JSON — that
+ * matches how the rest of the app renders live executions).
+ */
+interface NodeTrace {
+  nodeId: string;
+  status: NodeStatus;
+  logMessage?: string | null;
+  durationMs?: number | null;
+}
+
+function normalizeStatus(wire: string): NodeStatus {
+  switch (wire) {
+    case "COMPLETED":
+      return "completed";
+    case "FAILED":
+      return "failed";
+    case "RUNNING":
+      return "running";
+    case "SKIPPED":
+      return "skipped";
+    case "WAITING":
+      return "waiting";
+    default:
+      return "pending";
   }
 }
 
@@ -55,14 +84,25 @@ function NodeTraceCard({
       icon: <XCircle className="w-3 h-3" />,
       color: "text-destructive bg-destructive/10 border-destructive/20",
     },
+    running: {
+      icon: <LoadingSpinner className="w-3 h-3" />,
+      color: "text-primary bg-primary/10 border-primary/20",
+    },
     skipped: {
       icon: <SkipForward className="w-3 h-3" />,
       color: "text-muted-foreground bg-white/5 border-white/10",
     },
-  }[trace.status] ?? {
-    icon: <Zap className="w-3 h-3" />,
-    color: "text-muted-foreground bg-white/5 border-white/10",
-  };
+    waiting: {
+      icon: <PauseCircle className="w-3 h-3" />,
+      color: "text-warning bg-warning/10 border-warning/20",
+    },
+    pending: {
+      icon: <Zap className="w-3 h-3" />,
+      color: "text-muted-foreground bg-white/5 border-white/10",
+    },
+  }[trace.status];
+
+  const hasDetail = !!trace.logMessage;
 
   return (
     <div
@@ -76,6 +116,7 @@ function NodeTraceCard({
       <button
         className="w-full flex items-center gap-4 px-5 py-4 text-left hover:bg-white/5 transition-premium"
         onClick={() => setExpanded((v) => !v)}
+        disabled={!hasDetail}
       >
         <span className="text-[10px] font-black text-muted-foreground/30 w-5 shrink-0 tabular-nums">
           {String(index + 1).padStart(2, "0")}
@@ -96,52 +137,38 @@ function NodeTraceCard({
             </code>
           )}
         </span>
-        <div className="w-6 h-6 rounded-lg bg-white/5 flex items-center justify-center transition-premium group-hover:bg-white/10">
-          {expanded ? (
-            <ChevronDown className="w-3.5 h-3.5 text-muted-foreground/50" />
-          ) : (
-            <ChevronRight className="w-3.5 h-3.5 text-muted-foreground/50" />
-          )}
-        </div>
+        {trace.durationMs != null && (
+          <span className="text-[9px] font-black text-muted-foreground/40 tabular-nums shrink-0">
+            {trace.durationMs}ms
+          </span>
+        )}
+        {hasDetail && (
+          <div className="w-6 h-6 rounded-lg bg-white/5 flex items-center justify-center transition-premium group-hover:bg-white/10">
+            {expanded ? (
+              <ChevronDown className="w-3.5 h-3.5 text-muted-foreground/50" />
+            ) : (
+              <ChevronRight className="w-3.5 h-3.5 text-muted-foreground/50" />
+            )}
+          </div>
+        )}
       </button>
 
-      {expanded && (
+      {expanded && hasDetail && (
         <div className="border-t border-white/5 px-6 pb-6 space-y-5 pt-5 animate-in slide-in-from-top-2 duration-300">
-          {trace.error && (
-            <div className="bg-destructive/10 border border-destructive/20 rounded-[1.25rem] px-5 py-4 shadow-inner">
-              <p className="text-[9px] font-black text-destructive uppercase tracking-[0.2em] mb-2">
-                Diagnostic Fault
-              </p>
-              <p className="text-[11px] text-destructive/80 font-mono leading-relaxed font-bold">
-                {sanitizeErrorMessage(trace.error)}
-              </p>
-            </div>
-          )}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-3">
-              <p className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] ml-1">
-                Ingress Context
-              </p>
-              <pre className="text-[10px] font-mono text-foreground/60 bg-surface-4/60 border border-white/5 rounded-[1.25rem] p-5 overflow-x-auto max-h-48 whitespace-pre-wrap shadow-inner leading-relaxed">
-                {formatJson(trace.input)}
-              </pre>
-            </div>
-            <div className="space-y-3">
-              <p className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] ml-1">
-                Egress result
-              </p>
-              {trace.output ? (
-                <pre className="text-[10px] font-mono text-primary/60 bg-primary/5 border border-primary/10 rounded-[1.25rem] p-5 overflow-x-auto max-h-48 whitespace-pre-wrap shadow-inner leading-relaxed">
-                  {formatJson(trace.output)}
-                </pre>
-              ) : (
-                <div className="h-full flex items-center justify-center border border-white/5 bg-white/[0.02] rounded-[1.25rem] opacity-20">
-                  <p className="text-[10px] font-black uppercase tracking-widest italic">
-                    No Output Protocol
-                  </p>
-                </div>
+          <div className="space-y-3">
+            <p className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] ml-1">
+              {trace.status === "failed" ? "Diagnostic Fault" : "Node Log"}
+            </p>
+            <pre
+              className={cn(
+                "text-[10px] font-mono border rounded-[1.25rem] p-5 overflow-x-auto max-h-48 whitespace-pre-wrap shadow-inner leading-relaxed",
+                trace.status === "failed"
+                  ? "text-destructive/80 bg-destructive/10 border-destructive/20 font-bold"
+                  : "text-foreground/60 bg-surface-4/60 border-white/5",
               )}
-            </div>
+            >
+              {sanitizeErrorMessage(trace.logMessage ?? "")}
+            </pre>
           </div>
         </div>
       )}
@@ -161,8 +188,18 @@ export function TestWorkflowModal({
   onClose,
 }: Props) {
   const [mockInputs, setMockInputs] = useState("{}");
-  const [result, setResult] = useState<TestResult | null>(null);
   const [jsonError, setJsonError] = useState<string | null>(null);
+
+  // Detached-run state. The mutation now returns immediately with an
+  // executionId; progress + final result arrive over the executionUpdates
+  // subscription, so a slow local-Ollama test is no longer capped by any
+  // HTTP-request timeout (the bug that left rows stuck `running`).
+  const [executionId, setExecutionId] = useState<string | null>(null);
+  const [phase, setPhase] = useState<RunPhase>("idle");
+  const [events, setEvents] = useState<ExecutionUpdate[]>([]);
+  const [elapsedMs, setElapsedMs] = useState<number | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
+  const startRef = useRef<number>(0);
 
   const nodes = useWorkflowStore((s) => s.nodes);
   const nodeLabelMap = useMemo(() => {
@@ -174,9 +211,40 @@ export function TestWorkflowModal({
   }, [nodes]);
 
   const testMutation = useTestWorkflowMutation({
-    onSuccess: (data) => setResult(data.testWorkflow),
-    onError: () => toast.error("Test run failed"),
+    onSuccess: (data) => {
+      setExecutionId(data.testWorkflow.executionId);
+      setPhase("running");
+    },
+    onError: (err) => {
+      setPhase("failed");
+      setRunError(sanitizeErrorMessage(String(err)));
+      toast.error("Test run failed to start");
+    },
   });
+
+  // Subscribe to live execution events for the detached run. Folds terminal
+  // execution-level events (nodeId == null) into the run phase; per-node
+  // events accumulate for the trace list.
+  useEffect(() => {
+    if (!executionId) return;
+    const unsub = subscribeExecution(executionId, (ev) => {
+      setEvents((prev) => [...prev, ev]);
+      if (!ev.nodeId) {
+        if (ev.status === "COMPLETED") {
+          setPhase("completed");
+          setElapsedMs(Date.now() - startRef.current);
+        } else if (ev.status === "FAILED") {
+          setPhase("failed");
+          setRunError(ev.logMessage ?? "Test run failed");
+          setElapsedMs(Date.now() - startRef.current);
+        } else if (ev.status === "WAITING") {
+          setPhase("waiting");
+          setElapsedMs(Date.now() - startRef.current);
+        }
+      }
+    });
+    return () => unsub();
+  }, [executionId]);
 
   const handleMockInputChange = (v: string) => {
     setMockInputs(v);
@@ -190,16 +258,52 @@ export function TestWorkflowModal({
 
   const handleRun = () => {
     if (jsonError) return;
-    setResult(null);
+    setEvents([]);
+    setExecutionId(null);
+    setElapsedMs(null);
+    setRunError(null);
+    setPhase("idle");
+    startRef.current = Date.now();
     testMutation.mutate({
       workflowId,
       mockInputs: mockInputs !== "{}" ? mockInputs : undefined,
     });
   };
 
+  // Fold per-node events into the latest-status-per-node trace list.
+  //
+  // Per-node events on the live channel are LOG frames (status RUNNING, keyed by
+  // node_id) plus start/terminal execution-level frames — the engine's
+  // node-completion events are written to the DB but not broadcast. So once the
+  // run reaches terminal `completed`, promote any node still showing `running`
+  // to `completed` (its logs streamed, then the whole run succeeded). A failed /
+  // waiting run leaves nodes in their last live state; the global banner carries
+  // the authoritative outcome.
+  const nodeTraces = useMemo<NodeTrace[]>(() => {
+    const byNode = new Map<string, NodeTrace>();
+    for (const ev of events) {
+      if (!ev.nodeId) continue;
+      const prev = byNode.get(ev.nodeId);
+      byNode.set(ev.nodeId, {
+        nodeId: ev.nodeId,
+        status: normalizeStatus(ev.status),
+        logMessage: ev.logMessage ?? prev?.logMessage,
+        durationMs: ev.durationMs ?? prev?.durationMs,
+      });
+    }
+    const traces = Array.from(byNode.values());
+    if (phase === "completed") {
+      for (const t of traces) {
+        if (t.status === "running" || t.status === "pending") {
+          t.status = "completed";
+        }
+      }
+    }
+    return traces;
+  }, [events, phase]);
+
   const { succeeded, failed, skipped } = useMemo(() => {
-    if (!result?.nodeTraces) return { succeeded: 0, failed: 0, skipped: 0 };
-    return result.nodeTraces.reduce(
+    return nodeTraces.reduce(
       (acc, t) => {
         if (t.status === "completed") acc.succeeded++;
         else if (t.status === "failed") acc.failed++;
@@ -208,11 +312,12 @@ export function TestWorkflowModal({
       },
       { succeeded: 0, failed: 0, skipped: 0 },
     );
-    // Depend on `result` (not the narrower `result?.nodeTraces`): the body
-    // reads `result`, so the narrower manual dep could go stale if `result` is
-    // replaced while its `nodeTraces` reference compares equal. Matches the
-    // compiler-inferred dependency (react-hooks/preserve-manual-memoization).
-  }, [result]);
+  }, [nodeTraces]);
+
+  const isRunning = phase === "running";
+  const isTerminal =
+    phase === "completed" || phase === "failed" || phase === "waiting";
+  const traceTotal = nodeTraces.length || 1;
 
   return (
     <Dialog
@@ -262,19 +367,19 @@ export function TestWorkflowModal({
             <div className="flex items-start gap-3 flex-1">
               <AlertTriangle className="w-4 h-4 text-warning/40 shrink-0 mt-0.5" />
               <p className="text-[10px] text-muted-foreground/30 font-bold uppercase tracking-widest leading-relaxed">
-                Executes the current DAG in a transient sandbox. Zero
-                persistence, zero external side-effects.
+                Executes the current DAG in a transient sandbox. Streams live
+                telemetry until the run resolves.
               </p>
             </div>
             <Button
               onClick={handleRun}
-              disabled={!!jsonError || testMutation.isPending}
+              disabled={!!jsonError || testMutation.isPending || isRunning}
               className="bg-primary hover:bg-primary/90 text-white font-black px-10 h-14 rounded-2xl shadow-2xl shadow-primary/20 transition-premium flex items-center gap-3 uppercase tracking-widest text-[10px] border border-white/10 shrink-0"
             >
-              {testMutation.isPending ? (
+              {testMutation.isPending || isRunning ? (
                 <>
                   <LoadingSpinner className="w-4 h-4" />
-                  <span>SYNCHRONIZING...</span>
+                  <span>{isRunning ? "EXECUTING..." : "DISPATCHING..."}</span>
                 </>
               ) : (
                 <>
@@ -288,7 +393,7 @@ export function TestWorkflowModal({
 
         {/* Results */}
         <div className="max-h-[460px] overflow-y-auto custom-scrollbar border border-white/5 rounded-[2rem] bg-surface-4/20 shadow-inner">
-          {!result && !testMutation.isPending && (
+          {phase === "idle" && !testMutation.isPending && (
             <div className="flex flex-col items-center justify-center py-24 text-center px-6 opacity-20">
               <div className="w-16 h-16 rounded-[1.5rem] bg-surface-3 border border-white/5 flex items-center justify-center mb-6 shadow-2xl">
                 <Terminal size={32} className="text-muted-foreground" />
@@ -299,38 +404,39 @@ export function TestWorkflowModal({
             </div>
           )}
 
-          {testMutation.isPending && (
-            <div className="flex flex-col items-center justify-center py-24 gap-6">
-              <LoadingSpinner className="w-10 h-10 text-primary" />
-              <p className="text-[10px] font-black text-primary/40 uppercase tracking-[0.4em] animate-pulse">
-                Processing Execution Trace...
-              </p>
-            </div>
-          )}
-
-          {result && (
+          {(testMutation.isPending || isRunning || isTerminal) && (
             <div className="p-8 space-y-10">
               {/* Summary bar */}
               <div className="flex items-center gap-4 flex-wrap">
                 <div
                   className={cn(
                     "flex items-center gap-2 px-4 py-2 rounded-xl border text-[10px] font-black uppercase tracking-widest shadow-lg",
-                    result.status === "completed"
+                    phase === "completed"
                       ? "bg-success/10 text-success border-success/20"
-                      : "bg-destructive/10 text-destructive border-destructive/20",
+                      : phase === "failed"
+                        ? "bg-destructive/10 text-destructive border-destructive/20"
+                        : phase === "waiting"
+                          ? "bg-warning/10 text-warning border-warning/20"
+                          : "bg-primary/10 text-primary border-primary/20",
                   )}
                 >
-                  {result.status === "completed" ? (
+                  {phase === "completed" ? (
                     <CheckCircle2 className="w-3.5 h-3.5" />
-                  ) : (
+                  ) : phase === "failed" ? (
                     <XCircle className="w-3.5 h-3.5" />
+                  ) : phase === "waiting" ? (
+                    <PauseCircle className="w-3.5 h-3.5" />
+                  ) : (
+                    <LoadingSpinner className="w-3.5 h-3.5" />
                   )}
-                  {result.status}
+                  {isTerminal ? phase : "running"}
                 </div>
-                <div className="flex items-center gap-2 px-4 py-2 rounded-xl border border-white/5 bg-white/[0.02] text-[10px] text-muted-foreground font-black uppercase tracking-widest shadow-lg">
-                  <Clock className="w-3.5 h-3.5 opacity-40" />
-                  {result.durationMs}ms
-                </div>
+                {elapsedMs != null && (
+                  <div className="flex items-center gap-2 px-4 py-2 rounded-xl border border-white/5 bg-white/[0.02] text-[10px] text-muted-foreground font-black uppercase tracking-widest shadow-lg">
+                    <Clock className="w-3.5 h-3.5 opacity-40" />
+                    {elapsedMs}ms
+                  </div>
+                )}
                 <div className="flex items-center gap-4 ml-auto">
                   <div className="flex flex-col items-end gap-1">
                     <div className="flex items-center gap-3">
@@ -353,15 +459,11 @@ export function TestWorkflowModal({
                     <div className="h-1 w-full bg-white/5 rounded-full overflow-hidden flex shadow-inner">
                       <div
                         className="bg-success h-full transition-premium"
-                        style={{
-                          width: `${(succeeded / result.nodeTraces.length) * 100}%`,
-                        }}
+                        style={{ width: `${(succeeded / traceTotal) * 100}%` }}
                       />
                       <div
                         className="bg-destructive h-full transition-premium"
-                        style={{
-                          width: `${(failed / result.nodeTraces.length) * 100}%`,
-                        }}
+                        style={{ width: `${(failed / traceTotal) * 100}%` }}
                       />
                     </div>
                   </div>
@@ -369,7 +471,7 @@ export function TestWorkflowModal({
               </div>
 
               {/* Global error */}
-              {result.error && (
+              {runError && (
                 <div className="bg-destructive/5 border border-destructive/20 rounded-[2rem] p-6 flex items-start gap-4 shadow-2xl glass-light">
                   <Activity className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
                   <div className="space-y-2">
@@ -377,51 +479,43 @@ export function TestWorkflowModal({
                       Orchestration Failure
                     </p>
                     <p className="text-[11px] text-destructive/80 leading-relaxed font-mono font-bold">
-                      {sanitizeErrorMessage(result.error)}
+                      {sanitizeErrorMessage(runError)}
                     </p>
                   </div>
                 </div>
               )}
 
-              {/* Schema warnings */}
-              {result.schemaWarnings.length > 0 && (
-                <div className="bg-warning/5 border border-warning/15 rounded-[2rem] p-6 space-y-4 shadow-2xl glass-light">
-                  <p className="text-[10px] font-black text-warning uppercase tracking-[0.2em] ml-1">
-                    Protocol Schema Warnings
-                  </p>
-                  <div className="space-y-2">
-                    {result.schemaWarnings.map((w) => (
-                      <p
-                        key={w}
-                        className="text-[11px] text-warning/60 leading-relaxed font-bold"
-                      >
-                        • {w}
-                      </p>
+              {/* Live / final node traces */}
+              {nodeTraces.length > 0 ? (
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3 px-1 mb-6">
+                    <div className="h-px flex-1 bg-white/5" />
+                    <p className="text-[10px] font-black text-muted-foreground/20 uppercase tracking-[0.4em]">
+                      Telemetry Trace Sequence ({nodeTraces.length})
+                    </p>
+                    <div className="h-px flex-1 bg-white/5" />
+                  </div>
+                  <div className="space-y-3">
+                    {nodeTraces.map((trace, i) => (
+                      <NodeTraceCard
+                        key={trace.nodeId + i}
+                        trace={trace}
+                        index={i}
+                        nodeLabel={nodeLabelMap[trace.nodeId]}
+                      />
                     ))}
                   </div>
                 </div>
+              ) : (
+                !isTerminal && (
+                  <div className="flex flex-col items-center justify-center py-16 gap-6">
+                    <LoadingSpinner className="w-10 h-10 text-primary" />
+                    <p className="text-[10px] font-black text-primary/40 uppercase tracking-[0.4em] animate-pulse">
+                      Awaiting First Telemetry Frame...
+                    </p>
+                  </div>
+                )
               )}
-
-              {/* Node traces */}
-              <div className="space-y-4">
-                <div className="flex items-center gap-3 px-1 mb-6">
-                  <div className="h-px flex-1 bg-white/5" />
-                  <p className="text-[10px] font-black text-muted-foreground/20 uppercase tracking-[0.4em]">
-                    Telemetry Trace Sequence ({result.nodeTraces.length})
-                  </p>
-                  <div className="h-px flex-1 bg-white/5" />
-                </div>
-                <div className="space-y-3">
-                  {result.nodeTraces.map((trace, i) => (
-                    <NodeTraceCard
-                      key={trace.nodeId + i}
-                      trace={trace}
-                      index={i}
-                      nodeLabel={nodeLabelMap[trace.nodeId]}
-                    />
-                  ))}
-                </div>
-              </div>
             </div>
           )}
         </div>
