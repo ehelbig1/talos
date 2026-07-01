@@ -2,7 +2,10 @@
 # Pre-push gate — runs `make lint` + `make lint-frontend` so the CI-parity
 # quality gates can't silently regress between manual runs.
 #
-# `make lint` covers: rustfmt --check, WIT drift, the 40 structural lints,
+# `make lint` covers: rustfmt --check, WIT drift, the structural lints
+# (`bash scripts/lint-structural.sh --count` for the live number — this
+# comment deliberately doesn't state one; a hardcoded count drifted 40→49
+# undetected by 2026-07-01),
 # `cargo clippy --workspace --no-deps -- -D warnings` (TALOS_LINT_CLIPPY=1),
 # and offline cargo-deny (bans/licenses/sources).
 # `make lint-frontend` covers: frontend eslint + prettier + vitest.
