@@ -9,29 +9,39 @@
 # Pre-flight:
 #   1. `docker` running locally
 #   2. `docker login ghcr.io` already complete (or GHCR_TOKEN env set)
-#   3. `cosign` installed if you want signing
+#   3. `cosign` installed (signing is ON by default; pass --no-sign to skip)
 #      (https://docs.sigstore.dev/cosign/installation/)
-#   4. Clean git working tree (dirty builds taint the SHA-bound image
-#      label and warn loudly)
+#   4. Clean git working tree (dirty publishes are REFUSED; --allow-dirty
+#      to override for debugging, tags get a `-dirty` suffix)
+#   5. `gh` CLI authed — the publish gate verifies a green quality.yml
+#      run exists for HEAD before pushing (--skip-ci-check to override)
 #
 # Usage:
-#   bash scripts/publish-images.sh                       # build + push (NO sign by default)
+#   bash scripts/publish-images.sh                       # build + push + sign
 #   bash scripts/publish-images.sh --service controller  # one service only
 #   bash scripts/publish-images.sh --no-push             # smoke test, no upload
-#   bash scripts/publish-images.sh --sign                # also cosign-sign (batched —
-#                                                          ONE browser tab for all images)
+#   bash scripts/publish-images.sh --no-sign             # skip cosign signing
 #   bash scripts/publish-images.sh --update-env /etc/talos/install.env
 #                                                         # patch the env file in-place
 #
-# Signing default: OFF. The chart's Sigstore enforcement is opt-in
-# (TALOS_SIGSTORE_REQUIRED), so signing is dead weight for the typical
-# operator. Production deploys with enforcement enabled should pass
-# `--sign` OR `TALOS_PUBLISH_SIGN=1 bash scripts/publish-images.sh`.
+# Signing default: ON (flipped 2026-07-01; was OFF since 2026-05-20).
+# Rationale for the flip: provenance should be the default act and
+# skipping it the deliberate one. The batched flow signs all images in
+# ONE cosign invocation (one browser tab), so the old 3-tab cost that
+# justified default-OFF is gone. Operators without cosign or without
+# Sigstore enforcement pass `--no-sign` explicitly.
+#
+# Publish gate (2026-07-01): pushing requires (a) a clean tree and (b) a
+# green quality.yml conclusion for HEAD, checked via `gh run list`.
+# Nothing else stands between a local build and a production image —
+# these two checks are the CI-parity seam for the local-canonical path.
 #
 # Environment overrides:
-#   TALOS_GHCR_OWNER     default: parsed from `git remote get-url origin`
-#   GHCR_TOKEN           passed to `docker login` if you're not already authed
-#   TALOS_PUBLISH_SIGN=1 enable signing without passing --sign every time
+#   TALOS_GHCR_OWNER               default: parsed from `git remote get-url origin`
+#   GHCR_TOKEN                     passed to `docker login` if you're not already authed
+#   TALOS_PUBLISH_SIGN=0           disable signing without passing --no-sign every time
+#   TALOS_PUBLISH_ALLOW_DIRTY=1    same as --allow-dirty
+#   TALOS_PUBLISH_SKIP_CI_CHECK=1  same as --skip-ci-check
 #
 # Verification (operator-side, after sign step):
 #   cosign verify \
@@ -66,21 +76,21 @@ fi
 # Flag parsing.
 SERVICES=("${SERVICES_DEFAULT[@]}")
 DO_PUSH=1
-# Sign-by-default flipped to OFF (2026-05-20). Two reasons:
-#   1. The chart's Sigstore enforcement is opt-in (TALOS_SIGSTORE_REQUIRED).
-#      For the default operator running with enforcement disabled, the
-#      signature is dead weight that costs 3 browser OAuth roundtrips
-#      per publish.
-#   2. When the operator DOES want signing, the new batched flow signs
-#      all three images in a single `cosign sign` invocation that
-#      reuses ONE OAuth token across all three Fulcio cert issues.
-#      No more 3-tab browser cascade.
-# Operators on production clusters with Sigstore enforcement should
-# pass `--sign` explicitly OR set TALOS_PUBLISH_SIGN=1 in their env.
-DO_SIGN=0
-if [[ "${TALOS_PUBLISH_SIGN:-0}" == "1" ]]; then
-    DO_SIGN=1
+# Sign-by-default: ON (2026-07-01). History: default-OFF (2026-05-20)
+# was justified by the 3-tab OAuth cascade, but the batched single-call
+# flow removed that cost, and a codebase review flagged that the typical
+# publish shipping with NO cryptographic provenance inverted the right
+# default. Signing is now the default act; `--no-sign` (or
+# TALOS_PUBLISH_SIGN=0) is the deliberate opt-out.
+DO_SIGN=1
+if [[ "${TALOS_PUBLISH_SIGN:-1}" == "0" ]]; then
+    DO_SIGN=0
 fi
+# Publish gate defaults: refuse dirty trees, require a green quality.yml
+# run for HEAD. Both overridable — explicitly, so the bypass shows up in
+# shell history / terminal scrollback rather than happening silently.
+ALLOW_DIRTY="${TALOS_PUBLISH_ALLOW_DIRTY:-0}"
+REQUIRE_CI="$([[ "${TALOS_PUBLISH_SKIP_CI_CHECK:-0}" == "1" ]] && echo 0 || echo 1)"
 UPDATE_ENV_FILE=""
 # Default to linux/amd64 because the production k3s VM is x86_64.
 # Apple-Silicon Macs default Docker to linux/arm64; building without
@@ -96,10 +106,12 @@ while [[ $# -gt 0 ]]; do
         --no-push)   DO_PUSH=0; shift ;;
         --no-sign)   DO_SIGN=0; shift ;;
         --sign)      DO_SIGN=1; shift ;;
+        --allow-dirty)   ALLOW_DIRTY=1; shift ;;
+        --skip-ci-check) REQUIRE_CI=0; shift ;;
         --update-env) UPDATE_ENV_FILE="$2"; shift 2 ;;
         --platform)  PLATFORM="$2"; shift 2 ;;
         --help|-h)
-            sed -n '2,40p' "$0"
+            sed -n '2,44p' "$0"
             exit 0 ;;
         *)
             echo "✗ unknown flag: $1" >&2
@@ -139,22 +151,53 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
     fi
 fi
 
-# Git SHA + clean-tree check. A dirty build is allowed (often useful for
-# debugging) but the resulting tag is suffixed `-dirty` so it can't be
-# confused with a clean main commit.
+# Git SHA + clean-tree check. Publishing from a dirty tree is REFUSED by
+# default — the pushed image would contain changes no commit records, so
+# digest-pinning in install.env stops meaning "this code". --allow-dirty
+# keeps the old debugging escape hatch; the tag still gets a `-dirty`
+# suffix so it can't be confused with a clean main commit.
 GIT_SHA="$(git rev-parse HEAD)"
 SHORT_SHA="${GIT_SHA:0:12}"
 GIT_DIRTY=false
 if ! git diff-index --quiet HEAD --; then
+    if [[ "$ALLOW_DIRTY" != "1" ]]; then
+        die "Working tree is dirty — commit or stash first. (--allow-dirty to build anyway; tags get a '-dirty' suffix and must not be deployed to production.)"
+    fi
     GIT_DIRTY=true
     SHORT_SHA="${SHORT_SHA}-dirty"
-    warn "Working tree is dirty — building anyway, image tags will be marked with '-dirty'"
+    warn "Working tree is dirty (--allow-dirty) — image tags will be marked with '-dirty'"
 fi
 ok "Git: ${GIT_SHA} (short=${SHORT_SHA}, dirty=${GIT_DIRTY})"
 ok "Registry: ${REGISTRY}/${TALOS_GHCR_OWNER}/talos-{controller,worker,frontend}"
 ok "Services: ${SERVICES[*]}"
 ok "Platform: ${PLATFORM}"
 echo
+
+# ── CI-green gate ─────────────────────────────────────────────────────
+# The local publish path has no CI between code and a production image;
+# quality.yml (full test suite + integration tests + RUSTSEC scan) runs
+# on PRs and nightly, but nothing previously verified the image being
+# pushed came from a commit that PASSED it. Require a successful
+# quality.yml conclusion for HEAD before pushing. Skipped for --no-push
+# (smoke builds publish nothing). Override: --skip-ci-check /
+# TALOS_PUBLISH_SKIP_CI_CHECK=1 — an explicit act, by design.
+if [[ "$DO_PUSH" -eq 1 && "$REQUIRE_CI" -eq 1 ]]; then
+    command -v gh >/dev/null 2>&1 \
+        || die "gh CLI not found — cannot verify quality.yml passed for HEAD. Install gh (https://cli.github.com) or pass --skip-ci-check."
+    log "Checking for a green quality.yml run for ${SHORT_SHA}"
+    GREEN_RUNS="$(gh run list --workflow quality.yml --commit "$GIT_SHA" \
+                    --json conclusion --jq '[.[] | select(.conclusion == "success")] | length' \
+                    2>/dev/null)" \
+        || die "could not query GitHub Actions (gh not authed / offline?). Fix gh auth or pass --skip-ci-check."
+    if [[ "${GREEN_RUNS:-0}" -lt 1 ]]; then
+        die "no successful quality.yml run found for HEAD (${GIT_SHA}).
+  Trigger one:   gh workflow run quality.yml --ref $(git rev-parse --abbrev-ref HEAD)
+  Then re-run this script once it's green (gh run watch).
+  Deliberate bypass: --skip-ci-check"
+    fi
+    ok "quality.yml green for HEAD (${GREEN_RUNS} successful run(s))"
+    echo
+fi
 
 # ── RustSec advisory pre-flight ───────────────────────────────────────
 # A vulnerable dependency reaching production is the real harm `cargo audit`
