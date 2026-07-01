@@ -155,6 +155,37 @@ impl SlackIntegrationService {
     /// `user_id` the integration is linked to, attaching the attacker's
     /// Slack workspace to the victim's Talos account.
     pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
+        // Delegate to the shared driver — it builds the authorize URL from
+        // `authorize_request()` and persists the PKCE + CSRF state token bound
+        // to `user_id`. See the `OAuthIntegration` impl below.
+        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+    }
+
+    /// Handle OAuth callback and store the integration
+    pub async fn handle_callback(&self, code: String, state: String) -> Result<SlackIntegration> {
+        // Delegate to the shared driver — it consumes + validates the CSRF state
+        // token (single-use, format, tenancy) and only then hands the validated
+        // `ConsumedOAuthState` to `complete_callback()`. See the
+        // `OAuthIntegration` impl below.
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+    }
+}
+
+/// Canonical reference implementation of the shared OAuth flow contract.
+///
+/// The public [`SlackIntegrationService::get_authorization_url`] /
+/// [`SlackIntegrationService::handle_callback`] methods delegate to the
+/// `talos_oauth` drivers, which run the CSRF / PKCE / single-use / tenancy
+/// handling and call back into these three provider-specific pieces.
+#[async_trait::async_trait]
+impl talos_oauth::OAuthIntegration for SlackIntegrationService {
+    type Connected = SlackIntegration;
+
+    fn provider(&self) -> &'static str {
+        "slack"
+    }
+
+    fn authorize_request(&self) -> Result<talos_oauth::AuthorizeRequest<'static>> {
         if !self.is_configured() {
             return Err(anyhow!(
                 "Slack OAuth is not configured. Set SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, and SLACK_REDIRECT_URI"
@@ -163,7 +194,7 @@ impl SlackIntegrationService {
 
         // Authorize URL + PKCE + CSRF state token (bound to user_id) via the
         // shared flow helper — the CSRF/PKCE/tenancy handling lives in one place.
-        let req = talos_oauth::AuthorizeRequest {
+        Ok(talos_oauth::AuthorizeRequest {
             provider: "slack",
             auth_url: "https://slack.com/oauth/v2/authorize",
             token_url: "https://slack.com/api/oauth.v2.access",
@@ -187,20 +218,21 @@ impl SlackIntegrationService {
                 "chat:write",
             ],
             extra_params: &[("user_scope", "")],
-        };
-        talos_oauth::begin_oauth_authorization(&self.db_pool, &req, user_id).await
+        })
     }
 
-    /// Handle OAuth callback and store the integration
-    pub async fn handle_callback(&self, code: String, state: String) -> Result<SlackIntegration> {
-        // Validate + single-use-consume the CSRF state token, recovering the
-        // initiating user_id + PKCE verifier. SECURITY: user_id comes from the
-        // state token (bound at connect time), NOT the callback's session cookie —
-        // otherwise an attacker who completes Slack consent on their own account
-        // could hand a victim a callback URL and link the attacker's workspace to
-        // the victim. Centralized (CSRF single-use, PKCE scrub, format-gate,
-        // tenancy) in talos_oauth::consume_oauth_state.
-        let consumed = talos_oauth::consume_oauth_state(&self.db_pool, "slack", &state).await?;
+    async fn complete_callback(
+        &self,
+        _pool: &sqlx::PgPool,
+        code: &str,
+        consumed: talos_oauth::ConsumedOAuthState,
+    ) -> Result<SlackIntegration> {
+        // SECURITY: user_id comes from the state token (bound at connect time),
+        // NOT the callback's session cookie — otherwise an attacker who completes
+        // Slack consent on their own account could hand a victim a callback URL
+        // and link the attacker's workspace to the victim. The CSRF single-use /
+        // PKCE scrub / format-gate / tenancy consume already happened in the
+        // shared driver (talos_oauth::consume_oauth_state) before this call.
         let user_id = consumed.user_id;
         let pkce_verifier_secret = consumed.pkce_verifier;
 
@@ -218,7 +250,7 @@ impl SlackIntegrationService {
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("SLACK_CLIENT_SECRET not set"))?,
             ),
-            ("code", code.clone()),
+            ("code", code.to_string()),
         ];
         if let Some(verifier) = pkce_verifier_secret {
             token_params.push(("code_verifier", verifier));
@@ -370,7 +402,9 @@ impl SlackIntegrationService {
 
         Ok(integration)
     }
+}
 
+impl SlackIntegrationService {
     /// Insert or update a Slack integration.
     /// Insert or update a Slack integration (metadata only).
     ///

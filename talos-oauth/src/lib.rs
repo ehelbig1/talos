@@ -1,11 +1,13 @@
 pub mod credentials;
 pub mod flow;
+pub mod provider;
 pub mod refresh_task;
 pub mod resolver;
 pub use credentials::OAuthCredentialService;
 pub use flow::{
     begin_oauth_authorization, consume_oauth_state, AuthorizeRequest, ConsumedOAuthState,
 };
+pub use provider::{authorization_url, handle_oauth_callback, OAuthIntegration};
 pub use resolver::ControllerSecretsResolver;
 
 /// Compute an OAuth token's `expires_at` from a provider-supplied
