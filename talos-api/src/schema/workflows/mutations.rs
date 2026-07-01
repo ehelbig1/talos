@@ -2397,6 +2397,14 @@ impl WorkflowsMutations {
             .data::<Arc<talos_secrets_manager::SecretsManager>>()
             .ok()
             .cloned();
+        // Live-event broadcast sender — the detached run below emits
+        // start / terminal ExecutionEvents here so the existing
+        // `executionUpdates` GraphQL subscription streams a test run's
+        // progress exactly like a real execution (per-node events flow
+        // via the engine's PostgresEventSink → execution_events replay).
+        let sender = ctx
+            .data::<tokio::sync::broadcast::Sender<ExecutionEvent>>()?
+            .clone();
         // test_workflow runs the full graph (real LLM/HTTP/secret access);
         // it's a write — Viewer must not be able to test-trigger an
         // org-shared workflow.
@@ -2554,57 +2562,9 @@ impl WorkflowsMutations {
             async_graphql::Error::new("Failed to create test execution").extend_safe()
         })?;
 
-        // Build engine with proper error handling for SecretsManager.
-        // allow-secrets-manager-new: defensive fallback (same rationale
-        // as the trigger/resume sites above).
-        let secrets_manager = match secrets_manager {
-            Some(sm) => sm,
-            None => Arc::new(
-                talos_secrets_manager::SecretsManager::new(db_pool.clone()).map_err(|e| {
-                    tracing::error!("Failed to create SecretsManager: {}", e);
-                    async_graphql::Error::new("Secrets service unavailable").extend_safe()
-                })?,
-            ),
-        };
-
-        // Build the engine via the canonical builder.
-        // Note: this path is wrapped in `tokio::time::timeout(Duration::from_secs(30))`
-        // below as a hard wall-clock cap. TimeoutPolicy::Honor means the engine
-        // ALSO respects the graph's `execution_timeout_secs` if set — if a
-        // workflow declares a tighter ceiling (e.g. 10 s), the engine's
-        // internal timeout fires first; if it declares a looser one, tokio's
-        // 30 s wins. That matches author intent and is a behavior change
-        // from pre-r227 (engine never honored the graph's timeout here).
-        let test_actor_repo = Arc::new(talos_actor_repository::ActorRepository::new(
-            db_pool.clone(),
-        ));
-        let resolved_test_registry = registry
-            .unwrap_or_else(|| Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client)));
-        let mut engine = match talos_engine::builder::for_workflow(
-            resolved_test_registry,
-            secrets_manager,
-            test_actor_repo,
-            user_id,
-            // Phase C3: run the test at the resolved actor's tier (the builder
-            // calls apply_actor_to_engine, fail-closed to Tier-1 on error). For
-            // the common Tier-2 case this is unchanged; a Tier-1-actor workflow
-            // now correctly tests with on-host-only LLM egress instead of the
-            // pre-existing actor-less Tier-2 default.
-            talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json.clone())
-                .with_effective_actor(test_effective_actor, None),
-        )
-        .await
-        {
-            Ok(e) => e,
-            Err(e) => {
-                return Err(
-                    async_graphql::Error::new(format!("Invalid workflow graph: {}", e))
-                        .extend_safe(),
-                );
-            }
-        };
-
-        // If mock_inputs provided, use them as trigger input for the engine.
+        // Parse mock_inputs → trigger_input BEFORE spawning so a malformed
+        // payload returns a proper synchronous GraphQL error rather than a
+        // silent async failure.
         //
         // MCP-666 (2026-05-13): align with `TRIGGER_INPUT_MAX_BYTES`
         // (1_000_000 bytes / 1 MB decimal) in talos-execution-orchestration.
@@ -2631,85 +2591,259 @@ impl WorkflowsMutations {
             serde_json::Value::Null
         };
 
-        // Run with a 30-second timeout
-        let start = std::time::Instant::now();
-        let run_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            talos_engine::nats_run::run_with_trigger_input_via_nats(
+        // Detached execution — mirror trigger_workflow (see the `tokio::spawn`
+        // at the top of this file). Pre-fix (the "stuck running" bug) the run
+        // was awaited INLINE here, wrapped in `tokio::time::timeout(30s)`. A
+        // client that aborts the request (browser / graphql-ws, ~15 s) dropped
+        // the whole resolver future — cancelling the in-flight worker dispatch
+        // (reply inbox torn down, JobResult lost) AND skipping finalization, so
+        // the test-execution row sat `running` until the 30-min stale sweep. It
+        // also capped legitimately-slow local-Ollama tests at 30 s server-side
+        // even when the graph allowed longer.
+        //
+        // Now the run + finalize live in a detached `tokio::spawn` that OWNS the
+        // engine, so a client disconnect can't cancel it: the task runs to
+        // completion (bounded by the engine's own `execution_timeout_secs` via
+        // `for_run`'s Honor policy — no request-lifetime coupling), finalizes
+        // the row (status-guarded), and broadcasts terminal events. The
+        // resolver returns immediately with status `"running"`; the frontend
+        // subscribes to `executionUpdates(executionId)` for live progress +
+        // final result.
+        tokio::spawn(async move {
+            // allow-secrets-manager-new: defensive fallback (same rationale as
+            // the trigger/resume sites above). Production context always
+            // supplies the shared instance.
+            let secrets_manager = match secrets_manager {
+                Some(sm) => sm,
+                None => match talos_secrets_manager::SecretsManager::new(db_pool.clone()) {
+                    Ok(sm) => Arc::new(sm),
+                    Err(e) => {
+                        tracing::error!(
+                            execution_id = %execution_id,
+                            "test_workflow: failed to create SecretsManager: {}",
+                            e
+                        );
+                        mark_test_execution_failed(
+                            &db_pool,
+                            &sender,
+                            execution_id,
+                            "Secrets service unavailable",
+                        )
+                        .await;
+                        return;
+                    }
+                },
+            };
+            let sm_for_persist = secrets_manager.clone();
+
+            let test_actor_repo = Arc::new(talos_actor_repository::ActorRepository::new(
+                db_pool.clone(),
+            ));
+            let resolved_test_registry = registry
+                .unwrap_or_else(|| Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client)));
+
+            // Phase C3: build the engine at the resolved actor's tier (builder
+            // calls apply_actor_to_engine, fail-closed to Tier-1 on error). The
+            // graph's `execution_timeout_secs` is now the ONLY wall-clock cap.
+            let mut engine = match talos_engine::builder::for_workflow(
+                resolved_test_registry,
+                secrets_manager,
+                test_actor_repo,
+                user_id,
+                talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json.clone())
+                    .with_effective_actor(test_effective_actor, None),
+            )
+            .await
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(
+                        execution_id = %execution_id,
+                        "test_workflow: invalid workflow graph: {}",
+                        e
+                    );
+                    mark_test_execution_failed(
+                        &db_pool,
+                        &sender,
+                        execution_id,
+                        "Invalid workflow graph",
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            // Broadcast a "started" event so live subscribers see the run begin
+            // (per-node events flow via the engine's PostgresEventSink →
+            // execution_events, replayed by the subscription on connect).
+            let _ = sender.send(ExecutionEvent {
+                execution_id,
+                node_id: None,
+                status: ExecutionStatus::Running,
+                trace_id: None,
+                span_id: None,
+                log_message: None,
+                iteration_index: None,
+                iteration_total: None,
+                duration_ms: None,
+                output: None,
+            });
+
+            match talos_engine::nats_run::run_with_trigger_input_via_nats(
                 &mut engine,
                 nats_client,
                 worker_shared_key,
                 trigger_input,
                 execution_id,
-            ),
-        )
-        .await;
+            )
+            .await
+            {
+                Ok(ctx) => {
+                    // Aggregate per-node outputs, DLP-redact, size-cap, and
+                    // persist encryption-aware — same discipline as
+                    // trigger_workflow so the frontend can fetch final outputs
+                    // after completion.
+                    let mut aggregated_output = serde_json::Map::new();
+                    for (node_id, output) in &ctx.results {
+                        aggregated_output.insert(node_id.to_string(), output.clone());
+                    }
+                    let aggregated_json = talos_dlp_provider::redact_json(
+                        &serde_json::Value::Object(aggregated_output),
+                    );
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+                    const MAX_AGGREGATED_OUTPUT_BYTES: usize = 50 * 1024 * 1024; // 50 MB
+                    if let Ok(json_str) = serde_json::to_string(&aggregated_json) {
+                        if json_str.len() > MAX_AGGREGATED_OUTPUT_BYTES {
+                            tracing::error!(
+                                execution_id = %execution_id,
+                                output_bytes = json_str.len(),
+                                "test_workflow: output exceeds 50 MB limit"
+                            );
+                            mark_test_execution_failed(
+                                &db_pool,
+                                &sender,
+                                execution_id,
+                                "Workflow output exceeds size limit",
+                            )
+                            .await;
+                            return;
+                        }
+                    }
 
-        // Build the response
-        let (status_str, error_msg, ctx_results) = match run_result {
-            Ok(Ok(ctx)) => ("completed".to_string(), None, ctx.results),
-            Ok(Err(e)) => (
-                "failed".to_string(),
-                Some(e.to_string()),
-                std::collections::HashMap::new(),
-            ),
-            Err(_) => (
-                "failed".to_string(),
-                Some("Test execution timed out after 30 seconds".to_string()),
-                std::collections::HashMap::new(),
-            ),
-        };
+                    // MCP-682: encryption-aware repository write so Phase A
+                    // deployments persist ciphertext, not plaintext.
+                    let wf_repo =
+                        talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
+                            .with_encryption(sm_for_persist.clone());
+                    let (final_status, mark_res) = if ctx.waiting {
+                        (
+                            ExecutionStatus::Waiting,
+                            wf_repo
+                                .mark_execution_waiting(execution_id, &aggregated_json)
+                                .await,
+                        )
+                    } else {
+                        (
+                            ExecutionStatus::Completed,
+                            wf_repo
+                                .mark_execution_completed(execution_id, &aggregated_json)
+                                .await,
+                        )
+                    };
+                    if let Err(db_err) = mark_res {
+                        tracing::error!(
+                            execution_id = %execution_id,
+                            "test_workflow: failed to finalize execution: {}",
+                            db_err
+                        );
+                    }
 
-        // Build per-node traces from the checkpoint/results
-        let mut node_traces = Vec::new();
-        for &node_id in engine.node_map().keys() {
-            let output = ctx_results.get(&node_id);
-            let node_status = if output.is_some() {
-                "completed"
-            } else {
-                "skipped"
-            };
-            node_traces.push(TestNodeTrace {
-                node_id,
-                input: "{}".to_string(), // Input data is ephemeral in the engine
-                output: output.map(|v| v.to_string()),
-                status: node_status.to_string(),
-                error: None,
-            });
-        }
+                    let _ = sender.send(ExecutionEvent {
+                        execution_id,
+                        node_id: None,
+                        status: final_status,
+                        trace_id: ctx.trace_id,
+                        span_id: None,
+                        log_message: Some(if ctx.waiting {
+                            "Test run suspended (awaiting continuation)".to_string()
+                        } else {
+                            "Test run finished successfully".to_string()
+                        }),
+                        iteration_index: None,
+                        iteration_total: None,
+                        duration_ms: None,
+                        output: None,
+                    });
+                }
+                Err(e) => {
+                    // MCP-969-class: DLP-redact the engine error before it
+                    // reaches the DB / broadcast — `e.to_string()` carries
+                    // arbitrary node-emitted text (HTTP bodies, upstream
+                    // exceptions echoing Authorization headers).
+                    let redacted = talos_dlp_provider::redact_str(&e.to_string());
+                    let error_msg = format!("Test run failed: {}", redacted);
+                    mark_test_execution_failed(&db_pool, &sender, execution_id, &error_msg).await;
+                }
+            }
+        });
 
-        // Mark execution as complete (best-effort — the test harness has
-        // already gathered node_traces, so a stale row in `running` state
-        // is observability noise rather than a correctness bug).
-        if let Err(e) = sqlx::query(
-            // allow-bare-pool-rls: execution_id is the test row this resolver just INSERTed under the authenticated user_id (line ~2470), for a workflow gated by workflow_accessible_for_user; revisit on RLS SET-ROLE rollout
-            "UPDATE workflow_executions SET status = $2, completed_at = NOW() WHERE id = $1",
-        )
-        .bind(execution_id)
-        .bind(&status_str)
-        .execute(&db_pool)
-        .await
-        {
-            tracing::warn!(
-                execution_id = %execution_id,
-                error = %e,
-                "test_workflow: failed to mark execution complete (results still returned)"
-            );
-        }
-
+        // Return immediately — the run is detached. The frontend subscribes to
+        // executionUpdates(executionId) for live progress + final status.
         Ok(TestWorkflowResult {
             execution_id,
-            status: status_str,
-            node_traces,
+            status: "running".to_string(),
+            node_traces: Vec::new(),
             schema_warnings: Vec::new(),
-            duration_ms,
-            error: error_msg,
+            duration_ms: 0,
+            error: None,
         })
     }
 
     // ── Organization mutations ─────────────────────────────────────────
+}
+
+/// Finalize a test execution as `failed` (status-guarded) and broadcast a
+/// terminal Failed event. Used by `test_workflow`'s detached run so a build or
+/// run error can never leave the row stuck in `running` (the bug this refactor
+/// closes). `message` MUST already be DLP-redacted if it derives from engine /
+/// node output — callers redact before invoking; static strings are safe.
+async fn mark_test_execution_failed(
+    db_pool: &sqlx::Pool<sqlx::Postgres>,
+    sender: &tokio::sync::broadcast::Sender<ExecutionEvent>,
+    execution_id: Uuid,
+    message: &str,
+) {
+    if let Err(db_err) = sqlx::query(
+        // allow-bare-pool-rls: execution_id was INSERTed under the authenticated
+        // user_id by test_workflow before this detached task ran, for a workflow
+        // gated by workflow_accessible_for_user; revisit on RLS SET-ROLE rollout.
+        // Status guard prevents clobbering a terminal / resuming row.
+        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 \
+         WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
+    )
+    .bind(execution_id)
+    .bind(message)
+    .execute(db_pool)
+    .await
+    {
+        tracing::error!(
+            execution_id = %execution_id,
+            error = %db_err,
+            "test_workflow: failed to mark execution failed"
+        );
+    }
+    let _ = sender.send(ExecutionEvent {
+        execution_id,
+        node_id: None,
+        status: ExecutionStatus::Failed,
+        trace_id: None,
+        span_id: None,
+        log_message: Some(message.to_string()),
+        iteration_index: None,
+        iteration_total: None,
+        duration_ms: None,
+        output: None,
+    });
 }
 
 async fn release_advisory_lock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, lock_id: i64) {
