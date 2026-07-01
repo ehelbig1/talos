@@ -266,6 +266,11 @@ export interface ExecutionUpdate {
   durationMs?: number;
   /** Event timestamp from server. */
   timestamp?: string;
+  /**
+   * Final aggregated output, keyed by node id, populated on the terminal event
+   * of a test run (see test_workflow). Absent for normal executions.
+   */
+  output?: Record<string, unknown> | null;
 }
 
 export interface DlqUpdate {
@@ -457,7 +462,7 @@ export function subscribeExecution(
   onEvent: (event: ExecutionUpdate) => void,
 ): () => void {
   return createSubscription<ExecutionUpdate>(
-    `subscription ($execId: UUID!) { executionUpdates(executionId: $execId) { executionId nodeId status traceId spanId logMessage retryAttempt maxRetries errorRecovery approvalRequired checkpointSaved iterationIndex iterationTotal durationMs } }`,
+    `subscription ($execId: UUID!) { executionUpdates(executionId: $execId) { executionId nodeId status traceId spanId logMessage retryAttempt maxRetries errorRecovery approvalRequired checkpointSaved iterationIndex iterationTotal durationMs output } }`,
     { execId: executionId },
     onEvent,
     "executionUpdates",
