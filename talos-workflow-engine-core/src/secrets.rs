@@ -112,10 +112,21 @@ pub trait SecretsResolver: Send + Sync {
 /// reference to it without a dependency cycle.
 #[async_trait]
 pub trait GithubInstallationTokenProvider: Send + Sync {
-    /// * `Ok(Some(token))` — an active installation exists for `owner`; a fresh
-    ///   (cached / re-minted) installation token.
-    /// * `Ok(None)` — no installation (or App disabled); the secret is simply not
-    ///   injected, so the module fails closed on the missing secret.
+    /// Mint an installation token for `owner`, but ONLY if `user_id` owns an
+    /// active installation for that GitHub account. `user_id` is the Talos user
+    /// the execution runs as — passing it makes the App token a per-user
+    /// credential (tenancy isolation), so one user's workflow can't mint tokens
+    /// against another user's GitHub App installation.
+    ///
+    /// * `Ok(Some(token))` — `user_id` owns an active installation for `owner`;
+    ///   a fresh (cached / re-minted) installation token.
+    /// * `Ok(None)` — no installation owned by `user_id` for `owner` (or App
+    ///   disabled); the secret is simply not injected, so the module fails
+    ///   closed on the missing secret.
     /// * `Err` — an installation exists but minting failed.
-    async fn installation_token(&self, owner: &str) -> Result<Option<String>, BoxError>;
+    async fn installation_token(
+        &self,
+        owner: &str,
+        user_id: Uuid,
+    ) -> Result<Option<String>, BoxError>;
 }

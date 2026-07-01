@@ -18,6 +18,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use sqlx::PgPool;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use talos_github::{GithubAppConfig, InstallationTokenCache};
@@ -69,21 +70,27 @@ impl GithubTokenResolver {
         self.cache.is_some()
     }
 
-    /// Resolve an installation token for a GitHub account `owner`.
+    /// Resolve an installation token for a GitHub account `owner`, scoped to the
+    /// Talos `user_id` that owns the installation (tenancy isolation — a user's
+    /// workflow can only mint tokens for installations that same user set up).
     ///
-    /// * `Ok(None)` — App not configured, or no active installation for `owner`
-    ///   → the caller should fall back to the PAT (D6).
+    /// * `Ok(None)` — App not configured, or `user_id` has no active installation
+    ///   for `owner` → the caller should fall back to the PAT (D6).
     /// * `Ok(Some(token))` — a fresh (cached / re-minted) installation token.
     /// * `Err` — an active installation exists but minting failed (don't silently
     ///   fall back: surface it so a broken App config is visible, rather than
     ///   masquerading as "no installation").
-    pub async fn token_for_owner(&self, owner: &str) -> Result<Option<Zeroizing<String>>> {
+    pub async fn token_for_owner(
+        &self,
+        owner: &str,
+        user_id: Uuid,
+    ) -> Result<Option<Zeroizing<String>>> {
         let Some(cache) = self.cache.as_ref() else {
             return Ok(None);
         };
         let Some(installation) = self
             .repo
-            .get_active_by_account(owner)
+            .get_active_by_account_for_user(owner, user_id)
             .await
             .with_context(|| format!("look up GitHub App installation for {owner}"))?
         else {
@@ -108,8 +115,9 @@ impl talos_workflow_engine_core::GithubInstallationTokenProvider for GithubToken
     async fn installation_token(
         &self,
         owner: &str,
+        user_id: Uuid,
     ) -> Result<Option<String>, talos_workflow_engine_core::BoxError> {
-        match self.token_for_owner(owner).await {
+        match self.token_for_owner(owner, user_id).await {
             // Deref the zeroizing buffer to a plaintext String — same pattern as
             // ControllerSecretsResolver::resolve_llm_keys. It lives only until the
             // engine seals it into the job's encrypted_secrets (microseconds).

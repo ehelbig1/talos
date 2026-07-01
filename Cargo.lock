@@ -1724,6 +1724,7 @@ dependencies = [
  "talos-feature-flags",
  "talos-github",
  "talos-github-connect",
+ "talos-github-repository",
  "talos-gmail",
  "talos-google-calendar",
  "talos-graph-rag",
