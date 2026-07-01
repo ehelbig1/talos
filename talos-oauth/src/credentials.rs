@@ -169,7 +169,7 @@ impl OAuthCredentialService {
         tracing::info!(
             user_id = %user_id,
             provider = %provider,
-            provider_key = %provider_key,
+            provider_key = %crate::refresh_task::redact_provider_key_for_log(provider_key),
             "Stored OAuth credentials"
         );
 
@@ -262,7 +262,7 @@ impl OAuthCredentialService {
             tracing::debug!(
                 user_id = %user_id,
                 provider = %provider,
-                provider_key = %provider_key,
+                provider_key = %crate::refresh_task::redact_provider_key_for_log(provider_key),
                 "update_access_token: no integration_credentials row (legacy integration predating migration 019)"
             );
         }
@@ -574,19 +574,19 @@ impl OAuthCredentialService {
                 match self.refresh_oauth_token_if_needed(vp).await {
                     Ok(true) => tracing::info!(
                         target: "talos_oauth_refresh",
-                        vault_path = %vp,
+                        vault_path = %crate::refresh_task::redact_oauth_path_for_log(vp),
                         outcome = "refreshed",
                         "OAuth token refreshed before dispatch"
                     ),
                     Ok(false) => tracing::debug!(
                         target: "talos_oauth_refresh",
-                        vault_path = %vp,
+                        vault_path = %crate::refresh_task::redact_oauth_path_for_log(vp),
                         outcome = "skipped",
                         "OAuth token still valid — no refresh needed"
                     ),
                     Err(e) => tracing::warn!(
                         target: "talos_oauth_refresh",
-                        vault_path = %vp,
+                        vault_path = %crate::refresh_task::redact_oauth_path_for_log(vp),
                         outcome = "failed",
                         error = %e,
                         "OAuth token refresh failed — worker may see 401. \
@@ -785,8 +785,7 @@ impl OAuthCredentialService {
             scope: Option<String>,
         }
 
-        let token_data: RefreshResponse = resp
-            .json()
+        let token_data: RefreshResponse = talos_http_body::read_json_capped(resp)
             .await
             .context("Failed to parse refresh response")?;
         // MCP-960..962 sibling + chrono panic defense: clamp the
@@ -834,7 +833,7 @@ impl OAuthCredentialService {
 
         tracing::info!(
             provider,
-            provider_key,
+            provider_key = %crate::refresh_task::redact_provider_key_for_log(provider_key),
             expires_in = ?token_data.expires_in,
             "Auto-refreshed OAuth token before workflow execution"
         );

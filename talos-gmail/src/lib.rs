@@ -180,8 +180,7 @@ impl GmailApiClient {
             return Err(anyhow!("Gmail API returned non-success status {}", status));
         }
 
-        let json: Value = response
-            .json()
+        let json: Value = talos_http_body::read_json_capped(response)
             .await
             .context("Failed to parse Gmail API response")?;
 

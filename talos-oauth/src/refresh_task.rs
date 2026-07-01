@@ -93,19 +93,31 @@ pub async fn proactive_token_refresh_task(cred_service: Arc<OAuthCredentialServi
 /// only enqueues paths it queried by shape, so this defensive branch
 /// is unreachable in practice but doesn't lose information if the
 /// shape ever changes.
-fn redact_oauth_path_for_log(path: &str) -> String {
-    use sha2::{Digest, Sha256};
+pub(crate) fn redact_oauth_path_for_log(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() == 5 && parts[0] == "oauth" && parts[4] == "access_token" {
-        let hash = Sha256::digest(parts[3].as_bytes());
-        let prefix: String = hex::encode(hash).chars().take(8).collect();
         format!(
-            "{}/{}/{}/<{}>/{}",
-            parts[0], parts[1], parts[2], prefix, parts[4]
+            "{}/{}/{}/{}/{}",
+            parts[0],
+            parts[1],
+            parts[2],
+            redact_provider_key_for_log(parts[3]),
+            parts[4]
         )
     } else {
         path.to_string()
     }
+}
+
+/// Replace an OAuth `provider_key` (which for gmail/google_calendar IS the
+/// user's email address — PII) with a short sha256 prefix so it's safe to log.
+/// Same MCP-988 discipline as [`redact_oauth_path_for_log`], for the sites that
+/// log `provider_key` as a bare field rather than embedded in a path.
+pub(crate) fn redact_provider_key_for_log(provider_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(provider_key.as_bytes());
+    let prefix: String = hex::encode(hash).chars().take(8).collect();
+    format!("<{prefix}>")
 }
 
 #[cfg(test)]

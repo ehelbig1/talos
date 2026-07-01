@@ -325,8 +325,7 @@ impl PubsubJwtVerifier {
                     resp.status()
                 )));
             }
-            let set: JwkSet = resp
-                .json()
+            let set: JwkSet = talos_http_body::read_json_capped(resp)
                 .await
                 .map_err(|e| VerifyError::JwkFetchFailed(format!("parse: {e}")))?;
 

@@ -260,10 +260,10 @@ impl VaultTransitProvider {
         // Body shape doesn't matter beyond "well-formed" — we just need
         // to confirm the response parses. The actual capability check
         // is the encrypt+decrypt round-trip below.
-        let _: VaultResponse<TokenLookupSelfData> = resp
-            .json()
-            .await
-            .context("Vault token lookup-self returned malformed JSON")?;
+        let _: VaultResponse<TokenLookupSelfData> =
+            talos_http_body::read_json_capped(resp)
+                .await
+                .context("Vault token lookup-self returned malformed JSON")?;
 
         // 2. Real round-trip against the configured transit key. This
         // proves the token has both encrypt+decrypt capability AND the
@@ -327,8 +327,7 @@ impl KekProvider for VaultTransitProvider {
                     truncated
                 ));
             }
-            let body: VaultResponse<EncryptData> = resp
-                .json()
+            let body: VaultResponse<EncryptData> = talos_http_body::read_json_capped(resp)
                 .await
                 .context("Vault transit encrypt: malformed JSON response")?;
             if !body.errors.is_empty() {
@@ -388,8 +387,7 @@ impl KekProvider for VaultTransitProvider {
                     truncated
                 ));
             }
-            let mut body: VaultResponse<DecryptData> = resp
-                .json()
+            let mut body: VaultResponse<DecryptData> = talos_http_body::read_json_capped(resp)
                 .await
                 .context("Vault transit decrypt: malformed JSON response")?;
             if !body.errors.is_empty() {
