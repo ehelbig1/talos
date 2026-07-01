@@ -128,11 +128,15 @@ impl SecretsResolver for ControllerSecretsResolver {
         };
 
         if !github_paths.is_empty() {
-            match GITHUB_PROVIDER.get() {
-                Some(provider) => {
+            // App tokens are a PER-USER credential: only mint for installations
+            // the execution's own user set up. Without a `user_id` we cannot
+            // verify ownership, so fail closed (don't inject) rather than mint a
+            // token against whichever user happens to own the matching install.
+            match (GITHUB_PROVIDER.get(), user_id) {
+                (Some(provider), Some(uid)) => {
                     for path in github_paths {
                         let owner = &path[GITHUB_APP_SCHEME.len()..];
-                        match provider.installation_token(owner).await {
+                        match provider.installation_token(owner, uid).await {
                             // Key by the full `github_app:<owner>` path: that's
                             // what the module reads via get_secret(...).
                             Ok(Some(token)) => {
@@ -140,7 +144,7 @@ impl SecretsResolver for ControllerSecretsResolver {
                             }
                             Ok(None) => tracing::warn!(
                                 %owner,
-                                "no active GitHub App installation; github_app secret not injected (module will fail closed)"
+                                "no active GitHub App installation owned by this user; github_app secret not injected (module will fail closed)"
                             ),
                             Err(e) => tracing::error!(
                                 %owner,
@@ -150,7 +154,11 @@ impl SecretsResolver for ControllerSecretsResolver {
                         }
                     }
                 }
-                None => tracing::warn!(
+                (Some(_), None) => tracing::warn!(
+                    count = github_paths.len(),
+                    "github_app:<owner> secret requested without a user context; not injected (fail closed — App tokens are per-user)"
+                ),
+                (None, _) => tracing::warn!(
                     count = github_paths.len(),
                     "github_app:<owner> secret requested but no GitHub App provider is configured"
                 ),

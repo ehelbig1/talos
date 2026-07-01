@@ -99,21 +99,31 @@ impl GithubAppInstallationRepository {
         Ok(row)
     }
 
-    /// The active installation for a GitHub account login, if any. Used by module
-    /// dispatch (B4) to resolve a token for a repo's owner. Scoped to active rows.
-    pub async fn get_active_by_account(
+    /// The active installation for a GitHub account login **owned by `user_id`**,
+    /// if any. Used by module dispatch (B4) to resolve a token for a repo's
+    /// owner.
+    ///
+    /// The `user_id` filter is a **tenancy boundary**, not an optimisation:
+    /// `github_app:<owner>` token minting resolves to this row, so scoping to the
+    /// owning user prevents one Talos user from minting installation tokens
+    /// against another user's GitHub App install (each install is recorded here
+    /// with its own `user_id`). Credential-path callers MUST pass the execution's
+    /// user; an absent user must fail closed (skip the lookup entirely).
+    pub async fn get_active_by_account_for_user(
         &self,
         account_login: &str,
+        user_id: Uuid,
     ) -> Result<Option<GithubAppInstallation>> {
         let row = sqlx::query_as::<_, GithubAppInstallation>(&format!(
             "SELECT {COLS} FROM github_app_installations \
-             WHERE account_login = $1 AND is_active \
+             WHERE account_login = $1 AND user_id = $2 AND is_active \
              ORDER BY updated_at DESC, id DESC LIMIT 1"
         ))
         .bind(account_login)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .context("get active github_app_installation by account")?;
+        .context("get active github_app_installation by account for user")?;
         Ok(row)
     }
 

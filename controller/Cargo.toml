@@ -241,6 +241,8 @@ prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, 
 [dev-dependencies]
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
+# github_app_tenancy_tests: exercise the per-user installation lookup directly.
+talos-github-repository = { path = "../talos-github-repository" }
 # Used by gmail::pubsub_jwt tests to mint RSA keypairs that back
 # locally-signed test JWTs. Production verifier fetches JWKs from
 # Google and never calls rsa::* directly.
