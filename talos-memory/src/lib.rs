@@ -294,10 +294,36 @@ pub(crate) async fn maybe_encrypt_value_serialized(
     aad: Vec<u8>,
 ) -> anyhow::Result<Option<(Uuid, Vec<u8>, i16)>> {
     let Some(hook) = MEMORY_CRYPTO_HOOK.get().cloned() else {
+        guard_plaintext_fallback(std::env::var("RUST_ENV").as_deref() == Ok("production"))?;
         return Ok(None);
     };
     let (key_id, ciphertext, version) = hook.encrypt(plaintext, org_id, aad).await?;
     Ok(Some((key_id, ciphertext, version)))
+}
+
+/// Fail-closed guard for the legacy plaintext write path. The read path
+/// already fails loudly on ciphertext-without-hook (see
+/// `resolve_stored_value`); this is the write-side mirror. Any binary
+/// that links `talos-memory` with a live pool but forgets the
+/// `register_memory_crypto_hook()` boot call would otherwise silently
+/// persist plaintext `actor_memory` rows — in production that is a
+/// refusal, in dev a one-time WARN (local stacks legitimately run
+/// without the hook).
+pub(crate) fn guard_plaintext_fallback(is_production: bool) -> anyhow::Result<()> {
+    if is_production {
+        anyhow::bail!(
+            "no MemoryCryptoHook registered — refusing plaintext actor_memory write in \
+             production; ensure register_memory_crypto_hook() is called at startup"
+        );
+    }
+    static PLAINTEXT_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+    PLAINTEXT_WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            "no MemoryCryptoHook registered — actor_memory writes will persist PLAINTEXT \
+             (acceptable in dev only; production fails closed)"
+        );
+    });
+    Ok(())
 }
 
 /// Resolve the org an actor belongs to, for per-org DEK scoping at memory-write
@@ -2192,6 +2218,27 @@ pub async fn sweep_expired(pool: &Pool<Postgres>, grace_hours: i64) -> Result<u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ────────────────────────────────────────────────────────────────
+    // Fail-closed plaintext-fallback guard (write-side mirror of the
+    // resolve_stored_value ciphertext-without-hook refusal)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn guard_plaintext_fallback_refuses_in_production() {
+        let err = guard_plaintext_fallback(true).expect_err("production must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("register_memory_crypto_hook"),
+            "error must name the fix: {msg}"
+        );
+        assert!(msg.contains("plaintext"), "error must name the risk: {msg}");
+    }
+
+    #[test]
+    fn guard_plaintext_fallback_allows_in_dev() {
+        guard_plaintext_fallback(false).expect("dev keeps the legacy plaintext path");
+    }
 
     // ────────────────────────────────────────────────────────────────
     // MCP-S2: build_memory_aad invariants
