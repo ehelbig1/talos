@@ -24,6 +24,10 @@ use talos_memory::integration_state_rpc::{
 };
 use uuid::Uuid;
 
+pub mod crypto;
+use crypto::{integration_state_aad, integration_state_crypto};
+pub use crypto::{set_integration_state_crypto, IntegrationStateCrypto};
+
 // Utilities live in this module because the data-plane logic that
 // uses them is here. The RPC subscriber calls into this module, so
 // it picks them up through the same path.
@@ -211,7 +215,7 @@ pub async fn execute_op(
     match op {
         IntegrationOp::Get { key } => {
             let row_opt = sqlx::query(
-                "SELECT key, value, \
+                "SELECT key, value, value_enc, value_key_id, value_format, \
                         (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS updated_at_ms, \
                         CASE WHEN expires_at IS NULL THEN NULL \
                              ELSE (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint \
@@ -233,7 +237,7 @@ pub async fn execute_op(
             .await
             .map_err(db_err)?;
             let row = row_opt.ok_or(IntegrationStateError::KeyNotFound)?;
-            let entry = row_to_entry(&row)?;
+            let entry = row_to_entry(integration_name, user_id, &row).await?;
             Ok(IntegrationOpResult::Entry { entry })
         }
         IntegrationOp::Set {
@@ -248,6 +252,27 @@ pub async fn execute_op(
                     "value exceeds 64 KiB cap".into(),
                 ));
             }
+            // Encrypt at rest when a crypto provider is installed (controller
+            // startup wires one); otherwise store plaintext (unset in unit tests /
+            // pre-wiring). AAD binds the ciphertext to this exact
+            // (integration_name, user_id, key) slot. The `value`/`value_enc`
+            // columns are XOR by DB constraint — exactly one is written.
+            #[allow(clippy::type_complexity)]
+            let (value_plain, value_enc, value_key_id, value_format): (
+                Option<String>,
+                Option<Vec<u8>>,
+                Option<Uuid>,
+                Option<i16>,
+            ) = if let Some(c) = integration_state_crypto() {
+                let aad = integration_state_aad(integration_name, user_id, &key);
+                let (kid, ct, fmt) = c.encrypt(&value_str, user_id, &aad).await.map_err(|e| {
+                    tracing::error!(error = %e, "integration_state value encrypt failed");
+                    IntegrationStateError::Internal("value encryption failed".into())
+                })?;
+                (None, Some(ct), Some(kid), Some(fmt))
+            } else {
+                (Some(value_str), None, None, None)
+            };
             // MCP-717 (2026-05-13): TOCTOU-safe cap enforcement. Pre-fix
             // the existence + count + INSERT triple ran as three
             // independent statements against the pool — multiple
@@ -304,21 +329,27 @@ pub async fn execute_op(
             let idx_ts_1 = slots.idx_ts_1_ms.and_then(ms_to_datetime);
             sqlx::query(
                 "INSERT INTO integration_state \
-                     (integration_name, user_id, key, value, expires_at, \
-                      idx_str_1, idx_str_2, idx_ts_1, idx_int_1) \
-                 VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9) \
+                     (integration_name, user_id, key, value, value_enc, value_key_id, \
+                      value_format, expires_at, idx_str_1, idx_str_2, idx_ts_1, idx_int_1) \
+                 VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12) \
                  ON CONFLICT (integration_name, user_id, key) DO UPDATE SET \
-                     value      = EXCLUDED.value, \
-                     expires_at = EXCLUDED.expires_at, \
-                     idx_str_1  = EXCLUDED.idx_str_1, \
-                     idx_str_2  = EXCLUDED.idx_str_2, \
-                     idx_ts_1   = EXCLUDED.idx_ts_1, \
-                     idx_int_1  = EXCLUDED.idx_int_1",
+                     value        = EXCLUDED.value, \
+                     value_enc    = EXCLUDED.value_enc, \
+                     value_key_id = EXCLUDED.value_key_id, \
+                     value_format = EXCLUDED.value_format, \
+                     expires_at   = EXCLUDED.expires_at, \
+                     idx_str_1    = EXCLUDED.idx_str_1, \
+                     idx_str_2    = EXCLUDED.idx_str_2, \
+                     idx_ts_1     = EXCLUDED.idx_ts_1, \
+                     idx_int_1    = EXCLUDED.idx_int_1",
             )
             .bind(integration_name)
             .bind(user_id)
             .bind(&key)
-            .bind(&value_str)
+            .bind(&value_plain)
+            .bind(&value_enc)
+            .bind(value_key_id)
+            .bind(value_format)
             .bind(expires_at)
             .bind(slots.idx_str_1)
             .bind(slots.idx_str_2)
@@ -349,7 +380,7 @@ pub async fn execute_op(
             // parameters (never string-interpolated) so there's no
             // SQL-injection surface.
             let mut sql = String::from(
-                "SELECT key, value, \
+                "SELECT key, value, value_enc, value_key_id, value_format, \
                         (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS updated_at_ms, \
                         CASE WHEN expires_at IS NULL THEN NULL \
                              ELSE (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint \
@@ -418,7 +449,11 @@ pub async fn execute_op(
             q = q.bind(capped_limit);
 
             let rows = q.fetch_all(pool).await.map_err(db_err)?;
-            let entries: Vec<_> = rows.iter().map(row_to_entry).collect::<Result<_, _>>()?;
+            // Per-row async decrypt (each row's AAD is keyed by its own `key`).
+            let mut entries = Vec::with_capacity(rows.len());
+            for row in &rows {
+                entries.push(row_to_entry(integration_name, user_id, row).await?);
+            }
             Ok(IntegrationOpResult::Entries { entries })
         }
     }
@@ -433,20 +468,53 @@ fn db_err(e: sqlx::Error) -> IntegrationStateError {
     IntegrationStateError::Internal("database operation failed".into())
 }
 
-fn row_to_entry(row: &sqlx::postgres::PgRow) -> Result<StoredEntry, IntegrationStateError> {
+async fn row_to_entry(
+    integration_name: &str,
+    user_id: Uuid,
+    row: &sqlx::postgres::PgRow,
+) -> Result<StoredEntry, IntegrationStateError> {
     use sqlx::Row;
     let key: String = row.try_get("key").map_err(|e| {
         tracing::error!(error = %e, "integration_state row.key decode failed");
         IntegrationStateError::Internal("row decode failed".into())
     })?;
-    let value_json: serde_json::Value = row.try_get("value").map_err(|e| {
-        tracing::error!(error = %e, "integration_state row.value decode failed");
-        IntegrationStateError::Internal("row decode failed".into())
-    })?;
-    let value = serde_json::to_string(&value_json).map_err(|e| {
-        tracing::error!(error = %e, "integration_state row serialize failed");
-        IntegrationStateError::Internal("row encode failed".into())
-    })?;
+    // Encrypted rows carry the JSON string in `value_enc` (with `value` NULL);
+    // legacy rows carry plaintext JSON in `value`. Decrypt when present, else
+    // fall back to plaintext (the pre-encryption read path).
+    let value_enc: Option<Vec<u8>> = row.try_get("value_enc").unwrap_or(None);
+    let value = if let Some(ciphertext) = value_enc {
+        let key_id: Uuid = row.try_get("value_key_id").map_err(|e| {
+            tracing::error!(error = %e, "integration_state row.value_key_id decode failed");
+            IntegrationStateError::Internal("row decode failed".into())
+        })?;
+        let format: i16 = row.try_get("value_format").map_err(|e| {
+            tracing::error!(error = %e, "integration_state row.value_format decode failed");
+            IntegrationStateError::Internal("row decode failed".into())
+        })?;
+        let crypto = integration_state_crypto().ok_or_else(|| {
+            tracing::error!(
+                "integration_state row is encrypted but no crypto provider is configured"
+            );
+            IntegrationStateError::Internal("value decryption unavailable".into())
+        })?;
+        let aad = integration_state_aad(integration_name, user_id, &key);
+        crypto
+            .decrypt(key_id, &ciphertext, &aad, format)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "integration_state value decrypt failed");
+                IntegrationStateError::Internal("value decryption failed".into())
+            })?
+    } else {
+        let value_json: serde_json::Value = row.try_get("value").map_err(|e| {
+            tracing::error!(error = %e, "integration_state row.value decode failed");
+            IntegrationStateError::Internal("row decode failed".into())
+        })?;
+        serde_json::to_string(&value_json).map_err(|e| {
+            tracing::error!(error = %e, "integration_state row serialize failed");
+            IntegrationStateError::Internal("row encode failed".into())
+        })?
+    };
     let updated_at_ms: i64 = row.try_get("updated_at_ms").unwrap_or(0);
     let expires_at_ms: Option<i64> = row.try_get("expires_at_ms").unwrap_or(None);
     let idx_str_1: Option<String> = row.try_get("idx_str_1").unwrap_or(None);
