@@ -1,9 +1,5 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use oauth2::{
-    basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    Scope, TokenUrl,
-};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
@@ -184,120 +180,50 @@ impl GmailIntegrationService {
             ));
         }
 
-        // Unwraps replaced with explicit error handling for better observability.
-        let client_id = self
-            .client_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("GMAIL_CLIENT_ID not set"))?;
-        let client_secret = self
-            .client_secret
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("GMAIL_CLIENT_SECRET not set"))?;
-        let redirect_uri = self
-            .redirect_uri
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("GMAIL_REDIRECT_URI not set"))?;
-
-        let client = BasicClient::new(
-            ClientId::new(client_id),
-            Some(ClientSecret::new(client_secret)),
-            AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())?,
-            Some(TokenUrl::new(
-                "https://oauth2.googleapis.com/token".to_string(),
-            )?),
-        )
-        .set_redirect_uri(RedirectUrl::new(redirect_uri)?);
-
+        // Authorize URL + PKCE + CSRF state token (bound to user_id) via the
+        // shared flow helper — the CSRF/PKCE/tenancy handling lives in one place.
         // PKCE (Proof Key for Code Exchange) prevents authorization code
-        // interception attacks. Google supports S256 challenges. Matches the
-        // Atlassian integration's PKCE implementation for consistency.
-        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-
-        let (auth_url, csrf_token) = client
-            .authorize_url(CsrfToken::new_random)
+        // interception attacks. Google supports S256 challenges.
+        let req = talos_oauth::AuthorizeRequest {
+            provider: "gmail",
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
+            token_url: "https://oauth2.googleapis.com/token",
+            client_id: self
+                .client_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("GMAIL_CLIENT_ID not set"))?,
+            client_secret: self
+                .client_secret
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("GMAIL_CLIENT_SECRET not set"))?,
+            redirect_uri: self
+                .redirect_uri
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("GMAIL_REDIRECT_URI not set"))?,
             // Request Gmail API scopes
-            .add_scope(Scope::new(
-                "https://www.googleapis.com/auth/gmail.readonly".to_string(),
-            ))
-            .add_scope(Scope::new(
-                "https://www.googleapis.com/auth/gmail.modify".to_string(),
-            ))
-            .add_scope(Scope::new(
-                "https://www.googleapis.com/auth/userinfo.email".to_string(),
-            ))
+            scopes: &[
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/userinfo.email",
+            ],
             // Request offline access to get refresh token
-            .add_extra_param("access_type", "offline")
-            .add_extra_param("prompt", "consent")
-            .set_pkce_challenge(pkce_challenge)
-            .url();
-
-        let state_secret = csrf_token.secret().to_string();
-
-        // Persist state token + PKCE verifier + user_id so the callback can
-        // validate CSRF, complete the PKCE exchange, and identify the user
-        // without session auth (cross-site redirects may not carry cookies).
-        sqlx::query(
-            "INSERT INTO oauth_state_tokens (state_token, provider, pkce_verifier, user_id) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(&state_secret)
-        .bind("gmail")
-        .bind(pkce_verifier.secret())
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await
-        .context("Failed to store Gmail OAuth state token")?;
-
-        Ok((auth_url.to_string(), state_secret))
+            extra_params: &[("access_type", "offline"), ("prompt", "consent")],
+        };
+        talos_oauth::begin_oauth_authorization(&self.db_pool, &req, user_id).await
     }
 
     /// Handle OAuth callback and store the integration.
     /// `user_id` is recovered from the state token (stored during `get_authorization_url`),
     /// so this handler does NOT require session authentication.
     pub async fn handle_callback(&self, code: String, state: String) -> Result<GmailIntegration> {
-        // Format-gate the state value before it hits the DB lookup — same
-        // 1-255-char / restricted-charset check the login flow applies on both
-        // store + validate (MCP-1171). Parameterized `$1` already isolates
-        // injection; this closes the defense-asymmetry (the writer uses
-        // CsrfToken::new_random — always canonical) and the multi-KB-state
-        // DoS-amplification on the consume path.
-        talos_oauth::validate_oauth_state_token_format(&state)?;
-        // Validate CSRF state token (single-use, atomic) and recover user_id + PKCE verifier.
-        let state_row = sqlx::query_as::<_, (Uuid, Option<String>, Option<Uuid>)>(
-            "UPDATE oauth_state_tokens \
-             SET used = true \
-             WHERE state_token = $1 AND provider = $2 AND used = false AND expires_at > NOW() \
-             RETURNING id, pkce_verifier, user_id",
-        )
-        .bind(&state)
-        .bind("gmail")
-        .fetch_optional(&self.db_pool)
-        .await
-        .context("Failed to validate Gmail OAuth state token")?;
-
-        let (state_id, pkce_verifier_secret, user_id_opt) = state_row.ok_or_else(|| {
-            anyhow!("Invalid or expired OAuth state token. This may indicate a CSRF attack.")
-        })?;
-
-        // MCP-1096 (2026-05-16): scrub pkce_verifier post-consume.
-        // See talos-slack::handle_callback for the full rationale —
-        // defense-in-depth against a read-only DB compromise during
-        // the 10-min cleanup window.
-        if let Err(e) =
-            sqlx::query("UPDATE oauth_state_tokens SET pkce_verifier = NULL WHERE id = $1")
-                .bind(state_id)
-                .execute(&self.db_pool)
-                .await
-        {
-            tracing::warn!(
-                state_id = %state_id,
-                "Failed to scrub pkce_verifier after Gmail OAuth consume: {}",
-                e
-            );
-        }
-
-        let user_id = user_id_opt.ok_or_else(|| {
-            anyhow!("State token missing user_id — cannot identify the initiating user")
-        })?;
+        // Validate + single-use-consume the CSRF state token, recovering the
+        // initiating user_id + PKCE verifier. SECURITY: user_id comes from the
+        // state token (bound at connect time), NOT the callback's session cookie.
+        // Centralized (CSRF single-use, PKCE scrub, format-gate, tenancy) in
+        // talos_oauth::consume_oauth_state.
+        let consumed = talos_oauth::consume_oauth_state(&self.db_pool, "gmail", &state).await?;
+        let user_id = consumed.user_id;
+        let pkce_verifier_secret = consumed.pkce_verifier;
         // Build OAuth client – handle missing configuration explicitly
         let client_id = self
             .client_id

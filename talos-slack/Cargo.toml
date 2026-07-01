@@ -11,7 +11,6 @@ talos-http-utils = { path = "../talos-http-utils" }
 anyhow.workspace = true
 axum = { version = "0.8", features = ["json"] }
 chrono.workspace = true
-oauth2 = { version = "4.4.2", default-features = false, features = ["reqwest"] }
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
