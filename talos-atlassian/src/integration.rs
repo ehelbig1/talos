@@ -1,9 +1,5 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use oauth2::{
-    basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    Scope, TokenUrl,
-};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
@@ -121,59 +117,34 @@ impl AtlassianIntegrationService {
             ));
         }
 
-        let client_id = self.client_id.clone().unwrap();
-        let client_secret = self.client_secret.clone().unwrap();
-        let redirect_uri = self.redirect_uri.clone().unwrap();
-
-        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-
-        let client = BasicClient::new(
-            ClientId::new(client_id),
-            Some(ClientSecret::new(client_secret)),
-            AuthUrl::new("https://auth.atlassian.com/authorize".to_string())?,
-            Some(TokenUrl::new(
-                "https://auth.atlassian.com/oauth/token".to_string(),
-            )?),
-        )
-        .set_redirect_uri(RedirectUrl::new(redirect_uri)?);
-
-        let (auth_url, csrf_token) = client
-            .authorize_url(CsrfToken::new_random)
-            // Classic scopes
-            .add_scope(Scope::new("read:jira-work".to_string()))
-            .add_scope(Scope::new("write:jira-work".to_string()))
-            .add_scope(Scope::new("read:jira-user".to_string()))
-            .add_scope(Scope::new("offline_access".to_string()))
-            // Granular scopes — read
-            .add_scope(Scope::new("read:issue:jira".to_string()))
-            .add_scope(Scope::new("read:issue-details:jira".to_string()))
-            .add_scope(Scope::new("read:project:jira".to_string()))
-            .add_scope(Scope::new("read:jql:jira".to_string()))
-            .add_scope(Scope::new("read:user:jira".to_string()))
-            // Granular scopes — write (comments, transitions)
-            .add_scope(Scope::new("write:comment:jira".to_string()))
-            .add_scope(Scope::new("write:issue:jira".to_string()))
-            .add_extra_param("audience", "api.atlassian.com")
-            .add_extra_param("prompt", "consent")
-            .set_pkce_challenge(pkce_challenge)
-            .url();
-
-        let state_secret = csrf_token.secret().to_string();
-
-        // Store state token + PKCE verifier + user_id for callback validation.
-        sqlx::query(
-            "INSERT INTO oauth_state_tokens (state_token, provider, pkce_verifier, user_id) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(&state_secret)
-        .bind("atlassian")
-        .bind(pkce_verifier.secret())
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await
-        .context("Failed to store Atlassian OAuth state token")?;
-
-        Ok((auth_url.to_string(), state_secret))
+        // Authorize URL + PKCE + CSRF state token (bound to user_id) via the
+        // shared flow helper — the CSRF/PKCE/tenancy handling lives in one place.
+        let req = talos_oauth::AuthorizeRequest {
+            provider: "atlassian",
+            auth_url: "https://auth.atlassian.com/authorize",
+            token_url: "https://auth.atlassian.com/oauth/token",
+            client_id: self.client_id.clone().unwrap(),
+            client_secret: self.client_secret.clone().unwrap(),
+            redirect_uri: self.redirect_uri.clone().unwrap(),
+            scopes: &[
+                // Classic scopes
+                "read:jira-work",
+                "write:jira-work",
+                "read:jira-user",
+                "offline_access",
+                // Granular scopes — read
+                "read:issue:jira",
+                "read:issue-details:jira",
+                "read:project:jira",
+                "read:jql:jira",
+                "read:user:jira",
+                // Granular scopes — write (comments, transitions)
+                "write:comment:jira",
+                "write:issue:jira",
+            ],
+            extra_params: &[("audience", "api.atlassian.com"), ("prompt", "consent")],
+        };
+        talos_oauth::begin_oauth_authorization(&self.db_pool, &req, user_id).await
     }
 
     /// Handle the OAuth callback: validate CSRF, exchange code, discover cloud sites,
@@ -185,48 +156,14 @@ impl AtlassianIntegrationService {
         code: String,
         state: String,
     ) -> Result<AtlassianIntegration> {
-        // 0. Format-gate the state value before the DB lookup — same check the
-        // login flow applies on store + validate (MCP-1171 symmetry). `$1`
-        // binding already isolates injection; this closes the defense
-        // asymmetry + the multi-KB-state DoS-amplification on consume.
-        talos_oauth::validate_oauth_state_token_format(&state)?;
-        // 1. Validate CSRF state token (single-use, atomic) and recover user_id.
-        let state_row = sqlx::query_as::<_, (Uuid, Option<String>, Option<Uuid>)>(
-            "UPDATE oauth_state_tokens \
-             SET used = true \
-             WHERE state_token = $1 AND provider = $2 AND used = false AND expires_at > NOW() \
-             RETURNING id, pkce_verifier, user_id",
-        )
-        .bind(&state)
-        .bind("atlassian")
-        .fetch_optional(&self.db_pool)
-        .await
-        .context("Failed to validate Atlassian OAuth state token")?;
-
-        let (state_id, pkce_verifier_secret, user_id_opt) = state_row.ok_or_else(|| {
-            anyhow!("Invalid or expired OAuth state token. This may indicate a CSRF attack.")
-        })?;
-
-        // MCP-1096 (2026-05-16): scrub pkce_verifier post-consume.
-        // See talos-slack::handle_callback for the full rationale —
-        // defense-in-depth against a read-only DB compromise during
-        // the 10-min cleanup window.
-        if let Err(e) =
-            sqlx::query("UPDATE oauth_state_tokens SET pkce_verifier = NULL WHERE id = $1")
-                .bind(state_id)
-                .execute(&self.db_pool)
-                .await
-        {
-            tracing::warn!(
-                state_id = %state_id,
-                "Failed to scrub pkce_verifier after Atlassian OAuth consume: {}",
-                e
-            );
-        }
-
-        let user_id = user_id_opt.ok_or_else(|| {
-            anyhow!("State token missing user_id — cannot identify the initiating user")
-        })?;
+        // Validate + single-use-consume the CSRF state token, recovering the
+        // initiating user_id + PKCE verifier. SECURITY: user_id comes from the
+        // state token (bound at connect time), NOT the callback's session cookie.
+        // Centralized (CSRF single-use, PKCE scrub, format-gate, tenancy) in
+        // talos_oauth::consume_oauth_state.
+        let consumed = talos_oauth::consume_oauth_state(&self.db_pool, "atlassian", &state).await?;
+        let user_id = consumed.user_id;
+        let pkce_verifier_secret = consumed.pkce_verifier;
 
         // 2. Exchange authorization code for tokens.
         // Atlassian's token endpoint requires application/json (not form-urlencoded),

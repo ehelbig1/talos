@@ -1,9 +1,5 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use oauth2::{
-    basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    Scope, TokenUrl,
-};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
@@ -165,116 +161,48 @@ impl SlackIntegrationService {
             ));
         }
 
-        let client = BasicClient::new(
-            ClientId::new(
-                self.client_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("SLACK_CLIENT_ID not set"))?,
-            ),
-            Some(ClientSecret::new(
-                self.client_secret
-                    .clone()
-                    .ok_or_else(|| anyhow!("SLACK_CLIENT_SECRET not set"))?,
-            )),
-            AuthUrl::new("https://slack.com/oauth/v2/authorize".to_string())?,
-            Some(TokenUrl::new(
-                "https://slack.com/api/oauth.v2.access".to_string(),
-            )?),
-        )
-        .set_redirect_uri(RedirectUrl::new(
-            self.redirect_uri
+        // Authorize URL + PKCE + CSRF state token (bound to user_id) via the
+        // shared flow helper — the CSRF/PKCE/tenancy handling lives in one place.
+        let req = talos_oauth::AuthorizeRequest {
+            provider: "slack",
+            auth_url: "https://slack.com/oauth/v2/authorize",
+            token_url: "https://slack.com/api/oauth.v2.access",
+            client_id: self
+                .client_id
+                .clone()
+                .ok_or_else(|| anyhow!("SLACK_CLIENT_ID not set"))?,
+            client_secret: self
+                .client_secret
+                .clone()
+                .ok_or_else(|| anyhow!("SLACK_CLIENT_SECRET not set"))?,
+            redirect_uri: self
+                .redirect_uri
                 .clone()
                 .ok_or_else(|| anyhow!("SLACK_REDIRECT_URI not set"))?,
-        )?);
-
-        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-
-        let (auth_url, csrf_token) = client
-            .authorize_url(CsrfToken::new_random)
-            // Request bot token scopes
-            .add_scope(Scope::new("channels:read".to_string()))
-            .add_scope(Scope::new("users:read".to_string()))
-            .add_scope(Scope::new("channels:history".to_string()))
-            .add_scope(Scope::new("chat:write".to_string()))
-            // Add user scopes if needed
-            .add_extra_param("user_scope", "")
-            .set_pkce_challenge(pkce_challenge)
-            .url();
-
-        let state_secret = csrf_token.secret().to_string();
-
-        sqlx::query(
-            "INSERT INTO oauth_state_tokens (state_token, provider, pkce_verifier, user_id) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(&state_secret)
-        .bind("slack")
-        .bind(pkce_verifier.secret())
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await
-        .context("Failed to store Slack OAuth state token")?;
-
-        Ok((auth_url.to_string(), state_secret))
+            // Bot token scopes.
+            scopes: &[
+                "channels:read",
+                "users:read",
+                "channels:history",
+                "chat:write",
+            ],
+            extra_params: &[("user_scope", "")],
+        };
+        talos_oauth::begin_oauth_authorization(&self.db_pool, &req, user_id).await
     }
 
     /// Handle OAuth callback and store the integration
     pub async fn handle_callback(&self, code: String, state: String) -> Result<SlackIntegration> {
-        // Format-gate the state value before the DB lookup — same check the
-        // login flow applies on store + validate (MCP-1171 symmetry). `$1`
-        // binding already isolates injection; this closes the defense
-        // asymmetry + the multi-KB-state DoS-amplification on consume.
-        talos_oauth::validate_oauth_state_token_format(&state)?;
-        // Validate CSRF state token + recover PKCE verifier + user_id.
-        //
-        // SECURITY: user_id is recovered from the state token (set at
-        // connect-time), NOT from the callback request's session cookie.
-        // The session cookie identifies whoever's browser hits the
-        // callback URL — under SameSite=Strict that's the user whose
-        // device is being used, which is not necessarily the user who
-        // initiated the OAuth flow. Without this binding, an attacker
-        // who completes Slack consent on their own account could hand
-        // a victim a callback URL and link the attacker's Slack
-        // workspace to the victim's Talos account. Match the Gmail /
-        // Atlassian pattern: state token IS the auth artifact.
-        let state_row = sqlx::query_as::<_, (Uuid, Option<String>, Option<Uuid>)>(
-            "UPDATE oauth_state_tokens
-             SET used = true
-             WHERE state_token = $1 AND provider = $2 AND used = false AND expires_at > NOW()
-             RETURNING id, pkce_verifier, user_id",
-        )
-        .bind(&state)
-        .bind("slack")
-        .fetch_optional(&self.db_pool)
-        .await
-        .context("Failed to validate Slack OAuth state token")?;
-
-        let (state_id, pkce_verifier_secret, user_id_opt) = state_row.ok_or_else(|| {
-            anyhow!("Invalid or expired OAuth state token. This may indicate a CSRF attack.")
-        })?;
-
-        // MCP-1096 (2026-05-16): scrub pkce_verifier post-consume.
-        // Best-effort — the OAuth flow has the verifier in memory
-        // already; if this UPDATE fails we still complete the
-        // exchange. cleanup_expired_state_tokens sweeps the row at
-        // the 10-min TTL regardless. Defense-in-depth against a
-        // read-only DB compromise during the in-flight + 10-min
-        // post-consume window.
-        if let Err(e) =
-            sqlx::query("UPDATE oauth_state_tokens SET pkce_verifier = NULL WHERE id = $1")
-                .bind(state_id)
-                .execute(&self.db_pool)
-                .await
-        {
-            tracing::warn!(
-                state_id = %state_id,
-                "Failed to scrub pkce_verifier after Slack OAuth consume: {}",
-                e
-            );
-        }
-
-        let user_id = user_id_opt.ok_or_else(|| {
-            anyhow!("State token missing user_id — cannot identify the initiating user")
-        })?;
+        // Validate + single-use-consume the CSRF state token, recovering the
+        // initiating user_id + PKCE verifier. SECURITY: user_id comes from the
+        // state token (bound at connect time), NOT the callback's session cookie —
+        // otherwise an attacker who completes Slack consent on their own account
+        // could hand a victim a callback URL and link the attacker's workspace to
+        // the victim. Centralized (CSRF single-use, PKCE scrub, format-gate,
+        // tenancy) in talos_oauth::consume_oauth_state.
+        let consumed = talos_oauth::consume_oauth_state(&self.db_pool, "slack", &state).await?;
+        let user_id = consumed.user_id;
+        let pkce_verifier_secret = consumed.pkce_verifier;
 
         // Build the token exchange. Include PKCE code_verifier when present.
         let mut token_params: Vec<(&str, String)> = vec![

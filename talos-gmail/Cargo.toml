@@ -16,7 +16,6 @@ base64 = "0.22"
 chrono.workspace = true
 dashmap = "6.1"
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
-oauth2 = { version = "4.4.2", default-features = false, features = ["reqwest"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
