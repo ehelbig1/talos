@@ -1395,12 +1395,13 @@ async fn execute_job(
         // that `signing_payload()` consumes and surface them in
         // output_payload so `get_execution_status` shows the worker's
         // view side-by-side with the underlying error. The controller
-        // side logs the same fields at WARN level
-        // (target: "signature_diag") so operators can grep their
-        // controller logs and find the controller's view for direct
-        // comparison. `diag_hashes()` is the canonical helper, colocated
-        // with `signing_payload()` in job-protocol so the field formulas
-        // stay in sync across controller + worker.
+        // side can log the same fields at WARN level
+        // (target: "signature_diag") for direct comparison, but that log
+        // is gated behind `TALOS_SIGNATURE_DIAG=1` (default OFF) to avoid
+        // a per-dispatch field-dump in steady state — set it on the
+        // controller while investigating. `diag_hashes()` is the canonical
+        // helper, colocated with `signing_payload()` in job-protocol so the
+        // field formulas stay in sync across controller + worker.
         let (worker_input_hash, worker_secrets_hash, worker_input_byte_len) = req.diag_hashes();
         let signature_byte_len = req.signature.len();
 
@@ -1427,7 +1428,7 @@ async fn execute_job(
                     "integration_name": req.integration_name,
                     "expected_wasm_hash": req.expected_wasm_hash,
                     "timeout_ms": req.timeout_ms,
-                    "note": "Compare these worker-computed values against the controller's `signature_diag` WARN log entry for the same job_id to identify which signed field diverged."
+                    "note": "Compare these worker-computed values against the controller's `signature_diag` WARN log entry for the same job_id to identify which signed field diverged (enable it on the controller with TALOS_SIGNATURE_DIAG=1)."
                 }
             }),
             logs: vec![],
