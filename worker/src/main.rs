@@ -1357,6 +1357,127 @@ impl JobSpan {
     }
 }
 
+/// Worker-side gate for the MCP-1212 signature-failure diagnostic (the
+/// enriched `output_payload` built in `signature_failure_payload`). OFF by
+/// default — the rich payload echoes UNAUTHENTICATED attacker-controllable
+/// request fields into a result the worker then signs and publishes. Same
+/// env var as the controller's dispatch-side diagnostic so one setting
+/// lights up both halves during an investigation. Read once at first use;
+/// changing the env after boot has no effect.
+static WORKER_SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    matches!(
+        std::env::var("TALOS_SIGNATURE_DIAG").as_deref(),
+        Ok("1" | "true")
+    )
+});
+
+/// Build the `output_payload` for a signature-verification failure.
+///
+/// `diag_enabled == false` (production default): a generic error only —
+/// no request-derived bytes reach the signed result. `true`: the full
+/// MCP-1212 field dump for controller↔worker divergence debugging.
+/// Pure function so both shapes are unit-testable (see
+/// `signature_failure_payload_tests`).
+fn signature_failure_payload(
+    diag_enabled: bool,
+    req: &JobRequest,
+    verify_error: &str,
+) -> serde_json::Value {
+    if !diag_enabled {
+        return json!({ "error": "signature verification failed" });
+    }
+    let (worker_input_hash, worker_secrets_hash, worker_input_byte_len) = req.diag_hashes();
+    json!({
+        "error": "signature verification failed",
+        "diag": {
+            "verify_error": verify_error,
+            "worker_input_hash": worker_input_hash,
+            "worker_secrets_hash": worker_secrets_hash,
+            "worker_input_byte_len": worker_input_byte_len,
+            "signature_byte_len": req.signature.len(),
+            "job_nonce": req.job_nonce,
+            "module_uri": req.module_uri,
+            "actor_id": req.actor_id.map(|u| u.to_string()),
+            "user_id": req.user_id.to_string(),
+            "allowed_hosts": req.allowed_hosts,
+            "allowed_methods": req.allowed_methods,
+            "allowed_secrets": req.allowed_secrets,
+            "allowed_sql_operations": req.allowed_sql_operations,
+            "allow_tier2_exposure": req.allow_tier2_exposure,
+            "integration_name": req.integration_name,
+            "expected_wasm_hash": req.expected_wasm_hash,
+            "timeout_ms": req.timeout_ms,
+            "note": "Compare these worker-computed values against the controller's `signature_diag` WARN log entry for the same job_id to identify which signed field diverged (enable it on the controller with TALOS_SIGNATURE_DIAG=1)."
+        }
+    })
+}
+
+#[cfg(test)]
+mod signature_failure_payload_tests {
+    use super::*;
+    use talos_workflow_job_protocol::{EncryptedSecrets, LlmTier};
+    use uuid::Uuid;
+
+    fn unauthenticated_req() -> JobRequest {
+        JobRequest {
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            module_uri: "wasm://attacker-chosen/v1".to_string(),
+            input_payload: serde_json::json!({"x": 1}),
+            encrypted_secrets: EncryptedSecrets::default(),
+            timeout_ms: 30000,
+            priority: 100,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            allowed_hosts: vec!["attacker-chosen-host".to_string()],
+            allowed_methods: vec![],
+            allowed_secrets: vec!["attacker-chosen-secret".to_string()],
+            allowed_sql_operations: vec![],
+            allow_tier2_exposure: false,
+            signature: vec![1, 2, 3],
+            max_llm_tier: LlmTier::default(),
+            job_nonce: "attacker-chosen-nonce".to_string(),
+            actor_id: None,
+            wasm_bytes: None,
+            capability_world: None,
+            integration_name: None,
+            user_id: Uuid::nil(),
+            expected_wasm_hash: None,
+            max_fuel: 0,
+            dry_run: false,
+            reply_topic: None,
+        }
+    }
+
+    /// Default (diag OFF): no attacker-supplied byte may reach the payload
+    /// the worker will sign and publish — generic error only.
+    #[test]
+    fn diag_disabled_emits_generic_error_only() {
+        let payload = signature_failure_payload(false, &unauthenticated_req(), "hmac mismatch");
+        assert_eq!(
+            payload,
+            serde_json::json!({ "error": "signature verification failed" })
+        );
+        let raw = payload.to_string();
+        for tainted in ["attacker-chosen", "hmac mismatch"] {
+            assert!(
+                !raw.contains(tainted),
+                "unauthenticated request bytes leaked into signed result: {tainted}"
+            );
+        }
+    }
+
+    /// Diag ON (explicit operator opt-in): full MCP-1212 field dump.
+    #[test]
+    fn diag_enabled_carries_divergence_fields() {
+        let payload = signature_failure_payload(true, &unauthenticated_req(), "hmac mismatch");
+        let diag = payload.get("diag").expect("diag block present");
+        assert_eq!(diag["verify_error"], "hmac mismatch");
+        assert_eq!(diag["module_uri"], "wasm://attacker-chosen/v1");
+        assert!(diag.get("worker_input_hash").is_some());
+    }
+}
+
 /// Execute the Wasm module for a given job with observability.
 ///
 /// * Verifies the HMAC signature before executing.
@@ -1388,49 +1509,24 @@ async fn execute_job(
         _span.end_error("Signature verification failed");
 
         // MCP-1212 (2026-05-18): diagnostic enrichment for signature
-        // verification failures. Pre-fix the worker emitted an opaque
-        // "signature verification failed" string with no way for the
-        // operator to identify which signed field diverged between
-        // controller and worker. Recompute the same per-field hashes
-        // that `signing_payload()` consumes and surface them in
-        // output_payload so `get_execution_status` shows the worker's
-        // view side-by-side with the underlying error. The controller
-        // side can log the same fields at WARN level
-        // (target: "signature_diag") for direct comparison, but that log
-        // is gated behind `TALOS_SIGNATURE_DIAG=1` (default OFF) to avoid
-        // a per-dispatch field-dump in steady state — set it on the
-        // controller while investigating. `diag_hashes()` is the canonical
-        // helper, colocated with `signing_payload()` in job-protocol so the
-        // field formulas stay in sync across controller + worker.
-        let (worker_input_hash, worker_secrets_hash, worker_input_byte_len) = req.diag_hashes();
-        let signature_byte_len = req.signature.len();
-
+        // verification failures — recompute the per-field hashes that
+        // `signing_payload()` consumes so the operator can identify which
+        // signed field diverged between controller and worker.
+        //
+        // 2026-07-01 hardening: the enriched payload is now gated behind
+        // `TALOS_SIGNATURE_DIAG=1` on the WORKER (same env the controller
+        // uses for its side of the diagnostic), default OFF. The request
+        // failed authentication, yet the rich variant echoes
+        // attacker-supplied fields (module_uri, allowed_secrets, hashes)
+        // into a JobResult that the publish path then SIGNS with the
+        // worker key — a free sign-chosen-strings oracle plus a field-hash
+        // oracle for an on-NATS attacker. Default is a generic error;
+        // enable the env on both sides while investigating a real
+        // controller↔worker signing divergence, then unset it.
         return JobResult {
             job_id: req.job_id,
             status: JobStatus::Failed,
-            output_payload: json!({
-                "error": "signature verification failed",
-                "diag": {
-                    "verify_error": e,
-                    "worker_input_hash": worker_input_hash,
-                    "worker_secrets_hash": worker_secrets_hash,
-                    "worker_input_byte_len": worker_input_byte_len,
-                    "signature_byte_len": signature_byte_len,
-                    "job_nonce": req.job_nonce,
-                    "module_uri": req.module_uri,
-                    "actor_id": req.actor_id.map(|u| u.to_string()),
-                    "user_id": req.user_id.to_string(),
-                    "allowed_hosts": req.allowed_hosts,
-                    "allowed_methods": req.allowed_methods,
-                    "allowed_secrets": req.allowed_secrets,
-                    "allowed_sql_operations": req.allowed_sql_operations,
-                    "allow_tier2_exposure": req.allow_tier2_exposure,
-                    "integration_name": req.integration_name,
-                    "expected_wasm_hash": req.expected_wasm_hash,
-                    "timeout_ms": req.timeout_ms,
-                    "note": "Compare these worker-computed values against the controller's `signature_diag` WARN log entry for the same job_id to identify which signed field diverged (enable it on the controller with TALOS_SIGNATURE_DIAG=1)."
-                }
-            }),
+            output_payload: signature_failure_payload(*WORKER_SIGNATURE_DIAG_ENABLED, &req, &e),
             logs: vec![],
             execution_time_ms: start.elapsed().as_millis() as u64,
             signature: vec![],
