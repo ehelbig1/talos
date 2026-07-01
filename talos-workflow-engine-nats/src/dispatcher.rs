@@ -45,6 +45,22 @@ static SUBJECT_PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
     std::env::var("WORKFLOW_NATS_PREFIX").unwrap_or_else(|_| "workflow".to_string())
 });
 
+/// Gate for the MCP-1212 controller-side signature diagnostic (see the
+/// dispatch site below). OFF by default: the diagnostic fired at WARN on
+/// EVERY successful dispatch, which is one loud field-dump per job in
+/// steady state — noise that drowns real WARNs. Set `TALOS_SIGNATURE_DIAG=1`
+/// (or `true`) on the controller to re-enable it while investigating a
+/// worker-side "signature verification failed", then unset it. The worker's
+/// enriched failure `JobResult.output_payload` (worker/src/main.rs) carries
+/// the same fields unconditionally, so the primary diagnostic is unaffected.
+/// Read once at process start — changing the env var after boot has no effect.
+static SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    matches!(
+        std::env::var("TALOS_SIGNATURE_DIAG").as_deref(),
+        Ok("1" | "true")
+    )
+});
+
 fn edge_routing_enabled() -> bool {
     std::env::var("ENABLE_EDGE_ROUTING").as_deref() == Ok("true")
 }
@@ -778,12 +794,18 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // "signature verification failed" can grep their controller logs
         // for the same job_id and diff field-by-field against the worker's
         // enriched failure JobResult.output_payload (see worker/src/main.rs
-        // verify-fail branch). WARN is loud enough to bypass default
-        // RUST_LOG=info filtering. Only fires when worker_shared_key is
-        // configured — dev installs without a key produce no diag.
-        // `diag_hashes()` is colocated with `signing_payload()` in
-        // job-protocol so the field formulas stay in sync.
-        {
+        // verify-fail branch). `diag_hashes()` is colocated with
+        // `signing_payload()` in job-protocol so the field formulas stay in
+        // sync.
+        //
+        // 2026-07-01: gated behind `TALOS_SIGNATURE_DIAG` (default OFF). It
+        // previously fired on EVERY successful dispatch — one loud field-dump
+        // per job in steady state, drowning real WARNs. It's a break-glass
+        // aid for an active signature-mismatch incident, not steady-state
+        // telemetry; enable the env var while investigating, then unset it.
+        // The worker's enriched failure JobResult still carries the same
+        // fields unconditionally, so the primary diagnostic is unaffected.
+        if *SIGNATURE_DIAG_ENABLED {
             let (controller_input_hash, controller_secrets_hash, controller_input_byte_len) =
                 req.diag_hashes();
             tracing::warn!(
