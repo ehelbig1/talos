@@ -581,7 +581,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "disable_workflow",
-            "description": "Disable a workflow. A disabled workflow cannot be triggered, called, or replayed. Use enable_workflow to re-enable.",
+            "description": "Temporarily disable a workflow without deleting it. Disabled workflows refuse replay_execution / retry_execution with a clear error pointing at enable_workflow. Triggers, schedules, and webhooks continue to fire — use pause_schedule / disable_webhook to stop those. Use archive_workflow for permanent retirement.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -592,7 +592,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "enable_workflow",
-            "description": "Re-enable a previously disabled workflow so it can be triggered again.",
+            "description": "Re-enable a workflow that was previously disabled via disable_workflow. Restores replay_execution / retry_execution access.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4496,7 +4496,7 @@ async fn handle_import_workflow(
     // MCP-417 (2026-05-11): apply the same control-char / null-byte
     // check that create_workflow / rename_workflow enforce (via the
     // MCP-410 helper). Pre-fix a malicious bundle could carry
-    // `name: "evil name"` and import_workflow would persist
+    // `name: "evil\x00name"` and import_workflow would persist
     // it, hitting Postgres' "invalid byte sequence" with an opaque
     // -32000 instead of an actionable -32602 at the boundary. The
     // import path is an attractive carrier for hostile names
