@@ -2758,6 +2758,27 @@ impl WorkflowsMutations {
                         );
                     }
 
+                    // Carry the (already DLP-redacted) per-node aggregated
+                    // output on the terminal event so the test modal can show
+                    // each node's result live — the async model streams status
+                    // but the engine doesn't broadcast per-node output, and the
+                    // persisted copy is encrypted (a read-back would need a
+                    // decrypting query). We already hold the plaintext here.
+                    // Cap it so a large payload can't bloat the bounded
+                    // broadcast channel; the full output is still persisted.
+                    // Suppress on the waiting path (partial output is misleading).
+                    const MAX_EVENT_OUTPUT_BYTES: usize = 256 * 1024;
+                    let event_output = if ctx.waiting {
+                        None
+                    } else {
+                        match serde_json::to_string(&aggregated_json) {
+                            Ok(s) if s.len() <= MAX_EVENT_OUTPUT_BYTES => {
+                                Some(aggregated_json.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+
                     let _ = sender.send(ExecutionEvent {
                         execution_id,
                         node_id: None,
@@ -2772,7 +2793,7 @@ impl WorkflowsMutations {
                         iteration_index: None,
                         iteration_total: None,
                         duration_ms: None,
-                        output: None,
+                        output: event_output,
                     });
                 }
                 Err(e) => {

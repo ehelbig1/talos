@@ -45,6 +45,19 @@ interface NodeTrace {
   status: NodeStatus;
   logMessage?: string | null;
   durationMs?: number | null;
+  /** Final node output JSON, from the terminal event's aggregated output. */
+  output?: string | null;
+}
+
+function formatJson(raw: unknown): string {
+  if (typeof raw === "string") {
+    try {
+      return JSON.stringify(JSON.parse(raw), null, 2);
+    } catch {
+      return raw;
+    }
+  }
+  return JSON.stringify(raw, null, 2);
 }
 
 function normalizeStatus(wire: string): NodeStatus {
@@ -102,7 +115,7 @@ function NodeTraceCard({
     },
   }[trace.status];
 
-  const hasDetail = !!trace.logMessage;
+  const hasDetail = !!trace.logMessage || !!trace.output;
 
   return (
     <div
@@ -155,21 +168,33 @@ function NodeTraceCard({
 
       {expanded && hasDetail && (
         <div className="border-t border-white/5 px-6 pb-6 space-y-5 pt-5 animate-in slide-in-from-top-2 duration-300">
-          <div className="space-y-3">
-            <p className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] ml-1">
-              {trace.status === "failed" ? "Diagnostic Fault" : "Node Log"}
-            </p>
-            <pre
-              className={cn(
-                "text-[10px] font-mono border rounded-[1.25rem] p-5 overflow-x-auto max-h-48 whitespace-pre-wrap shadow-inner leading-relaxed",
-                trace.status === "failed"
-                  ? "text-destructive/80 bg-destructive/10 border-destructive/20 font-bold"
-                  : "text-foreground/60 bg-surface-4/60 border-white/5",
-              )}
-            >
-              {sanitizeErrorMessage(trace.logMessage ?? "")}
-            </pre>
-          </div>
+          {trace.logMessage && (
+            <div className="space-y-3">
+              <p className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] ml-1">
+                {trace.status === "failed" ? "Diagnostic Fault" : "Node Log"}
+              </p>
+              <pre
+                className={cn(
+                  "text-[10px] font-mono border rounded-[1.25rem] p-5 overflow-x-auto max-h-48 whitespace-pre-wrap shadow-inner leading-relaxed",
+                  trace.status === "failed"
+                    ? "text-destructive/80 bg-destructive/10 border-destructive/20 font-bold"
+                    : "text-foreground/60 bg-surface-4/60 border-white/5",
+                )}
+              >
+                {sanitizeErrorMessage(trace.logMessage)}
+              </pre>
+            </div>
+          )}
+          {trace.output && (
+            <div className="space-y-3">
+              <p className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] ml-1">
+                Egress Result
+              </p>
+              <pre className="text-[10px] font-mono text-primary/60 bg-primary/5 border border-primary/10 rounded-[1.25rem] p-5 overflow-x-auto max-h-64 whitespace-pre-wrap shadow-inner leading-relaxed">
+                {trace.output}
+              </pre>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -199,6 +224,11 @@ export function TestWorkflowModal({
   const [events, setEvents] = useState<ExecutionUpdate[]>([]);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  // Aggregated per-node output, delivered on the terminal event.
+  const [finalOutput, setFinalOutput] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
   const startRef = useRef<number>(0);
 
   const nodes = useWorkflowStore((s) => s.nodes);
@@ -229,6 +259,9 @@ export function TestWorkflowModal({
     if (!executionId) return;
     const unsub = subscribeExecution(executionId, (ev) => {
       setEvents((prev) => [...prev, ev]);
+      if (ev.output && typeof ev.output === "object") {
+        setFinalOutput(ev.output);
+      }
       if (!ev.nodeId) {
         if (ev.status === "COMPLETED") {
           setPhase("completed");
@@ -262,6 +295,7 @@ export function TestWorkflowModal({
     setExecutionId(null);
     setElapsedMs(null);
     setRunError(null);
+    setFinalOutput(null);
     setPhase("idle");
     startRef.current = Date.now();
     testMutation.mutate({
@@ -299,8 +333,27 @@ export function TestWorkflowModal({
         }
       }
     }
+    // Attach the terminal aggregated output (keyed by node id) so each card
+    // can show the node's actual result, not just its live log.
+    if (finalOutput) {
+      for (const t of traces) {
+        const out = finalOutput[t.nodeId];
+        if (out !== undefined) t.output = formatJson(out);
+      }
+      // A node that produced output but never emitted a live status frame
+      // (fast short-circuit) won't be in `byNode` — surface it too.
+      for (const nodeId of Object.keys(finalOutput)) {
+        if (!byNode.has(nodeId)) {
+          traces.push({
+            nodeId,
+            status: phase === "completed" ? "completed" : "pending",
+            output: formatJson(finalOutput[nodeId]),
+          });
+        }
+      }
+    }
     return traces;
-  }, [events, phase]);
+  }, [events, phase, finalOutput]);
 
   const { succeeded, failed, skipped } = useMemo(() => {
     return nodeTraces.reduce(
