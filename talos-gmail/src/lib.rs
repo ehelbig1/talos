@@ -31,12 +31,8 @@ pub use handlers::{
 /// a single API call. Gmail allows up to 30 s for some endpoints
 /// (large `list_messages` pages, message-body fetches with attachments).
 pub(crate) const GMAIL_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Gmail API HTTP client connect timeout. Tighter than the request
-/// timeout because TCP+TLS handshake should complete fast even
-/// across continents; a slow handshake usually indicates DNS or
-/// upstream-network issues that retry won't fix.
-pub(crate) const GMAIL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Connect-timeout is now the shared 5s baseline from
+// talos_http_utils::trusted_client::build_integration_client.
 
 /// Gmail API client for enrichment and browsing
 pub struct GmailApiClient {
@@ -53,12 +49,8 @@ impl Default for GmailApiClient {
         // loudly on TLS init instead of silently re-enabling default
         // redirect-following via the `unwrap_or_else(Client::new)`
         // footgun documented in ssrf_via_redirect_pattern.md.
-        let http_client = reqwest::Client::builder()
-            .timeout(GMAIL_HTTP_TIMEOUT)
-            .connect_timeout(GMAIL_CONNECT_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("GmailApiClient: failed to build hardened reqwest client");
+        let http_client =
+            talos_http_utils::trusted_client::build_integration_client(GMAIL_HTTP_TIMEOUT);
         GmailApiClient { http_client }
     }
 }

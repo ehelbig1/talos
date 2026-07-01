@@ -747,12 +747,9 @@ impl OAuthCredentialService {
         // redirect-following and fail loudly on TLS init rather than
         // silently re-enabling default redirects via
         // `unwrap_or_else(|_| Client::new())`.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("OAuth credentials refresh: failed to build hardened reqwest client");
+        let http = talos_http_utils::trusted_client::build_integration_client(
+            std::time::Duration::from_secs(15),
+        );
 
         let resp = http
             .post(token_url)

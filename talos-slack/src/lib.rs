@@ -69,12 +69,9 @@ impl SlackApiClient {
             // MCP-1034: explicit connect_timeout — slack.com TCP-handshake
             // failure (rare but possible) fails fast on 5s rather than
             // holding the call for 10s.
-            http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("SlackApiClient: failed to build hardened reqwest client"),
+            http_client: talos_http_utils::trusted_client::build_integration_client(
+                std::time::Duration::from_secs(10),
+            ),
         }
     }
 

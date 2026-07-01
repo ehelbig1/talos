@@ -106,12 +106,7 @@ use anyhow::{anyhow, Context, Result};
 /// same-origin redirects still carry the bearer. Fail-closed at
 /// the policy layer rather than rely on reqwest's strip heuristics.
 fn oauth_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("oauth_http_client: reqwest builder failed (TLS init?)")
+    talos_http_utils::trusted_client::build_integration_client(std::time::Duration::from_secs(15))
 }
 /// Revoke an OAuth token at the provider (best-effort).
 ///

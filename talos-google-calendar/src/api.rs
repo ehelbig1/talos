@@ -97,12 +97,9 @@ impl GoogleCalendarApiClient {
         // so a stray 302 can't replay the credential to a redirect
         // target, and replace the `unwrap_or_else(Client::new)`
         // silent-downgrade footgun with a loud `.expect()`.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("GoogleCalendarApiClient: failed to build hardened reqwest client");
+        let client = talos_http_utils::trusted_client::build_integration_client(
+            std::time::Duration::from_secs(30),
+        );
         Self {
             client,
             base_url: "https://www.googleapis.com/calendar/v3".to_string(),

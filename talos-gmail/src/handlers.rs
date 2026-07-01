@@ -510,12 +510,9 @@ pub async fn test_watch_channel_handler(
     // MCP-1034: explicit connect_timeout so a slow-loris on the Gmail
     // API endpoint fails fast on TCP-handshake rather than pinning the
     // probe for the full 10s.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("gmail oauth-probe: failed to build hardened reqwest client");
+    let client = talos_http_utils::trusted_client::build_integration_client(
+        std::time::Duration::from_secs(10),
+    );
     let resp = client
         .get("https://gmail.googleapis.com/gmail/v1/users/me/profile")
         .bearer_auth(&access_token)
