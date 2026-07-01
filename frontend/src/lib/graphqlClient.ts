@@ -266,6 +266,11 @@ export interface ExecutionUpdate {
   durationMs?: number;
   /** Event timestamp from server. */
   timestamp?: string;
+  /**
+   * Final aggregated output, keyed by node id, populated on the terminal event
+   * of a test run (see test_workflow). Absent for normal executions.
+   */
+  output?: Record<string, unknown> | null;
 }
 
 export interface DlqUpdate {
@@ -363,7 +368,19 @@ function createSubscription<T>(
         }
 
         if (data.type === "data" && data.id === "1") {
-          onEvent(data.payload.data[dataKey]);
+          // Surface GraphQL errors instead of swallowing them. A query that
+          // references a non-existent field returns `{data: null, errors}`,
+          // and blindly indexing `data.payload.data[dataKey]` would throw into
+          // the catch below — silently dropping every event with no signal.
+          const payloadData = data.payload?.data;
+          if (payloadData && payloadData[dataKey] != null) {
+            onEvent(payloadData[dataKey]);
+          } else if (data.payload?.errors?.length) {
+            console.error(
+              `[subscription:${dataKey}] server returned errors:`,
+              data.payload.errors,
+            );
+          }
         }
 
         if (data.type === "connection_error") {
@@ -457,7 +474,16 @@ export function subscribeExecution(
   onEvent: (event: ExecutionUpdate) => void,
 ): () => void {
   return createSubscription<ExecutionUpdate>(
-    `subscription ($execId: UUID!) { executionUpdates(executionId: $execId) { executionId nodeId status traceId spanId logMessage retryAttempt maxRetries errorRecovery approvalRequired checkpointSaved iterationIndex iterationTotal durationMs } }`,
+    // NOTE: only fields that actually exist on the GraphQL `ExecutionEvent`
+    // type. A prior version of this query also requested
+    // `retryAttempt maxRetries errorRecovery approvalRequired checkpointSaved`,
+    // none of which exist on the schema type — that made the whole subscription
+    // fail validation (`{data: null, errors: [...]}`), so `data.payload.data`
+    // was null and every event was silently dropped (see the try/catch in
+    // createSubscription). The subscription delivered ZERO events to any
+    // consumer (execution monitor + test modal). Keep this selection in sync
+    // with the `ExecutionEvent` SimpleObject in talos-engine-events.
+    `subscription ($execId: UUID!) { executionUpdates(executionId: $execId) { executionId nodeId status traceId spanId logMessage iterationIndex iterationTotal durationMs output } }`,
     { execId: executionId },
     onEvent,
     "executionUpdates",

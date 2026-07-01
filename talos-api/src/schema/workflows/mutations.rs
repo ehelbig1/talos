@@ -2673,21 +2673,26 @@ impl WorkflowsMutations {
                 }
             };
 
-            // Broadcast a "started" event so live subscribers see the run begin
+            // Emit a "started" event so subscribers see the run begin
             // (per-node events flow via the engine's PostgresEventSink →
             // execution_events, replayed by the subscription on connect).
-            let _ = sender.send(ExecutionEvent {
-                execution_id,
-                node_id: None,
-                status: ExecutionStatus::Running,
-                trace_id: None,
-                span_id: None,
-                log_message: None,
-                iteration_index: None,
-                iteration_total: None,
-                duration_ms: None,
-                output: None,
-            });
+            persist_and_broadcast_test_event(
+                &db_pool,
+                &sender,
+                ExecutionEvent {
+                    execution_id,
+                    node_id: None,
+                    status: ExecutionStatus::Running,
+                    trace_id: None,
+                    span_id: None,
+                    log_message: None,
+                    iteration_index: None,
+                    iteration_total: None,
+                    duration_ms: None,
+                    output: None,
+                },
+            )
+            .await;
 
             match talos_engine::nats_run::run_with_trigger_input_via_nats(
                 &mut engine,
@@ -2758,22 +2763,48 @@ impl WorkflowsMutations {
                         );
                     }
 
-                    let _ = sender.send(ExecutionEvent {
-                        execution_id,
-                        node_id: None,
-                        status: final_status,
-                        trace_id: ctx.trace_id,
-                        span_id: None,
-                        log_message: Some(if ctx.waiting {
-                            "Test run suspended (awaiting continuation)".to_string()
-                        } else {
-                            "Test run finished successfully".to_string()
-                        }),
-                        iteration_index: None,
-                        iteration_total: None,
-                        duration_ms: None,
-                        output: None,
-                    });
+                    // Carry the (already DLP-redacted) per-node aggregated
+                    // output on the terminal event so the test modal can show
+                    // each node's result live — the async model streams status
+                    // but the engine doesn't broadcast per-node output, and the
+                    // persisted copy is encrypted (a read-back would need a
+                    // decrypting query). We already hold the plaintext here.
+                    // Cap it so a large payload can't bloat the bounded
+                    // broadcast channel; the full output is still persisted.
+                    // Suppress on the waiting path (partial output is misleading).
+                    const MAX_EVENT_OUTPUT_BYTES: usize = 256 * 1024;
+                    let event_output = if ctx.waiting {
+                        None
+                    } else {
+                        match serde_json::to_string(&aggregated_json) {
+                            Ok(s) if s.len() <= MAX_EVENT_OUTPUT_BYTES => {
+                                Some(aggregated_json.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+
+                    persist_and_broadcast_test_event(
+                        &db_pool,
+                        &sender,
+                        ExecutionEvent {
+                            execution_id,
+                            node_id: None,
+                            status: final_status,
+                            trace_id: ctx.trace_id,
+                            span_id: None,
+                            log_message: Some(if ctx.waiting {
+                                "Test run suspended (awaiting continuation)".to_string()
+                            } else {
+                                "Test run finished successfully".to_string()
+                            }),
+                            iteration_index: None,
+                            iteration_total: None,
+                            duration_ms: None,
+                            output: event_output,
+                        },
+                    )
+                    .await;
                 }
                 Err(e) => {
                     // MCP-969-class: DLP-redact the engine error before it
@@ -2802,11 +2833,71 @@ impl WorkflowsMutations {
     // ── Organization mutations ─────────────────────────────────────────
 }
 
-/// Finalize a test execution as `failed` (status-guarded) and broadcast a
-/// terminal Failed event. Used by `test_workflow`'s detached run so a build or
-/// run error can never leave the row stuck in `running` (the bug this refactor
-/// closes). `message` MUST already be DLP-redacted if it derives from engine /
-/// node output — callers redact before invoking; static strings are safe.
+/// Broadcast a test-run execution event to live subscribers AND persist it to
+/// `execution_events` so the `executionUpdates` connect-replay can recover it.
+///
+/// test_workflow runs detached and can finish in a few ms — faster than the
+/// browser can open its WebSocket subscription after the mutation returns. A
+/// broadcast-only terminal event would be sent before anyone is listening and
+/// never seen, leaving the modal hung on "running". Persisting it (exactly as
+/// trigger_workflow's `store_and_send!` does for real runs) makes it durable:
+/// a late subscriber's replay reads the terminal row from `execution_events`.
+/// `log_message` is DLP-redacted + capped (8 KiB) before persistence — it can
+/// carry arbitrary node output. (The `output` field is live-only; it has no
+/// `execution_events` column, so a sub-second run's per-node output is best-
+/// effort — status + error message are what's made durable here.)
+async fn persist_and_broadcast_test_event(
+    db_pool: &sqlx::Pool<sqlx::Postgres>,
+    sender: &tokio::sync::broadcast::Sender<ExecutionEvent>,
+    event: ExecutionEvent,
+) {
+    // Broadcast first so live subscribers get it even if persistence fails.
+    let _ = sender.send(event.clone());
+
+    let event_type = match (&event.node_id, &event.status) {
+        (None, ExecutionStatus::Running) => "started",
+        (None, ExecutionStatus::Completed) => "completed",
+        (None, ExecutionStatus::Failed) => "failed",
+        (None, ExecutionStatus::Waiting) => "waiting",
+        _ => "node_event",
+    };
+    let redacted_log_message = event.log_message.as_deref().map(|m| {
+        let truncated: &str = if m.len() > 8192 {
+            talos_text_util::truncate_at_char_boundary(m, 8192)
+        } else {
+            m
+        };
+        talos_dlp_provider::redact_str(truncated)
+    });
+    if let Err(db_err) = sqlx::query(
+        // allow-bare-pool-rls: execution_id owned by the authenticated user via
+        // the test row test_workflow INSERTed before this detached task ran.
+        r#"
+        INSERT INTO execution_events (execution_id, event_type, node_id, status, log_message)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(event.execution_id)
+    .bind(event_type)
+    .bind(event.node_id)
+    .bind(format!("{:?}", event.status))
+    .bind(&redacted_log_message)
+    .execute(db_pool)
+    .await
+    {
+        tracing::error!(
+            execution_id = %event.execution_id,
+            error = %db_err,
+            "test_workflow: failed to persist execution event"
+        );
+    }
+}
+
+/// Finalize a test execution as `failed` (status-guarded) and broadcast +
+/// persist a terminal Failed event. Used by `test_workflow`'s detached run so a
+/// build or run error can never leave the row stuck in `running` (the bug this
+/// refactor closes). `message` MUST already be DLP-redacted if it derives from
+/// engine / node output — callers redact before invoking; static strings are safe.
 async fn mark_test_execution_failed(
     db_pool: &sqlx::Pool<sqlx::Postgres>,
     sender: &tokio::sync::broadcast::Sender<ExecutionEvent>,
@@ -2832,18 +2923,23 @@ async fn mark_test_execution_failed(
             "test_workflow: failed to mark execution failed"
         );
     }
-    let _ = sender.send(ExecutionEvent {
-        execution_id,
-        node_id: None,
-        status: ExecutionStatus::Failed,
-        trace_id: None,
-        span_id: None,
-        log_message: Some(message.to_string()),
-        iteration_index: None,
-        iteration_total: None,
-        duration_ms: None,
-        output: None,
-    });
+    persist_and_broadcast_test_event(
+        db_pool,
+        sender,
+        ExecutionEvent {
+            execution_id,
+            node_id: None,
+            status: ExecutionStatus::Failed,
+            trace_id: None,
+            span_id: None,
+            log_message: Some(message.to_string()),
+            iteration_index: None,
+            iteration_total: None,
+            duration_ms: None,
+            output: None,
+        },
+    )
+    .await;
 }
 
 async fn release_advisory_lock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, lock_id: i64) {
