@@ -610,6 +610,12 @@ async fn main() -> anyhow::Result<()> {
     secrets_manager.initialize().await?;
     tracing::info!("Secrets manager initialized");
 
+    // Install the process-wide integration_state value encryptor (encrypt-at-rest
+    // for the durable OAuth-token / watch-secret primitive). Every execute_op
+    // write is now AEAD-sealed under the per-user org DEK; reads decrypt or fall
+    // back to legacy plaintext. Mirrors the set-once GitHub-provider wiring below.
+    talos_integration_state::set_integration_state_crypto(secrets_manager.clone());
+
     // ---------- Start the audit ledger subscriber ----------
     // Deferred from the NATS-connect block above so it can be handed the
     // SecretsManager for the KEK-backed OTLP auth-header envelope (v3). If it

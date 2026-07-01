@@ -11,6 +11,7 @@ anyhow.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+async-trait = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-memory = { path = "../talos-memory" }
 tracing.workspace = true
