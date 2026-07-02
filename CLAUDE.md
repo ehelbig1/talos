@@ -388,7 +388,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
   14. `talos-api` `Err(async_graphql::Error::new)` missing `.extend_safe()`
   15. `graph_json` writes via canonical chokepoint (MCP-1226/1227/1228/1229)
   16. `wit/talos.wit` ↔ `module-templates/wit/talos.wit` drift
-  17. `encrypted_secrets: Default::default()` outside tests
+  17. `encrypted_secrets: Default::default()` outside tests — **now also a compiler guarantee** (2026-07-02): `EncryptedSecrets` no longer derives `Default`; the empty case costs a deliberate `EncryptedSecrets::empty()`, so the accidental-empty bug can't compile. The lint remains as a cheap backstop but should find zero sites structurally. (Checks 23 and 39 were evaluated for the same graduation and deliberately kept as lints: 23's no-AAD `encrypt_value` has a legitimate *cross-crate* caller — the `talos-api` secrets-table writers — that Rust visibility can't distinguish from a disallowed one; 39 is a raw-SQL status write, not expressible as a type.)
   18. `JobResult.sign()` in worker must use `sign_with_worker_id`
   19. worker must single-publish each `JobResult` (no dual NATS publish)
   20. every wasmtime WASM proposal must be explicitly opted in/out
