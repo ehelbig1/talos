@@ -12,7 +12,8 @@
 #   - >= 4 vCPU, 8 GB RAM, 80 GB disk.
 #   - Public Postgres (Neon, RDS) with pgvector extension — UNLESS you
 #     set TALOS_USE_INTERNAL_POSTGRES=yes, in which case the chart
-#     deploys postgres:17-alpine in-cluster on a local-path PVC.
+#     deploys pgvector/pgvector:pg17 in-cluster on a local-path PVC
+#     (NOT stock/alpine postgres — the schema needs the pgvector extension).
 #   - Public Redis with TLS (Upstash, ElastiCache).
 #
 # Required env vars (set in /etc/talos/install.env or export before run):
@@ -32,7 +33,7 @@
 #   TALOS_NAMESPACE            default: talos
 #   TALOS_RELEASE              default: talos
 #   TALOS_DISABLE_SIGSTORE     "yes" → admit unsigned images (dev / first-deploy)
-#   TALOS_USE_INTERNAL_POSTGRES "yes" → deploy postgres:17-alpine in-cluster on a
+#   TALOS_USE_INTERNAL_POSTGRES "yes" → deploy pgvector/pgvector:pg17 in-cluster on a
 #                              local-path PVC instead of pointing at a managed
 #                              Postgres. Single-replica, daily pg_dump only — NOT
 #                              suitable for multi-node production. When set,
