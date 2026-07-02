@@ -161,7 +161,101 @@ fn scrub_wasm_log_for_broadcast(message: &str) -> String {
     talos_dlp_provider::redact_str_cow(&sanitized).into_owned()
 }
 
-/// Type alias for the full GraphQL schema.
+// Type alias for the full GraphQL schema: see the `TalosSchema` re-export at
+// the top of this file (canonical home is `talos_api`).
+
+// ---------------------------------------------------------------------------
+// Startup decomposition (2026-07-01). `main()` was a single ~4,900-line
+// sequential body; it is now a readable sequence of phase functions. The
+// extraction was purely mechanical — every block moved verbatim (with its
+// comments) out of `main()` into a module-level function below, and the
+// phase structs group the values that used to be `let` bindings threaded
+// through the body. Startup ORDER is load-bearing (crypto hooks before RPC
+// subscribers, HMAC ring registration before subscriber spawn, probe routes
+// merged after rate-limit layers, ...) — do not reorder the calls in
+// `main()` without reading the comments in the corresponding phase function.
+// ---------------------------------------------------------------------------
+
+/// Broadcast buses created before any service construction.
+struct EventBuses {
+    /// Execution updates — consumed by the GraphQL schema (`.data(tx)`), the
+    /// webhook router, the WASM-log subscriber, and the orchestration service.
+    tx: broadcast::Sender<ExecutionEvent>,
+    /// Clone taken before the schema builder consumes `tx` — needed by the scheduler.
+    tx_for_scheduler: broadcast::Sender<ExecutionEvent>,
+    dlq_tx: broadcast::Sender<crate::engine::events::DlqEvent>,
+    workflow_execution_tx: broadcast::Sender<crate::engine::events::WorkflowExecutionEvent>,
+}
+
+/// Module registry + compiler + secrets manager — the services everything
+/// else hangs off. Built first so the crypto hooks can be registered before
+/// any other service touches encrypted data.
+struct CoreServices {
+    registry: std::sync::Arc<ModuleRegistry>,
+    compiler: std::sync::Arc<CompilationService>,
+    compilation_event_tx: broadcast::Sender<crate::engine::events::CompilationEvent>,
+    secrets_manager: std::sync::Arc<SecretsManager>,
+}
+
+/// The integration / auth / OAuth / webhook service pile. Field order
+/// mirrors the construction order in `build_platform_services` (which is the
+/// pre-decomposition `main()` body order).
+struct PlatformServices {
+    worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+    worker_manager: std::sync::Arc<crate::worker_manager::WorkerManager>,
+    dlp_service: std::sync::Arc<dlp::DlpService>,
+    module_execution_service: std::sync::Arc<ModuleExecutionService>,
+    oauth_credential_service: std::sync::Arc<oauth::OAuthCredentialService>,
+    slack_api_client: std::sync::Arc<slack::SlackApiClient>,
+    slack_integration_service: std::sync::Arc<slack::SlackIntegrationService>,
+    gmail_integration_service: std::sync::Arc<gmail::GmailIntegrationService>,
+    github_connect_service: std::sync::Arc<talos_github_connect::GithubConnectService>,
+    gmail_watch_service: Option<std::sync::Arc<gmail::watch::GmailWatchService>>,
+    gmail_pubsub_verifier: Option<std::sync::Arc<gmail::pubsub_jwt::PubsubJwtVerifier>>,
+    atlassian_integration_service: std::sync::Arc<atlassian::AtlassianIntegrationService>,
+    gmail_api_client: std::sync::Arc<gmail::GmailApiClient>,
+    google_calendar_service: std::sync::Arc<google_calendar::GoogleCalendarService>,
+    circuit_breaker: std::sync::Arc<crate::webhooks::CircuitBreaker>,
+    webhook_router: std::sync::Arc<WebhookRouter>,
+    auth_service: std::sync::Arc<AuthService>,
+    totp_service: std::sync::Arc<totp_2fa::TotpService>,
+    api_key_service: std::sync::Arc<api_keys::ApiKeyService>,
+    oauth_service: std::sync::Arc<OAuthService>,
+    auth_rate_limiter: std::sync::Arc<rate_limit::DistributedRateLimiter>,
+    idempotency_service: Option<std::sync::Arc<idempotency::IdempotencyService>>,
+}
+
+/// Per-IP / global rate limiters + proxy trust config shared between the
+/// cleanup sweeps, the router layers, and the startup banner.
+struct RateLimiters {
+    api_rate_limit: u32,
+    webhook_rate_limit: u32,
+    global_rate_limit: u32,
+    api_limiter: rate_limit::IpRateLimiter,
+    webhook_limiter: rate_limit::IpRateLimiter,
+    global_limiter: rate_limit::GlobalRateLimiter,
+    whitelist: std::sync::Arc<rate_limit::IpWhitelist>,
+    trusted_proxies: std::sync::Arc<rate_limit::TrustedProxies>,
+}
+
+/// GraphQL schema + the cross-protocol services / repositories shared
+/// between the GraphQL ctx.data wiring and the MCP router.
+struct SchemaBundle {
+    schema: TalosSchema,
+    runtime: std::sync::Arc<TalosRuntime>,
+    llm_client: Option<std::sync::Arc<crate::llm::LlmClient>>,
+    workflow_repo: std::sync::Arc<workflow_repository::WorkflowRepository>,
+    module_repo: std::sync::Arc<module_repository::ModuleRepository>,
+    execution_repo: std::sync::Arc<crate::execution_repository::ExecutionRepository>,
+    workflow_creation_service: std::sync::Arc<talos_workflow_creation::WorkflowCreationService>,
+    hot_update_service: std::sync::Arc<talos_hot_update_service::HotUpdateService>,
+    execution_orchestration_service:
+        std::sync::Arc<talos_execution_orchestration::ExecutionOrchestrationService>,
+    workflow_manifest_service: std::sync::Arc<talos_workflow_manifest::WorkflowManifestService>,
+    replay_service: std::sync::Arc<talos_replay_service::ReplayService>,
+    inline_compile_service: std::sync::Arc<talos_inline_compile_service::InlineCompileService>,
+    search_service: std::sync::Arc<talos_search_service::SearchService>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -216,6 +310,176 @@ async fn main() -> anyhow::Result<()> {
         panic!("CRITICAL SECURITY ERROR: ALLOW_DEV_UNSAFE_CSRF_BYPASS cannot be enabled in production mode!");
     }
 
+    // Initialise the logger + tracing subscriber (OTLP bridge when configured).
+    init_tracing_and_logging();
+
+    // Verify essential environment configuration early (fail-fast gate).
+    validate_startup_config()?;
+
+    // Event buses for execution / DLQ / workflow-started updates.
+    let buses = build_event_buses();
+
+    // Postgres pool + migrations + first-user bootstrap + embedding warmup.
+    let db_pool: sqlx::Pool<sqlx::Postgres> = init_database().await?;
+
+    // Redis (distributed caching) and NATS (job dispatch + RPC) clients.
+    let redis_client = init_redis().await;
+    let nats_client = init_nats().await?;
+
+    // Module registry, compiler, and the secrets manager (KEK provider selection).
+    let core = build_core_services(db_pool.clone(), redis_client.clone()).await?;
+
+    // At-rest crypto hooks + the audit-ledger subscriber. MUST run before any
+    // memory writes and before the RPC subscribers start (hook-before-
+    // subscriber ordering is load-bearing — writers panic-loud without it).
+    register_crypto_hooks(
+        db_pool.clone(),
+        nats_client.clone(),
+        core.secrets_manager.clone(),
+    )
+    .await?;
+
+    // Integration / auth / OAuth / webhook service pile (+ metrics service
+    // and the embedding-provider boot probe, in original construction order).
+    let services = build_platform_services(
+        db_pool.clone(),
+        redis_client.clone(),
+        nats_client.clone(),
+        &buses,
+        &core,
+    )
+    .await?;
+
+    // Embedding re-probe + crypto-invariant orphan gauges + DB-pool gauges.
+    spawn_metrics_gauge_tasks(db_pool.clone());
+
+    // Seed templates on first run
+    seed_templates(&core.registry, core.compiler.clone()).await?;
+    seed_marketplace(&db_pool).await;
+
+    // OCI registry background sync loop (started after disk seeding).
+    spawn_registry_sync(core.registry.clone());
+
+    // ---------- Background-sweep shutdown channel ----------
+    //
+    // Long-running tick-driven sweeps (LLM-keys, actor-memory TTL, scheduler)
+    // need a fan-out shutdown signal so they can drain in-flight work on
+    // SIGTERM instead of being abruptly aborted with the runtime. Use a
+    // tokio::sync::watch — single-producer, multi-consumer, .changed()
+    // future yields when the value flips. Notified once from the
+    // axum::serve graceful-shutdown callback at the bottom of main().
+    //
+    // Distinct from `rpc_shutdown_tx` (declared further down with the
+    // RPC subscribers); both fire on the same trigger but their lifecycles
+    // start at different points in startup, so they're separate channels.
+    let (bg_shutdown_tx, bg_shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
+    let bg_shutdown_tx = std::sync::Arc::new(bg_shutdown_tx);
+
+    // LLM-keys/DEK cache sweeps, audit-chain verification, bcrypt-cache
+    // revocation, and modules-table reconciliation loops.
+    spawn_maintenance_sweeps(
+        db_pool.clone(),
+        core.secrets_manager.clone(),
+        bg_shutdown_rx.clone(),
+    );
+
+    // Per-IP / global rate limiters + IP whitelist + trusted proxies.
+    let limiters = build_rate_limiters();
+
+    // Session/API-key/OAuth-state/execution/audit-log/WASM-cache/rate-limiter
+    // cleanup sweeps, plus the one-shot crash-recovery resume sweep (RFC 0003).
+    spawn_cleanup_tasks(
+        db_pool.clone(),
+        nats_client.clone(),
+        &core,
+        &services,
+        &limiters,
+        bg_shutdown_rx.clone(),
+    );
+
+    // Build `actor_repo` here (earlier than the rest of the service
+    // pile below) so the Graph RAG init block can hand it in for
+    // tier-1 enforcement. It's independent of the services that
+    // come between this point and its second use site at the bulk
+    // service-construction block, so the early build is free.
+    let actor_repo = std::sync::Arc::new(
+        actor_repository::ActorRepository::new(db_pool.clone())
+            .with_encryption(core.secrets_manager.clone()),
+    );
+
+    // Graph RAG (Neo4j) init — TLS prod gate + tier-1 egress gate wiring.
+    init_graph_rag(core.secrets_manager.clone(), actor_repo.clone()).await?;
+
+    // HMAC verify-ring registration MUST precede the RPC subscriber spawns,
+    // otherwise verify() fails closed and every request returns Unauthorized.
+    let rpc_subscribers_enabled = register_rpc_hmac_ring()?;
+    let rpc_shutdown_tx = wire_rpc_subscribers(
+        db_pool.clone(),
+        nats_client.clone(),
+        rpc_subscribers_enabled,
+    );
+
+    // Embedding backfill, readiness recomputation, SLA degradation alerting.
+    spawn_analytics_tasks(db_pool.clone(), bg_shutdown_rx.clone());
+
+    // Gmail watch / Google Calendar channel renewal + OAuth token refresh.
+    spawn_integration_renewal_tasks(&services, bg_shutdown_rx.clone());
+
+    // WASM-log + job-result NATS subscribers (supervisor-wrapped).
+    spawn_nats_log_subscribers(db_pool.clone(), nats_client.clone(), &services, &buses)?;
+
+    // GraphQL schema + the cross-protocol services shared with MCP.
+    let bundle = build_schema_and_services(
+        db_pool.clone(),
+        redis_client.clone(),
+        nats_client.clone(),
+        &buses,
+        &core,
+        &services,
+        actor_repo.clone(),
+    )?;
+
+    // Axum router — route/middleware/Extension assembly. Middleware ORDER and
+    // sub-router merge ORDER are load-bearing; see build_router's comments.
+    let app = build_router(
+        db_pool.clone(),
+        redis_client.clone(),
+        nats_client.clone(),
+        &core,
+        &services,
+        &limiters,
+        &bundle,
+        actor_repo.clone(),
+    )?;
+
+    // Stale-execution cleanup, workflow scheduler, SLA threshold breach check.
+    spawn_late_background_tasks(
+        db_pool.clone(),
+        nats_client.clone(),
+        &core,
+        &services,
+        buses.tx_for_scheduler.clone(),
+        bg_shutdown_rx.clone(),
+    );
+
+    // Bind + serve with graceful shutdown (SIGTERM/SIGINT → DLQ flush →
+    // RPC-subscriber + background-sweep shutdown broadcasts).
+    serve(
+        app,
+        &limiters,
+        services.webhook_router.clone(),
+        rpc_shutdown_tx,
+        bg_shutdown_tx,
+    )
+    .await?;
+
+    crate::trace::shutdown_tracing();
+    Ok(())
+}
+
+/// Install the fmt/OTLP tracing subscriber. Extracted verbatim from the top
+/// of the pre-decomposition `main()`.
+fn init_tracing_and_logging() {
     // Initialise logger
     let jaeger_endpoint = std::env::var("JAEGER_ENDPOINT")
         .ok()
@@ -250,7 +514,11 @@ async fn main() -> anyhow::Result<()> {
             .with(otel_layer)
             .init();
     }
+}
 
+/// Startup configuration validation gate (MCP-906) + process start-time
+/// stamp. Extracted verbatim from `main()`.
+fn validate_startup_config() -> anyhow::Result<()> {
     // ---------------------------------------------------------------------
     // Verify essential environment configuration early.
     // ---------------------------------------------------------------------
@@ -281,6 +549,11 @@ async fn main() -> anyhow::Result<()> {
     // ticking from server startup.
     let _ = *crate::mcp::PROCESS_START_TIME;
 
+    Ok(())
+}
+
+/// Create the broadcast event buses. Extracted verbatim from `main()`.
+fn build_event_buses() -> EventBuses {
     // ---------- Event bus for execution updates ----------
     let (tx, _rx) = broadcast::channel::<ExecutionEvent>(100);
     // Clone before the schema builder consumes tx — needed by the scheduler.
@@ -293,6 +566,17 @@ async fn main() -> anyhow::Result<()> {
     let (workflow_execution_tx, _workflow_execution_rx) =
         broadcast::channel::<crate::engine::events::WorkflowExecutionEvent>(4096);
 
+    EventBuses {
+        tx,
+        tx_for_scheduler,
+        dlq_tx,
+        workflow_execution_tx,
+    }
+}
+
+/// Postgres pool init + migrations + RLS-bypass warning + first-user
+/// bootstrap + embedding warmup. Extracted verbatim from `main()`.
+async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>> {
     // ---------- Initialise DB ----------
     // Database schema is managed via migrations in /migrations/.
     // Auto-applied at startup so a `make rebuild` is enough — no separate
@@ -343,6 +627,12 @@ async fn main() -> anyhow::Result<()> {
     // semantic searches on that row silently degrade to keyword fallback.
     tokio::spawn(talos_memory::embedding::warmup());
 
+    Ok(db_pool)
+}
+
+/// Redis client init (TLS prod gate + connection test). Extracted verbatim
+/// from `main()`.
+async fn init_redis() -> Option<std::sync::Arc<redis::Client>> {
     // ---------- Initialize Redis client for distributed caching ----------
     let redis_client = if let Ok(redis_url) = std::env::var("REDIS_URL") {
         // SECURITY: In production, enforce TLS (rediss://) and reject plaintext (redis://).
@@ -387,6 +677,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    redis_client
+}
+
+/// NATS client init (TLS prod gate + authenticated connect). Extracted
+/// verbatim from `main()`.
+async fn init_nats() -> anyhow::Result<Option<std::sync::Arc<async_nats::Client>>> {
     // ---------- Initialize NATS client for message queues ----------
     let nats_client = if let Ok(nats_url) = std::env::var("NATS_URL") {
         // SECURITY: In production, REFUSE to start on a plaintext NATS URL. The
@@ -479,6 +775,15 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    Ok(nats_client)
+}
+
+/// Module registry + compilation service + secrets manager (KEK provider
+/// selection). Extracted verbatim from `main()`.
+async fn build_core_services(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    redis_client: Option<std::sync::Arc<redis::Client>>,
+) -> anyhow::Result<CoreServices> {
     // ---------- Initialize node creation services ----------
     let registry = std::sync::Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client.clone()));
     // MCP-922 (2026-05-14): `talos_templates::TemplateGenerator` was
@@ -610,6 +915,25 @@ async fn main() -> anyhow::Result<()> {
     secrets_manager.initialize().await?;
     tracing::info!("Secrets manager initialized");
 
+    Ok(CoreServices {
+        registry,
+        compiler,
+        compilation_event_tx,
+        secrets_manager,
+    })
+}
+
+/// At-rest crypto hook registration + audit-ledger subscriber start.
+/// Ordering is load-bearing: the integration_state encryptor and the
+/// actor_memory crypto hook MUST be installed before any writes, and the
+/// audit-ledger subscriber is deliberately started only after the
+/// SecretsManager exists (KEK-backed OTLP auth-header envelope). Extracted
+/// verbatim from `main()`.
+async fn register_crypto_hooks(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+    secrets_manager: std::sync::Arc<SecretsManager>,
+) -> anyhow::Result<()> {
     // Install the process-wide integration_state value encryptor (encrypt-at-rest
     // for the durable OAuth-token / watch-secret primitive). Every execute_op
     // write is now AEAD-sealed under the per-user org DEK; reads decrypt or fall
@@ -640,6 +964,23 @@ async fn main() -> anyhow::Result<()> {
     ));
     tracing::info!("actor_memory at-rest encryption hook registered");
 
+    Ok(())
+}
+
+/// The integration / auth / OAuth / webhook service pile, the metrics
+/// service, and the embedding-provider boot probe — in the exact
+/// construction order of the pre-decomposition `main()` body.
+async fn build_platform_services(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    redis_client: Option<std::sync::Arc<redis::Client>>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+    buses: &EventBuses,
+    core: &CoreServices,
+) -> anyhow::Result<PlatformServices> {
+    let secrets_manager = core.secrets_manager.clone();
+    let registry = core.registry.clone();
+    let tx = buses.tx.clone();
+    let dlq_tx = buses.dlq_tx.clone();
     // ---------- Load worker shared key (for signing NATS job requests) ----------
     // Optional: if not set, Google Calendar webhook dispatch is disabled.
     // In production this MUST be set to the same value as the worker's WORKER_SHARED_KEY.
@@ -1201,6 +1542,36 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    Ok(PlatformServices {
+        worker_shared_key,
+        worker_manager,
+        dlp_service,
+        module_execution_service,
+        oauth_credential_service,
+        slack_api_client,
+        slack_integration_service,
+        gmail_integration_service,
+        github_connect_service,
+        gmail_watch_service,
+        gmail_pubsub_verifier,
+        atlassian_integration_service,
+        gmail_api_client,
+        google_calendar_service,
+        circuit_breaker,
+        webhook_router,
+        auth_service,
+        totp_service,
+        api_key_service,
+        oauth_service,
+        auth_rate_limiter,
+        idempotency_service,
+    })
+}
+
+/// Embedding-provider re-probe loop + crypto-invariant orphan gauges +
+/// DB-pool saturation gauges. Extracted verbatim from `main()`; spawn order
+/// preserved.
+fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
     // Background refresh — every 5 min, re-probe the provider so that
     // operator config rotations (key swap, URL change, tier upgrade) are
     // picked up without a controller restart. The interval is intentionally
@@ -1308,32 +1679,26 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+}
 
-    // Seed templates on first run
-    seed_templates(&registry, compiler.clone()).await?;
-    seed_marketplace(&db_pool).await;
-
+/// OCI registry background sync loop. Extracted verbatim from `main()` —
+/// must start AFTER `seed_templates` / `seed_marketplace`.
+fn spawn_registry_sync(registry: std::sync::Arc<ModuleRegistry>) {
     // ---------- Start OCI Registry background sync loop ----------
     let sync_registry = registry.clone();
     tokio::spawn(async move {
         registry::sync::start_registry_sync_loop(sync_registry).await;
     });
+}
 
-    // ---------- Background-sweep shutdown channel ----------
-    //
-    // Long-running tick-driven sweeps (LLM-keys, actor-memory TTL, scheduler)
-    // need a fan-out shutdown signal so they can drain in-flight work on
-    // SIGTERM instead of being abruptly aborted with the runtime. Use a
-    // tokio::sync::watch — single-producer, multi-consumer, .changed()
-    // future yields when the value flips. Notified once from the
-    // axum::serve graceful-shutdown callback at the bottom of main().
-    //
-    // Distinct from `rpc_shutdown_tx` (declared further down with the
-    // RPC subscribers); both fire on the same trigger but their lifecycles
-    // start at different points in startup, so they're separate channels.
-    let (bg_shutdown_tx, bg_shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
-    let bg_shutdown_tx = std::sync::Arc::new(bg_shutdown_tx);
-
+/// LLM-keys/DEK cache sweeps, audit-chain verification sweep, bcrypt-cache
+/// revocation sweep, and the modules-table reconciliation sweep. Extracted
+/// verbatim from `main()`; spawn order preserved.
+fn spawn_maintenance_sweeps(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    secrets_manager: std::sync::Arc<SecretsManager>,
+    bg_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     // ---------- Start LLM-keys cache sweep loop ----------
     //
     // The LLM-keys cache (`SecretsManager::llm_keys_cache`) evicts expired
@@ -1579,7 +1944,11 @@ async fn main() -> anyhow::Result<()> {
         "LLM-keys cache sweep loop started (interval: {}s)",
         sweep_interval_secs
     );
+}
 
+/// Per-IP / global rate limiters + IP whitelist + trusted-proxy list.
+/// Extracted verbatim from `main()`.
+fn build_rate_limiters() -> RateLimiters {
     // ---------- Initialize rate limiters ----------
     // Read rate limit configuration from environment variables
     // Load rate‑limit settings using the shared helper.
@@ -1641,6 +2010,42 @@ async fn main() -> anyhow::Result<()> {
     // Example: TRUSTED_PROXY_CIDRS=172.16.0.0/12 (Docker bridge default)
     let trusted_proxies = std::sync::Arc::new(rate_limit::TrustedProxies::from_env());
 
+    RateLimiters {
+        api_rate_limit,
+        webhook_rate_limit,
+        global_rate_limit,
+        api_limiter,
+        webhook_limiter,
+        global_limiter,
+        whitelist,
+        trusted_proxies,
+    }
+}
+
+/// Cleanup / retention / archival sweeps (sessions, API keys, OAuth state
+/// tokens, executions, audit logs, suspensions, WASM cache, webhook +
+/// IP rate limiters, stuck executions), the one-shot crash-recovery resume
+/// sweep (RFC 0003), the DEK cache cleanup, and the actor-memory TTL sweep.
+/// Extracted verbatim from `main()`; spawn order preserved.
+fn spawn_cleanup_tasks(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+    core: &CoreServices,
+    services: &PlatformServices,
+    limiters: &RateLimiters,
+    bg_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let secrets_manager = core.secrets_manager.clone();
+    let registry = core.registry.clone();
+    let auth_service = services.auth_service.clone();
+    let api_key_service = services.api_key_service.clone();
+    let oauth_service = services.oauth_service.clone();
+    let webhook_router = services.webhook_router.clone();
+    let module_execution_service = services.module_execution_service.clone();
+    let worker_shared_key = services.worker_shared_key.clone();
+    let auth_rate_limiter = services.auth_rate_limiter.clone();
+    let api_limiter = limiters.api_limiter.clone();
+    let webhook_limiter = limiters.webhook_limiter.clone();
     // ---------- Start background session cleanup task ----------
     // MCP-1043 (2026-05-15): the three auth-data DELETE sweeps below
     // (sessions / API keys / OAuth state tokens) now subscribe to
@@ -2365,17 +2770,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     tracing::info!("Actor memory TTL cleanup task started (runs every 15 minutes)");
+}
 
-    // Build `actor_repo` here (earlier than the rest of the service
-    // pile below) so the Graph RAG init block can hand it in for
-    // tier-1 enforcement. It's independent of the services that
-    // come between this point and its second use site at the bulk
-    // service-construction block, so the early build is free.
-    let actor_repo = std::sync::Arc::new(
-        actor_repository::ActorRepository::new(db_pool.clone())
-            .with_encryption(secrets_manager.clone()),
-    );
-
+/// Graph RAG service (Neo4j) init — TLS prod gate, vault-first key
+/// resolution, and the tier-1 data-egress gate. Extracted verbatim from
+/// `main()`.
+async fn init_graph_rag(
+    secrets_manager: std::sync::Arc<SecretsManager>,
+    actor_repo: std::sync::Arc<actor_repository::ActorRepository>,
+) -> anyhow::Result<()> {
     // ---------- Initialize Graph RAG service (Neo4j) ----------
     {
         // SECURITY: In production, REFUSE to start on a plaintext Neo4j URI.
@@ -2429,6 +2832,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Register the HMAC verify-ring for the talos-memory RPC subscribers and
+/// compute whether the subscribers may start. MUST run before
+/// `wire_rpc_subscribers` — registration-before-subscribe is the invariant
+/// (verify() fails closed otherwise). Extracted verbatim from `main()`.
+fn register_rpc_hmac_ring() -> anyhow::Result<bool> {
     // ---------- Register HMAC key for talos-memory RPC subscribers ----------
     // Both the graph-search and memory-op RPCs require an HMAC-signed
     // request. Workers sign with WORKER_SHARED_KEY; we register the
@@ -2512,6 +2923,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(rpc_subscribers_enabled)
+}
+
+/// Spawn the five signed NATS-RPC subscribers (graph / memory / database /
+/// state / integration_state) plus the integration_state sweeper, and return
+/// the shutdown handle the graceful-shutdown hook flips. Extracted verbatim
+/// from `main()`; spawn order preserved.
+fn wire_rpc_subscribers(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+    rpc_subscribers_enabled: bool,
+) -> std::sync::Arc<tokio::sync::watch::Sender<bool>> {
     // ---------- Graph-search NATS-RPC subscriber (Phase 3) ----------
     // Workers can't reach the Neo4j driver directly (it's a
     // controller-side dependency), so the WIT `graph-memory::graph-search`
@@ -2556,6 +2979,16 @@ async fn main() -> anyhow::Result<()> {
     // or not the RPC subscriber is live.
     spawn_integration_state_sweeper(db_pool.clone(), rpc_shutdown_rx.clone());
 
+    rpc_shutdown_tx
+}
+
+/// Actor-memory embedding backfill (one-shot), readiness-score
+/// recomputation, and SLA degradation alerting. Extracted verbatim from
+/// `main()`; spawn order preserved.
+fn spawn_analytics_tasks(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    bg_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     // ---------- Start actor memory embedding backfill (one-shot on startup) ----------
     {
         let backfill_pool = db_pool.clone();
@@ -3086,7 +3519,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     tracing::info!("SLA degradation alerting task started (runs every 15 minutes)");
+}
 
+/// Gmail watch renewal, Google Calendar channel renewal, and the OAuth
+/// proactive token refresh loops. Extracted verbatim from `main()`; spawn
+/// order preserved.
+fn spawn_integration_renewal_tasks(
+    services: &PlatformServices,
+    bg_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let gmail_watch_service = services.gmail_watch_service.clone();
+    let google_calendar_service = services.google_calendar_service.clone();
+    let oauth_credential_service = services.oauth_credential_service.clone();
     // ---------- Start Gmail watch renewal task ----------
     if let Some(ref gmail_watch) = gmail_watch_service {
         let renewal = gmail_watch.clone();
@@ -3145,7 +3589,20 @@ async fn main() -> anyhow::Result<()> {
         });
         tracing::info!("OAuth proactive token refresh task started (5-minute interval)");
     }
+}
 
+/// WASM-log subscriber + job-result subscriber (both supervisor-wrapped,
+/// MCP-1121/1122). Extracted verbatim from `main()`; spawn order preserved.
+fn spawn_nats_log_subscribers(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+    services: &PlatformServices,
+    buses: &EventBuses,
+) -> anyhow::Result<()> {
+    let module_execution_service = services.module_execution_service.clone();
+    let worker_shared_key = services.worker_shared_key.clone();
+    let tx = buses.tx.clone();
+    let workflow_execution_tx = buses.workflow_execution_tx.clone();
     // ---------- Start WASM log subscriber (automatic logging from worker) ----------
     // This background task receives logs from WASM executions and persists them to database
     // Provides guaranteed observability for all WASM module executions
@@ -3581,6 +4038,42 @@ async fn main() -> anyhow::Result<()> {
     // handler could use it, causing missed events. Syncing is driven exclusively by
     // real-time push notifications (webhook_notification_handler).
 
+    Ok(())
+}
+
+/// Build the shared TalosRuntime, LLM client, repositories, cross-protocol
+/// services, and the GraphQL schema. Extracted verbatim from `main()`. The
+/// ExecutionOrchestrationService construction chains
+/// `.with_event_sender(tx.clone())` — preserved exactly.
+fn build_schema_and_services(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    redis_client: Option<std::sync::Arc<redis::Client>>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+    buses: &EventBuses,
+    core: &CoreServices,
+    services: &PlatformServices,
+    actor_repo: std::sync::Arc<actor_repository::ActorRepository>,
+) -> anyhow::Result<SchemaBundle> {
+    let secrets_manager = core.secrets_manager.clone();
+    let registry = core.registry.clone();
+    let compiler = core.compiler.clone();
+    let compilation_event_tx = core.compilation_event_tx.clone();
+    let tx = buses.tx.clone();
+    let dlq_tx = buses.dlq_tx.clone();
+    let workflow_execution_tx = buses.workflow_execution_tx.clone();
+    let worker_shared_key = services.worker_shared_key.clone();
+    let worker_manager = services.worker_manager.clone();
+    let dlp_service = services.dlp_service.clone();
+    let webhook_router = services.webhook_router.clone();
+    let auth_service = services.auth_service.clone();
+    let totp_service = services.totp_service.clone();
+    let api_key_service = services.api_key_service.clone();
+    let oauth_service = services.oauth_service.clone();
+    let google_calendar_service = services.google_calendar_service.clone();
+    let oauth_credential_service = services.oauth_credential_service.clone();
+    let gmail_integration_service = services.gmail_integration_service.clone();
+    let module_execution_service = services.module_execution_service.clone();
+    let auth_rate_limiter = services.auth_rate_limiter.clone();
     // ---------- Build GraphQL schema ----------
     // Shared TalosRuntime with Redis, NATS, and file sandbox support (thread‑safe via Arc)
     // Note: the controller embeds its own WasmRuntime (used by
@@ -3811,6 +4304,79 @@ async fn main() -> anyhow::Result<()> {
         schema_builder.finish()
     };
 
+    Ok(SchemaBundle {
+        schema,
+        runtime,
+        llm_client,
+        workflow_repo,
+        module_repo,
+        execution_repo,
+        workflow_creation_service,
+        hot_update_service,
+        execution_orchestration_service,
+        workflow_manifest_service,
+        replay_service,
+        inline_compile_service,
+        search_service,
+    })
+}
+
+/// Route / middleware / Extension assembly for the whole HTTP surface.
+/// Extracted verbatim from `main()`. CRITICAL ordering invariants preserved
+/// byte-for-byte (see the inline comments): layers run bottom-up; the
+/// governor + global rate-limit layers are production-only; `mcp_router` and
+/// `probe_routes` are merged AFTER the rate-limit layers so MCP traffic and
+/// kubelet probes can never be 429'd; merged sub-routers re-attach the
+/// Extension layers their handlers need.
+fn build_router(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    redis_client: Option<std::sync::Arc<redis::Client>>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+    core: &CoreServices,
+    services: &PlatformServices,
+    limiters: &RateLimiters,
+    bundle: &SchemaBundle,
+    actor_repo: std::sync::Arc<actor_repository::ActorRepository>,
+) -> anyhow::Result<Router> {
+    let secrets_manager = core.secrets_manager.clone();
+    let registry = core.registry.clone();
+    let compiler = core.compiler.clone();
+    let worker_shared_key = services.worker_shared_key.clone();
+    let worker_manager = services.worker_manager.clone();
+    let dlp_service = services.dlp_service.clone();
+    let module_execution_service = services.module_execution_service.clone();
+    let slack_api_client = services.slack_api_client.clone();
+    let slack_integration_service = services.slack_integration_service.clone();
+    let gmail_integration_service = services.gmail_integration_service.clone();
+    let github_connect_service = services.github_connect_service.clone();
+    let gmail_watch_service = services.gmail_watch_service.clone();
+    let gmail_pubsub_verifier = services.gmail_pubsub_verifier.clone();
+    let atlassian_integration_service = services.atlassian_integration_service.clone();
+    let gmail_api_client = services.gmail_api_client.clone();
+    let google_calendar_service = services.google_calendar_service.clone();
+    let circuit_breaker = services.circuit_breaker.clone();
+    let webhook_router = services.webhook_router.clone();
+    let auth_service = services.auth_service.clone();
+    let oauth_service = services.oauth_service.clone();
+    let idempotency_service = services.idempotency_service.clone();
+    let api_limiter = limiters.api_limiter.clone();
+    let webhook_limiter = limiters.webhook_limiter.clone();
+    let global_limiter = limiters.global_limiter.clone();
+    let whitelist = limiters.whitelist.clone();
+    let trusted_proxies = limiters.trusted_proxies.clone();
+    let schema = bundle.schema.clone();
+    let runtime = bundle.runtime.clone();
+    let llm_client = bundle.llm_client.clone();
+    let workflow_repo = bundle.workflow_repo.clone();
+    let module_repo = bundle.module_repo.clone();
+    let execution_repo = bundle.execution_repo.clone();
+    let workflow_creation_service = bundle.workflow_creation_service.clone();
+    let hot_update_service = bundle.hot_update_service.clone();
+    let execution_orchestration_service = bundle.execution_orchestration_service.clone();
+    let workflow_manifest_service = bundle.workflow_manifest_service.clone();
+    let replay_service = bundle.replay_service.clone();
+    let inline_compile_service = bundle.inline_compile_service.clone();
+    let search_service = bundle.search_service.clone();
     // ---------- Rate limiting configuration ----------
     // Global rate limit configuration using tower_governor
     // Recommended: 10 requests per second per IP to prevent brute-force attacks
@@ -4699,6 +5265,25 @@ async fn main() -> anyhow::Result<()> {
         // CORS - must be last layer (runs first) to handle OPTIONS preflight
         .layer(from_fn(cors_middleware));
 
+    Ok(app)
+}
+
+/// Stale-execution cleanup, the workflow scheduler, and the SLA threshold
+/// breach check. Extracted verbatim from `main()`; spawn order preserved
+/// (these three started after router assembly in the original body).
+fn spawn_late_background_tasks(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+    core: &CoreServices,
+    services: &PlatformServices,
+    tx_for_scheduler: broadcast::Sender<ExecutionEvent>,
+    bg_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let secrets_manager = core.secrets_manager.clone();
+    let registry = core.registry.clone();
+    let worker_manager = services.worker_manager.clone();
+    let module_execution_service = services.module_execution_service.clone();
+    let worker_shared_key = services.worker_shared_key.clone();
     // ---------- Start stale execution cleanup task ----------
     // Marks executions stuck in 'running' state beyond a configurable threshold
     // as 'failed'. Prevents ghost executions from accumulating indefinitely.
@@ -5003,7 +5588,21 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     tracing::info!("SLA threshold breach check task started (runs every 5 minutes)");
+}
 
+/// Bind the listener and serve with graceful shutdown (SIGTERM/SIGINT →
+/// DLQ flush → RPC-subscriber + background-sweep shutdown broadcasts).
+/// Extracted verbatim from `main()`.
+async fn serve(
+    app: Router,
+    limiters: &RateLimiters,
+    webhook_router: std::sync::Arc<WebhookRouter>,
+    rpc_shutdown_tx: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
+    bg_shutdown_tx: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
+) -> anyhow::Result<()> {
+    let api_rate_limit = limiters.api_rate_limit;
+    let webhook_rate_limit = limiters.webhook_rate_limit;
+    let global_rate_limit = limiters.global_rate_limit;
     let addr: std::net::SocketAddr = "0.0.0.0:8000"
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid listen address"))?;
@@ -5071,7 +5670,6 @@ async fn main() -> anyhow::Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("Failed to start Axum server: {}", e))?;
 
-    crate::trace::shutdown_tracing();
     Ok(())
 }
 
