@@ -1,0 +1,46 @@
+# Operations previously hand-maintained inside src/generated/graphql.ts.
+# They now live here as codegen source documents: `npm run codegen` regenerates
+# the typed react-query hooks + Document constants from these definitions.
+
+query MySchedules {
+  mySchedules {
+    id
+    workflowId
+    cronExpression
+    timezone
+    isEnabled
+    lastTriggeredAt
+    nextTriggerAt
+    createdAt
+    updatedAt
+  }
+}
+
+mutation CreateSchedule($workflowId: UUID!, $cronExpression: String!, $timezone: String) {
+  createSchedule(workflowId: $workflowId, cronExpression: $cronExpression, timezone: $timezone) {
+    id
+    workflowId
+    cronExpression
+    timezone
+    isEnabled
+    nextTriggerAt
+    createdAt
+    updatedAt
+  }
+}
+
+mutation UpdateSchedule($workflowId: UUID!, $cronExpression: String, $timezone: String, $isEnabled: Boolean) {
+  updateSchedule(workflowId: $workflowId, cronExpression: $cronExpression, timezone: $timezone, isEnabled: $isEnabled) {
+    id
+    workflowId
+    cronExpression
+    timezone
+    isEnabled
+    nextTriggerAt
+    updatedAt
+  }
+}
+
+mutation DeleteSchedule($workflowId: UUID!) {
+  deleteSchedule(workflowId: $workflowId)
+}

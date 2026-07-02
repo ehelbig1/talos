@@ -176,6 +176,8 @@ pub mod webhooks;
 pub mod workflows;
 
 #[cfg(test)]
+mod schema_parity_tests;
+#[cfg(test)]
 mod tests;
 
 // ============================================================================
@@ -1138,8 +1140,9 @@ async fn handle_tools_list(
     // from clients that only issue one tools/list request. Returning all tools at once
     // is both spec-compliant and universally compatible.
     //
-    // Size budget: 275 static tools × ~700 bytes ≈ 193 KB — well within limits for
-    // stdio, SSE, and Streamable HTTP transports.
+    // Size budget: ~320 static tools (`static_tool_count()` is the live number —
+    // a hardcoded count here drifted 275→320 undetected) × ~700 bytes ≈ 220 KB —
+    // well within limits for stdio, SSE, and Streamable HTTP transports.
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id: req.id,

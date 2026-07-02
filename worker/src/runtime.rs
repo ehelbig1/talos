@@ -935,7 +935,7 @@ fn describe_oversized_input(input: &JsonValue) -> String {
 /// Without this, `WASM_FUEL_LIMIT=-1` (parsed as i64) would slip
 /// through the `!= 0` check and produce destructive negative downstream
 /// arithmetic on the first caller that wires a signed type.
-pub(crate) fn nonzero_env_or_default<T>(var: &str, default: T) -> T
+pub fn nonzero_env_or_default<T>(var: &str, default: T) -> T
 where
     T: std::str::FromStr + std::fmt::Display + Default + PartialOrd + Copy,
 {

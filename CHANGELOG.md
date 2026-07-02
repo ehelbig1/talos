@@ -2,12 +2,42 @@
 
 All notable changes to the Talos platform are documented in this file.
 
-## [Unreleased] — 2026-05-05 → 2026-06-14
+## [Unreleased] — 2026-05-05 → 2026-07-01
 
 > Entries below dated after 2026-05-05 use **PR numbers** (the May→June work
 > landed as discrete PRs rather than the `rNNN` review-pass numbering of the
 > architectural-extraction sprint). The `rNNN` sections that follow are the
 > 2026-05-05 architectural-mandate batch, unchanged.
+
+### 2026-07-01 — codebase-review remediation batch
+
+Follow-ups from a five-subsystem architecture/security review:
+
+* **Fleet-wide job idempotency** — the worker's FU-2 result caches
+  (single-job + pipeline) now write through to Redis, closing the
+  queue-group gap where a controller transport-retry landing on a
+  *different* worker re-executed side effects. Redis-sourced entries are
+  HMAC-re-verified + job_id-matched before re-publish.
+* **GraphQL `triggerWorkflow` migrated onto `ExecutionOrchestrationService`**
+  — the ~690-line inline copy (6 bare-pool RLS opt-outs) deleted; terminal
+  `executionUpdates` event emission moved into the service, so
+  MCP-triggered executions now broadcast live events too.
+* **Publish gate** — `publish-images.sh` refuses dirty trees, requires a
+  green `quality.yml` run for HEAD (`quality.yml` gains a `push: main`
+  trigger), and signs by default (`--no-sign` to opt out).
+* **Memory-crypto fail-closed guard** — production refuses plaintext
+  `actor_memory` writes when no `MemoryCryptoHook` is registered.
+* **Worker signature-failure diagnostics gated** behind
+  `TALOS_SIGNATURE_DIAG=1` (was an unauthenticated sign-chosen-strings
+  oracle).
+* **MCP schema↔dispatch parity tests** — caught and fixed a duplicate
+  `disable_workflow`/`enable_workflow` advertisement (workflows.rs vs
+  advanced.rs) and a raw NUL byte in `workflows.rs` that made grep treat
+  the file as binary (blinding the structural lints to it).
+* **Lint self-consistency** — `lint-structural.sh --count`, meta-check 51
+  (numbering + documented-count sync; the count had drifted 49/43/40
+  across three sources), and check 50: a raw-sqlx ratchet for
+  `talos-api/src/schema` (baseline 117 → 108 after the trigger migration).
 
 ### Security — tenant isolation (RFC 0005 S3 / RFC 0006)
 

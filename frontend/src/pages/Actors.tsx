@@ -11,7 +11,7 @@ import {
   writeActorMemory,
   cloneActor,
   type ActorSummary,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
 import { cn } from "@/lib/utils";
 import { SkeletonCard } from "@/components/ui";
 import { ActorCard, CapabilityBadge } from "./actors/ActorCard";

@@ -19,6 +19,13 @@ name: Quality (heavy gates)
 on:
   pull_request:
     branches: [main]
+  # push:main exists for the publish gate (2026-07-01): publish-images.sh
+  # refuses to push an image unless `gh run list --commit HEAD` shows a
+  # green quality.yml run. PR runs attach to the PR *head* SHA, so a
+  # squash-merged commit on main would otherwise never have a run for its
+  # own SHA and the gate could never pass. Cost: one extra run per merge.
+  push:
+    branches: [main]
   schedule:
     - cron: "0 7 * * *" # nightly 07:00 UTC — catches new RUSTSEC advisories within 24h
   workflow_dispatch:

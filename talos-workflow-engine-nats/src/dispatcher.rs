@@ -51,8 +51,10 @@ static SUBJECT_PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
 /// steady state — noise that drowns real WARNs. Set `TALOS_SIGNATURE_DIAG=1`
 /// (or `true`) on the controller to re-enable it while investigating a
 /// worker-side "signature verification failed", then unset it. The worker's
-/// enriched failure `JobResult.output_payload` (worker/src/main.rs) carries
-/// the same fields unconditionally, so the primary diagnostic is unaffected.
+/// enriched failure `JobResult.output_payload` (worker/src/main.rs) is gated
+/// behind the SAME env var (2026-07-01 — the unconditional variant let an
+/// unauthenticated request get attacker-chosen fields signed by the worker
+/// key), so set it on BOTH sides while investigating.
 /// Read once at process start — changing the env var after boot has no effect.
 static SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     matches!(

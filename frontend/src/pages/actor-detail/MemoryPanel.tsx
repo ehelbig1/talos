@@ -22,7 +22,7 @@ import {
   writeActorMemory,
   deleteActorMemory,
   type ActorMemoryEntry,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
 import { SkeletonBlock } from "@/components/ui";
 
 // ── Memory type metadata ──────────────────────────────────────────────────────

@@ -31,7 +31,7 @@ import {
   useUpdateScheduleMutation,
   useDeleteScheduleMutation,
   useWorkflowsQuery,
-  WorkflowScheduleItem,
+  WorkflowScheduleObj,
 } from "@/generated/graphql";
 
 // ─── Cron examples ────────────────────────────────────────────────────────────
@@ -226,7 +226,7 @@ function AddScheduleDialog({
 // ─── Inline edit form ─────────────────────────────────────────────────────────
 
 interface EditFormProps {
-  schedule: WorkflowScheduleItem;
+  schedule: WorkflowScheduleObj;
   onDone: () => void;
 }
 
@@ -311,7 +311,7 @@ function EditForm({ schedule, onDone }: EditFormProps) {
 // ─── Schedule Card ────────────────────────────────────────────────────────────
 
 interface ScheduleCardProps {
-  schedule: WorkflowScheduleItem;
+  schedule: WorkflowScheduleObj;
   workflowName: string;
 }
 

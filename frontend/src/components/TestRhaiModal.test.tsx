@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { TestRhaiModal } from "./TestRhaiModal";
 
 // Mock testRhaiExpression
-vi.mock("@/lib/graphqlClient", () => ({
+vi.mock("@/lib/graphqlApi", () => ({
   testRhaiExpression: vi.fn(),
 }));
 
@@ -28,7 +28,7 @@ describe("TestRhaiModal", () => {
   });
 
   it("calls testRhaiExpression and shows result", async () => {
-    const { testRhaiExpression } = await import("@/lib/graphqlClient");
+    const { testRhaiExpression } = await import("@/lib/graphqlApi");
     vi.mocked(testRhaiExpression).mockResolvedValueOnce({
       success: true,
       output: "42",
@@ -53,7 +53,7 @@ describe("TestRhaiModal", () => {
   });
 
   it("shows error when test fails", async () => {
-    const { testRhaiExpression } = await import("@/lib/graphqlClient");
+    const { testRhaiExpression } = await import("@/lib/graphqlApi");
     vi.mocked(testRhaiExpression).mockResolvedValueOnce({
       success: false,
       error: "Syntax Error",

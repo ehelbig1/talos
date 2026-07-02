@@ -15,7 +15,7 @@ import { relativeTime } from "@/lib/formatTime";
 import { getCapabilityConfig } from "@/lib/capabilityConfig";
 import { statusColors } from "@/pages/actor-detail/shared";
 export { statusColors };
-import type { ActorSummary } from "@/lib/graphqlClient";
+import type { ActorSummary } from "@/lib/graphqlApi";
 
 // ── CapabilityBadge ───────────────────────────────────────────────────────────
 

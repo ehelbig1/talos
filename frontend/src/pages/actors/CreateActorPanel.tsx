@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { X, ChevronRight, Info, Zap, Shield, Gauge } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { StepIndicator } from "@/components/ui";
-import { getMyCapabilityCeiling } from "@/lib/graphqlClient";
+import { getMyCapabilityCeiling } from "@/lib/graphqlApi";
 import { getCapabilityConfig, CAPABILITY_LADDER } from "@/lib/capabilityConfig";
 import { CapabilityBadge } from "./ActorCard";
 

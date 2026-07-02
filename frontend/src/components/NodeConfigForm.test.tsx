@@ -1,10 +1,10 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NodeConfigForm } from "./NodeConfigForm";
-import { analyzeRhai } from "@/lib/graphqlClient";
+import { analyzeRhai } from "@/lib/graphqlApi";
 
 // Mock analyzeRhai
-vi.mock("@/lib/graphqlClient", () => ({
+vi.mock("@/lib/graphqlApi", () => ({
   analyzeRhai: vi.fn(),
 }));
 

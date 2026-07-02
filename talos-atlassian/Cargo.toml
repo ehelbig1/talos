@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 talos-http-utils = { path = "../talos-http-utils" }
 anyhow.workspace = true
+async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 chrono.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -23,6 +24,11 @@ talos-oauth = { path = "../talos-oauth" }
 tracing.workspace = true
 urlencoding = "2.1"
 uuid.workspace = true
+
+[dev-dependencies]
+# `#[tokio::test]` for the OAuth-callback ordering tests — sqlx's
+# `connect_lazy` requires a Tokio runtime even for never-connected pools.
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

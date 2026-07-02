@@ -1,0 +1,174 @@
+# Actor operations. Source documents for graphql-codegen — `npm run codegen`
+# regenerates the typed react-query hooks + Document constants from these.
+# Imperative (non-hook) call sites go through the thin typed wrappers in
+# src/lib/graphqlApi.ts, which reuse the generated Document constants.
+
+query ListActorSummaries {
+  actors {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    totalBudgetUsd
+    spentBudgetUsd
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+
+query GetActor($id: UUID!) {
+  actor(id: $id) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    totalBudgetUsd
+    spentBudgetUsd
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+    mcpToken
+    rateLimit
+    metadata
+    lastActiveAt
+  }
+}
+
+mutation CreateActor($input: CreateActorInput!) {
+  createActor(input: $input) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    totalBudgetUsd
+    spentBudgetUsd
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+
+mutation UpdateActorStatus($id: UUID!, $status: String!) {
+  updateActorStatus(id: $id, status: $status) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    totalBudgetUsd
+    spentBudgetUsd
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+
+mutation TerminateActor($id: UUID!, $cleanupWorkflows: Boolean) {
+  terminateActor(id: $id, cleanupWorkflows: $cleanupWorkflows)
+}
+
+query GetActorActionLog($actorId: UUID!, $limit: Int) {
+  actorActionLog(actorId: $actorId, limit: $limit) {
+    id
+    actionType
+    summary
+    timestamp
+    workflowId
+    executionId
+  }
+}
+
+query GetActorWorkflows($actorId: UUID!) {
+  actorWorkflows(actorId: $actorId) {
+    id
+    name
+    status
+    nodeCount
+    graphJson
+    createdAt
+    updatedAt
+  }
+}
+
+query GetActorExecutionsSummary($actorId: UUID!) {
+  actorExecutionsSummary(actorId: $actorId) {
+    totalExecutions
+    successfulExecutions
+    failedExecutions
+    activeExecutions
+  }
+}
+
+mutation UpdateActor(
+  $id: UUID!
+  $name: String
+  $description: String
+  $maxCapabilityWorld: String
+) {
+  updateActor(
+    id: $id
+    name: $name
+    description: $description
+    maxCapabilityWorld: $maxCapabilityWorld
+  ) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+
+mutation CloneActor($id: UUID!, $name: String) {
+  cloneActor(id: $id, name: $name) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+
+query GetActorMemories($actorId: UUID!, $memoryType: String) {
+  actorMemories(actorId: $actorId, memoryType: $memoryType) {
+    key
+    value
+    memoryType
+    expiresAt
+    updatedAt
+  }
+}
+
+mutation WriteActorMemory($input: WriteActorMemoryInput!) {
+  writeActorMemory(input: $input) {
+    key
+    value
+    memoryType
+    expiresAt
+    updatedAt
+  }
+}
+
+mutation DeleteActorMemory($actorId: UUID!, $key: String!) {
+  deleteActorMemory(actorId: $actorId, key: $key)
+}
+
+query GetMyCapabilityCeiling {
+  myCapabilityCeiling
+}

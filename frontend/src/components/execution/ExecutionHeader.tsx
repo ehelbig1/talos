@@ -2,7 +2,7 @@ import React from "react";
 import { Button, DarkSelect } from "@/components/ui";
 import { Play, RefreshCw, Bot, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { ActorSummary } from "@/lib/graphqlClient";
+import type { ActorSummary } from "@/lib/graphqlApi";
 
 interface Workflow {
   id: string;

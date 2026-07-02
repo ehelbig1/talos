@@ -1,0 +1,116 @@
+# Operations previously hand-maintained inside src/generated/graphql.ts.
+# They now live here as codegen source documents: `npm run codegen` regenerates
+# the typed react-query hooks + Document constants from these definitions.
+
+query GetAllWorkflowStats($days: Int) {
+  getAllWorkflowStats(days: $days) {
+    id
+    name
+    total
+    succeeded
+    failed
+    avgDurationSecs
+  }
+}
+
+query GetApprovals {
+  pendingApprovals {
+    id
+    workflowId
+    executionId
+    nodeId
+    requiredFor
+    status
+    requestedAt
+    decidedAt
+    decidedBy
+    reason
+  }
+}
+
+mutation ApproveExecution($id: UUID!, $reason: String) {
+  approveExecution(id: $id, reason: $reason)
+}
+
+mutation DenyExecution($id: UUID!, $reason: String) {
+  denyExecution(id: $id, reason: $reason)
+}
+
+query GetAuditSettings {
+  auditSettings {
+    streamingEnabled
+    otlpEndpoint
+    otlpProtocol
+    updatedAt
+    createdAt
+  }
+}
+
+mutation UpdateAuditSettings($enabled: Boolean!, $endpoint: String, $protocol: String!, $headers: String) {
+  updateAuditSettings(
+    streamingEnabled: $enabled
+    otlpEndpoint: $endpoint
+    otlpProtocol: $protocol
+    authHeaders: $headers
+  ) {
+    streamingEnabled
+    otlpEndpoint
+    otlpProtocol
+    updatedAt
+  }
+}
+
+query GetResourceQuotas {
+  resourceQuotas {
+    cpuCores
+    usedCpu
+    memoryGb
+    usedMemory
+    storageGb
+    usedStorage
+    concurrentExecutions
+    activeExecutions
+  }
+}
+
+mutation UpdateResourceQuotas($input: UpdateResourceQuotasInput!) {
+  updateResourceQuotas(input: $input) {
+    cpuCores
+    usedCpu
+    memoryGb
+    usedMemory
+    storageGb
+    usedStorage
+    concurrentExecutions
+    activeExecutions
+  }
+}
+
+mutation RotateDek {
+  rotateDek {
+    newDekId
+    message
+  }
+}
+
+mutation ReEncryptSecrets {
+  reEncryptSecrets {
+    reEncryptedCount
+    message
+  }
+}
+
+mutation RotateMasterKey($newMasterKey: String!) {
+  rotateMasterKey(newMasterKey: $newMasterKey) {
+    reEncryptedDekCount
+    message
+  }
+}
+
+mutation UpdateSecret($input: UpdateSecretInput!) {
+  updateSecret(input: $input) {
+    id
+    name
+    keyPath
+  }
+}

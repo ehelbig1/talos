@@ -704,10 +704,9 @@ pub async fn pubsub_push_handler(
         }
     };
 
-    // 5. Advance the cursor (dispatch TODO — follow-up commit).
-    //    The history.list call proves the OAuth token + Pub/Sub
-    //    subscription pipeline work end-to-end; the dispatch layer
-    //    will sit on top in a separate commit.
+    // 5. Advance the cursor and dispatch. (Stale-comment fix 2026-07-01:
+    //    an earlier revision deferred dispatch to a "follow-up commit" —
+    //    it landed; `dispatch_history_entries` below is that layer.)
     let svc = Arc::clone(&state.watch_service);
     let dispatch_ctx_opt = state.dispatch.clone();
     // DLP: don't carry the connected account's email (PII) into the WARN-level

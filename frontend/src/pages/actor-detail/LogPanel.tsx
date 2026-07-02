@@ -2,10 +2,7 @@ import React, { useState, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ClipboardList, Download, Filter, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
-import {
-  getActorActionLog,
-  type ActorActionLogEntry,
-} from "@/lib/graphqlClient";
+import { getActorActionLog, type ActorActionLogEntry } from "@/lib/graphqlApi";
 import { SkeletonTimeline } from "@/components/ui";
 import { LocalEmptyState, LogEntryRow, downloadLogCsv } from "./shared";
 

@@ -13,6 +13,19 @@
 //! lines. Zero behaviour change from the extraction — the public
 //! `spawn_*_subscriber` functions are the entry points and signatures
 //! are unchanged.
+//!
+//! 2026-07-01: the five copy-pasted subscriber loop skeletons were
+//! extracted into the generic [`kernel`] module. Each `spawn_*`
+//! function is now a thin wrapper: it builds a
+//! `kernel::RpcSubscriberSpec` (subject, concurrency cap, the exact
+//! pre-extraction log strings) and hands the kernel a per-message
+//! handler closure holding the protocol-specific parse → verify →
+//! nonce → permit → execute → reply → metric logic. Public signatures
+//! unchanged; subjects, caps, reply semantics, and log/metric shapes
+//! preserved byte-for-byte.
+
+mod kernel;
+use kernel::record_rpc_metric;
 
 use talos_actor_memory_service as actor_memory_service;
 
@@ -377,367 +390,53 @@ fn rpc_cte_name() -> &'static str {
     .as_str()
 }
 
-/// Emit a structured completion event for an RPC subscriber. Fields
-/// are tagged `target = "talos_rpc"` so ops can filter logs or
-/// aggregate them into Prometheus/OTel pipelines without each
-/// subscriber growing its own metrics code path.
-///
-/// `queue_ms` measures time from request receipt to semaphore
-/// permit acquisition; `exec_ms` measures permit-to-reply. Splitting
-/// these lets operators distinguish backpressure (queue rising) from
-/// downstream slowdowns (exec rising). For handlers that never
-/// acquire a permit (fast-path rejections like HMAC failure),
-/// `queue_ms == total` and `exec_ms == 0`.
-/// L-24: graceful-drain helper for subscriber loops.
-///
-/// Stops waiting once `in_flight` empties OR the deadline elapses,
-/// whichever comes first. On deadline-elapsed the remaining tasks are
-/// `abort_all()`d so a stuck request doesn't hang the controller's
-/// pod-termination grace window.
-///
-/// Pre-extraction this drain logic only existed in `spawn_memory_rpc_subscriber`;
-/// the other request/reply subscribers (graph, database,
-/// integration_state) dropped in-flight tasks on shutdown. A worker
-/// mid-query would see a NATS request timeout instead of a clean
-/// "subscriber shut down" reply. This helper is now invoked by every
-/// request/reply subscriber for a uniform shutdown experience.
-async fn graceful_drain(
-    mut in_flight: tokio::task::JoinSet<()>,
-    deadline_secs: u64,
-    subject: &'static str,
-) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
-    while !in_flight.is_empty() {
-        tokio::select! {
-            biased;
-            _ = in_flight.join_next() => {}
-            _ = tokio::time::sleep_until(deadline) => {
-                tracing::warn!(
-                    subject,
-                    remaining = in_flight.len(),
-                    deadline_secs,
-                    "RPC drain deadline reached — aborting remaining tasks"
-                );
-                in_flight.abort_all();
-                break;
-            }
-        }
-    }
-}
-
-fn record_rpc_metric(
-    subject: &'static str,
-    actor_id: uuid::Uuid,
-    outcome: &'static str, // "ok" | "not_found" | "unauthorized" | "invalid" | "internal" | "timeout" | …
-    queue_ms: u64,
-    exec_ms: u64,
-) {
-    // L-22: success outcomes are high-volume and routine; demote to
-    // debug! so production INFO logs aren't dominated by `rpc completed`
-    // baseline noise. Failure outcomes stay at warn!/info! so they
-    // remain visible without a level filter — failures are the
-    // operationally interesting class. Operators who want every-RPC
-    // tracing for capacity planning enable debug! for the talos_rpc
-    // target.
-    if outcome == "ok" {
-        tracing::debug!(
-            target: "talos_rpc",
-            subject,
-            actor_id = %actor_id,
-            outcome,
-            queue_ms,
-            exec_ms,
-            duration_ms = queue_ms + exec_ms,
-            "rpc completed"
-        );
-    } else {
-        tracing::warn!(
-            target: "talos_rpc",
-            subject,
-            actor_id = %actor_id,
-            outcome,
-            queue_ms,
-            exec_ms,
-            duration_ms = queue_ms + exec_ms,
-            "rpc completed (non-ok outcome)"
-        );
-    }
-}
+// `record_rpc_metric` (structured queue_ms/exec_ms completion events)
+// and `graceful_drain` (L-24) now live in `kernel` alongside the rest
+// of the shared loop skeleton.
 
 pub fn spawn_graph_rpc_subscriber(
     nats: std::sync::Arc<async_nats::Client>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use futures::StreamExt;
-    use std::sync::Arc;
     use talos_memory::graph_rpc::{
         GraphHit as RpcHit, GraphRpcError, GraphSearchReply, GraphSearchRequest,
         GraphSearchResponse, MAX_DEPTH, MAX_IN_FLIGHT, MAX_LIMIT, SUBJECT_GRAPH_SEARCH,
     };
-    tokio::spawn(async move {
-        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
-        tracing::info!(
-            subject = SUBJECT_GRAPH_SEARCH,
-            max_in_flight = MAX_IN_FLIGHT,
-            "Graph-RPC subscriber active"
-        );
-
-        let mut shutdown = shutdown;
-        let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        // MCP-1126 (2026-05-16): supervisor loop re-binds subscription
-        // on stream-end. Sibling sweep of MCP-1119/1120/1121/1122 to
-        // the controller-side signed-RPC subscribers — graph_rpc is
-        // the worker's only path to Neo4j graph-RAG, so if this
-        // subscriber dies on `sub.next() → None` (NATS reconnect
-        // window, server-side unsubscribe, transient async-nats
-        // subscription handoff) every worker graph-search call times
-        // out until the controller restarts. The `in_flight`
-        // JoinSet AND `sem` live OUTSIDE the supervisor loop so
-        // existing in-flight work survives a re-bind.
-        let mut backoff_secs: u64 = 1;
-        'supervisor: loop {
-            let mut sub = match nats.subscribe(SUBJECT_GRAPH_SEARCH).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        subject = SUBJECT_GRAPH_SEARCH,
-                        error = %e,
-                        backoff_secs,
-                        "Graph-RPC subscribe failed; retrying after backoff (worker graph-search calls time out in the meantime)"
-                    );
-                    // Respect shutdown signal DURING the backoff so a
-                    // controller stop doesn't have to wait the full
-                    // backoff window before draining.
-                    tokio::select! {
-                        _ = shutdown.changed() => break 'supervisor,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    }
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue 'supervisor;
-                }
+    // MCP-1126 (2026-05-16): supervisor loop re-binds subscription
+    // on stream-end (now provided by `kernel::spawn_rpc_subscriber`).
+    // Sibling sweep of MCP-1119/1120/1121/1122 to the controller-side
+    // signed-RPC subscribers — graph_rpc is the worker's only path to
+    // Neo4j graph-RAG, so if this subscriber dies on `sub.next() →
+    // None` (NATS reconnect window, server-side unsubscribe, transient
+    // async-nats subscription handoff) every worker graph-search call
+    // times out until the controller restarts. The `in_flight` JoinSet
+    // AND `sem` live OUTSIDE the supervisor loop so existing in-flight
+    // work survives a re-bind.
+    let spec = kernel::RpcSubscriberSpec {
+        subject: SUBJECT_GRAPH_SEARCH,
+        max_in_flight: MAX_IN_FLIGHT,
+        active_msg: "Graph-RPC subscriber active",
+        subscribe_failed_msg: "Graph-RPC subscribe failed; retrying after backoff (worker graph-search calls time out in the meantime)",
+        rebind_event_kind: "graph_rpc_subscriber_rebinding",
+        rebind_msg: "Graph-RPC subscriber stream ended; supervisor re-binding",
+    };
+    let handler_nats = nats.clone();
+    kernel::spawn_rpc_subscriber(nats, shutdown, spec, move |msg, sem| {
+        let nats_client = handler_nats.clone();
+        async move {
+            let start = std::time::Instant::now();
+            let reply_to = match msg.reply.clone() {
+                Some(r) => r,
+                None => return,
             };
-            backoff_secs = 1;
-            let mut shutdown_requested = false;
-            loop {
-                let msg = tokio::select! {
-                    biased;
-                    _ = shutdown.changed() => {
-                        tracing::info!("RPC subscriber shutting down");
-                        shutdown_requested = true;
-                        break;
-                    }
-                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                    maybe_msg = sub.next() => match maybe_msg {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                let nats_client = nats.clone();
-                let sem = sem.clone();
-                in_flight.spawn(async move {
-                    let start = std::time::Instant::now();
-                    let reply_to = match msg.reply.clone() {
-                        Some(r) => r,
-                        None => return,
-                    };
 
-                    let req: GraphSearchRequest = match serde_json::from_slice(&msg.payload) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let reply = GraphSearchReply {
-                                result: Err(GraphRpcError::InvalidInput(format!(
-                                    "malformed request: {e}"
-                                ))),
-                            };
-                            let _ = nats_client
-                                .publish(
-                                    reply_to,
-                                    serde_json::to_vec(&reply).unwrap_or_default().into(),
-                                )
-                                .await;
-                            record_rpc_metric(
-                                SUBJECT_GRAPH_SEARCH,
-                                uuid::Uuid::nil(),
-                                "invalid",
-                                start.elapsed().as_millis() as u64,
-                                0,
-                            );
-                            return;
-                        }
-                    };
-
-                    if !req.verify() {
-                        tracing::warn!(
-                            actor_id = %req.actor_id,
-                            "graph-search RPC: HMAC or freshness verification failed"
-                        );
-                        let reply = GraphSearchReply {
-                            result: Err(GraphRpcError::Unauthorized),
-                        };
-                        let _ = nats_client
-                            .publish(
-                                reply_to,
-                                serde_json::to_vec(&reply).unwrap_or_default().into(),
-                            )
-                            .await;
-                        record_rpc_metric(
-                            SUBJECT_GRAPH_SEARCH,
-                            req.actor_id,
-                            "unauthorized",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    if !talos_memory::rpc_auth::check_and_record_nonce(
-                        talos_memory::graph_rpc::SUBJECT_NAME,
-                        req.actor_id,
-                        &req.nonce,
-                    ) {
-                        tracing::warn!(
-                            actor_id = %req.actor_id,
-                            "graph-search RPC: nonce replay rejected"
-                        );
-                        let reply = GraphSearchReply {
-                            result: Err(GraphRpcError::Unauthorized),
-                        };
-                        let _ = nats_client
-                            .publish(
-                                reply_to,
-                                serde_json::to_vec(&reply).unwrap_or_default().into(),
-                            )
-                            .await;
-                        record_rpc_metric(
-                            SUBJECT_GRAPH_SEARCH,
-                            req.actor_id,
-                            "replay",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    let depth = req.max_depth.min(MAX_DEPTH);
-                    let limit = req.limit.clamp(1, MAX_LIMIT);
-                    if req.query.trim().is_empty() {
-                        let reply = GraphSearchReply {
-                            result: Err(GraphRpcError::InvalidInput(
-                                "query must be non-empty".to_string(),
-                            )),
-                        };
-                        let _ = nats_client
-                            .publish(
-                                reply_to,
-                                serde_json::to_vec(&reply).unwrap_or_default().into(),
-                            )
-                            .await;
-                        return;
-                    }
-
-                    let service = match actor_memory_service::GRAPH_SERVICE.get() {
-                        Some(s) => s,
-                        None => {
-                            let reply = GraphSearchReply {
-                                result: Err(GraphRpcError::NotAvailable),
-                            };
-                            let _ = nats_client
-                                .publish(
-                                    reply_to,
-                                    serde_json::to_vec(&reply).unwrap_or_default().into(),
-                                )
-                                .await;
-                            return;
-                        }
-                    };
-
-                    // Bound concurrent Neo4j queries. Dropping the permit on
-                    // either branch releases it.
-                    let _permit = sem.acquire_owned().await;
-                    let permit_at = std::time::Instant::now();
-
-                    let ctx_result = service
-                        .get_graph_context(req.actor_id, &req.query, depth as usize, limit as usize)
-                        .await;
-
-                    let reply = match ctx_result {
-                        Ok(json) => {
-                            let entity_count = json
-                                .get("entity_count")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
-                            let mut entities: Vec<RpcHit> = Vec::new();
-                            let mut edges: Vec<serde_json::Value> = Vec::new();
-                            if let Some(arr) = json.get("entities").and_then(|v| v.as_array()) {
-                                for ent in arr {
-                                    let label = ent
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let entity_type = ent
-                                        .get("type")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("Unknown")
-                                        .to_string();
-                                    let rels = ent
-                                        .get("relationships")
-                                        .and_then(|v| v.as_array())
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    for r in &rels {
-                                        if let Some(target) =
-                                            r.get("target").and_then(|v| v.as_str())
-                                        {
-                                            let edge_type = r
-                                                .get("type")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or_default();
-                                            edges.push(serde_json::json!({
-                                                "src": label,
-                                                "dst": target,
-                                                "type": edge_type,
-                                            }));
-                                        }
-                                    }
-                                    entities.push(RpcHit {
-                                        entity_type,
-                                        label,
-                                        distance: 0,
-                                        properties: serde_json::to_string(&rels)
-                                            .unwrap_or_else(|_| "[]".to_string()),
-                                    });
-                                }
-                            }
-                            GraphSearchReply {
-                                result: Ok(GraphSearchResponse {
-                                    entity_count,
-                                    entities,
-                                    relationships: serde_json::json!({ "edges": edges })
-                                        .to_string(),
-                                }),
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                actor_id = %req.actor_id,
-                                query = %req.query,
-                                error = %e,
-                                "graph-search RPC: service error"
-                            );
-                            GraphSearchReply {
-                                result: Err(GraphRpcError::Internal(e.to_string())),
-                            }
-                        }
-                    };
-
-                    let outcome = match &reply.result {
-                        Ok(_) => "ok",
-                        Err(GraphRpcError::Unauthorized) => "unauthorized",
-                        Err(GraphRpcError::InvalidInput(_)) => "invalid",
-                        Err(GraphRpcError::NotAvailable) => "not_available",
-                        Err(GraphRpcError::Timeout) => "timeout",
-                        Err(GraphRpcError::Internal(_)) => "internal",
+            let req: GraphSearchRequest = match serde_json::from_slice(&msg.payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    let reply = GraphSearchReply {
+                        result: Err(GraphRpcError::InvalidInput(format!(
+                            "malformed request: {e}"
+                        ))),
                     };
                     let _ = nats_client
                         .publish(
@@ -747,32 +446,215 @@ pub fn spawn_graph_rpc_subscriber(
                         .await;
                     record_rpc_metric(
                         SUBJECT_GRAPH_SEARCH,
-                        req.actor_id,
-                        outcome,
-                        permit_at.saturating_duration_since(start).as_millis() as u64,
-                        permit_at.elapsed().as_millis() as u64,
+                        uuid::Uuid::nil(),
+                        "invalid",
+                        start.elapsed().as_millis() as u64,
+                        0,
                     );
-                });
-            }
-            // Inner loop exited.
-            if shutdown_requested {
-                break 'supervisor;
-            }
-            // Stream ended (NATS reconnect / server-side unsub /
-            // async-nats subscription handoff); supervisor re-binds.
-            tracing::warn!(
-                target: "talos_rpc",
-                event_kind = "graph_rpc_subscriber_rebinding",
-                "Graph-RPC subscriber stream ended; supervisor re-binding"
-            );
-            tokio::select! {
-                _ = shutdown.changed() => break 'supervisor,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            }
-        } // end 'supervisor
+                    return;
+                }
+            };
 
-        // L-24: shared graceful-drain helper.
-        graceful_drain(in_flight, 10, SUBJECT_GRAPH_SEARCH).await;
+            if !req.verify() {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "graph-search RPC: HMAC or freshness verification failed"
+                );
+                let reply = GraphSearchReply {
+                    result: Err(GraphRpcError::Unauthorized),
+                };
+                let _ = nats_client
+                    .publish(
+                        reply_to,
+                        serde_json::to_vec(&reply).unwrap_or_default().into(),
+                    )
+                    .await;
+                record_rpc_metric(
+                    SUBJECT_GRAPH_SEARCH,
+                    req.actor_id,
+                    "unauthorized",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            if !talos_memory::rpc_auth::check_and_record_nonce(
+                talos_memory::graph_rpc::SUBJECT_NAME,
+                req.actor_id,
+                &req.nonce,
+            ) {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "graph-search RPC: nonce replay rejected"
+                );
+                let reply = GraphSearchReply {
+                    result: Err(GraphRpcError::Unauthorized),
+                };
+                let _ = nats_client
+                    .publish(
+                        reply_to,
+                        serde_json::to_vec(&reply).unwrap_or_default().into(),
+                    )
+                    .await;
+                record_rpc_metric(
+                    SUBJECT_GRAPH_SEARCH,
+                    req.actor_id,
+                    "replay",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            let depth = req.max_depth.min(MAX_DEPTH);
+            let limit = req.limit.clamp(1, MAX_LIMIT);
+            if req.query.trim().is_empty() {
+                let reply = GraphSearchReply {
+                    result: Err(GraphRpcError::InvalidInput(
+                        "query must be non-empty".to_string(),
+                    )),
+                };
+                let _ = nats_client
+                    .publish(
+                        reply_to,
+                        serde_json::to_vec(&reply).unwrap_or_default().into(),
+                    )
+                    .await;
+                return;
+            }
+
+            let service = match actor_memory_service::GRAPH_SERVICE.get() {
+                Some(s) => s,
+                None => {
+                    let reply = GraphSearchReply {
+                        result: Err(GraphRpcError::NotAvailable),
+                    };
+                    let _ = nats_client
+                        .publish(
+                            reply_to,
+                            serde_json::to_vec(&reply).unwrap_or_default().into(),
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            // Bound concurrent Neo4j queries. Dropping the permit on
+            // either branch releases it.
+            let _permit = sem.acquire_owned().await;
+            let permit_at = std::time::Instant::now();
+
+            // Zombie-permit guard (docs/platform-primitive-checklist.md
+            // §3): a stalled Neo4j must not hold this permit
+            // indefinitely. Elapsed maps to the protocol's existing
+            // `Timeout` variant / "timeout" outcome tag.
+            let ctx_result = kernel::guard_op(service.get_graph_context(
+                req.actor_id,
+                &req.query,
+                depth as usize,
+                limit as usize,
+            ))
+            .await;
+
+            let reply = match ctx_result {
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        timeout_secs = kernel::PERMIT_GUARD_TIMEOUT_SECS,
+                        "graph-search RPC: op exceeded permit-guard timeout — permit released"
+                    );
+                    GraphSearchReply {
+                        result: Err(GraphRpcError::Timeout),
+                    }
+                }
+                Ok(Ok(json)) => {
+                    let entity_count = json
+                        .get("entity_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let mut entities: Vec<RpcHit> = Vec::new();
+                    let mut edges: Vec<serde_json::Value> = Vec::new();
+                    if let Some(arr) = json.get("entities").and_then(|v| v.as_array()) {
+                        for ent in arr {
+                            let label = ent
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let entity_type = ent
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let rels = ent
+                                .get("relationships")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            for r in &rels {
+                                if let Some(target) = r.get("target").and_then(|v| v.as_str()) {
+                                    let edge_type =
+                                        r.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                                    edges.push(serde_json::json!({
+                                        "src": label,
+                                        "dst": target,
+                                        "type": edge_type,
+                                    }));
+                                }
+                            }
+                            entities.push(RpcHit {
+                                entity_type,
+                                label,
+                                distance: 0,
+                                properties: serde_json::to_string(&rels)
+                                    .unwrap_or_else(|_| "[]".to_string()),
+                            });
+                        }
+                    }
+                    GraphSearchReply {
+                        result: Ok(GraphSearchResponse {
+                            entity_count,
+                            entities,
+                            relationships: serde_json::json!({ "edges": edges }).to_string(),
+                        }),
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        query = %req.query,
+                        error = %e,
+                        "graph-search RPC: service error"
+                    );
+                    GraphSearchReply {
+                        result: Err(GraphRpcError::Internal(e.to_string())),
+                    }
+                }
+            };
+
+            let outcome = match &reply.result {
+                Ok(_) => "ok",
+                Err(GraphRpcError::Unauthorized) => "unauthorized",
+                Err(GraphRpcError::InvalidInput(_)) => "invalid",
+                Err(GraphRpcError::NotAvailable) => "not_available",
+                Err(GraphRpcError::Timeout) => "timeout",
+                Err(GraphRpcError::Internal(_)) => "internal",
+            };
+            let _ = nats_client
+                .publish(
+                    reply_to,
+                    serde_json::to_vec(&reply).unwrap_or_default().into(),
+                )
+                .await;
+            record_rpc_metric(
+                SUBJECT_GRAPH_SEARCH,
+                req.actor_id,
+                outcome,
+                permit_at.saturating_duration_since(start).as_millis() as u64,
+                permit_at.elapsed().as_millis() as u64,
+            );
+        }
     });
 }
 
@@ -781,408 +663,372 @@ pub fn spawn_memory_rpc_subscriber(
     pool: sqlx::PgPool,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use futures::StreamExt;
-    use std::sync::Arc;
     use talos_memory::memory_rpc::{
-        MemoryHit as RpcMemHit, MemoryOp, MemoryOpResult, MemoryRpcError, MemoryRpcReply,
-        MemoryRpcRequest, MAX_IN_FLIGHT, MAX_RESULT_LIMIT, SUBJECT_MEMORY_OP,
+        MemoryRpcError, MemoryRpcReply, MemoryRpcRequest, MAX_IN_FLIGHT, SUBJECT_MEMORY_OP,
     };
-    tokio::spawn(async move {
-        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
-        tracing::info!(
-            subject = SUBJECT_MEMORY_OP,
-            max_in_flight = MAX_IN_FLIGHT,
-            "Memory-RPC subscriber active"
-        );
-
-        let mut shutdown = shutdown;
-        let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        // MCP-1127 (2026-05-16): supervisor loop re-binds subscription
-        // on stream-end. Sibling sweep of MCP-1126 to the memory_rpc
-        // primitive — the worker's only path to actor_memory
-        // operations (Get/Set/Delete/ListKeys/Search). Per CLAUDE.md
-        // "Anything that needs to read or write actor_memory MUST go
-        // through talos_memory::* functions" → workers ALWAYS use
-        // this RPC for memory operations. Pre-fix `None => break` on
-        // stream-end (NATS reconnect window, server-side unsub,
-        // async-nats subscription handoff) → every worker memory
-        // operation timed out until controller restart. Same
-        // shape as MCP-1126: in_flight + sem outside supervisor for
-        // permit-leak-safe re-binds.
-        let mut backoff_secs: u64 = 1;
-        'supervisor: loop {
-            let mut sub = match nats.subscribe(SUBJECT_MEMORY_OP).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        subject = SUBJECT_MEMORY_OP,
-                        error = %e,
-                        backoff_secs,
-                        "Memory-RPC subscribe failed; retrying after backoff (worker agent_memory calls time out in the meantime)"
-                    );
-                    tokio::select! {
-                        _ = shutdown.changed() => break 'supervisor,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    }
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue 'supervisor;
-                }
+    // MCP-1127 (2026-05-16): supervisor loop re-binds subscription
+    // on stream-end (now provided by `kernel::spawn_rpc_subscriber`).
+    // Sibling sweep of MCP-1126 to the memory_rpc
+    // primitive — the worker's only path to actor_memory
+    // operations (Get/Set/Delete/ListKeys/Search). Per CLAUDE.md
+    // "Anything that needs to read or write actor_memory MUST go
+    // through talos_memory::* functions" → workers ALWAYS use
+    // this RPC for memory operations. Pre-fix `None => break` on
+    // stream-end (NATS reconnect window, server-side unsub,
+    // async-nats subscription handoff) → every worker memory
+    // operation timed out until controller restart. Same
+    // shape as MCP-1126: in_flight + sem outside supervisor for
+    // permit-leak-safe re-binds.
+    let spec = kernel::RpcSubscriberSpec {
+        subject: SUBJECT_MEMORY_OP,
+        max_in_flight: MAX_IN_FLIGHT,
+        active_msg: "Memory-RPC subscriber active",
+        subscribe_failed_msg: "Memory-RPC subscribe failed; retrying after backoff (worker agent_memory calls time out in the meantime)",
+        rebind_event_kind: "memory_rpc_subscriber_rebinding",
+        rebind_msg: "Memory-RPC subscriber stream ended; supervisor re-binding",
+    };
+    let handler_nats = nats.clone();
+    kernel::spawn_rpc_subscriber(nats, shutdown, spec, move |msg, sem| {
+        let nats_client = handler_nats.clone();
+        let pool = pool.clone();
+        async move {
+            let start = std::time::Instant::now();
+            let reply_to = match msg.reply.clone() {
+                Some(r) => r,
+                None => return,
             };
-            backoff_secs = 1;
-            let mut shutdown_requested = false;
-            loop {
-                let msg = tokio::select! {
-                    biased;
-                    _ = shutdown.changed() => {
-                        tracing::info!("RPC subscriber shutting down");
-                        shutdown_requested = true;
-                        break;
-                    }
-                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                    maybe_msg = sub.next() => match maybe_msg {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                let nats_client = nats.clone();
-                let sem = sem.clone();
-                let pool = pool.clone();
-                in_flight.spawn(async move {
-                    let start = std::time::Instant::now();
-                    let reply_to = match msg.reply.clone() {
-                        Some(r) => r,
-                        None => return,
-                    };
 
-                    let send_err = |err: MemoryRpcError| {
-                        let nats_client = nats_client.clone();
-                        let reply_to = reply_to.clone();
-                        async move {
-                            let reply = MemoryRpcReply { result: Err(err) };
-                            let _ = nats_client
-                                .publish(
-                                    reply_to,
-                                    serde_json::to_vec(&reply).unwrap_or_default().into(),
-                                )
-                                .await;
-                        }
-                    };
-
-                    let req: MemoryRpcRequest = match serde_json::from_slice(&msg.payload) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            send_err(MemoryRpcError::InvalidInput(format!(
-                                "malformed request: {e}"
-                            )))
-                            .await;
-                            record_rpc_metric(
-                                SUBJECT_MEMORY_OP,
-                                uuid::Uuid::nil(),
-                                "invalid",
-                                start.elapsed().as_millis() as u64,
-                                0,
-                            );
-                            return;
-                        }
-                    };
-
-                    if !req.verify() {
-                        tracing::warn!(
-                            actor_id = %req.actor_id,
-                            "memory RPC: HMAC or freshness verification failed"
-                        );
-                        send_err(MemoryRpcError::Unauthorized).await;
-                        record_rpc_metric(
-                            SUBJECT_MEMORY_OP,
-                            req.actor_id,
-                            "unauthorized",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    if !talos_memory::rpc_auth::check_and_record_nonce(
-                        talos_memory::memory_rpc::SUBJECT_NAME,
-                        req.actor_id,
-                        &req.nonce,
-                    ) {
-                        tracing::warn!(
-                            actor_id = %req.actor_id,
-                            "memory RPC: nonce replay rejected"
-                        );
-                        send_err(MemoryRpcError::Unauthorized).await;
-                        record_rpc_metric(
-                            SUBJECT_MEMORY_OP,
-                            req.actor_id,
-                            "replay",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    let _permit = sem.acquire_owned().await;
-                    let permit_at = std::time::Instant::now();
-
-                    let op_result = execute_memory_op(&pool, req.actor_id, req.op).await;
-
-                    let outcome_tag: &'static str = match &op_result {
-                        Ok(_) => "ok",
-                        // Distinct from "ok" so dashboards can alert on a
-                        // spike (replay lag, actor-id mismatch, cache wipe)
-                        // without being confused by normal traffic.
-                        Err(MemoryRpcError::KeyNotFound) => "not_found",
-                        Err(MemoryRpcError::Unauthorized) => "unauthorized",
-                        Err(MemoryRpcError::InvalidInput(_)) => "invalid",
-                        Err(MemoryRpcError::Timeout) => "timeout",
-                        Err(MemoryRpcError::StorageFull) => "storage_full",
-                        _ => "internal",
-                    };
-                    let reply = match op_result {
-                        Ok(r) => MemoryRpcReply { result: Ok(r) },
-                        Err(e) => {
-                            tracing::warn!(
-                                actor_id = %req.actor_id,
-                                error = ?e,
-                                "memory RPC: op failed"
-                            );
-                            MemoryRpcReply { result: Err(e) }
-                        }
-                    };
+            let send_err = |err: MemoryRpcError| {
+                let nats_client = nats_client.clone();
+                let reply_to = reply_to.clone();
+                async move {
+                    let reply = MemoryRpcReply { result: Err(err) };
                     let _ = nats_client
                         .publish(
                             reply_to,
                             serde_json::to_vec(&reply).unwrap_or_default().into(),
                         )
                         .await;
+                }
+            };
+
+            let req: MemoryRpcRequest = match serde_json::from_slice(&msg.payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    send_err(MemoryRpcError::InvalidInput(format!(
+                        "malformed request: {e}"
+                    )))
+                    .await;
                     record_rpc_metric(
                         SUBJECT_MEMORY_OP,
-                        req.actor_id,
-                        outcome_tag,
-                        permit_at.saturating_duration_since(start).as_millis() as u64,
-                        permit_at.elapsed().as_millis() as u64,
+                        uuid::Uuid::nil(),
+                        "invalid",
+                        start.elapsed().as_millis() as u64,
+                        0,
                     );
-                });
-            }
-            // Inner loop exited.
-            if shutdown_requested {
-                break 'supervisor;
-            }
-            // Stream ended (NATS reconnect / server-side unsub /
-            // async-nats subscription handoff); supervisor re-binds.
-            tracing::warn!(
-                target: "talos_rpc",
-                event_kind = "memory_rpc_subscriber_rebinding",
-                "Memory-RPC subscriber stream ended; supervisor re-binding"
-            );
-            tokio::select! {
-                _ = shutdown.changed() => break 'supervisor,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            }
-        } // end 'supervisor
+                    return;
+                }
+            };
 
-        async fn execute_memory_op(
-            pool: &sqlx::PgPool,
-            actor_id: uuid::Uuid,
-            op: MemoryOp,
-        ) -> Result<MemoryOpResult, MemoryRpcError> {
-            match op {
-                MemoryOp::Get { key } => {
-                    // MCP-836 (2026-05-14): canonical key validator at
-                    // the RPC trust boundary. Pre-fix `key.is_empty()`
-                    // let `Get("   ")` through; after MCP-834/835
-                    // trimmed every write path, the worker would
-                    // self-MISS its own data because reads weren't
-                    // trimmed (the MCP-388 trim-asymmetry class
-                    // applied to the worker entry point).
-                    let key = talos_memory::validate_memory_key(&key)
-                        .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
-                    match talos_memory::recall_exact(pool, actor_id, key).await {
-                        Ok(Some(row)) => Ok(MemoryOpResult::GetValue {
-                            value: serde_json::to_string(&row.value)
-                                .unwrap_or_else(|_| "null".into()),
-                        }),
-                        Ok(None) => Err(MemoryRpcError::KeyNotFound),
-                        Err(e) => Err(MemoryRpcError::Internal(e.to_string())),
+            if !req.verify() {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "memory RPC: HMAC or freshness verification failed"
+                );
+                send_err(MemoryRpcError::Unauthorized).await;
+                record_rpc_metric(
+                    SUBJECT_MEMORY_OP,
+                    req.actor_id,
+                    "unauthorized",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            if !talos_memory::rpc_auth::check_and_record_nonce(
+                talos_memory::memory_rpc::SUBJECT_NAME,
+                req.actor_id,
+                &req.nonce,
+            ) {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "memory RPC: nonce replay rejected"
+                );
+                send_err(MemoryRpcError::Unauthorized).await;
+                record_rpc_metric(
+                    SUBJECT_MEMORY_OP,
+                    req.actor_id,
+                    "replay",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            let _permit = sem.acquire_owned().await;
+            let permit_at = std::time::Instant::now();
+
+            // Zombie-permit guard (docs/platform-primitive-checklist.md
+            // §3): a stalled Postgres must not hold this permit
+            // indefinitely. Elapsed maps to the protocol's existing
+            // `Timeout` variant / "timeout" outcome tag.
+            let op_result =
+                match kernel::guard_op(execute_memory_op(&pool, req.actor_id, req.op)).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            actor_id = %req.actor_id,
+                            timeout_secs = kernel::PERMIT_GUARD_TIMEOUT_SECS,
+                            "memory RPC: op exceeded permit-guard timeout — permit released"
+                        );
+                        Err(MemoryRpcError::Timeout)
                     }
+                };
+
+            let outcome_tag: &'static str = match &op_result {
+                Ok(_) => "ok",
+                // Distinct from "ok" so dashboards can alert on a
+                // spike (replay lag, actor-id mismatch, cache wipe)
+                // without being confused by normal traffic.
+                Err(MemoryRpcError::KeyNotFound) => "not_found",
+                Err(MemoryRpcError::Unauthorized) => "unauthorized",
+                Err(MemoryRpcError::InvalidInput(_)) => "invalid",
+                Err(MemoryRpcError::Timeout) => "timeout",
+                Err(MemoryRpcError::StorageFull) => "storage_full",
+                _ => "internal",
+            };
+            let reply = match op_result {
+                Ok(r) => MemoryRpcReply { result: Ok(r) },
+                Err(e) => {
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        error = ?e,
+                        "memory RPC: op failed"
+                    );
+                    MemoryRpcReply { result: Err(e) }
                 }
-                MemoryOp::Set {
-                    key,
-                    value,
-                    memory_type,
-                    ttl_hours,
-                    metadata,
-                } => {
-                    // MCP-836 (2026-05-14): validate at RPC boundary
-                    // BEFORE persist. Pre-fix there was no validation
-                    // here at all — the service catches empty + length
-                    // but accepts whitespace-only and control-char/`\0`
-                    // keys. The post-fix error classifier below relied
-                    // on substring matching on the word "key" which
-                    // captured almost any error (over-broad InvalidInput
-                    // mapping) — the explicit validate-then-persist
-                    // shape produces typed `InvalidInput` for key
-                    // issues, leaving the substring matcher to only
-                    // distinguish memory_type and too-large.
-                    let key = talos_memory::validate_memory_key(&key)
-                        .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
-                    match talos_memory::persist_memory_with_metadata(
-                        pool,
-                        actor_id,
-                        key,
-                        &value,
-                        metadata.as_ref(),
-                        &memory_type,
-                        ttl_hours,
-                    )
-                    .await
-                    {
-                        Ok(_) => Ok(MemoryOpResult::Ok),
-                        Err(e) => {
-                            let s = e.to_string();
-                            if s.contains("too large") {
-                                Err(MemoryRpcError::StorageFull)
-                            } else if s.contains("invalid memory_type") {
-                                Err(MemoryRpcError::InvalidInput(s))
-                            } else {
-                                Err(MemoryRpcError::Internal(s))
-                            }
-                        }
+            };
+            let _ = nats_client
+                .publish(
+                    reply_to,
+                    serde_json::to_vec(&reply).unwrap_or_default().into(),
+                )
+                .await;
+            record_rpc_metric(
+                SUBJECT_MEMORY_OP,
+                req.actor_id,
+                outcome_tag,
+                permit_at.saturating_duration_since(start).as_millis() as u64,
+                permit_at.elapsed().as_millis() as u64,
+            );
+        }
+    });
+}
+
+/// Memory-RPC op dispatch — the per-protocol execute stage called by
+/// `spawn_memory_rpc_subscriber`'s handler while holding a permit.
+/// Was a nested fn inside the subscriber loop pre-kernel-extraction;
+/// body unchanged.
+async fn execute_memory_op(
+    pool: &sqlx::PgPool,
+    actor_id: uuid::Uuid,
+    op: talos_memory::memory_rpc::MemoryOp,
+) -> Result<talos_memory::memory_rpc::MemoryOpResult, talos_memory::memory_rpc::MemoryRpcError> {
+    use talos_memory::memory_rpc::{
+        MemoryHit as RpcMemHit, MemoryOp, MemoryOpResult, MemoryRpcError, MAX_RESULT_LIMIT,
+    };
+    match op {
+        MemoryOp::Get { key } => {
+            // MCP-836 (2026-05-14): canonical key validator at
+            // the RPC trust boundary. Pre-fix `key.is_empty()`
+            // let `Get("   ")` through; after MCP-834/835
+            // trimmed every write path, the worker would
+            // self-MISS its own data because reads weren't
+            // trimmed (the MCP-388 trim-asymmetry class
+            // applied to the worker entry point).
+            let key = talos_memory::validate_memory_key(&key)
+                .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
+            match talos_memory::recall_exact(pool, actor_id, key).await {
+                Ok(Some(row)) => Ok(MemoryOpResult::GetValue {
+                    value: serde_json::to_string(&row.value).unwrap_or_else(|_| "null".into()),
+                }),
+                Ok(None) => Err(MemoryRpcError::KeyNotFound),
+                Err(e) => Err(MemoryRpcError::Internal(e.to_string())),
+            }
+        }
+        MemoryOp::Set {
+            key,
+            value,
+            memory_type,
+            ttl_hours,
+            metadata,
+        } => {
+            // MCP-836 (2026-05-14): validate at RPC boundary
+            // BEFORE persist. Pre-fix there was no validation
+            // here at all — the service catches empty + length
+            // but accepts whitespace-only and control-char/`\0`
+            // keys. The post-fix error classifier below relied
+            // on substring matching on the word "key" which
+            // captured almost any error (over-broad InvalidInput
+            // mapping) — the explicit validate-then-persist
+            // shape produces typed `InvalidInput` for key
+            // issues, leaving the substring matcher to only
+            // distinguish memory_type and too-large.
+            let key = talos_memory::validate_memory_key(&key)
+                .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
+            match talos_memory::persist_memory_with_metadata(
+                pool,
+                actor_id,
+                key,
+                &value,
+                metadata.as_ref(),
+                &memory_type,
+                ttl_hours,
+            )
+            .await
+            {
+                Ok(_) => Ok(MemoryOpResult::Ok),
+                Err(e) => {
+                    let s = e.to_string();
+                    if s.contains("too large") {
+                        Err(MemoryRpcError::StorageFull)
+                    } else if s.contains("invalid memory_type") {
+                        Err(MemoryRpcError::InvalidInput(s))
+                    } else {
+                        Err(MemoryRpcError::Internal(s))
                     }
-                }
-                MemoryOp::Delete { key } => {
-                    // Hard delete — WIT `delete` guarantees removal, not
-                    // a tombstone. MCP's actor_forget (soft delete)
-                    // takes a different path.
-                    //
-                    // MCP-836 (2026-05-14): same trim-parity reasoning
-                    // as Get above — `Delete("  foo  ")` against a
-                    // trim-canonicalized key store would silently
-                    // no-op, indistinguishable from "key never existed."
-                    let key = talos_memory::validate_memory_key(&key)
-                        .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
-                    match talos_memory::forget_exact(pool, actor_id, key).await {
-                        Ok(_) => Ok(MemoryOpResult::Ok),
-                        Err(e) => Err(MemoryRpcError::Internal(e.to_string())),
-                    }
-                }
-                MemoryOp::ListKeys { prefix } => {
-                    // L-23: clamp via the same MAX_RESULT_LIMIT constant
-                    // that bounds Search. Pre-fix, ListKeys silently
-                    // inherited a 1000-row cap inside `talos_memory::list_keys`
-                    // that disagreed with the 200-row Search cap — operators
-                    // tuning result-size budgets had to remember the asymmetry.
-                    match talos_memory::list_keys_with_limit(
-                        pool,
-                        actor_id,
-                        prefix.as_deref(),
-                        MAX_RESULT_LIMIT as i64,
-                    )
-                    .await
-                    {
-                        Ok(keys) => Ok(MemoryOpResult::Keys { keys }),
-                        Err(e) => Err(MemoryRpcError::Internal(e.to_string())),
-                    }
-                }
-                MemoryOp::Search {
-                    query,
-                    limit,
-                    min_score,
-                    exclude_kinds,
-                } => {
-                    if query.trim().is_empty() {
-                        return Err(MemoryRpcError::InvalidInput("empty query".into()));
-                    }
-                    let limit = limit.clamp(1, MAX_RESULT_LIMIT) as i64;
-                    // MCP-1005 (2026-05-15): cap exclude_kinds at the
-                    // controller-side trust boundary. Pre-fix the only
-                    // bounds were the NATS payload limit (~1 MB) and the
-                    // worker's voluntary dedup. A malicious or buggy
-                    // worker could pack ~70 000 short strings into
-                    // exclude_kinds within the NATS payload cap; the
-                    // resulting SQL `WHERE metadata->>'kind' != ALL($N::text[])`
-                    // performs an O(M) array scan per row in
-                    // `recall_semantic_filtered`, multiplying out to
-                    // O(N rows × M kinds) per Search call. With N rows
-                    // = thousands per actor and M = tens of thousands,
-                    // a single Search call can lock up Postgres CPU
-                    // long enough to starve other queries.
-                    //
-                    // Intended use is exclude-synthetic-source-kinds:
-                    // typical caller passes 1-5 entries ("meeting_prep",
-                    // "recall", "daily_brief", "execution"). A cap of 64
-                    // entries × 64 chars/entry is comfortably above any
-                    // realistic ceiling AND bounds the per-row scan
-                    // cost. Same defense-in-depth shape as MCP-656
-                    // (metadata size cap) and MCP-432 (memory key
-                    // length cap). Sibling class to MCP-982 (unbounded
-                    // pagination loops) — every guest-controlled
-                    // collection at an RPC trust boundary needs an
-                    // explicit cap.
-                    // MCP-1026 (2026-05-15): same caps now live in
-                    // `memory_rpc::verify()` as module-level consts so
-                    // cross-process callers share one source of truth.
-                    // The local check stays for explicit
-                    // operator-readable error messages (verify() just
-                    // returns false; this branch surfaces the offending
-                    // field count back to the worker).
-                    use talos_memory::memory_rpc::{MAX_EXCLUDE_KINDS, MAX_EXCLUDE_KIND_LEN};
-                    if exclude_kinds.len() > MAX_EXCLUDE_KINDS {
-                        return Err(MemoryRpcError::InvalidInput(format!(
-                            "exclude_kinds too large ({} entries, max {})",
-                            exclude_kinds.len(),
-                            MAX_EXCLUDE_KINDS
-                        )));
-                    }
-                    if let Some(oversize) = exclude_kinds
-                        .iter()
-                        .find(|k| k.len() > MAX_EXCLUDE_KIND_LEN)
-                    {
-                        return Err(MemoryRpcError::InvalidInput(format!(
-                            "exclude_kinds entry too long ({} chars, max {})",
-                            oversize.len(),
-                            MAX_EXCLUDE_KIND_LEN
-                        )));
-                    }
-                    // exclude_kinds flows from the worker's `search_filtered`
-                    // host call through the signed canonical bytes; recall_semantic_filtered
-                    // excludes rows whose metadata.kind ∈ the list at the DB
-                    // layer so synthetic outputs never re-enter an LLM's
-                    // source list.
-                    let outcome = talos_memory::recall_semantic_filtered(
-                        pool,
-                        actor_id,
-                        &query,
-                        limit,
-                        min_score,
-                        None,
-                        talos_memory::SearchMethod::Direct,
-                        &exclude_kinds,
-                    )
-                    .await
-                    .map_err(|e| MemoryRpcError::Internal(e.to_string()))?;
-                    let method = outcome.method.to_string();
-                    let hits: Vec<RpcMemHit> = outcome
-                        .hits
-                        .into_iter()
-                        .map(|h| RpcMemHit {
-                            key: h.key,
-                            value: serde_json::to_string(&h.value).unwrap_or_default(),
-                            score: h.score as f32,
-                            metadata: h
-                                .metadata
-                                .as_ref()
-                                .map(|m| serde_json::to_string(m).unwrap_or_default()),
-                        })
-                        .collect();
-                    Ok(MemoryOpResult::SearchHits { hits, method })
                 }
             }
         }
-        // L-24: shared graceful-drain helper.
-        graceful_drain(in_flight, 10, SUBJECT_MEMORY_OP).await;
-    });
+        MemoryOp::Delete { key } => {
+            // Hard delete — WIT `delete` guarantees removal, not
+            // a tombstone. MCP's actor_forget (soft delete)
+            // takes a different path.
+            //
+            // MCP-836 (2026-05-14): same trim-parity reasoning
+            // as Get above — `Delete("  foo  ")` against a
+            // trim-canonicalized key store would silently
+            // no-op, indistinguishable from "key never existed."
+            let key = talos_memory::validate_memory_key(&key)
+                .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
+            match talos_memory::forget_exact(pool, actor_id, key).await {
+                Ok(_) => Ok(MemoryOpResult::Ok),
+                Err(e) => Err(MemoryRpcError::Internal(e.to_string())),
+            }
+        }
+        MemoryOp::ListKeys { prefix } => {
+            // L-23: clamp via the same MAX_RESULT_LIMIT constant
+            // that bounds Search. Pre-fix, ListKeys silently
+            // inherited a 1000-row cap inside `talos_memory::list_keys`
+            // that disagreed with the 200-row Search cap — operators
+            // tuning result-size budgets had to remember the asymmetry.
+            match talos_memory::list_keys_with_limit(
+                pool,
+                actor_id,
+                prefix.as_deref(),
+                MAX_RESULT_LIMIT as i64,
+            )
+            .await
+            {
+                Ok(keys) => Ok(MemoryOpResult::Keys { keys }),
+                Err(e) => Err(MemoryRpcError::Internal(e.to_string())),
+            }
+        }
+        MemoryOp::Search {
+            query,
+            limit,
+            min_score,
+            exclude_kinds,
+        } => {
+            if query.trim().is_empty() {
+                return Err(MemoryRpcError::InvalidInput("empty query".into()));
+            }
+            let limit = limit.clamp(1, MAX_RESULT_LIMIT) as i64;
+            // MCP-1005 (2026-05-15): cap exclude_kinds at the
+            // controller-side trust boundary. Pre-fix the only
+            // bounds were the NATS payload limit (~1 MB) and the
+            // worker's voluntary dedup. A malicious or buggy
+            // worker could pack ~70 000 short strings into
+            // exclude_kinds within the NATS payload cap; the
+            // resulting SQL `WHERE metadata->>'kind' != ALL($N::text[])`
+            // performs an O(M) array scan per row in
+            // `recall_semantic_filtered`, multiplying out to
+            // O(N rows × M kinds) per Search call. With N rows
+            // = thousands per actor and M = tens of thousands,
+            // a single Search call can lock up Postgres CPU
+            // long enough to starve other queries.
+            //
+            // Intended use is exclude-synthetic-source-kinds:
+            // typical caller passes 1-5 entries ("meeting_prep",
+            // "recall", "daily_brief", "execution"). A cap of 64
+            // entries × 64 chars/entry is comfortably above any
+            // realistic ceiling AND bounds the per-row scan
+            // cost. Same defense-in-depth shape as MCP-656
+            // (metadata size cap) and MCP-432 (memory key
+            // length cap). Sibling class to MCP-982 (unbounded
+            // pagination loops) — every guest-controlled
+            // collection at an RPC trust boundary needs an
+            // explicit cap.
+            // MCP-1026 (2026-05-15): same caps now live in
+            // `memory_rpc::verify()` as module-level consts so
+            // cross-process callers share one source of truth.
+            // The local check stays for explicit
+            // operator-readable error messages (verify() just
+            // returns false; this branch surfaces the offending
+            // field count back to the worker).
+            use talos_memory::memory_rpc::{MAX_EXCLUDE_KINDS, MAX_EXCLUDE_KIND_LEN};
+            if exclude_kinds.len() > MAX_EXCLUDE_KINDS {
+                return Err(MemoryRpcError::InvalidInput(format!(
+                    "exclude_kinds too large ({} entries, max {})",
+                    exclude_kinds.len(),
+                    MAX_EXCLUDE_KINDS
+                )));
+            }
+            if let Some(oversize) = exclude_kinds
+                .iter()
+                .find(|k| k.len() > MAX_EXCLUDE_KIND_LEN)
+            {
+                return Err(MemoryRpcError::InvalidInput(format!(
+                    "exclude_kinds entry too long ({} chars, max {})",
+                    oversize.len(),
+                    MAX_EXCLUDE_KIND_LEN
+                )));
+            }
+            // exclude_kinds flows from the worker's `search_filtered`
+            // host call through the signed canonical bytes; recall_semantic_filtered
+            // excludes rows whose metadata.kind ∈ the list at the DB
+            // layer so synthetic outputs never re-enter an LLM's
+            // source list.
+            let outcome = talos_memory::recall_semantic_filtered(
+                pool,
+                actor_id,
+                &query,
+                limit,
+                min_score,
+                None,
+                talos_memory::SearchMethod::Direct,
+                &exclude_kinds,
+            )
+            .await
+            .map_err(|e| MemoryRpcError::Internal(e.to_string()))?;
+            let method = outcome.method.to_string();
+            let hits: Vec<RpcMemHit> = outcome
+                .hits
+                .into_iter()
+                .map(|h| RpcMemHit {
+                    key: h.key,
+                    value: serde_json::to_string(&h.value).unwrap_or_default(),
+                    score: h.score as f32,
+                    metadata: h
+                        .metadata
+                        .as_ref()
+                        .map(|m| serde_json::to_string(m).unwrap_or_default()),
+                })
+                .collect();
+            Ok(MemoryOpResult::SearchHits { hits, method })
+        }
+    }
 }
 
 pub fn spawn_database_rpc_subscriber(
@@ -1190,8 +1036,6 @@ pub fn spawn_database_rpc_subscriber(
     pool: sqlx::PgPool,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use futures::StreamExt;
-    use std::sync::Arc;
     // Wasm-security review 2026-05-22 (MEDIUM-2): MAX_RESULT_* /
     // QUERY_TIMEOUT_SECS moved into `execute_guest_query`; only
     // the types still referenced in this fn remain (`DatabaseResult`
@@ -1201,468 +1045,420 @@ pub fn spawn_database_rpc_subscriber(
         DatabaseResult, DatabaseRpcError, DatabaseRpcReply, DatabaseRpcRequest, MAX_IN_FLIGHT,
         SUBJECT_DATABASE_QUERY,
     };
-    tokio::spawn(async move {
-        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
-        tracing::info!(
-            subject = SUBJECT_DATABASE_QUERY,
-            max_in_flight = MAX_IN_FLIGHT,
-            "Database-RPC subscriber active"
-        );
+    // MCP-1128 (2026-05-16): supervisor loop re-binds subscription
+    // on stream-end (now provided by `kernel::spawn_rpc_subscriber`).
+    // Sibling sweep of MCP-1126/1127 to the
+    // database_rpc primitive. Per CLAUDE.md the worker is
+    // credential-free; `wit_database::execute_query` is the only
+    // path for sandbox SQL. Pre-fix `None => break` on stream-end
+    // (NATS reconnect window, server-side unsub, async-nats
+    // subscription handoff) → every worker SQL query timed out
+    // until controller restart, taking down every workflow that
+    // uses the database WIT host fn.
+    let spec = kernel::RpcSubscriberSpec {
+        subject: SUBJECT_DATABASE_QUERY,
+        max_in_flight: MAX_IN_FLIGHT,
+        active_msg: "Database-RPC subscriber active",
+        subscribe_failed_msg: "Database-RPC subscribe failed; retrying after backoff (worker execute_query calls time out in the meantime)",
+        rebind_event_kind: "database_rpc_subscriber_rebinding",
+        rebind_msg: "Database-RPC subscriber stream ended; supervisor re-binding",
+    };
+    let handler_nats = nats.clone();
+    kernel::spawn_rpc_subscriber(nats, shutdown, spec, move |msg, sem| {
+        let nats_client = handler_nats.clone();
+        let pool = pool.clone();
+        async move {
+            let start = std::time::Instant::now();
+            let reply_to = match msg.reply.clone() {
+                Some(r) => r,
+                None => return,
+            };
 
-        let mut shutdown = shutdown;
-        let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        // MCP-1128 (2026-05-16): supervisor loop re-binds subscription
-        // on stream-end. Sibling sweep of MCP-1126/1127 to the
-        // database_rpc primitive. Per CLAUDE.md the worker is
-        // credential-free; `wit_database::execute_query` is the only
-        // path for sandbox SQL. Pre-fix `None => break` on stream-end
-        // (NATS reconnect window, server-side unsub, async-nats
-        // subscription handoff) → every worker SQL query timed out
-        // until controller restart, taking down every workflow that
-        // uses the database WIT host fn.
-        let mut backoff_secs: u64 = 1;
-        'supervisor: loop {
-            let mut sub = match nats.subscribe(SUBJECT_DATABASE_QUERY).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        subject = SUBJECT_DATABASE_QUERY,
-                        error = %e,
-                        backoff_secs,
-                        "Database-RPC subscribe failed; retrying after backoff (worker execute_query calls time out in the meantime)"
-                    );
-                    tokio::select! {
-                        _ = shutdown.changed() => break 'supervisor,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    }
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue 'supervisor;
+            let send = |result: Result<DatabaseResult, DatabaseRpcError>| {
+                let nats_client = nats_client.clone();
+                let reply_to = reply_to.clone();
+                async move {
+                    let reply = DatabaseRpcReply { result };
+                    let _ = nats_client
+                        .publish(
+                            reply_to,
+                            serde_json::to_vec(&reply).unwrap_or_default().into(),
+                        )
+                        .await;
                 }
             };
-            backoff_secs = 1;
-            let mut shutdown_requested = false;
-            loop {
-                let msg = tokio::select! {
-                    biased;
-                    _ = shutdown.changed() => {
-                        tracing::info!("RPC subscriber shutting down");
-                        shutdown_requested = true;
-                        break;
-                    }
-                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                    maybe_msg = sub.next() => match maybe_msg {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                let nats_client = nats.clone();
-                let sem = sem.clone();
-                let pool = pool.clone();
-                in_flight.spawn(async move {
-                let start = std::time::Instant::now();
-                let reply_to = match msg.reply.clone() {
-                    Some(r) => r,
-                    None => return,
-                };
 
-                let send = |result: Result<DatabaseResult, DatabaseRpcError>| {
-                    let nats_client = nats_client.clone();
-                    let reply_to = reply_to.clone();
-                    async move {
-                        let reply = DatabaseRpcReply { result };
-                        let _ = nats_client
-                            .publish(
-                                reply_to,
-                                serde_json::to_vec(&reply).unwrap_or_default().into(),
-                            )
-                            .await;
-                    }
-                };
-
-                let req: DatabaseRpcRequest = match serde_json::from_slice(&msg.payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        send(Err(DatabaseRpcError::InvalidQuery(format!(
-                            "malformed request: {e}"
-                        ))))
-                        .await;
-                        record_rpc_metric(
-                            SUBJECT_DATABASE_QUERY,
-                            uuid::Uuid::nil(),
-                            "invalid",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-                };
-
-                if !req.verify() {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        "database RPC: HMAC or freshness verification failed"
-                    );
-                    send(Err(DatabaseRpcError::Unauthorized)).await;
+            let req: DatabaseRpcRequest = match serde_json::from_slice(&msg.payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    send(Err(DatabaseRpcError::InvalidQuery(format!(
+                        "malformed request: {e}"
+                    ))))
+                    .await;
                     record_rpc_metric(
                         SUBJECT_DATABASE_QUERY,
-                        req.actor_id,
-                        "unauthorized",
+                        uuid::Uuid::nil(),
+                        "invalid",
                         start.elapsed().as_millis() as u64,
                         0,
                     );
                     return;
                 }
+            };
 
-                if !talos_memory::rpc_auth::check_and_record_nonce(
-                    talos_memory::database_rpc::SUBJECT_NAME,
-                    req.actor_id,
-                    &req.nonce,
-                ) {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        "database RPC: nonce replay rejected"
-                    );
-                    send(Err(DatabaseRpcError::Unauthorized)).await;
-                    record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
-                        req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
-
-                // M-7: controller-side AST re-parse as defense-in-depth.
-                //
-                // Worker-side `sqlparser` is the active validator, but
-                // the CTE wrap below string-interpolates `req.sql` —
-                // if a future sqlparser↔Postgres parse divergence is
-                // found, an attacker-controlled sandbox could craft
-                // SQL that sqlparser accepts as one statement but
-                // Postgres parses as multiple, escaping the wrap.
-                //
-                // We re-parse here with the same dialect + version the
-                // worker uses, requiring exactly one statement and
-                // rejecting anything sqlparser can't parse. Cost: ~50-200µs
-                // per query, well below the network + DB time. Closes
-                // the parser-divergence gap by requiring the SAME
-                // parser to accept the SQL on BOTH ends.
-                {
-                    use sqlparser::dialect::PostgreSqlDialect;
-                    use sqlparser::parser::Parser;
-                    let stmts = match Parser::parse_sql(&PostgreSqlDialect {}, &req.sql) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "talos_rpc",
-                                event_kind = "database_rpc_reparse_failed",
-                                actor_id = %req.actor_id,
-                                error = %e,
-                                "database RPC: controller-side sqlparser rejected query — \
-                                 possible worker bypass attempt or parser-divergence gap"
-                            );
-                            send(Err(DatabaseRpcError::InvalidQuery(
-                                "controller rejected SQL".to_string(),
-                            )))
-                            .await;
-                            record_rpc_metric(
-                                SUBJECT_DATABASE_QUERY,
-                                req.actor_id,
-                                "invalid",
-                                start.elapsed().as_millis() as u64,
-                                0,
-                            );
-                            return;
-                        }
-                    };
-                    if stmts.len() != 1 {
-                        tracing::warn!(
-                            target: "talos_rpc",
-                            event_kind = "database_rpc_multi_statement",
-                            actor_id = %req.actor_id,
-                            statement_count = stmts.len(),
-                            "database RPC: rejecting multi-statement query"
-                        );
-                        send(Err(DatabaseRpcError::InvalidQuery(
-                            "exactly one statement required".to_string(),
-                        )))
-                        .await;
-                        record_rpc_metric(
-                            SUBJECT_DATABASE_QUERY,
-                            req.actor_id,
-                            "invalid",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    // MCP-473: controller-side mirror of the worker's
-                    // `always_blocked_label` deny-list (MCP-472). The
-                    // worker is the primary defense, but if a future
-                    // worker upgrade has a divergence bug OR a worker
-                    // is compromised in a way that preserves signed
-                    // RPC framing, the controller still refuses the
-                    // high-risk statement types. ~10-50ns per query.
-                    // Cost is dwarfed by the network + DB time.
-                    //
-                    // Variant list kept in lockstep with
-                    // `worker::sql_validator::always_blocked_label`.
-                    // Deliberate duplication: if the two ever diverge
-                    // the divergence becomes a defense-in-depth gain,
-                    // not loss — the union catches both sides' new
-                    // additions until the lag is resolved.
-                    // MCP-540: sync to worker::sql_validator::always_blocked_label
-                    // verbatim. Pre-sync the controller had only the MCP-473
-                    // baseline + 8 Show variants; the worker had grown the
-                    // MCP-519 additions (LOAD / INSTALL / PRAGMA / LockTables /
-                    // Comment / Declare / etc.) + CopyIntoSnowflake + three
-                    // more Show variants without the controller catching up.
-                    // The "deliberate duplication" comment below explicitly
-                    // calls out that the union catches both sides' new
-                    // additions — but only while operators are willing to
-                    // resolve the lag. This commit closes the lag.
-                    use sqlparser::ast::Statement as S;
-                    let blocked_label: Option<&'static str> = match &stmts[0] {
-                        S::Copy { .. } | S::CopyIntoSnowflake { .. } => Some("COPY"),
-                        S::SetRole { .. } => Some("SET ROLE"),
-                        S::SetVariable { .. } => Some("SET"),
-                        S::SetTimeZone { .. } => Some("SET TIME ZONE"),
-                        S::SetNamesDefault { .. } | S::SetNames { .. } => Some("SET NAMES"),
-                        S::SetTransaction { .. } => Some("SET TRANSACTION"),
-                        S::ShowVariable { .. }
-                        | S::ShowStatus { .. }
-                        | S::ShowVariables { .. }
-                        | S::ShowCreate { .. }
-                        | S::ShowColumns { .. }
-                        | S::ShowTables { .. }
-                        | S::ShowDatabases { .. }
-                        | S::ShowSchemas { .. }
-                        | S::ShowViews { .. }
-                        | S::ShowCollation { .. }
-                        | S::ShowFunctions { .. } => Some("SHOW"),
-                        S::LISTEN { .. } => Some("LISTEN"),
-                        S::NOTIFY { .. } => Some("NOTIFY"),
-                        S::UNLISTEN { .. } => Some("UNLISTEN"),
-                        S::Prepare { .. } => Some("PREPARE"),
-                        S::Execute { .. } => Some("EXECUTE"),
-                        S::Deallocate { .. } => Some("DEALLOCATE"),
-                        S::StartTransaction { .. } => Some("START TRANSACTION"),
-                        S::Commit { .. } => Some("COMMIT"),
-                        S::Rollback { .. } => Some("ROLLBACK"),
-                        S::Savepoint { .. } => Some("SAVEPOINT"),
-                        S::ReleaseSavepoint { .. } => Some("RELEASE SAVEPOINT"),
-                        S::Discard { .. } => Some("DISCARD"),
-                        S::Use(_) => Some("USE"),
-                        // MCP-540: MCP-519 additions — each one parses with
-                        // PostgreSqlDialect (sqlparser shares the layer
-                        // across dialects) and carries real escalation /
-                        // sandbox-escape risk if it ever lands at the DB.
-                        // See `worker::sql_validator::always_blocked_label`
-                        // for per-statement rationale; the list is mirrored
-                        // here as the controller-side last line of defense.
-                        S::Load { .. } => Some("LOAD"),
-                        S::Install { .. } => Some("INSTALL"),
-                        S::Pragma { .. } => Some("PRAGMA"),
-                        S::LockTables { .. } => Some("LOCK TABLES"),
-                        S::UnlockTables => Some("UNLOCK TABLES"),
-                        S::Kill { .. } => Some("KILL"),
-                        S::Comment { .. } => Some("COMMENT"),
-                        S::Declare { .. } => Some("DECLARE"),
-                        S::Fetch { .. } => Some("FETCH"),
-                        S::Close { .. } => Some("CLOSE"),
-                        S::Flush { .. } => Some("FLUSH"),
-                        S::OptimizeTable { .. } => Some("OPTIMIZE TABLE"),
-                        S::Msck { .. } => Some("MSCK"),
-                        S::Cache { .. } => Some("CACHE"),
-                        S::UNCache { .. } => Some("UNCACHE"),
-                        S::Directory { .. } => Some("DIRECTORY"),
-                        S::Unload { .. } => Some("UNLOAD"),
-                        S::LoadData { .. } => Some("LOAD DATA"),
-                        S::Assert { .. } => Some("ASSERT"),
-                        _ => None,
-                    };
-                    if let Some(label) = blocked_label {
-                        tracing::warn!(
-                            target: "talos_rpc",
-                            event_kind = "database_rpc_always_blocked",
-                            actor_id = %req.actor_id,
-                            blocked_statement = label,
-                            "database RPC: rejecting unconditionally-blocked statement type \
-                             — possible worker bypass (worker should already have refused)"
-                        );
-                        send(Err(DatabaseRpcError::InvalidQuery(format!(
-                            "{} statements are not permitted",
-                            label
-                        ))))
-                        .await;
-                        record_rpc_metric(
-                            SUBJECT_DATABASE_QUERY,
-                            req.actor_id,
-                            "always_blocked",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    // Wasm-security review 2026-05-22 (MEDIUM-1):
-                    // controller-side mirror of the worker's
-                    // expression-level function deny-list.
-                    //
-                    // The deliberate-duplication pattern follows
-                    // MCP-473 (statement-level) above: the worker is
-                    // primary defense, but if a future divergence bug
-                    // lets a denied function reach here, the controller
-                    // re-rejects. Both sides import the canonical
-                    // deny-list from `talos_workflow_job_protocol::
-                    // DISALLOWED_SQL_FUNCTIONS` so list-drift is
-                    // architecturally impossible. The visitor wrapper
-                    // is duplicated (worker uses its own to wire into
-                    // `SqlValidationError::DisallowedFunction`, this
-                    // side just needs a yes/no), but the deny-list
-                    // itself is shared.
-                    //
-                    // Same cost profile as the worker walk: ~5-20 µs
-                    // for a typical query, well below the network +
-                    // DB time.
-                    if let Some(denied) = controller_side_denied_function(&stmts[0]) {
-                        tracing::warn!(
-                            target: "talos_rpc",
-                            event_kind = "database_rpc_disallowed_function",
-                            actor_id = %req.actor_id,
-                            denied_function = %denied,
-                            "database RPC: rejecting query referencing deny-listed function \
-                             — possible worker bypass (worker should already have refused)"
-                        );
-                        send(Err(DatabaseRpcError::InvalidQuery(format!(
-                            "SQL references function `{denied}` which is on the unconditional deny-list"
-                        ))))
-                        .await;
-                        record_rpc_metric(
-                            SUBJECT_DATABASE_QUERY,
-                            req.actor_id,
-                            "disallowed_function",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    // Fail-closed allow-list — the worker's posture, mirrored.
-                    // The blocked_label + function deny-lists above are DENY
-                    // lists: a DDL statement (DROP / ALTER … DISABLE ROW LEVEL
-                    // SECURITY / GRANT / REVOKE / TRUNCATE / CREATE), an
-                    // ATTACH/CALL, or ANY new sqlparser variant falls through
-                    // them as `None` and would reach `execute_guest_query` on
-                    // the controller's full-privilege pool. The worker's
-                    // `is_ddl` + fail-closed `UNKNOWN` gate is the only fence
-                    // today; a COMPROMISED worker (the entire reason this
-                    // handler re-validates) that skipped it could run arbitrary
-                    // DDL — DROP a table, disable RLS, GRANT privileges. Permit
-                    // ONLY the data statements a database node legitimately
-                    // issues; reject everything else.
-                    //
-                    // EXPLAIN is deliberately EXCLUDED (stricter than the
-                    // worker, which always permits it): `EXPLAIN ANALYZE <stmt>`
-                    // EXECUTES its inner statement (e.g. `EXPLAIN ANALYZE CREATE
-                    // TABLE … AS SELECT` runs the CTAS), so admitting Explain
-                    // here would reopen the DDL/mutation bypass this gate
-                    // closes. DML is admitted: the per-actor
-                    // `allowed_sql_operations` allowlist isn't on the RPC wire,
-                    // and the `talos_guest` role grant is its privilege fence.
-                    if !controller_permits_data_statement(&stmts[0]) {
-                        tracing::warn!(
-                            target: "talos_rpc",
-                            event_kind = "database_rpc_statement_not_permitted",
-                            actor_id = %req.actor_id,
-                            "database RPC: rejecting non-data statement (DDL / CALL / ATTACH / \
-                             EXPLAIN / unknown) — possible worker bypass (worker should already \
-                             have refused)"
-                        );
-                        send(Err(DatabaseRpcError::InvalidQuery(
-                            "only data statements (SELECT/INSERT/UPDATE/DELETE/MERGE) are permitted"
-                                .to_string(),
-                        )))
-                        .await;
-                        record_rpc_metric(
-                            SUBJECT_DATABASE_QUERY,
-                            req.actor_id,
-                            "statement_not_permitted",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-                }
-
-                let _permit = sem.acquire_owned().await;
-                let permit_at = std::time::Instant::now();
-
-                // Wasm-security review 2026-05-22 (MEDIUM-2): per-actor
-                // role wrap. When `TALOS_RPC_GUEST_ROLE` is set, every
-                // guest query runs inside a transaction with
-                // `SET LOCAL ROLE <role>`. This bounds the privileges
-                // available to guest SQL to whatever the operator has
-                // granted to that role — which by default is nothing
-                // (see `migrations/20260522120000_talos_guest_role.sql`).
-                // Unset = legacy behaviour (queries run as the app
-                // user); operators roll out per environment.
-                //
-                // The wrap is conditional on the env var, but the
-                // transaction-with-SET-LOCAL approach is also the
-                // canonical pattern for "per-query session state"
-                // even without a role — it ensures the connection
-                // returned to the pool is clean regardless of how the
-                // query exited (commit, rollback, panic).
-                let result = execute_guest_query(
-                    &pool,
-                    &req.sql,
-                    &req.params,
-                    req.is_fetch,
-                    guest_role_for_query(),
-                )
-                .await;
-
-                let outcome = match &result {
-                    Ok(_) => "ok",
-                    Err(DatabaseRpcError::Unauthorized) => "unauthorized",
-                    Err(DatabaseRpcError::InvalidQuery(_)) => "invalid",
-                    Err(DatabaseRpcError::ConnectionFailed(_)) => "connection_failed",
-                    Err(DatabaseRpcError::ResultTooLarge(_)) => "too_large",
-                    Err(DatabaseRpcError::Timeout) => "timeout",
-                    Err(DatabaseRpcError::QueryError(_)) => "query_error",
-                };
-                send(result).await;
+            if !req.verify() {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "database RPC: HMAC or freshness verification failed"
+                );
+                send(Err(DatabaseRpcError::Unauthorized)).await;
                 record_rpc_metric(
                     SUBJECT_DATABASE_QUERY,
                     req.actor_id,
-                    outcome,
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    permit_at.elapsed().as_millis() as u64,
+                    "unauthorized",
+                    start.elapsed().as_millis() as u64,
+                    0,
                 );
-            });
+                return;
             }
-            // Inner loop exited.
-            if shutdown_requested {
-                break 'supervisor;
-            }
-            // Stream ended (NATS reconnect / server-side unsub /
-            // async-nats subscription handoff); supervisor re-binds.
-            tracing::warn!(
-                target: "talos_rpc",
-                event_kind = "database_rpc_subscriber_rebinding",
-                "Database-RPC subscriber stream ended; supervisor re-binding"
-            );
-            tokio::select! {
-                _ = shutdown.changed() => break 'supervisor,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            }
-        } // end 'supervisor
 
-        // L-24: shared graceful-drain helper.
-        graceful_drain(in_flight, 10, SUBJECT_DATABASE_QUERY).await;
+            if !talos_memory::rpc_auth::check_and_record_nonce(
+                talos_memory::database_rpc::SUBJECT_NAME,
+                req.actor_id,
+                &req.nonce,
+            ) {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "database RPC: nonce replay rejected"
+                );
+                send(Err(DatabaseRpcError::Unauthorized)).await;
+                record_rpc_metric(
+                    SUBJECT_DATABASE_QUERY,
+                    req.actor_id,
+                    "replay",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            // M-7: controller-side AST re-parse as defense-in-depth.
+            //
+            // Worker-side `sqlparser` is the active validator, but
+            // the CTE wrap below string-interpolates `req.sql` —
+            // if a future sqlparser↔Postgres parse divergence is
+            // found, an attacker-controlled sandbox could craft
+            // SQL that sqlparser accepts as one statement but
+            // Postgres parses as multiple, escaping the wrap.
+            //
+            // We re-parse here with the same dialect + version the
+            // worker uses, requiring exactly one statement and
+            // rejecting anything sqlparser can't parse. Cost: ~50-200µs
+            // per query, well below the network + DB time. Closes
+            // the parser-divergence gap by requiring the SAME
+            // parser to accept the SQL on BOTH ends.
+            {
+                use sqlparser::dialect::PostgreSqlDialect;
+                use sqlparser::parser::Parser;
+                let stmts = match Parser::parse_sql(&PostgreSqlDialect {}, &req.sql) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "talos_rpc",
+                            event_kind = "database_rpc_reparse_failed",
+                            actor_id = %req.actor_id,
+                            error = %e,
+                            "database RPC: controller-side sqlparser rejected query — \
+                             possible worker bypass attempt or parser-divergence gap"
+                        );
+                        send(Err(DatabaseRpcError::InvalidQuery(
+                            "controller rejected SQL".to_string(),
+                        )))
+                        .await;
+                        record_rpc_metric(
+                            SUBJECT_DATABASE_QUERY,
+                            req.actor_id,
+                            "invalid",
+                            start.elapsed().as_millis() as u64,
+                            0,
+                        );
+                        return;
+                    }
+                };
+                if stmts.len() != 1 {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        event_kind = "database_rpc_multi_statement",
+                        actor_id = %req.actor_id,
+                        statement_count = stmts.len(),
+                        "database RPC: rejecting multi-statement query"
+                    );
+                    send(Err(DatabaseRpcError::InvalidQuery(
+                        "exactly one statement required".to_string(),
+                    )))
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_DATABASE_QUERY,
+                        req.actor_id,
+                        "invalid",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+
+                // MCP-473: controller-side mirror of the worker's
+                // `always_blocked_label` deny-list (MCP-472). The
+                // worker is the primary defense, but if a future
+                // worker upgrade has a divergence bug OR a worker
+                // is compromised in a way that preserves signed
+                // RPC framing, the controller still refuses the
+                // high-risk statement types. ~10-50ns per query.
+                // Cost is dwarfed by the network + DB time.
+                //
+                // Variant list kept in lockstep with
+                // `worker::sql_validator::always_blocked_label`.
+                // Deliberate duplication: if the two ever diverge
+                // the divergence becomes a defense-in-depth gain,
+                // not loss — the union catches both sides' new
+                // additions until the lag is resolved.
+                // MCP-540: sync to worker::sql_validator::always_blocked_label
+                // verbatim. Pre-sync the controller had only the MCP-473
+                // baseline + 8 Show variants; the worker had grown the
+                // MCP-519 additions (LOAD / INSTALL / PRAGMA / LockTables /
+                // Comment / Declare / etc.) + CopyIntoSnowflake + three
+                // more Show variants without the controller catching up.
+                // The "deliberate duplication" comment below explicitly
+                // calls out that the union catches both sides' new
+                // additions — but only while operators are willing to
+                // resolve the lag. This commit closes the lag.
+                use sqlparser::ast::Statement as S;
+                let blocked_label: Option<&'static str> = match &stmts[0] {
+                    S::Copy { .. } | S::CopyIntoSnowflake { .. } => Some("COPY"),
+                    S::SetRole { .. } => Some("SET ROLE"),
+                    S::SetVariable { .. } => Some("SET"),
+                    S::SetTimeZone { .. } => Some("SET TIME ZONE"),
+                    S::SetNamesDefault { .. } | S::SetNames { .. } => Some("SET NAMES"),
+                    S::SetTransaction { .. } => Some("SET TRANSACTION"),
+                    S::ShowVariable { .. }
+                    | S::ShowStatus { .. }
+                    | S::ShowVariables { .. }
+                    | S::ShowCreate { .. }
+                    | S::ShowColumns { .. }
+                    | S::ShowTables { .. }
+                    | S::ShowDatabases { .. }
+                    | S::ShowSchemas { .. }
+                    | S::ShowViews { .. }
+                    | S::ShowCollation { .. }
+                    | S::ShowFunctions { .. } => Some("SHOW"),
+                    S::LISTEN { .. } => Some("LISTEN"),
+                    S::NOTIFY { .. } => Some("NOTIFY"),
+                    S::UNLISTEN { .. } => Some("UNLISTEN"),
+                    S::Prepare { .. } => Some("PREPARE"),
+                    S::Execute { .. } => Some("EXECUTE"),
+                    S::Deallocate { .. } => Some("DEALLOCATE"),
+                    S::StartTransaction { .. } => Some("START TRANSACTION"),
+                    S::Commit { .. } => Some("COMMIT"),
+                    S::Rollback { .. } => Some("ROLLBACK"),
+                    S::Savepoint { .. } => Some("SAVEPOINT"),
+                    S::ReleaseSavepoint { .. } => Some("RELEASE SAVEPOINT"),
+                    S::Discard { .. } => Some("DISCARD"),
+                    S::Use(_) => Some("USE"),
+                    // MCP-540: MCP-519 additions — each one parses with
+                    // PostgreSqlDialect (sqlparser shares the layer
+                    // across dialects) and carries real escalation /
+                    // sandbox-escape risk if it ever lands at the DB.
+                    // See `worker::sql_validator::always_blocked_label`
+                    // for per-statement rationale; the list is mirrored
+                    // here as the controller-side last line of defense.
+                    S::Load { .. } => Some("LOAD"),
+                    S::Install { .. } => Some("INSTALL"),
+                    S::Pragma { .. } => Some("PRAGMA"),
+                    S::LockTables { .. } => Some("LOCK TABLES"),
+                    S::UnlockTables => Some("UNLOCK TABLES"),
+                    S::Kill { .. } => Some("KILL"),
+                    S::Comment { .. } => Some("COMMENT"),
+                    S::Declare { .. } => Some("DECLARE"),
+                    S::Fetch { .. } => Some("FETCH"),
+                    S::Close { .. } => Some("CLOSE"),
+                    S::Flush { .. } => Some("FLUSH"),
+                    S::OptimizeTable { .. } => Some("OPTIMIZE TABLE"),
+                    S::Msck { .. } => Some("MSCK"),
+                    S::Cache { .. } => Some("CACHE"),
+                    S::UNCache { .. } => Some("UNCACHE"),
+                    S::Directory { .. } => Some("DIRECTORY"),
+                    S::Unload { .. } => Some("UNLOAD"),
+                    S::LoadData { .. } => Some("LOAD DATA"),
+                    S::Assert { .. } => Some("ASSERT"),
+                    _ => None,
+                };
+                if let Some(label) = blocked_label {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        event_kind = "database_rpc_always_blocked",
+                        actor_id = %req.actor_id,
+                        blocked_statement = label,
+                        "database RPC: rejecting unconditionally-blocked statement type \
+                         — possible worker bypass (worker should already have refused)"
+                    );
+                    send(Err(DatabaseRpcError::InvalidQuery(format!(
+                        "{} statements are not permitted",
+                        label
+                    ))))
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_DATABASE_QUERY,
+                        req.actor_id,
+                        "always_blocked",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+
+                // Wasm-security review 2026-05-22 (MEDIUM-1):
+                // controller-side mirror of the worker's
+                // expression-level function deny-list.
+                //
+                // The deliberate-duplication pattern follows
+                // MCP-473 (statement-level) above: the worker is
+                // primary defense, but if a future divergence bug
+                // lets a denied function reach here, the controller
+                // re-rejects. Both sides import the canonical
+                // deny-list from `talos_workflow_job_protocol::
+                // DISALLOWED_SQL_FUNCTIONS` so list-drift is
+                // architecturally impossible. The visitor wrapper
+                // is duplicated (worker uses its own to wire into
+                // `SqlValidationError::DisallowedFunction`, this
+                // side just needs a yes/no), but the deny-list
+                // itself is shared.
+                //
+                // Same cost profile as the worker walk: ~5-20 µs
+                // for a typical query, well below the network +
+                // DB time.
+                if let Some(denied) = controller_side_denied_function(&stmts[0]) {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        event_kind = "database_rpc_disallowed_function",
+                        actor_id = %req.actor_id,
+                        denied_function = %denied,
+                        "database RPC: rejecting query referencing deny-listed function \
+                         — possible worker bypass (worker should already have refused)"
+                    );
+                    send(Err(DatabaseRpcError::InvalidQuery(format!(
+                            "SQL references function `{denied}` which is on the unconditional deny-list"
+                        ))))
+                        .await;
+                    record_rpc_metric(
+                        SUBJECT_DATABASE_QUERY,
+                        req.actor_id,
+                        "disallowed_function",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+
+                // Fail-closed allow-list — the worker's posture, mirrored.
+                // The blocked_label + function deny-lists above are DENY
+                // lists: a DDL statement (DROP / ALTER … DISABLE ROW LEVEL
+                // SECURITY / GRANT / REVOKE / TRUNCATE / CREATE), an
+                // ATTACH/CALL, or ANY new sqlparser variant falls through
+                // them as `None` and would reach `execute_guest_query` on
+                // the controller's full-privilege pool. The worker's
+                // `is_ddl` + fail-closed `UNKNOWN` gate is the only fence
+                // today; a COMPROMISED worker (the entire reason this
+                // handler re-validates) that skipped it could run arbitrary
+                // DDL — DROP a table, disable RLS, GRANT privileges. Permit
+                // ONLY the data statements a database node legitimately
+                // issues; reject everything else.
+                //
+                // EXPLAIN is deliberately EXCLUDED (stricter than the
+                // worker, which always permits it): `EXPLAIN ANALYZE <stmt>`
+                // EXECUTES its inner statement (e.g. `EXPLAIN ANALYZE CREATE
+                // TABLE … AS SELECT` runs the CTAS), so admitting Explain
+                // here would reopen the DDL/mutation bypass this gate
+                // closes. DML is admitted: the per-actor
+                // `allowed_sql_operations` allowlist isn't on the RPC wire,
+                // and the `talos_guest` role grant is its privilege fence.
+                if !controller_permits_data_statement(&stmts[0]) {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        event_kind = "database_rpc_statement_not_permitted",
+                        actor_id = %req.actor_id,
+                        "database RPC: rejecting non-data statement (DDL / CALL / ATTACH / \
+                         EXPLAIN / unknown) — possible worker bypass (worker should already \
+                         have refused)"
+                    );
+                    send(Err(DatabaseRpcError::InvalidQuery(
+                        "only data statements (SELECT/INSERT/UPDATE/DELETE/MERGE) are permitted"
+                            .to_string(),
+                    )))
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_DATABASE_QUERY,
+                        req.actor_id,
+                        "statement_not_permitted",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+            }
+
+            let _permit = sem.acquire_owned().await;
+            let permit_at = std::time::Instant::now();
+
+            // Zombie-permit guard: unlike the other subscribers this
+            // path does NOT wrap in `kernel::guard_op` —
+            // `execute_guest_query` already runs its entire
+            // transaction under `QUERY_TIMEOUT_SECS` (30 s), which
+            // bounds the permit-holding window; double-wrapping
+            // would just race two identical timers.
+
+            // Wasm-security review 2026-05-22 (MEDIUM-2): per-actor
+            // role wrap. When `TALOS_RPC_GUEST_ROLE` is set, every
+            // guest query runs inside a transaction with
+            // `SET LOCAL ROLE <role>`. This bounds the privileges
+            // available to guest SQL to whatever the operator has
+            // granted to that role — which by default is nothing
+            // (see `migrations/20260522120000_talos_guest_role.sql`).
+            // Unset = legacy behaviour (queries run as the app
+            // user); operators roll out per environment.
+            //
+            // The wrap is conditional on the env var, but the
+            // transaction-with-SET-LOCAL approach is also the
+            // canonical pattern for "per-query session state"
+            // even without a role — it ensures the connection
+            // returned to the pool is clean regardless of how the
+            // query exited (commit, rollback, panic).
+            let result = execute_guest_query(
+                &pool,
+                &req.sql,
+                &req.params,
+                req.is_fetch,
+                guest_role_for_query(),
+            )
+            .await;
+
+            let outcome = match &result {
+                Ok(_) => "ok",
+                Err(DatabaseRpcError::Unauthorized) => "unauthorized",
+                Err(DatabaseRpcError::InvalidQuery(_)) => "invalid",
+                Err(DatabaseRpcError::ConnectionFailed(_)) => "connection_failed",
+                Err(DatabaseRpcError::ResultTooLarge(_)) => "too_large",
+                Err(DatabaseRpcError::Timeout) => "timeout",
+                Err(DatabaseRpcError::QueryError(_)) => "query_error",
+            };
+            send(result).await;
+            record_rpc_metric(
+                SUBJECT_DATABASE_QUERY,
+                req.actor_id,
+                outcome,
+                permit_at.saturating_duration_since(start).as_millis() as u64,
+                permit_at.elapsed().as_millis() as u64,
+            );
+        }
     });
 }
 
@@ -1671,213 +1467,186 @@ pub fn spawn_state_write_subscriber(
     pool: sqlx::PgPool,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use futures::StreamExt;
-    use std::sync::Arc;
     use talos_memory::state_rpc::{StateWriteRequest, MAX_IN_FLIGHT, SUBJECT_STATE_WRITE};
-    tokio::spawn(async move {
-        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
-        tracing::info!(
-            subject = SUBJECT_STATE_WRITE,
-            max_in_flight = MAX_IN_FLIGHT,
-            "State-write subscriber active"
-        );
-
-        // Fire-and-forget: no reply subject, no response. We still
-        // verify the HMAC, rate-limit, and write to execution_state.
-        let mut shutdown = shutdown;
-        let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        // MCP-1129 (2026-05-16): supervisor loop re-binds subscription
-        // on stream-end. Sibling sweep of MCP-1126/1127/1128 to
-        // state_rpc — the worker's path for execution_state
-        // durability writes. Unlike the other RPCs this is fire-and-
-        // forget (no reply inbox), so a dead subscriber would NOT
-        // surface as a worker timeout — workers' state-writes simply
-        // vanish into NATS with no record on the controller side.
-        // execution_state is the durable record of which workflow
-        // execution wrote which key/value; silent loss == data loss
-        // visible only when an operator queries the table and finds
-        // gaps. Supervisor re-bind closes that silent-data-loss
-        // window on NATS reconnects / subscription handoff.
-        let mut backoff_secs: u64 = 1;
-        'supervisor: loop {
-            let mut sub = match nats.subscribe(SUBJECT_STATE_WRITE).await {
-                Ok(s) => s,
+    // Fire-and-forget: no reply subject, no response. We still
+    // verify the HMAC, rate-limit, and write to execution_state.
+    //
+    // MCP-1129 (2026-05-16): supervisor loop re-binds subscription
+    // on stream-end (now provided by `kernel::spawn_rpc_subscriber`).
+    // Sibling sweep of MCP-1126/1127/1128 to
+    // state_rpc — the worker's path for execution_state
+    // durability writes. Unlike the other RPCs this is fire-and-
+    // forget (no reply inbox), so a dead subscriber would NOT
+    // surface as a worker timeout — workers' state-writes simply
+    // vanish into NATS with no record on the controller side.
+    // execution_state is the durable record of which workflow
+    // execution wrote which key/value; silent loss == data loss
+    // visible only when an operator queries the table and finds
+    // gaps. Supervisor re-bind closes that silent-data-loss
+    // window on NATS reconnects / subscription handoff.
+    let spec = kernel::RpcSubscriberSpec {
+        subject: SUBJECT_STATE_WRITE,
+        max_in_flight: MAX_IN_FLIGHT,
+        active_msg: "State-write subscriber active",
+        subscribe_failed_msg: "State-write subscribe failed; retrying after backoff (execution_state durability disabled in the meantime)",
+        rebind_event_kind: "state_rpc_subscriber_rebinding",
+        rebind_msg: "State-write subscriber stream ended; supervisor re-binding",
+    };
+    // NB: `nats` is consumed by the kernel for the subscription only —
+    // this handler never publishes (fire-and-forget has no reply).
+    kernel::spawn_rpc_subscriber(nats, shutdown, spec, move |msg, sem| {
+        let pool = pool.clone();
+        async move {
+            let start = std::time::Instant::now();
+            let req: StateWriteRequest = match serde_json::from_slice(&msg.payload) {
+                Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(
-                        subject = SUBJECT_STATE_WRITE,
-                        error = %e,
-                        backoff_secs,
-                        "State-write subscribe failed; retrying after backoff (execution_state durability disabled in the meantime)"
+                    tracing::debug!(error = %e, "state-write: malformed payload dropped");
+                    record_rpc_metric(
+                        SUBJECT_STATE_WRITE,
+                        uuid::Uuid::nil(),
+                        "invalid",
+                        start.elapsed().as_millis() as u64,
+                        0,
                     );
-                    tokio::select! {
-                        _ = shutdown.changed() => break 'supervisor,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    }
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue 'supervisor;
+                    return;
                 }
             };
-            backoff_secs = 1;
-            let mut shutdown_requested = false;
-            loop {
-                let msg = tokio::select! {
-                    biased;
-                    _ = shutdown.changed() => {
-                        tracing::info!("RPC subscriber shutting down");
-                        shutdown_requested = true;
-                        break;
-                    }
-                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                    maybe_msg = sub.next() => match maybe_msg {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                let sem = sem.clone();
-                let pool = pool.clone();
-                in_flight.spawn(async move {
-                let start = std::time::Instant::now();
-                let req: StateWriteRequest = match serde_json::from_slice(&msg.payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "state-write: malformed payload dropped");
-                        record_rpc_metric(
-                            SUBJECT_STATE_WRITE,
-                            uuid::Uuid::nil(),
-                            "invalid",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-                };
-                if !req.verify() {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        execution_id = %req.execution_id,
-                        "state-write: HMAC or freshness verification failed — request dropped"
-                    );
-                    record_rpc_metric(
-                        SUBJECT_STATE_WRITE,
-                        req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
-
-                if !talos_memory::rpc_auth::check_and_record_nonce(
-                    talos_memory::state_rpc::SUBJECT_NAME,
+            if !req.verify() {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    execution_id = %req.execution_id,
+                    "state-write: HMAC or freshness verification failed — request dropped"
+                );
+                record_rpc_metric(
+                    SUBJECT_STATE_WRITE,
                     req.actor_id,
-                    &req.nonce,
-                ) {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        execution_id = %req.execution_id,
-                        "state-write: nonce replay rejected"
-                    );
-                    record_rpc_metric(
-                        SUBJECT_STATE_WRITE,
-                        req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
-                    );
-                    return;
-                }
+                    "unauthorized",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
 
-                let _permit = sem.acquire_owned().await;
-                let permit_at = std::time::Instant::now();
+            if !talos_memory::rpc_auth::check_and_record_nonce(
+                talos_memory::state_rpc::SUBJECT_NAME,
+                req.actor_id,
+                &req.nonce,
+            ) {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    execution_id = %req.execution_id,
+                    "state-write: nonce replay rejected"
+                );
+                record_rpc_metric(
+                    SUBJECT_STATE_WRITE,
+                    req.actor_id,
+                    "replay",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
 
-                // MCP-1006 (2026-05-15): controller-side key/value caps
-                // for defense in depth. Pre-fix the only size bounds
-                // were the worker-side check in
-                // `wit_state::Host::set` (key ≤ 1024 chars,
-                // value ≤ 1 MiB) and the NATS payload cap (~1 MiB).
-                // A compromised or buggy worker that bypasses its own
-                // checks could ship a fire-and-forget state_set RPC
-                // with arbitrarily-large key or near-1 MiB value
-                // — both signed correctly, both accepted by this
-                // handler, both persisted to `execution_state` until
-                // Postgres row-size or TOAST limits intervene. Without
-                // these caps, repeated large writes inflate the WAL,
-                // pin CPU on the autovacuum daemon, and grow
-                // `execution_state` storage with no bound from this
-                // side. Same sibling-defense class as MCP-1005
-                // (Memory Search exclude_kinds cap) — voluntary
-                // worker-side bounds are necessary but not sufficient.
-                // The integration_state_rpc subscriber already
-                // enforces `value ≤ 64 KiB`; this fix brings
-                // state_rpc into the same defense posture.
-                //
-                // Limits mirror the worker-side checks so legitimate
-                // traffic is unaffected:
-                //   key:    1-1024 chars (matches `wit_state::set`)
-                //   value:  ≤ 1 MiB     (matches `wit_state::set`)
-                // Violations log + drop without responding (this is a
-                // fire-and-forget subject — no reply channel) so a
-                // compromised worker doesn't get an oracle for size
-                // probing.
-                //
-                // MCP-1024 (2026-05-15): caps now also live in
-                // `state_rpc::verify()` (sibling pattern to
-                // integration_state_rpc) so cross-process callers
-                // share one well-formed definition. The subscriber
-                // keeps the explicit check for metric tagging and
-                // operator-readable log lines; verify() handles
-                // the structural rejection at sign-validation time.
-                // Imported constants instead of re-declared locals
-                // so the two stay in lockstep.
-                use talos_memory::state_rpc::{MAX_STATE_KEY_LEN, MAX_STATE_VALUE_BYTES};
-                if req.key.is_empty() || req.key.len() > MAX_STATE_KEY_LEN {
-                    tracing::warn!(
-                        target: "talos_rpc",
-                        actor_id = %req.actor_id,
-                        execution_id = %req.execution_id,
-                        key_len = req.key.len(),
-                        "state-write: rejecting oversized/empty key (possible worker bypass)"
-                    );
-                    record_rpc_metric(
-                        SUBJECT_STATE_WRITE,
-                        req.actor_id,
-                        "invalid",
-                        permit_at.saturating_duration_since(start).as_millis() as u64,
-                        permit_at.elapsed().as_millis() as u64,
-                    );
-                    return;
-                }
-                if !req.is_delete && req.value.len() > MAX_STATE_VALUE_BYTES {
-                    tracing::warn!(
-                        target: "talos_rpc",
-                        actor_id = %req.actor_id,
-                        execution_id = %req.execution_id,
-                        value_bytes = req.value.len(),
-                        "state-write: rejecting oversized value (possible worker bypass)"
-                    );
-                    record_rpc_metric(
-                        SUBJECT_STATE_WRITE,
-                        req.actor_id,
-                        "too_large",
-                        permit_at.saturating_duration_since(start).as_millis() as u64,
-                        permit_at.elapsed().as_millis() as u64,
-                    );
-                    return;
-                }
+            let _permit = sem.acquire_owned().await;
+            let permit_at = std::time::Instant::now();
 
-                // MCP-733 (2026-05-13): log SQL errors on the state-write
-                // path. Pre-fix the Err arms discarded the error entirely
-                // (`Err(_) => "query_error"`) — under a DB outage, every
-                // guest's `state_set` / `state_delete` silently lost
-                // persistence with zero operational signal. Guests treat
-                // state-write as fire-and-forget, so the user-facing
-                // contract permits silent loss, but the OPERATOR contract
-                // requires that errors be visible. Log at WARN so SIEM /
-                // dashboard alerting can fire on sustained query_error
-                // outcomes. Same operational-class fix as the canonical
-                // "fire-and-forget swallows errors" anti-pattern from
-                // `memory/patterns.md`.
-                let outcome: &'static str = if req.is_delete {
+            // MCP-1006 (2026-05-15): controller-side key/value caps
+            // for defense in depth. Pre-fix the only size bounds
+            // were the worker-side check in
+            // `wit_state::Host::set` (key ≤ 1024 chars,
+            // value ≤ 1 MiB) and the NATS payload cap (~1 MiB).
+            // A compromised or buggy worker that bypasses its own
+            // checks could ship a fire-and-forget state_set RPC
+            // with arbitrarily-large key or near-1 MiB value
+            // — both signed correctly, both accepted by this
+            // handler, both persisted to `execution_state` until
+            // Postgres row-size or TOAST limits intervene. Without
+            // these caps, repeated large writes inflate the WAL,
+            // pin CPU on the autovacuum daemon, and grow
+            // `execution_state` storage with no bound from this
+            // side. Same sibling-defense class as MCP-1005
+            // (Memory Search exclude_kinds cap) — voluntary
+            // worker-side bounds are necessary but not sufficient.
+            // The integration_state_rpc subscriber already
+            // enforces `value ≤ 64 KiB`; this fix brings
+            // state_rpc into the same defense posture.
+            //
+            // Limits mirror the worker-side checks so legitimate
+            // traffic is unaffected:
+            //   key:    1-1024 chars (matches `wit_state::set`)
+            //   value:  ≤ 1 MiB     (matches `wit_state::set`)
+            // Violations log + drop without responding (this is a
+            // fire-and-forget subject — no reply channel) so a
+            // compromised worker doesn't get an oracle for size
+            // probing.
+            //
+            // MCP-1024 (2026-05-15): caps now also live in
+            // `state_rpc::verify()` (sibling pattern to
+            // integration_state_rpc) so cross-process callers
+            // share one well-formed definition. The subscriber
+            // keeps the explicit check for metric tagging and
+            // operator-readable log lines; verify() handles
+            // the structural rejection at sign-validation time.
+            // Imported constants instead of re-declared locals
+            // so the two stay in lockstep.
+            use talos_memory::state_rpc::{MAX_STATE_KEY_LEN, MAX_STATE_VALUE_BYTES};
+            if req.key.is_empty() || req.key.len() > MAX_STATE_KEY_LEN {
+                tracing::warn!(
+                    target: "talos_rpc",
+                    actor_id = %req.actor_id,
+                    execution_id = %req.execution_id,
+                    key_len = req.key.len(),
+                    "state-write: rejecting oversized/empty key (possible worker bypass)"
+                );
+                record_rpc_metric(
+                    SUBJECT_STATE_WRITE,
+                    req.actor_id,
+                    "invalid",
+                    permit_at.saturating_duration_since(start).as_millis() as u64,
+                    permit_at.elapsed().as_millis() as u64,
+                );
+                return;
+            }
+            if !req.is_delete && req.value.len() > MAX_STATE_VALUE_BYTES {
+                tracing::warn!(
+                    target: "talos_rpc",
+                    actor_id = %req.actor_id,
+                    execution_id = %req.execution_id,
+                    value_bytes = req.value.len(),
+                    "state-write: rejecting oversized value (possible worker bypass)"
+                );
+                record_rpc_metric(
+                    SUBJECT_STATE_WRITE,
+                    req.actor_id,
+                    "too_large",
+                    permit_at.saturating_duration_since(start).as_millis() as u64,
+                    permit_at.elapsed().as_millis() as u64,
+                );
+                return;
+            }
+
+            // MCP-733 (2026-05-13): log SQL errors on the state-write
+            // path. Pre-fix the Err arms discarded the error entirely
+            // (`Err(_) => "query_error"`) — under a DB outage, every
+            // guest's `state_set` / `state_delete` silently lost
+            // persistence with zero operational signal. Guests treat
+            // state-write as fire-and-forget, so the user-facing
+            // contract permits silent loss, but the OPERATOR contract
+            // requires that errors be visible. Log at WARN so SIEM /
+            // dashboard alerting can fire on sustained query_error
+            // outcomes. Same operational-class fix as the canonical
+            // "fire-and-forget swallows errors" anti-pattern from
+            // `memory/patterns.md`.
+            // Zombie-permit guard (docs/platform-primitive-checklist.md
+            // §3): a stalled Postgres must not hold this permit
+            // indefinitely. Fire-and-forget → nothing to reply on
+            // timeout; the write is dropped (within the guest-facing
+            // silent-loss contract) and the drop is logged + tagged
+            // "timeout" so operators can alert on it, same as the
+            // MCP-733 query_error visibility rule.
+            let db_work = async {
+                if req.is_delete {
                     match sqlx::query(
                         "DELETE FROM execution_state WHERE execution_id = $1 AND key = $2",
                     )
@@ -1925,35 +1694,29 @@ pub fn spawn_state_write_subscriber(
                             "query_error"
                         }
                     }
-                };
-                record_rpc_metric(
-                    SUBJECT_STATE_WRITE,
-                    req.actor_id,
-                    outcome,
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    permit_at.elapsed().as_millis() as u64,
-                );
-            });
-            }
-            // Inner loop exited.
-            if shutdown_requested {
-                break 'supervisor;
-            }
-            // Stream ended (NATS reconnect / server-side unsub /
-            // async-nats subscription handoff); supervisor re-binds.
-            tracing::warn!(
-                target: "talos_rpc",
-                event_kind = "state_rpc_subscriber_rebinding",
-                "State-write subscriber stream ended; supervisor re-binding"
+                }
+            };
+            let outcome: &'static str = match kernel::guard_op(db_work).await {
+                Ok(tag) => tag,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        actor_id = %req.actor_id,
+                        execution_id = %req.execution_id,
+                        timeout_secs = kernel::PERMIT_GUARD_TIMEOUT_SECS,
+                        "state-write: DB op exceeded permit-guard timeout — write dropped (fire-and-forget), permit released"
+                    );
+                    "timeout"
+                }
+            };
+            record_rpc_metric(
+                SUBJECT_STATE_WRITE,
+                req.actor_id,
+                outcome,
+                permit_at.saturating_duration_since(start).as_millis() as u64,
+                permit_at.elapsed().as_millis() as u64,
             );
-            tokio::select! {
-                _ = shutdown.changed() => break 'supervisor,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            }
-        } // end 'supervisor
-
-        // L-24: shared graceful-drain helper.
-        graceful_drain(in_flight, 10, SUBJECT_STATE_WRITE).await;
+        }
     });
 }
 
@@ -1979,214 +1742,173 @@ pub fn spawn_integration_state_subscriber(
     pool: sqlx::PgPool,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use futures::StreamExt;
-    use std::sync::Arc;
     use talos_memory::integration_state_rpc::{
         IntegrationStateError, IntegrationStateReply, IntegrationStateRequest, MAX_IN_FLIGHT,
         SUBJECT_INTEGRATION_STATE_OP,
     };
-    tokio::spawn(async move {
-        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
-        tracing::info!(
-            subject = SUBJECT_INTEGRATION_STATE_OP,
-            max_in_flight = MAX_IN_FLIGHT,
-            "Integration-state subscriber active"
-        );
-
-        let mut shutdown = shutdown;
-        let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        // MCP-1130 (2026-05-16): supervisor loop re-binds subscription
-        // on stream-end. Completes the MCP-1126–1129 sweep across all
-        // 5 signed-RPC subscribers. integration_state_rpc is the
-        // generic primitive integrations use to persist their own
-        // scoped state (gcal sync token, gmail watch history-id,
-        // jira filter cursor, etc.) — a dead subscriber means
-        // workers' integration-state writes time out → integrations
-        // can't persist their sync progress → next poll re-fetches
-        // from the beginning of history (gcal/gmail) or fails
-        // outright (jira filter cursor lost). Re-bind closes that
-        // gap on NATS reconnects / subscription handoff.
-        let mut backoff_secs: u64 = 1;
-        'supervisor: loop {
-            let mut sub = match nats.subscribe(SUBJECT_INTEGRATION_STATE_OP).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        subject = SUBJECT_INTEGRATION_STATE_OP,
-                        error = %e,
-                        backoff_secs,
-                        "Integration-state subscribe failed; retrying after backoff (worker integration_state calls time out in the meantime)"
-                    );
-                    tokio::select! {
-                        _ = shutdown.changed() => break 'supervisor,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    }
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue 'supervisor;
-                }
+    // MCP-1130 (2026-05-16): supervisor loop re-binds subscription
+    // on stream-end (now provided by `kernel::spawn_rpc_subscriber`).
+    // Completes the MCP-1126–1129 sweep across all
+    // 5 signed-RPC subscribers. integration_state_rpc is the
+    // generic primitive integrations use to persist their own
+    // scoped state (gcal sync token, gmail watch history-id,
+    // jira filter cursor, etc.) — a dead subscriber means
+    // workers' integration-state writes time out → integrations
+    // can't persist their sync progress → next poll re-fetches
+    // from the beginning of history (gcal/gmail) or fails
+    // outright (jira filter cursor lost). Re-bind closes that
+    // gap on NATS reconnects / subscription handoff.
+    let spec = kernel::RpcSubscriberSpec {
+        subject: SUBJECT_INTEGRATION_STATE_OP,
+        max_in_flight: MAX_IN_FLIGHT,
+        active_msg: "Integration-state subscriber active",
+        subscribe_failed_msg: "Integration-state subscribe failed; retrying after backoff (worker integration_state calls time out in the meantime)",
+        rebind_event_kind: "integration_state_rpc_subscriber_rebinding",
+        rebind_msg: "Integration-state subscriber stream ended; supervisor re-binding",
+    };
+    let handler_nats = nats.clone();
+    kernel::spawn_rpc_subscriber(nats, shutdown, spec, move |msg, sem| {
+        let nats_client = handler_nats.clone();
+        let pool = pool.clone();
+        async move {
+            let start = std::time::Instant::now();
+            let reply_to = match msg.reply.clone() {
+                Some(r) => r,
+                None => return,
             };
-            backoff_secs = 1;
-            let mut shutdown_requested = false;
-            loop {
-                let msg = tokio::select! {
-                    biased;
-                    _ = shutdown.changed() => {
-                        tracing::info!("RPC subscriber shutting down");
-                        shutdown_requested = true;
-                        break;
-                    }
-                    Some(_) = in_flight.join_next(), if !in_flight.is_empty() => continue,
-                    maybe_msg = sub.next() => match maybe_msg {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                let nats_client = nats.clone();
-                let sem = sem.clone();
-                let pool = pool.clone();
-                in_flight.spawn(async move {
-                    let start = std::time::Instant::now();
-                    let reply_to = match msg.reply.clone() {
-                        Some(r) => r,
-                        None => return,
-                    };
 
-                    let send_err = |err: IntegrationStateError| {
-                        let nats_client = nats_client.clone();
-                        let reply_to = reply_to.clone();
-                        async move {
-                            let reply = IntegrationStateReply { result: Err(err) };
-                            let _ = nats_client
-                                .publish(
-                                    reply_to,
-                                    serde_json::to_vec(&reply).unwrap_or_default().into(),
-                                )
-                                .await;
-                        }
-                    };
-
-                    let req: IntegrationStateRequest = match serde_json::from_slice(&msg.payload) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            send_err(IntegrationStateError::InvalidInput(format!(
-                                "malformed request: {e}"
-                            )))
-                            .await;
-                            record_rpc_metric(
-                                SUBJECT_INTEGRATION_STATE_OP,
-                                uuid::Uuid::nil(),
-                                "invalid",
-                                start.elapsed().as_millis() as u64,
-                                0,
-                            );
-                            return;
-                        }
-                    };
-
-                    if !req.verify() {
-                        tracing::warn!(
-                            actor_id = %req.actor_id,
-                            integration = %req.integration_name,
-                            "integration-state RPC: HMAC or freshness verification failed"
-                        );
-                        send_err(IntegrationStateError::Unauthorized).await;
-                        record_rpc_metric(
-                            SUBJECT_INTEGRATION_STATE_OP,
-                            req.actor_id,
-                            "unauthorized",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    if !talos_memory::rpc_auth::check_and_record_nonce(
-                        talos_memory::integration_state_rpc::SUBJECT_NAME,
-                        req.actor_id,
-                        &req.nonce,
-                    ) {
-                        tracing::warn!(
-                            actor_id = %req.actor_id,
-                            integration = %req.integration_name,
-                            "integration-state RPC: nonce replay rejected"
-                        );
-                        send_err(IntegrationStateError::Unauthorized).await;
-                        record_rpc_metric(
-                            SUBJECT_INTEGRATION_STATE_OP,
-                            req.actor_id,
-                            "replay",
-                            start.elapsed().as_millis() as u64,
-                            0,
-                        );
-                        return;
-                    }
-
-                    let _permit = sem.acquire_owned().await;
-                    let permit_at = std::time::Instant::now();
-
-                    let op_result = talos_integration_state::execute_op(
-                        &pool,
-                        &req.integration_name,
-                        req.user_id,
-                        req.op,
-                    )
-                    .await;
-
-                    let outcome_tag: &'static str = match &op_result {
-                        Ok(_) => "ok",
-                        Err(IntegrationStateError::KeyNotFound) => "not_found",
-                        Err(IntegrationStateError::Unauthorized) => "unauthorized",
-                        Err(IntegrationStateError::InvalidInput(_)) => "invalid",
-                        Err(IntegrationStateError::Timeout) => "timeout",
-                        Err(IntegrationStateError::StorageFull) => "storage_full",
-                        _ => "internal",
-                    };
-                    let reply = match op_result {
-                        Ok(r) => IntegrationStateReply { result: Ok(r) },
-                        Err(e) => {
-                            tracing::warn!(
-                                actor_id = %req.actor_id,
-                                integration = %req.integration_name,
-                                error = ?e,
-                                "integration-state RPC: op failed"
-                            );
-                            IntegrationStateReply { result: Err(e) }
-                        }
-                    };
+            let send_err = |err: IntegrationStateError| {
+                let nats_client = nats_client.clone();
+                let reply_to = reply_to.clone();
+                async move {
+                    let reply = IntegrationStateReply { result: Err(err) };
                     let _ = nats_client
                         .publish(
                             reply_to,
                             serde_json::to_vec(&reply).unwrap_or_default().into(),
                         )
                         .await;
+                }
+            };
+
+            let req: IntegrationStateRequest = match serde_json::from_slice(&msg.payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    send_err(IntegrationStateError::InvalidInput(format!(
+                        "malformed request: {e}"
+                    )))
+                    .await;
                     record_rpc_metric(
                         SUBJECT_INTEGRATION_STATE_OP,
-                        req.actor_id,
-                        outcome_tag,
-                        permit_at.saturating_duration_since(start).as_millis() as u64,
-                        permit_at.elapsed().as_millis() as u64,
+                        uuid::Uuid::nil(),
+                        "invalid",
+                        start.elapsed().as_millis() as u64,
+                        0,
                     );
-                });
-            }
-            // Inner loop exited.
-            if shutdown_requested {
-                break 'supervisor;
-            }
-            // Stream ended (NATS reconnect / server-side unsub /
-            // async-nats subscription handoff); supervisor re-binds.
-            tracing::warn!(
-                target: "talos_rpc",
-                event_kind = "integration_state_rpc_subscriber_rebinding",
-                "Integration-state subscriber stream ended; supervisor re-binding"
-            );
-            tokio::select! {
-                _ = shutdown.changed() => break 'supervisor,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            }
-        } // end 'supervisor
+                    return;
+                }
+            };
 
-        // L-24: shared graceful-drain helper.
-        graceful_drain(in_flight, 10, SUBJECT_INTEGRATION_STATE_OP).await;
+            if !req.verify() {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    integration = %req.integration_name,
+                    "integration-state RPC: HMAC or freshness verification failed"
+                );
+                send_err(IntegrationStateError::Unauthorized).await;
+                record_rpc_metric(
+                    SUBJECT_INTEGRATION_STATE_OP,
+                    req.actor_id,
+                    "unauthorized",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            if !talos_memory::rpc_auth::check_and_record_nonce(
+                talos_memory::integration_state_rpc::SUBJECT_NAME,
+                req.actor_id,
+                &req.nonce,
+            ) {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    integration = %req.integration_name,
+                    "integration-state RPC: nonce replay rejected"
+                );
+                send_err(IntegrationStateError::Unauthorized).await;
+                record_rpc_metric(
+                    SUBJECT_INTEGRATION_STATE_OP,
+                    req.actor_id,
+                    "replay",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            let _permit = sem.acquire_owned().await;
+            let permit_at = std::time::Instant::now();
+
+            // Zombie-permit guard (docs/platform-primitive-checklist.md
+            // §3): a stalled Postgres must not hold this permit
+            // indefinitely. Elapsed maps to the protocol's existing
+            // `Timeout` variant / "timeout" outcome tag.
+            let op_result = match kernel::guard_op(talos_integration_state::execute_op(
+                &pool,
+                &req.integration_name,
+                req.user_id,
+                req.op,
+            ))
+            .await
+            {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        integration = %req.integration_name,
+                        timeout_secs = kernel::PERMIT_GUARD_TIMEOUT_SECS,
+                        "integration-state RPC: op exceeded permit-guard timeout — permit released"
+                    );
+                    Err(IntegrationStateError::Timeout)
+                }
+            };
+
+            let outcome_tag: &'static str = match &op_result {
+                Ok(_) => "ok",
+                Err(IntegrationStateError::KeyNotFound) => "not_found",
+                Err(IntegrationStateError::Unauthorized) => "unauthorized",
+                Err(IntegrationStateError::InvalidInput(_)) => "invalid",
+                Err(IntegrationStateError::Timeout) => "timeout",
+                Err(IntegrationStateError::StorageFull) => "storage_full",
+                _ => "internal",
+            };
+            let reply = match op_result {
+                Ok(r) => IntegrationStateReply { result: Ok(r) },
+                Err(e) => {
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        integration = %req.integration_name,
+                        error = ?e,
+                        "integration-state RPC: op failed"
+                    );
+                    IntegrationStateReply { result: Err(e) }
+                }
+            };
+            let _ = nats_client
+                .publish(
+                    reply_to,
+                    serde_json::to_vec(&reply).unwrap_or_default().into(),
+                )
+                .await;
+            record_rpc_metric(
+                SUBJECT_INTEGRATION_STATE_OP,
+                req.actor_id,
+                outcome_tag,
+                permit_at.saturating_duration_since(start).as_millis() as u64,
+                permit_at.elapsed().as_millis() as u64,
+            );
+        }
     });
 }
 

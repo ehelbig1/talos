@@ -66,6 +66,33 @@ pub struct AccessibleResource {
     pub scopes: Vec<String>,
 }
 
+/// Scopes requested at authorize time (the `scope` param on the Atlassian
+/// authorize URL). Single source of truth — `requested_scope_fallback()`
+/// derives the space-joined string persisted when Atlassian omits the
+/// granted `scope` field from a token/refresh response.
+const REQUESTED_SCOPES: &[&str] = &[
+    // Classic scopes
+    "read:jira-work",
+    "write:jira-work",
+    "read:jira-user",
+    "offline_access",
+    // Granular scopes — read
+    "read:issue:jira",
+    "read:issue-details:jira",
+    "read:project:jira",
+    "read:jql:jira",
+    "read:user:jira",
+    // Granular scopes — write (comments, transitions)
+    "write:comment:jira",
+    "write:issue:jira",
+];
+
+/// The full originally-requested scope set, space-joined — the fallback
+/// persisted when Atlassian omits `scope` (see call sites for rationale).
+pub(crate) fn requested_scope_fallback() -> String {
+    REQUESTED_SCOPES.join(" ")
+}
+
 // ── Service ──────────────────────────────────────────────────────────────
 
 pub struct AtlassianIntegrationService {
@@ -110,41 +137,10 @@ impl AtlassianIntegrationService {
     /// user without requiring session auth (cross-site redirects from OAuth
     /// providers may not carry session cookies).
     pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
-        if !self.is_configured() {
-            return Err(anyhow!(
-                "Atlassian OAuth is not configured. Set ATLASSIAN_CLIENT_ID, \
-                 ATLASSIAN_CLIENT_SECRET, and ATLASSIAN_REDIRECT_URI."
-            ));
-        }
-
-        // Authorize URL + PKCE + CSRF state token (bound to user_id) via the
-        // shared flow helper — the CSRF/PKCE/tenancy handling lives in one place.
-        let req = talos_oauth::AuthorizeRequest {
-            provider: "atlassian",
-            auth_url: "https://auth.atlassian.com/authorize",
-            token_url: "https://auth.atlassian.com/oauth/token",
-            client_id: self.client_id.clone().unwrap(),
-            client_secret: self.client_secret.clone().unwrap(),
-            redirect_uri: self.redirect_uri.clone().unwrap(),
-            scopes: &[
-                // Classic scopes
-                "read:jira-work",
-                "write:jira-work",
-                "read:jira-user",
-                "offline_access",
-                // Granular scopes — read
-                "read:issue:jira",
-                "read:issue-details:jira",
-                "read:project:jira",
-                "read:jql:jira",
-                "read:user:jira",
-                // Granular scopes — write (comments, transitions)
-                "write:comment:jira",
-                "write:issue:jira",
-            ],
-            extra_params: &[("audience", "api.atlassian.com"), ("prompt", "consent")],
-        };
-        talos_oauth::begin_oauth_authorization(&self.db_pool, &req, user_id).await
+        // Delegate to the shared driver — it builds the authorize URL from
+        // `authorize_request()` and persists the PKCE + CSRF state token bound
+        // to `user_id`. See the `OAuthIntegration` impl below.
+        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
     }
 
     /// Handle the OAuth callback: validate CSRF, exchange code, discover cloud sites,
@@ -156,12 +152,58 @@ impl AtlassianIntegrationService {
         code: String,
         state: String,
     ) -> Result<AtlassianIntegration> {
-        // Validate + single-use-consume the CSRF state token, recovering the
-        // initiating user_id + PKCE verifier. SECURITY: user_id comes from the
-        // state token (bound at connect time), NOT the callback's session cookie.
-        // Centralized (CSRF single-use, PKCE scrub, format-gate, tenancy) in
-        // talos_oauth::consume_oauth_state.
-        let consumed = talos_oauth::consume_oauth_state(&self.db_pool, "atlassian", &state).await?;
+        // Delegate to the shared driver — it consumes + validates the CSRF state
+        // token (single-use, format, tenancy) and only then hands the validated
+        // `ConsumedOAuthState` to `complete_callback()`. See the
+        // `OAuthIntegration` impl below.
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+    }
+}
+
+/// Shared OAuth flow contract — the `talos_oauth` drivers run the CSRF /
+/// PKCE / single-use / tenancy handling and call back into these three
+/// provider-specific pieces, making consume-before-exchange structural.
+/// `talos-slack` is the canonical reference implementation of this shape.
+#[async_trait::async_trait]
+impl talos_oauth::OAuthIntegration for AtlassianIntegrationService {
+    type Connected = AtlassianIntegration;
+
+    fn provider(&self) -> &'static str {
+        "atlassian"
+    }
+
+    fn authorize_request(&self) -> Result<talos_oauth::AuthorizeRequest<'static>> {
+        if !self.is_configured() {
+            return Err(anyhow!(
+                "Atlassian OAuth is not configured. Set ATLASSIAN_CLIENT_ID, \
+                 ATLASSIAN_CLIENT_SECRET, and ATLASSIAN_REDIRECT_URI."
+            ));
+        }
+
+        // Authorize URL + PKCE + CSRF state token (bound to user_id) via the
+        // shared flow helper — the CSRF/PKCE/tenancy handling lives in one place.
+        Ok(talos_oauth::AuthorizeRequest {
+            provider: "atlassian",
+            auth_url: "https://auth.atlassian.com/authorize",
+            token_url: "https://auth.atlassian.com/oauth/token",
+            client_id: self.client_id.clone().unwrap(),
+            client_secret: self.client_secret.clone().unwrap(),
+            redirect_uri: self.redirect_uri.clone().unwrap(),
+            scopes: REQUESTED_SCOPES,
+            extra_params: &[("audience", "api.atlassian.com"), ("prompt", "consent")],
+        })
+    }
+
+    async fn complete_callback(
+        &self,
+        _pool: &sqlx::PgPool,
+        code: &str,
+        consumed: talos_oauth::ConsumedOAuthState,
+    ) -> Result<AtlassianIntegration> {
+        // SECURITY: user_id comes from the state token (bound at connect time),
+        // NOT the callback's session cookie. The CSRF single-use / PKCE scrub /
+        // format-gate / tenancy consume already happened in the shared driver
+        // (talos_oauth::consume_oauth_state) before this call.
         let user_id = consumed.user_id;
         let pkce_verifier_secret = consumed.pkce_verifier;
 
@@ -237,15 +279,10 @@ impl AtlassianIntegrationService {
         let token_expires_at = talos_oauth::oauth_expires_at(token_data.expires_in);
         // Persist the granted scope string verbatim so operators can diagnose
         // "Unauthorized; scope does not match" errors by comparing what was
-        // requested (in get_authorization_url) against what was granted. If
+        // requested (in authorize_request) against what was granted. If
         // Atlassian omits the scope field, fall back to the full requested
         // set so the column is non-empty.
-        let granted_scope = token_data.scope.unwrap_or_else(|| {
-            "read:jira-work write:jira-work read:jira-user offline_access \
-             read:issue:jira read:issue-details:jira read:project:jira \
-             read:jql:jira read:user:jira write:comment:jira write:issue:jira"
-                .to_string()
-        });
+        let granted_scope = token_data.scope.unwrap_or_else(requested_scope_fallback);
 
         // 3. Discover accessible Atlassian Cloud sites.
         // MCP-533: this GET carries `Bearer access_token` — same
@@ -357,7 +394,9 @@ impl AtlassianIntegrationService {
 
         Ok(integration)
     }
+}
 
+impl AtlassianIntegrationService {
     // ── CRUD ─────────────────────────────────────────────────────────
 
     pub async fn get_user_integrations(
@@ -545,11 +584,8 @@ impl AtlassianIntegrationService {
                 Ok(None) | Err(_) => {
                     // No DB row or read failure — fall back to the full
                     // originally-requested set so the column stays
-                    // non-empty. Matches the handle_callback fallback.
-                    "read:jira-work write:jira-work read:jira-user offline_access \
-                     read:issue:jira read:issue-details:jira read:project:jira \
-                     read:jql:jira read:user:jira write:comment:jira write:issue:jira"
-                        .to_string()
+                    // non-empty. Matches the complete_callback fallback.
+                    requested_scope_fallback()
                 }
             }
         };
@@ -570,5 +606,204 @@ impl AtlassianIntegrationService {
             .context("Failed to store refreshed Atlassian credentials")?;
 
         Ok(token_resp.access_token)
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests exercise the REAL production flow (repo testing convention):
+    //! the public `get_authorization_url` / `handle_callback` methods delegate
+    //! to the shared `talos_oauth` drivers, and these tests call those public
+    //! methods — no test-local re-implementation of the flow.
+    //!
+    //! DB-touching paths use a lazy pool pointed at an unreachable address
+    //! (port 1, nothing listens) with a short acquire timeout — the
+    //! `SecretsManager::test_stub_for_cache` pattern: any test that would
+    //! genuinely need Postgres fails fast and loudly instead of silently
+    //! passing against a developer's local DB.
+
+    use super::*;
+    use talos_oauth::OAuthIntegration;
+
+    /// Lazy pool that can never connect (port 1). `connect_lazy` requires a
+    /// Tokio runtime, so every constructor-using test is `#[tokio::test]`.
+    fn unreachable_pool() -> Pool<Postgres> {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://talos:talos@127.0.0.1:1/talos_unreachable")
+            .expect("lazy pool construction should not fail")
+    }
+
+    /// Fully-configured service with injected (non-env) credentials so tests
+    /// don't race on process-global env vars.
+    fn configured_service() -> AtlassianIntegrationService {
+        AtlassianIntegrationService {
+            db_pool: unreachable_pool(),
+            client_id: Some("test-client-id".to_string()),
+            client_secret: Some("test-client-secret".to_string()),
+            redirect_uri: Some("https://talos.example/api/atlassian/callback".to_string()),
+            credentials_service: None,
+        }
+    }
+
+    fn unconfigured_service() -> AtlassianIntegrationService {
+        AtlassianIntegrationService {
+            db_pool: unreachable_pool(),
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+            credentials_service: None,
+        }
+    }
+
+    /// Full anyhow context chain as one string, for asserting which layer
+    /// produced an error (and which layers were never reached).
+    fn error_chain(err: &anyhow::Error) -> String {
+        format!("{err:#}")
+    }
+
+    // ── Pure helpers ─────────────────────────────────────────────────
+
+    /// Locks the fallback scope string byte-for-byte to the pre-extraction
+    /// literal that `handle_callback` / `get_access_token` persisted, so the
+    /// `REQUESTED_SCOPES.join(" ")` refactor can never drift the stored value.
+    #[test]
+    fn requested_scope_fallback_is_stable() {
+        assert_eq!(
+            requested_scope_fallback(),
+            "read:jira-work write:jira-work read:jira-user offline_access \
+             read:issue:jira read:issue-details:jira read:project:jira \
+             read:jql:jira read:user:jira write:comment:jira write:issue:jira"
+        );
+    }
+
+    // ── OAuthIntegration contract ────────────────────────────────────
+
+    #[tokio::test]
+    async fn provider_key_matches_authorize_request_provider() {
+        let svc = configured_service();
+        // The trait contract requires these two to be equal — the driver
+        // stores authorize_request().provider at authorize time and consumes
+        // with provider() on the callback; a mismatch strands every state row.
+        assert_eq!(svc.provider(), "atlassian");
+        let req = svc.authorize_request().expect("configured service");
+        assert_eq!(req.provider, svc.provider());
+    }
+
+    #[tokio::test]
+    async fn authorize_request_shape_is_preserved() {
+        let svc = configured_service();
+        let req = svc.authorize_request().expect("configured service");
+        assert_eq!(req.auth_url, "https://auth.atlassian.com/authorize");
+        assert_eq!(req.token_url, "https://auth.atlassian.com/oauth/token");
+        assert_eq!(req.client_id, "test-client-id");
+        assert_eq!(req.client_secret, "test-client-secret");
+        assert_eq!(
+            req.redirect_uri,
+            "https://talos.example/api/atlassian/callback"
+        );
+        assert_eq!(req.scopes, REQUESTED_SCOPES);
+        assert_eq!(
+            req.extra_params,
+            &[("audience", "api.atlassian.com"), ("prompt", "consent")]
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_request_fails_closed_when_unconfigured() {
+        let svc = unconfigured_service();
+        // NOTE: no `expect_err` — `AuthorizeRequest` carries `client_secret`
+        // and deliberately implements no `Debug` (secret-redaction, lint 37).
+        let err = match svc.authorize_request() {
+            Ok(_) => panic!("unconfigured service must not build an authorize request"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("Atlassian OAuth is not configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_authorization_url_fails_before_any_db_write_when_unconfigured() {
+        let svc = unconfigured_service();
+        let err = svc
+            .get_authorization_url(Uuid::new_v4())
+            .await
+            .expect_err("must fail closed");
+        // The config error surfaces verbatim — the driver evaluates
+        // authorize_request() BEFORE begin_oauth_authorization, so the
+        // (unreachable) DB is never touched: a DB error here would mean the
+        // state INSERT ran ahead of config validation.
+        let chain = error_chain(&err);
+        assert!(
+            chain.contains("Atlassian OAuth is not configured"),
+            "unexpected error chain: {chain}"
+        );
+        assert!(
+            !chain.contains("state token"),
+            "DB state write attempted before config validation: {chain}"
+        );
+    }
+
+    // ── Callback ordering (consume-before-exchange, structural) ─────
+
+    #[tokio::test]
+    async fn callback_rejects_malformed_state_before_db_or_exchange() {
+        let svc = configured_service();
+        // Invalid charset (space + `!`) must be rejected by the shared
+        // format gate BEFORE the DB consume and BEFORE any token exchange.
+        // The pool is unreachable and no HTTP mock exists, so reaching
+        // either later stage would produce a different error.
+        let err = svc
+            .handle_callback("dummy-code".to_string(), "bad state!".to_string())
+            .await
+            .expect_err("malformed state must be rejected");
+        let chain = error_chain(&err);
+        assert!(
+            chain.contains("OAuth state token contains invalid characters"),
+            "unexpected error chain: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_empty_state_before_db_or_exchange() {
+        let svc = configured_service();
+        let err = svc
+            .handle_callback("dummy-code".to_string(), String::new())
+            .await
+            .expect_err("empty state must be rejected");
+        let chain = error_chain(&err);
+        assert!(
+            chain.contains("OAuth state token must be 1-255 characters"),
+            "unexpected error chain: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_consumes_state_before_token_exchange() {
+        let svc = configured_service();
+        // Well-formed state + unreachable DB: the shared driver's
+        // consume_oauth_state must fail at the DB step — proving the
+        // single-use state consume runs BEFORE complete_callback's token
+        // exchange. If the exchange ran first we'd see the Atlassian
+        // token-endpoint error instead (and would have leaked an outbound
+        // request carrying client_secret for an unvalidated state).
+        let err = svc
+            .handle_callback("dummy-code".to_string(), "wellformedstate123".to_string())
+            .await
+            .expect_err("unreachable DB must fail the state consume");
+        let chain = error_chain(&err);
+        assert!(
+            chain.contains("Failed to validate atlassian OAuth state token"),
+            "expected the state-consume error, got: {chain}"
+        );
+        assert!(
+            !chain.contains("token endpoint") && !chain.contains("token exchange"),
+            "token exchange ran before (or instead of) the state consume: {chain}"
+        );
     }
 }

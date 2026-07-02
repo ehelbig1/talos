@@ -34,7 +34,7 @@ import {
   listServiceIntegrations,
   disconnectServiceIntegration,
   ServiceIntegration as GqlServiceIntegration,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
 
 function authedFetch(
   url: string,

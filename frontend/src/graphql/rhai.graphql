@@ -1,0 +1,24 @@
+# Rhai expression tooling. Source documents for graphql-codegen —
+# `npm run codegen` regenerates hooks + Document constants.
+
+query AnalyzeRhai($input: AnalyzeRhaiInput!) {
+  analyzeRhai(input: $input) {
+    success
+    errors {
+      line
+      column
+      endLine
+      endColumn
+      message
+      severity
+    }
+  }
+}
+
+query TestRhaiExpression($input: TestRhaiExpressionInput!) {
+  testRhaiExpression(input: $input) {
+    success
+    output
+    error
+  }
+}

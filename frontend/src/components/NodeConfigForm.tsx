@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { cn } from "@/lib/utils";
 import { z } from "zod";
 import { Input, Textarea, Badge, FormField, Button } from "@/components/ui";
-import { analyzeRhai } from "@/lib/graphqlClient";
+import { analyzeRhai } from "@/lib/graphqlApi";
 import { TestRhaiModal } from "./TestRhaiModal";
 
 import {

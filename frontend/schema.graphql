@@ -1,0 +1,1450 @@
+type ActorActionLogEntry {
+	id: UUID!
+	actionType: String!
+	summary: String!
+	timestamp: String!
+	workflowId: UUID
+	executionId: UUID
+}
+
+type ActorDetails {
+	id: UUID!
+	name: String!
+	description: String
+	status: String!
+	maxCapabilityWorld: String!
+	metadata: String
+	workflowCount: Int!
+	executionCount: Int!
+	"""
+	Lifetime budget cap in USD. None = unlimited.
+	"""
+	totalBudgetUsd: Float
+	"""
+	Lifetime budget consumed. Always 0 until budget tracking is wired.
+	"""
+	spentBudgetUsd: Float!
+	"""
+	MCP bearer token — intentionally always None via GraphQL (shown once at MCP creation).
+	"""
+	mcpToken: String
+	"""
+	Per-minute execution rate limit. None = unlimited.
+	"""
+	rateLimit: Int
+	"""
+	ISO-8601 timestamp of the most recent execution dispatched by this actor.
+	"""
+	lastActiveAt: String
+	createdAt: String!
+	updatedAt: String!
+}
+
+type ActorExecutionsSummary {
+	totalExecutions: Int!
+	successfulExecutions: Int!
+	failedExecutions: Int!
+	activeExecutions: Int!
+}
+
+"""
+A single memory entry stored against an actor.
+"""
+type ActorMemoryEntry {
+	key: String!
+	"""
+	JSON-serialized value — parse on the client.
+	"""
+	value: String!
+	"""
+	"working" | "episodic" | "semantic" | "scratchpad"
+	"""
+	memoryType: String!
+	"""
+	ISO-8601 expiry, null means permanent (semantic).
+	"""
+	expiresAt: String
+	updatedAt: String!
+}
+
+type ActorSummary {
+	id: UUID!
+	name: String!
+	description: String
+	status: String!
+	maxCapabilityWorld: String!
+	workflowCount: Int!
+	executionCount: Int!
+	"""
+	Lifetime budget cap in USD. None = unlimited.
+	"""
+	totalBudgetUsd: Float
+	"""
+	Lifetime budget consumed. Always 0 until budget tracking is wired.
+	"""
+	spentBudgetUsd: Float!
+	createdAt: String!
+	updatedAt: String!
+}
+
+type ActorWorkflowItem {
+	id: UUID!
+	name: String!
+	status: String
+	nodeCount: Int!
+	"""
+	Serialized graph JSON — used client-side to detect AI Actor (LLM + INJECT_CONTEXT).
+	"""
+	graphJson: String
+	createdAt: String!
+	updatedAt: String!
+}
+
+type ActorWorkflowsSummary {
+	totalWorkflows: Int!
+	activeWorkflows: Int!
+}
+
+type AnalyzeCustomModuleResult {
+	success: Boolean!
+	errors: [CompilationErrorObj!]!
+}
+
+input AnalyzeRhaiInput {
+	script: String!
+}
+
+type ApiKeyCreated {
+	id: UUID!
+	name: String!
+	key: String!
+	scopes: [String!]!
+	expiresAt: String
+}
+
+type ApiKeyInfo {
+	id: UUID!
+	name: String!
+	keyPrefix: String!
+	scopes: [String!]!
+	createdAt: String!
+	expiresAt: String
+	lastUsedAt: String
+	isActive: Boolean!
+	usageCount: Int!
+}
+
+"""
+One integrity failure found while verifying a persisted audit chain.
+Flattened from `talos_audit_ledger::ChainBreak` for the GraphQL surface.
+"""
+type AuditChainBreak {
+	"""
+	`sequence_gap` | `duplicate_sequence` | `genesis_mismatch` |
+	`linkage_mismatch` | `bad_signature` | `unsigned`.
+	"""
+	kind: String!
+	"""
+	The sequence number the break is associated with, if applicable.
+	"""
+	sequence: Int
+	"""
+	Expected value (prior/genesis hash, or expected sequence), if applicable.
+	"""
+	expected: String
+	"""
+	Found value, if applicable.
+	"""
+	found: String
+}
+
+"""
+Result of verifying the cryptographic audit chain for one execution
+(finding #2). `ok` is true iff there are no `breaks` and — when signing
+keys are configured — every event's HMAC verified.
+"""
+type AuditChainVerification {
+	executionId: String!
+	workflowId: String!
+	totalEvents: Int!
+	ok: Boolean!
+	"""
+	Whether HMAC verification was attempted (signing keys configured).
+	"""
+	signaturesChecked: Boolean!
+	breaks: [AuditChainBreak!]!
+}
+
+type AuthPayload {
+	user: UserInfo!
+}
+
+"""
+Detailed capability ceiling information for the current user.
+"""
+type CapabilityCeilingDetail {
+	ceiling: String!
+	source: String!
+	grantedByEmail: String
+	grantedAt: String
+	notes: String
+}
+
+"""
+A capability grant record (admin view).
+"""
+type CapabilityGrant {
+	userId: UUID!
+	email: String!
+	maxCapabilityWorld: String!
+	grantedBy: UUID
+	grantedAt: String!
+	notes: String
+}
+
+"""
+A single world in the capability hierarchy.
+"""
+type CapabilityWorldInfo {
+	name: String!
+	rank: Int!
+	description: String!
+}
+
+"""
+Human-readable changelog entry for a workflow version.
+"""
+type ChangelogEntry {
+	versionNumber: Int!
+	publishedAt: String!
+	description: String
+	summary: String!
+}
+
+type CompilationErrorObj {
+	line: Int
+	column: Int
+	endLine: Int
+	endColumn: Int
+	message: String!
+	severity: String!
+}
+
+type CompilationEvent {
+	jobId: UUID!
+	userId: UUID!
+	status: String!
+	message: String
+	progress: Float
+}
+
+"""
+Input type for createActor mutation.
+"""
+input CreateActorInput {
+	name: String!
+	description: String
+	maxCapabilityWorld: String
+	"""
+	Lifetime budget cap in USD (informational — enforcement via budget policies).
+	"""
+	totalBudgetUsd: Float
+	"""
+	Per-minute execution rate limit (informational — reserved for future enforcement).
+	"""
+	rateLimit: Int
+}
+
+input CreateApiKeyInput {
+	name: String!
+	scopes: [String!]!
+	expiresInDays: Int
+}
+
+input CreateModuleInput {
+	templateId: UUID!
+	name: String!
+	config: String!
+	jobId: UUID
+}
+
+input CreateSecretInput {
+	name: String!
+	keyPath: String!
+	value: String!
+	description: String
+	allowedModules: [UUID!]
+	"""
+	Optional organization to assign the secret to. When set, all org
+	members can access this secret.
+	"""
+	orgId: UUID
+}
+
+input CreateWebhookTriggerInput {
+	name: String!
+	moduleId: UUID!
+	verificationToken: String
+	signingSecret: String
+	maxRequestsPerMinute: Int
+	enabled: Boolean
+	allowedIps: [String!]
+	"""
+	RFC 0007: optional provider-agnostic event filter, evaluated AFTER
+	signature verification. A non-matching delivery is acknowledged 200 with
+	no dispatch (so it doesn't burn an execution). Omit to fire on every
+	verified delivery. Shape (validated via `talos_webhooks::validate_event_filter`):
+	`{ "header": "X-GitHub-Event", "values": ["pull_request"],
+	"payload_match": { "action": ["opened","synchronize","reopened"] } }`.
+	"""
+	eventFilter: JSON
+}
+
+"""
+Input for `createWorkflowFromDescription`. Mirrors the MCP
+`create_workflow_from_description` tool — natural-language
+description plus an optional fallback list of module UUIDs to
+chain when no LLM is configured.
+"""
+input CreateWorkflowFromDescriptionInput {
+	description: String!
+	"""
+	Optional explicit module UUIDs. Used when no LLM is
+	available, or when the caller wants to force a specific set
+	of modules instead of relying on AI scaffolding.
+	"""
+	modules: [String!]
+}
+
+"""
+Result envelope for `createWorkflowFromDescription`. Maps the
+service's typed `CreateFromDescriptionOutcome` enum into a
+flattened struct with stable shape — GraphQL doesn't have great
+ergonomics for multi-variant union responses, and this shape
+matches what callers actually need to branch on (`success`,
+`scaffolded_by`, optional error class).
+"""
+type CreateWorkflowFromDescriptionResult {
+	success: Boolean!
+	"""
+	Set on the two success cases (`LlmScaffold`,
+	`ExplicitModuleScaffold`).
+	"""
+	workflowId: UUID
+	"""
+	"llm" | "explicit_modules" | "none". Mirrors the MCP
+	response's `scaffolded_by` field so a UI built off the MCP
+	surface can switch onto the same value.
+	"""
+	scaffoldedBy: String!
+	name: String
+	"""
+	LLM-only — the natural-language reasoning the LLM provided
+	for its scaffold choice.
+	"""
+	reasoning: String
+	"""
+	Module names the LLM suggested but couldn't be resolved
+	against the catalog.
+	"""
+	unresolvedModules: [String!]
+	"""
+	Module names that exist in the catalog but have no compiled
+	WASM. Caller should run `compile_template` before triggering.
+	"""
+	modulesNotCompiled: [String!]
+	"""
+	LLM-only — suggested cron expression for automatic triggering.
+	"""
+	suggestedSchedule: String
+	"""
+	Per-soft-failure-mode tag: `"llm_incomplete"`,
+	`"llm_invalid_json"`, `"llm_failed"`, `"no_llm_and_no_explicit"`,
+	`"no_matched_modules"`, or null on success. Stable strings —
+	agents and the UI branch on these.
+	"""
+	errorClass: String
+	"""
+	Human-readable message paired with `error_class`.
+	"""
+	errorMessage: String
+	"""
+	Sub-class for `error_class = "llm_failed"`: `"rate_limited"`,
+	`"timeout"`, `"auth"`, `"upstream_unavailable"`, `"network"`,
+	`"unknown"`. Null otherwise.
+	"""
+	llmErrorClass: String
+}
+
+input CreateWorkflowInput {
+	name: String!
+	graphJson: String!
+	maxConcurrentExecutions: Int
+	intent: JSON
+	"""
+	Organization that owns this workflow (RFC 0004 tenant = org).
+	Omit to create it in your **personal org** (the default). When set
+	to a shared org, the caller must have Member+ role there
+	(validated against `user_writable_org_ids`); teammates then see
+	the workflow via the org-union read path.
+	"""
+	organizationId: UUID
+}
+
+"""
+A node execution that failed and was moved to the Dead Letter Queue.
+"""
+type DeadLetterEntry {
+	id: UUID!
+	workflowId: UUID!
+	executionId: UUID!
+	nodeId: UUID!
+	errorMessage: String!
+	payload: String
+	createdAt: String!
+	replayedAt: String
+	replayedBy: UUID
+}
+
+"""
+Per-table per-org DEK migration status (one entry per encrypted table).
+"""
+type DekMigrationStatusEntry {
+	"""
+	Logical table/column label.
+	"""
+	table: String!
+	"""
+	True when a `reEncrypt…ToOrg` sweep drives `pending` to 0; false for the
+	personal tables that migrate lazily on next write.
+	"""
+	hasSweep: Boolean!
+	"""
+	Rows still on the global DEK that have a resolvable org (remaining sweep
+	work). 0 = migration complete for this table.
+	"""
+	pending: Int!
+}
+
+"""
+Result of a DEK rotation operation.
+"""
+type DekRotationResult {
+	"""
+	The UUID of the newly created DEK.
+	"""
+	newDekId: UUID!
+	"""
+	Human-readable status message.
+	"""
+	message: String!
+}
+
+type DlqEvent {
+	id: UUID!
+	workflowId: UUID
+	executionId: UUID
+	nodeId: UUID
+	errorMessage: String
+	payload: String
+	createdAt: String!
+	replayedAt: String
+	"""
+	M T6-1: workflow owner. Stamped at emit time so the
+	subscription filter doesn't need a per-event DB lookup. None
+	when the trigger has been deleted (`webhook_triggers.workflow_id`
+	is `ON DELETE SET NULL`) — the subscription treats None as
+	platform-admin-only-visible.
+	"""
+	userId: UUID
+	"""
+	M T6-1: workflow's organisation. Same emit-time stamp.
+	Subscribers gated to org membership view events with
+	matching `org_id`.
+	"""
+	orgId: UUID
+}
+
+input Enable2FAInput {
+	secret: String!
+	code: String!
+}
+
+"""
+A pending authorization request for a module execution.
+"""
+type ExecutionApproval {
+	id: UUID!
+	workflowId: UUID!
+	executionId: UUID!
+	nodeId: UUID!
+	requiredFor: [String!]!
+	status: String!
+	requestedAt: String!
+	decidedAt: String
+	decidedBy: UUID
+	reason: String
+}
+
+type ExecutionEvent {
+	executionId: UUID!
+	nodeId: UUID
+	status: ExecutionStatus!
+	logMessage: String
+	traceId: String
+	spanId: String
+	iterationIndex: Int
+	iterationTotal: Int
+	"""
+	Wall-clock duration in ms from node_started to this event. Present on completion events.
+	"""
+	durationMs: Int
+	"""
+	Final output JSON. Only populated on `OutputReady` events for streaming consumers.
+	"""
+	output: JSON
+}
+
+enum ExecutionStatus {
+	PENDING
+	RUNNING
+	COMPLETED
+	FAILED
+	SKIPPED
+	WAITING
+	"""
+	Workflow has finished and the final output is available.
+	Used by streaming consumers to receive the final result.
+	"""
+	OUTPUT_READY
+}
+
+input GenerateCodeInput {
+	prompt: String!
+	currentCode: String!
+	capabilityWorld: String!
+}
+
+type GenerateCodeResult {
+	code: String!
+}
+
+"""
+Input for granting a capability ceiling to a user.
+"""
+input GrantCapabilityCeilingInput {
+	userId: UUID!
+	maxCapabilityWorld: String!
+	notes: String
+}
+
+enum IntegrationService {
+	GOOGLE_CALENDAR
+	GMAIL
+	SLACK
+	JIRA
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+input LoginInput {
+	email: String!
+	password: String!
+}
+
+"""
+Result of a master key rotation operation.
+"""
+type MasterKeyRotationResult {
+	"""
+	Number of DEKs that were re-encrypted with the new master key.
+	"""
+	reEncryptedDekCount: Int!
+	"""
+	Human-readable status message.
+	"""
+	message: String!
+}
+
+type McpAgent {
+	id: UUID!
+	name: String!
+	createdAt: String!
+	lastUsedAt: String
+}
+
+type McpAgentCreated {
+	agentId: UUID!
+	name: String!
+	token: String!
+	role: String!
+}
+
+type ModuleExecution {
+	id: UUID!
+	moduleId: UUID!
+	status: String!
+	triggerType: String!
+	triggerMetadata: String
+	inputData: String
+	outputData: String
+	startedAt: String!
+	completedAt: String
+	durationMs: Int
+	errorMessage: String
+	errorType: String
+	fuelConsumed: Int
+	memoryUsedMb: Int
+	createdAt: String!
+	module: WasmModule
+	logs: [ModuleExecutionLog!]!
+}
+
+type ModuleExecutionLog {
+	id: UUID!
+	executionId: UUID!
+	level: String!
+	message: String!
+	metadata: String
+	createdAt: String!
+}
+
+type MutationRoot {
+	registerMcpAgent(name: String!, roleName: String!): McpAgentCreated!
+	createActor(input: CreateActorInput!): ActorSummary!
+	updateActorStatus(id: UUID!, status: String!): ActorSummary!
+	terminateActor(id: UUID!, cleanupWorkflows: Boolean): Boolean!
+	"""
+	Write (upsert) a memory entry for an actor. Returns the saved entry.
+	Update an actor's name and/or description.
+	"""
+	updateActor(		id: UUID!,		name: String,		description: String,
+		"""
+		New capability ceiling world. Must be one of the valid world names.
+		"""
+		maxCapabilityWorld: String
+	): ActorSummary!
+	writeActorMemory(input: WriteActorMemoryInput!): ActorMemoryEntry!
+	"""
+	Delete a memory entry by key for an actor the current user owns.
+	"""
+	deleteActorMemory(actorId: UUID!, key: String!): Boolean!
+	"""
+	Clone an actor, copying its semantic and episodic memories into the new actor.
+	"""
+	cloneActor(		id: UUID!,
+		"""
+		Name for the cloned actor. Defaults to 'Copy of <original name>'.
+		"""
+		name: String
+	): ActorSummary!
+	revokeMcpAgent(id: UUID!): Boolean!
+	signup(input: SignupInput!): AuthPayload!
+	login(input: LoginInput!): AuthPayload!
+	refreshToken: AuthPayload!
+	logout: Boolean!
+	"""
+	Revoke ALL active sessions for the authenticated user across all devices.
+	Use this after a suspected account compromise or when a user wants to
+	sign out everywhere. Clears the current device's cookies as well.
+	"""
+	logoutAllSessions: Boolean!
+	setupTwoFactor: TwoFactorSetup!
+	enableTwoFactor(input: Enable2FAInput!): TwoFactorEnrollment!
+	disableTwoFactor: Boolean!
+	verifyTwoFactor(input: Verify2FAInput!): AuthPayload!
+	unlinkOauthAccount(provider: String!): Boolean!
+	retryExecution(executionId: UUID!): UUID!
+	approveExecution(id: UUID!, reason: String): Boolean!
+	denyExecution(id: UUID!, reason: String): Boolean!
+	createModuleFromTemplate(input: CreateModuleInput!): WasmModule!
+	testModule(moduleId: UUID!, input: String, timeoutSecs: Int): TestModuleResult!
+	createOrganization(name: String!, slug: String!): OrganizationObj!
+	inviteMember(orgId: UUID!, targetUserId: UUID!, role: String!): OrgMemberObj!
+	removeMember(orgId: UUID!, targetUserId: UUID!): Boolean!
+	updateMemberRole(orgId: UUID!, targetUserId: UUID!, role: String!): OrgMemberObj!
+	transferOwnership(orgId: UUID!, newOwnerId: UUID!): OrganizationObj!
+	setConcurrencyLimit(workflowId: UUID!, maxConcurrent: Int): Boolean!
+	updateResourceQuotas(input: UpdateResourceQuotasInput!): ResourceQuota!
+	"""
+	Grant a capability ceiling to a user. Cross-user grants require
+	the designated `users.is_platform_admin` flag (M T6-1) — NOT
+	"admin of any organisation." Self-grants stay open (no-op since
+	you can't exceed your own ceiling). Granter's own ceiling must
+	be >= the world being granted (enforced separately below).
+	"""
+	grantCapabilityCeiling(input: GrantCapabilityCeilingInput!): Boolean!
+	"""
+	Revoke a user's capability ceiling grant, reverting to the default (http-node).
+	Admins can revoke any grant; users can revoke their own.
+	"""
+	revokeCapabilityCeiling(userId: UUID!): Boolean!
+	disconnectServiceIntegration(id: UUID!, service: IntegrationService!): Boolean!
+	createSecret(input: CreateSecretInput!): Secret!
+	updateSecret(input: UpdateSecretInput!): Secret!
+	deleteSecret(keyPath: String!): Boolean!
+	createApiKey(input: CreateApiKeyInput!): ApiKeyCreated!
+	revokeApiKey(keyId: UUID!): Boolean!
+	deleteApiKey(keyId: UUID!): Boolean!
+	rotateApiKey(keyId: UUID!): ApiKeyCreated!
+	rotateDek: DekRotationResult!
+	reEncryptSecrets: ReEncryptionResult!
+	"""
+	Per-org DEK arc: migrate existing org-scoped secrets to their org's root
+	DEK (format v4). The complement of `reEncryptSecrets` (which keeps the
+	global-DEK rows current); together they let the global DEK retire for the
+	secrets table. Personal/org-less secrets are intentionally left global.
+	"""
+	reEncryptSecretsToOrg: ReEncryptionResult!
+	"""
+	Per-org DEK arc: migrate existing `actor_memory` rows to their actor's
+	org root DEK (format v4). Memory sibling of `reEncryptSecretsToOrg`;
+	rows whose actor has no org stay on the global DEK.
+	"""
+	reEncryptMemoriesToOrg: ReEncryptionResult!
+	"""
+	Per-org DEK arc: migrate existing encrypted execution outputs to their
+	workflow's org root DEK (format v4). Execution-output sibling of
+	`reEncryptSecretsToOrg` / `reEncryptMemoriesToOrg`; outputs whose workflow
+	has no org stay on the global DEK.
+	"""
+	reEncryptOutputsToOrg: ReEncryptionResult!
+	"""
+	Per-org DEK arc: migrate existing module-execution payloads to their
+	workflow's org root DEK (format v4). Last of the per-org sweeps; org-less
+	/ standalone payloads stay on the global DEK.
+	"""
+	reEncryptModulePayloadsToOrg: ReEncryptionResult!
+	rotateMasterKey(newMasterKey: String!): MasterKeyRotationResult!
+	rotateEncryptionKey: Int!
+	updateAuditSettings(streamingEnabled: Boolean!, otlpEndpoint: String, otlpProtocol: String, authHeaders: String): UserAuditSettings!
+	createWebhookTrigger(input: CreateWebhookTriggerInput!): WebhookTrigger!
+	replayWebhookDeadLetterEntry(id: UUID!): Boolean!
+	replayDeadLetterEntry(id: UUID!): Boolean!
+	triggerWorkflow(		workflowId: UUID!,
+		"""
+		Optional actor to run as. When set, the execution is tagged with this actor's ID and the actor's budget is enforced.
+		"""
+		actorId: UUID
+	): WorkflowExecution!
+	resumeWorkflow(executionId: UUID!): Boolean!
+	createWorkflow(input: CreateWorkflowInput!): Workflow!
+	"""
+	AI-scaffolded workflow creation from a natural-language
+	description. Backed by the same `WorkflowCreationService`
+	that powers the MCP `create_workflow_from_description` tool —
+	a single source of truth for scaffold semantics across both
+	surfaces.
+	
+	Both success cases (LLM-scaffolded, explicit-modules) and all
+	soft-failure cases (LLM unavailable, LLM rate-limited, etc.)
+	return a populated `CreateWorkflowFromDescriptionResult` —
+	hard failures (DB unavailable, etc.) flow as a GraphQL Error.
+	"""
+	createWorkflowFromDescription(input: CreateWorkflowFromDescriptionInput!): CreateWorkflowFromDescriptionResult!
+	updateWorkflow(id: UUID!, input: CreateWorkflowInput!): Workflow!
+	deleteWorkflow(id: UUID!): Boolean!
+	generateCode(input: GenerateCodeInput!): GenerateCodeResult!
+	publishWorkflowVersion(workflowId: UUID!, description: String): WorkflowVersion!
+	rollbackWorkflowVersion(workflowId: UUID!, versionId: UUID!): WorkflowVersion!
+	createSchedule(workflowId: UUID!, cronExpression: String!, timezone: String): WorkflowScheduleObj!
+	updateSchedule(workflowId: UUID!, cronExpression: String, timezone: String, isEnabled: Boolean): WorkflowScheduleObj!
+	deleteSchedule(workflowId: UUID!): Boolean!
+	testWorkflow(workflowId: UUID!, mockInputs: String): TestWorkflowResult!
+}
+
+type NodeTemplate {
+	id: UUID!
+	name: String!
+	category: String!
+	description: String
+	configSchema: String!
+	icon: String
+	allowedHosts: [String!]!
+}
+
+type OauthAccount {
+	id: UUID!
+	provider: String!
+	email: String!
+	name: String
+	pictureUrl: String
+	linkedAt: String!
+	lastLoginAt: String
+}
+
+type OauthAuthUrl {
+	authUrl: String!
+	provider: String!
+}
+
+"""
+GraphQL representation of an organization member.
+"""
+type OrgMemberObj {
+	id: UUID!
+	orgId: UUID!
+	userId: UUID!
+	role: String!
+	invitedBy: UUID
+	joinedAt: String!
+}
+
+"""
+GraphQL representation of an organization.
+"""
+type OrganizationObj {
+	id: UUID!
+	name: String!
+	slug: String!
+	ownerId: UUID!
+	createdAt: String!
+	updatedAt: String!
+}
+
+"""
+Pagination input for list queries
+"""
+input PaginationInput {
+	"""
+	Maximum number of items to return (default: 100, max: 1000)
+	"""
+	limit: Int
+	"""
+	Number of items to skip (default: 0)
+	"""
+	offset: Int
+}
+
+type QueryRoot {
+	actors: [ActorSummary!]!
+	actor(id: UUID!): ActorDetails
+	actorExecutionsSummary(actorId: UUID!): ActorExecutionsSummary!
+	actorWorkflowsSummary(actorId: UUID!): ActorWorkflowsSummary!
+	actorActionLog(actorId: UUID!, limit: Int): [ActorActionLogEntry!]!
+	"""
+	MCP-1189 (2026-05-17): `limit` arg added with default 1000 and
+	hard cap of 1000. Pre-fix the query did `fetch_all` on workflows
+	with NO LIMIT, AND each row carried the full `graph_json` blob
+	(capped at MAX_PAYLOAD_SIZE = 10 MiB per row, talos-api/src/
+	validation.rs:31). Theoretical worst case for a malicious /
+	pathological user who created thousands of workflows linked to
+	one actor: rows × 10 MiB per `graph_json` = tens of GiB
+	allocated on the controller per request. Frontend
+	`getActorWorkflows` (graphqlClient.ts:922) explicitly requests
+	`graphJson` so the full blob comes back per row — caller can't
+	opt out via projection. Sibling fix to MCP-1188 (actor_memories
+	1000-row cap).
+	"""
+	actorWorkflows(		actorId: UUID!,
+		"""
+		Max rows to return (default 1000, max 1000)
+		"""
+		limit: Int
+	): [ActorWorkflowItem!]!
+	"""
+	List non-expired memory entries for an actor the current user owns.
+	
+	MCP-1188 (2026-05-17): `limit` arg added with default 1000 and a
+	hard cap of 1000. Pre-fix the query did `fetch_all` with no
+	LIMIT — a user's actor can hold up to MAX_MEMORIES_PER_ACTOR =
+	10_000 rows (talos-memory:48), each carrying a decrypted value
+	up to MAX_VALUE_BYTES = 64 KiB → worst-case ~640 MB allocation
+	per request, AND a per-row AES-GCM decrypt. A user with a
+	memory-heavy actor could trash the controller on repeated calls
+	via the dashboard. The MCP sibling `handle_list_actor_memories`
+	has always had a 200-row cap; this query was the holdout.
+	"""
+	actorMemories(		actorId: UUID!,
+		"""
+		Filter by type: working | episodic | semantic | scratchpad
+		"""
+		memoryType: String,
+		"""
+		Max rows to return (default 1000, max 1000)
+		"""
+		limit: Int
+	): [ActorMemoryEntry!]!
+	"""
+	MCP-1190 (2026-05-17): `limit` arg added with default 100 and
+	hard cap of 1000. Pre-fix the query did `fetch_all` on
+	mcp_agents with NO LIMIT — no formal per-user MCP-agent cap
+	exists at registration time, so an admin who accidentally /
+	maliciously creates thousands of agents trashes controller
+	heap on every dashboard `mcpAgents` call. Same unbounded-
+	fetch-all audit class as MCP-1188 / MCP-1189; here per-row
+	size is small (Uuid + name + two timestamps) so the worst-
+	case is dominated by row count rather than per-row weight.
+	"""
+	mcpAgents(
+		"""
+		Max rows to return (default 100, max 1000)
+		"""
+		limit: Int
+	): [McpAgent!]!
+	me: UserInfo!
+	oauthLoginUrl(provider: String!): OauthAuthUrl!
+	linkedOauthAccounts: [OauthAccount!]!
+	moduleExecutionHistory(moduleId: UUID!, pagination: PaginationInput): [ModuleExecution!]!
+	moduleExecutionLogs(executionId: UUID!): [ModuleExecutionLog!]!
+	nodeTemplates(category: String, pagination: PaginationInput): [NodeTemplate!]!
+	nodeTemplate(id: UUID!): NodeTemplate!
+	wasmModules(ids: [UUID!]!): [WasmModule!]!
+	myModules(pagination: PaginationInput): [WasmModule!]!
+	myOrganizations: [OrganizationObj!]!
+	organization(orgId: UUID!): OrganizationObj!
+	organizationMembers(orgId: UUID!): [OrgMemberObj!]!
+	myCapabilityCeiling: String!
+	"""
+	Get detailed capability ceiling info for the current user.
+	"""
+	capabilityCeilingDetail: CapabilityCeilingDetail!
+	"""
+	Return the full capability world hierarchy with ranks and descriptions.
+	"""
+	capabilityWorldHierarchy: [CapabilityWorldInfo!]!
+	"""
+	List all capability grants. Requires platform admin role.
+	
+	MCP-998 (2026-05-15): closes the QUERY sibling of the M T6-1
+	drift fix that `grant_capability_ceiling` /
+	`revoke_capability_ceiling` already received. Pre-fix this used
+	the same inline `organization_members ... role IN
+	('owner','admin')` conflation that the mutations were
+	audit-fixed away from — `require_scope(Admin)` session-bypasses,
+	and the inline EXISTS check granted access to ANY user who was
+	owner/admin of ANY organisation (their own tiny tenant counted).
+	Information-disclosure class: the query returns ALL capability
+	grants platform-wide (user_id, email, max_capability_world,
+	granted_by, granted_at, notes — LIMIT 200), so a curious org
+	admin on tenant A could enumerate every elevated user on
+	tenants B/C/D, useful for targeted social engineering or
+	reconnaissance ahead of an attempted privilege escalation.
+	Fix delegates to the canonical `ActorRepository::
+	is_platform_admin` helper that queries the dedicated
+	`users.is_platform_admin` column. Same drift class as
+	r277/r289/r291/r292 that `graphql_must_mirror_mcp_rbac_checks.md`
+	flags — every NEW endpoint that touches cross-tenant data MUST
+	either go through `require_platform_admin` or call
+	`actor_repo.is_platform_admin` after a session check.
+	"""
+	capabilityGrants: [CapabilityGrant!]!
+	"""
+	Verify the cryptographic audit chain for one execution (finding #2,
+	on-demand forensic check). Platform admin only — it reads the WORM
+	audit store across tenants, so it goes through the canonical
+	`is_platform_admin` gate (NOT the org-admin conflation the MCP-998
+	sweep removed). Returns the structured break list (sequence gaps,
+	linkage/genesis mismatch, bad/missing HMAC); the inline ingest check
+	and the continuous sweep cover the always-on side.
+	"""
+	verifyAuditChain(executionId: UUID!): AuditChainVerification!
+	resourceQuotas: ResourceQuota!
+	serviceIntegrations: [ServiceIntegration!]!
+	secrets(pagination: PaginationInput): [Secret!]!
+	secret(keyPath: String!): Secret!
+	secretAuditLog(secretId: UUID!, pagination: PaginationInput): [SecretAuditLog!]!
+	auditSettings: UserAuditSettings
+	"""
+	Per-org DEK migration status — per encrypted table, how many rows still
+	reference the global DEK but could be migrated to a per-org DEK (the
+	remaining work for the `reEncrypt…ToOrg` sweeps). When every `pending` is
+	0, the global DEK is no longer load-bearing for migratable data.
+	Platform-admin only (reveals system-wide counts across all orgs).
+	"""
+	dekMigrationStatus: [DekMigrationStatusEntry!]!
+	apiKeys(pagination: PaginationInput): [ApiKeyInfo!]!
+	webhookTriggers(pagination: PaginationInput): [WebhookTrigger!]!
+	webhookDeadLetterQueue: [WebhookDlqEntry!]!
+	deadLetterQueue: [DeadLetterEntry!]!
+	latestWorkflowExecutions(workflowIds: [UUID!]!): [WorkflowExecution!]!
+	workflowExecutionHistory(workflowId: UUID!, pagination: PaginationInput): [WorkflowExecution!]!
+	workflow(id: UUID!): Workflow!
+	workflows(pagination: PaginationInput): [Workflow!]!
+	analyzeRhai(input: AnalyzeRhaiInput!): AnalyzeCustomModuleResult!
+	testRhaiExpression(input: TestRhaiExpressionInput!): TestRhaiExpressionResult!
+	workflowVersions(workflowId: UUID!, limit: Int, offset: Int): [WorkflowVersion!]!
+	workflowVersion(id: UUID!): WorkflowVersion
+	activeWorkflowVersion(workflowId: UUID!): WorkflowVersion
+	workflowSchedule(workflowId: UUID!): WorkflowScheduleObj
+	mySchedules(limit: Int, offset: Int): [WorkflowScheduleObj!]!
+	getAllWorkflowStats(days: Int): [WorkflowStats!]!
+	getVersionDiffSummary(workflowId: UUID!): VersionDiffSummary!
+	getWorkflowChangelog(workflowId: UUID!, limit: Int): [ChangelogEntry!]!
+	"""
+	MCP-1190 (2026-05-17): `limit` arg added with default 20 and
+	hard cap of 100, matching the canonical MCP sibling at
+	`handle_list_pending_approvals` (executions.rs:6063) which has
+	enforced 1..=100 since MCP-179. Pre-fix this GraphQL query did
+	`fetch_all` with NO LIMIT — a user with a misconfigured
+	approval workflow accumulating thousands of pending gates would
+	get a huge response on every dashboard `pendingApprovals` call;
+	repeated polls trash controller heap. Same cross-protocol
+	GraphQL-must-mirror-MCP class as MCP-1188/1189.
+	"""
+	pendingApprovals(
+		"""
+		Max rows to return (default 20, max 100)
+		"""
+		limit: Int
+	): [ExecutionApproval!]!
+}
+
+"""
+Result of a re-encryption operation.
+"""
+type ReEncryptionResult {
+	"""
+	Number of secrets that were re-encrypted with the new active DEK.
+	"""
+	reEncryptedCount: Int!
+	"""
+	L T2-6: number of secrets that failed to re-encrypt (decrypt
+	error, cipher init failure, UPDATE failure). Operators MUST
+	inspect this field — a non-zero value means some secrets are
+	still wrapped with a non-active DEK and may become un-decryptable
+	if the source DEK is purged. Re-run after fixing the root cause.
+	"""
+	failedCount: Int!
+	"""
+	L T2-6: secret IDs that failed (capped at 100). Empty when
+	`failed_count == 0`. The full list appears in server-side logs.
+	"""
+	failedIds: [UUID!]!
+	"""
+	Human-readable status message.
+	"""
+	message: String!
+}
+
+"""
+Resource quotas for an organization.
+"""
+type ResourceQuota {
+	cpuCores: Int!
+	usedCpu: Int!
+	memoryGb: Int!
+	usedMemory: Int!
+	storageGb: Int!
+	usedStorage: Int!
+	concurrentExecutions: Int!
+	activeExecutions: Int!
+}
+
+type Secret {
+	id: UUID!
+	name: String!
+	keyPath: String!
+	description: String
+	createdAt: String!
+	lastAccessedAt: String
+	accessCount: Int!
+	expiresAt: String
+}
+
+type SecretAuditLog {
+	id: UUID!
+	action: String!
+	actorType: String!
+	success: Boolean!
+	timestamp: String!
+	errorMessage: String
+}
+
+type ServiceIntegration {
+	id: UUID!
+	service: IntegrationService!
+	accountIdentifier: String!
+	connectedAt: String!
+	status: String!
+}
+
+input SignupInput {
+	email: String!
+	password: String!
+	name: String
+}
+
+type SubscriptionRoot {
+	"""
+	Real‑time updates for a specific execution ID.
+	
+	SECURITY: Authorization is enforced - users can only subscribe to their own executions.
+	Events are replayed from the database before streaming new events, ensuring no events are lost.
+	"""
+	executionUpdates(executionId: UUID!): ExecutionEvent!
+	"""
+	Stream LLM completion tokens as they are generated.
+	
+	Subscribes to a NATS topic for the given execution and streams
+	partial text chunks as they arrive from the worker. The worker
+	publishes chunks to `talos.llm.stream.{execution_id}`.
+	"""
+	llmStream(executionId: UUID!): String!
+	"""
+	Real-time stream of dead-letter queue entries.
+	
+	M T6-1 visibility model:
+	* Platform admins (`users.is_platform_admin = TRUE`) see every
+	event regardless of ownership.
+	* Regular users see events for workflows they own
+	(`event.user_id == subscriber`) AND events for workflows in
+	any organisation they're a member of (`event.org_id IN
+	subscriber's orgs`).
+	* Events with both `user_id` and `org_id` NULL (orphan trigger
+	whose workflow was deleted) are platform-admin-only — the
+	ownership chain is gone, so no non-admin user can prove
+	they owned the underlying workflow.
+	
+	`DlqEvent.payload` is the raw trigger body (DLP-scrubbed at
+	persistence time but still tenant-scoped); the per-tenant
+	filter is what allows non-admin users to subscribe at all.
+	"""
+	dlqUpdates: DlqEvent!
+	"""
+	Real-time notifications when any workflow execution status changes (started, completed, failed).
+	
+	Powers the global dashboard "recent executions" list without polling.
+	"""
+	workflowExecutionUpdates: WorkflowExecutionEvent!
+	"""
+	Real-time stream of compilation progress events.
+	
+	Subscribes to the global compilation event broadcast and filters by user ID.
+	"""
+	compilationUpdates: CompilationEvent!
+}
+
+"""
+Result of testing a module in isolation.
+"""
+type TestModuleResult {
+	success: Boolean!
+	output: String
+	error: String
+	durationMs: Int!
+}
+
+type TestNodeTrace {
+	"""
+	The node UUID.
+	"""
+	nodeId: UUID!
+	"""
+	The input JSON that was fed to this node.
+	"""
+	input: String!
+	"""
+	The output JSON produced by this node (null if skipped/failed).
+	"""
+	output: String
+	"""
+	"completed", "failed", or "skipped".
+	"""
+	status: String!
+	"""
+	Error message if the node failed.
+	"""
+	error: String
+}
+
+input TestRhaiExpressionInput {
+	script: String!
+	mockContext: String!
+}
+
+type TestRhaiExpressionResult {
+	success: Boolean!
+	output: String
+	error: String
+}
+
+"""
+Result of a testWorkflow dry-run execution.
+"""
+type TestWorkflowResult {
+	"""
+	The temporary execution ID (not persisted long-term).
+	"""
+	executionId: UUID!
+	"""
+	Overall status: "completed" or "failed".
+	"""
+	status: String!
+	"""
+	Per-node execution trace.
+	"""
+	nodeTraces: [TestNodeTrace!]!
+	"""
+	Edge schema validation warnings (if any).
+	"""
+	schemaWarnings: [String!]!
+	"""
+	Total duration in milliseconds.
+	"""
+	durationMs: Int!
+	"""
+	Error message if the workflow failed overall.
+	"""
+	error: String
+}
+
+type TwoFactorEnrollment {
+	backupCodes: [String!]!
+}
+
+type TwoFactorSetup {
+	secret: String!
+	qrCodeUrl: String!
+	qrCodePng: String!
+}
+
+"""
+A UUID is a unique 128-bit number, stored as 16 octets. UUIDs are parsed as
+Strings within GraphQL. UUIDs are used to assign unique identifiers to
+entities without requiring a central allocating authority.
+
+# References
+
+* [Wikipedia: Universally Unique Identifier](http://en.wikipedia.org/wiki/Universally_unique_identifier)
+* [RFC4122: A Universally Unique Identifier (UUID) URN Namespace](http://tools.ietf.org/html/rfc4122)
+"""
+scalar UUID
+
+"""
+Input for updating organization resource quotas.
+"""
+input UpdateResourceQuotasInput {
+	cpuCores: Int
+	memoryGb: Int
+	storageGb: Int
+	concurrentExecutions: Int
+}
+
+input UpdateSecretInput {
+	keyPath: String!
+	value: String!
+}
+
+type UserAuditSettings {
+	streamingEnabled: Boolean!
+	otlpEndpoint: String
+	otlpProtocol: String
+	createdAt: String!
+	updatedAt: String!
+}
+
+type UserInfo {
+	id: UUID!
+	email: String!
+	name: String
+	createdAt: String!
+	twoFactorEnabled: Boolean!
+	isTwoFactorVerified: Boolean!
+}
+
+input Verify2FAInput {
+	code: String!
+}
+
+"""
+Summary of differences between the current draft and the last published version.
+"""
+type VersionDiffSummary {
+	summary: String!
+	nodesAdded: Int!
+	nodesRemoved: Int!
+	nodesChanged: Int!
+	edgesAdded: Int!
+	edgesRemoved: Int!
+	hasPublishedVersion: Boolean!
+}
+
+type WasmModule {
+	id: UUID!
+	name: String!
+	sizeBytes: Int!
+	contentHash: String!
+	compiledAt: String!
+	config: String!
+	capabilityWorld: String
+	importedInterfaces: [String!]
+	sourceCode: String
+	"""
+	Source language: "rust", "javascript", or "typescript". Defaults to "rust".
+	"""
+	language: String
+	capabilityDescription: String
+}
+
+"""
+A webhook payload that was dropped (e.g. circuit breaker) and persisted for replay.
+"""
+type WebhookDlqEntry {
+	id: UUID!
+	triggerId: UUID
+	sourceIp: String
+	"""
+	Reason the original request was dropped: 'circuit_breaker' | 'rate_limit' | 'sig_invalid' | 'disabled'
+	"""
+	dropReason: String!
+	"""
+	DLP-scrubbed request headers (auth headers stripped).
+	"""
+	headers: String
+	"""
+	DLP-scrubbed request payload.
+	"""
+	payload: String
+	createdAt: String!
+	replayedAt: String
+	replayedBy: UUID
+}
+
+type WebhookTrigger {
+	id: UUID!
+	name: String!
+	webhookUrl: String!
+	verificationToken: String
+	enabled: Boolean!
+	maxRequestsPerMinute: Int!
+	triggerCount: Int!
+	successCount: Int!
+	errorCount: Int!
+	lastTriggeredAt: String
+	"""
+	RFC 0007: the trigger's event filter, if any (null = fire on every
+	verified delivery). Read-only; set via `createWebhookTrigger`.
+	"""
+	eventFilter: JSON
+	module: WasmModule
+}
+
+type Workflow {
+	id: UUID!
+	name: String!
+	"""
+	Serialized representation of the graph (flexible JSON).
+	"""
+	graphJson: String!
+	"""
+	Maximum number of concurrent executions allowed (null = unlimited).
+	"""
+	maxConcurrentExecutions: Int
+	"""
+	Optional structured intent metadata.
+	"""
+	intent: JSON
+	"""
+	Actor that owns this workflow, if any.
+	"""
+	actorId: UUID
+}
+
+type WorkflowExecution {
+	id: UUID!
+	workflowId: UUID!
+	status: String!
+	startedAt: String!
+	completedAt: String
+	"""
+	How the execution was triggered: "manual", "scheduled", "webhook", "actor_dispatch", etc.
+	"""
+	triggerType: String
+	"""
+	Actor that dispatched this execution, if any.
+	"""
+	actorId: UUID
+	errorMessage: String
+	createdAt: String!
+	durationMs: Int
+	outputData: JSON
+}
+
+type WorkflowExecutionEvent {
+	workflowId: UUID!
+	executionId: UUID!
+	userId: UUID!
+	status: String!
+	startedAt: String!
+	errorMessage: String
+}
+
+type WorkflowScheduleObj {
+	id: UUID!
+	workflowId: UUID!
+	cronExpression: String!
+	timezone: String!
+	isEnabled: Boolean!
+	lastTriggeredAt: String
+	nextTriggerAt: String
+	createdAt: String!
+	updatedAt: String!
+}
+
+"""
+A single node's trace during a test workflow execution.
+Aggregated per-workflow stats for the dashboard.
+"""
+type WorkflowStats {
+	id: UUID!
+	name: String!
+	total: Int!
+	succeeded: Int!
+	failed: Int!
+	avgDurationSecs: Float
+}
+
+"""
+A published, immutable snapshot of a workflow graph.
+"""
+type WorkflowVersion {
+	id: UUID!
+	workflowId: UUID!
+	versionNumber: Int!
+	graphJson: String!
+	description: String
+	publishedAt: String!
+	publishedBy: UUID!
+	isActive: Boolean!
+	createdAt: String!
+}
+
+input WriteActorMemoryInput {
+	actorId: UUID!
+	key: String!
+	"""
+	JSON value to store.
+	"""
+	value: String!
+	"""
+	"working" | "episodic" | "semantic" | "scratchpad". Default: "working".
+	"""
+	memoryType: String
+	"""
+	Custom TTL in hours. Overrides memory_type default. Null = use type default.
+	"""
+	ttlHours: Float
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Provides a scalar specification URL for specifying the behavior of custom scalar types.
+"""
+directive @specifiedBy(url: String!) on SCALAR
+schema {
+	query: QueryRoot
+	mutation: MutationRoot
+	subscription: SubscriptionRoot
+}
+

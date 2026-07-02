@@ -34,6 +34,7 @@ mod input;
 mod outcome;
 mod replay;
 mod retry;
+mod terminal_event;
 mod trigger;
 
 pub use count_memory_write_nodes::count_memory_write_nodes;
@@ -84,6 +85,15 @@ pub struct ExecutionOrchestrationService {
     /// caller that needs raw pool access; everything else flows through
     /// the per-domain repositories.
     pub(crate) db_pool: sqlx::PgPool,
+    /// Optional live-event broadcast (the controller's global
+    /// `broadcast::Sender<ExecutionEvent>` that feeds the GraphQL
+    /// `executionUpdates` subscription). When set, the trigger dispatch
+    /// task emits terminal Completed/Failed events — previously only the
+    /// GraphQL-inline trigger path broadcast these, so MCP-triggered
+    /// executions never produced live subscription updates. `None` in
+    /// tests and non-controller embeddings.
+    pub(crate) event_sender:
+        Option<tokio::sync::broadcast::Sender<talos_engine::events::ExecutionEvent>>,
 }
 
 impl ExecutionOrchestrationService {
@@ -109,7 +119,20 @@ impl ExecutionOrchestrationService {
             nats_client,
             worker_shared_key,
             db_pool,
+            event_sender: None,
         }
+    }
+
+    /// Attach the controller's live-event broadcast channel (see the
+    /// `event_sender` field docs). Builder-style so the eight-arg `new`
+    /// signature stays stable.
+    #[must_use]
+    pub fn with_event_sender(
+        mut self,
+        sender: tokio::sync::broadcast::Sender<talos_engine::events::ExecutionEvent>,
+    ) -> Self {
+        self.event_sender = Some(sender);
+        self
     }
 
     // ---- Method stubs filled in by subsequent commits ---------------

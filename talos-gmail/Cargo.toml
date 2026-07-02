@@ -11,6 +11,7 @@ talos-http-utils = { path = "../talos-http-utils" }
 anyhow.workspace = true
 arc-swap = "1.7"
 async-nats = "0.47"
+async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 chrono.workspace = true

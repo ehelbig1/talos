@@ -581,4 +581,7 @@ pub fn get_prometheus_metrics() -> String {
 
 #[cfg(test)]
 #[path = "metrics_tests.rs"]
+// The included file wraps its content in its own `mod tests` —
+// latent clippy::module_inception surfaced by `--all-targets`.
+#[allow(clippy::module_inception)]
 mod tests;

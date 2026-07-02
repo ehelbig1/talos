@@ -211,7 +211,9 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
     store.setWorkflowMeta(workflow.id, workflow.name);
     store.setMaxConcurrentExecutions(workflow.maxConcurrentExecutions ?? 1);
     store.setPriority(graph.priority ?? "normal");
-    store.setIntent(workflow.intent ?? {});
+    store.setIntent(
+      (workflow.intent as Record<string, unknown> | null | undefined) ?? {},
+    );
     store.loadWorkflow({ nodes, edges });
   } catch (error) {
     if (import.meta.env.DEV) console.error("Failed to load workflow:", error);

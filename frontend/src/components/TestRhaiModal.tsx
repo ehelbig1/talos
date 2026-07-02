@@ -8,7 +8,7 @@ import {
   Code2,
   Play,
 } from "lucide-react";
-import { testRhaiExpression } from "@/lib/graphqlClient";
+import { testRhaiExpression } from "@/lib/graphqlApi";
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { LoadingSpinner } from "@/components/LoadingSpinner";

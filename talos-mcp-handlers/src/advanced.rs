@@ -794,36 +794,16 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "required": ["workflow_id"]
             }
         }),
-        // MCP-568: enable_workflow / disable_workflow round-trip the
-        // `workflows.is_enabled` column. Pre-fix this column was set
-        // only by the migration default (true) and read by
-        // `replay_execution`'s `is_workflow_enabled` check — but the
-        // pre-flight error message ("Workflow is disabled. Use
-        // enable_workflow to re-enable.") referenced a tool that
-        // didn't exist. Either the message lied or the column was
-        // dead. Wiring the setters honours the contract.
-        serde_json::json!({
-            "name": "disable_workflow",
-            "description": "Temporarily disable a workflow without deleting it. Disabled workflows refuse replay_execution / retry_execution with a clear error pointing at enable_workflow. Triggers, schedules, and webhooks continue to fire — use pause_schedule / disable_webhook to stop those. Use archive_workflow for permanent retirement.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow to disable" }
-                },
-                "required": ["workflow_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "enable_workflow",
-            "description": "Re-enable a workflow that was previously disabled via disable_workflow. Restores replay_execution / retry_execution access.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow to enable" }
-                },
-                "required": ["workflow_id"]
-            }
-        }),
+        // MCP-568 historical note: enable_workflow / disable_workflow
+        // (round-tripping `workflows.is_enabled`, read by
+        // `replay_execution`'s `is_workflow_enabled` check) were first
+        // wired HERE, but `workflows.rs` grew its own advertisement +
+        // dispatch arms for the same names — and since
+        // `workflows::dispatch` runs before `advanced::dispatch` in
+        // handle_tools_call, this module's copies were dead at runtime
+        // and double-advertised in tools/list (caught by
+        // schema_parity_tests, 2026-07-01). The single owner is now
+        // workflows.rs; do not re-add the tools here.
         serde_json::json!({
             "name": "star_module",
             "description": "Star a marketplace module to signal that it is high-quality and tested. Stars are visible to all users via list_published_modules.",
@@ -1049,12 +1029,9 @@ pub async fn dispatch(
         }
         "list_published_modules" => Some(handle_list_published_modules(req_id, args, state).await),
         "archive_workflow" => Some(handle_archive_workflow(req_id, args, state, user_id).await),
-        "enable_workflow" => {
-            Some(handle_set_workflow_enabled(req_id, args, state, user_id, true).await)
-        }
-        "disable_workflow" => {
-            Some(handle_set_workflow_enabled(req_id, args, state, user_id, false).await)
-        }
+        // enable_workflow / disable_workflow live in workflows.rs (see the
+        // MCP-568 historical note in tool_schemas above) — arms here would
+        // be dead code because workflows::dispatch runs first.
         "star_module" => Some(handle_star_module(req_id, args, state, user_id).await),
         "get_config_suggestions" => {
             Some(handle_get_config_suggestions(req_id, args, state, user_id).await)
@@ -2748,58 +2725,6 @@ async fn handle_archive_workflow(
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, "archive_workflow failed: {}", e);
             mcp_error(req_id, -32000, "Failed to archive workflow")
-        }
-    }
-}
-
-/// MCP-568: enable/disable a workflow. Thin wrapper over
-/// `WorkflowRepository::set_workflow_enabled` — the user-facing replay
-/// error message (`utils.rs:313`) already advertised `enable_workflow`,
-/// so this closes a 1-year UX gap where operators saw the error but
-/// found no MCP tool to act on it.
-async fn handle_set_workflow_enabled(
-    req_id: Option<serde_json::Value>,
-    args: &serde_json::Value,
-    state: &McpState,
-    user_id: Uuid,
-    enabled: bool,
-) -> JsonRpcResponse {
-    let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
-        Ok(id) => id,
-        Err(resp) => return resp,
-    };
-
-    match state
-        .workflow_repo
-        .set_workflow_enabled(wf_id, user_id, enabled)
-        .await
-    {
-        Ok(true) => {
-            let status = if enabled { "enabled" } else { "disabled" };
-            let message = if enabled {
-                "Workflow re-enabled. replay_execution / retry_execution will resume working."
-            } else {
-                "Workflow disabled. replay_execution / retry_execution will refuse until enable_workflow is called. Note: schedules, webhooks, and triggers continue to fire — use pause_schedule / disable_webhook to stop those."
-            };
-            mcp_text(
-                req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "workflow_id": wf_id.to_string(),
-                    "status": status,
-                    "message": message,
-                }))
-                .unwrap_or_default(),
-            )
-        }
-        Ok(false) => mcp_error(req_id, -32000, "Workflow not found or access denied"),
-        Err(e) => {
-            tracing::error!(
-                workflow_id = %wf_id,
-                enabled,
-                "set_workflow_enabled failed: {}",
-                e
-            );
-            mcp_error(req_id, -32000, "Failed to update workflow enabled state")
         }
     }
 }

@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { CopyField } from "@/components/ui/CopyField";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
-import { listMcpAgents, revokeMcpAgent, McpAgent } from "@/lib/graphqlClient";
+import { listMcpAgents, revokeMcpAgent, McpAgent } from "@/lib/graphqlApi";
 import { gql } from "@/lib/graphqlClient";
 import {
   useRegisterMcpAgentMutation,

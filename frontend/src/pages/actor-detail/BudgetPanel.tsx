@@ -5,7 +5,7 @@ import {
   getActorExecutionsSummary,
   type ActorDetails,
   type ActorExecutionsSummary,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
 import { StatCard } from "./shared";
 
 export function BudgetPanel({

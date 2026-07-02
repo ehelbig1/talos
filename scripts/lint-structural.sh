@@ -42,6 +42,16 @@ green()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 
+# Machine-readable check count, derived from the runtime `▶ check N:`
+# markers so it can't drift from the checks themselves. Used by the
+# self-consistency meta-check (the last check) and by docs tooling:
+#   bash scripts/lint-structural.sh --count   → prints N, exits 0
+CHECK_COUNT="$(grep -cE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}")"
+if [[ "${1:-}" == "--count" ]]; then
+    echo "$CHECK_COUNT"
+    exit 0
+fi
+
 EXIT_CODE=0
 
 # ── 1. Raw actor_memory SQL + legacy value-column projections ─────────
@@ -3347,6 +3357,71 @@ if [ "$INTEG_CLIENT_VIOLATIONS" -gt 0 ]; then
     EXIT_CODE=1
 else
     green "✓ integration crates build HTTP clients via the shared hardened builder"
+fi
+echo
+
+# ── 50. Raw sqlx in talos-api/src/schema — RATCHET ────────────────────
+# talos-mcp-handlers went 371 → 0 raw-sqlx sites under check 6; the
+# GraphQL schema tree never got the same treatment and sat at 117 sites
+# (2026-07-01 review) — on the surface where RLS/tenancy stakes are
+# highest. Full check-6-style prohibition would block every PR touching
+# the debt, so this is a RATCHET: the count may only go DOWN. New inline
+# SQL in talos-api/src/schema fails the lint; burning down existing debt
+# lowers the baseline (update TALOS_API_SQLX_BASELINE when you do).
+# Same playbook as check 6: push the SQL into the relevant repository
+# crate and call it from the resolver.
+bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count must not grow)"
+# 117 at introduction (2026-07-01); 108 after the trigger_workflow
+# migration onto ExecutionOrchestrationService removed 9 inline sites.
+TALOS_API_SQLX_BASELINE=108
+API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
+        --include='*.rs' \
+        talos-api/src/schema 2>/dev/null \
+    | awk -F: '{s+=$2} END {print s+0}')"
+if [ "$API_SQLX_COUNT" -gt "$TALOS_API_SQLX_BASELINE" ]; then
+    red "✗ raw sqlx::query sites in talos-api/src/schema grew: ${API_SQLX_COUNT} > baseline ${TALOS_API_SQLX_BASELINE}"
+    yellow "  → new resolver SQL goes in a repository crate (same rule as talos-mcp-handlers, check 6)."
+    yellow "  → if you MOVED existing SQL (site count unchanged overall), re-run to confirm;"
+    yellow "    the ratchet counts sites, not diffs."
+    EXIT_CODE=1
+elif [ "$API_SQLX_COUNT" -lt "$TALOS_API_SQLX_BASELINE" ]; then
+    yellow "⚠ talos-api sqlx debt burned down: ${API_SQLX_COUNT} < baseline ${TALOS_API_SQLX_BASELINE}"
+    yellow "  → lower TALOS_API_SQLX_BASELINE in scripts/lint-structural.sh (check 50) to lock in the progress."
+    green "✓ talos-api/src/schema raw-sqlx ratchet holds (${API_SQLX_COUNT}/${TALOS_API_SQLX_BASELINE})"
+else
+    green "✓ talos-api/src/schema raw-sqlx ratchet holds (${API_SQLX_COUNT}/${TALOS_API_SQLX_BASELINE})"
+fi
+echo
+
+# ── 51. Lint self-consistency (meta-check) ────────────────────────────
+# The system whose purpose is catching drift drifted from its own docs:
+# by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
+# pre-push hook comment said 40 — three sources, three numbers. Assert
+# (a) check numbers are contiguous 1..N with no dupes/gaps (a gap means
+# a renumber went wrong or a check was deleted without renumbering), and
+# (b) CLAUDE.md's "N checks today" sentence matches the real count. The
+# pre-push hook no longer states a number (it points at --count).
+bold "▶ check 51: lint self-consistency (check numbering + documented count)"
+ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
+EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"
+META_FAIL=0
+if [ "$ACTUAL_NUMS" != "$EXPECTED_NUMS" ]; then
+    red "✗ check numbers are not contiguous 1..$CHECK_COUNT (duplicate or gap)"
+    yellow "  → diff of expected vs actual check numbers:"
+    diff <(echo "$EXPECTED_NUMS") <(echo "$ACTUAL_NUMS") | sed 's/^/    /' || true
+    META_FAIL=1
+fi
+if ! grep -q "${CHECK_COUNT} checks today" CLAUDE.md; then
+    DOC_CLAIM="$(grep -oE '[0-9]+ checks today' CLAUDE.md | head -1 || true)"
+    red "✗ CLAUDE.md check count is stale: says '${DOC_CLAIM:-<none found>}', script has ${CHECK_COUNT}"
+    yellow "  → update the '<N> checks today' sentence in CLAUDE.md's pre-deploy section"
+    yellow "    (and add a one-line entry for any new check to the numbered list)."
+    META_FAIL=1
+fi
+if [ "$META_FAIL" -gt 0 ]; then
+    EXIT_CODE=1
+else
+    green "✓ ${CHECK_COUNT} checks, contiguous numbering, CLAUDE.md count in sync"
 fi
 echo
 

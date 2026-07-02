@@ -130,13 +130,21 @@ impl SsrfFilteringResolver {
     ///      2026-05-22).
     ///   3. The queried hostname is in this execution's explicit
     ///      `allowed_hosts` (no `*` wildcards).
+    ///
+    /// `#[cfg(test)]`: test-only pure mirror of the inline decision in
+    /// `resolve()` (which additionally folds in `local_egress_only`).
+    /// No production caller — compiled for tests only so the dead-code
+    /// lint stays honest for release builds.
+    #[cfg(test)]
     fn bypass_allowed(&self, host_lower: &str, env_toggle_on: bool) -> bool {
         self.bypass_allowed_with_prod(host_lower, env_toggle_on, false)
     }
 
-    /// Production-aware variant. Public for testing — callers in
+    /// Production-aware variant. Exists for testing — callers in
     /// production paths use the env- and production-aware shape via
-    /// `resolve()`.
+    /// `resolve()`. `#[cfg(test)]` for the same reason as
+    /// [`Self::bypass_allowed`].
+    #[cfg(test)]
     pub(crate) fn bypass_allowed_with_prod(
         &self,
         host_lower: &str,
