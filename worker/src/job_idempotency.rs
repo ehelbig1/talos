@@ -113,7 +113,7 @@ struct Entry<V> {
 /// `JobResult` (re-published via `publish_result_with_retry`) and the pipeline
 /// path stores the already-serialized publish `Bytes` (re-published verbatim) —
 /// the bound/TTL/sweep logic is identical for both.
-pub(crate) struct JobResultCache<V> {
+pub struct JobResultCache<V> {
     map: DashMap<Uuid, Entry<V>>,
 }
 
@@ -125,7 +125,7 @@ impl<V: Clone> JobResultCache<V> {
     }
 
     /// Return the cached result for `job_id` if present and not expired.
-    pub(crate) fn get(&self, job_id: Uuid) -> Option<V> {
+    pub fn get(&self, job_id: Uuid) -> Option<V> {
         self.get_at(job_id, Instant::now())
     }
 
@@ -143,7 +143,7 @@ impl<V: Clone> JobResultCache<V> {
     /// result as it will be published; oversized results are skipped. No-op for
     /// a result whose serialized form exceeds the size cap or when the cache is
     /// full of live entries.
-    pub(crate) fn put(&self, job_id: Uuid, result: V, serialized_len: usize) {
+    pub fn put(&self, job_id: Uuid, result: V, serialized_len: usize) {
         self.put_at(job_id, result, serialized_len, Instant::now());
     }
 
@@ -170,7 +170,7 @@ impl<V: Clone> JobResultCache<V> {
 
     /// Drop expired entries. Called from a periodic sweep task and from the
     /// put-path when at capacity.
-    pub(crate) fn sweep(&self) {
+    pub fn sweep(&self) {
         self.sweep_at(Instant::now());
     }
 
@@ -188,17 +188,17 @@ impl<V: Clone> JobResultCache<V> {
 /// Process-global completed single-job-result cache. Keyed on `job_id` (a fresh
 /// v4 UUID per dispatch, preserved across transport retries), so there is no
 /// cross-job key collision.
-pub(crate) static JOB_RESULT_CACHE: LazyLock<JobResultCache<JobResult>> =
+pub static JOB_RESULT_CACHE: LazyLock<JobResultCache<JobResult>> =
     LazyLock::new(JobResultCache::new);
 
 // ── Redis tier (fleet-wide dedup across queue-group members) ─────────────
 
 /// Redis key prefix for completed single-job results (serialized signed
 /// `JobResult` JSON).
-pub(crate) const REDIS_JOB_PREFIX: &str = "talos:idem:job:";
+pub const REDIS_JOB_PREFIX: &str = "talos:idem:job:";
 /// Redis key prefix for completed pipeline publish payloads (serialized
 /// signed `PipelineJobResult` JSON, exactly the bytes that were published).
-pub(crate) const REDIS_PIPELINE_PREFIX: &str = "talos:idem:pipe:";
+pub const REDIS_PIPELINE_PREFIX: &str = "talos:idem:pipe:";
 /// Redis entry TTL — matches [`CACHE_TTL`] for the same reason (must exceed
 /// the controller retry window, pointless past the 300 s result-freshness
 /// window).
@@ -214,7 +214,7 @@ static REDIS_CM: tokio::sync::OnceCell<redis::aio::ConnectionManager> =
 /// Wire the fleet-wide tier to the worker's Redis. Call once at startup;
 /// failure to connect is a WARN + same-worker-only degradation, never fatal
 /// (matching the OCI cache's posture toward Redis availability).
-pub(crate) async fn init_redis(client: redis::Client) {
+pub async fn init_redis(client: redis::Client) {
     match redis::aio::ConnectionManager::new(client).await {
         Ok(cm) => {
             if REDIS_CM.set(cm).is_ok() {
@@ -231,7 +231,7 @@ pub(crate) async fn init_redis(client: redis::Client) {
 /// Fetch a cached serialized result from the fleet-wide tier. `None` on
 /// miss, Redis-unconfigured, Redis error, or an oversized entry (which is
 /// also deleted — it can only be garbage, `shared_put` never writes one).
-pub(crate) async fn shared_get(prefix: &str, job_id: Uuid) -> Option<Vec<u8>> {
+pub async fn shared_get(prefix: &str, job_id: Uuid) -> Option<Vec<u8>> {
     let mut cm = REDIS_CM.get()?.clone();
     let key = format!("{prefix}{job_id}");
     match redis::cmd("GET")
@@ -261,7 +261,7 @@ pub(crate) async fn shared_get(prefix: &str, job_id: Uuid) -> Option<Vec<u8>> {
 /// oversized entries are skipped (same cap as the local tier) and Redis
 /// errors are logged at debug — the local tier already covers same-worker
 /// retries.
-pub(crate) async fn shared_put(prefix: &str, job_id: Uuid, bytes: &[u8]) {
+pub async fn shared_put(prefix: &str, job_id: Uuid, bytes: &[u8]) {
     if bytes.len() > MAX_CACHED_RESULT_BYTES {
         return;
     }
@@ -284,14 +284,14 @@ pub(crate) async fn shared_put(prefix: &str, job_id: Uuid, bytes: &[u8]) {
 /// double-execution exposure as the single-job path; the pipeline handler
 /// publishes already-serialized `Bytes` (post size-gating), so we cache and
 /// re-publish those bytes verbatim rather than the typed `PipelineJobResult`.
-pub(crate) static PIPELINE_PAYLOAD_CACHE: LazyLock<JobResultCache<bytes::Bytes>> =
+pub static PIPELINE_PAYLOAD_CACHE: LazyLock<JobResultCache<bytes::Bytes>> =
     LazyLock::new(JobResultCache::new);
 
 /// Interval for the background sweep of expired entries. Read-path eviction
 /// handles active job_ids; this reaps entries for workers that go idle so the
 /// map can't retain expired results indefinitely (CLAUDE.md cache rule:
 /// TTL cache = read-path eviction + periodic sweep).
-pub(crate) const SWEEP_INTERVAL_SECS: u64 = 60;
+pub const SWEEP_INTERVAL_SECS: u64 = 60;
 
 #[cfg(test)]
 mod tests {

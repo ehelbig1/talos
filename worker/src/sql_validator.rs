@@ -200,11 +200,6 @@ fn is_ddl(stmt: &Statement) -> bool {
     )
 }
 
-/// Check whether a statement is a mutation (INSERT/UPDATE/DELETE).
-fn is_mutation(stmt: &Statement) -> bool {
-    matches!(statement_type(stmt), "INSERT" | "UPDATE" | "DELETE")
-}
-
 /// MCP-472: classify a parsed statement as unconditionally blocked,
 /// returning the canonical label for the error message. None means the
 /// statement is not on the deny-list (the regular DDL / allowlist

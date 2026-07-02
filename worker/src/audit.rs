@@ -13,4 +13,7 @@ pub use talos_audit_event::{AuditEvent, ExecutionLedger};
 
 #[cfg(test)]
 #[path = "audit_tests.rs"]
+// The included file wraps its content in its own `mod tests` —
+// latent clippy::module_inception surfaced by `--all-targets`.
+#[allow(clippy::module_inception)]
 mod tests;

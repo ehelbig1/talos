@@ -40,7 +40,7 @@ use worker::CapabilityWorld;
 /// rejection MUST come from the tier-1 gate (not from the
 /// allowed_hosts check that would otherwise short-circuit first).
 fn make_tier1_context_with_llm_host(world: CapabilityWorld, llm_host: &str) -> TalosContext {
-    let ctx = TalosContext::new(
+    TalosContext::new(
         world,
         vec![llm_host.to_string()],
         vec![],
@@ -57,8 +57,7 @@ fn make_tier1_context_with_llm_host(world: CapabilityWorld, llm_host: &str) -> T
         // which no longer reconfigures the resolver.)
         talos_workflow_job_protocol::LlmTier::Tier1,
     )
-    .expect("failed to create TalosContext");
-    ctx
+    .expect("failed to create TalosContext")
 }
 
 // ---------------------------------------------------------------------------
