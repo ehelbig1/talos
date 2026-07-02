@@ -597,6 +597,18 @@ impl wit_data_transform::Host for TalosContext {
     }
 }
 
+/// Append a text fragment to the element-under-construction's `#text`
+/// value. Fragments accumulate because quick-xml 0.38+ splits a logical
+/// text run around entity references (Text / GeneralRef / Text).
+fn append_xml_text(obj: &mut serde_json::Map<String, serde_json::Value>, fragment: &str) {
+    let entry = obj
+        .entry("#text".to_string())
+        .or_insert_with(|| serde_json::Value::String(String::new()));
+    if let serde_json::Value::String(t) = entry {
+        t.push_str(fragment);
+    }
+}
+
 /// Very simple XML → JSON converter (element names become keys, text content becomes values).
 fn xml_string_to_json(xml: &str) -> Result<serde_json::Value, wit_data_transform::Error> {
     use quick_xml::events::Event;
@@ -606,8 +618,12 @@ fn xml_string_to_json(xml: &str) -> Result<serde_json::Value, wit_data_transform
     /// Maximum nesting depth to prevent stack exhaustion via deeply nested XML.
     const MAX_XML_DEPTH: usize = 1_000;
 
+    // No reader-level trim_text: post-0.38 a text run splits into
+    // fragments around entity references, and per-FRAGMENT trimming
+    // would eat interior spaces ("a &amp; b" → "a&b"). Fragments are
+    // assembled raw; the whole run is trimmed once at element close,
+    // matching the pre-0.38 whole-text-node trim.
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut stack: VecDeque<(String, serde_json::Map<String, serde_json::Value>)> = VecDeque::new();
     let mut root: Option<serde_json::Value> = None;
@@ -624,19 +640,61 @@ fn xml_string_to_json(xml: &str) -> Result<serde_json::Value, wit_data_transform
             }
             Ok(Event::Text(e)) => {
                 if let Some((_, obj)) = stack.back_mut() {
+                    // quick-xml 0.38+ (RUSTSEC-2026-0194/0195 bump): Text
+                    // events are plain character data — entity references
+                    // arrive as separate GeneralRef events (below), which
+                    // also means one logical text run can split into
+                    // Text/GeneralRef/Text. APPEND rather than insert so
+                    // "a &amp; b" still assembles into one "#text" value
+                    // (the pre-0.38 BytesText::unescape behavior).
                     let text = e
-                        .unescape()
+                        .decode()
                         .map_err(|_| wit_data_transform::Error::Parseerror)?;
-                    if !text.trim().is_empty() {
-                        obj.insert(
-                            "#text".to_string(),
-                            serde_json::Value::String(text.to_string()),
-                        );
+                    append_xml_text(obj, &text);
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Some((_, obj)) = stack.back_mut() {
+                    // Numeric char refs (&#49; / &#x30;) resolve directly;
+                    // the five XML-predefined entities are mapped by name.
+                    // Unknown entities are dropped — this lenient converter
+                    // never supported custom DTD entities (the old
+                    // unescape() errored on them, mapped to Parseerror; we
+                    // stay lenient-but-lossless for everything that was
+                    // previously representable).
+                    let resolved: Option<String> = match e.resolve_char_ref() {
+                        Ok(Some(ch)) => Some(ch.to_string()),
+                        _ => match e.decode().as_deref() {
+                            Ok("lt") => Some("<".to_string()),
+                            Ok("gt") => Some(">".to_string()),
+                            Ok("amp") => Some("&".to_string()),
+                            Ok("apos") => Some("'".to_string()),
+                            Ok("quot") => Some("\"".to_string()),
+                            _ => None,
+                        },
+                    };
+                    match resolved {
+                        Some(s) => append_xml_text(obj, &s),
+                        // Pre-0.38 unescape() failed the whole conversion on
+                        // an unknown entity — preserve that contract.
+                        None => return Err(wit_data_transform::Error::Parseerror),
                     }
                 }
             }
             Ok(Event::End(_)) => {
-                if let Some((name, obj)) = stack.pop_back() {
+                if let Some((name, mut obj)) = stack.pop_back() {
+                    // Whole-run trim (see the reader-config note above):
+                    // trim the assembled #text once; drop it entirely when
+                    // whitespace-only (inter-element formatting).
+                    if let Some(serde_json::Value::String(t)) = obj.get("#text") {
+                        let trimmed = t.trim();
+                        if trimmed.is_empty() {
+                            obj.remove("#text");
+                        } else if trimmed.len() != t.len() {
+                            let trimmed = trimmed.to_string();
+                            obj.insert("#text".to_string(), serde_json::Value::String(trimmed));
+                        }
+                    }
                     let value = if obj.len() == 1 && obj.contains_key("#text") {
                         obj["#text"].clone()
                     } else {
