@@ -534,9 +534,12 @@ impl TotpService {
         let encrypted_bytes = STANDARD
             .decode(parts[1])
             .map_err(|_| anyhow!("Invalid base64 in encrypted TOTP secret"))?;
+        // `decrypt_versioned` now returns `Result<_, SecretsError>`; this
+        // method's contract is `anyhow::Result`, so map into anyhow.
         self.secrets_manager
             .decrypt_versioned(key_id, &encrypted_bytes, user_id.as_bytes(), format_version)
             .await
+            .map_err(Into::into)
     }
 
     /// Enable 2FA for a user.

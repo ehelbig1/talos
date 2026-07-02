@@ -65,9 +65,13 @@ impl talos_memory::MemoryCryptoHook for SecretsManagerMemoryCrypto {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<zeroize::Zeroizing<String>>> + Send>> {
         let secrets = self.secrets.clone();
         Box::pin(async move {
+            // `decrypt_versioned` now returns `Result<_, SecretsError>`;
+            // this trait method's contract is `anyhow::Result`, so map the
+            // typed error into anyhow (it impls `std::error::Error`).
             secrets
                 .decrypt_versioned(key_id, &ciphertext, &aad, format_version)
                 .await
+                .map_err(Into::into)
         })
     }
 }
