@@ -101,7 +101,7 @@ function statusStyle(status: string) {
   return STATUS_STYLES[status.toLowerCase()] ?? STATUS_STYLES["cancelled"];
 }
 
-export default function WorkflowExecutionHistory({
+export default function WorkflowExecutionHistoryDialog({
   workflowId,
   workflowName,
   onClose,

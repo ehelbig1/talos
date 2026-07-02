@@ -2,7 +2,7 @@ import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import React, { useState, useMemo, memo } from "react";
 import { type NodeTemplate, useTemplates } from "@/lib/useTemplates";
-import { graphqlRequest } from "@/lib/graphqlClient";
+import { useCreateModuleFromTemplateMutation } from "@/generated/graphql";
 import { ConfigForm, type JSONSchema } from "@/components/builder/ConfigForm";
 import {
   Search,
@@ -64,6 +64,8 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState<string>("all");
+
+  const createModuleMutation = useCreateModuleFromTemplateMutation();
 
   const selectedTemplate = templates.find((t) => t.id === selectedTemplateId);
 
@@ -135,23 +137,13 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
     setError(null);
 
     try {
-      const data = await graphqlRequest<{
-        createModuleFromTemplate: { id: string; name: string };
-      }>(
-        `mutation CreateModule($input: CreateModuleInput!) {
-          createModuleFromTemplate(input: $input) {
-            id
-            name
-          }
-        }`,
-        {
-          input: {
-            templateId: selectedTemplateId,
-            name: moduleName,
-            config: JSON.stringify(config),
-          },
+      const data = await createModuleMutation.mutateAsync({
+        input: {
+          templateId: selectedTemplateId,
+          name: moduleName,
+          config: JSON.stringify(config),
         },
-      );
+      });
 
       onModuleCreated(
         data.createModuleFromTemplate.id,

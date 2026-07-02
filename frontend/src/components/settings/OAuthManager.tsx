@@ -20,14 +20,13 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { gql, graphqlRequest } from "@/lib/graphqlClient";
+import { gql } from "@/lib/graphqlClient";
+import { getOAuthLoginUrl } from "@/lib/graphqlApi";
 import { validateOAuthUrl, loadOAuthHosts } from "@/lib/oauthUtils";
 import {
   useListLinkedAccountsQuery,
   useUnlinkOAuthMutation,
   ListLinkedAccountsQuery,
-  GetOAuthUrlDocument,
-  GetOAuthUrlQuery,
 } from "@/generated/graphql";
 
 const LIST_LINKED_ACCOUNTS = gql`
@@ -126,22 +125,19 @@ export default function OAuthManager() {
     // previously-linked provider's id.
     setLinkingProvider(providerId);
     try {
-      const urlData = await graphqlRequest<GetOAuthUrlQuery>(
-        GetOAuthUrlDocument,
-        { provider: providerId },
-      );
-      if (urlData?.oauthLoginUrl?.authUrl) {
+      const authUrl = await getOAuthLoginUrl(providerId);
+      if (authUrl) {
         // 2026-05-28 review (low): gate the top-level navigation through the
         // same open-redirect guard the sibling redirect sites use
         // (IntegrationsManager, SlackAppSelector). Defends against a
         // backend-minted authUrl ever pointing off-allowlist.
-        if (!validateOAuthUrl(urlData.oauthLoginUrl.authUrl)) {
+        if (!validateOAuthUrl(authUrl)) {
           toast.error("Invalid OAuth authorization URL received from server");
           setLinkingProvider(null);
           return;
         }
         // eslint-disable-next-line react-hooks/immutability -- intentional browser navigation to the OAuth login URL in an async handler (not a render-time mutation of external state); the URL is validated above.
-        window.location.href = urlData.oauthLoginUrl.authUrl;
+        window.location.href = authUrl;
       }
     } catch (err: unknown) {
       toast.error(

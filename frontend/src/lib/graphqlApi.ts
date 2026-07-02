@@ -24,6 +24,7 @@ import {
   GetActorWorkflowsDocument,
   GetMyCapabilityCeilingDocument,
   GetNodeTemplatesDocument,
+  GetOAuthUrlDocument,
   GetWorkflowExecutionHistoryDocument,
   ListActorSummariesDocument,
   ListMcpAgentsDocument,
@@ -356,6 +357,20 @@ export const getNodeTemplates = async (
     { category: category ?? null },
   );
   return response.nodeTemplates;
+};
+
+// --- OAuth ---
+
+// Imperative on purpose: the OAuth-link handler needs the freshly-clicked
+// provider id, not a value captured in a hook's render-time closure
+// (MCP-863). Kept as a wrapper so components never touch the transport.
+export const getOAuthLoginUrl = async (
+  provider: string,
+): Promise<string | null> => {
+  const response = await graphqlRequest<{
+    oauthLoginUrl: { authUrl: string } | null;
+  }>(GetOAuthUrlDocument, { provider });
+  return response.oauthLoginUrl?.authUrl ?? null;
 };
 
 // --- Integrations & MCP Agents ---

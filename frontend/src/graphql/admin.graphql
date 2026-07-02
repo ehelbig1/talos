@@ -114,3 +114,31 @@ mutation UpdateSecret($input: UpdateSecretInput!) {
     keyPath
   }
 }
+
+query GetCapabilityCeilingDetail {
+  capabilityCeilingDetail {
+    ceiling
+    source
+    grantedByEmail
+    grantedAt
+    notes
+  }
+}
+
+query GetCapabilityWorldHierarchy {
+  capabilityWorldHierarchy {
+    name
+    rank
+    description
+  }
+}
+
+mutation RevokeCapabilityCeiling($userId: UUID!) {
+  revokeCapabilityCeiling(userId: $userId)
+}
+
+query GetCurrentUserId {
+  me {
+    id
+  }
+}

@@ -1,11 +1,11 @@
 import React from "react";
 import { render, screen, fireEvent, waitFor } from "../test-utils";
-import { WorkflowExecutionHistory } from "./WorkflowExecutionHistory";
+import { WorkflowExecutionHistoryPanel } from "./WorkflowExecutionHistoryPanel";
 import { describe, it, expect, beforeEach } from "vitest";
 import { server } from "../../vitest.setup";
 import { http, HttpResponse } from "msw";
 
-describe("WorkflowExecutionHistory", () => {
+describe("WorkflowExecutionHistoryPanel", () => {
   const workflowId = "workflow-1";
 
   beforeEach(() => {
@@ -44,12 +44,12 @@ describe("WorkflowExecutionHistory", () => {
   });
 
   it("renders loading state initially", async () => {
-    render(<WorkflowExecutionHistory workflowId={workflowId} />);
+    render(<WorkflowExecutionHistoryPanel workflowId={workflowId} />);
     expect(screen.getByText(/Synchronizing Registry/i)).toBeInTheDocument();
   });
 
   it("renders execution list after loading", async () => {
-    render(<WorkflowExecutionHistory workflowId={workflowId} />);
+    render(<WorkflowExecutionHistoryPanel workflowId={workflowId} />);
 
     await waitFor(() => {
       expect(screen.getByText("completed")).toBeInTheDocument();
@@ -61,7 +61,7 @@ describe("WorkflowExecutionHistory", () => {
   });
 
   it("expands execution details on click", async () => {
-    render(<WorkflowExecutionHistory workflowId={workflowId} />);
+    render(<WorkflowExecutionHistoryPanel workflowId={workflowId} />);
 
     await waitFor(() => {
       expect(screen.getByText("completed")).toBeInTheDocument();
@@ -75,7 +75,7 @@ describe("WorkflowExecutionHistory", () => {
   });
 
   it("shows error message for failed executions when expanded", async () => {
-    render(<WorkflowExecutionHistory workflowId={workflowId} />);
+    render(<WorkflowExecutionHistoryPanel workflowId={workflowId} />);
 
     await waitFor(() => {
       expect(screen.getByText("failed")).toBeInTheDocument();

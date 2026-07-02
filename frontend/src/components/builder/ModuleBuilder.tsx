@@ -18,11 +18,10 @@ import { ConfigForm, type JSONSchema } from "./ConfigForm";
 import { GoogleCalendarSelector } from "./GoogleCalendarSelector";
 import { toast } from "sonner";
 import { getTemplateDefaults } from "@/lib/smartConfig";
-import { useQuery } from "@tanstack/react-query";
-import { graphqlRequest } from "@/lib/graphqlClient";
 import {
   useCreateModuleFromTemplateMutation,
   useCreateWebhookTriggerMutation,
+  useGetNodeTemplateQuery,
 } from "@/generated/graphql";
 import { InfoTip } from "@/components/ui/InfoTip";
 import { InfoBanner } from "@/components/ui/InfoBanner";
@@ -41,15 +40,6 @@ import {
 } from "lucide-react";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
-
-interface NodeTemplateDetails {
-  id: string;
-  name: string;
-  category: string;
-  description?: string;
-  configSchema?: string;
-  icon?: string;
-}
 
 interface ModuleBuilderProps {
   open: boolean;
@@ -82,38 +72,18 @@ export function ModuleBuilder({
   } | null>(null);
   const [ipInput, setIpInput] = useState("");
 
-  // Fetch full template details when one is selected
+  // Fetch full template details when one is selected. The generated hook
+  // returns `{ nodeTemplate }`; map it to the flat `selectedTemplate` shape
+  // the rest of the component consumes.
   const {
-    data: selectedTemplate,
+    data: templateData,
     isLoading: templateLoading,
     error: templateError,
-  } = useQuery({
-    queryKey: ["template", selectedTemplateId],
-    queryFn: async () => {
-      if (!selectedTemplateId) return null;
-
-      const query = `
-        query GetTemplate($id: UUID!) {
-          nodeTemplate(id: $id) {
-            id
-            name
-            category
-            description
-            configSchema
-            icon
-          }
-        }
-      `;
-      const result = await graphqlRequest<{
-        nodeTemplate: NodeTemplateDetails;
-      }>(query, {
-        id: selectedTemplateId,
-      });
-
-      return result.nodeTemplate;
-    },
-    enabled: !!selectedTemplateId,
-  });
+  } = useGetNodeTemplateQuery(
+    { id: selectedTemplateId ?? "" },
+    { enabled: !!selectedTemplateId },
+  );
+  const selectedTemplate = templateData?.nodeTemplate ?? null;
 
   // Apply smart defaults once a freshly-selected template's details
   // arrive. Done during render via the "store information from previous

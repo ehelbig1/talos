@@ -22,7 +22,7 @@ import {
   SectionHeader,
   CopyField,
 } from "@/components/ui";
-import { WorkflowExecutionHistory } from "../WorkflowExecutionHistory";
+import { WorkflowExecutionHistoryPanel } from "../WorkflowExecutionHistoryPanel";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useShallow } from "zustand/react/shallow";
 import { cn } from "@/lib/utils";
@@ -409,7 +409,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           className="flex-1 overflow-auto p-4 custom-scrollbar focus:outline-none"
         >
           {workflowId ? (
-            <WorkflowExecutionHistory workflowId={workflowId} />
+            <WorkflowExecutionHistoryPanel workflowId={workflowId} />
           ) : (
             <div className="h-full flex flex-col items-center justify-center p-12 text-center space-y-8 opacity-20 grayscale">
               <div className="p-10 rounded-[3.5rem] bg-surface-3/40 border border-white/5 shadow-2xl relative overflow-hidden group">

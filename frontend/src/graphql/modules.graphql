@@ -20,6 +20,7 @@ query MyModules($limit: Int, $offset: Int) {
 mutation CreateModuleFromTemplate($input: CreateModuleInput!) {
   createModuleFromTemplate(input: $input) {
     id
+    name
     config
   }
 }
@@ -44,5 +45,16 @@ query GetNodeTemplates($category: String) {
     configSchema
     icon
     allowedHosts
+  }
+}
+
+query GetNodeTemplate($id: UUID!) {
+  nodeTemplate(id: $id) {
+    id
+    name
+    category
+    description
+    configSchema
+    icon
   }
 }
