@@ -330,6 +330,193 @@ mod worker_id_validation_tests {
     }
 }
 
+// ============================================================================
+// Shared sign/verify core — `SignedMessage`
+// ============================================================================
+//
+// Every signed NATS message type in this crate (`JobRequest`, `JobResult`,
+// `PipelineJobRequest`, `PipelineJobResult`, `WorkerHeartbeat`) shares the
+// exact same HMAC / nonce-freshness / replay-cache / key-ring machinery.
+// Historically each type carried its own hand-rolled copy of that logic
+// (~5 near-identical families) — a drift surface for subtle security code
+// (this crate carries the r300/r301 dual-verify incident history). The
+// crate-private trait below holds the logic ONCE; each type supplies only
+// its canonical `signing_payload()` bytes (untouched — wire-format-stable),
+// its nonce/signature field accessors, and the nonce field's name for the
+// byte-for-byte-stable error strings.
+//
+// The public API is unchanged: the inherent `sign` / `verify` /
+// `verify_no_replay` / `*_with_ring` methods on each type are thin wrappers
+// over these defaults, so worker/controller/engine callers need no changes
+// and the verify() vs verify_no_replay() split (CLAUDE.md "Verify-once
+// rule") is preserved exactly — `verify_core` is the ONLY path that inserts
+// into `JOB_NONCE_CACHE`; `verify_no_replay_core` never touches it.
+
+/// Crate-private core shared by every signed NATS message type.
+///
+/// Implementors provide the canonical signing payload plus nonce/signature
+/// field access; the provided methods implement sign, HMAC+freshness
+/// verification, replay-cache recording, and key-ring rotation support
+/// exactly once for all five message types.
+trait SignedMessage {
+    /// The nonce field's name as it appears in every error string
+    /// (`"job_nonce"` / `"result_nonce"` / `"heartbeat_nonce"`).
+    /// Error messages are byte-for-byte stable — callers and tests
+    /// match on them (e.g. `"result_nonce already seen"`).
+    const NONCE_LABEL: &'static str;
+
+    /// Canonical byte string signed / verified by HMAC-SHA256. Forwards to
+    /// the type's inherent `signing_payload()` — the append-only,
+    /// wire-format-stable payload construction stays per-type and untouched.
+    fn payload_bytes(&self) -> Vec<u8>;
+
+    /// The nonce field (`"{unix_secs}:{random_hex}"`).
+    fn nonce(&self) -> &str;
+
+    /// Set the nonce field (called by [`Self::sign_core`]).
+    fn set_nonce(&mut self, nonce: String);
+
+    /// The HMAC-SHA256 signature field.
+    fn signature(&self) -> &[u8];
+
+    /// Set the signature field (called by [`Self::sign_core`]).
+    fn set_signature(&mut self, signature: Vec<u8>);
+
+    /// Shared signing core: build a fresh nonce
+    /// (`"<unix_seconds>:<16 random hex bytes>"`), then HMAC-SHA256 the
+    /// canonical payload with the pre-shared `key`. Sets both fields.
+    fn sign_core(&mut self, key: &[u8]) -> Result<(), String> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("system time error: {e}"))?
+            .as_secs();
+        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
+        self.set_nonce(format!("{}:{}", ts, hex::encode(rand_bytes)));
+
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
+        mac.update(&self.payload_bytes());
+        self.set_signature(mac.finalize().into_bytes().to_vec());
+        Ok(())
+    }
+
+    /// Shared verify-without-replay-recording core: nonce parse +
+    /// freshness window + constant-time HMAC. **Never touches the replay
+    /// cache** — this is the observer half of the verify-once split.
+    /// Returns the parsed nonce timestamp on success.
+    ///
+    /// Check order is timestamp-parse before hex-validation. (Pre-refactor
+    /// `PipelineJobResult` alone checked hex first — accidental drift; the
+    /// orders are otherwise equivalent, differing only in WHICH error
+    /// string is returned for a nonce malformed in both ways at once.)
+    fn verify_no_replay_core(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
+        // 1. Parse + freshness window check.
+        let parts: Vec<&str> = self.nonce().splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return Err(format!("malformed {}", Self::NONCE_LABEL));
+        }
+        let ts: u64 = parts[0]
+            .parse()
+            .map_err(|_| format!("invalid timestamp in {}", Self::NONCE_LABEL))?;
+        if hex::decode(parts[1]).is_err() {
+            return Err(format!("invalid hex in {}", Self::NONCE_LABEL));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(ts) > max_age_secs {
+            return Err(format!(
+                "{} is too old ({} s, max {})",
+                Self::NONCE_LABEL,
+                now.saturating_sub(ts),
+                max_age_secs
+            ));
+        }
+        if ts.saturating_sub(now) > MAX_FUTURE_SKEW_SECS {
+            return Err(format!(
+                "{} is in the future ({} s ahead, max {})",
+                Self::NONCE_LABEL,
+                ts.saturating_sub(now),
+                MAX_FUTURE_SKEW_SECS
+            ));
+        }
+
+        // 2. Constant-time HMAC verification.
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
+        mac.update(&self.payload_bytes());
+        mac.verify_slice(self.signature())
+            .map_err(|_| "HMAC signature verification failed".to_string())?;
+
+        Ok(ts)
+    }
+
+    /// Record the (already HMAC+freshness-verified) nonce in the
+    /// process-local replay cache, or fail with the byte-stable
+    /// `"<nonce> already seen"` replay error. This is the ONLY place the
+    /// shared core inserts into `JOB_NONCE_CACHE`.
+    fn record_nonce_or_replay_err(&self, ts: u64, max_age_secs: u64) -> Result<(), String> {
+        // Replay protection: refuse a nonce we have seen before within
+        // the freshness window. HMAC alone catches forgery; without
+        // this check, anyone with NATS-publish access can capture a
+        // signed message and re-fire it any number of times until
+        // ts + max_age_secs expires.
+        if !check_and_record_job_nonce(self.nonce(), ts, max_age_secs) {
+            return Err(format!(
+                "{} already seen (replay attempt within {}-second window)",
+                Self::NONCE_LABEL,
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Shared primary-verifier core: [`Self::verify_no_replay_core`] plus
+    /// replay-cache recording. Exactly one primary caller per signed
+    /// message per process (verify-once rule).
+    fn verify_core(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
+        let ts = self.verify_no_replay_core(key, max_age_secs)?;
+        self.record_nonce_or_replay_err(ts, max_age_secs)
+    }
+
+    /// Ring variant of [`Self::verify_no_replay_core`]: HMAC+freshness
+    /// against the signing key first, then each staged previous key; first
+    /// match wins. Returns the signing-key error if all fail. Touches no
+    /// replay cache — which is what makes the multi-key loop safe (a naive
+    /// `for k { self.verify(k) }` would insert the nonce on the first
+    /// attempt and spuriously fail the second key as a replay).
+    fn verify_no_replay_with_ring_core(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        let mut keys = ring.verify_keys().iter();
+        let signing = keys.next().expect("WorkerKeyRing is never empty");
+        let signing_err = match self.verify_no_replay_core(signing.as_bytes(), max_age_secs) {
+            Ok(ts) => return Ok(ts),
+            Err(e) => e,
+        };
+        for prev in keys {
+            if let Ok(ts) = self.verify_no_replay_core(prev.as_bytes(), max_age_secs) {
+                return Ok(ts);
+            }
+        }
+        Err(signing_err)
+    }
+
+    /// Ring variant of [`Self::verify_core`]: the nonce is recorded exactly
+    /// once, only after a ring member matches.
+    fn verify_with_ring_core(
+        &self,
+        ring: &talos_workflow_engine_core::WorkerKeyRing,
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        let ts = self.verify_no_replay_with_ring_core(ring, max_age_secs)?;
+        self.record_nonce_or_replay_err(ts, max_age_secs)
+    }
+}
+
 /// Hard cap for the job-nonce replay cache.
 ///
 /// Exposed so health endpoints can report the headroom (`size / cap`)
@@ -1749,19 +1936,7 @@ impl JobRequest {
     /// Sets `self.signature` and `self.job_nonce` (timestamp + random hex).
     /// Call this after all other fields have been populated.
     pub fn sign(&mut self, key: &[u8]) -> Result<(), String> {
-        // Build nonce: "<unix_seconds>:<16 random hex bytes>"
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system time error: {e}"))?
-            .as_secs();
-        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
-        self.job_nonce = format!("{}:{}", ts, hex::encode(rand_bytes));
-
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        self.signature = mac.finalize().into_bytes().to_vec();
-        Ok(())
+        self.sign_core(key)
     }
 
     /// Verify the HMAC signature and nonce freshness, *and* record the
@@ -1782,19 +1957,7 @@ impl JobRequest {
     /// Returns `Err` if the signature is invalid or the nonce is older than
     /// `max_age_secs` (default recommendation: 300 s / 5 minutes).
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
-        let ts = self.verify_no_replay(key, max_age_secs)?;
-        // Replay protection: refuse a nonce we have seen before
-        // within the freshness window. HMAC alone catches forgery;
-        // without this check, anyone with NATS-publish access can
-        // capture a signed JobRequest and re-fire it any number of
-        // times until ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "job_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_core(key, max_age_secs)
     }
 
     /// Verify against a [`WorkerKeyRing`] (decrypt/verify-ring), recording the
@@ -1811,14 +1974,7 @@ impl JobRequest {
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
     ) -> Result<(), String> {
-        let ts = self.verify_no_replay_with_ring(ring, max_age_secs)?;
-        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "job_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_with_ring_core(ring, max_age_secs)
     }
 
     /// Ring variant of [`Self::verify_no_replay`]: HMAC+freshness against the
@@ -1829,18 +1985,7 @@ impl JobRequest {
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
     ) -> Result<u64, String> {
-        let mut keys = ring.verify_keys().iter();
-        let signing = keys.next().expect("WorkerKeyRing is never empty");
-        let signing_err = match self.verify_no_replay(signing.as_bytes(), max_age_secs) {
-            Ok(ts) => return Ok(ts),
-            Err(e) => e,
-        };
-        for prev in keys {
-            if let Ok(ts) = self.verify_no_replay(prev.as_bytes(), max_age_secs) {
-                return Ok(ts);
-            }
-        }
-        Err(signing_err)
+        self.verify_no_replay_with_ring_core(ring, max_age_secs)
     }
 
     /// Verify HMAC signature and nonce freshness **without** recording
@@ -1861,44 +2006,27 @@ impl JobRequest {
     /// forgery and the freshness window continues to gate stale-replay;
     /// replay protection is the responsibility of the primary verifier.
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
-        // 1. Verify nonce freshness to prevent replay attacks.
-        let parts: Vec<&str> = self.job_nonce.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err("malformed job_nonce".to_string());
-        }
-        let ts: u64 = parts[0]
-            .parse()
-            .map_err(|_| "invalid timestamp in job_nonce".to_string())?;
-        if hex::decode(parts[1]).is_err() {
-            return Err("invalid hex in job_nonce".to_string());
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now.saturating_sub(ts) > max_age_secs {
-            return Err(format!(
-                "job_nonce is too old ({} s, max {})",
-                now.saturating_sub(ts),
-                max_age_secs
-            ));
-        }
-        if ts.saturating_sub(now) > MAX_FUTURE_SKEW_SECS {
-            return Err(format!(
-                "job_nonce is in the future ({} s ahead, max {})",
-                ts.saturating_sub(now),
-                MAX_FUTURE_SKEW_SECS
-            ));
-        }
+        self.verify_no_replay_core(key, max_age_secs)
+    }
+}
 
-        // 2. Constant-time HMAC verification.
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())?;
+impl SignedMessage for JobRequest {
+    const NONCE_LABEL: &'static str = "job_nonce";
 
-        Ok(ts)
+    fn payload_bytes(&self) -> Vec<u8> {
+        self.signing_payload()
+    }
+    fn nonce(&self) -> &str {
+        &self.job_nonce
+    }
+    fn set_nonce(&mut self, nonce: String) {
+        self.job_nonce = nonce;
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn set_signature(&mut self, signature: Vec<u8>) {
+        self.signature = signature;
     }
 }
 
@@ -2013,19 +2141,7 @@ impl JobResult {
     pub fn sign_with_worker_id(&mut self, key: &[u8], worker_id: &str) -> Result<(), String> {
         validate_worker_id(worker_id)?;
         self.worker_id = worker_id.to_string();
-
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system time error: {e}"))?
-            .as_secs();
-        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
-        self.result_nonce = format!("{}:{}", ts, hex::encode(rand_bytes));
-
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        self.signature = mac.finalize().into_bytes().to_vec();
-        Ok(())
+        self.sign_core(key)
     }
 
     /// Verify the HMAC signature and nonce freshness, *and* record the
@@ -2043,19 +2159,7 @@ impl JobResult {
     /// `verify()` from two consumers of the same signed result causes
     /// the second one to fail with a spurious replay error.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
-        let ts = self.verify_no_replay(key, max_age_secs)?;
-        // Replay protection: refuse a nonce we have seen before within
-        // the freshness window. HMAC alone catches forgery; without
-        // this check, anyone with NATS-publish access can capture a
-        // signed JobResult and re-fire it any number of times until
-        // ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "result_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_core(key, max_age_secs)
     }
 
     /// L-4 typed verifier: dispatches to [`Self::verify`] for
@@ -2098,14 +2202,7 @@ impl JobResult {
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
     ) -> Result<(), String> {
-        let ts = self.verify_no_replay_with_ring(ring, max_age_secs)?;
-        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "result_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_with_ring_core(ring, max_age_secs)
     }
 
     /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
@@ -2116,18 +2213,7 @@ impl JobResult {
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
     ) -> Result<u64, String> {
-        let mut keys = ring.verify_keys().iter();
-        let signing = keys.next().expect("WorkerKeyRing is never empty");
-        let signing_err = match self.verify_no_replay(signing.as_bytes(), max_age_secs) {
-            Ok(ts) => return Ok(ts),
-            Err(e) => e,
-        };
-        for prev in keys {
-            if let Ok(ts) = self.verify_no_replay(prev.as_bytes(), max_age_secs) {
-                return Ok(ts);
-            }
-        }
-        Err(signing_err)
+        self.verify_no_replay_with_ring_core(ring, max_age_secs)
     }
 
     /// Verify HMAC signature and nonce freshness **without** recording
@@ -2148,44 +2234,27 @@ impl JobResult {
     /// adding a NEW result-consumer and it's the only verifier in its
     /// chain, use `verify()` (not this method).
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
-        // 1. Parse + freshness window check.
-        let parts: Vec<&str> = self.result_nonce.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err("malformed result_nonce".to_string());
-        }
-        let ts: u64 = parts[0]
-            .parse()
-            .map_err(|_| "invalid timestamp in result_nonce".to_string())?;
-        if hex::decode(parts[1]).is_err() {
-            return Err("invalid hex in result_nonce".to_string());
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now.saturating_sub(ts) > max_age_secs {
-            return Err(format!(
-                "result_nonce is too old ({} s, max {})",
-                now.saturating_sub(ts),
-                max_age_secs
-            ));
-        }
-        if ts.saturating_sub(now) > MAX_FUTURE_SKEW_SECS {
-            return Err(format!(
-                "result_nonce is in the future ({} s ahead, max {})",
-                ts.saturating_sub(now),
-                MAX_FUTURE_SKEW_SECS
-            ));
-        }
+        self.verify_no_replay_core(key, max_age_secs)
+    }
+}
 
-        // 2. Constant-time HMAC verification.
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())?;
+impl SignedMessage for JobResult {
+    const NONCE_LABEL: &'static str = "result_nonce";
 
-        Ok(ts)
+    fn payload_bytes(&self) -> Vec<u8> {
+        self.signing_payload()
+    }
+    fn nonce(&self) -> &str {
+        &self.result_nonce
+    }
+    fn set_nonce(&mut self, nonce: String) {
+        self.result_nonce = nonce;
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn set_signature(&mut self, signature: Vec<u8>) {
+        self.signature = signature;
     }
 }
 
@@ -2500,18 +2569,7 @@ impl PipelineJobRequest {
 
     /// Sign the pipeline request using the pre-shared `key`.
     pub fn sign(&mut self, key: &[u8]) -> Result<(), String> {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system time error: {e}"))?
-            .as_secs();
-        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
-        self.job_nonce = format!("{}:{}", ts, hex::encode(rand_bytes));
-
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        self.signature = mac.finalize().into_bytes().to_vec();
-        Ok(())
+        self.sign_core(key)
     }
 
     /// Verify the HMAC signature and nonce freshness, *and* record the
@@ -2520,19 +2578,7 @@ impl PipelineJobRequest {
     /// rule"). Pair with [`verify_no_replay`](Self::verify_no_replay)
     /// for passive observers.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
-        let ts = self.verify_no_replay(key, max_age_secs)?;
-        // 3. Replay protection: refuse a nonce we have seen before
-        // within the freshness window. HMAC alone catches forgery;
-        // without this check, anyone with NATS-publish access can
-        // capture a signed PipelineJobRequest and re-fire it any
-        // number of times until ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "job_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_core(key, max_age_secs)
     }
 
     /// Ring variant of [`Self::verify`]: HMAC+freshness per ring member,
@@ -2543,14 +2589,7 @@ impl PipelineJobRequest {
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
     ) -> Result<(), String> {
-        let ts = self.verify_no_replay_with_ring(ring, max_age_secs)?;
-        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "job_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_with_ring_core(ring, max_age_secs)
     }
 
     /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
@@ -2560,18 +2599,7 @@ impl PipelineJobRequest {
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
     ) -> Result<u64, String> {
-        let mut keys = ring.verify_keys().iter();
-        let signing = keys.next().expect("WorkerKeyRing is never empty");
-        let signing_err = match self.verify_no_replay(signing.as_bytes(), max_age_secs) {
-            Ok(ts) => return Ok(ts),
-            Err(e) => e,
-        };
-        for prev in keys {
-            if let Ok(ts) = self.verify_no_replay(prev.as_bytes(), max_age_secs) {
-                return Ok(ts);
-            }
-        }
-        Err(signing_err)
+        self.verify_no_replay_with_ring_core(ring, max_age_secs)
     }
 
     /// Verify HMAC + freshness WITHOUT touching the replay cache.
@@ -2579,42 +2607,27 @@ impl PipelineJobRequest {
     /// passive observers (metrics, audit subscribers) MUST use this
     /// to avoid dual-cache-insert deadlocks.
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
-        let parts: Vec<&str> = self.job_nonce.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err("malformed job_nonce".to_string());
-        }
-        let ts: u64 = parts[0]
-            .parse()
-            .map_err(|_| "invalid timestamp in job_nonce".to_string())?;
-        if hex::decode(parts[1]).is_err() {
-            return Err("invalid hex in job_nonce".to_string());
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now.saturating_sub(ts) > max_age_secs {
-            return Err(format!(
-                "job_nonce is too old ({} s, max {})",
-                now.saturating_sub(ts),
-                max_age_secs
-            ));
-        }
-        if ts.saturating_sub(now) > MAX_FUTURE_SKEW_SECS {
-            return Err(format!(
-                "job_nonce is in the future ({} s ahead, max {})",
-                ts.saturating_sub(now),
-                MAX_FUTURE_SKEW_SECS
-            ));
-        }
+        self.verify_no_replay_core(key, max_age_secs)
+    }
+}
 
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())?;
+impl SignedMessage for PipelineJobRequest {
+    const NONCE_LABEL: &'static str = "job_nonce";
 
-        Ok(ts)
+    fn payload_bytes(&self) -> Vec<u8> {
+        self.signing_payload()
+    }
+    fn nonce(&self) -> &str {
+        &self.job_nonce
+    }
+    fn set_nonce(&mut self, nonce: String) {
+        self.job_nonce = nonce;
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn set_signature(&mut self, signature: Vec<u8>) {
+        self.signature = signature;
     }
 }
 
@@ -2747,19 +2760,7 @@ impl PipelineJobResult {
     pub fn sign_with_worker_id(&mut self, key: &[u8], worker_id: &str) -> Result<(), String> {
         validate_worker_id(worker_id)?;
         self.worker_id = worker_id.to_string();
-
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system time error: {e}"))?
-            .as_secs();
-        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
-        self.result_nonce = format!("{}:{}", ts, hex::encode(rand_bytes));
-
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        self.signature = mac.finalize().into_bytes().to_vec();
-        Ok(())
+        self.sign_core(key)
     }
 
     /// Verify the HMAC signature, nonce freshness, *and* record the
@@ -2776,14 +2777,7 @@ impl PipelineJobResult {
     /// safe option available BEFORE a future second consumer is
     /// added, not after the same regression hits production.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
-        let ts = self.verify_no_replay(key, max_age_secs)?;
-        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "result_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_core(key, max_age_secs)
     }
 
     /// L-4 typed verifier — same dispatch as
@@ -2819,14 +2813,7 @@ impl PipelineJobResult {
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
     ) -> Result<(), String> {
-        let ts = self.verify_no_replay_with_ring(ring, max_age_secs)?;
-        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "result_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_with_ring_core(ring, max_age_secs)
     }
 
     /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
@@ -2836,18 +2823,7 @@ impl PipelineJobResult {
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
     ) -> Result<u64, String> {
-        let mut keys = ring.verify_keys().iter();
-        let signing = keys.next().expect("WorkerKeyRing is never empty");
-        let signing_err = match self.verify_no_replay(signing.as_bytes(), max_age_secs) {
-            Ok(ts) => return Ok(ts),
-            Err(e) => e,
-        };
-        for prev in keys {
-            if let Ok(ts) = self.verify_no_replay(prev.as_bytes(), max_age_secs) {
-                return Ok(ts);
-            }
-        }
-        Err(signing_err)
+        self.verify_no_replay_with_ring_core(ring, max_age_secs)
     }
 
     /// Verify HMAC signature and nonce freshness without recording the
@@ -2858,43 +2834,34 @@ impl PipelineJobResult {
     /// HMAC continues to gate forgery; freshness continues to gate
     /// stale-replay; within-window-replay protection is the
     /// responsibility of the primary `verify()` caller.
+    ///
+    /// (Historical note: pre-refactor this type alone validated the
+    /// nonce's hex component before parsing its timestamp; the shared
+    /// core now checks timestamp-first like every other message type.
+    /// Only the error-string *selection* for a nonce malformed in both
+    /// ways at once differs — every accept/reject outcome is identical.)
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
-        let parts: Vec<&str> = self.result_nonce.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err("malformed result_nonce".to_string());
-        }
-        if hex::decode(parts[1]).is_err() {
-            return Err("invalid hex in result_nonce".to_string());
-        }
-        let ts: u64 = parts[0]
-            .parse()
-            .map_err(|_| "invalid timestamp in result_nonce".to_string())?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now.saturating_sub(ts) > max_age_secs {
-            return Err(format!(
-                "result_nonce is too old ({} s, max {})",
-                now.saturating_sub(ts),
-                max_age_secs
-            ));
-        }
-        if ts.saturating_sub(now) > MAX_FUTURE_SKEW_SECS {
-            return Err(format!(
-                "result_nonce is in the future ({} s ahead, max {})",
-                ts.saturating_sub(now),
-                MAX_FUTURE_SKEW_SECS
-            ));
-        }
+        self.verify_no_replay_core(key, max_age_secs)
+    }
+}
 
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())?;
+impl SignedMessage for PipelineJobResult {
+    const NONCE_LABEL: &'static str = "result_nonce";
 
-        Ok(ts)
+    fn payload_bytes(&self) -> Vec<u8> {
+        self.signing_payload()
+    }
+    fn nonce(&self) -> &str {
+        &self.result_nonce
+    }
+    fn set_nonce(&mut self, nonce: String) {
+        self.result_nonce = nonce;
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn set_signature(&mut self, signature: Vec<u8>) {
+        self.signature = signature;
     }
 }
 
@@ -2933,18 +2900,7 @@ impl WorkerHeartbeat {
 
     /// Sign the heartbeat using the pre-shared `key`.
     pub fn sign(&mut self, key: &[u8]) -> Result<(), String> {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system time error: {e}"))?
-            .as_secs();
-        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
-        self.heartbeat_nonce = format!("{}:{}", ts, hex::encode(rand_bytes));
-
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        self.signature = mac.finalize().into_bytes().to_vec();
-        Ok(())
+        self.sign_core(key)
     }
 
     /// Verify the HMAC signature and nonce freshness, *and* record
@@ -2953,60 +2909,33 @@ impl WorkerHeartbeat {
     /// (CLAUDE.md "Verify-once rule"). Pair with
     /// [`verify_no_replay`](Self::verify_no_replay) for passive observers.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
-        let ts = self.verify_no_replay(key, max_age_secs)?;
-        // 3. Replay protection: refuse a nonce we have seen before
-        // within the freshness window. HMAC alone catches forgery;
-        // without this check, anyone with NATS-publish access can
-        // capture a signed WorkerHeartbeat and re-fire it any number
-        // of times until ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.heartbeat_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "heartbeat_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        self.verify_core(key, max_age_secs)
     }
 
     /// Verify HMAC + freshness WITHOUT touching the replay cache.
     /// 2026-05-28 audit F5 sibling of `JobRequest::verify_no_replay`.
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
-        let parts: Vec<&str> = self.heartbeat_nonce.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err("malformed heartbeat_nonce".to_string());
-        }
-        let ts: u64 = parts[0]
-            .parse()
-            .map_err(|_| "invalid timestamp in heartbeat_nonce".to_string())?;
-        if hex::decode(parts[1]).is_err() {
-            return Err("invalid hex in heartbeat_nonce".to_string());
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now.saturating_sub(ts) > max_age_secs {
-            return Err(format!(
-                "heartbeat_nonce is too old ({} s, max {})",
-                now.saturating_sub(ts),
-                max_age_secs
-            ));
-        }
-        if ts.saturating_sub(now) > MAX_FUTURE_SKEW_SECS {
-            return Err(format!(
-                "heartbeat_nonce is in the future ({} s ahead, max {})",
-                ts.saturating_sub(now),
-                MAX_FUTURE_SKEW_SECS
-            ));
-        }
+        self.verify_no_replay_core(key, max_age_secs)
+    }
+}
 
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
-        mac.update(&self.signing_payload());
-        mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())?;
+impl SignedMessage for WorkerHeartbeat {
+    const NONCE_LABEL: &'static str = "heartbeat_nonce";
 
-        Ok(ts)
+    fn payload_bytes(&self) -> Vec<u8> {
+        self.signing_payload()
+    }
+    fn nonce(&self) -> &str {
+        &self.heartbeat_nonce
+    }
+    fn set_nonce(&mut self, nonce: String) {
+        self.heartbeat_nonce = nonce;
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn set_signature(&mut self, signature: Vec<u8>) {
+        self.signature = signature;
     }
 }
 

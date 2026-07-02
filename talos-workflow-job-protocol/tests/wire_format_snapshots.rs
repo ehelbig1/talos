@@ -146,6 +146,9 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     // string options, numeric / bool fields render via Display.
     let capability_world_str = req.capability_world.as_deref().unwrap_or("-");
     let cancellation_token_str = req.cancellation_token.as_deref().unwrap_or("-");
+    // Deliberately nested next to the payload build it mirrors (the
+    // production `lp` in src/lib.rs) rather than hoisted to module scope.
+    #[allow(clippy::items_after_statements)]
     fn lp(s: &str) -> String {
         format!("{}:{}", s.len(), s)
     }
