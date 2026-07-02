@@ -1,0 +1,25 @@
+[package]
+name = "talos-failure-analysis-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tracing.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Talos crates — repositories
+talos-execution-repository = { path = "../talos-execution-repository" }
+
+# Talos crates — shared types (graph timeout-cap validator for the
+# apply_fix write path — MCP-1227 chokepoint parity)
+talos-workflow-types = { path = "../talos-workflow-types" }
+
+[lints]
+workspace = true

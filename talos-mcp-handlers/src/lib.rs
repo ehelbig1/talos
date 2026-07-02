@@ -294,6 +294,22 @@ pub struct McpState {
     /// input + outcome, `SearchError` with stable `jsonrpc_code()`
     /// mapping.
     pub search_service: std::sync::Arc<talos_search_service::SearchService>,
+    /// Failure-analysis service — backs `analyze_execution_failure`.
+    /// Owns the per-node error classification, remediation playbooks,
+    /// and the config-field auto-fix write path (MCP-1227 chokepoint
+    /// parity). Cross-protocol-ready: typed input + outcome,
+    /// `FailureAnalysisError` with stable `jsonrpc_code()` mapping and
+    /// generic-string DB error collapse.
+    pub failure_analysis_service:
+        std::sync::Arc<talos_failure_analysis_service::FailureAnalysisService>,
+    /// Actor-lifecycle service — backs `scaffold_actor` and
+    /// `handoff_to_actor` (plus the deprecated `handoff_to_agent`
+    /// alias). Owns the scaffold arg-validation stack and the full
+    /// handoff gate sequence + engine dispatch. Cross-protocol-ready:
+    /// typed outcomes, `ScaffoldActorError` / `HandoffError` with
+    /// stable `jsonrpc_code()` mappings.
+    pub actor_lifecycle_service:
+        std::sync::Arc<talos_actor_lifecycle_service::ActorLifecycleService>,
 }
 
 pub fn create_router(
@@ -321,6 +337,10 @@ pub fn create_router(
     replay_service: std::sync::Arc<talos_replay_service::ReplayService>,
     inline_compile_service: std::sync::Arc<talos_inline_compile_service::InlineCompileService>,
     search_service: std::sync::Arc<talos_search_service::SearchService>,
+    failure_analysis_service: std::sync::Arc<
+        talos_failure_analysis_service::FailureAnalysisService,
+    >,
+    actor_lifecycle_service: std::sync::Arc<talos_actor_lifecycle_service::ActorLifecycleService>,
 ) -> Router {
     // Initialize Ollama client for Tier 1 (local) LLM inference.
     // MCP-630 (2026-05-12): route through `talos_config::get_env` so a
@@ -373,6 +393,8 @@ pub fn create_router(
         replay_service,
         inline_compile_service,
         search_service,
+        failure_analysis_service,
+        actor_lifecycle_service,
     };
 
     // Authenticated routes (Bearer token required)

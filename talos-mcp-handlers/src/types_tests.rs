@@ -1,4 +1,7 @@
 #[cfg(test)]
+// Mounted from types.rs via `#[path = "types_tests.rs"] mod tests;`, so the
+// inner module shares its parent's name — accepted, renaming would churn paths.
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 

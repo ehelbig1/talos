@@ -59,6 +59,8 @@ members = [
     "talos-replay-service",
     "talos-inline-compile-service",
     "talos-search-service",
+    "talos-failure-analysis-service",
+    "talos-actor-lifecycle-service",
     "talos-hot-update-service",
     "talos-secrets-manager",
     "talos-module-payload-encryption",

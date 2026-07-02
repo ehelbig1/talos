@@ -6271,6 +6271,7 @@ mod retry_classifier_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // NOT-emphasis is intentional in the test name
     fn rate_limit_is_NOT_deterministic() {
         // Rate limits are transient — backoff + retry is exactly
         // the right strategy. Must NOT be flagged as deterministic.
@@ -6280,6 +6281,7 @@ mod retry_classifier_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // NOT-emphasis is intentional in the test name
     fn network_timeout_is_NOT_deterministic() {
         // Network connection timeouts are usually transient.
         assert!(!is_deterministic_failure("connection refused by upstream"));

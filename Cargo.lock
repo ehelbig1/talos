@@ -1688,6 +1688,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "subtle",
+ "talos-actor-lifecycle-service",
  "talos-actor-memory-service",
  "talos-actor-policies",
  "talos-actor-policy-hook",
@@ -1721,6 +1722,7 @@ dependencies = [
  "talos-errors",
  "talos-execution-orchestration",
  "talos-execution-repository",
+ "talos-failure-analysis-service",
  "talos-feature-flags",
  "talos-github",
  "talos-github-connect",
@@ -7031,6 +7033,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-actor-lifecycle-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "serde_json",
+ "sqlx",
+ "talos-actor-repository",
+ "talos-actor-scaffold",
+ "talos-dlp-provider",
+ "talos-engine",
+ "talos-execution-result-collector",
+ "talos-memory",
+ "talos-module-repository",
+ "talos-registry",
+ "talos-secrets-manager",
+ "talos-text-util",
+ "talos-validation",
+ "talos-workflow-authorization",
+ "talos-workflow-engine-core",
+ "talos-workflow-job-protocol",
+ "talos-workflow-repository",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-actor-memory-service"
 version = "0.1.0"
 dependencies = [
@@ -7680,6 +7711,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-failure-analysis-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "sha2 0.10.9",
+ "talos-execution-repository",
+ "talos-workflow-types",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-feature-flags"
 version = "0.1.0"
 dependencies = [
@@ -7773,7 +7818,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "subtle",
  "talos-actor-repository",
  "talos-config",
  "talos-dlp-provider",
@@ -7803,6 +7847,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -7830,7 +7875,6 @@ dependencies = [
  "talos-oauth",
  "talos-registry",
  "talos-secrets-manager",
- "talos-text-util",
  "talos-trace-nats",
  "talos-worker-fleet",
  "talos-workflow-engine-core",
@@ -7953,10 +7997,23 @@ dependencies = [
 name = "talos-integration-helpers"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
  "chrono",
+ "dashmap 6.2.1",
  "serde",
+ "serde_json",
+ "sqlx",
+ "subtle",
+ "talos-config",
+ "talos-dlp-provider",
+ "talos-integration-state",
+ "talos-memory",
  "talos-secrets-manager",
+ "talos-text-util",
  "talos-workflow-job-protocol",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -8063,10 +8120,10 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "sqlx",
+ "talos-actor-lifecycle-service",
  "talos-actor-memory-service",
  "talos-actor-policies",
  "talos-actor-repository",
- "talos-actor-scaffold",
  "talos-advanced-repository",
  "talos-analytics-repository",
  "talos-capability-world",
@@ -8079,6 +8136,7 @@ dependencies = [
  "talos-execution-orchestration",
  "talos-execution-repository",
  "talos-execution-result-collector",
+ "talos-failure-analysis-service",
  "talos-graph-rag",
  "talos-hot-update-service",
  "talos-http-body",

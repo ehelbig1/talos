@@ -255,6 +255,9 @@ struct SchemaBundle {
     replay_service: std::sync::Arc<talos_replay_service::ReplayService>,
     inline_compile_service: std::sync::Arc<talos_inline_compile_service::InlineCompileService>,
     search_service: std::sync::Arc<talos_search_service::SearchService>,
+    failure_analysis_service:
+        std::sync::Arc<talos_failure_analysis_service::FailureAnalysisService>,
+    actor_lifecycle_service: std::sync::Arc<talos_actor_lifecycle_service::ActorLifecycleService>,
 }
 
 #[tokio::main]
@@ -4237,6 +4240,31 @@ fn build_schema_and_services(
         workflow_repo.clone(),
     ));
 
+    // Failure-analysis service. Backs the MCP `analyze_execution_failure`
+    // tool — per-node error classification + remediation playbooks + the
+    // config-field auto-fix write path — and is ready to back a future
+    // GraphQL surface. Typed input + outcome, `FailureAnalysisError`
+    // carries a stable jsonrpc_code() mapping.
+    let failure_analysis_service = std::sync::Arc::new(
+        talos_failure_analysis_service::FailureAnalysisService::new(execution_repo.clone()),
+    );
+
+    // Actor-lifecycle service. Backs the MCP `scaffold_actor` and
+    // `handoff_to_actor` tools — scaffold arg-validation + orchestration
+    // delegation, and the full handoff gate sequence (status / chain /
+    // budget / authorization) + engine dispatch. Same Arc is ready for a
+    // future GraphQL surface.
+    let actor_lifecycle_service =
+        std::sync::Arc::new(talos_actor_lifecycle_service::ActorLifecycleService::new(
+            db_pool.clone(),
+            registry.clone(),
+            actor_repo.clone(),
+            workflow_repo.clone(),
+            module_repo.clone(),
+            secrets_manager.clone(),
+            nats_client.clone(),
+        ));
+
     // Build async-graphql schema with limits (defense in depth)
     let mut schema_builder = Schema::build(
         QueryRoot::default(),
@@ -4318,6 +4346,8 @@ fn build_schema_and_services(
         replay_service,
         inline_compile_service,
         search_service,
+        failure_analysis_service,
+        actor_lifecycle_service,
     })
 }
 
@@ -4377,6 +4407,8 @@ fn build_router(
     let replay_service = bundle.replay_service.clone();
     let inline_compile_service = bundle.inline_compile_service.clone();
     let search_service = bundle.search_service.clone();
+    let failure_analysis_service = bundle.failure_analysis_service.clone();
+    let actor_lifecycle_service = bundle.actor_lifecycle_service.clone();
     // ---------- Rate limiting configuration ----------
     // Global rate limit configuration using tower_governor
     // Recommended: 10 requests per second per IP to prevent brute-force attacks
@@ -5089,6 +5121,8 @@ fn build_router(
         replay_service.clone(),
         inline_compile_service.clone(),
         search_service.clone(),
+        failure_analysis_service.clone(),
+        actor_lifecycle_service.clone(),
     );
 
     // MCP routes are added separately to avoid the global governor rate limiter.
