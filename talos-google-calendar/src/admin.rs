@@ -34,7 +34,7 @@ use axum::{
 };
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
+use talos_integration_helpers::admin::{authorize_admin_request, require_uuid_field};
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{IntegrationOp, IntegrationOpResult, ListFilter};
 use uuid::Uuid;
@@ -43,83 +43,32 @@ use uuid::Uuid;
 /// success; on failure the (already-built) rejection response is
 /// returned so the caller doesn't re-implement the short-circuit.
 ///
-/// Separately from the secret compare, `ENABLE_ADMIN_OPS` MUST be set
-/// to `1` or `true` — otherwise the routes are disabled entirely
-/// regardless of how well the secret matches. This is the "big red
-/// button" defense: production deployments leave the env var unset.
+/// The two-check defense (MCP-1064 canonical `admin_ops_enabled()`
+/// "big red button" resolver + MCP-983 direct-slice `ct_eq`, no padded
+/// buffer) lives in
+/// `talos_integration_helpers::admin::authorize_admin_request` so the
+/// gmail/gcal skeletons can't drift and future security fixes land
+/// once.
 fn authorize(headers: &HeaderMap) -> Result<(), (StatusCode, Json<JsonValue>)> {
-    // MCP-1064 (2026-05-15): canonical `admin_ops_enabled()` resolver.
-    // See talos-gmail::admin for the cross-site drift this closes.
-    if !talos_config::admin_ops_enabled() {
-        tracing::warn!("admin gcal endpoint hit but ENABLE_ADMIN_OPS is unset/false");
-        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))));
-    }
-
-    let admin_secret = std::env::var("ADMIN_SECRET_KEY").unwrap_or_default();
-    let provided = headers
-        .get("X-Admin-Secret")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    // MCP-983 (2026-05-15): direct ct_eq on slices. Pre-fix used a
-    // 512-byte padded buffer with `a[..a.len().min(CT_BUF)].copy_...`
-    // — when `admin_secret.len() > 512` the comparison silently
-    // truncated to the first 512 bytes, so an attacker who knew the
-    // first 512 bytes (plus the true length, via the explicit
-    // `a.len() == b.len()` check) could authenticate against any
-    // longer secret. Subtle's slice `ct_eq` returns Choice(0)
-    // immediately on length mismatch and runs constant-time over
-    // equal-length contents — the implicit length compare leaks a
-    // negligible signal under network jitter for sensibly-sized
-    // admin secrets. Same fix applied to sibling sites
-    // talos-gmail/src/admin.rs and controller/src/main.rs.
-    let bytes_ok = admin_secret.as_bytes().ct_eq(provided.as_bytes());
-    if admin_secret.is_empty() || bytes_ok.unwrap_u8() != 1 {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
-        ));
-    }
-    Ok(())
+    authorize_admin_request(headers, "gcal")
 }
 
 /// Audit-log a successful admin action. Every admin endpoint calls
 /// this. Insert failure is logged but non-fatal — losing the audit
-/// row is a visibility regression, not a correctness one.
+/// row is a visibility regression, not a correctness one. The
+/// MCP-1015 metadata DLP scrub + MCP-1197 measure-first-then-redact
+/// bound live in the shared helper; this wrapper pins gcal's
+/// historical `admin_{action}` event_type and failure-warn text.
 async fn log_admin_action(pool: &sqlx::PgPool, user_id: Uuid, action: &str, metadata: JsonValue) {
-    // MCP-1015 (2026-05-15): DLP-redact metadata before persisting to
-    // google_calendar_audit_log.metadata. Callers pass `e.to_string()`
-    // of `stop_watch_channel` / `stop_watch` failures (see stop_orphan
-    // around line 393 + stop_all line 514) — these strings embed
-    // Google API error bodies that can echo back access_token /
-    // refresh_token / Bearer / client_secret bytes on token-rejection
-    // paths. Same persistence-boundary rule as MCP-980 closed on the
-    // sibling scheduler.rs / watch.rs error_message column; the helper
-    // is the right place so all current AND future call sites are
-    // covered without per-caller discipline.
-    //
-    // MCP-1197 (2026-05-17): measure-first-then-redact via
-    // `redact_json_bounded`. `stop_all` packs one entry per failed
-    // integration; with thousands of integrations the `failed` array
-    // can exceed 1 MiB and bloat the audit table + WAL. Returning
-    // `None` drops the metadata column to NULL (event_type + success
-    // still persist). Sibling of `bound_log_details` in
-    // talos-actor-repository (MCP-1195).
-    let scrubbed = talos_dlp_provider::redact_json_bounded(&metadata);
-    if let Err(e) = sqlx::query(
-        "INSERT INTO google_calendar_audit_log \
-         (user_id, event_type, success, metadata) \
-         VALUES ($1, $2, $3, $4)",
+    talos_integration_helpers::admin::log_admin_action(
+        pool,
+        user_id,
+        &format!("admin_{action}"),
+        action,
+        "admin audit log insert failed",
+        metadata,
     )
-    .bind(user_id)
-    .bind(format!("admin_{action}"))
-    .bind(true)
-    .bind(scrubbed)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(error = %e, action, "admin audit log insert failed");
-    }
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,18 +88,9 @@ pub async fn create_watch(
         return rejection;
     }
 
-    let integration_id = match body
-        .get("integration_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "integration_id required (uuid)"})),
-            )
-        }
+    let integration_id = match require_uuid_field(&body, "integration_id") {
+        Ok(id) => id,
+        Err(rejection) => return rejection,
     };
     let calendar_id = body
         .get("calendar_id")
@@ -251,18 +191,9 @@ pub async fn stop_orphan(
         return rejection;
     }
 
-    let user_id = match body
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "user_id required (uuid)"})),
-            )
-        }
+    let user_id = match require_uuid_field(&body, "user_id") {
+        Ok(id) => id,
+        Err(rejection) => return rejection,
     };
 
     // Length caps on Google-supplied ids. Channel IDs are UUIDs we
@@ -441,18 +372,9 @@ pub async fn stop_all(
         return rejection;
     }
 
-    let user_id = match body
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "user_id required (uuid)"})),
-            )
-        }
+    let user_id = match require_uuid_field(&body, "user_id") {
+        Ok(id) => id,
+        Err(rejection) => return rejection,
     };
 
     // Enumerate rows — decode just enough to find internal UUIDs.

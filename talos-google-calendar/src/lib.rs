@@ -116,9 +116,10 @@ pub struct GoogleCalendarService {
     ///
     /// The lock is process-local; cross-controller coordination would
     /// require a Redis lock or DB advisory lock. Single-controller is
-    /// the current deployment, so a DashMap suffices.
+    /// the current deployment, so the DashMap-backed
+    /// `talos_integration_helpers::state_store::CreateLockMap` suffices.
     pub(crate) create_channel_locks:
-        Arc<DashMap<(Uuid, Uuid, String), Arc<tokio::sync::Mutex<()>>>>,
+        talos_integration_helpers::state_store::CreateLockMap<(Uuid, Uuid, String)>,
 }
 
 impl GoogleCalendarService {
@@ -141,7 +142,7 @@ impl GoogleCalendarService {
             webhook_channel_limits: Arc::new(DashMap::new()),
             credentials_service: OnceLock::new(),
             shared_key: OnceLock::new(),
-            create_channel_locks: Arc::new(DashMap::new()),
+            create_channel_locks: talos_integration_helpers::state_store::CreateLockMap::new(),
         }
     }
 
@@ -183,8 +184,7 @@ impl GoogleCalendarService {
     /// can safely drop our entry. A call that takes the lock will
     /// re-create it on demand.
     pub fn cleanup_create_channel_locks(&self) {
-        self.create_channel_locks
-            .retain(|_k, lock| std::sync::Arc::strong_count(lock) > 1);
+        self.create_channel_locks.cleanup();
     }
 
     /// Per-channel rate limiter for incoming Google Calendar webhook notifications.
