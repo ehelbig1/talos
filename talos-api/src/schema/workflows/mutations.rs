@@ -17,7 +17,6 @@ use talos_engine::events::{ExecutionEvent, ExecutionStatus};
 use talos_registry::ModuleRegistry;
 use talos_workflow_engine_core::WorkerSharedKey;
 use talos_workflow_versions::WorkflowVersionService;
-use worker::runtime::TalosRuntime;
 
 /// Saturating u32→i32 conversion for `execution_events.iteration_index`
 /// / `iteration_total` columns (Postgres `int4`). Defense in depth on
@@ -56,26 +55,6 @@ impl WorkflowsMutations {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
 
         let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?.clone();
-        let execution_id = Uuid::new_v4();
-        let sender = ctx
-            .data::<tokio::sync::broadcast::Sender<ExecutionEvent>>()?
-            .clone();
-        let nats_client = ctx
-            .data_opt::<Option<Arc<async_nats::Client>>>()
-            .cloned()
-            .flatten()
-            .ok_or_else(|| async_graphql::Error::new("NATS client not available").extend_safe())?;
-        let worker_shared_key = ctx.data_opt::<Option<WorkerSharedKey>>().cloned().flatten();
-        let registry = ctx.data::<Arc<ModuleRegistry>>().ok().cloned();
-        let redis_client = ctx
-            .data_opt::<Option<Arc<redis::Client>>>()
-            .cloned()
-            .flatten();
-        let secrets_manager = ctx
-            .data::<Arc<talos_secrets_manager::SecretsManager>>()
-            .ok()
-            .cloned();
-        let _runtime = ctx.data::<Arc<TalosRuntime>>()?.clone();
 
         // Triggering a workflow is a write — it consumes LLM/fuel budget,
         // may write to actor memory, fires external HTTP calls. A Viewer
@@ -101,687 +80,98 @@ impl WorkflowsMutations {
             );
         }
 
-        // Pre-load the graph_json synchronously so trigger-time
-        // authorization can re-verify the actor's capability ceiling
-        // against the actual modules in the graph (post-create graph
-        // edits would otherwise slip past the create-time gate). This
-        // also lets `authorize_workflow_trigger` run before the
-        // concurrency-limit transaction below — failing fast on auth
-        // errors before any execution row is created.
-        let pre_loaded_graph: Option<(String, Option<Uuid>)> =
-            match WorkflowVersionService::get_active_version(&db_pool, workflow_id).await {
-                Ok(Some(version)) => Some((version.graph_json.to_string(), Some(version.id))),
-                _ => match sqlx::query_scalar::<_, String>(
-                    // allow-bare-pool-rls: workflow_accessible_for_user (line ~84, user_id=$2 OR org_id=ANY) gates this workflow_id before we reach here; revisit on RLS SET-ROLE rollout
-                    "SELECT graph_json FROM workflows WHERE id = $1",
+        // Cross-protocol unification (2026-07-01): route through the shared
+        // ExecutionOrchestrationService — the SAME Arc the MCP
+        // trigger_workflow handler consumes — instead of the ~690-line
+        // inline reimplementation this resolver carried since before r295.
+        // The inline copy was kept in sync with the MCP path by comments
+        // (r292, MCP-853, MCP-916, MCP-918 were all drift fixes); the
+        // service makes the parity load-bearing. What the service adds
+        // that the inline path lacked: platform-pause gate, is_enabled
+        // check, input-schema validation, actor-context injection hooks,
+        // audit log, reuse analytics, failure alert + failure webhook,
+        // scratchpad trace, the F4 fresh-run fence, and the atomic
+        // actor-budget backstop. What moved INTO the service to avoid
+        // regressions: terminal executionUpdates event emission
+        // (broadcast + execution_events persistence — see
+        // talos-execution-orchestration/src/terminal_event.rs), which now
+        // fires for MCP-triggered executions too.
+        //
+        // Deliberate semantic changes vs. the inline path (documented in
+        // docs/engine-builder-refactor-plan.md "Open questions" #3):
+        // - actor binding now falls back to the workflow's default actor
+        //   and then the user's default actor (MCP parity) instead of
+        //   caller-arg-only.
+        // - the row is created as 'running' with the epoch fence instead
+        //   of 'queued' + advisory-lock promotion; the returned status
+        //   string is therefore "running" (was "pending").
+        let orchestration_service = ctx
+            .data::<Arc<talos_execution_orchestration::ExecutionOrchestrationService>>()
+            .map_err(|_| {
+                async_graphql::Error::new(
+                    "Execution orchestration service unavailable — cannot trigger",
                 )
-                .bind(workflow_id)
-                .fetch_optional(&db_pool)
-                .await
-                {
-                    Ok(Some(g)) => Some((g, None)),
-                    Ok(None) => None,
-                    Err(e) => {
-                        tracing::error!("Failed to load workflow graph for auth: {}", e);
-                        return Err(
-                            async_graphql::Error::new("Failed to check workflow").extend_safe()
-                        );
-                    }
-                },
-            };
+                .extend_safe()
+            })?;
 
-        // Trigger-time authorization. Mirrors the MCP `trigger_workflow`
-        // path (see CLAUDE.md "GraphQL handlers must mirror MCP RBAC
-        // checks"): the inline `SELECT status FROM actors WHERE
-        // id = $1 AND user_id = $2` probe was insufficient — it caught
-        // ownership + terminal state but skipped (a) suspended-via-budget
-        // gating and (b) capability-ceiling re-verification against the
-        // graph's modules. r292 closed the same drift on a different
-        // surface; this is the trigger-side parity fix.
-        if let Some((ref graph_json_for_auth, _version_id)) = pre_loaded_graph {
-            use talos_workflow_authorization::{authorize_workflow_trigger, TriggerAuthError};
-            let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-            let actor_repo_for_auth = talos_actor_repository::ActorRepository::new(db_pool.clone());
-            match authorize_workflow_trigger(
-                &workflow_repo,
-                &actor_repo_for_auth,
-                &db_pool,
-                actor_id,
-                *user_id,
-                graph_json_for_auth,
-            )
-            .await
-            {
-                Ok(_) => {}
-                // MCP-916 (2026-05-14): every actionable TriggerAuthError
-                // variant marked `.extend_safe()` so the production error
-                // scrubber doesn't replace them with "Internal server
-                // error". "Actor is archived/terminated" and the
-                // capability-ceiling diagnostic have no overlap with the
-                // production-mode substring whitelist (Authentication /
-                // Access denied / Not found / Invalid / Validation /
-                // Unauthorized — see controller/main.rs:4999) — without
-                // the explicit safe-marker, operators triggering a
-                // workflow with an archived actor saw "Internal server
-                // error" with no clue why. Database variant intentionally
-                // stays unmarked: the inner sqlx::Error is logged
-                // server-side and the generic outer message is correct
-                // for the client.
-                Err(TriggerAuthError::ActorNotFoundOrInactive) => {
-                    return Err(
-                        async_graphql::Error::new("Actor not found or access denied").extend_safe(),
-                    );
-                }
-                Err(TriggerAuthError::ActorArchived) => {
-                    return Err(async_graphql::Error::new(
-                        "Actor is archived — terminal state, cannot dispatch executions.",
-                    )
-                    .extend_safe());
-                }
-                Err(TriggerAuthError::ActorTerminated) => {
-                    return Err(async_graphql::Error::new(
-                        "Actor is terminated — terminal state, cannot dispatch executions.",
-                    )
-                    .extend_safe());
-                }
-                Err(TriggerAuthError::ExecutionDenied(msg)) => {
-                    // user-facing message from check_execution_allowed
-                    // (budget/status). Surface verbatim — same as MCP.
-                    return Err(async_graphql::Error::new(msg).extend_safe());
-                }
-                Err(TriggerAuthError::CapabilityCeilingViolation {
-                    module_world,
-                    max_world,
-                    ..
-                }) => {
-                    return Err(async_graphql::Error::new(format!(
-                        "Workflow contains a module that exceeds the actor's capability \
-                         ceiling: module requires `{module_world}`, actor max is `{max_world}`. \
-                         Lower the workflow's capability requirement or grant the actor a \
-                         higher ceiling via `grant_capability_ceiling`."
-                    ))
-                    .extend_safe());
-                }
-                Err(TriggerAuthError::Database(e)) => {
-                    tracing::error!("Trigger authorization DB error: {}", e);
-                    return Err(async_graphql::Error::new("Internal database error").extend_safe());
-                }
-            }
-        }
-
-        // Per-workflow concurrency limit check + execution INSERT via the
-        // canonical TOCTOU-safe entry point in `talos_workflow_repository`.
-        // L T6-1: pre-extraction this resolver duplicated the `SELECT …
-        // FOR UPDATE` + COUNT + INSERT block inline; the canonical method
-        // also gates on `(workflow_id, user_id)` ownership and on
-        // `parent_execution_id` lineage when supplied (defense-in-depth
-        // T5-N3 / T7-N1). The asymmetry vs MCP — `'queued'` instead of
-        // `'running'` — is preserved via the typed `InitialExecutionStatus`
-        // enum: GraphQL spawns dispatch in a `tokio::spawn` so the row
-        // must not advertise `'running'` until the engine actually
-        // receives the JobRequest.
-        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-        match workflow_repo
-            .create_execution_under_concurrency_limit(
-                execution_id,
+        let outcome = orchestration_service
+            .trigger(talos_execution_orchestration::TriggerInput {
                 workflow_id,
-                *user_id,
-                None,
-                None,
-                actor_id,
-                None,
-                None,
-                None,
-                talos_workflow_repository::InitialExecutionStatus::Queued,
-            )
+                user_id: *user_id,
+                trigger_input: serde_json::json!({}),
+                trigger_agent_id: actor_id,
+                inject_memory_context: false,
+                dry_run: false,
+                wait_ms: None,
+            })
             .await
-        {
-            Ok(talos_workflow_repository::ConcurrencyAdmission::Created) => {}
-            Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached {
-                limit,
-                running,
-            }) => {
-                return Err(async_graphql::Error::new(format!(
-                    "Workflow has reached its concurrency limit ({running} running, max {limit}). \
-                     Wait for running executions to complete or increase the limit."
-                ))
-                .extend_safe());
-            }
-            Ok(talos_workflow_repository::ConcurrencyAdmission::ActorBudgetExceeded {
-                kind,
-                limit,
-                count,
-            }) => {
-                return Err(async_graphql::Error::new(
-                    talos_workflow_repository::actor_budget_exceeded_message(kind, limit, count),
-                )
-                .extend_safe());
-            }
-            Err(e) => {
-                tracing::error!("Failed to create execution: {}", e);
-                return Err(async_graphql::Error::new("Internal database error").extend_safe());
-            }
-        }
-
-        let user_id = *user_id;
-        tokio::spawn(async move {
-            // Distributed lock at the start of the background task
-            let mut conn = match db_pool.acquire().await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("Failed to acquire DB connection for locking: {}", e);
-                    return;
-                }
-            };
-
-            // Use hash of workflow_id for advisory lock so concurrent executions of the
-            // same workflow are serialized (not execution_id which is unique per run).
-            let lock_id = (workflow_id.as_u128() % (i64::MAX as u128)) as i64;
-
-            // Try to acquire the lock
-            let locked: bool =
-                match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-                    .bind(lock_id)
-                    .fetch_one(&mut *conn)
-                    .await
-                {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::error!("Failed to acquire advisory lock: {}", e);
-                        false
+            .map_err(|e| {
+                use talos_execution_orchestration::OrchestrationError;
+                // Same mapping as retry_execution above: actionable
+                // variants surface their typed Display verbatim (the
+                // service owns the canonical user-facing strings, shared
+                // with MCP); internal variants collapse to a generic
+                // message after server-side logging.
+                match &e {
+                    OrchestrationError::InvalidArgument(_)
+                    | OrchestrationError::ValidationFailed(_)
+                    | OrchestrationError::WorkflowNotFound(_)
+                    | OrchestrationError::ExecutionNotFound(_)
+                    | OrchestrationError::ExecutionPaused
+                    | OrchestrationError::WorkflowDisabled(_)
+                    | OrchestrationError::StatusConflict(_)
+                    | OrchestrationError::AuthorizationDenied(_)
+                    | OrchestrationError::ConcurrencyLimitExceeded(_) => {
+                        async_graphql::Error::new(e.to_string()).extend_safe()
                     }
-                };
-
-            if !locked {
-                tracing::warn!(execution_id = %execution_id, "Execution already in progress, skipping duplicate trigger");
-                return;
-            }
-
-            // Promote queued -> running now that we hold the dispatch lock.
-            // trigger_workflow creates the row as `queued` so it doesn't
-            // advertise `running` before the engine actually starts. The
-            // success-path `mark_execution_completed` is guarded
-            // `WHERE status = 'running'`, so WITHOUT this promotion it matches
-            // zero rows and silently no-ops — every successful run then sticks
-            // at `queued` until the stuck-execution sweep force-fails it
-            // (observed: 0 executions ever reaching `completed`). `false` means
-            // the row is no longer `queued` (already claimed by another
-            // dispatcher, or terminal) — abort rather than double-run.
-            let dispatch_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-            match dispatch_repo
-                .mark_execution_running_from_queued(execution_id)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!(
-                        execution_id = %execution_id,
-                        "Execution no longer queued (already claimed or terminal); skipping dispatch"
-                    );
-                    return;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        execution_id = %execution_id,
-                        error = %e,
-                        "Failed to promote execution queued -> running; aborting dispatch"
-                    );
-                    return;
-                }
-            }
-
-            // Create secrets_manager with proper error handling.
-            // allow-secrets-manager-new: defensive fallback. Production
-            // GraphQL context always supplies the shared instance via
-            // schema.data::<Arc<SecretsManager>>(); this branch only
-            // fires in dev/test paths that don't wire it. Carries the
-            // KEK-mismatch risk documented on subworkflow_contract_service
-            // — if it ever fires in production, that's the bug.
-            let secrets_manager = match secrets_manager {
-                Some(sm) => sm,
-                None => match talos_secrets_manager::SecretsManager::new(db_pool.clone()) {
-                    Ok(sm) => Arc::new(sm),
-                    Err(e) => {
-                        tracing::error!("Failed to create SecretsManager: {}", e);
-                        return;
-                    }
-                },
-            };
-
-            // The engine is built AFTER the graph fetch below. Pre-r227 it
-            // was built here and then load_graph_from_json was called later
-            // — but that pattern dropped the graph's execution_timeout_secs
-            // (same regression class r225 fixed for the scheduler). Routing
-            // through `for_workflow` requires the graph_json upfront, so the
-            // build moves down. Materialise the inputs here so the move
-            // doesn't change behavior beyond the timeout fix.
-            let resolved_registry = registry
-                .unwrap_or_else(|| Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client)));
-
-            // Load checkpoint if exists. MCP-684 (2026-05-13): also pass
-            // a SecretsManager clone so a Phase A deployment without
-            // WORKER_SHARED_KEY can still resume by decrypting
-            // `output_data_enc` (the mark_execution_waiting payload).
-            let initial_results = load_checkpoint_for_full(
-                &db_pool,
-                worker_shared_key.as_ref().map(WorkerSharedKey::as_bytes),
-                Some(secrets_manager.clone()),
-                execution_id,
-            )
-            .await;
-
-            // Helper macro to store event in database AND broadcast
-            macro_rules! store_and_send {
-                ($event:expr) => {{
-                    let event = $event;
-                    // Store in database for audit trail and replay
-                    let event_type = match (&event.node_id, &event.status) {
-                        (None, ExecutionStatus::Running) => "started",
-                        (Some(_), ExecutionStatus::Running) => "node_started",
-                        (Some(_), ExecutionStatus::Completed) => "node_completed",
-                        (Some(_), ExecutionStatus::Failed) => "node_failed",
-                        (Some(_), ExecutionStatus::Skipped) => "node_skipped",
-                        (None, ExecutionStatus::Completed) => "completed",
-                        (None, ExecutionStatus::Failed) => "failed",
-                        (None, ExecutionStatus::Pending) => "pending",
-                        (Some(_), ExecutionStatus::Pending) => "pending",
-                        (None, ExecutionStatus::Skipped) => "skipped",
-                        (Some(_), ExecutionStatus::Waiting) => "node_waiting",
-                        (None, ExecutionStatus::Waiting) => "waiting",
-                        (_, ExecutionStatus::OutputReady) => "output_ready",
-                    };
-
-                    // Broadcast to subscriptions FIRST so live subscribers get the event
-                    // even if the database persistence fails.
-                    //
-                    // MCP-853 (2026-05-14): trigger_workflow sibling of
-                    // MCP-852. Pre-fix this site fired
-                    // `info!("sending event: {:?}", event)` for EVERY
-                    // event broadcast (node_started / node_completed /
-                    // node_failed / ...). Same PII concern: the
-                    // `log_message` field on ExecutionEvent is arbitrary
-                    // workflow-node output (HTTP response bodies, raw
-                    // error text, partial user input) with NO DLP
-                    // redaction at log time. The sibling resume_workflow
-                    // macro (~line 911) already omits this debug log;
-                    // bringing trigger_workflow in line. If a future
-                    // operator needs per-event tracing, use the
-                    // structured `tracing::trace!` shape MCP-852
-                    // adopted in the subscription resolver.
-                    let _ = sender.send(event.clone());
-
-                    // MCP-965 (2026-05-15): DLP-redact log_message
-                    // before persistence. Pre-fix `event.log_message`
-                    // (arbitrary node-emitted text — HTTP response
-                    // bodies, error strings echoing Authorization
-                    // headers, partial outputs from misconfigured
-                    // workflows) was bound directly into INSERT, so
-                    // secrets matching the canonical patterns (`sk-*`,
-                    // `ghp_*`, Bearer tokens) leaked into the DB.
-                    // The sibling output-data redaction pattern lives
-                    // at line ~550 (`talos_dlp_provider::redact_json`
-                    // on `aggregated_output`); this is the matching
-                    // event-side redaction. Same scope as MCP-466 /
-                    // MCP-481-484 persistence-boundary DLP sweep.
-                    //
-                    // MCP-1194 (2026-05-17): truncate-then-redact
-                    // discipline. Sibling holdout to MCP-1165 which
-                    // closed the same gap on the engine-side
-                    // `event_sink.rs` execution_events writer. The
-                    // engine-emitted `log_message: Option<String>` is
-                    // unbounded — node errors echo HTTP response
-                    // bodies (multi-MB possible), retry reasons echo
-                    // wasmtime traces. Pre-fix the regex pass walked
-                    // the entire string AND the unbounded result
-                    // landed in `execution_events.log_message` with
-                    // no DB-side length cap. 8 KiB matches the
-                    // canonical MCP-1165 cap.
-                    let redacted_log_message = event.log_message.as_deref().map(|m| {
-                        let truncated: &str = if m.len() > 8192 {
-                            talos_text_util::truncate_at_char_boundary(m, 8192)
-                        } else {
-                            m
-                        };
-                        talos_dlp_provider::redact_str(truncated)
-                    });
-                    // Then persist for replay
-                    if let Err(db_err) = sqlx::query(
-                        r#"
-                        INSERT INTO execution_events (execution_id, event_type, node_id, status, log_message, iteration_index, iteration_total)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
-                        "#
-                    )
-                    .bind(event.execution_id)
-                    .bind(event_type)
-                    .bind(event.node_id)
-                    .bind(format!("{:?}", event.status))
-                    .bind(&redacted_log_message)
-                    .bind(event.iteration_index.map(saturating_u32_to_i32))
-                    .bind(event.iteration_total.map(saturating_u32_to_i32))
-                    .execute(&db_pool)
-                    .await {
-                        tracing::error!("Failed to persist execution event: {}", db_err);
-                    }
-                }};
-            }
-
-            // Fetch workflow definition: prefer active published version, fall back to draft
-            #[derive(sqlx::FromRow)]
-            struct WorkflowGraph {
-                graph_json: String,
-            }
-
-            // Check for an active published version first
-            let (graph_json_str, version_id) = match WorkflowVersionService::get_active_version(
-                &db_pool,
-                workflow_id,
-            )
-            .await
-            {
-                Ok(Some(version)) => {
-                    tracing::info!(
-                        workflow_id = %workflow_id,
-                        version = version.version_number,
-                        "Using published version for execution"
-                    );
-                    (version.graph_json.to_string(), Some(version.id))
-                }
-                _ => {
-                    // Fall back to draft graph_json from workflows table
-                    match sqlx::query_as::<_, WorkflowGraph>(
-                        // allow-bare-pool-rls: query's own `AND user_id = $2` predicate scopes to the owner; also downstream of workflow_accessible_for_user + create_execution_under_concurrency_limit (workflow_id,user_id) gate; revisit on RLS SET-ROLE rollout
-                        "SELECT graph_json FROM workflows WHERE id = $1 AND user_id = $2",
-                    )
-                    .bind(workflow_id)
-                    .bind(user_id)
-                    .fetch_one(&db_pool)
-                    .await
-                    {
-                        Ok(w) => (w.graph_json, None),
-                        Err(e) => {
-                            tracing::error!(execution_id = %execution_id, "Failed to load workflow: {}", e);
-                            let error_msg = "Workflow execution failed".to_string();
-                            if let Err(db_err) = sqlx::query(
-                                // allow-bare-pool-rls: execution_id owned by user_id via create_execution_under_concurrency_limit's (workflow_id,user_id) gate (line ~222) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
-                            )
-                            .bind(execution_id)
-                            .bind(&error_msg)
-                            .execute(&db_pool)
-                            .await {
-                                tracing::error!("Database operation failed in schema: {}", db_err);
-                            }
-
-                            let event = ExecutionEvent {
-                                execution_id,
-                                node_id: None,
-                                status: ExecutionStatus::Failed,
-                                trace_id: None,
-                                span_id: None,
-                                log_message: Some(error_msg),
-                                iteration_index: None,
-                                iteration_total: None,
-                                duration_ms: None,
-                                output: None,
-                            };
-                            store_and_send!(event);
-                            release_advisory_lock(conn, lock_id).await;
-                            return;
-                        }
+                    OrchestrationError::DispatchFailed(_)
+                    | OrchestrationError::Database(_)
+                    | OrchestrationError::Internal(_) => {
+                        tracing::error!(workflow_id = %workflow_id, "trigger_workflow: {}", e);
+                        async_graphql::Error::new("Internal error during trigger").extend_safe()
                     }
                 }
-            };
+            })?;
 
-            // Store the workflow_version_id on the execution record (best-effort)
-            if let Some(vid) = version_id {
-                if let Err(db_err) = sqlx::query(
-                    // allow-bare-pool-rls: execution_id owned by user_id via create_execution_under_concurrency_limit's (workflow_id,user_id) gate (line ~222) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                    "UPDATE workflow_executions SET workflow_version_id = $2 WHERE id = $1",
-                )
-                .bind(execution_id)
-                .bind(vid)
-                .execute(&db_pool)
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to store workflow_version_id on execution: {}",
-                        db_err
-                    );
-                }
+        let dispatched = match outcome {
+            talos_execution_orchestration::TriggerOutcome::Dispatched(o) => o,
+            // Unreachable with dry_run: false — defensive arm.
+            talos_execution_orchestration::TriggerOutcome::DryRun(_) => {
+                tracing::error!(
+                    workflow_id = %workflow_id,
+                    "trigger_workflow: service returned DryRun for a non-dry-run trigger"
+                );
+                return Err(
+                    async_graphql::Error::new("Internal error during trigger").extend_safe()
+                );
             }
-
-            // Build the engine via the canonical builder. TimeoutPolicy::Honor
-            // closes a latent bug: pre-r227 this site never set
-            // execution_timeout_secs at all, so a workflow with
-            // `execution_timeout_secs: 60` in graph_json was silently using
-            // the engine compile-time default (300 s) when triggered via
-            // GraphQL — same regression class r225 fixed for the scheduler.
-            //
-            // Actor-binding semantic preserved: this path uses the
-            // caller-supplied `actor_id` arg only and does NOT fall back
-            // to the workflow's default (asymmetric vs MCP trigger_workflow,
-            // see docs/engine-builder-refactor-plan.md "Open questions" #3).
-            let actor_repo = Arc::new(talos_actor_repository::ActorRepository::new(
-                db_pool.clone(),
-            ));
-            let mut opts = talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json_str);
-            if let Some(aid) = actor_id {
-                opts = opts.with_actor_id(aid);
-            }
-            // MCP-682 (2026-05-13): retain a SecretsManager clone for the
-            // post-run persistence step. Pre-fix the engine consumed the
-            // Arc at builder time, and the final UPDATE statement wrote
-            // plaintext `output_data = $2` via raw SQL — bypassing
-            // Phase A encryption for every GraphQL-triggered workflow.
-            // Route the completion/waiting writes through
-            // `WorkflowRepository::mark_execution_{completed,waiting}`
-            // so the encryption-aware branch (output_data NULL +
-            // output_data_enc filled) fires on production deployments.
-            let sm_for_persist = secrets_manager.clone();
-            let engine = match talos_engine::builder::for_workflow(
-                resolved_registry,
-                secrets_manager,
-                actor_repo,
-                user_id,
-                opts,
-            )
-            .await
-            {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!(execution_id = %execution_id, "Failed to build engine: {}", e);
-                    let error_msg = "Workflow execution failed".to_string();
-                    if let Err(db_err) = sqlx::query(
-                        // allow-bare-pool-rls: execution_id owned by user_id via create_execution_under_concurrency_limit's (workflow_id,user_id) gate (line ~222) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
-                    )
-                    .bind(execution_id)
-                    .bind(&error_msg)
-                    .execute(&db_pool)
-                    .await
-                    {
-                        tracing::error!("Database operation failed in schema: {}", db_err);
-                    }
-
-                    let event = ExecutionEvent {
-                        execution_id,
-                        node_id: None,
-                        status: ExecutionStatus::Failed,
-                        trace_id: None,
-                        span_id: None,
-                        log_message: Some(error_msg),
-                        iteration_index: None,
-                        iteration_total: None,
-                        duration_ms: None,
-                        output: None,
-                    };
-                    store_and_send!(event);
-                    release_advisory_lock(conn, lock_id).await;
-                    return;
-                }
-            };
-
-            // Execute workflow
-            let wsk_for_checkpoint = worker_shared_key.clone();
-            match talos_engine::nats_run::run_with_seed_via_nats(
-                &engine,
-                nats_client.clone(),
-                worker_shared_key,
-                initial_results,
-                execution_id,
-            )
-            .await
-            {
-                Ok(ctx) => {
-                    // Convert entire ctx.results hashmap to JSON to save on the workflow_execution
-                    let mut aggregated_output = serde_json::Map::new();
-                    for (node_id, output) in &ctx.results {
-                        aggregated_output.insert(node_id.to_string(), output.clone());
-                    }
-                    let aggregated_json = talos_dlp_provider::redact_json(
-                        &serde_json::Value::Object(aggregated_output),
-                    );
-
-                    // Enforce output size limit to prevent DoS via unbounded DB writes
-                    const MAX_AGGREGATED_OUTPUT_BYTES: usize = 50 * 1024 * 1024; // 50 MB
-                    match serde_json::to_string(&aggregated_json) {
-                        Ok(json_str) if json_str.len() > MAX_AGGREGATED_OUTPUT_BYTES => {
-                            tracing::error!(
-                                execution_id = %execution_id,
-                                output_bytes = json_str.len(),
-                                "Workflow output exceeds 50 MB limit"
-                            );
-                            if let Err(e) = sqlx::query(
-                                // allow-bare-pool-rls: execution_id owned by user_id via create_execution_under_concurrency_limit's (workflow_id,user_id) gate (line ~222) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
-                            )
-                            .bind(execution_id)
-                            .bind("Workflow output exceeds size limit")
-                            .execute(&db_pool)
-                            .await {
-                                tracing::error!(
-                                    execution_id = %execution_id,
-                                    error = %e,
-                                    "Failed to mark execution as failed (size-limit path) — \
-                                     execution will appear stuck in 'running' state"
-                                );
-                            }
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::error!(execution_id = %execution_id, "Failed to serialize workflow output: {}", e);
-                        }
-                        Ok(_) => {}
-                    }
-
-                    // Update execution status. MCP-682: encryption-aware
-                    // repository writes so Phase A deployments persist
-                    // ciphertext, not plaintext.
-                    let wf_repo =
-                        talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
-                            .with_encryption(sm_for_persist.clone());
-                    if ctx.waiting {
-                        if let Err(db_err) = wf_repo
-                            .mark_execution_waiting(execution_id, &aggregated_json)
-                            .await
-                        {
-                            tracing::error!("Database operation failed in schema: {}", db_err);
-                        }
-                        // Also persist an encrypted copy of the checkpoint for defense-in-depth.
-                        let store = ControllerCheckpointStore::new(
-                            db_pool.clone(),
-                            wsk_for_checkpoint.as_ref().map(|k| k.as_bytes().to_vec()),
-                        );
-                        // Monotonic seq = node-keyed snapshot cardinality (same
-                        // scale the engine's per-node saves use). The suspend-time
-                        // write holds the complete completed-node set, so its seq
-                        // is >= any racing interim save and a later resume's saves
-                        // continue above it.
-                        let checkpoint_seq =
-                            aggregated_json.as_object().map(|o| o.len()).unwrap_or(0) as i64;
-                        if let Err(e) = talos_workflow_engine_core::CheckpointStore::save(
-                            &store,
-                            execution_id,
-                            &aggregated_json,
-                            checkpoint_seq,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                %execution_id,
-                                error = %e,
-                                "Failed to persist encrypted checkpoint — resume will rely on plain output_data fallback",
-                            );
-                        }
-                    } else if let Err(db_err) = wf_repo
-                        .mark_execution_completed(execution_id, &aggregated_json)
-                        .await
-                    {
-                        tracing::error!("Database operation failed in schema: {}", db_err);
-                    }
-
-                    let event = ExecutionEvent {
-                        execution_id,
-                        node_id: None,
-                        status: ExecutionStatus::Completed,
-                        trace_id: ctx.trace_id,
-                        span_id: None,
-                        log_message: Some("Workflow finished successfully".to_string()),
-                        iteration_index: None,
-                        iteration_total: None,
-                        duration_ms: None,
-                        output: None,
-                    };
-                    store_and_send!(event);
-                }
-                Err(e) => {
-                    // MCP-969 (2026-05-15): DLP-redact the engine
-                    // error before formatting it into the UPDATE
-                    // bind. Engine `e.to_string()` carries arbitrary
-                    // node-emitted text (HTTP response bodies, upstream
-                    // exception messages echoing Authorization headers).
-                    // Sibling-class to MCP-967/968 on the
-                    // mark_execution_failed paths; matches the
-                    // already-correct talos-scheduler:1119 pattern.
-                    let redacted_e = talos_dlp_provider::redact_str(&e.to_string());
-                    let error_msg = format!("Workflow failed: {}", redacted_e);
-                    if let Err(db_err) = sqlx::query(
-                        // allow-bare-pool-rls: execution_id owned by user_id via create_execution_under_concurrency_limit's (workflow_id,user_id) gate (line ~222) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
-                    )
-                    .bind(execution_id)
-                    .bind(&error_msg)
-                    .execute(&db_pool)
-                    .await {
-    tracing::error!("Database operation failed in schema: {}", db_err);
-}
-
-                    // Note: sending node_id=None signals to the frontend that the *entire workflow* has failed.
-                    let event = ExecutionEvent {
-                        execution_id,
-                        node_id: None,
-                        status: ExecutionStatus::Failed,
-                        trace_id: None,
-                        span_id: None,
-                        log_message: Some(error_msg),
-                        iteration_index: None,
-                        iteration_total: None,
-                        duration_ms: None,
-                        output: None,
-                    };
-                    store_and_send!(event);
-                }
-            }
-
-            // Release the advisory lock on the SAME connection where it was acquired.
-            release_advisory_lock(conn, lock_id).await;
-        });
+        };
 
         let now = Utc::now().to_rfc3339();
         Ok(WorkflowExecution {
-            id: execution_id,
+            id: dispatched.execution_id,
             workflow_id,
-            status: "pending".to_string(),
+            status: "running".to_string(),
             started_at: now.clone(),
             completed_at: None,
             error_message: None,
@@ -789,7 +179,7 @@ impl WorkflowsMutations {
             duration_ms: None,
             output_data: None,
             trigger_type: Some("manual".to_string()),
-            actor_id: None,
+            actor_id: dispatched.metadata.actor_id,
         })
     }
 

@@ -3685,7 +3685,12 @@ async fn main() -> anyhow::Result<()> {
             nats_client.clone(),
             worker_shared_key.clone(),
             db_pool.clone(),
-        ),
+        )
+        // Live executionUpdates events for terminal transitions — with the
+        // service owning emission, MCP-triggered executions broadcast the
+        // same events GraphQL-triggered ones do (pre-2026-07-01 only the
+        // GraphQL-inline trigger path fed the channel).
+        .with_event_sender(tx.clone()),
     );
 
     // Workflow-manifest service. Single shared instance backs the MCP

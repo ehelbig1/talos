@@ -498,6 +498,8 @@ impl ExecutionOrchestrationService {
         let worker_key = self.worker_shared_key.clone();
         let trigger_input_for_storage = input_payload.clone();
         let trace_actor_id = trigger_agent_id;
+        let event_sender = self.event_sender.clone();
+        let db_pool_for_events = self.db_pool.clone();
         // F4 fresh-run fence (FU-1): the pool drives the epoch heartbeat that
         // aborts this run if a crash-recovery reclaim bumps the row's epoch out
         // from under us. See `talos_engine::fence::run_with_trigger_input_fenced`.
@@ -580,6 +582,20 @@ impl ExecutionOrchestrationService {
                             "trigger: failed to mark execution as completed"
                         );
                     }
+
+                    // Live terminal event: broadcast to executionUpdates
+                    // subscribers + persist to execution_events (see
+                    // terminal_event.rs — semantics inherited from the
+                    // pre-migration GraphQL store_and_send! macro).
+                    crate::terminal_event::emit_terminal_event(
+                        &db_pool_for_events,
+                        event_sender.as_ref(),
+                        execution_id,
+                        talos_engine::events::ExecutionStatus::Completed,
+                        "Workflow finished successfully".to_string(),
+                        wf_ctx.trace_id.clone(),
+                    )
+                    .await;
 
                     // Phase 5.2: Reasoning-trace capture under the actor's
                     // scratchpad memory. Best-effort; failures land in
@@ -700,6 +716,19 @@ impl ExecutionOrchestrationService {
                         workflow_id,
                         execution_id,
                         &redacted_err,
+                    )
+                    .await;
+
+                    // Live terminal event (already-redacted error — the
+                    // MCP-447 single-source redaction above covers this
+                    // fourth sink too).
+                    crate::terminal_event::emit_terminal_event(
+                        &db_pool_for_events,
+                        event_sender.as_ref(),
+                        execution_id,
+                        talos_engine::events::ExecutionStatus::Failed,
+                        format!("Workflow failed: {}", redacted_err),
+                        None,
                     )
                     .await;
                 }

@@ -3371,7 +3371,9 @@ echo
 # Same playbook as check 6: push the SQL into the relevant repository
 # crate and call it from the resolver.
 bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count must not grow)"
-TALOS_API_SQLX_BASELINE=117
+# 117 at introduction (2026-07-01); 108 after the trigger_workflow
+# migration onto ExecutionOrchestrationService removed 9 inline sites.
+TALOS_API_SQLX_BASELINE=108
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \
