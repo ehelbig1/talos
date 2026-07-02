@@ -174,6 +174,37 @@ impl GmailIntegrationService {
     /// user without requiring session auth (cross-site redirects from OAuth
     /// providers may not carry session cookies).
     pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
+        // Delegate to the shared driver — it builds the authorize URL from
+        // `authorize_request()` and persists the PKCE + CSRF state token bound
+        // to `user_id`. See the `OAuthIntegration` impl below.
+        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+    }
+
+    /// Handle OAuth callback and store the integration.
+    /// `user_id` is recovered from the state token (stored during `get_authorization_url`),
+    /// so this handler does NOT require session authentication.
+    pub async fn handle_callback(&self, code: String, state: String) -> Result<GmailIntegration> {
+        // Delegate to the shared driver — it consumes + validates the CSRF state
+        // token (single-use, format, tenancy) and only then hands the validated
+        // `ConsumedOAuthState` to `complete_callback()`. See the
+        // `OAuthIntegration` impl below.
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+    }
+}
+
+/// Shared OAuth flow contract — the `talos_oauth` drivers run the CSRF /
+/// PKCE / single-use / tenancy handling and call back into these three
+/// provider-specific pieces, making consume-before-exchange structural.
+/// `talos-slack` is the canonical reference implementation of this shape.
+#[async_trait::async_trait]
+impl talos_oauth::OAuthIntegration for GmailIntegrationService {
+    type Connected = GmailIntegration;
+
+    fn provider(&self) -> &'static str {
+        "gmail"
+    }
+
+    fn authorize_request(&self) -> Result<talos_oauth::AuthorizeRequest<'static>> {
         if !self.is_configured() {
             return Err(anyhow!(
                 "Gmail OAuth is not configured. Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, and GMAIL_REDIRECT_URI"
@@ -184,7 +215,7 @@ impl GmailIntegrationService {
         // shared flow helper — the CSRF/PKCE/tenancy handling lives in one place.
         // PKCE (Proof Key for Code Exchange) prevents authorization code
         // interception attacks. Google supports S256 challenges.
-        let req = talos_oauth::AuthorizeRequest {
+        Ok(talos_oauth::AuthorizeRequest {
             provider: "gmail",
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
             token_url: "https://oauth2.googleapis.com/token",
@@ -208,20 +239,19 @@ impl GmailIntegrationService {
             ],
             // Request offline access to get refresh token
             extra_params: &[("access_type", "offline"), ("prompt", "consent")],
-        };
-        talos_oauth::begin_oauth_authorization(&self.db_pool, &req, user_id).await
+        })
     }
 
-    /// Handle OAuth callback and store the integration.
-    /// `user_id` is recovered from the state token (stored during `get_authorization_url`),
-    /// so this handler does NOT require session authentication.
-    pub async fn handle_callback(&self, code: String, state: String) -> Result<GmailIntegration> {
-        // Validate + single-use-consume the CSRF state token, recovering the
-        // initiating user_id + PKCE verifier. SECURITY: user_id comes from the
-        // state token (bound at connect time), NOT the callback's session cookie.
-        // Centralized (CSRF single-use, PKCE scrub, format-gate, tenancy) in
-        // talos_oauth::consume_oauth_state.
-        let consumed = talos_oauth::consume_oauth_state(&self.db_pool, "gmail", &state).await?;
+    async fn complete_callback(
+        &self,
+        _pool: &sqlx::PgPool,
+        code: &str,
+        consumed: talos_oauth::ConsumedOAuthState,
+    ) -> Result<GmailIntegration> {
+        // SECURITY: user_id comes from the state token (bound at connect time),
+        // NOT the callback's session cookie. The CSRF single-use / PKCE scrub /
+        // format-gate / tenancy consume already happened in the shared driver
+        // (talos_oauth::consume_oauth_state) before this call.
         let user_id = consumed.user_id;
         let pkce_verifier_secret = consumed.pkce_verifier;
         // Build OAuth client – handle missing configuration explicitly
@@ -359,7 +389,9 @@ impl GmailIntegrationService {
 
         Ok(integration)
     }
+}
 
+impl GmailIntegrationService {
     /// Insert or update a Gmail integration (metadata only).
     ///
     /// Tokens are stored exclusively in the unified credential service —

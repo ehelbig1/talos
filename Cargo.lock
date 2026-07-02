@@ -7282,6 +7282,7 @@ name = "talos-atlassian"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "reqwest 0.12.28",
@@ -7292,6 +7293,7 @@ dependencies = [
  "talos-http-body",
  "talos-http-utils",
  "talos-oauth",
+ "tokio",
  "tracing",
  "urlencoding",
  "uuid",
@@ -7759,6 +7761,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-nats",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
