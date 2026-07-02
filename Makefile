@@ -204,6 +204,12 @@ drill: ## Run the backup→restore drill (pg_dump + vault snapshot → scratch s
 smoke: ## End-to-end probe of a deployed cluster (BASE_URL=https://… SMOKE_AGENT_TOKEN=… SMOKE_ACTOR_ID=…)
 	@bash scripts/smoke.sh
 
+schema-baseline: ## Generate the migration baseline snapshot + seed (RFC 0009; BASELINE_DATABASE_URL=… disposable PG)
+	@bash scripts/generate-schema-baseline.sh
+
+verify-schema-baseline: ## Prove baseline+seed+tail == full chain (RFC 0009; CHAIN_DATABASE_URL=… BASELINE_DATABASE_URL=…)
+	@bash scripts/verify-schema-baseline.sh
+
 rls-preflight: ## Verify Postgres is ready for RLS SET-ROLE enforcement (DATABASE_URL=… controller's role)
 	@bash scripts/rls-preflight.sh
 
