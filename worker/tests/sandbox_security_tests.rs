@@ -687,3 +687,27 @@ async fn xml_external_entity_is_not_resolved_xxe() {
         );
     }
 }
+
+/// Entity-resolution freeze for the quick-xml 0.37 → 0.41 migration
+/// (RUSTSEC-2026-0194/0195). Post-0.38, entity references arrive as
+/// GeneralRef events and a text run splits around them — the converter
+/// must reassemble "a &amp; b &lt;ok&gt;" into ONE "#text" string,
+/// resolving the five predefined entities and numeric char refs exactly
+/// as the old BytesText::unescape did.
+#[tokio::test]
+async fn xml_predefined_entities_and_char_refs_resolve_into_one_text() {
+    use worker::bindings::talos::core::data_transform::Host;
+    let mut ctx = make_context();
+
+    let xml = r#"<r>a &amp; b &lt;ok&gt; &quot;q&quot; &apos;s&apos; &#49;&#x30;</r>"#;
+    let json = ctx
+        .xml_to_json(xml.to_string())
+        .await
+        .expect("predefined entities + char refs must convert");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON out");
+    assert_eq!(
+        parsed["r"],
+        serde_json::json!(r#"a & b <ok> "q" 's' 10"#),
+        "entity fragments must reassemble into one unescaped #text value"
+    );
+}

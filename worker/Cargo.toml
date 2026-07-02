@@ -94,7 +94,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # guest template's CPU is bounded host-side (see wit_templates::render).
 minijinja = { version = "2.5", features = ["fuel"] }  # Jinja2-compatible template engine
 csv = "1.3"  # CSV parsing and generation
-quick-xml = { version = "0.37", features = ["serialize"] }  # XML parsing with security
+quick-xml = { version = "0.41", features = ["serialize"] }  # XML parsing with security
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # Redis client; rustls for rediss:// (Upstash, ElastiCache TLS)
 # rustls direct dep so worker/main.rs can install the ring CryptoProvider
 # at startup — required since rustls 0.23 stopped auto-selecting one when
