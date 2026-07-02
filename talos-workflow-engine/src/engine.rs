@@ -966,7 +966,7 @@ impl ParallelWorkflowEngine {
             node_timeouts: HashMap::new(),
             actor_id: None,
             // SECURITY: default to Tier1 (local-only LLM egress).
-            // `ActorRepository::apply_actor_to_engine` overrides this
+            // `talos_engine::actor_binding::apply_actor_to_engine` overrides this
             // before `run()` / `run_with_seed()` so real dispatch is
             // unaffected. Tier1 is the fail-closed posture for any
             // code path that forgets the canonical actor-stamping step.

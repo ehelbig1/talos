@@ -298,7 +298,11 @@ mod tests {
         assert_eq!(ring.len(), 3);
         // Signing key is always the first verify candidate.
         assert_eq!(ring.signing_key().as_bytes(), &[1u8; 32]);
-        let verify: Vec<&[u8]> = ring.verify_keys().iter().map(|k| k.as_bytes()).collect();
+        let verify: Vec<&[u8]> = ring
+            .verify_keys()
+            .iter()
+            .map(WorkerSharedKey::as_bytes)
+            .collect();
         assert_eq!(verify, vec![&[1u8; 32][..], &[2u8; 32][..], &[3u8; 32][..]]);
     }
 

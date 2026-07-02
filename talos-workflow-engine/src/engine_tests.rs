@@ -825,7 +825,7 @@ fn memo_reuses_arc_on_unchanged_version_and_rebuilds_on_bump() {
 // P2 — per-execution module-artifact cache
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A `ModuleFetcher` that records how many times each module_id was fetched,
+/// A `ModuleFetcher` that records how many times each `module_id` was fetched,
 /// so a test can prove the per-execution cache elides redundant DB-shaped
 /// round-trips. Local to the test module so the shared test-utils crate stays
 /// untouched.

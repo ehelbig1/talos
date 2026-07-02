@@ -191,7 +191,7 @@ pub struct DispatchJob {
     /// closed.
     ///
     /// **Default `Tier1`** (fail-closed). Real dispatch paths override
-    /// this via `ActorRepository::apply_actor_to_engine`, which sources
+    /// this via `talos_engine::actor_binding::apply_actor_to_engine`, which sources
     /// the value from `actors.max_llm_tier` for actor-bound executions
     /// and fail-closes to Tier1 on DB errors. Tier1 as the default
     /// ensures any code path that bypasses the canonical builder lands
@@ -277,7 +277,7 @@ impl Default for DispatchJob {
             // is the fail-closed posture — any code path that constructs
             // a `DispatchJob` without going through the canonical
             // `talos_engine::builder::for_workflow` (which calls
-            // `ActorRepository::apply_actor_to_engine` and stamps the
+            // `talos_engine::actor_binding::apply_actor_to_engine` and stamps the
             // actor's configured ceiling) will land here.
             //
             // Pre-r306 the default was `Tier2`, which fail-OPENED: a
@@ -857,7 +857,7 @@ mod tests {
         // SECURITY: `DispatchJob::default()` MUST return `Tier1`. Any
         // code path that constructs a `DispatchJob` without going
         // through `talos_engine::builder::for_workflow` (and thus
-        // `ActorRepository::apply_actor_to_engine`) lands in the
+        // `talos_engine::actor_binding::apply_actor_to_engine`) lands in the
         // most-restrictive ceiling rather than fail-opening to Tier2.
         //
         // If this test fails, the default was probably flipped back to
