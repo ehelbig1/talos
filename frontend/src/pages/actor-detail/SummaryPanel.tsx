@@ -22,7 +22,7 @@ import {
   type ActorDetails,
   type ActorActionLogEntry,
   type ActorWorkflowItem,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
 import {
   getCapabilityConfig,
   isAiWorkflow,

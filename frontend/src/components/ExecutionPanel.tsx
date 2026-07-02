@@ -2,10 +2,11 @@ import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button, ConfirmDialog } from "@/components/ui";
 import {
-  graphqlRequest,
   listActors,
+  triggerWorkflowAsActor,
   type ActorSummary,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
+import { useListWorkflowNamesQuery } from "@/generated/graphql";
 import { loadWorkflowById } from "@/lib/workflowLoader";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useShallow } from "zustand/react/shallow";
@@ -71,15 +72,8 @@ export default function ExecutionPanel() {
     data: workflows = [],
     isLoading: loadingWorkflows,
     refetch: refetchWorkflows,
-  } = useQuery<Workflow[]>({
-    queryKey: ["workflows"],
-    queryFn: async () => {
-      const data = await graphqlRequest<{ workflows: Workflow[] }>(
-        `query { workflows { id name } }`,
-        {},
-      );
-      return data?.workflows || [];
-    },
+  } = useListWorkflowNamesQuery(undefined, {
+    select: (data): Workflow[] => data.workflows,
   });
 
   // Fetch active actors for the actor selector
@@ -117,14 +111,12 @@ export default function ExecutionPanel() {
 
     try {
       const hasActor = selectedActorId && selectedActorId !== "";
-      const data = await graphqlRequest<{ triggerWorkflow: { id: string } }>(
-        hasActor
-          ? `mutation ($workflowId: UUID!, $actorId: UUID) { triggerWorkflow(workflowId: $workflowId, actorId: $actorId) { id } }`
-          : `mutation ($workflowId: UUID!) { triggerWorkflow(workflowId: $workflowId) { id } }`,
-        hasActor ? { workflowId, actorId: selectedActorId } : { workflowId },
+      const execution = await triggerWorkflowAsActor(
+        workflowId,
+        hasActor ? selectedActorId : undefined,
       );
 
-      const execId = data.triggerWorkflow.id;
+      const execId = execution.id;
       setExecutionId(execId);
 
       // The useActiveExecutionSync hook will pick up this new execution automatically

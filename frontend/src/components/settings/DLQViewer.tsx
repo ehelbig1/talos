@@ -466,7 +466,7 @@ export function DLQViewer() {
                       TRIGGER_ID
                     </span>
                     <span className="text-[10px] text-white/40 font-black tracking-tight">
-                      {entry.triggerId.slice(0, 12)}...
+                      {entry.triggerId?.slice(0, 12) ?? "unknown"}...
                     </span>
                   </div>
                 </div>

@@ -22,7 +22,7 @@ import {
 import { cn } from "@/lib/utils";
 import { formatDate } from "@/lib/format";
 import {
-  WorkflowVersionItem,
+  type WorkflowVersionsQuery,
   useWorkflowVersionsQuery,
   usePublishWorkflowVersionMutation,
   useRollbackWorkflowVersionMutation,
@@ -366,71 +366,75 @@ export default function WorkflowVersionsPanel({
             </div>
           ) : activeTab === "versions" ? (
             <div className="divide-y divide-white/5">
-              {versions.map((v: WorkflowVersionItem) => (
-                <div
-                  key={v.id}
-                  className={cn(
-                    "px-8 py-6 flex items-center justify-between gap-6 group transition-premium",
-                    v.isActive ? "bg-primary/[0.03]" : "hover:bg-white/[0.015]",
-                  )}
-                >
-                  <div className="flex items-center gap-6 min-w-0">
-                    <div
-                      className={cn(
-                        "w-10 h-10 rounded-xl flex items-center justify-center text-[10px] font-black shrink-0 border transition-premium",
-                        v.isActive
-                          ? "bg-primary/10 border-primary/30 text-primary shadow-[0_0_15px_hsla(var(--primary),0.2)]"
-                          : "bg-surface-3 border-white/5 text-muted-foreground/40 group-hover:border-white/10",
-                      )}
-                    >
-                      V{v.versionNumber}
-                    </div>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-3 mb-1.5">
-                        {v.isActive && (
-                          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-primary/10 border border-primary/20 text-[9px] font-black text-primary rounded-md uppercase tracking-widest animate-status-pulse">
-                            <CheckCircle2 className="w-2.5 h-2.5" />
-                            Live
-                          </span>
-                        )}
-                        <span
-                          className={cn(
-                            "text-sm truncate font-bold",
-                            v.description
-                              ? "text-white"
-                              : "text-muted-foreground/30 italic",
-                          )}
-                        >
-                          {v.description || "No identifier"}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2 text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em]">
-                        <Clock className="w-3 h-3" />
-                        {formatDate(v.publishedAt)}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="shrink-0">
-                    {v.isActive ? (
-                      <span className="px-4 py-2 bg-primary/5 border border-primary/10 text-[9px] font-black text-primary/60 rounded-xl uppercase tracking-widest">
-                        ORCHESTRATING
-                      </span>
-                    ) : (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => setRollbackTargetId(v.id)}
-                        disabled={rollbackMutation.isPending}
-                        className="opacity-0 group-hover:opacity-100 text-muted-foreground/40 hover:text-primary hover:bg-primary/5 h-9 px-5 font-black transition-premium text-[9px] gap-2 uppercase tracking-widest border border-white/5 rounded-xl hover:border-primary/20"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5" />
-                        Rollback
-                      </Button>
+              {versions.map(
+                (v: WorkflowVersionsQuery["workflowVersions"][number]) => (
+                  <div
+                    key={v.id}
+                    className={cn(
+                      "px-8 py-6 flex items-center justify-between gap-6 group transition-premium",
+                      v.isActive
+                        ? "bg-primary/[0.03]"
+                        : "hover:bg-white/[0.015]",
                     )}
+                  >
+                    <div className="flex items-center gap-6 min-w-0">
+                      <div
+                        className={cn(
+                          "w-10 h-10 rounded-xl flex items-center justify-center text-[10px] font-black shrink-0 border transition-premium",
+                          v.isActive
+                            ? "bg-primary/10 border-primary/30 text-primary shadow-[0_0_15px_hsla(var(--primary),0.2)]"
+                            : "bg-surface-3 border-white/5 text-muted-foreground/40 group-hover:border-white/10",
+                        )}
+                      >
+                        V{v.versionNumber}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-3 mb-1.5">
+                          {v.isActive && (
+                            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-primary/10 border border-primary/20 text-[9px] font-black text-primary rounded-md uppercase tracking-widest animate-status-pulse">
+                              <CheckCircle2 className="w-2.5 h-2.5" />
+                              Live
+                            </span>
+                          )}
+                          <span
+                            className={cn(
+                              "text-sm truncate font-bold",
+                              v.description
+                                ? "text-white"
+                                : "text-muted-foreground/30 italic",
+                            )}
+                          >
+                            {v.description || "No identifier"}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em]">
+                          <Clock className="w-3 h-3" />
+                          {formatDate(v.publishedAt)}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="shrink-0">
+                      {v.isActive ? (
+                        <span className="px-4 py-2 bg-primary/5 border border-primary/10 text-[9px] font-black text-primary/60 rounded-xl uppercase tracking-widest">
+                          ORCHESTRATING
+                        </span>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setRollbackTargetId(v.id)}
+                          disabled={rollbackMutation.isPending}
+                          className="opacity-0 group-hover:opacity-100 text-muted-foreground/40 hover:text-primary hover:bg-primary/5 h-9 px-5 font-black transition-premium text-[9px] gap-2 uppercase tracking-widest border border-white/5 rounded-xl hover:border-primary/20"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          Rollback
+                        </Button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                ),
+              )}
             </div>
           ) : null}
 

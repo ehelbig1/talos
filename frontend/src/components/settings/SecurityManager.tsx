@@ -26,20 +26,17 @@ import {
   useReEncryptSecretsMutation,
   useRotateMasterKeyMutation,
   useRotateEncryptionKeyMutation,
-  DekRotationResultType,
-  ReEncryptionResultType,
-  MasterKeyRotationResultType,
+  DekRotationResult,
+  ReEncryptionResult,
+  MasterKeyRotationResult,
 } from "@/generated/graphql";
 
 // ─── Sub-types for result state ───────────────────────────────────────────────
 
-type DekResult = Pick<DekRotationResultType, "newDekId" | "message">;
-type ReEncryptResult = Pick<
-  ReEncryptionResultType,
-  "reEncryptedCount" | "message"
->;
+type DekResult = Pick<DekRotationResult, "newDekId" | "message">;
+type ReEncryptResult = Pick<ReEncryptionResult, "reEncryptedCount" | "message">;
 type MasterKeyResult = Pick<
-  MasterKeyRotationResultType,
+  MasterKeyRotationResult,
   "reEncryptedDekCount" | "message"
 >;
 

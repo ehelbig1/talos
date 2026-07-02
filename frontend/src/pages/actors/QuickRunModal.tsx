@@ -4,11 +4,11 @@ import { toast } from "sonner";
 import { Play, Loader2, ChevronRight } from "lucide-react";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
-  graphqlRequest,
   getActorWorkflows,
+  triggerWorkflowAsActor,
   type ActorSummary,
   type ActorWorkflowItem,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
 import { Dialog } from "@/components/ui/dialog";
 
 interface QuickRunModalProps {
@@ -29,11 +29,8 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
 
   const triggerMut = useMutation({
     mutationFn: async (workflowId: string) => {
-      const data = await graphqlRequest<{ triggerWorkflow: { id: string } }>(
-        `mutation ($wId: UUID!, $aId: UUID) { triggerWorkflow(workflowId: $wId, actorId: $aId) { id } }`,
-        { wId: workflowId, aId: actor.id },
-      );
-      return data.triggerWorkflow.id;
+      const execution = await triggerWorkflowAsActor(workflowId, actor.id);
+      return execution.id;
     },
     onSuccess: (execId) => setResult({ execId }),
     onError: (e: Error) => toast.error(sanitizeErrorMessage(e.message)),

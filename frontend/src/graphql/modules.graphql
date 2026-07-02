@@ -1,0 +1,48 @@
+# Operations previously hand-maintained inside src/generated/graphql.ts.
+# They now live here as codegen source documents: `npm run codegen` regenerates
+# the typed react-query hooks + Document constants from these definitions.
+
+query MyModules($limit: Int, $offset: Int) {
+  myModules(pagination: {limit: $limit, offset: $offset}) {
+    id
+    name
+    capabilityWorld
+    language
+    sizeBytes
+    compiledAt
+    contentHash
+    capabilityDescription
+    importedInterfaces
+    config
+  }
+}
+
+mutation CreateModuleFromTemplate($input: CreateModuleInput!) {
+  createModuleFromTemplate(input: $input) {
+    id
+    config
+  }
+}
+
+query NodeTemplates($category: String) {
+  nodeTemplates(category: $category) {
+    id
+    name
+    category
+    description
+    icon
+    allowedHosts
+  }
+}
+
+query GetNodeTemplates($category: String) {
+  nodeTemplates(category: $category) {
+    id
+    name
+    category
+    description
+    configSchema
+    icon
+    allowedHosts
+  }
+}

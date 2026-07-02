@@ -1,3 +1,12 @@
+/** Internal type. DO NOT USE DIRECTLY. */
+type Exact<T extends { [key: string]: unknown }> = { [K in keyof T]: T[K] };
+/** Internal type. DO NOT USE DIRECTLY. */
+export type Incremental<T> =
+  | T
+  | {
+      [P in keyof T]?: P extends " $fragmentName" | "__typename" ? T[P] : never;
+    };
+import { DocumentTypeDecoration } from "@graphql-typed-document-node/core";
 import {
   useQuery,
   useMutation,
@@ -5,1359 +14,154 @@ import {
   UseMutationOptions,
 } from "@tanstack/react-query";
 import { graphqlFetcher } from "@/lib/graphqlClient";
-export type Maybe<T> = T | null;
-export type InputMaybe<T> = Maybe<T>;
-export type Exact<T extends { [key: string]: unknown }> = {
-  [K in keyof T]: T[K];
-};
-export type MakeOptional<T, K extends keyof T> = Omit<T, K> & {
-  [SubKey in K]?: Maybe<T[SubKey]>;
-};
-export type MakeMaybe<T, K extends keyof T> = Omit<T, K> & {
-  [SubKey in K]: Maybe<T[SubKey]>;
-};
-export type MakeEmpty<
-  T extends { [key: string]: unknown },
-  K extends keyof T,
-> = { [_ in K]?: never };
-export type Incremental<T> =
-  | T
-  | {
-      [P in keyof T]?: P extends " $fragmentName" | "__typename" ? T[P] : never;
-    };
-/** All built-in and custom scalars, mapped to their actual values */
-export type Scalars = {
-  ID: { input: string; output: string };
-  String: { input: string; output: string };
-  Boolean: { input: boolean; output: boolean };
-  Int: { input: number; output: number };
-  Float: { input: number; output: number };
-  JSON: { input: unknown; output: unknown };
-  UUID: { input: string; output: string };
-};
-
-export type ActorActionLogEntry = {
-  __typename?: "ActorActionLogEntry";
-  actionType: Scalars["String"]["output"];
-  executionId?: Maybe<Scalars["UUID"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  summary: Scalars["String"]["output"];
-  timestamp: Scalars["String"]["output"];
-  workflowId?: Maybe<Scalars["UUID"]["output"]>;
-};
-
-export type ActorDetails = {
-  __typename?: "ActorDetails";
-  createdAt: Scalars["String"]["output"];
-  description?: Maybe<Scalars["String"]["output"]>;
-  executionCount: Scalars["Int"]["output"];
-  id: Scalars["UUID"]["output"];
-  /** ISO-8601 timestamp of the most recent execution dispatched by this actor. */
-  lastActiveAt?: Maybe<Scalars["String"]["output"]>;
-  maxCapabilityWorld: Scalars["String"]["output"];
-  /** MCP bearer token — intentionally always None via GraphQL (shown once at MCP creation). */
-  mcpToken?: Maybe<Scalars["String"]["output"]>;
-  metadata?: Maybe<Scalars["String"]["output"]>;
-  name: Scalars["String"]["output"];
-  /** Per-minute execution rate limit. None = unlimited. */
-  rateLimit?: Maybe<Scalars["Int"]["output"]>;
-  /** Lifetime budget consumed. Always 0 until budget tracking is wired. */
-  spentBudgetUsd: Scalars["Float"]["output"];
-  status: Scalars["String"]["output"];
-  /** Lifetime budget cap in USD. None = unlimited. */
-  totalBudgetUsd?: Maybe<Scalars["Float"]["output"]>;
-  updatedAt: Scalars["String"]["output"];
-  workflowCount: Scalars["Int"]["output"];
-};
-
-export type ActorExecutionsSummary = {
-  __typename?: "ActorExecutionsSummary";
-  activeExecutions: Scalars["Int"]["output"];
-  failedExecutions: Scalars["Int"]["output"];
-  successfulExecutions: Scalars["Int"]["output"];
-  totalExecutions: Scalars["Int"]["output"];
-};
-
-export type ActorSummary = {
-  __typename?: "ActorSummary";
-  createdAt: Scalars["String"]["output"];
-  description?: Maybe<Scalars["String"]["output"]>;
-  executionCount: Scalars["Int"]["output"];
-  id: Scalars["UUID"]["output"];
-  maxCapabilityWorld: Scalars["String"]["output"];
-  name: Scalars["String"]["output"];
-  /** Lifetime budget consumed. Always 0 until budget tracking is wired. */
-  spentBudgetUsd: Scalars["Float"]["output"];
-  status: Scalars["String"]["output"];
-  /** Lifetime budget cap in USD. None = unlimited. */
-  totalBudgetUsd?: Maybe<Scalars["Float"]["output"]>;
-  updatedAt: Scalars["String"]["output"];
-  workflowCount: Scalars["Int"]["output"];
-};
-
-export type ActorWorkflowItem = {
-  __typename?: "ActorWorkflowItem";
-  createdAt: Scalars["String"]["output"];
-  /** Serialized graph JSON — used client-side to detect AI Actor (LLM + INJECT_CONTEXT). */
-  graphJson?: Maybe<Scalars["String"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  name: Scalars["String"]["output"];
-  nodeCount: Scalars["Int"]["output"];
-  status?: Maybe<Scalars["String"]["output"]>;
-  updatedAt: Scalars["String"]["output"];
-};
-
-export type ActorWorkflowsSummary = {
-  __typename?: "ActorWorkflowsSummary";
-  activeWorkflows: Scalars["Int"]["output"];
-  totalWorkflows: Scalars["Int"]["output"];
-};
-
-export type AnalyzeCustomModuleResult = {
-  __typename?: "AnalyzeCustomModuleResult";
-  errors: Array<CompilationErrorObj>;
-  success: Scalars["Boolean"]["output"];
-};
-
+export * from "./schema";
 export type AnalyzeRhaiInput = {
-  script: Scalars["String"]["input"];
-};
-
-export type ApiKeyCreated = {
-  __typename?: "ApiKeyCreated";
-  expiresAt?: Maybe<Scalars["String"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  key: Scalars["String"]["output"];
-  name: Scalars["String"]["output"];
-  scopes: Array<Scalars["String"]["output"]>;
-};
-
-export type ApiKeyInfo = {
-  __typename?: "ApiKeyInfo";
-  createdAt: Scalars["String"]["output"];
-  expiresAt?: Maybe<Scalars["String"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  isActive: Scalars["Boolean"]["output"];
-  keyPrefix: Scalars["String"]["output"];
-  lastUsedAt?: Maybe<Scalars["String"]["output"]>;
-  name: Scalars["String"]["output"];
-  scopes: Array<Scalars["String"]["output"]>;
-  usageCount: Scalars["Int"]["output"];
-};
-
-export type AuthPayload = {
-  __typename?: "AuthPayload";
-  user: UserInfo;
-};
-
-/** Human-readable changelog entry for a workflow version. */
-export type ChangelogEntry = {
-  __typename?: "ChangelogEntry";
-  description?: Maybe<Scalars["String"]["output"]>;
-  publishedAt: Scalars["String"]["output"];
-  summary: Scalars["String"]["output"];
-  versionNumber: Scalars["Int"]["output"];
-};
-
-export type CompilationErrorObj = {
-  __typename?: "CompilationErrorObj";
-  column?: Maybe<Scalars["Int"]["output"]>;
-  endColumn?: Maybe<Scalars["Int"]["output"]>;
-  endLine?: Maybe<Scalars["Int"]["output"]>;
-  line?: Maybe<Scalars["Int"]["output"]>;
-  message: Scalars["String"]["output"];
-  severity: Scalars["String"]["output"];
+  script: string;
 };
 
 /** Input type for createActor mutation. */
 export type CreateActorInput = {
-  description?: InputMaybe<Scalars["String"]["input"]>;
-  maxCapabilityWorld?: InputMaybe<Scalars["String"]["input"]>;
-  name: Scalars["String"]["input"];
+  description?: string | null | undefined;
+  maxCapabilityWorld?: string | null | undefined;
+  name: string;
   /** Per-minute execution rate limit (informational — reserved for future enforcement). */
-  rateLimit?: InputMaybe<Scalars["Int"]["input"]>;
+  rateLimit?: number | null | undefined;
   /** Lifetime budget cap in USD (informational — enforcement via budget policies). */
-  totalBudgetUsd?: InputMaybe<Scalars["Float"]["input"]>;
+  totalBudgetUsd?: number | null | undefined;
 };
 
 export type CreateApiKeyInput = {
-  expiresInDays?: InputMaybe<Scalars["Int"]["input"]>;
-  name: Scalars["String"]["input"];
-  scopes: Array<Scalars["String"]["input"]>;
+  expiresInDays?: number | null | undefined;
+  name: string;
+  scopes: Array<string>;
 };
 
 export type CreateModuleInput = {
-  config: Scalars["String"]["input"];
-  name: Scalars["String"]["input"];
-  templateId: Scalars["UUID"]["input"];
+  config: string;
+  jobId?: string | null | undefined;
+  name: string;
+  templateId: string;
 };
 
 export type CreateSecretInput = {
-  allowedModules?: InputMaybe<Array<Scalars["UUID"]["input"]>>;
-  description?: InputMaybe<Scalars["String"]["input"]>;
-  keyPath: Scalars["String"]["input"];
-  name: Scalars["String"]["input"];
+  allowedModules?: Array<string> | null | undefined;
+  description?: string | null | undefined;
+  keyPath: string;
+  name: string;
   /**
    * Optional organization to assign the secret to. When set, all org
    * members can access this secret.
    */
-  orgId?: InputMaybe<Scalars["UUID"]["input"]>;
-  value: Scalars["String"]["input"];
+  orgId?: string | null | undefined;
+  value: string;
 };
 
 export type CreateWebhookTriggerInput = {
-  allowedIps?: InputMaybe<Array<Scalars["String"]["input"]>>;
-  enabled?: InputMaybe<Scalars["Boolean"]["input"]>;
-  maxRequestsPerMinute?: InputMaybe<Scalars["Int"]["input"]>;
-  moduleId: Scalars["UUID"]["input"];
-  name: Scalars["String"]["input"];
-  signingSecret?: InputMaybe<Scalars["String"]["input"]>;
-  verificationToken?: InputMaybe<Scalars["String"]["input"]>;
-};
-
-export type CreateWorkflowInput = {
-  graphJson: Scalars["String"]["input"];
-  name: Scalars["String"]["input"];
-};
-
-/** A node execution that failed and was moved to the Dead Letter Queue. */
-export type DeadLetterEntry = {
-  __typename?: "DeadLetterEntry";
-  createdAt: Scalars["String"]["output"];
-  errorMessage: Scalars["String"]["output"];
-  executionId: Scalars["UUID"]["output"];
-  id: Scalars["UUID"]["output"];
-  nodeId: Scalars["UUID"]["output"];
-  payload?: Maybe<Scalars["String"]["output"]>;
-  replayedAt?: Maybe<Scalars["String"]["output"]>;
-  replayedBy?: Maybe<Scalars["UUID"]["output"]>;
-  workflowId: Scalars["UUID"]["output"];
-};
-
-/** Result of a DEK rotation operation. */
-export type DekRotationResult = {
-  __typename?: "DekRotationResult";
-  /** Human-readable status message. */
-  message: Scalars["String"]["output"];
-  /** The UUID of the newly created DEK. */
-  newDekId: Scalars["UUID"]["output"];
+  allowedIps?: Array<string> | null | undefined;
+  enabled?: boolean | null | undefined;
+  /**
+   * RFC 0007: optional provider-agnostic event filter, evaluated AFTER
+   * signature verification. A non-matching delivery is acknowledged 200 with
+   * no dispatch (so it doesn't burn an execution). Omit to fire on every
+   * verified delivery. Shape (validated via `talos_webhooks::validate_event_filter`):
+   * `{ "header": "X-GitHub-Event", "values": ["pull_request"],
+   * "payload_match": { "action": ["opened","synchronize","reopened"] } }`.
+   */
+  eventFilter?: unknown;
+  maxRequestsPerMinute?: number | null | undefined;
+  moduleId: string;
+  name: string;
+  signingSecret?: string | null | undefined;
+  verificationToken?: string | null | undefined;
 };
 
 export type Enable2FaInput = {
-  code: Scalars["String"]["input"];
-  secret: Scalars["String"]["input"];
+  code: string;
+  secret: string;
 };
 
-/** A pending authorization request for a module execution. */
-export type ExecutionApproval = {
-  __typename?: "ExecutionApproval";
-  decidedAt?: Maybe<Scalars["String"]["output"]>;
-  decidedBy?: Maybe<Scalars["UUID"]["output"]>;
-  executionId: Scalars["UUID"]["output"];
-  id: Scalars["UUID"]["output"];
-  nodeId: Scalars["UUID"]["output"];
-  reason?: Maybe<Scalars["String"]["output"]>;
-  requestedAt: Scalars["String"]["output"];
-  requiredFor: Array<Scalars["String"]["output"]>;
-  status: Scalars["String"]["output"];
-  workflowId: Scalars["UUID"]["output"];
-};
-
-export type ExecutionEvent = {
-  __typename?: "ExecutionEvent";
-  executionId: Scalars["UUID"]["output"];
-  iterationIndex?: Maybe<Scalars["Int"]["output"]>;
-  iterationTotal?: Maybe<Scalars["Int"]["output"]>;
-  logMessage?: Maybe<Scalars["String"]["output"]>;
-  nodeId?: Maybe<Scalars["UUID"]["output"]>;
-  spanId?: Maybe<Scalars["String"]["output"]>;
-  status: ExecutionStatus;
-  traceId?: Maybe<Scalars["String"]["output"]>;
-};
-
-export enum ExecutionStatus {
-  Completed = "COMPLETED",
-  Failed = "FAILED",
-  Pending = "PENDING",
-  Running = "RUNNING",
-  Skipped = "SKIPPED",
-  Waiting = "WAITING",
-}
-
-export type GenerateCodeInput = {
-  capabilityWorld: Scalars["String"]["input"];
-  currentCode: Scalars["String"]["input"];
-  prompt: Scalars["String"]["input"];
-};
-
-export type GenerateCodeResult = {
-  __typename?: "GenerateCodeResult";
-  code: Scalars["String"]["output"];
-};
-
-export type LoginInput = {
-  email: Scalars["String"]["input"];
-  password: Scalars["String"]["input"];
-};
-
-/** Result of a master key rotation operation. */
-export type MasterKeyRotationResult = {
-  __typename?: "MasterKeyRotationResult";
-  /** Human-readable status message. */
-  message: Scalars["String"]["output"];
-  /** Number of DEKs that were re-encrypted with the new master key. */
-  reEncryptedDekCount: Scalars["Int"]["output"];
-};
-
-export type McpAgentCreated = {
-  __typename?: "McpAgentCreated";
-  agentId: Scalars["UUID"]["output"];
-  name: Scalars["String"]["output"];
-  role: Scalars["String"]["output"];
-  /** Bearer token — shown only once! Store in Claude Desktop config. */
-  token: Scalars["String"]["output"];
-};
-
-export type ModuleExecution = {
-  __typename?: "ModuleExecution";
-  completedAt?: Maybe<Scalars["String"]["output"]>;
-  createdAt: Scalars["String"]["output"];
-  durationMs?: Maybe<Scalars["Int"]["output"]>;
-  errorMessage?: Maybe<Scalars["String"]["output"]>;
-  errorType?: Maybe<Scalars["String"]["output"]>;
-  fuelConsumed?: Maybe<Scalars["Int"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  inputData?: Maybe<Scalars["String"]["output"]>;
-  logs: Array<ModuleExecutionLog>;
-  memoryUsedMb?: Maybe<Scalars["Int"]["output"]>;
-  module?: Maybe<WasmModule>;
-  moduleId: Scalars["UUID"]["output"];
-  outputData?: Maybe<Scalars["String"]["output"]>;
-  startedAt: Scalars["String"]["output"];
-  status: Scalars["String"]["output"];
-  triggerMetadata?: Maybe<Scalars["String"]["output"]>;
-  triggerType: Scalars["String"]["output"];
-};
-
-export type ModuleExecutionLog = {
-  __typename?: "ModuleExecutionLog";
-  createdAt: Scalars["String"]["output"];
-  executionId: Scalars["UUID"]["output"];
-  id: Scalars["UUID"]["output"];
-  level: Scalars["String"]["output"];
-  message: Scalars["String"]["output"];
-  metadata?: Maybe<Scalars["String"]["output"]>;
-};
-
-export type MutationRoot = {
-  __typename?: "MutationRoot";
-  /** Approves a pending module execution. */
-  approveExecution: Scalars["Boolean"]["output"];
-  /** Create a new runtime actor */
-  createActor: ActorSummary;
-  /** Create a new API key */
-  createApiKey: ApiKeyCreated;
-  /** Create node from template */
-  createModuleFromTemplate: WasmModule;
-  /** Create a new organization. The caller becomes the owner. */
-  createOrganization: OrganizationObj;
-  /** Create or replace a cron schedule for a workflow. */
-  createSchedule: WorkflowScheduleObj;
-  /** Create a secret */
-  createSecret: Secret;
-  /** Create a webhook listener */
-  createWebhookTrigger: WebhookTrigger;
-  /** Create or update a workflow */
-  createWorkflow: Workflow;
-  /** Delete an API key permanently */
-  deleteApiKey: Scalars["Boolean"]["output"];
-  /** Delete a workflow schedule. */
-  deleteSchedule: Scalars["Boolean"]["output"];
-  /** Delete a secret - requires ownership or org membership */
-  deleteSecret: Scalars["Boolean"]["output"];
-  /** Delete a workflow */
-  deleteWorkflow: Scalars["Boolean"]["output"];
-  /** Denies a pending module execution. */
-  denyExecution: Scalars["Boolean"]["output"];
-  /** Disable 2FA */
-  disableTwoFactor: Scalars["Boolean"]["output"];
-  /** Enable 2FA - verify code and get backup codes */
-  enableTwoFactor: TwoFactorEnrollment;
-  /** Generate or modify code using AI */
-  generateCode: GenerateCodeResult;
-  /** Invite a member to an organization. Requires Admin+ role. */
-  inviteMember: OrgMemberObj;
-  /** Login with email and password */
-  login: AuthPayload;
-  /** Logout (revoke refresh token from httpOnly cookie) */
-  logout: Scalars["Boolean"]["output"];
-  /** Publish the current draft workflow as a new immutable version. */
-  publishWorkflowVersion: WorkflowVersion;
-  /**
-   * Re-encrypt all secrets that are still using an inactive DEK.
-   *
-   * After rotating the DEK, some secrets may still be encrypted with the
-   * old key. This mutation decrypts them with the old key and re-encrypts
-   * them with the current active DEK.
-   */
-  reEncryptSecrets: ReEncryptionResult;
-  /** Refresh access token using refresh token from httpOnly cookie */
-  refreshToken: AuthPayload;
-  registerMcpAgent: McpAgentCreated;
-  /**
-   * Remove a member from an organization. Requires Admin+ role.
-   * Cannot remove the last owner.
-   */
-  removeMember: Scalars["Boolean"]["output"];
-  /** Replays a node execution from the Dead Letter Queue. */
-  replayDeadLetterEntry: Scalars["Boolean"]["output"];
-  /**
-   * Replay a dropped webhook payload from the dead-letter queue.
-   * Re-dispatches the original payload to the webhook handler and marks the entry replayed.
-   */
-  replayWebhookDeadLetterEntry: Scalars["Boolean"]["output"];
-  /** Resume execution of a workflow that is paused at a 'Wait' node. */
-  resumeWorkflow: Scalars["Boolean"]["output"];
-  /**
-   * Retry a failed or cancelled execution by resetting its status and re-running it.
-   * Unlike replay, this updates the SAME execution record.
-   */
-  retryExecution: Scalars["UUID"]["output"];
-  /** Revoke an API key */
-  revokeApiKey: Scalars["Boolean"]["output"];
-  /**
-   * Rollback a workflow to a previously published version.
-   * Creates a new version with the same graph_json as the target version.
-   */
-  rollbackWorkflowVersion: WorkflowVersion;
-  /** Rotate an API key (creates new key, deactivates old one) */
-  rotateApiKey: ApiKeyCreated;
-  /**
-   * Rotate the Data Encryption Key (DEK) used for envelope encryption.
-   *
-   * Creates a new DEK and marks all previous DEKs as inactive. Existing
-   * secrets can still be decrypted (old DEKs stay in the database), but
-   * new secrets will use the new DEK. Call `reEncryptSecrets` afterwards
-   * to migrate old secrets to the new key.
-   */
-  rotateDek: DekRotationResult;
-  /**
-   * Rotate the data-encryption key (DEK) version.
-   *
-   * Creates a new DEK version, marks existing keys for expiry in 30 days,
-   * and logs a rotation event. Requires the `Admin` API key scope.
-   *
-   * Returns the new key version number.
-   */
-  rotateEncryptionKey: Scalars["Int"]["output"];
-  /**
-   * Rotate the master key used for envelope encryption.
-   *
-   * Re-encrypts all DEKs in the `encryption_keys` table with the new master
-   * key. The new key must be provided as a 64-character hex string (32 bytes).
-   * After rotation, update the `TALOS_MASTER_KEY` environment variable to the
-   * new value before restarting the controller.
-   */
-  rotateMasterKey: MasterKeyRotationResult;
-  /**
-   * Set or clear the concurrency limit for a workflow.
-   * Pass `max_concurrent` between 1 and 100 to set, or null to clear.
-   */
-  setConcurrencyLimit: Scalars["Boolean"]["output"];
-  /** Initiate 2FA setup - generates secret and QR code */
-  setupTwoFactor: TwoFactorSetup;
-  /** Sign up a new user */
-  signup: AuthPayload;
-  /** Terminate an actor */
-  terminateActor: Scalars["Boolean"]["output"];
-  /** Test a module in isolation by executing it directly with optional input. */
-  testModule: TestModuleResult;
-  /**
-   * Dry-run a workflow with mock inputs. The execution is not persisted to
-   * the main workflow_executions table (it is marked `is_test_execution=true`
-   * and cleaned up aggressively). Returns the full execution trace.
-   */
-  testWorkflow: TestWorkflowResult;
-  /** Transfer organization ownership to another member. Requires Owner role. */
-  transferOwnership: OrganizationObj;
-  /** Trigger execution of a workflow. Returns an execution object. */
-  triggerWorkflow: WorkflowExecution;
-  /** Unlink OAuth account */
-  unlinkOauthAccount: Scalars["Boolean"]["output"];
-  /** Update an actor's status */
-  updateActorStatus: ActorSummary;
-  /**
-   * Register a new MCP agent and return its bearer token.
-   *
-   * The token is shown only once — store it in Claude Desktop's config.
-   * Requires admin scope.
-   */
-  updateAuditSettings: UserAuditSettings;
-  /** Update a member's role. Requires Admin+ role. */
-  updateMemberRole: OrgMemberObj;
-  /** Updates resource quotas for the user's organization. */
-  updateResourceQuotas: ResourceQuota;
-  /** Update an existing workflow schedule. */
-  updateSchedule: WorkflowScheduleObj;
-  /** Update a secret (rotation) - requires ownership or org membership */
-  updateSecret: Secret;
-  /** Update an existing workflow */
-  updateWorkflow: Workflow;
-  /** Verify 2FA code (used during login after password verification) */
-  verifyTwoFactor: AuthPayload;
-};
-
-export type MutationRootApproveExecutionArgs = {
-  id: Scalars["UUID"]["input"];
-  reason?: InputMaybe<Scalars["String"]["input"]>;
-};
-
-export type MutationRootCreateActorArgs = {
-  input: CreateActorInput;
-};
-
-export type MutationRootCreateApiKeyArgs = {
-  input: CreateApiKeyInput;
-};
-
-export type MutationRootCreateModuleFromTemplateArgs = {
-  input: CreateModuleInput;
-};
-
-export type MutationRootCreateOrganizationArgs = {
-  name: Scalars["String"]["input"];
-  slug: Scalars["String"]["input"];
-};
-
-export type MutationRootCreateScheduleArgs = {
-  cronExpression: Scalars["String"]["input"];
-  timezone?: InputMaybe<Scalars["String"]["input"]>;
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootCreateSecretArgs = {
-  input: CreateSecretInput;
-};
-
-export type MutationRootCreateWebhookTriggerArgs = {
-  input: CreateWebhookTriggerInput;
-};
-
-export type MutationRootCreateWorkflowArgs = {
-  input: CreateWorkflowInput;
-};
-
-export type MutationRootDeleteApiKeyArgs = {
-  keyId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootDeleteScheduleArgs = {
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootDeleteSecretArgs = {
-  keyPath: Scalars["String"]["input"];
-};
-
-export type MutationRootDeleteWorkflowArgs = {
-  id: Scalars["UUID"]["input"];
-};
-
-export type MutationRootDenyExecutionArgs = {
-  id: Scalars["UUID"]["input"];
-  reason?: InputMaybe<Scalars["String"]["input"]>;
-};
-
-export type MutationRootEnableTwoFactorArgs = {
-  input: Enable2FaInput;
-};
-
-export type MutationRootGenerateCodeArgs = {
-  input: GenerateCodeInput;
-};
-
-export type MutationRootInviteMemberArgs = {
-  orgId: Scalars["UUID"]["input"];
-  role: Scalars["String"]["input"];
-  targetUserId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootLoginArgs = {
-  input: LoginInput;
-};
-
-export type MutationRootPublishWorkflowVersionArgs = {
-  description?: InputMaybe<Scalars["String"]["input"]>;
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootRegisterMcpAgentArgs = {
-  name: Scalars["String"]["input"];
-  roleName: Scalars["String"]["input"];
-};
-
-export type MutationRootRemoveMemberArgs = {
-  orgId: Scalars["UUID"]["input"];
-  targetUserId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootReplayDeadLetterEntryArgs = {
-  id: Scalars["UUID"]["input"];
-};
-
-export type MutationRootReplayWebhookDeadLetterEntryArgs = {
-  id: Scalars["UUID"]["input"];
-};
-
-export type MutationRootResumeWorkflowArgs = {
-  executionId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootRetryExecutionArgs = {
-  executionId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootRevokeApiKeyArgs = {
-  keyId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootRollbackWorkflowVersionArgs = {
-  versionId: Scalars["UUID"]["input"];
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootRotateApiKeyArgs = {
-  keyId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootRotateMasterKeyArgs = {
-  newMasterKey: Scalars["String"]["input"];
-};
-
-export type MutationRootSetConcurrencyLimitArgs = {
-  maxConcurrent?: InputMaybe<Scalars["Int"]["input"]>;
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootSignupArgs = {
-  input: SignupInput;
-};
-
-export type MutationRootTerminateActorArgs = {
-  cleanupWorkflows?: InputMaybe<Scalars["Boolean"]["input"]>;
-  id: Scalars["UUID"]["input"];
-};
-
-export type MutationRootTestModuleArgs = {
-  input?: InputMaybe<Scalars["String"]["input"]>;
-  moduleId: Scalars["UUID"]["input"];
-  timeoutSecs?: InputMaybe<Scalars["Int"]["input"]>;
-};
-
-export type MutationRootTestWorkflowArgs = {
-  mockInputs?: InputMaybe<Scalars["String"]["input"]>;
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootTransferOwnershipArgs = {
-  newOwnerId: Scalars["UUID"]["input"];
-  orgId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootTriggerWorkflowArgs = {
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootUnlinkOauthAccountArgs = {
-  provider: Scalars["String"]["input"];
-};
-
-export type MutationRootUpdateActorStatusArgs = {
-  id: Scalars["UUID"]["input"];
-  status: Scalars["String"]["input"];
-};
-
-export type MutationRootUpdateAuditSettingsArgs = {
-  authHeaders?: InputMaybe<Scalars["String"]["input"]>;
-  otlpEndpoint?: InputMaybe<Scalars["String"]["input"]>;
-  otlpProtocol?: InputMaybe<Scalars["String"]["input"]>;
-  streamingEnabled: Scalars["Boolean"]["input"];
-};
-
-export type MutationRootUpdateMemberRoleArgs = {
-  orgId: Scalars["UUID"]["input"];
-  role: Scalars["String"]["input"];
-  targetUserId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootUpdateResourceQuotasArgs = {
-  input: UpdateResourceQuotasInput;
-};
-
-export type MutationRootUpdateScheduleArgs = {
-  cronExpression?: InputMaybe<Scalars["String"]["input"]>;
-  isEnabled?: InputMaybe<Scalars["Boolean"]["input"]>;
-  timezone?: InputMaybe<Scalars["String"]["input"]>;
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type MutationRootUpdateSecretArgs = {
-  input: UpdateSecretInput;
-};
-
-export type MutationRootUpdateWorkflowArgs = {
-  id: Scalars["UUID"]["input"];
-  input: CreateWorkflowInput;
-};
-
-export type MutationRootVerifyTwoFactorArgs = {
-  input: Verify2FaInput;
-};
-
-export type NodeTemplate = {
-  __typename?: "NodeTemplate";
-  allowedHosts: Array<Scalars["String"]["output"]>;
-  category: Scalars["String"]["output"];
-  configSchema: Scalars["String"]["output"];
-  description?: Maybe<Scalars["String"]["output"]>;
-  icon?: Maybe<Scalars["String"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  name: Scalars["String"]["output"];
-};
-
-export type OauthAccount = {
-  __typename?: "OauthAccount";
-  email: Scalars["String"]["output"];
-  id: Scalars["UUID"]["output"];
-  lastLoginAt?: Maybe<Scalars["String"]["output"]>;
-  linkedAt: Scalars["String"]["output"];
-  name?: Maybe<Scalars["String"]["output"]>;
-  pictureUrl?: Maybe<Scalars["String"]["output"]>;
-  provider: Scalars["String"]["output"];
-};
-
-export type OauthAuthUrl = {
-  __typename?: "OauthAuthUrl";
-  authUrl: Scalars["String"]["output"];
-  provider: Scalars["String"]["output"];
-};
-
-/** GraphQL representation of an organization member. */
-export type OrgMemberObj = {
-  __typename?: "OrgMemberObj";
-  id: Scalars["UUID"]["output"];
-  invitedBy?: Maybe<Scalars["UUID"]["output"]>;
-  joinedAt: Scalars["String"]["output"];
-  orgId: Scalars["UUID"]["output"];
-  role: Scalars["String"]["output"];
-  userId: Scalars["UUID"]["output"];
-};
-
-/** GraphQL representation of an organization. */
-export type OrganizationObj = {
-  __typename?: "OrganizationObj";
-  createdAt: Scalars["String"]["output"];
-  id: Scalars["UUID"]["output"];
-  name: Scalars["String"]["output"];
-  ownerId: Scalars["UUID"]["output"];
-  slug: Scalars["String"]["output"];
-  updatedAt: Scalars["String"]["output"];
-};
+export type IntegrationService = "GMAIL" | "GOOGLE_CALENDAR" | "JIRA" | "SLACK";
 
 /** Pagination input for list queries */
 export type PaginationInput = {
   /** Maximum number of items to return (default: 100, max: 1000) */
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
+  limit?: number | null | undefined;
   /** Number of items to skip (default: 0) */
-  offset?: InputMaybe<Scalars["Int"]["input"]>;
-};
-
-export type QueryRoot = {
-  __typename?: "QueryRoot";
-  /** Get the currently active published version of a workflow. */
-  activeWorkflowVersion?: Maybe<WorkflowVersion>;
-  actor?: Maybe<ActorDetails>;
-  actorActionLog: Array<ActorActionLogEntry>;
-  actorExecutionsSummary: ActorExecutionsSummary;
-  actorWorkflows: Array<ActorWorkflowItem>;
-  actorWorkflowsSummary: ActorWorkflowsSummary;
-  actors: Array<ActorSummary>;
-  /** Analyze Rhai script syntax */
-  analyzeRhai: AnalyzeCustomModuleResult;
-  /** List API keys for current user with pagination */
-  apiKeys: Array<ApiKeyInfo>;
-  auditSettings?: Maybe<UserAuditSettings>;
-  /** Returns node DLQ entries for workflows owned by the current user. */
-  deadLetterQueue: Array<DeadLetterEntry>;
-  /**
-   * Aggregate dashboard stats across all workflows for the current user.
-   * Returns the top 50 most active workflows sorted by failure count, then total.
-   */
-  getAllWorkflowStats: Array<WorkflowStats>;
-  /**
-   * Quick diff between the current draft and the last published version.
-   * Returns a human-readable summary without requiring version numbers.
-   */
-  getVersionDiffSummary: VersionDiffSummary;
-  /**
-   * Human-readable changelog from version history.
-   * Shows diffs between consecutive versions.
-   */
-  getWorkflowChangelog: Array<ChangelogEntry>;
-  /** Get the latest execution for a list of workflows */
-  latestWorkflowExecutions: Array<WorkflowExecution>;
-  /** List linked OAuth accounts for current user */
-  linkedOauthAccounts: Array<OauthAccount>;
-  /** Get current authenticated user */
-  me: UserInfo;
-  /** Get execution history for a module */
-  moduleExecutionHistory: Array<ModuleExecution>;
-  /** Get logs for a specific module execution */
-  moduleExecutionLogs: Array<ModuleExecutionLog>;
-  /**
-   * Returns the capability world ceiling for the current user.
-   * Defaults to 'http-node' if no explicit grant exists.
-   */
-  myCapabilityCeiling: Scalars["String"]["output"];
-  /** List all compiled WASM modules for current user */
-  myModules: Array<WasmModule>;
-  /** List all organizations the current user belongs to. */
-  myOrganizations: Array<OrganizationObj>;
-  /** List all schedules for the current user. */
-  mySchedules: Array<WorkflowScheduleObj>;
-  /** Get single template by ID */
-  nodeTemplate: NodeTemplate;
-  /** List available node templates with pagination */
-  nodeTemplates: Array<NodeTemplate>;
-  /** Get OAuth login URL for a provider */
-  oauthLoginUrl: OauthAuthUrl;
-  /** Get a single organization by ID. The caller must be a member. */
-  organization: OrganizationObj;
-  /** List all members of an organization. The caller must be a member. */
-  organizationMembers: Array<OrgMemberObj>;
-  /** Returns pending authorization requests for workflows owned by the current user. */
-  pendingApprovals: Array<ExecutionApproval>;
-  /** Returns current resource quotas for the user's primary organization. */
-  resourceQuotas: ResourceQuota;
-  /** Get secret metadata by key path */
-  secret: Secret;
-  /** Get audit log for a secret */
-  secretAuditLog: Array<SecretAuditLog>;
-  /** List all secrets (without values) - scoped to current user and their orgs */
-  secrets: Array<Secret>;
-  /** Test Rhai expression with mock context */
-  testRhaiExpression: TestRhaiExpressionResult;
-  /** Fetch WASM modules by IDs (for loading workflow nodes) */
-  wasmModules: Array<WasmModule>;
-  /** Returns DLQ entries for webhook triggers owned by the current user. */
-  webhookDeadLetterQueue: Array<WebhookDlqEntry>;
-  /** List webhook listeners - scoped to current user with pagination */
-  webhookTriggers: Array<WebhookTrigger>;
-  /** Fetch a workflow definition by ID. */
-  workflow: Workflow;
-  /** Get execution history for an entire workflow */
-  workflowExecutionHistory: Array<WorkflowExecution>;
-  /** Get the schedule for a specific workflow. */
-  workflowSchedule?: Maybe<WorkflowScheduleObj>;
-  /** List published versions of a workflow, ordered by version number descending. */
-  workflowVersions: Array<WorkflowVersion>;
-  /** List workflows for current user */
-  workflows: Array<Workflow>;
-};
-
-export type QueryRootActiveWorkflowVersionArgs = {
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootActorArgs = {
-  id: Scalars["UUID"]["input"];
-};
-
-export type QueryRootActorActionLogArgs = {
-  actorId: Scalars["UUID"]["input"];
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
-};
-
-export type QueryRootActorExecutionsSummaryArgs = {
-  actorId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootActorWorkflowsArgs = {
-  actorId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootActorWorkflowsSummaryArgs = {
-  actorId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootAnalyzeRhaiArgs = {
-  input: AnalyzeRhaiInput;
-};
-
-export type QueryRootApiKeysArgs = {
-  pagination?: InputMaybe<PaginationInput>;
-};
-
-export type QueryRootGetAllWorkflowStatsArgs = {
-  days?: InputMaybe<Scalars["Int"]["input"]>;
-};
-
-export type QueryRootGetVersionDiffSummaryArgs = {
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootGetWorkflowChangelogArgs = {
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootLatestWorkflowExecutionsArgs = {
-  workflowIds: Array<Scalars["UUID"]["input"]>;
-};
-
-export type QueryRootModuleExecutionHistoryArgs = {
-  moduleId: Scalars["UUID"]["input"];
-  pagination?: InputMaybe<PaginationInput>;
-};
-
-export type QueryRootModuleExecutionLogsArgs = {
-  executionId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootMyModulesArgs = {
-  pagination?: InputMaybe<PaginationInput>;
-};
-
-export type QueryRootMySchedulesArgs = {
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
-  offset?: InputMaybe<Scalars["Int"]["input"]>;
-};
-
-export type QueryRootNodeTemplateArgs = {
-  id: Scalars["UUID"]["input"];
-};
-
-export type QueryRootNodeTemplatesArgs = {
-  category?: InputMaybe<Scalars["String"]["input"]>;
-  pagination?: InputMaybe<PaginationInput>;
-};
-
-export type QueryRootOauthLoginUrlArgs = {
-  provider: Scalars["String"]["input"];
-};
-
-export type QueryRootOrganizationArgs = {
-  orgId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootOrganizationMembersArgs = {
-  orgId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootSecretArgs = {
-  keyPath: Scalars["String"]["input"];
-};
-
-export type QueryRootSecretAuditLogArgs = {
-  pagination?: InputMaybe<PaginationInput>;
-  secretId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootSecretsArgs = {
-  pagination?: InputMaybe<PaginationInput>;
-};
-
-export type QueryRootTestRhaiExpressionArgs = {
-  input: TestRhaiExpressionInput;
-};
-
-export type QueryRootWasmModulesArgs = {
-  ids: Array<Scalars["UUID"]["input"]>;
-};
-
-export type QueryRootWebhookTriggersArgs = {
-  pagination?: InputMaybe<PaginationInput>;
-};
-
-export type QueryRootWorkflowArgs = {
-  id: Scalars["UUID"]["input"];
-};
-
-export type QueryRootWorkflowExecutionHistoryArgs = {
-  pagination?: InputMaybe<PaginationInput>;
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootWorkflowScheduleArgs = {
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootWorkflowVersionsArgs = {
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
-  offset?: InputMaybe<Scalars["Int"]["input"]>;
-  workflowId: Scalars["UUID"]["input"];
-};
-
-export type QueryRootWorkflowsArgs = {
-  pagination?: InputMaybe<PaginationInput>;
-};
-
-/** Result of a re-encryption operation. */
-export type ReEncryptionResult = {
-  __typename?: "ReEncryptionResult";
-  /** Human-readable status message. */
-  message: Scalars["String"]["output"];
-  /** Number of secrets that were re-encrypted with the new active DEK. */
-  reEncryptedCount: Scalars["Int"]["output"];
-};
-
-/** Resource quotas for an organization. */
-export type ResourceQuota = {
-  __typename?: "ResourceQuota";
-  activeExecutions: Scalars["Int"]["output"];
-  concurrentExecutions: Scalars["Int"]["output"];
-  cpuCores: Scalars["Int"]["output"];
-  memoryGb: Scalars["Int"]["output"];
-  storageGb: Scalars["Int"]["output"];
-  usedCpu: Scalars["Int"]["output"];
-  usedMemory: Scalars["Int"]["output"];
-  usedStorage: Scalars["Int"]["output"];
-};
-
-export type Secret = {
-  __typename?: "Secret";
-  accessCount: Scalars["Int"]["output"];
-  createdAt: Scalars["String"]["output"];
-  description?: Maybe<Scalars["String"]["output"]>;
-  expiresAt?: Maybe<Scalars["String"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  keyPath: Scalars["String"]["output"];
-  lastAccessedAt?: Maybe<Scalars["String"]["output"]>;
-  name: Scalars["String"]["output"];
-};
-
-export type SecretAuditLog = {
-  __typename?: "SecretAuditLog";
-  action: Scalars["String"]["output"];
-  actorType: Scalars["String"]["output"];
-  errorMessage?: Maybe<Scalars["String"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  success: Scalars["Boolean"]["output"];
-  timestamp: Scalars["String"]["output"];
-};
-
-export type SignupInput = {
-  email: Scalars["String"]["input"];
-  name?: InputMaybe<Scalars["String"]["input"]>;
-  password: Scalars["String"]["input"];
-};
-
-export type SubscriptionRoot = {
-  __typename?: "SubscriptionRoot";
-  /**
-   * Real‑time updates for a specific execution ID.
-   *
-   * SECURITY: Authorization is enforced - users can only subscribe to their own executions.
-   * Events are replayed from the database before streaming new events, ensuring no events are lost.
-   */
-  executionUpdates: ExecutionEvent;
-  /**
-   * Stream LLM completion tokens as they are generated.
-   *
-   * Subscribes to a NATS topic for the given execution and streams
-   * partial text chunks as they arrive from the worker. The worker
-   * publishes chunks to `talos.llm.stream.{execution_id}`.
-   */
-  llmStream: Scalars["String"]["output"];
-};
-
-export type SubscriptionRootExecutionUpdatesArgs = {
-  executionId: Scalars["UUID"]["input"];
-};
-
-export type SubscriptionRootLlmStreamArgs = {
-  executionId: Scalars["UUID"]["input"];
-};
-
-/** Result of testing a module in isolation. */
-export type TestModuleResult = {
-  __typename?: "TestModuleResult";
-  durationMs: Scalars["Int"]["output"];
-  error?: Maybe<Scalars["String"]["output"]>;
-  output?: Maybe<Scalars["String"]["output"]>;
-  success: Scalars["Boolean"]["output"];
-};
-
-export type TestNodeTrace = {
-  __typename?: "TestNodeTrace";
-  /** Error message if the node failed. */
-  error?: Maybe<Scalars["String"]["output"]>;
-  /** The input JSON that was fed to this node. */
-  input: Scalars["String"]["output"];
-  /** The node UUID. */
-  nodeId: Scalars["UUID"]["output"];
-  /** The output JSON produced by this node (null if skipped/failed). */
-  output?: Maybe<Scalars["String"]["output"]>;
-  /** "completed", "failed", or "skipped". */
-  status: Scalars["String"]["output"];
+  offset?: number | null | undefined;
 };
 
 export type TestRhaiExpressionInput = {
-  mockContext: Scalars["String"]["input"];
-  script: Scalars["String"]["input"];
-};
-
-export type TestRhaiExpressionResult = {
-  __typename?: "TestRhaiExpressionResult";
-  error?: Maybe<Scalars["String"]["output"]>;
-  output?: Maybe<Scalars["String"]["output"]>;
-  success: Scalars["Boolean"]["output"];
-};
-
-/** Result of a testWorkflow dry-run execution. */
-export type TestWorkflowResult = {
-  __typename?: "TestWorkflowResult";
-  /** Total duration in milliseconds. */
-  durationMs: Scalars["Int"]["output"];
-  /** Error message if the workflow failed overall. */
-  error?: Maybe<Scalars["String"]["output"]>;
-  /** The temporary execution ID (not persisted long-term). */
-  executionId: Scalars["UUID"]["output"];
-  /** Per-node execution trace. */
-  nodeTraces: Array<TestNodeTrace>;
-  /** Edge schema validation warnings (if any). */
-  schemaWarnings: Array<Scalars["String"]["output"]>;
-  /** Overall status: "completed" or "failed". */
-  status: Scalars["String"]["output"];
-};
-
-export type TwoFactorEnrollment = {
-  __typename?: "TwoFactorEnrollment";
-  backupCodes: Array<Scalars["String"]["output"]>;
-};
-
-export type TwoFactorSetup = {
-  __typename?: "TwoFactorSetup";
-  qrCodePng: Scalars["String"]["output"];
-  qrCodeUrl: Scalars["String"]["output"];
-  secret: Scalars["String"]["output"];
+  mockContext: string;
+  script: string;
 };
 
 /** Input for updating organization resource quotas. */
 export type UpdateResourceQuotasInput = {
-  concurrentExecutions?: InputMaybe<Scalars["Int"]["input"]>;
-  cpuCores?: InputMaybe<Scalars["Int"]["input"]>;
-  memoryGb?: InputMaybe<Scalars["Int"]["input"]>;
-  storageGb?: InputMaybe<Scalars["Int"]["input"]>;
+  concurrentExecutions?: number | null | undefined;
+  cpuCores?: number | null | undefined;
+  memoryGb?: number | null | undefined;
+  storageGb?: number | null | undefined;
 };
 
 export type UpdateSecretInput = {
-  keyPath: Scalars["String"]["input"];
-  value: Scalars["String"]["input"];
+  keyPath: string;
+  value: string;
 };
 
-export type UserAuditSettings = {
-  __typename?: "UserAuditSettings";
-  createdAt: Scalars["String"]["output"];
-  otlpEndpoint?: Maybe<Scalars["String"]["output"]>;
-  otlpProtocol?: Maybe<Scalars["String"]["output"]>;
-  streamingEnabled: Scalars["Boolean"]["output"];
-  updatedAt: Scalars["String"]["output"];
-};
-
-export type UserInfo = {
-  __typename?: "UserInfo";
-  createdAt: Scalars["String"]["output"];
-  email: Scalars["String"]["output"];
-  id: Scalars["UUID"]["output"];
-  isTwoFactorVerified: Scalars["Boolean"]["output"];
-  name?: Maybe<Scalars["String"]["output"]>;
-  twoFactorEnabled: Scalars["Boolean"]["output"];
-};
-
-export type Verify2FaInput = {
-  code: Scalars["String"]["input"];
-};
-
-/** Summary of differences between the current draft and the last published version. */
-export type VersionDiffSummary = {
-  __typename?: "VersionDiffSummary";
-  edgesAdded: Scalars["Int"]["output"];
-  edgesRemoved: Scalars["Int"]["output"];
-  hasPublishedVersion: Scalars["Boolean"]["output"];
-  nodesAdded: Scalars["Int"]["output"];
-  nodesChanged: Scalars["Int"]["output"];
-  nodesRemoved: Scalars["Int"]["output"];
-  summary: Scalars["String"]["output"];
-};
-
-export type WasmModule = {
-  __typename?: "WasmModule";
-  capabilityDescription?: Maybe<Scalars["String"]["output"]>;
-  capabilityWorld?: Maybe<Scalars["String"]["output"]>;
-  compiledAt: Scalars["String"]["output"];
-  config: Scalars["String"]["output"];
-  contentHash: Scalars["String"]["output"];
-  id: Scalars["UUID"]["output"];
-  importedInterfaces?: Maybe<Array<Scalars["String"]["output"]>>;
-  /** Source language: "rust", "javascript", or "typescript". Defaults to "rust". */
-  language?: Maybe<Scalars["String"]["output"]>;
-  name: Scalars["String"]["output"];
-  sizeBytes: Scalars["Int"]["output"];
-  sourceCode?: Maybe<Scalars["String"]["output"]>;
-};
-
-/** A webhook payload that was dropped (e.g. circuit breaker) and persisted for replay. */
-export type WebhookDlqEntry = {
-  __typename?: "WebhookDlqEntry";
-  createdAt: Scalars["String"]["output"];
-  /** Reason the original request was dropped: 'circuit_breaker' | 'rate_limit' | 'sig_invalid' | 'disabled' */
-  dropReason: Scalars["String"]["output"];
-  /** DLP-scrubbed request headers (auth headers stripped). */
-  headers?: Maybe<Scalars["String"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  /** DLP-scrubbed request payload. */
-  payload?: Maybe<Scalars["String"]["output"]>;
-  replayedAt?: Maybe<Scalars["String"]["output"]>;
-  replayedBy?: Maybe<Scalars["UUID"]["output"]>;
-  sourceIp?: Maybe<Scalars["String"]["output"]>;
-  triggerId?: Maybe<Scalars["UUID"]["output"]>;
-};
-
-export type WebhookTrigger = {
-  __typename?: "WebhookTrigger";
-  enabled: Scalars["Boolean"]["output"];
-  errorCount: Scalars["Int"]["output"];
-  id: Scalars["UUID"]["output"];
-  lastTriggeredAt?: Maybe<Scalars["String"]["output"]>;
-  maxRequestsPerMinute: Scalars["Int"]["output"];
-  module?: Maybe<WasmModule>;
-  name: Scalars["String"]["output"];
-  successCount: Scalars["Int"]["output"];
-  triggerCount: Scalars["Int"]["output"];
-  verificationToken?: Maybe<Scalars["String"]["output"]>;
-  webhookUrl: Scalars["String"]["output"];
-};
-
-export type Workflow = {
-  __typename?: "Workflow";
-  /** Actor that owns this workflow, if any. */
-  actorId?: Maybe<Scalars["UUID"]["output"]>;
-  /** Serialized representation of the graph (flexible JSON). */
-  graphJson: Scalars["String"]["output"];
-  id: Scalars["UUID"]["output"];
-  maxConcurrentExecutions?: Maybe<Scalars["Int"]["output"]>;
-  name: Scalars["String"]["output"];
-  intent?: Maybe<Scalars["JSON"]["output"]>;
-};
-
-export type WorkflowExecution = {
-  __typename?: "WorkflowExecution";
-  /** Actor that dispatched this execution, if any. */
-  actorId?: Maybe<Scalars["UUID"]["output"]>;
-  completedAt?: Maybe<Scalars["String"]["output"]>;
-  createdAt: Scalars["String"]["output"];
-  durationMs?: Maybe<Scalars["Int"]["output"]>;
-  errorMessage?: Maybe<Scalars["String"]["output"]>;
-  id: Scalars["UUID"]["output"];
-  outputData?: Maybe<Scalars["JSON"]["output"]>;
-  startedAt: Scalars["String"]["output"];
-  status: Scalars["String"]["output"];
-  /** How the execution was triggered: "manual", "scheduled", "webhook", "actor_dispatch", etc. */
-  triggerType?: Maybe<Scalars["String"]["output"]>;
-  workflowId: Scalars["UUID"]["output"];
-};
-
-export type WorkflowScheduleObj = {
-  __typename?: "WorkflowScheduleObj";
-  createdAt: Scalars["String"]["output"];
-  cronExpression: Scalars["String"]["output"];
-  id: Scalars["UUID"]["output"];
-  isEnabled: Scalars["Boolean"]["output"];
-  lastTriggeredAt?: Maybe<Scalars["String"]["output"]>;
-  nextTriggerAt?: Maybe<Scalars["String"]["output"]>;
-  timezone: Scalars["String"]["output"];
-  updatedAt: Scalars["String"]["output"];
-  workflowId: Scalars["UUID"]["output"];
-};
-
-/**
- * A single node's trace during a test workflow execution.
- * Aggregated per-workflow stats for the dashboard.
- */
-export type WorkflowStats = {
-  __typename?: "WorkflowStats";
-  avgDurationSecs?: Maybe<Scalars["Float"]["output"]>;
-  failed: Scalars["Int"]["output"];
-  id: Scalars["UUID"]["output"];
-  name: Scalars["String"]["output"];
-  succeeded: Scalars["Int"]["output"];
-  total: Scalars["Int"]["output"];
-};
-
-/** A published, immutable snapshot of a workflow graph. */
-export type WorkflowVersion = {
-  __typename?: "WorkflowVersion";
-  createdAt: Scalars["String"]["output"];
-  description?: Maybe<Scalars["String"]["output"]>;
-  graphJson: Scalars["String"]["output"];
-  id: Scalars["UUID"]["output"];
-  isActive: Scalars["Boolean"]["output"];
-  publishedAt: Scalars["String"]["output"];
-  publishedBy: Scalars["UUID"]["output"];
-  versionNumber: Scalars["Int"]["output"];
-  workflowId: Scalars["UUID"]["output"];
+export type WriteActorMemoryInput = {
+  actorId: string;
+  key: string;
+  /** "working" | "episodic" | "semantic" | "scratchpad". Default: "working". */
+  memoryType?: string | null | undefined;
+  /** Custom TTL in hours. Overrides memory_type default. Null = use type default. */
+  ttlHours?: number | null | undefined;
+  /** JSON value to store. */
+  value: string;
 };
 
 export type GetModuleExecutionHistoryQueryVariables = Exact<{
-  moduleId: Scalars["UUID"]["input"];
-  pagination?: InputMaybe<PaginationInput>;
+  moduleId: string;
+  pagination?: PaginationInput | null | undefined;
 }>;
 
 export type GetModuleExecutionHistoryQuery = {
-  __typename?: "QueryRoot";
   moduleExecutionHistory: Array<{
-    __typename?: "ModuleExecution";
-    id: any;
+    id: string;
     status: string;
-    durationMs?: number | null;
+    durationMs: number | null;
     startedAt: string;
-    errorMessage?: string | null;
-    outputData?: string | null;
+    errorMessage: string | null;
+    outputData: string | null;
   }>;
 };
 
 export type GetModuleExecutionLogsQueryVariables = Exact<{
-  executionId: Scalars["UUID"]["input"];
+  executionId: string;
 }>;
 
 export type GetModuleExecutionLogsQuery = {
-  __typename?: "QueryRoot";
   moduleExecutionLogs: Array<{
-    __typename?: "ModuleExecutionLog";
-    id: any;
+    id: string;
     level: string;
     message: string;
     createdAt: string;
-    metadata?: string | null;
+    metadata: string | null;
   }>;
 };
 
 export type GetSecretAuditLogQueryVariables = Exact<{
-  secretId: Scalars["UUID"]["input"];
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
+  secretId: string;
+  limit?: number | null | undefined;
 }>;
 
 export type GetSecretAuditLogQuery = {
-  __typename?: "QueryRoot";
   secretAuditLog: Array<{
-    __typename?: "SecretAuditLog";
-    id: any;
+    id: string;
     action: string;
     actorType: string;
     success: boolean;
     timestamp: string;
-    errorMessage?: string | null;
+    errorMessage: string | null;
   }>;
 };
 
@@ -1366,67 +170,51 @@ export type CreateSecretMutationVariables = Exact<{
 }>;
 
 export type CreateSecretMutation = {
-  __typename?: "MutationRoot";
-  createSecret: {
-    __typename?: "Secret";
-    id: any;
-    name: string;
-    keyPath: string;
-  };
+  createSecret: { id: string; name: string; keyPath: string };
 };
 
 export type GetSecretsQueryVariables = Exact<{
-  pagination?: InputMaybe<PaginationInput>;
+  pagination?: PaginationInput | null | undefined;
 }>;
 
 export type GetSecretsQuery = {
-  __typename?: "QueryRoot";
   secrets: Array<{
-    __typename?: "Secret";
-    id: any;
+    id: string;
     name: string;
     keyPath: string;
-    description?: string | null;
+    description: string | null;
     createdAt: string;
-    lastAccessedAt?: string | null;
+    lastAccessedAt: string | null;
     accessCount: number;
-    expiresAt?: string | null;
+    expiresAt: string | null;
   }>;
 };
 
 export type DeleteSecretMutationVariables = Exact<{
-  keyPath: Scalars["String"]["input"];
+  keyPath: string;
 }>;
 
-export type DeleteSecretMutation = {
-  __typename?: "MutationRoot";
-  deleteSecret: boolean;
-};
+export type DeleteSecretMutation = { deleteSecret: boolean };
 
 export type RotateEncryptionKeyMutationVariables = Exact<{
   [key: string]: never;
 }>;
 
-export type RotateEncryptionKeyMutation = {
-  __typename?: "MutationRoot";
-  rotateEncryptionKey: number;
-};
+export type RotateEncryptionKeyMutation = { rotateEncryptionKey: number };
 
 export type ListApiKeysQueryVariables = Exact<{
-  pagination?: InputMaybe<PaginationInput>;
+  pagination?: PaginationInput | null | undefined;
 }>;
 
 export type ListApiKeysQuery = {
-  __typename?: "QueryRoot";
   apiKeys: Array<{
-    __typename?: "ApiKeyInfo";
-    id: any;
+    id: string;
     name: string;
     keyPrefix: string;
     scopes: Array<string>;
     createdAt: string;
-    expiresAt?: string | null;
-    lastUsedAt?: string | null;
+    expiresAt: string | null;
+    lastUsedAt: string | null;
     isActive: boolean;
     usageCount: number;
   }>;
@@ -1437,112 +225,54 @@ export type CreateApiKeyMutationVariables = Exact<{
 }>;
 
 export type CreateApiKeyMutation = {
-  __typename?: "MutationRoot";
   createApiKey: {
-    __typename?: "ApiKeyCreated";
-    id: any;
+    id: string;
     name: string;
     key: string;
     scopes: Array<string>;
-    expiresAt?: string | null;
+    expiresAt: string | null;
   };
 };
 
 export type RevokeApiKeyMutationVariables = Exact<{
-  keyId: Scalars["UUID"]["input"];
+  keyId: string;
 }>;
 
-export type RevokeApiKeyMutation = {
-  __typename?: "MutationRoot";
-  revokeApiKey: boolean;
-};
+export type RevokeApiKeyMutation = { revokeApiKey: boolean };
 
-export type GetApprovalsQueryVariables = Exact<{ [key: string]: never }>;
-
-export type GetApprovalsQuery = {
-  __typename?: "QueryRoot";
-  pendingApprovals: Array<{
-    __typename?: "ExecutionApproval";
-    id: any;
-    workflowId: any;
-    executionId: any;
-    nodeId: any;
-    requiredFor: Array<string>;
-    status: string;
-    requestedAt: string;
-    decidedAt?: string | null;
-    decidedBy?: any | null;
-    reason?: string | null;
-  }>;
-};
-
-export type ApproveExecutionMutationVariables = Exact<{
-  id: Scalars["UUID"]["input"];
-  reason?: InputMaybe<Scalars["String"]["input"]>;
+export type RotateApiKeyMutationVariables = Exact<{
+  keyId: string;
 }>;
 
-export type ApproveExecutionMutation = {
-  __typename?: "MutationRoot";
-  approveExecution: boolean;
-};
-
-export type DenyExecutionMutationVariables = Exact<{
-  id: Scalars["UUID"]["input"];
-  reason?: InputMaybe<Scalars["String"]["input"]>;
-}>;
-
-export type DenyExecutionMutation = {
-  __typename?: "MutationRoot";
-  denyExecution: boolean;
-};
-
-export type GetAuditSettingsQueryVariables = Exact<{ [key: string]: never }>;
-
-export type GetAuditSettingsQuery = {
-  __typename?: "QueryRoot";
-  auditSettings?: {
-    __typename?: "UserAuditSettings";
-    streamingEnabled: boolean;
-    otlpEndpoint?: string | null;
-    otlpProtocol?: string | null;
-    updatedAt: string;
-    createdAt: string;
-  } | null;
-};
-
-export type UpdateAuditSettingsMutationVariables = Exact<{
-  enabled: Scalars["Boolean"]["input"];
-  endpoint?: InputMaybe<Scalars["String"]["input"]>;
-  protocol: Scalars["String"]["input"];
-  headers?: InputMaybe<Scalars["String"]["input"]>;
-}>;
-
-export type UpdateAuditSettingsMutation = {
-  __typename?: "MutationRoot";
-  updateAuditSettings: {
-    __typename?: "UserAuditSettings";
-    streamingEnabled: boolean;
-    otlpEndpoint?: string | null;
-    otlpProtocol?: string | null;
-    updatedAt: string;
+export type RotateApiKeyMutation = {
+  rotateApiKey: {
+    id: string;
+    name: string;
+    key: string;
+    scopes: Array<string>;
+    expiresAt: string | null;
   };
 };
+
+export type DeleteApiKeyMutationVariables = Exact<{
+  keyId: string;
+}>;
+
+export type DeleteApiKeyMutation = { deleteApiKey: boolean };
 
 export type GetDeadLetterQueueQueryVariables = Exact<{ [key: string]: never }>;
 
 export type GetDeadLetterQueueQuery = {
-  __typename?: "QueryRoot";
   deadLetterQueue: Array<{
-    __typename?: "DeadLetterEntry";
-    id: any;
-    workflowId: any;
-    executionId: any;
-    nodeId: any;
+    id: string;
+    workflowId: string;
+    executionId: string;
+    nodeId: string;
     errorMessage: string;
-    payload?: string | null;
+    payload: string | null;
     createdAt: string;
-    replayedAt?: string | null;
-    replayedBy?: any | null;
+    replayedAt: string | null;
+    replayedBy: string | null;
   }>;
 };
 
@@ -1551,49 +281,41 @@ export type GetWebhookDeadLetterQueueQueryVariables = Exact<{
 }>;
 
 export type GetWebhookDeadLetterQueueQuery = {
-  __typename?: "QueryRoot";
   webhookDeadLetterQueue: Array<{
-    __typename?: "WebhookDlqEntry";
-    id: any;
-    triggerId?: any | null;
+    id: string;
+    triggerId: string | null;
     dropReason: string;
-    headers?: string | null;
-    payload?: string | null;
-    sourceIp?: string | null;
+    headers: string | null;
+    payload: string | null;
+    sourceIp: string | null;
     createdAt: string;
-    replayedAt?: string | null;
-    replayedBy?: any | null;
+    replayedAt: string | null;
+    replayedBy: string | null;
   }>;
 };
 
 export type ReplayDeadLetterEntryMutationVariables = Exact<{
-  id: Scalars["UUID"]["input"];
+  id: string;
 }>;
 
-export type ReplayDeadLetterEntryMutation = {
-  __typename?: "MutationRoot";
-  replayDeadLetterEntry: boolean;
-};
+export type ReplayDeadLetterEntryMutation = { replayDeadLetterEntry: boolean };
 
 export type ReplayWebhookDeadLetterEntryMutationVariables = Exact<{
-  id: Scalars["UUID"]["input"];
+  id: string;
 }>;
 
 export type ReplayWebhookDeadLetterEntryMutation = {
-  __typename?: "MutationRoot";
   replayWebhookDeadLetterEntry: boolean;
 };
 
 export type RegisterMcpAgentMutationVariables = Exact<{
-  name: Scalars["String"]["input"];
-  role: Scalars["String"]["input"];
+  name: string;
+  role: string;
 }>;
 
 export type RegisterMcpAgentMutation = {
-  __typename?: "MutationRoot";
   registerMcpAgent: {
-    __typename?: "McpAgentCreated";
-    agentId: any;
+    agentId: string;
     name: string;
     token: string;
     role: string;
@@ -1603,95 +325,428 @@ export type RegisterMcpAgentMutation = {
 export type ListLinkedAccountsQueryVariables = Exact<{ [key: string]: never }>;
 
 export type ListLinkedAccountsQuery = {
-  __typename?: "QueryRoot";
   linkedOauthAccounts: Array<{
-    __typename?: "OauthAccount";
-    id: any;
+    id: string;
     provider: string;
     email: string;
-    name?: string | null;
-    pictureUrl?: string | null;
+    name: string | null;
+    pictureUrl: string | null;
     linkedAt: string;
-    lastLoginAt?: string | null;
+    lastLoginAt: string | null;
   }>;
 };
 
 export type GetOAuthUrlQueryVariables = Exact<{
-  provider: Scalars["String"]["input"];
+  provider: string;
 }>;
 
-export type GetOAuthUrlQuery = {
-  __typename?: "QueryRoot";
-  oauthLoginUrl: { __typename?: "OauthAuthUrl"; authUrl: string };
-};
+export type GetOAuthUrlQuery = { oauthLoginUrl: { authUrl: string } };
 
 export type UnlinkOAuthMutationVariables = Exact<{
-  provider: Scalars["String"]["input"];
+  provider: string;
 }>;
 
-export type UnlinkOAuthMutation = {
-  __typename?: "MutationRoot";
-  unlinkOauthAccount: boolean;
-};
+export type UnlinkOAuthMutation = { unlinkOauthAccount: boolean };
 
 export type ListOrgsQueryVariables = Exact<{ [key: string]: never }>;
 
 export type ListOrgsQuery = {
-  __typename?: "QueryRoot";
   myOrganizations: Array<{
-    __typename?: "OrganizationObj";
-    id: any;
+    id: string;
     name: string;
     slug: string;
-    ownerId: any;
+    ownerId: string;
     createdAt: string;
     updatedAt: string;
   }>;
 };
 
 export type ListOrgMembersQueryVariables = Exact<{
-  orgId: Scalars["UUID"]["input"];
+  orgId: string;
 }>;
 
 export type ListOrgMembersQuery = {
-  __typename?: "QueryRoot";
   organizationMembers: Array<{
-    __typename?: "OrgMemberObj";
-    id: any;
-    orgId: any;
-    userId: any;
+    id: string;
+    orgId: string;
+    userId: string;
     role: string;
-    invitedBy?: any | null;
+    invitedBy: string | null;
     joinedAt: string;
   }>;
 };
 
 export type CreateOrgMutationVariables = Exact<{
-  name: Scalars["String"]["input"];
-  slug: Scalars["String"]["input"];
+  name: string;
+  slug: string;
 }>;
 
 export type CreateOrgMutation = {
-  __typename?: "MutationRoot";
-  createOrganization: { __typename?: "OrganizationObj"; id: any; name: string };
+  createOrganization: { id: string; name: string };
 };
 
 export type RemoveMemberMutationVariables = Exact<{
-  orgId: Scalars["UUID"]["input"];
-  userId: Scalars["UUID"]["input"];
+  orgId: string;
+  userId: string;
 }>;
 
-export type RemoveMemberMutation = {
-  __typename?: "MutationRoot";
-  removeMember: boolean;
+export type RemoveMemberMutation = { removeMember: boolean };
+
+export type InviteMemberMutationVariables = Exact<{
+  orgId: string;
+  targetUserId: string;
+  role: string;
+}>;
+
+export type InviteMemberMutation = {
+  inviteMember: {
+    id: string;
+    orgId: string;
+    userId: string;
+    role: string;
+    invitedBy: string | null;
+    joinedAt: string;
+  };
+};
+
+export type UpdateMemberRoleMutationVariables = Exact<{
+  orgId: string;
+  targetUserId: string;
+  role: string;
+}>;
+
+export type UpdateMemberRoleMutation = {
+  updateMemberRole: {
+    id: string;
+    orgId: string;
+    userId: string;
+    role: string;
+    joinedAt: string;
+  };
+};
+
+export type TransferOwnershipMutationVariables = Exact<{
+  orgId: string;
+  newOwnerId: string;
+}>;
+
+export type TransferOwnershipMutation = {
+  transferOwnership: { id: string; name: string; ownerId: string };
+};
+
+export type Setup2FaMutationVariables = Exact<{ [key: string]: never }>;
+
+export type Setup2FaMutation = {
+  setupTwoFactor: { secret: string; qrCodeUrl: string; qrCodePng: string };
+};
+
+export type Enable2FaMutationVariables = Exact<{
+  input: Enable2FaInput;
+}>;
+
+export type Enable2FaMutation = {
+  enableTwoFactor: { backupCodes: Array<string> };
+};
+
+export type Disable2FaMutationVariables = Exact<{ [key: string]: never }>;
+
+export type Disable2FaMutation = { disableTwoFactor: boolean };
+
+export type ListActorSummariesQueryVariables = Exact<{ [key: string]: never }>;
+
+export type ListActorSummariesQuery = {
+  actors: Array<{
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+    maxCapabilityWorld: string;
+    totalBudgetUsd: number | null;
+    spentBudgetUsd: number;
+    workflowCount: number;
+    executionCount: number;
+    createdAt: string;
+    updatedAt: string;
+  }>;
+};
+
+export type GetActorQueryVariables = Exact<{
+  id: string;
+}>;
+
+export type GetActorQuery = {
+  actor: {
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+    maxCapabilityWorld: string;
+    totalBudgetUsd: number | null;
+    spentBudgetUsd: number;
+    workflowCount: number;
+    executionCount: number;
+    createdAt: string;
+    updatedAt: string;
+    mcpToken: string | null;
+    rateLimit: number | null;
+    metadata: string | null;
+    lastActiveAt: string | null;
+  } | null;
+};
+
+export type CreateActorMutationVariables = Exact<{
+  input: CreateActorInput;
+}>;
+
+export type CreateActorMutation = {
+  createActor: {
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+    maxCapabilityWorld: string;
+    totalBudgetUsd: number | null;
+    spentBudgetUsd: number;
+    workflowCount: number;
+    executionCount: number;
+    createdAt: string;
+    updatedAt: string;
+  };
+};
+
+export type UpdateActorStatusMutationVariables = Exact<{
+  id: string;
+  status: string;
+}>;
+
+export type UpdateActorStatusMutation = {
+  updateActorStatus: {
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+    maxCapabilityWorld: string;
+    totalBudgetUsd: number | null;
+    spentBudgetUsd: number;
+    workflowCount: number;
+    executionCount: number;
+    createdAt: string;
+    updatedAt: string;
+  };
+};
+
+export type TerminateActorMutationVariables = Exact<{
+  id: string;
+  cleanupWorkflows?: boolean | null | undefined;
+}>;
+
+export type TerminateActorMutation = { terminateActor: boolean };
+
+export type GetActorActionLogQueryVariables = Exact<{
+  actorId: string;
+  limit?: number | null | undefined;
+}>;
+
+export type GetActorActionLogQuery = {
+  actorActionLog: Array<{
+    id: string;
+    actionType: string;
+    summary: string;
+    timestamp: string;
+    workflowId: string | null;
+    executionId: string | null;
+  }>;
+};
+
+export type GetActorWorkflowsQueryVariables = Exact<{
+  actorId: string;
+}>;
+
+export type GetActorWorkflowsQuery = {
+  actorWorkflows: Array<{
+    id: string;
+    name: string;
+    status: string | null;
+    nodeCount: number;
+    graphJson: string | null;
+    createdAt: string;
+    updatedAt: string;
+  }>;
+};
+
+export type GetActorExecutionsSummaryQueryVariables = Exact<{
+  actorId: string;
+}>;
+
+export type GetActorExecutionsSummaryQuery = {
+  actorExecutionsSummary: {
+    totalExecutions: number;
+    successfulExecutions: number;
+    failedExecutions: number;
+    activeExecutions: number;
+  };
+};
+
+export type UpdateActorMutationVariables = Exact<{
+  id: string;
+  name?: string | null | undefined;
+  description?: string | null | undefined;
+  maxCapabilityWorld?: string | null | undefined;
+}>;
+
+export type UpdateActorMutation = {
+  updateActor: {
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+    maxCapabilityWorld: string;
+    workflowCount: number;
+    executionCount: number;
+    createdAt: string;
+    updatedAt: string;
+  };
+};
+
+export type CloneActorMutationVariables = Exact<{
+  id: string;
+  name?: string | null | undefined;
+}>;
+
+export type CloneActorMutation = {
+  cloneActor: {
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+    maxCapabilityWorld: string;
+    workflowCount: number;
+    executionCount: number;
+    createdAt: string;
+    updatedAt: string;
+  };
+};
+
+export type GetActorMemoriesQueryVariables = Exact<{
+  actorId: string;
+  memoryType?: string | null | undefined;
+}>;
+
+export type GetActorMemoriesQuery = {
+  actorMemories: Array<{
+    key: string;
+    value: string;
+    memoryType: string;
+    expiresAt: string | null;
+    updatedAt: string;
+  }>;
+};
+
+export type WriteActorMemoryMutationVariables = Exact<{
+  input: WriteActorMemoryInput;
+}>;
+
+export type WriteActorMemoryMutation = {
+  writeActorMemory: {
+    key: string;
+    value: string;
+    memoryType: string;
+    expiresAt: string | null;
+    updatedAt: string;
+  };
+};
+
+export type DeleteActorMemoryMutationVariables = Exact<{
+  actorId: string;
+  key: string;
+}>;
+
+export type DeleteActorMemoryMutation = { deleteActorMemory: boolean };
+
+export type GetMyCapabilityCeilingQueryVariables = Exact<{
+  [key: string]: never;
+}>;
+
+export type GetMyCapabilityCeilingQuery = { myCapabilityCeiling: string };
+
+export type GetAllWorkflowStatsQueryVariables = Exact<{
+  days?: number | null | undefined;
+}>;
+
+export type GetAllWorkflowStatsQuery = {
+  getAllWorkflowStats: Array<{
+    id: string;
+    name: string;
+    total: number;
+    succeeded: number;
+    failed: number;
+    avgDurationSecs: number | null;
+  }>;
+};
+
+export type GetApprovalsQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GetApprovalsQuery = {
+  pendingApprovals: Array<{
+    id: string;
+    workflowId: string;
+    executionId: string;
+    nodeId: string;
+    requiredFor: Array<string>;
+    status: string;
+    requestedAt: string;
+    decidedAt: string | null;
+    decidedBy: string | null;
+    reason: string | null;
+  }>;
+};
+
+export type ApproveExecutionMutationVariables = Exact<{
+  id: string;
+  reason?: string | null | undefined;
+}>;
+
+export type ApproveExecutionMutation = { approveExecution: boolean };
+
+export type DenyExecutionMutationVariables = Exact<{
+  id: string;
+  reason?: string | null | undefined;
+}>;
+
+export type DenyExecutionMutation = { denyExecution: boolean };
+
+export type GetAuditSettingsQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GetAuditSettingsQuery = {
+  auditSettings: {
+    streamingEnabled: boolean;
+    otlpEndpoint: string | null;
+    otlpProtocol: string | null;
+    updatedAt: string;
+    createdAt: string;
+  } | null;
+};
+
+export type UpdateAuditSettingsMutationVariables = Exact<{
+  enabled: boolean;
+  endpoint?: string | null | undefined;
+  protocol: string;
+  headers?: string | null | undefined;
+}>;
+
+export type UpdateAuditSettingsMutation = {
+  updateAuditSettings: {
+    streamingEnabled: boolean;
+    otlpEndpoint: string | null;
+    otlpProtocol: string | null;
+    updatedAt: string;
+  };
 };
 
 export type GetResourceQuotasQueryVariables = Exact<{ [key: string]: never }>;
 
 export type GetResourceQuotasQuery = {
-  __typename?: "QueryRoot";
   resourceQuotas: {
-    __typename?: "ResourceQuota";
     cpuCores: number;
     usedCpu: number;
     memoryGb: number;
@@ -1708,9 +763,7 @@ export type UpdateResourceQuotasMutationVariables = Exact<{
 }>;
 
 export type UpdateResourceQuotasMutation = {
-  __typename?: "MutationRoot";
   updateResourceQuotas: {
-    __typename?: "ResourceQuota";
     cpuCores: number;
     usedCpu: number;
     memoryGb: number;
@@ -1722,98 +775,472 @@ export type UpdateResourceQuotasMutation = {
   };
 };
 
-export type Setup2FaMutationVariables = Exact<{ [key: string]: never }>;
+export type RotateDekMutationVariables = Exact<{ [key: string]: never }>;
 
-export type Setup2FaMutation = {
-  __typename?: "MutationRoot";
-  setupTwoFactor: {
-    __typename?: "TwoFactorSetup";
-    secret: string;
-    qrCodeUrl: string;
-    qrCodePng: string;
-  };
+export type RotateDekMutation = {
+  rotateDek: { newDekId: string; message: string };
 };
 
-export type Enable2FaMutationVariables = Exact<{
-  input: Enable2FaInput;
+export type ReEncryptSecretsMutationVariables = Exact<{ [key: string]: never }>;
+
+export type ReEncryptSecretsMutation = {
+  reEncryptSecrets: { reEncryptedCount: number; message: string };
+};
+
+export type RotateMasterKeyMutationVariables = Exact<{
+  newMasterKey: string;
 }>;
 
-export type Enable2FaMutation = {
-  __typename?: "MutationRoot";
-  enableTwoFactor: {
-    __typename?: "TwoFactorEnrollment";
-    backupCodes: Array<string>;
+export type RotateMasterKeyMutation = {
+  rotateMasterKey: { reEncryptedDekCount: number; message: string };
+};
+
+export type UpdateSecretMutationVariables = Exact<{
+  input: UpdateSecretInput;
+}>;
+
+export type UpdateSecretMutation = {
+  updateSecret: { id: string; name: string; keyPath: string };
+};
+
+export type ListServiceIntegrationsQueryVariables = Exact<{
+  [key: string]: never;
+}>;
+
+export type ListServiceIntegrationsQuery = {
+  serviceIntegrations: Array<{
+    id: string;
+    service: IntegrationService;
+    accountIdentifier: string;
+    connectedAt: string;
+    status: string;
+  }>;
+};
+
+export type DisconnectServiceIntegrationMutationVariables = Exact<{
+  id: string;
+  service: IntegrationService;
+}>;
+
+export type DisconnectServiceIntegrationMutation = {
+  disconnectServiceIntegration: boolean;
+};
+
+export type ListMcpAgentsQueryVariables = Exact<{ [key: string]: never }>;
+
+export type ListMcpAgentsQuery = {
+  mcpAgents: Array<{
+    id: string;
+    name: string;
+    createdAt: string;
+    lastUsedAt: string | null;
+  }>;
+};
+
+export type RevokeMcpAgentMutationVariables = Exact<{
+  id: string;
+}>;
+
+export type RevokeMcpAgentMutation = { revokeMcpAgent: boolean };
+
+export type MyModulesQueryVariables = Exact<{
+  limit?: number | null | undefined;
+  offset?: number | null | undefined;
+}>;
+
+export type MyModulesQuery = {
+  myModules: Array<{
+    id: string;
+    name: string;
+    capabilityWorld: string | null;
+    language: string | null;
+    sizeBytes: number;
+    compiledAt: string;
+    contentHash: string;
+    capabilityDescription: string | null;
+    importedInterfaces: Array<string> | null;
+    config: string;
+  }>;
+};
+
+export type CreateModuleFromTemplateMutationVariables = Exact<{
+  input: CreateModuleInput;
+}>;
+
+export type CreateModuleFromTemplateMutation = {
+  createModuleFromTemplate: { id: string; config: string };
+};
+
+export type NodeTemplatesQueryVariables = Exact<{
+  category?: string | null | undefined;
+}>;
+
+export type NodeTemplatesQuery = {
+  nodeTemplates: Array<{
+    id: string;
+    name: string;
+    category: string;
+    description: string | null;
+    icon: string | null;
+    allowedHosts: Array<string>;
+  }>;
+};
+
+export type GetNodeTemplatesQueryVariables = Exact<{
+  category?: string | null | undefined;
+}>;
+
+export type GetNodeTemplatesQuery = {
+  nodeTemplates: Array<{
+    id: string;
+    name: string;
+    category: string;
+    description: string | null;
+    configSchema: string;
+    icon: string | null;
+    allowedHosts: Array<string>;
+  }>;
+};
+
+export type AnalyzeRhaiQueryVariables = Exact<{
+  input: AnalyzeRhaiInput;
+}>;
+
+export type AnalyzeRhaiQuery = {
+  analyzeRhai: {
+    success: boolean;
+    errors: Array<{
+      line: number | null;
+      column: number | null;
+      endLine: number | null;
+      endColumn: number | null;
+      message: string;
+      severity: string;
+    }>;
   };
 };
 
-export type Disable2FaMutationVariables = Exact<{ [key: string]: never }>;
+export type TestRhaiExpressionQueryVariables = Exact<{
+  input: TestRhaiExpressionInput;
+}>;
 
-export type Disable2FaMutation = {
-  __typename?: "MutationRoot";
-  disableTwoFactor: boolean;
+export type TestRhaiExpressionQuery = {
+  testRhaiExpression: {
+    success: boolean;
+    output: string | null;
+    error: string | null;
+  };
 };
 
-export type LegacyListActorsQueryVariables = Exact<{ [key: string]: never }>;
+export type MySchedulesQueryVariables = Exact<{ [key: string]: never }>;
 
-export type LegacyListActorsQuery = {
-  __typename?: "QueryRoot";
-  actors: Array<{
-    __typename?: "ActorSummary";
-    id: any;
-    name: string;
-    description?: string | null;
-    status: string;
-    maxCapabilityWorld: string;
-    totalBudgetUsd?: number | null;
-    spentBudgetUsd: number;
-    workflowCount: number;
-    executionCount: number;
+export type MySchedulesQuery = {
+  mySchedules: Array<{
+    id: string;
+    workflowId: string;
+    cronExpression: string;
+    timezone: string;
+    isEnabled: boolean;
+    lastTriggeredAt: string | null;
+    nextTriggerAt: string | null;
     createdAt: string;
     updatedAt: string;
   }>;
 };
 
+export type CreateScheduleMutationVariables = Exact<{
+  workflowId: string;
+  cronExpression: string;
+  timezone?: string | null | undefined;
+}>;
+
+export type CreateScheduleMutation = {
+  createSchedule: {
+    id: string;
+    workflowId: string;
+    cronExpression: string;
+    timezone: string;
+    isEnabled: boolean;
+    nextTriggerAt: string | null;
+    createdAt: string;
+    updatedAt: string;
+  };
+};
+
+export type UpdateScheduleMutationVariables = Exact<{
+  workflowId: string;
+  cronExpression?: string | null | undefined;
+  timezone?: string | null | undefined;
+  isEnabled?: boolean | null | undefined;
+}>;
+
+export type UpdateScheduleMutation = {
+  updateSchedule: {
+    id: string;
+    workflowId: string;
+    cronExpression: string;
+    timezone: string;
+    isEnabled: boolean;
+    nextTriggerAt: string | null;
+    updatedAt: string;
+  };
+};
+
+export type DeleteScheduleMutationVariables = Exact<{
+  workflowId: string;
+}>;
+
+export type DeleteScheduleMutation = { deleteSchedule: boolean };
+
+export type SetConcurrencyLimitMutationVariables = Exact<{
+  workflowId: string;
+  maxConcurrent?: number | null | undefined;
+}>;
+
+export type SetConcurrencyLimitMutation = { setConcurrencyLimit: boolean };
+
+export type DeleteWorkflowMutationVariables = Exact<{
+  id: string;
+}>;
+
+export type DeleteWorkflowMutation = { deleteWorkflow: boolean };
+
+export type TestWorkflowMutationVariables = Exact<{
+  workflowId: string;
+  mockInputs?: string | null | undefined;
+}>;
+
+export type TestWorkflowMutation = {
+  testWorkflow: {
+    executionId: string;
+    status: string;
+    durationMs: number;
+    error: string | null;
+    schemaWarnings: Array<string>;
+    nodeTraces: Array<{
+      nodeId: string;
+      status: string;
+      input: string;
+      output: string | null;
+      error: string | null;
+    }>;
+  };
+};
+
+export type ResumeWorkflowMutationVariables = Exact<{
+  executionId: string;
+}>;
+
+export type ResumeWorkflowMutation = { resumeWorkflow: boolean };
+
+export type RetryExecutionMutationVariables = Exact<{
+  executionId: string;
+}>;
+
+export type RetryExecutionMutation = { retryExecution: string };
+
+export type WorkflowVersionsQueryVariables = Exact<{
+  workflowId: string;
+  limit?: number | null | undefined;
+}>;
+
+export type WorkflowVersionsQuery = {
+  workflowVersions: Array<{
+    id: string;
+    workflowId: string;
+    versionNumber: number;
+    description: string | null;
+    publishedAt: string;
+    publishedBy: string;
+    isActive: boolean;
+    createdAt: string;
+  }>;
+};
+
+export type PublishWorkflowVersionMutationVariables = Exact<{
+  workflowId: string;
+  description?: string | null | undefined;
+}>;
+
+export type PublishWorkflowVersionMutation = {
+  publishWorkflowVersion: {
+    id: string;
+    workflowId: string;
+    versionNumber: number;
+    description: string | null;
+    publishedAt: string;
+    publishedBy: string;
+    isActive: boolean;
+    createdAt: string;
+  };
+};
+
+export type RollbackWorkflowVersionMutationVariables = Exact<{
+  workflowId: string;
+  versionId: string;
+}>;
+
+export type RollbackWorkflowVersionMutation = {
+  rollbackWorkflowVersion: {
+    id: string;
+    workflowId: string;
+    versionNumber: number;
+    description: string | null;
+    publishedAt: string;
+    isActive: boolean;
+    createdAt: string;
+  };
+};
+
+export type GetVersionDiffSummaryQueryVariables = Exact<{
+  workflowId: string;
+}>;
+
+export type GetVersionDiffSummaryQuery = {
+  getVersionDiffSummary: {
+    hasPublishedVersion: boolean;
+    nodesAdded: number;
+    nodesChanged: number;
+    nodesRemoved: number;
+    edgesAdded: number;
+    edgesRemoved: number;
+    summary: string;
+  };
+};
+
+export type GetWorkflowChangelogQueryVariables = Exact<{
+  workflowId: string;
+}>;
+
+export type GetWorkflowChangelogQuery = {
+  getWorkflowChangelog: Array<{
+    versionNumber: number;
+    summary: string;
+    description: string | null;
+    publishedAt: string;
+  }>;
+};
+
+export type WebhookTriggersQueryVariables = Exact<{ [key: string]: never }>;
+
+export type WebhookTriggersQuery = {
+  webhookTriggers: Array<{
+    id: string;
+    name: string;
+    webhookUrl: string;
+    enabled: boolean;
+    triggerCount: number;
+    successCount: number;
+    errorCount: number;
+    maxRequestsPerMinute: number;
+    lastTriggeredAt: string | null;
+    verificationToken: string | null;
+  }>;
+};
+
+export type CreateWebhookTriggerMutationVariables = Exact<{
+  input: CreateWebhookTriggerInput;
+}>;
+
+export type CreateWebhookTriggerMutation = {
+  createWebhookTrigger: {
+    id: string;
+    name: string;
+    webhookUrl: string;
+    verificationToken: string | null;
+  };
+};
+
+export type WorkflowExecutionHistoryQueryVariables = Exact<{
+  workflowId: string;
+  limit?: number | null | undefined;
+  offset?: number | null | undefined;
+}>;
+
+export type WorkflowExecutionHistoryQuery = {
+  workflowExecutionHistory: Array<{
+    id: string;
+    workflowId: string;
+    status: string;
+    startedAt: string;
+    completedAt: string | null;
+    triggerType: string | null;
+    actorId: string | null;
+    errorMessage: string | null;
+    createdAt: string;
+    durationMs: number | null;
+  }>;
+};
+
+export type GetWorkflowExecutionHistoryQueryVariables = Exact<{
+  workflowId: string;
+  pagination?: PaginationInput | null | undefined;
+}>;
+
+export type GetWorkflowExecutionHistoryQuery = {
+  workflowExecutionHistory: Array<{
+    id: string;
+    status: string;
+    startedAt: string;
+    completedAt: string | null;
+    durationMs: number | null;
+    errorMessage: string | null;
+    outputData: unknown;
+    triggerType: string | null;
+    actorId: string | null;
+  }>;
+};
+
+export type ListWorkflowNamesQueryVariables = Exact<{ [key: string]: never }>;
+
+export type ListWorkflowNamesQuery = {
+  workflows: Array<{ id: string; name: string }>;
+};
+
+export type TriggerWorkflowAsActorMutationVariables = Exact<{
+  workflowId: string;
+  actorId?: string | null | undefined;
+}>;
+
+export type TriggerWorkflowAsActorMutation = {
+  triggerWorkflow: { id: string };
+};
+
 export type GetWorkflowLoaderQueryVariables = Exact<{
-  id: Scalars["UUID"]["input"];
+  id: string;
 }>;
 
 export type GetWorkflowLoaderQuery = {
-  __typename?: "QueryRoot";
-  workflow?: {
-    __typename?: "Workflow";
-    id: any;
+  workflow: {
+    id: string;
     name: string;
     graphJson: string;
-    actorId?: any | null;
-    maxConcurrentExecutions?: number | null;
-    intent?: any | null;
-  } | null;
+    actorId: string | null;
+    maxConcurrentExecutions: number | null;
+    intent: unknown;
+  };
 };
 
 export type GetModulesLoaderQueryVariables = Exact<{
-  ids: Array<Scalars["UUID"]["input"]> | Scalars["UUID"]["input"];
+  ids: Array<string> | string;
 }>;
 
 export type GetModulesLoaderQuery = {
-  __typename?: "QueryRoot";
   wasmModules: Array<{
-    __typename?: "WasmModule";
-    id: any;
+    id: string;
     name: string;
     config: string;
-    sourceCode?: string | null;
-    capabilityWorld?: string | null;
-    importedInterfaces?: Array<string> | null;
+    sourceCode: string | null;
+    capabilityWorld: string | null;
+    importedInterfaces: Array<string> | null;
   }>;
 };
 
 export type ListActorsQueryVariables = Exact<{ [key: string]: never }>;
 
 export type ListActorsQuery = {
-  __typename?: "QueryRoot";
   actors: Array<{
-    __typename?: "ActorSummary";
-    id: any;
+    id: string;
     name: string;
     status: string;
     executionCount: number;
@@ -1823,47 +1250,59 @@ export type ListActorsQuery = {
 export type WorkflowsQueryVariables = Exact<{ [key: string]: never }>;
 
 export type WorkflowsQuery = {
-  __typename?: "QueryRoot";
   workflows: Array<{
-    __typename?: "Workflow";
-    id: any;
+    id: string;
     name: string;
     graphJson: string;
-    actorId?: any | null;
-    maxConcurrentExecutions?: number | null;
-    intent?: any | null;
+    actorId: string | null;
+    maxConcurrentExecutions: number | null;
+    intent: unknown;
   }>;
 };
 
 export type TriggerWorkflowMutationVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
+  workflowId: string;
 }>;
 
 export type TriggerWorkflowMutation = {
-  __typename?: "MutationRoot";
-  triggerWorkflow: {
-    __typename?: "WorkflowExecution";
-    id: any;
-    status: string;
-  };
+  triggerWorkflow: { id: string; status: string };
 };
 
 export type LatestWorkflowExecutionsQueryVariables = Exact<{
-  workflowIds: Array<Scalars["UUID"]["input"]> | Scalars["UUID"]["input"];
+  workflowIds: Array<string> | string;
 }>;
 
 export type LatestWorkflowExecutionsQuery = {
-  __typename?: "QueryRoot";
   latestWorkflowExecutions: Array<{
-    __typename?: "WorkflowExecution";
-    workflowId: any;
+    workflowId: string;
     status: string;
     startedAt: string;
-    errorMessage?: string | null;
+    errorMessage: string | null;
   }>;
 };
 
-export const GetModuleExecutionHistoryDocument = `
+export class TypedDocumentString<TResult, TVariables>
+  extends String
+  implements DocumentTypeDecoration<TResult, TVariables>
+{
+  __apiType?: NonNullable<
+    DocumentTypeDecoration<TResult, TVariables>["__apiType"]
+  >;
+  private value: string;
+  public __meta__?: Record<string, any> | undefined;
+
+  constructor(value: string, __meta__?: Record<string, any> | undefined) {
+    super(value);
+    this.value = value;
+    this.__meta__ = __meta__;
+  }
+
+  override toString(): string & DocumentTypeDecoration<TResult, TVariables> {
+    return this.value;
+  }
+}
+
+export const GetModuleExecutionHistoryDocument = new TypedDocumentString(`
     query GetModuleExecutionHistory($moduleId: UUID!, $pagination: PaginationInput) {
   moduleExecutionHistory(moduleId: $moduleId, pagination: $pagination) {
     id
@@ -1874,7 +1313,7 @@ export const GetModuleExecutionHistoryDocument = `
     outputData
   }
 }
-    `;
+    `);
 
 export const useGetModuleExecutionHistoryQuery = <
   TData = GetModuleExecutionHistoryQuery,
@@ -1902,7 +1341,7 @@ export const useGetModuleExecutionHistoryQuery = <
   });
 };
 
-export const GetModuleExecutionLogsDocument = `
+export const GetModuleExecutionLogsDocument = new TypedDocumentString(`
     query GetModuleExecutionLogs($executionId: UUID!) {
   moduleExecutionLogs(executionId: $executionId) {
     id
@@ -1912,7 +1351,7 @@ export const GetModuleExecutionLogsDocument = `
     metadata
   }
 }
-    `;
+    `);
 
 export const useGetModuleExecutionLogsQuery = <
   TData = GetModuleExecutionLogsQuery,
@@ -1940,7 +1379,7 @@ export const useGetModuleExecutionLogsQuery = <
   });
 };
 
-export const GetSecretAuditLogDocument = `
+export const GetSecretAuditLogDocument = new TypedDocumentString(`
     query GetSecretAuditLog($secretId: UUID!, $limit: Int) {
   secretAuditLog(secretId: $secretId, pagination: {limit: $limit}) {
     id
@@ -1951,7 +1390,7 @@ export const GetSecretAuditLogDocument = `
     errorMessage
   }
 }
-    `;
+    `);
 
 export const useGetSecretAuditLogQuery = <
   TData = GetSecretAuditLogQuery,
@@ -1979,7 +1418,7 @@ export const useGetSecretAuditLogQuery = <
   });
 };
 
-export const CreateSecretDocument = `
+export const CreateSecretDocument = new TypedDocumentString(`
     mutation CreateSecret($input: CreateSecretInput!) {
   createSecret(input: $input) {
     id
@@ -1987,7 +1426,7 @@ export const CreateSecretDocument = `
     keyPath
   }
 }
-    `;
+    `);
 
 export const useCreateSecretMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
@@ -2013,7 +1452,7 @@ export const useCreateSecretMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
-export const GetSecretsDocument = `
+export const GetSecretsDocument = new TypedDocumentString(`
     query GetSecrets($pagination: PaginationInput) {
   secrets(pagination: $pagination) {
     id
@@ -2026,7 +1465,7 @@ export const GetSecretsDocument = `
     expiresAt
   }
 }
-    `;
+    `);
 
 export const useGetSecretsQuery = <TData = GetSecretsQuery, TError = unknown>(
   variables?: GetSecretsQueryVariables,
@@ -2048,11 +1487,11 @@ export const useGetSecretsQuery = <TData = GetSecretsQuery, TError = unknown>(
   });
 };
 
-export const DeleteSecretDocument = `
+export const DeleteSecretDocument = new TypedDocumentString(`
     mutation DeleteSecret($keyPath: String!) {
   deleteSecret(keyPath: $keyPath)
 }
-    `;
+    `);
 
 export const useDeleteSecretMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
@@ -2078,11 +1517,11 @@ export const useDeleteSecretMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
-export const RotateEncryptionKeyDocument = `
+export const RotateEncryptionKeyDocument = new TypedDocumentString(`
     mutation RotateEncryptionKey {
   rotateEncryptionKey
 }
-    `;
+    `);
 
 export const useRotateEncryptionKeyMutation = <
   TError = unknown,
@@ -2111,7 +1550,7 @@ export const useRotateEncryptionKeyMutation = <
   });
 };
 
-export const ListApiKeysDocument = `
+export const ListApiKeysDocument = new TypedDocumentString(`
     query ListApiKeys($pagination: PaginationInput) {
   apiKeys(pagination: $pagination) {
     id
@@ -2125,7 +1564,7 @@ export const ListApiKeysDocument = `
     usageCount
   }
 }
-    `;
+    `);
 
 export const useListApiKeysQuery = <TData = ListApiKeysQuery, TError = unknown>(
   variables?: ListApiKeysQueryVariables,
@@ -2147,7 +1586,7 @@ export const useListApiKeysQuery = <TData = ListApiKeysQuery, TError = unknown>(
   });
 };
 
-export const CreateApiKeyDocument = `
+export const CreateApiKeyDocument = new TypedDocumentString(`
     mutation CreateApiKey($input: CreateApiKeyInput!) {
   createApiKey(input: $input) {
     id
@@ -2157,7 +1596,7 @@ export const CreateApiKeyDocument = `
     expiresAt
   }
 }
-    `;
+    `);
 
 export const useCreateApiKeyMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
@@ -2183,11 +1622,11 @@ export const useCreateApiKeyMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
-export const RevokeApiKeyDocument = `
+export const RevokeApiKeyDocument = new TypedDocumentString(`
     mutation RevokeApiKey($keyId: UUID!) {
   revokeApiKey(keyId: $keyId)
 }
-    `;
+    `);
 
 export const useRevokeApiKeyMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
@@ -2213,194 +1652,73 @@ export const useRevokeApiKeyMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
-export const GetApprovalsDocument = `
-    query GetApprovals {
-  pendingApprovals {
+export const RotateApiKeyDocument = new TypedDocumentString(`
+    mutation RotateApiKey($keyId: UUID!) {
+  rotateApiKey(keyId: $keyId) {
     id
-    workflowId
-    executionId
-    nodeId
-    requiredFor
-    status
-    requestedAt
-    decidedAt
-    decidedBy
-    reason
+    name
+    key
+    scopes
+    expiresAt
   }
 }
-    `;
+    `);
 
-export const useGetApprovalsQuery = <
-  TData = GetApprovalsQuery,
-  TError = unknown,
->(
-  variables?: GetApprovalsQueryVariables,
-  options?: Omit<
-    UseQueryOptions<GetApprovalsQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<GetApprovalsQuery, TError, TData>["queryKey"];
-  },
-) => {
-  return useQuery<GetApprovalsQuery, TError, TData>({
-    queryKey:
-      variables === undefined ? ["GetApprovals"] : ["GetApprovals", variables],
-    queryFn: graphqlFetcher<GetApprovalsQuery, GetApprovalsQueryVariables>(
-      GetApprovalsDocument,
-      variables,
-    ),
-    ...options,
-  });
-};
-
-export const ApproveExecutionDocument = `
-    mutation ApproveExecution($id: UUID!, $reason: String) {
-  approveExecution(id: $id, reason: $reason)
-}
-    `;
-
-export const useApproveExecutionMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
+export const useRotateApiKeyMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
-    ApproveExecutionMutation,
+    RotateApiKeyMutation,
     TError,
-    ApproveExecutionMutationVariables,
+    RotateApiKeyMutationVariables,
     TContext
   >,
 ) => {
   return useMutation<
-    ApproveExecutionMutation,
+    RotateApiKeyMutation,
     TError,
-    ApproveExecutionMutationVariables,
+    RotateApiKeyMutationVariables,
     TContext
   >({
-    mutationKey: ["ApproveExecution"],
-    mutationFn: (variables?: ApproveExecutionMutationVariables) =>
-      graphqlFetcher<
-        ApproveExecutionMutation,
-        ApproveExecutionMutationVariables
-      >(ApproveExecutionDocument, variables)(),
-    ...options,
-  });
-};
-
-export const DenyExecutionDocument = `
-    mutation DenyExecution($id: UUID!, $reason: String) {
-  denyExecution(id: $id, reason: $reason)
-}
-    `;
-
-export const useDenyExecutionMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    DenyExecutionMutation,
-    TError,
-    DenyExecutionMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    DenyExecutionMutation,
-    TError,
-    DenyExecutionMutationVariables,
-    TContext
-  >({
-    mutationKey: ["DenyExecution"],
-    mutationFn: (variables?: DenyExecutionMutationVariables) =>
-      graphqlFetcher<DenyExecutionMutation, DenyExecutionMutationVariables>(
-        DenyExecutionDocument,
+    mutationKey: ["RotateApiKey"],
+    mutationFn: (variables?: RotateApiKeyMutationVariables) =>
+      graphqlFetcher<RotateApiKeyMutation, RotateApiKeyMutationVariables>(
+        RotateApiKeyDocument,
         variables,
       )(),
     ...options,
   });
 };
 
-export const GetAuditSettingsDocument = `
-    query GetAuditSettings {
-  auditSettings {
-    streamingEnabled
-    otlpEndpoint
-    otlpProtocol
-    updatedAt
-    createdAt
-  }
+export const DeleteApiKeyDocument = new TypedDocumentString(`
+    mutation DeleteApiKey($keyId: UUID!) {
+  deleteApiKey(keyId: $keyId)
 }
-    `;
+    `);
 
-export const useGetAuditSettingsQuery = <
-  TData = GetAuditSettingsQuery,
-  TError = unknown,
->(
-  variables?: GetAuditSettingsQueryVariables,
-  options?: Omit<
-    UseQueryOptions<GetAuditSettingsQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<
-      GetAuditSettingsQuery,
-      TError,
-      TData
-    >["queryKey"];
-  },
-) => {
-  return useQuery<GetAuditSettingsQuery, TError, TData>({
-    queryKey:
-      variables === undefined
-        ? ["GetAuditSettings"]
-        : ["GetAuditSettings", variables],
-    queryFn: graphqlFetcher<
-      GetAuditSettingsQuery,
-      GetAuditSettingsQueryVariables
-    >(GetAuditSettingsDocument, variables),
-    ...options,
-  });
-};
-
-export const UpdateAuditSettingsDocument = `
-    mutation UpdateAuditSettings($enabled: Boolean!, $endpoint: String, $protocol: String!, $headers: String) {
-  updateAuditSettings(
-    streamingEnabled: $enabled
-    otlpEndpoint: $endpoint
-    otlpProtocol: $protocol
-    authHeaders: $headers
-  ) {
-    streamingEnabled
-    otlpEndpoint
-    otlpProtocol
-    updatedAt
-  }
-}
-    `;
-
-export const useUpdateAuditSettingsMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
+export const useDeleteApiKeyMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
-    UpdateAuditSettingsMutation,
+    DeleteApiKeyMutation,
     TError,
-    UpdateAuditSettingsMutationVariables,
+    DeleteApiKeyMutationVariables,
     TContext
   >,
 ) => {
   return useMutation<
-    UpdateAuditSettingsMutation,
+    DeleteApiKeyMutation,
     TError,
-    UpdateAuditSettingsMutationVariables,
+    DeleteApiKeyMutationVariables,
     TContext
   >({
-    mutationKey: ["UpdateAuditSettings"],
-    mutationFn: (variables?: UpdateAuditSettingsMutationVariables) =>
-      graphqlFetcher<
-        UpdateAuditSettingsMutation,
-        UpdateAuditSettingsMutationVariables
-      >(UpdateAuditSettingsDocument, variables)(),
+    mutationKey: ["DeleteApiKey"],
+    mutationFn: (variables?: DeleteApiKeyMutationVariables) =>
+      graphqlFetcher<DeleteApiKeyMutation, DeleteApiKeyMutationVariables>(
+        DeleteApiKeyDocument,
+        variables,
+      )(),
     ...options,
   });
 };
 
-export const GetDeadLetterQueueDocument = `
+export const GetDeadLetterQueueDocument = new TypedDocumentString(`
     query GetDeadLetterQueue {
   deadLetterQueue {
     id
@@ -2414,7 +1732,7 @@ export const GetDeadLetterQueueDocument = `
     replayedBy
   }
 }
-    `;
+    `);
 
 export const useGetDeadLetterQueueQuery = <
   TData = GetDeadLetterQueueQuery,
@@ -2445,7 +1763,7 @@ export const useGetDeadLetterQueueQuery = <
   });
 };
 
-export const GetWebhookDeadLetterQueueDocument = `
+export const GetWebhookDeadLetterQueueDocument = new TypedDocumentString(`
     query GetWebhookDeadLetterQueue {
   webhookDeadLetterQueue {
     id
@@ -2459,7 +1777,7 @@ export const GetWebhookDeadLetterQueueDocument = `
     replayedBy
   }
 }
-    `;
+    `);
 
 export const useGetWebhookDeadLetterQueueQuery = <
   TData = GetWebhookDeadLetterQueueQuery,
@@ -2490,11 +1808,11 @@ export const useGetWebhookDeadLetterQueueQuery = <
   });
 };
 
-export const ReplayDeadLetterEntryDocument = `
+export const ReplayDeadLetterEntryDocument = new TypedDocumentString(`
     mutation ReplayDeadLetterEntry($id: UUID!) {
   replayDeadLetterEntry(id: $id)
 }
-    `;
+    `);
 
 export const useReplayDeadLetterEntryMutation = <
   TError = unknown,
@@ -2523,11 +1841,11 @@ export const useReplayDeadLetterEntryMutation = <
   });
 };
 
-export const ReplayWebhookDeadLetterEntryDocument = `
+export const ReplayWebhookDeadLetterEntryDocument = new TypedDocumentString(`
     mutation ReplayWebhookDeadLetterEntry($id: UUID!) {
   replayWebhookDeadLetterEntry(id: $id)
 }
-    `;
+    `);
 
 export const useReplayWebhookDeadLetterEntryMutation = <
   TError = unknown,
@@ -2556,7 +1874,7 @@ export const useReplayWebhookDeadLetterEntryMutation = <
   });
 };
 
-export const RegisterMcpAgentDocument = `
+export const RegisterMcpAgentDocument = new TypedDocumentString(`
     mutation RegisterMcpAgent($name: String!, $role: String!) {
   registerMcpAgent(name: $name, roleName: $role) {
     agentId
@@ -2565,7 +1883,7 @@ export const RegisterMcpAgentDocument = `
     role
   }
 }
-    `;
+    `);
 
 export const useRegisterMcpAgentMutation = <
   TError = unknown,
@@ -2594,7 +1912,7 @@ export const useRegisterMcpAgentMutation = <
   });
 };
 
-export const ListLinkedAccountsDocument = `
+export const ListLinkedAccountsDocument = new TypedDocumentString(`
     query ListLinkedAccounts {
   linkedOauthAccounts {
     id
@@ -2606,7 +1924,7 @@ export const ListLinkedAccountsDocument = `
     lastLoginAt
   }
 }
-    `;
+    `);
 
 export const useListLinkedAccountsQuery = <
   TData = ListLinkedAccountsQuery,
@@ -2637,13 +1955,13 @@ export const useListLinkedAccountsQuery = <
   });
 };
 
-export const GetOAuthUrlDocument = `
+export const GetOAuthUrlDocument = new TypedDocumentString(`
     query GetOAuthUrl($provider: String!) {
   oauthLoginUrl(provider: $provider) {
     authUrl
   }
 }
-    `;
+    `);
 
 export const useGetOAuthUrlQuery = <TData = GetOAuthUrlQuery, TError = unknown>(
   variables: GetOAuthUrlQueryVariables,
@@ -2664,11 +1982,11 @@ export const useGetOAuthUrlQuery = <TData = GetOAuthUrlQuery, TError = unknown>(
   });
 };
 
-export const UnlinkOAuthDocument = `
+export const UnlinkOAuthDocument = new TypedDocumentString(`
     mutation UnlinkOAuth($provider: String!) {
   unlinkOauthAccount(provider: $provider)
 }
-    `;
+    `);
 
 export const useUnlinkOAuthMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
@@ -2694,7 +2012,7 @@ export const useUnlinkOAuthMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
-export const ListOrgsDocument = `
+export const ListOrgsDocument = new TypedDocumentString(`
     query ListOrgs {
   myOrganizations {
     id
@@ -2705,7 +2023,7 @@ export const ListOrgsDocument = `
     updatedAt
   }
 }
-    `;
+    `);
 
 export const useListOrgsQuery = <TData = ListOrgsQuery, TError = unknown>(
   variables?: ListOrgsQueryVariables,
@@ -2723,7 +2041,7 @@ export const useListOrgsQuery = <TData = ListOrgsQuery, TError = unknown>(
   });
 };
 
-export const ListOrgMembersDocument = `
+export const ListOrgMembersDocument = new TypedDocumentString(`
     query ListOrgMembers($orgId: UUID!) {
   organizationMembers(orgId: $orgId) {
     id
@@ -2734,7 +2052,7 @@ export const ListOrgMembersDocument = `
     joinedAt
   }
 }
-    `;
+    `);
 
 export const useListOrgMembersQuery = <
   TData = ListOrgMembersQuery,
@@ -2758,14 +2076,14 @@ export const useListOrgMembersQuery = <
   });
 };
 
-export const CreateOrgDocument = `
+export const CreateOrgDocument = new TypedDocumentString(`
     mutation CreateOrg($name: String!, $slug: String!) {
   createOrganization(name: $name, slug: $slug) {
     id
     name
   }
 }
-    `;
+    `);
 
 export const useCreateOrgMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
@@ -2791,11 +2109,11 @@ export const useCreateOrgMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
-export const RemoveMemberDocument = `
+export const RemoveMemberDocument = new TypedDocumentString(`
     mutation RemoveMember($orgId: UUID!, $userId: UUID!) {
   removeMember(orgId: $orgId, targetUserId: $userId)
 }
-    `;
+    `);
 
 export const useRemoveMemberMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
@@ -2821,7 +2139,993 @@ export const useRemoveMemberMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
-export const GetResourceQuotasDocument = `
+export const InviteMemberDocument = new TypedDocumentString(`
+    mutation InviteMember($orgId: UUID!, $targetUserId: UUID!, $role: String!) {
+  inviteMember(orgId: $orgId, targetUserId: $targetUserId, role: $role) {
+    id
+    orgId
+    userId
+    role
+    invitedBy
+    joinedAt
+  }
+}
+    `);
+
+export const useInviteMemberMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    InviteMemberMutation,
+    TError,
+    InviteMemberMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    InviteMemberMutation,
+    TError,
+    InviteMemberMutationVariables,
+    TContext
+  >({
+    mutationKey: ["InviteMember"],
+    mutationFn: (variables?: InviteMemberMutationVariables) =>
+      graphqlFetcher<InviteMemberMutation, InviteMemberMutationVariables>(
+        InviteMemberDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const UpdateMemberRoleDocument = new TypedDocumentString(`
+    mutation UpdateMemberRole($orgId: UUID!, $targetUserId: UUID!, $role: String!) {
+  updateMemberRole(orgId: $orgId, targetUserId: $targetUserId, role: $role) {
+    id
+    orgId
+    userId
+    role
+    joinedAt
+  }
+}
+    `);
+
+export const useUpdateMemberRoleMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    UpdateMemberRoleMutation,
+    TError,
+    UpdateMemberRoleMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    UpdateMemberRoleMutation,
+    TError,
+    UpdateMemberRoleMutationVariables,
+    TContext
+  >({
+    mutationKey: ["UpdateMemberRole"],
+    mutationFn: (variables?: UpdateMemberRoleMutationVariables) =>
+      graphqlFetcher<
+        UpdateMemberRoleMutation,
+        UpdateMemberRoleMutationVariables
+      >(UpdateMemberRoleDocument, variables)(),
+    ...options,
+  });
+};
+
+export const TransferOwnershipDocument = new TypedDocumentString(`
+    mutation TransferOwnership($orgId: UUID!, $newOwnerId: UUID!) {
+  transferOwnership(orgId: $orgId, newOwnerId: $newOwnerId) {
+    id
+    name
+    ownerId
+  }
+}
+    `);
+
+export const useTransferOwnershipMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    TransferOwnershipMutation,
+    TError,
+    TransferOwnershipMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    TransferOwnershipMutation,
+    TError,
+    TransferOwnershipMutationVariables,
+    TContext
+  >({
+    mutationKey: ["TransferOwnership"],
+    mutationFn: (variables?: TransferOwnershipMutationVariables) =>
+      graphqlFetcher<
+        TransferOwnershipMutation,
+        TransferOwnershipMutationVariables
+      >(TransferOwnershipDocument, variables)(),
+    ...options,
+  });
+};
+
+export const Setup2FaDocument = new TypedDocumentString(`
+    mutation Setup2FA {
+  setupTwoFactor {
+    secret
+    qrCodeUrl
+    qrCodePng
+  }
+}
+    `);
+
+export const useSetup2FaMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    Setup2FaMutation,
+    TError,
+    Setup2FaMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    Setup2FaMutation,
+    TError,
+    Setup2FaMutationVariables,
+    TContext
+  >({
+    mutationKey: ["Setup2FA"],
+    mutationFn: (variables?: Setup2FaMutationVariables) =>
+      graphqlFetcher<Setup2FaMutation, Setup2FaMutationVariables>(
+        Setup2FaDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const Enable2FaDocument = new TypedDocumentString(`
+    mutation Enable2FA($input: Enable2FAInput!) {
+  enableTwoFactor(input: $input) {
+    backupCodes
+  }
+}
+    `);
+
+export const useEnable2FaMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    Enable2FaMutation,
+    TError,
+    Enable2FaMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    Enable2FaMutation,
+    TError,
+    Enable2FaMutationVariables,
+    TContext
+  >({
+    mutationKey: ["Enable2FA"],
+    mutationFn: (variables?: Enable2FaMutationVariables) =>
+      graphqlFetcher<Enable2FaMutation, Enable2FaMutationVariables>(
+        Enable2FaDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const Disable2FaDocument = new TypedDocumentString(`
+    mutation Disable2FA {
+  disableTwoFactor
+}
+    `);
+
+export const useDisable2FaMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    Disable2FaMutation,
+    TError,
+    Disable2FaMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    Disable2FaMutation,
+    TError,
+    Disable2FaMutationVariables,
+    TContext
+  >({
+    mutationKey: ["Disable2FA"],
+    mutationFn: (variables?: Disable2FaMutationVariables) =>
+      graphqlFetcher<Disable2FaMutation, Disable2FaMutationVariables>(
+        Disable2FaDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const ListActorSummariesDocument = new TypedDocumentString(`
+    query ListActorSummaries {
+  actors {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    totalBudgetUsd
+    spentBudgetUsd
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+    `);
+
+export const useListActorSummariesQuery = <
+  TData = ListActorSummariesQuery,
+  TError = unknown,
+>(
+  variables?: ListActorSummariesQueryVariables,
+  options?: Omit<
+    UseQueryOptions<ListActorSummariesQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      ListActorSummariesQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<ListActorSummariesQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["ListActorSummaries"]
+        : ["ListActorSummaries", variables],
+    queryFn: graphqlFetcher<
+      ListActorSummariesQuery,
+      ListActorSummariesQueryVariables
+    >(ListActorSummariesDocument, variables),
+    ...options,
+  });
+};
+
+export const GetActorDocument = new TypedDocumentString(`
+    query GetActor($id: UUID!) {
+  actor(id: $id) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    totalBudgetUsd
+    spentBudgetUsd
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+    mcpToken
+    rateLimit
+    metadata
+    lastActiveAt
+  }
+}
+    `);
+
+export const useGetActorQuery = <TData = GetActorQuery, TError = unknown>(
+  variables: GetActorQueryVariables,
+  options?: Omit<UseQueryOptions<GetActorQuery, TError, TData>, "queryKey"> & {
+    queryKey?: UseQueryOptions<GetActorQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<GetActorQuery, TError, TData>({
+    queryKey: ["GetActor", variables],
+    queryFn: graphqlFetcher<GetActorQuery, GetActorQueryVariables>(
+      GetActorDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const CreateActorDocument = new TypedDocumentString(`
+    mutation CreateActor($input: CreateActorInput!) {
+  createActor(input: $input) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    totalBudgetUsd
+    spentBudgetUsd
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+    `);
+
+export const useCreateActorMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    CreateActorMutation,
+    TError,
+    CreateActorMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    CreateActorMutation,
+    TError,
+    CreateActorMutationVariables,
+    TContext
+  >({
+    mutationKey: ["CreateActor"],
+    mutationFn: (variables?: CreateActorMutationVariables) =>
+      graphqlFetcher<CreateActorMutation, CreateActorMutationVariables>(
+        CreateActorDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const UpdateActorStatusDocument = new TypedDocumentString(`
+    mutation UpdateActorStatus($id: UUID!, $status: String!) {
+  updateActorStatus(id: $id, status: $status) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    totalBudgetUsd
+    spentBudgetUsd
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+    `);
+
+export const useUpdateActorStatusMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    UpdateActorStatusMutation,
+    TError,
+    UpdateActorStatusMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    UpdateActorStatusMutation,
+    TError,
+    UpdateActorStatusMutationVariables,
+    TContext
+  >({
+    mutationKey: ["UpdateActorStatus"],
+    mutationFn: (variables?: UpdateActorStatusMutationVariables) =>
+      graphqlFetcher<
+        UpdateActorStatusMutation,
+        UpdateActorStatusMutationVariables
+      >(UpdateActorStatusDocument, variables)(),
+    ...options,
+  });
+};
+
+export const TerminateActorDocument = new TypedDocumentString(`
+    mutation TerminateActor($id: UUID!, $cleanupWorkflows: Boolean) {
+  terminateActor(id: $id, cleanupWorkflows: $cleanupWorkflows)
+}
+    `);
+
+export const useTerminateActorMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    TerminateActorMutation,
+    TError,
+    TerminateActorMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    TerminateActorMutation,
+    TError,
+    TerminateActorMutationVariables,
+    TContext
+  >({
+    mutationKey: ["TerminateActor"],
+    mutationFn: (variables?: TerminateActorMutationVariables) =>
+      graphqlFetcher<TerminateActorMutation, TerminateActorMutationVariables>(
+        TerminateActorDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const GetActorActionLogDocument = new TypedDocumentString(`
+    query GetActorActionLog($actorId: UUID!, $limit: Int) {
+  actorActionLog(actorId: $actorId, limit: $limit) {
+    id
+    actionType
+    summary
+    timestamp
+    workflowId
+    executionId
+  }
+}
+    `);
+
+export const useGetActorActionLogQuery = <
+  TData = GetActorActionLogQuery,
+  TError = unknown,
+>(
+  variables: GetActorActionLogQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetActorActionLogQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetActorActionLogQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetActorActionLogQuery, TError, TData>({
+    queryKey: ["GetActorActionLog", variables],
+    queryFn: graphqlFetcher<
+      GetActorActionLogQuery,
+      GetActorActionLogQueryVariables
+    >(GetActorActionLogDocument, variables),
+    ...options,
+  });
+};
+
+export const GetActorWorkflowsDocument = new TypedDocumentString(`
+    query GetActorWorkflows($actorId: UUID!) {
+  actorWorkflows(actorId: $actorId) {
+    id
+    name
+    status
+    nodeCount
+    graphJson
+    createdAt
+    updatedAt
+  }
+}
+    `);
+
+export const useGetActorWorkflowsQuery = <
+  TData = GetActorWorkflowsQuery,
+  TError = unknown,
+>(
+  variables: GetActorWorkflowsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetActorWorkflowsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetActorWorkflowsQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetActorWorkflowsQuery, TError, TData>({
+    queryKey: ["GetActorWorkflows", variables],
+    queryFn: graphqlFetcher<
+      GetActorWorkflowsQuery,
+      GetActorWorkflowsQueryVariables
+    >(GetActorWorkflowsDocument, variables),
+    ...options,
+  });
+};
+
+export const GetActorExecutionsSummaryDocument = new TypedDocumentString(`
+    query GetActorExecutionsSummary($actorId: UUID!) {
+  actorExecutionsSummary(actorId: $actorId) {
+    totalExecutions
+    successfulExecutions
+    failedExecutions
+    activeExecutions
+  }
+}
+    `);
+
+export const useGetActorExecutionsSummaryQuery = <
+  TData = GetActorExecutionsSummaryQuery,
+  TError = unknown,
+>(
+  variables: GetActorExecutionsSummaryQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetActorExecutionsSummaryQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetActorExecutionsSummaryQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetActorExecutionsSummaryQuery, TError, TData>({
+    queryKey: ["GetActorExecutionsSummary", variables],
+    queryFn: graphqlFetcher<
+      GetActorExecutionsSummaryQuery,
+      GetActorExecutionsSummaryQueryVariables
+    >(GetActorExecutionsSummaryDocument, variables),
+    ...options,
+  });
+};
+
+export const UpdateActorDocument = new TypedDocumentString(`
+    mutation UpdateActor($id: UUID!, $name: String, $description: String, $maxCapabilityWorld: String) {
+  updateActor(
+    id: $id
+    name: $name
+    description: $description
+    maxCapabilityWorld: $maxCapabilityWorld
+  ) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+    `);
+
+export const useUpdateActorMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    UpdateActorMutation,
+    TError,
+    UpdateActorMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    UpdateActorMutation,
+    TError,
+    UpdateActorMutationVariables,
+    TContext
+  >({
+    mutationKey: ["UpdateActor"],
+    mutationFn: (variables?: UpdateActorMutationVariables) =>
+      graphqlFetcher<UpdateActorMutation, UpdateActorMutationVariables>(
+        UpdateActorDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const CloneActorDocument = new TypedDocumentString(`
+    mutation CloneActor($id: UUID!, $name: String) {
+  cloneActor(id: $id, name: $name) {
+    id
+    name
+    description
+    status
+    maxCapabilityWorld
+    workflowCount
+    executionCount
+    createdAt
+    updatedAt
+  }
+}
+    `);
+
+export const useCloneActorMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    CloneActorMutation,
+    TError,
+    CloneActorMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    CloneActorMutation,
+    TError,
+    CloneActorMutationVariables,
+    TContext
+  >({
+    mutationKey: ["CloneActor"],
+    mutationFn: (variables?: CloneActorMutationVariables) =>
+      graphqlFetcher<CloneActorMutation, CloneActorMutationVariables>(
+        CloneActorDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const GetActorMemoriesDocument = new TypedDocumentString(`
+    query GetActorMemories($actorId: UUID!, $memoryType: String) {
+  actorMemories(actorId: $actorId, memoryType: $memoryType) {
+    key
+    value
+    memoryType
+    expiresAt
+    updatedAt
+  }
+}
+    `);
+
+export const useGetActorMemoriesQuery = <
+  TData = GetActorMemoriesQuery,
+  TError = unknown,
+>(
+  variables: GetActorMemoriesQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetActorMemoriesQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetActorMemoriesQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetActorMemoriesQuery, TError, TData>({
+    queryKey: ["GetActorMemories", variables],
+    queryFn: graphqlFetcher<
+      GetActorMemoriesQuery,
+      GetActorMemoriesQueryVariables
+    >(GetActorMemoriesDocument, variables),
+    ...options,
+  });
+};
+
+export const WriteActorMemoryDocument = new TypedDocumentString(`
+    mutation WriteActorMemory($input: WriteActorMemoryInput!) {
+  writeActorMemory(input: $input) {
+    key
+    value
+    memoryType
+    expiresAt
+    updatedAt
+  }
+}
+    `);
+
+export const useWriteActorMemoryMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    WriteActorMemoryMutation,
+    TError,
+    WriteActorMemoryMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    WriteActorMemoryMutation,
+    TError,
+    WriteActorMemoryMutationVariables,
+    TContext
+  >({
+    mutationKey: ["WriteActorMemory"],
+    mutationFn: (variables?: WriteActorMemoryMutationVariables) =>
+      graphqlFetcher<
+        WriteActorMemoryMutation,
+        WriteActorMemoryMutationVariables
+      >(WriteActorMemoryDocument, variables)(),
+    ...options,
+  });
+};
+
+export const DeleteActorMemoryDocument = new TypedDocumentString(`
+    mutation DeleteActorMemory($actorId: UUID!, $key: String!) {
+  deleteActorMemory(actorId: $actorId, key: $key)
+}
+    `);
+
+export const useDeleteActorMemoryMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    DeleteActorMemoryMutation,
+    TError,
+    DeleteActorMemoryMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    DeleteActorMemoryMutation,
+    TError,
+    DeleteActorMemoryMutationVariables,
+    TContext
+  >({
+    mutationKey: ["DeleteActorMemory"],
+    mutationFn: (variables?: DeleteActorMemoryMutationVariables) =>
+      graphqlFetcher<
+        DeleteActorMemoryMutation,
+        DeleteActorMemoryMutationVariables
+      >(DeleteActorMemoryDocument, variables)(),
+    ...options,
+  });
+};
+
+export const GetMyCapabilityCeilingDocument = new TypedDocumentString(`
+    query GetMyCapabilityCeiling {
+  myCapabilityCeiling
+}
+    `);
+
+export const useGetMyCapabilityCeilingQuery = <
+  TData = GetMyCapabilityCeilingQuery,
+  TError = unknown,
+>(
+  variables?: GetMyCapabilityCeilingQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetMyCapabilityCeilingQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetMyCapabilityCeilingQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetMyCapabilityCeilingQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["GetMyCapabilityCeiling"]
+        : ["GetMyCapabilityCeiling", variables],
+    queryFn: graphqlFetcher<
+      GetMyCapabilityCeilingQuery,
+      GetMyCapabilityCeilingQueryVariables
+    >(GetMyCapabilityCeilingDocument, variables),
+    ...options,
+  });
+};
+
+export const GetAllWorkflowStatsDocument = new TypedDocumentString(`
+    query GetAllWorkflowStats($days: Int) {
+  getAllWorkflowStats(days: $days) {
+    id
+    name
+    total
+    succeeded
+    failed
+    avgDurationSecs
+  }
+}
+    `);
+
+export const useGetAllWorkflowStatsQuery = <
+  TData = GetAllWorkflowStatsQuery,
+  TError = unknown,
+>(
+  variables?: GetAllWorkflowStatsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetAllWorkflowStatsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetAllWorkflowStatsQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetAllWorkflowStatsQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["GetAllWorkflowStats"]
+        : ["GetAllWorkflowStats", variables],
+    queryFn: graphqlFetcher<
+      GetAllWorkflowStatsQuery,
+      GetAllWorkflowStatsQueryVariables
+    >(GetAllWorkflowStatsDocument, variables),
+    ...options,
+  });
+};
+
+export const GetApprovalsDocument = new TypedDocumentString(`
+    query GetApprovals {
+  pendingApprovals {
+    id
+    workflowId
+    executionId
+    nodeId
+    requiredFor
+    status
+    requestedAt
+    decidedAt
+    decidedBy
+    reason
+  }
+}
+    `);
+
+export const useGetApprovalsQuery = <
+  TData = GetApprovalsQuery,
+  TError = unknown,
+>(
+  variables?: GetApprovalsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetApprovalsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<GetApprovalsQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<GetApprovalsQuery, TError, TData>({
+    queryKey:
+      variables === undefined ? ["GetApprovals"] : ["GetApprovals", variables],
+    queryFn: graphqlFetcher<GetApprovalsQuery, GetApprovalsQueryVariables>(
+      GetApprovalsDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const ApproveExecutionDocument = new TypedDocumentString(`
+    mutation ApproveExecution($id: UUID!, $reason: String) {
+  approveExecution(id: $id, reason: $reason)
+}
+    `);
+
+export const useApproveExecutionMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    ApproveExecutionMutation,
+    TError,
+    ApproveExecutionMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    ApproveExecutionMutation,
+    TError,
+    ApproveExecutionMutationVariables,
+    TContext
+  >({
+    mutationKey: ["ApproveExecution"],
+    mutationFn: (variables?: ApproveExecutionMutationVariables) =>
+      graphqlFetcher<
+        ApproveExecutionMutation,
+        ApproveExecutionMutationVariables
+      >(ApproveExecutionDocument, variables)(),
+    ...options,
+  });
+};
+
+export const DenyExecutionDocument = new TypedDocumentString(`
+    mutation DenyExecution($id: UUID!, $reason: String) {
+  denyExecution(id: $id, reason: $reason)
+}
+    `);
+
+export const useDenyExecutionMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    DenyExecutionMutation,
+    TError,
+    DenyExecutionMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    DenyExecutionMutation,
+    TError,
+    DenyExecutionMutationVariables,
+    TContext
+  >({
+    mutationKey: ["DenyExecution"],
+    mutationFn: (variables?: DenyExecutionMutationVariables) =>
+      graphqlFetcher<DenyExecutionMutation, DenyExecutionMutationVariables>(
+        DenyExecutionDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const GetAuditSettingsDocument = new TypedDocumentString(`
+    query GetAuditSettings {
+  auditSettings {
+    streamingEnabled
+    otlpEndpoint
+    otlpProtocol
+    updatedAt
+    createdAt
+  }
+}
+    `);
+
+export const useGetAuditSettingsQuery = <
+  TData = GetAuditSettingsQuery,
+  TError = unknown,
+>(
+  variables?: GetAuditSettingsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetAuditSettingsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetAuditSettingsQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetAuditSettingsQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["GetAuditSettings"]
+        : ["GetAuditSettings", variables],
+    queryFn: graphqlFetcher<
+      GetAuditSettingsQuery,
+      GetAuditSettingsQueryVariables
+    >(GetAuditSettingsDocument, variables),
+    ...options,
+  });
+};
+
+export const UpdateAuditSettingsDocument = new TypedDocumentString(`
+    mutation UpdateAuditSettings($enabled: Boolean!, $endpoint: String, $protocol: String!, $headers: String) {
+  updateAuditSettings(
+    streamingEnabled: $enabled
+    otlpEndpoint: $endpoint
+    otlpProtocol: $protocol
+    authHeaders: $headers
+  ) {
+    streamingEnabled
+    otlpEndpoint
+    otlpProtocol
+    updatedAt
+  }
+}
+    `);
+
+export const useUpdateAuditSettingsMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    UpdateAuditSettingsMutation,
+    TError,
+    UpdateAuditSettingsMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    UpdateAuditSettingsMutation,
+    TError,
+    UpdateAuditSettingsMutationVariables,
+    TContext
+  >({
+    mutationKey: ["UpdateAuditSettings"],
+    mutationFn: (variables?: UpdateAuditSettingsMutationVariables) =>
+      graphqlFetcher<
+        UpdateAuditSettingsMutation,
+        UpdateAuditSettingsMutationVariables
+      >(UpdateAuditSettingsDocument, variables)(),
+    ...options,
+  });
+};
+
+export const GetResourceQuotasDocument = new TypedDocumentString(`
     query GetResourceQuotas {
   resourceQuotas {
     cpuCores
@@ -2834,7 +3138,7 @@ export const GetResourceQuotasDocument = `
     activeExecutions
   }
 }
-    `;
+    `);
 
 export const useGetResourceQuotasQuery = <
   TData = GetResourceQuotasQuery,
@@ -2865,7 +3169,7 @@ export const useGetResourceQuotasQuery = <
   });
 };
 
-export const UpdateResourceQuotasDocument = `
+export const UpdateResourceQuotasDocument = new TypedDocumentString(`
     mutation UpdateResourceQuotas($input: UpdateResourceQuotasInput!) {
   updateResourceQuotas(input: $input) {
     cpuCores
@@ -2878,7 +3182,7 @@ export const UpdateResourceQuotasDocument = `
     activeExecutions
   }
 }
-    `;
+    `);
 
 export const useUpdateResourceQuotasMutation = <
   TError = unknown,
@@ -2907,1185 +3211,14 @@ export const useUpdateResourceQuotasMutation = <
   });
 };
 
-export const Setup2FaDocument = `
-    mutation Setup2FA {
-  setupTwoFactor {
-    secret
-    qrCodeUrl
-    qrCodePng
-  }
-}
-    `;
-
-export const useSetup2FaMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    Setup2FaMutation,
-    TError,
-    Setup2FaMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    Setup2FaMutation,
-    TError,
-    Setup2FaMutationVariables,
-    TContext
-  >({
-    mutationKey: ["Setup2FA"],
-    mutationFn: (variables?: Setup2FaMutationVariables) =>
-      graphqlFetcher<Setup2FaMutation, Setup2FaMutationVariables>(
-        Setup2FaDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const Enable2FaDocument = `
-    mutation Enable2FA($input: Enable2FAInput!) {
-  enableTwoFactor(input: $input) {
-    backupCodes
-  }
-}
-    `;
-
-export const useEnable2FaMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    Enable2FaMutation,
-    TError,
-    Enable2FaMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    Enable2FaMutation,
-    TError,
-    Enable2FaMutationVariables,
-    TContext
-  >({
-    mutationKey: ["Enable2FA"],
-    mutationFn: (variables?: Enable2FaMutationVariables) =>
-      graphqlFetcher<Enable2FaMutation, Enable2FaMutationVariables>(
-        Enable2FaDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const Disable2FaDocument = `
-    mutation Disable2FA {
-  disableTwoFactor
-}
-    `;
-
-export const useDisable2FaMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    Disable2FaMutation,
-    TError,
-    Disable2FaMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    Disable2FaMutation,
-    TError,
-    Disable2FaMutationVariables,
-    TContext
-  >({
-    mutationKey: ["Disable2FA"],
-    mutationFn: (variables?: Disable2FaMutationVariables) =>
-      graphqlFetcher<Disable2FaMutation, Disable2FaMutationVariables>(
-        Disable2FaDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const LegacyListActorsDocument = `
-    query LegacyListActors {
-  actors {
-    id
-    name
-    description
-    status
-    maxCapabilityWorld
-    totalBudgetUsd
-    spentBudgetUsd
-    workflowCount
-    executionCount
-    createdAt
-    updatedAt
-  }
-}
-    `;
-
-export const useLegacyListActorsQuery = <
-  TData = LegacyListActorsQuery,
-  TError = unknown,
->(
-  variables?: LegacyListActorsQueryVariables,
-  options?: Omit<
-    UseQueryOptions<LegacyListActorsQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<
-      LegacyListActorsQuery,
-      TError,
-      TData
-    >["queryKey"];
-  },
-) => {
-  return useQuery<LegacyListActorsQuery, TError, TData>({
-    queryKey:
-      variables === undefined
-        ? ["LegacyListActors"]
-        : ["LegacyListActors", variables],
-    queryFn: graphqlFetcher<
-      LegacyListActorsQuery,
-      LegacyListActorsQueryVariables
-    >(LegacyListActorsDocument, variables),
-    ...options,
-  });
-};
-
-export const GetWorkflowLoaderDocument = `
-    query GetWorkflowLoader($id: UUID!) {
-  workflow(id: $id) {
-    id
-    name
-    graphJson
-  }
-}
-    `;
-
-export const useGetWorkflowLoaderQuery = <
-  TData = GetWorkflowLoaderQuery,
-  TError = unknown,
->(
-  variables: GetWorkflowLoaderQueryVariables,
-  options?: Omit<
-    UseQueryOptions<GetWorkflowLoaderQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<
-      GetWorkflowLoaderQuery,
-      TError,
-      TData
-    >["queryKey"];
-  },
-) => {
-  return useQuery<GetWorkflowLoaderQuery, TError, TData>({
-    queryKey: ["GetWorkflowLoader", variables],
-    queryFn: graphqlFetcher<
-      GetWorkflowLoaderQuery,
-      GetWorkflowLoaderQueryVariables
-    >(GetWorkflowLoaderDocument, variables),
-    ...options,
-  });
-};
-
-export const GetModulesLoaderDocument = `
-    query GetModulesLoader($ids: [UUID!]!) {
-  wasmModules(ids: $ids) {
-    id
-    name
-    config
-    sourceCode
-    capabilityWorld
-    importedInterfaces
-  }
-}
-    `;
-
-export const useGetModulesLoaderQuery = <
-  TData = GetModulesLoaderQuery,
-  TError = unknown,
->(
-  variables: GetModulesLoaderQueryVariables,
-  options?: Omit<
-    UseQueryOptions<GetModulesLoaderQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<
-      GetModulesLoaderQuery,
-      TError,
-      TData
-    >["queryKey"];
-  },
-) => {
-  return useQuery<GetModulesLoaderQuery, TError, TData>({
-    queryKey: ["GetModulesLoader", variables],
-    queryFn: graphqlFetcher<
-      GetModulesLoaderQuery,
-      GetModulesLoaderQueryVariables
-    >(GetModulesLoaderDocument, variables),
-    ...options,
-  });
-};
-
-export const ListActorsDocument = `
-    query ListActors {
-  actors {
-    id
-    name
-    status
-    executionCount
-  }
-}
-    `;
-
-export const useListActorsQuery = <TData = ListActorsQuery, TError = unknown>(
-  variables?: ListActorsQueryVariables,
-  options?: Omit<
-    UseQueryOptions<ListActorsQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<ListActorsQuery, TError, TData>["queryKey"];
-  },
-) => {
-  return useQuery<ListActorsQuery, TError, TData>({
-    queryKey:
-      variables === undefined ? ["ListActors"] : ["ListActors", variables],
-    queryFn: graphqlFetcher<ListActorsQuery, ListActorsQueryVariables>(
-      ListActorsDocument,
-      variables,
-    ),
-    ...options,
-  });
-};
-
-export const WorkflowsDocument = `
-    query Workflows {
-  workflows {
-    id
-    name
-    graphJson
-    actorId
-  }
-}
-    `;
-
-export const useWorkflowsQuery = <TData = WorkflowsQuery, TError = unknown>(
-  variables?: WorkflowsQueryVariables,
-  options?: Omit<UseQueryOptions<WorkflowsQuery, TError, TData>, "queryKey"> & {
-    queryKey?: UseQueryOptions<WorkflowsQuery, TError, TData>["queryKey"];
-  },
-) => {
-  return useQuery<WorkflowsQuery, TError, TData>({
-    queryKey:
-      variables === undefined ? ["Workflows"] : ["Workflows", variables],
-    queryFn: graphqlFetcher<WorkflowsQuery, WorkflowsQueryVariables>(
-      WorkflowsDocument,
-      variables,
-    ),
-    ...options,
-  });
-};
-
-export const TriggerWorkflowDocument = `
-    mutation TriggerWorkflow($workflowId: UUID!) {
-  triggerWorkflow(workflowId: $workflowId) {
-    id
-    status
-  }
-}
-    `;
-
-export const useTriggerWorkflowMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
-  options?: UseMutationOptions<
-    TriggerWorkflowMutation,
-    TError,
-    TriggerWorkflowMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    TriggerWorkflowMutation,
-    TError,
-    TriggerWorkflowMutationVariables,
-    TContext
-  >({
-    mutationKey: ["TriggerWorkflow"],
-    mutationFn: (variables?: TriggerWorkflowMutationVariables) =>
-      graphqlFetcher<TriggerWorkflowMutation, TriggerWorkflowMutationVariables>(
-        TriggerWorkflowDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const LatestWorkflowExecutionsDocument = `
-    query LatestWorkflowExecutions($workflowIds: [UUID!]!) {
-  latestWorkflowExecutions(workflowIds: $workflowIds) {
-    workflowId
-    status
-    startedAt
-    errorMessage
-  }
-}
-    `;
-
-export const useLatestWorkflowExecutionsQuery = <
-  TData = LatestWorkflowExecutionsQuery,
-  TError = unknown,
->(
-  variables: LatestWorkflowExecutionsQueryVariables,
-  options?: Omit<
-    UseQueryOptions<LatestWorkflowExecutionsQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<
-      LatestWorkflowExecutionsQuery,
-      TError,
-      TData
-    >["queryKey"];
-  },
-) => {
-  return useQuery<LatestWorkflowExecutionsQuery, TError, TData>({
-    queryKey: ["LatestWorkflowExecutions", variables],
-    queryFn: graphqlFetcher<
-      LatestWorkflowExecutionsQuery,
-      LatestWorkflowExecutionsQueryVariables
-    >(LatestWorkflowExecutionsDocument, variables),
-    ...options,
-  });
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Types for operations added below (not yet in codegen output)
-// ─────────────────────────────────────────────────────────────────────────────
-
-export type WorkflowVersionItem = {
-  __typename?: "WorkflowVersion";
-  id: any;
-  workflowId: any;
-  versionNumber: number;
-  graphJson: string;
-  description?: string | null;
-  publishedAt: string;
-  publishedBy: any;
-  isActive: boolean;
-  createdAt: string;
-};
-
-export type WorkflowExecutionItem = {
-  __typename?: "WorkflowExecution";
-  id: any;
-  workflowId: any;
-  status: string;
-  startedAt: string;
-  completedAt?: string | null;
-  triggerType?: string | null;
-  actorId?: any | null;
-  errorMessage?: string | null;
-  createdAt: string;
-  durationMs?: number | null;
-};
-
-export type WorkflowScheduleItem = {
-  __typename?: "WorkflowScheduleObj";
-  id: any;
-  workflowId: any;
-  cronExpression: string;
-  timezone: string;
-  isEnabled: boolean;
-  lastTriggeredAt?: string | null;
-  nextTriggerAt?: string | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type DekRotationResultType = {
-  __typename?: "DekRotationResult";
-  newDekId: any;
-  message: string;
-};
-
-export type ReEncryptionResultType = {
-  __typename?: "ReEncryptionResult";
-  reEncryptedCount: number;
-  message: string;
-};
-
-export type MasterKeyRotationResultType = {
-  __typename?: "MasterKeyRotationResult";
-  reEncryptedDekCount: number;
-  message: string;
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Workflow Versions
-// ─────────────────────────────────────────────────────────────────────────────
-
-export type WorkflowVersionsQueryVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
-}>;
-
-export type WorkflowVersionsQuery = {
-  __typename?: "QueryRoot";
-  workflowVersions: Array<WorkflowVersionItem>;
-};
-
-export const WorkflowVersionsDocument = `
-    query WorkflowVersions($workflowId: UUID!, $limit: Int) {
-  workflowVersions(workflowId: $workflowId, limit: $limit) {
-    id
-    workflowId
-    versionNumber
-    description
-    publishedAt
-    publishedBy
-    isActive
-    createdAt
-  }
-}
-    `;
-
-export const useWorkflowVersionsQuery = <
-  TData = WorkflowVersionsQuery,
-  TError = unknown,
->(
-  variables: WorkflowVersionsQueryVariables,
-  options?: Omit<
-    UseQueryOptions<WorkflowVersionsQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<
-      WorkflowVersionsQuery,
-      TError,
-      TData
-    >["queryKey"];
-  },
-) => {
-  return useQuery<WorkflowVersionsQuery, TError, TData>({
-    queryKey: ["WorkflowVersions", variables],
-    queryFn: graphqlFetcher<
-      WorkflowVersionsQuery,
-      WorkflowVersionsQueryVariables
-    >(WorkflowVersionsDocument, variables),
-    ...options,
-  });
-};
-
-export type PublishWorkflowVersionMutationVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-  description?: InputMaybe<Scalars["String"]["input"]>;
-}>;
-
-export type PublishWorkflowVersionMutation = {
-  __typename?: "MutationRoot";
-  publishWorkflowVersion: WorkflowVersionItem;
-};
-
-export const PublishWorkflowVersionDocument = `
-    mutation PublishWorkflowVersion($workflowId: UUID!, $description: String) {
-  publishWorkflowVersion(workflowId: $workflowId, description: $description) {
-    id
-    workflowId
-    versionNumber
-    description
-    publishedAt
-    publishedBy
-    isActive
-    createdAt
-  }
-}
-    `;
-
-export const usePublishWorkflowVersionMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
-  options?: UseMutationOptions<
-    PublishWorkflowVersionMutation,
-    TError,
-    PublishWorkflowVersionMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    PublishWorkflowVersionMutation,
-    TError,
-    PublishWorkflowVersionMutationVariables,
-    TContext
-  >({
-    mutationKey: ["PublishWorkflowVersion"],
-    mutationFn: (variables?: PublishWorkflowVersionMutationVariables) =>
-      graphqlFetcher<
-        PublishWorkflowVersionMutation,
-        PublishWorkflowVersionMutationVariables
-      >(PublishWorkflowVersionDocument, variables)(),
-    ...options,
-  });
-};
-
-export type RollbackWorkflowVersionMutationVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-  versionId: Scalars["UUID"]["input"];
-}>;
-
-export type RollbackWorkflowVersionMutation = {
-  __typename?: "MutationRoot";
-  rollbackWorkflowVersion: WorkflowVersionItem;
-};
-
-export const RollbackWorkflowVersionDocument = `
-    mutation RollbackWorkflowVersion($workflowId: UUID!, $versionId: UUID!) {
-  rollbackWorkflowVersion(workflowId: $workflowId, versionId: $versionId) {
-    id
-    workflowId
-    versionNumber
-    description
-    publishedAt
-    isActive
-    createdAt
-  }
-}
-    `;
-
-export const useRollbackWorkflowVersionMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
-  options?: UseMutationOptions<
-    RollbackWorkflowVersionMutation,
-    TError,
-    RollbackWorkflowVersionMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    RollbackWorkflowVersionMutation,
-    TError,
-    RollbackWorkflowVersionMutationVariables,
-    TContext
-  >({
-    mutationKey: ["RollbackWorkflowVersion"],
-    mutationFn: (variables?: RollbackWorkflowVersionMutationVariables) =>
-      graphqlFetcher<
-        RollbackWorkflowVersionMutation,
-        RollbackWorkflowVersionMutationVariables
-      >(RollbackWorkflowVersionDocument, variables)(),
-    ...options,
-  });
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Execution History & Retry
-// ─────────────────────────────────────────────────────────────────────────────
-
-export type WorkflowExecutionHistoryQueryVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
-  offset?: InputMaybe<Scalars["Int"]["input"]>;
-}>;
-
-export type WorkflowExecutionHistoryQuery = {
-  __typename?: "QueryRoot";
-  workflowExecutionHistory: Array<WorkflowExecutionItem>;
-};
-
-export const WorkflowExecutionHistoryDocument = `
-    query WorkflowExecutionHistory($workflowId: UUID!, $limit: Int, $offset: Int) {
-  workflowExecutionHistory(workflowId: $workflowId, pagination: {limit: $limit, offset: $offset}) {
-    id
-    workflowId
-    status
-    startedAt
-    completedAt
-    triggerType
-    actorId
-    errorMessage
-    createdAt
-    durationMs
-  }
-}
-    `;
-
-export const useWorkflowExecutionHistoryQuery = <
-  TData = WorkflowExecutionHistoryQuery,
-  TError = unknown,
->(
-  variables: WorkflowExecutionHistoryQueryVariables,
-  options?: Omit<
-    UseQueryOptions<WorkflowExecutionHistoryQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<
-      WorkflowExecutionHistoryQuery,
-      TError,
-      TData
-    >["queryKey"];
-  },
-) => {
-  return useQuery<WorkflowExecutionHistoryQuery, TError, TData>({
-    queryKey: ["WorkflowExecutionHistory", variables],
-    queryFn: graphqlFetcher<
-      WorkflowExecutionHistoryQuery,
-      WorkflowExecutionHistoryQueryVariables
-    >(WorkflowExecutionHistoryDocument, variables),
-    ...options,
-  });
-};
-
-export type RetryExecutionMutationVariables = Exact<{
-  executionId: Scalars["UUID"]["input"];
-}>;
-
-export type RetryExecutionMutation = {
-  __typename?: "MutationRoot";
-  retryExecution: any;
-};
-
-export const RetryExecutionDocument = `
-    mutation RetryExecution($executionId: UUID!) {
-  retryExecution(executionId: $executionId)
-}
-    `;
-
-export const useRetryExecutionMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    RetryExecutionMutation,
-    TError,
-    RetryExecutionMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    RetryExecutionMutation,
-    TError,
-    RetryExecutionMutationVariables,
-    TContext
-  >({
-    mutationKey: ["RetryExecution"],
-    mutationFn: (variables?: RetryExecutionMutationVariables) =>
-      graphqlFetcher<RetryExecutionMutation, RetryExecutionMutationVariables>(
-        RetryExecutionDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export type ResumeWorkflowMutationVariables = Exact<{
-  executionId: Scalars["UUID"]["input"];
-}>;
-
-export type ResumeWorkflowMutation = {
-  __typename?: "MutationRoot";
-  resumeWorkflow: boolean;
-};
-
-export const ResumeWorkflowDocument = `
-    mutation ResumeWorkflow($executionId: UUID!) {
-  resumeWorkflow(executionId: $executionId)
-}
-    `;
-
-export const useResumeWorkflowMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    ResumeWorkflowMutation,
-    TError,
-    ResumeWorkflowMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    ResumeWorkflowMutation,
-    TError,
-    ResumeWorkflowMutationVariables,
-    TContext
-  >({
-    mutationKey: ["ResumeWorkflow"],
-    mutationFn: (variables?: ResumeWorkflowMutationVariables) =>
-      graphqlFetcher<ResumeWorkflowMutation, ResumeWorkflowMutationVariables>(
-        ResumeWorkflowDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Schedules
-// ─────────────────────────────────────────────────────────────────────────────
-
-export type MySchedulesQueryVariables = Exact<{ [key: string]: never }>;
-
-export type MySchedulesQuery = {
-  __typename?: "QueryRoot";
-  mySchedules: Array<WorkflowScheduleItem>;
-};
-
-export const MySchedulesDocument = `
-    query MySchedules {
-  mySchedules {
-    id
-    workflowId
-    cronExpression
-    timezone
-    isEnabled
-    lastTriggeredAt
-    nextTriggerAt
-    createdAt
-    updatedAt
-  }
-}
-    `;
-
-export const useMySchedulesQuery = <TData = MySchedulesQuery, TError = unknown>(
-  variables?: MySchedulesQueryVariables,
-  options?: Omit<
-    UseQueryOptions<MySchedulesQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<MySchedulesQuery, TError, TData>["queryKey"];
-  },
-) => {
-  return useQuery<MySchedulesQuery, TError, TData>({
-    queryKey:
-      variables === undefined ? ["MySchedules"] : ["MySchedules", variables],
-    queryFn: graphqlFetcher<MySchedulesQuery, MySchedulesQueryVariables>(
-      MySchedulesDocument,
-      variables,
-    ),
-    ...options,
-  });
-};
-
-export type CreateScheduleMutationVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-  cronExpression: Scalars["String"]["input"];
-  timezone?: InputMaybe<Scalars["String"]["input"]>;
-}>;
-
-export type CreateScheduleMutation = {
-  __typename?: "MutationRoot";
-  createSchedule: WorkflowScheduleItem;
-};
-
-export const CreateScheduleDocument = `
-    mutation CreateSchedule($workflowId: UUID!, $cronExpression: String!, $timezone: String) {
-  createSchedule(workflowId: $workflowId, cronExpression: $cronExpression, timezone: $timezone) {
-    id
-    workflowId
-    cronExpression
-    timezone
-    isEnabled
-    nextTriggerAt
-    createdAt
-    updatedAt
-  }
-}
-    `;
-
-export const useCreateScheduleMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    CreateScheduleMutation,
-    TError,
-    CreateScheduleMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    CreateScheduleMutation,
-    TError,
-    CreateScheduleMutationVariables,
-    TContext
-  >({
-    mutationKey: ["CreateSchedule"],
-    mutationFn: (variables?: CreateScheduleMutationVariables) =>
-      graphqlFetcher<CreateScheduleMutation, CreateScheduleMutationVariables>(
-        CreateScheduleDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export type UpdateScheduleMutationVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-  cronExpression?: InputMaybe<Scalars["String"]["input"]>;
-  timezone?: InputMaybe<Scalars["String"]["input"]>;
-  isEnabled?: InputMaybe<Scalars["Boolean"]["input"]>;
-}>;
-
-export type UpdateScheduleMutation = {
-  __typename?: "MutationRoot";
-  updateSchedule: WorkflowScheduleItem;
-};
-
-export const UpdateScheduleDocument = `
-    mutation UpdateSchedule($workflowId: UUID!, $cronExpression: String, $timezone: String, $isEnabled: Boolean) {
-  updateSchedule(workflowId: $workflowId, cronExpression: $cronExpression, timezone: $timezone, isEnabled: $isEnabled) {
-    id
-    workflowId
-    cronExpression
-    timezone
-    isEnabled
-    nextTriggerAt
-    updatedAt
-  }
-}
-    `;
-
-export const useUpdateScheduleMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    UpdateScheduleMutation,
-    TError,
-    UpdateScheduleMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    UpdateScheduleMutation,
-    TError,
-    UpdateScheduleMutationVariables,
-    TContext
-  >({
-    mutationKey: ["UpdateSchedule"],
-    mutationFn: (variables?: UpdateScheduleMutationVariables) =>
-      graphqlFetcher<UpdateScheduleMutation, UpdateScheduleMutationVariables>(
-        UpdateScheduleDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export type DeleteScheduleMutationVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-}>;
-
-export type DeleteScheduleMutation = {
-  __typename?: "MutationRoot";
-  deleteSchedule: boolean;
-};
-
-export const DeleteScheduleDocument = `
-    mutation DeleteSchedule($workflowId: UUID!) {
-  deleteSchedule(workflowId: $workflowId)
-}
-    `;
-
-export const useDeleteScheduleMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    DeleteScheduleMutation,
-    TError,
-    DeleteScheduleMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    DeleteScheduleMutation,
-    TError,
-    DeleteScheduleMutationVariables,
-    TContext
-  >({
-    mutationKey: ["DeleteSchedule"],
-    mutationFn: (variables?: DeleteScheduleMutationVariables) =>
-      graphqlFetcher<DeleteScheduleMutation, DeleteScheduleMutationVariables>(
-        DeleteScheduleDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// API Key Rotation & Deletion
-// ─────────────────────────────────────────────────────────────────────────────
-
-export type RotateApiKeyMutationVariables = Exact<{
-  keyId: Scalars["UUID"]["input"];
-}>;
-
-export type RotateApiKeyMutation = {
-  __typename?: "MutationRoot";
-  rotateApiKey: {
-    __typename?: "ApiKeyCreated";
-    id: any;
-    name: string;
-    key: string;
-    scopes: Array<string>;
-    expiresAt?: string | null;
-  };
-};
-
-export const RotateApiKeyDocument = `
-    mutation RotateApiKey($keyId: UUID!) {
-  rotateApiKey(keyId: $keyId) {
-    id
-    name
-    key
-    scopes
-    expiresAt
-  }
-}
-    `;
-
-export const useRotateApiKeyMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    RotateApiKeyMutation,
-    TError,
-    RotateApiKeyMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    RotateApiKeyMutation,
-    TError,
-    RotateApiKeyMutationVariables,
-    TContext
-  >({
-    mutationKey: ["RotateApiKey"],
-    mutationFn: (variables?: RotateApiKeyMutationVariables) =>
-      graphqlFetcher<RotateApiKeyMutation, RotateApiKeyMutationVariables>(
-        RotateApiKeyDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export type DeleteApiKeyMutationVariables = Exact<{
-  keyId: Scalars["UUID"]["input"];
-}>;
-
-export type DeleteApiKeyMutation = {
-  __typename?: "MutationRoot";
-  deleteApiKey: boolean;
-};
-
-export const DeleteApiKeyDocument = `
-    mutation DeleteApiKey($keyId: UUID!) {
-  deleteApiKey(keyId: $keyId)
-}
-    `;
-
-export const useDeleteApiKeyMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    DeleteApiKeyMutation,
-    TError,
-    DeleteApiKeyMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    DeleteApiKeyMutation,
-    TError,
-    DeleteApiKeyMutationVariables,
-    TContext
-  >({
-    mutationKey: ["DeleteApiKey"],
-    mutationFn: (variables?: DeleteApiKeyMutationVariables) =>
-      graphqlFetcher<DeleteApiKeyMutation, DeleteApiKeyMutationVariables>(
-        DeleteApiKeyDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Organization Member Management
-// ─────────────────────────────────────────────────────────────────────────────
-
-export type InviteMemberMutationVariables = Exact<{
-  orgId: Scalars["UUID"]["input"];
-  targetUserId: Scalars["UUID"]["input"];
-  role: Scalars["String"]["input"];
-}>;
-
-export type InviteMemberMutation = {
-  __typename?: "MutationRoot";
-  inviteMember: {
-    __typename?: "OrgMemberObj";
-    id: any;
-    orgId: any;
-    userId: any;
-    role: string;
-    invitedBy?: any | null;
-    joinedAt: string;
-  };
-};
-
-export const InviteMemberDocument = `
-    mutation InviteMember($orgId: UUID!, $targetUserId: UUID!, $role: String!) {
-  inviteMember(orgId: $orgId, targetUserId: $targetUserId, role: $role) {
-    id
-    orgId
-    userId
-    role
-    invitedBy
-    joinedAt
-  }
-}
-    `;
-
-export const useInviteMemberMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    InviteMemberMutation,
-    TError,
-    InviteMemberMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    InviteMemberMutation,
-    TError,
-    InviteMemberMutationVariables,
-    TContext
-  >({
-    mutationKey: ["InviteMember"],
-    mutationFn: (variables?: InviteMemberMutationVariables) =>
-      graphqlFetcher<InviteMemberMutation, InviteMemberMutationVariables>(
-        InviteMemberDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export type UpdateMemberRoleMutationVariables = Exact<{
-  orgId: Scalars["UUID"]["input"];
-  targetUserId: Scalars["UUID"]["input"];
-  role: Scalars["String"]["input"];
-}>;
-
-export type UpdateMemberRoleMutation = {
-  __typename?: "MutationRoot";
-  updateMemberRole: {
-    __typename?: "OrgMemberObj";
-    id: any;
-    orgId: any;
-    userId: any;
-    role: string;
-    joinedAt: string;
-  };
-};
-
-export const UpdateMemberRoleDocument = `
-    mutation UpdateMemberRole($orgId: UUID!, $targetUserId: UUID!, $role: String!) {
-  updateMemberRole(orgId: $orgId, targetUserId: $targetUserId, role: $role) {
-    id
-    orgId
-    userId
-    role
-    joinedAt
-  }
-}
-    `;
-
-export const useUpdateMemberRoleMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
-  options?: UseMutationOptions<
-    UpdateMemberRoleMutation,
-    TError,
-    UpdateMemberRoleMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    UpdateMemberRoleMutation,
-    TError,
-    UpdateMemberRoleMutationVariables,
-    TContext
-  >({
-    mutationKey: ["UpdateMemberRole"],
-    mutationFn: (variables?: UpdateMemberRoleMutationVariables) =>
-      graphqlFetcher<
-        UpdateMemberRoleMutation,
-        UpdateMemberRoleMutationVariables
-      >(UpdateMemberRoleDocument, variables)(),
-    ...options,
-  });
-};
-
-export type TransferOwnershipMutationVariables = Exact<{
-  orgId: Scalars["UUID"]["input"];
-  newOwnerId: Scalars["UUID"]["input"];
-}>;
-
-export type TransferOwnershipMutation = {
-  __typename?: "MutationRoot";
-  transferOwnership: {
-    __typename?: "OrganizationObj";
-    id: any;
-    name: string;
-    slug: string;
-    ownerId: any;
-    updatedAt: string;
-  };
-};
-
-export const TransferOwnershipDocument = `
-    mutation TransferOwnership($orgId: UUID!, $newOwnerId: UUID!) {
-  transferOwnership(orgId: $orgId, newOwnerId: $newOwnerId) {
-    id
-    name
-    slug
-    ownerId
-    updatedAt
-  }
-}
-    `;
-
-export const useTransferOwnershipMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
-  options?: UseMutationOptions<
-    TransferOwnershipMutation,
-    TError,
-    TransferOwnershipMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    TransferOwnershipMutation,
-    TError,
-    TransferOwnershipMutationVariables,
-    TContext
-  >({
-    mutationKey: ["TransferOwnership"],
-    mutationFn: (variables?: TransferOwnershipMutationVariables) =>
-      graphqlFetcher<
-        TransferOwnershipMutation,
-        TransferOwnershipMutationVariables
-      >(TransferOwnershipDocument, variables)(),
-    ...options,
-  });
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Encryption Key Management
-// ─────────────────────────────────────────────────────────────────────────────
-
-export type RotateDekMutationVariables = Exact<{ [key: string]: never }>;
-
-export type RotateDekMutation = {
-  __typename?: "MutationRoot";
-  rotateDek: DekRotationResultType;
-};
-
-export const RotateDekDocument = `
+export const RotateDekDocument = new TypedDocumentString(`
     mutation RotateDek {
   rotateDek {
     newDekId
     message
   }
 }
-    `;
+    `);
 
 export const useRotateDekMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
@@ -4111,21 +3244,14 @@ export const useRotateDekMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
-export type ReEncryptSecretsMutationVariables = Exact<{ [key: string]: never }>;
-
-export type ReEncryptSecretsMutation = {
-  __typename?: "MutationRoot";
-  reEncryptSecrets: ReEncryptionResultType;
-};
-
-export const ReEncryptSecretsDocument = `
+export const ReEncryptSecretsDocument = new TypedDocumentString(`
     mutation ReEncryptSecrets {
   reEncryptSecrets {
     reEncryptedCount
     message
   }
 }
-    `;
+    `);
 
 export const useReEncryptSecretsMutation = <
   TError = unknown,
@@ -4154,23 +3280,14 @@ export const useReEncryptSecretsMutation = <
   });
 };
 
-export type RotateMasterKeyMutationVariables = Exact<{
-  newMasterKey: Scalars["String"]["input"];
-}>;
-
-export type RotateMasterKeyMutation = {
-  __typename?: "MutationRoot";
-  rotateMasterKey: MasterKeyRotationResultType;
-};
-
-export const RotateMasterKeyDocument = `
+export const RotateMasterKeyDocument = new TypedDocumentString(`
     mutation RotateMasterKey($newMasterKey: String!) {
   rotateMasterKey(newMasterKey: $newMasterKey) {
     reEncryptedDekCount
     message
   }
 }
-    `;
+    `);
 
 export const useRotateMasterKeyMutation = <
   TError = unknown,
@@ -4199,177 +3316,16 @@ export const useRotateMasterKeyMutation = <
   });
 };
 
-// ---------------------------------------------------------------------------
-// setConcurrencyLimit mutation
-// ---------------------------------------------------------------------------
-export type SetConcurrencyLimitMutationVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-  maxConcurrent?: InputMaybe<Scalars["Int"]["input"]>;
-}>;
-export type SetConcurrencyLimitMutation = {
-  __typename?: "MutationRoot";
-  setConcurrencyLimit: boolean;
-};
-const SetConcurrencyLimitDocument = `
-  mutation SetConcurrencyLimit($workflowId: UUID!, $maxConcurrent: Int) {
-    setConcurrencyLimit(workflowId: $workflowId, maxConcurrent: $maxConcurrent)
+export const UpdateSecretDocument = new TypedDocumentString(`
+    mutation UpdateSecret($input: UpdateSecretInput!) {
+  updateSecret(input: $input) {
+    id
+    name
+    keyPath
   }
-`;
-export const useSetConcurrencyLimitMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
-  options?: UseMutationOptions<
-    SetConcurrencyLimitMutation,
-    TError,
-    SetConcurrencyLimitMutationVariables,
-    TContext
-  >,
-) =>
-  useMutation<
-    SetConcurrencyLimitMutation,
-    TError,
-    SetConcurrencyLimitMutationVariables,
-    TContext
-  >({
-    mutationKey: ["SetConcurrencyLimit"],
-    mutationFn: (variables: SetConcurrencyLimitMutationVariables) =>
-      graphqlFetcher<
-        SetConcurrencyLimitMutation,
-        SetConcurrencyLimitMutationVariables
-      >(SetConcurrencyLimitDocument, variables)(),
-    ...options,
-  });
+}
+    `);
 
-// ---------------------------------------------------------------------------
-// deleteWorkflow mutation
-// ---------------------------------------------------------------------------
-export type DeleteWorkflowMutationVariables = Exact<{
-  id: Scalars["UUID"]["input"];
-}>;
-export type DeleteWorkflowMutation = {
-  __typename?: "MutationRoot";
-  deleteWorkflow: boolean;
-};
-const DeleteWorkflowDocument = `
-  mutation DeleteWorkflow($id: UUID!) {
-    deleteWorkflow(id: $id)
-  }
-`;
-export const useDeleteWorkflowMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    DeleteWorkflowMutation,
-    TError,
-    DeleteWorkflowMutationVariables,
-    TContext
-  >,
-) =>
-  useMutation<
-    DeleteWorkflowMutation,
-    TError,
-    DeleteWorkflowMutationVariables,
-    TContext
-  >({
-    mutationKey: ["DeleteWorkflow"],
-    mutationFn: (variables: DeleteWorkflowMutationVariables) =>
-      graphqlFetcher<DeleteWorkflowMutation, DeleteWorkflowMutationVariables>(
-        DeleteWorkflowDocument,
-        variables,
-      )(),
-    ...options,
-  });
-
-// ---------------------------------------------------------------------------
-// testWorkflow mutation
-// ---------------------------------------------------------------------------
-export type TestWorkflowMutationVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-  mockInputs?: InputMaybe<Scalars["String"]["input"]>;
-}>;
-export type TestWorkflowMutation = {
-  __typename?: "MutationRoot";
-  testWorkflow: {
-    __typename?: "TestWorkflowResult";
-    executionId: string;
-    status: string;
-    durationMs: number;
-    error?: string | null;
-    schemaWarnings: Array<string>;
-    nodeTraces: Array<{
-      __typename?: "TestNodeTrace";
-      nodeId: string;
-      status: string;
-      input: string;
-      output?: string | null;
-      error?: string | null;
-    }>;
-  };
-};
-const TestWorkflowDocument = `
-  mutation TestWorkflow($workflowId: UUID!, $mockInputs: String) {
-    testWorkflow(workflowId: $workflowId, mockInputs: $mockInputs) {
-      executionId
-      status
-      durationMs
-      error
-      schemaWarnings
-      nodeTraces {
-        nodeId
-        status
-        input
-        output
-        error
-      }
-    }
-  }
-`;
-export const useTestWorkflowMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    TestWorkflowMutation,
-    TError,
-    TestWorkflowMutationVariables,
-    TContext
-  >,
-) =>
-  useMutation<
-    TestWorkflowMutation,
-    TError,
-    TestWorkflowMutationVariables,
-    TContext
-  >({
-    mutationKey: ["TestWorkflow"],
-    mutationFn: (variables: TestWorkflowMutationVariables) =>
-      graphqlFetcher<TestWorkflowMutation, TestWorkflowMutationVariables>(
-        TestWorkflowDocument,
-        variables,
-      )(),
-    ...options,
-  });
-
-// ---------------------------------------------------------------------------
-// updateSecret
-// ---------------------------------------------------------------------------
-export type UpdateSecretMutationVariables = Exact<{
-  input: UpdateSecretInput;
-}>;
-export type UpdateSecretMutation = {
-  __typename?: "MutationRoot";
-  updateSecret: {
-    __typename?: "Secret";
-    id: string;
-    name: string;
-    keyPath: string;
-  };
-};
-const UpdateSecretDocument = `
-  mutation UpdateSecret($input: UpdateSecretInput!) {
-    updateSecret(input: $input) {
-      id
-      name
-      keyPath
-    }
-  }
-`;
 export const useUpdateSecretMutation = <TError = unknown, TContext = unknown>(
   options?: UseMutationOptions<
     UpdateSecretMutation,
@@ -4377,164 +3333,246 @@ export const useUpdateSecretMutation = <TError = unknown, TContext = unknown>(
     UpdateSecretMutationVariables,
     TContext
   >,
-) =>
-  useMutation<
+) => {
+  return useMutation<
     UpdateSecretMutation,
     TError,
     UpdateSecretMutationVariables,
     TContext
   >({
     mutationKey: ["UpdateSecret"],
-    mutationFn: (variables: UpdateSecretMutationVariables) =>
+    mutationFn: (variables?: UpdateSecretMutationVariables) =>
       graphqlFetcher<UpdateSecretMutation, UpdateSecretMutationVariables>(
         UpdateSecretDocument,
         variables,
       )(),
     ...options,
   });
-
-// ---------------------------------------------------------------------------
-// webhookTriggers query
-// ---------------------------------------------------------------------------
-export type WebhookTriggersQueryVariables = Exact<{ [key: string]: never }>;
-export type WebhookTriggersQuery = {
-  __typename?: "QueryRoot";
-  webhookTriggers: Array<{
-    __typename?: "WebhookTrigger";
-    id: string;
-    name: string;
-    webhookUrl: string;
-    enabled: boolean;
-    triggerCount: number;
-    successCount: number;
-    errorCount: number;
-    maxRequestsPerMinute: number;
-    lastTriggeredAt?: string | null;
-    verificationToken?: string | null;
-  }>;
 };
-const WebhookTriggersDocument = `
-  query WebhookTriggers {
-    webhookTriggers {
-      id
-      name
-      webhookUrl
-      enabled
-      triggerCount
-      successCount
-      errorCount
-      maxRequestsPerMinute
-      lastTriggeredAt
-      verificationToken
-    }
+
+export const ListServiceIntegrationsDocument = new TypedDocumentString(`
+    query ListServiceIntegrations {
+  serviceIntegrations {
+    id
+    service
+    accountIdentifier
+    connectedAt
+    status
   }
-`;
-export const useWebhookTriggersQuery = <
-  TData = WebhookTriggersQuery,
+}
+    `);
+
+export const useListServiceIntegrationsQuery = <
+  TData = ListServiceIntegrationsQuery,
   TError = unknown,
 >(
-  variables?: WebhookTriggersQueryVariables,
+  variables?: ListServiceIntegrationsQueryVariables,
   options?: Omit<
-    UseQueryOptions<WebhookTriggersQuery, TError, TData>,
+    UseQueryOptions<ListServiceIntegrationsQuery, TError, TData>,
     "queryKey"
   > & {
-    queryKey?: UseQueryOptions<WebhookTriggersQuery, TError, TData>["queryKey"];
+    queryKey?: UseQueryOptions<
+      ListServiceIntegrationsQuery,
+      TError,
+      TData
+    >["queryKey"];
   },
-) =>
-  useQuery<WebhookTriggersQuery, TError, TData>({
+) => {
+  return useQuery<ListServiceIntegrationsQuery, TError, TData>({
     queryKey:
       variables === undefined
-        ? ["WebhookTriggers"]
-        : ["WebhookTriggers", variables],
+        ? ["ListServiceIntegrations"]
+        : ["ListServiceIntegrations", variables],
     queryFn: graphqlFetcher<
-      WebhookTriggersQuery,
-      WebhookTriggersQueryVariables
-    >(WebhookTriggersDocument, variables),
+      ListServiceIntegrationsQuery,
+      ListServiceIntegrationsQueryVariables
+    >(ListServiceIntegrationsDocument, variables),
     ...options,
   });
-
-// ---------------------------------------------------------------------------
-// createWebhookTrigger mutation
-// ---------------------------------------------------------------------------
-export type CreateWebhookTriggerMutationVariables = Exact<{
-  input: CreateWebhookTriggerInput;
-}>;
-export type CreateWebhookTriggerMutation = {
-  __typename?: "MutationRoot";
-  createWebhookTrigger: {
-    __typename?: "WebhookTrigger";
-    id: string;
-    name: string;
-    webhookUrl: string;
-    verificationToken?: string | null;
-  };
 };
-const CreateWebhookTriggerDocument = `
-  mutation CreateWebhookTrigger($input: CreateWebhookTriggerInput!) {
-    createWebhookTrigger(input: $input) {
-      id
-      name
-      webhookUrl
-      verificationToken
-    }
-  }
-`;
-export const useCreateWebhookTriggerMutation = <
+
+export const DisconnectServiceIntegrationDocument = new TypedDocumentString(`
+    mutation DisconnectServiceIntegration($id: UUID!, $service: IntegrationService!) {
+  disconnectServiceIntegration(id: $id, service: $service)
+}
+    `);
+
+export const useDisconnectServiceIntegrationMutation = <
   TError = unknown,
   TContext = unknown,
 >(
   options?: UseMutationOptions<
-    CreateWebhookTriggerMutation,
+    DisconnectServiceIntegrationMutation,
     TError,
-    CreateWebhookTriggerMutationVariables,
+    DisconnectServiceIntegrationMutationVariables,
     TContext
   >,
-) =>
-  useMutation<
-    CreateWebhookTriggerMutation,
+) => {
+  return useMutation<
+    DisconnectServiceIntegrationMutation,
     TError,
-    CreateWebhookTriggerMutationVariables,
+    DisconnectServiceIntegrationMutationVariables,
     TContext
   >({
-    mutationKey: ["CreateWebhookTrigger"],
-    mutationFn: (variables: CreateWebhookTriggerMutationVariables) =>
+    mutationKey: ["DisconnectServiceIntegration"],
+    mutationFn: (variables?: DisconnectServiceIntegrationMutationVariables) =>
       graphqlFetcher<
-        CreateWebhookTriggerMutation,
-        CreateWebhookTriggerMutationVariables
-      >(CreateWebhookTriggerDocument, variables)(),
+        DisconnectServiceIntegrationMutation,
+        DisconnectServiceIntegrationMutationVariables
+      >(DisconnectServiceIntegrationDocument, variables)(),
     ...options,
   });
-
-// ---------------------------------------------------------------------------
-// nodeTemplates query
-// ---------------------------------------------------------------------------
-export type NodeTemplatesQueryVariables = Exact<{
-  category?: InputMaybe<Scalars["String"]["input"]>;
-}>;
-export type NodeTemplatesQuery = {
-  __typename?: "QueryRoot";
-  nodeTemplates: Array<{
-    __typename?: "NodeTemplate";
-    id: string;
-    name: string;
-    category: string;
-    description?: string | null;
-    icon?: string | null;
-    allowedHosts: Array<string>;
-  }>;
 };
-const NodeTemplatesDocument = `
-  query NodeTemplates($category: String) {
-    nodeTemplates(category: $category) {
-      id
-      name
-      category
-      description
-      icon
-      allowedHosts
-    }
+
+export const ListMcpAgentsDocument = new TypedDocumentString(`
+    query ListMcpAgents {
+  mcpAgents {
+    id
+    name
+    createdAt
+    lastUsedAt
   }
-`;
+}
+    `);
+
+export const useListMcpAgentsQuery = <
+  TData = ListMcpAgentsQuery,
+  TError = unknown,
+>(
+  variables?: ListMcpAgentsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<ListMcpAgentsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<ListMcpAgentsQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<ListMcpAgentsQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["ListMcpAgents"]
+        : ["ListMcpAgents", variables],
+    queryFn: graphqlFetcher<ListMcpAgentsQuery, ListMcpAgentsQueryVariables>(
+      ListMcpAgentsDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const RevokeMcpAgentDocument = new TypedDocumentString(`
+    mutation RevokeMcpAgent($id: UUID!) {
+  revokeMcpAgent(id: $id)
+}
+    `);
+
+export const useRevokeMcpAgentMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    RevokeMcpAgentMutation,
+    TError,
+    RevokeMcpAgentMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    RevokeMcpAgentMutation,
+    TError,
+    RevokeMcpAgentMutationVariables,
+    TContext
+  >({
+    mutationKey: ["RevokeMcpAgent"],
+    mutationFn: (variables?: RevokeMcpAgentMutationVariables) =>
+      graphqlFetcher<RevokeMcpAgentMutation, RevokeMcpAgentMutationVariables>(
+        RevokeMcpAgentDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const MyModulesDocument = new TypedDocumentString(`
+    query MyModules($limit: Int, $offset: Int) {
+  myModules(pagination: {limit: $limit, offset: $offset}) {
+    id
+    name
+    capabilityWorld
+    language
+    sizeBytes
+    compiledAt
+    contentHash
+    capabilityDescription
+    importedInterfaces
+    config
+  }
+}
+    `);
+
+export const useMyModulesQuery = <TData = MyModulesQuery, TError = unknown>(
+  variables?: MyModulesQueryVariables,
+  options?: Omit<UseQueryOptions<MyModulesQuery, TError, TData>, "queryKey"> & {
+    queryKey?: UseQueryOptions<MyModulesQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<MyModulesQuery, TError, TData>({
+    queryKey:
+      variables === undefined ? ["MyModules"] : ["MyModules", variables],
+    queryFn: graphqlFetcher<MyModulesQuery, MyModulesQueryVariables>(
+      MyModulesDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const CreateModuleFromTemplateDocument = new TypedDocumentString(`
+    mutation CreateModuleFromTemplate($input: CreateModuleInput!) {
+  createModuleFromTemplate(input: $input) {
+    id
+    config
+  }
+}
+    `);
+
+export const useCreateModuleFromTemplateMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    CreateModuleFromTemplateMutation,
+    TError,
+    CreateModuleFromTemplateMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    CreateModuleFromTemplateMutation,
+    TError,
+    CreateModuleFromTemplateMutationVariables,
+    TContext
+  >({
+    mutationKey: ["CreateModuleFromTemplate"],
+    mutationFn: (variables?: CreateModuleFromTemplateMutationVariables) =>
+      graphqlFetcher<
+        CreateModuleFromTemplateMutation,
+        CreateModuleFromTemplateMutationVariables
+      >(CreateModuleFromTemplateDocument, variables)(),
+    ...options,
+  });
+};
+
+export const NodeTemplatesDocument = new TypedDocumentString(`
+    query NodeTemplates($category: String) {
+  nodeTemplates(category: $category) {
+    id
+    name
+    category
+    description
+    icon
+    allowedHosts
+  }
+}
+    `);
+
 export const useNodeTemplatesQuery = <
   TData = NodeTemplatesQuery,
   TError = unknown,
@@ -4546,8 +3584,8 @@ export const useNodeTemplatesQuery = <
   > & {
     queryKey?: UseQueryOptions<NodeTemplatesQuery, TError, TData>["queryKey"];
   },
-) =>
-  useQuery<NodeTemplatesQuery, TError, TData>({
+) => {
+  return useQuery<NodeTemplatesQuery, TError, TData>({
     queryKey:
       variables === undefined
         ? ["NodeTemplates"]
@@ -4558,145 +3596,578 @@ export const useNodeTemplatesQuery = <
     ),
     ...options,
   });
-
-// ---------------------------------------------------------------------------
-// createModuleFromTemplate mutation
-// ---------------------------------------------------------------------------
-export type CreateModuleFromTemplateMutationVariables = Exact<{
-  input: CreateModuleInput;
-}>;
-export type CreateModuleFromTemplateMutation = {
-  __typename?: "MutationRoot";
-  createModuleFromTemplate: {
-    __typename?: "WasmModule";
-    id: string;
-    config: string;
-  };
 };
-const CreateModuleFromTemplateDocument = `
-  mutation CreateModuleFromTemplate($input: CreateModuleInput!) {
-    createModuleFromTemplate(input: $input) {
-      id
-      config
-    }
-  }
-`;
-export const useCreateModuleFromTemplateMutation = <
-  TError = unknown,
-  TContext = unknown,
->(
-  options?: UseMutationOptions<
-    CreateModuleFromTemplateMutation,
-    TError,
-    CreateModuleFromTemplateMutationVariables,
-    TContext
-  >,
-) =>
-  useMutation<
-    CreateModuleFromTemplateMutation,
-    TError,
-    CreateModuleFromTemplateMutationVariables,
-    TContext
-  >({
-    mutationKey: ["CreateModuleFromTemplate"],
-    mutationFn: (variables: CreateModuleFromTemplateMutationVariables) =>
-      graphqlFetcher<
-        CreateModuleFromTemplateMutation,
-        CreateModuleFromTemplateMutationVariables
-      >(CreateModuleFromTemplateDocument, variables)(),
-    ...options,
-  });
 
-// ---------------------------------------------------------------------------
-// getAllWorkflowStats query
-// ---------------------------------------------------------------------------
-export type GetAllWorkflowStatsQueryVariables = Exact<{
-  days?: InputMaybe<Scalars["Int"]["input"]>;
-}>;
-export type GetAllWorkflowStatsQuery = {
-  __typename?: "QueryRoot";
-  getAllWorkflowStats: Array<{
-    __typename?: "WorkflowStats";
-    id: string;
-    name: string;
-    total: number;
-    succeeded: number;
-    failed: number;
-    avgDurationSecs?: number | null;
-  }>;
-};
-const GetAllWorkflowStatsDocument = `
-  query GetAllWorkflowStats($days: Int) {
-    getAllWorkflowStats(days: $days) {
-      id
-      name
-      total
-      succeeded
-      failed
-      avgDurationSecs
-    }
+export const GetNodeTemplatesDocument = new TypedDocumentString(`
+    query GetNodeTemplates($category: String) {
+  nodeTemplates(category: $category) {
+    id
+    name
+    category
+    description
+    configSchema
+    icon
+    allowedHosts
   }
-`;
-export const useGetAllWorkflowStatsQuery = <
-  TData = GetAllWorkflowStatsQuery,
+}
+    `);
+
+export const useGetNodeTemplatesQuery = <
+  TData = GetNodeTemplatesQuery,
   TError = unknown,
 >(
-  variables?: GetAllWorkflowStatsQueryVariables,
+  variables?: GetNodeTemplatesQueryVariables,
   options?: Omit<
-    UseQueryOptions<GetAllWorkflowStatsQuery, TError, TData>,
+    UseQueryOptions<GetNodeTemplatesQuery, TError, TData>,
     "queryKey"
   > & {
     queryKey?: UseQueryOptions<
-      GetAllWorkflowStatsQuery,
+      GetNodeTemplatesQuery,
       TError,
       TData
     >["queryKey"];
   },
-) =>
-  useQuery<GetAllWorkflowStatsQuery, TError, TData>({
+) => {
+  return useQuery<GetNodeTemplatesQuery, TError, TData>({
     queryKey:
       variables === undefined
-        ? ["GetAllWorkflowStats"]
-        : ["GetAllWorkflowStats", variables],
+        ? ["GetNodeTemplates"]
+        : ["GetNodeTemplates", variables],
     queryFn: graphqlFetcher<
-      GetAllWorkflowStatsQuery,
-      GetAllWorkflowStatsQueryVariables
-    >(GetAllWorkflowStatsDocument, variables),
+      GetNodeTemplatesQuery,
+      GetNodeTemplatesQueryVariables
+    >(GetNodeTemplatesDocument, variables),
     ...options,
   });
-
-// ---------------------------------------------------------------------------
-// getVersionDiffSummary query
-// ---------------------------------------------------------------------------
-export type GetVersionDiffSummaryQueryVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-}>;
-export type GetVersionDiffSummaryQuery = {
-  __typename?: "QueryRoot";
-  getVersionDiffSummary: {
-    __typename?: "VersionDiffSummary";
-    hasPublishedVersion: boolean;
-    nodesAdded: number;
-    nodesChanged: number;
-    nodesRemoved: number;
-    edgesAdded: number;
-    edgesRemoved: number;
-    summary: string;
-  };
 };
-const GetVersionDiffSummaryDocument = `
-  query GetVersionDiffSummary($workflowId: UUID!) {
-    getVersionDiffSummary(workflowId: $workflowId) {
-      hasPublishedVersion
-      nodesAdded
-      nodesChanged
-      nodesRemoved
-      edgesAdded
-      edgesRemoved
-      summary
+
+export const AnalyzeRhaiDocument = new TypedDocumentString(`
+    query AnalyzeRhai($input: AnalyzeRhaiInput!) {
+  analyzeRhai(input: $input) {
+    success
+    errors {
+      line
+      column
+      endLine
+      endColumn
+      message
+      severity
     }
   }
-`;
+}
+    `);
+
+export const useAnalyzeRhaiQuery = <TData = AnalyzeRhaiQuery, TError = unknown>(
+  variables: AnalyzeRhaiQueryVariables,
+  options?: Omit<
+    UseQueryOptions<AnalyzeRhaiQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<AnalyzeRhaiQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<AnalyzeRhaiQuery, TError, TData>({
+    queryKey: ["AnalyzeRhai", variables],
+    queryFn: graphqlFetcher<AnalyzeRhaiQuery, AnalyzeRhaiQueryVariables>(
+      AnalyzeRhaiDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const TestRhaiExpressionDocument = new TypedDocumentString(`
+    query TestRhaiExpression($input: TestRhaiExpressionInput!) {
+  testRhaiExpression(input: $input) {
+    success
+    output
+    error
+  }
+}
+    `);
+
+export const useTestRhaiExpressionQuery = <
+  TData = TestRhaiExpressionQuery,
+  TError = unknown,
+>(
+  variables: TestRhaiExpressionQueryVariables,
+  options?: Omit<
+    UseQueryOptions<TestRhaiExpressionQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      TestRhaiExpressionQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<TestRhaiExpressionQuery, TError, TData>({
+    queryKey: ["TestRhaiExpression", variables],
+    queryFn: graphqlFetcher<
+      TestRhaiExpressionQuery,
+      TestRhaiExpressionQueryVariables
+    >(TestRhaiExpressionDocument, variables),
+    ...options,
+  });
+};
+
+export const MySchedulesDocument = new TypedDocumentString(`
+    query MySchedules {
+  mySchedules {
+    id
+    workflowId
+    cronExpression
+    timezone
+    isEnabled
+    lastTriggeredAt
+    nextTriggerAt
+    createdAt
+    updatedAt
+  }
+}
+    `);
+
+export const useMySchedulesQuery = <TData = MySchedulesQuery, TError = unknown>(
+  variables?: MySchedulesQueryVariables,
+  options?: Omit<
+    UseQueryOptions<MySchedulesQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<MySchedulesQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<MySchedulesQuery, TError, TData>({
+    queryKey:
+      variables === undefined ? ["MySchedules"] : ["MySchedules", variables],
+    queryFn: graphqlFetcher<MySchedulesQuery, MySchedulesQueryVariables>(
+      MySchedulesDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const CreateScheduleDocument = new TypedDocumentString(`
+    mutation CreateSchedule($workflowId: UUID!, $cronExpression: String!, $timezone: String) {
+  createSchedule(
+    workflowId: $workflowId
+    cronExpression: $cronExpression
+    timezone: $timezone
+  ) {
+    id
+    workflowId
+    cronExpression
+    timezone
+    isEnabled
+    nextTriggerAt
+    createdAt
+    updatedAt
+  }
+}
+    `);
+
+export const useCreateScheduleMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    CreateScheduleMutation,
+    TError,
+    CreateScheduleMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    CreateScheduleMutation,
+    TError,
+    CreateScheduleMutationVariables,
+    TContext
+  >({
+    mutationKey: ["CreateSchedule"],
+    mutationFn: (variables?: CreateScheduleMutationVariables) =>
+      graphqlFetcher<CreateScheduleMutation, CreateScheduleMutationVariables>(
+        CreateScheduleDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const UpdateScheduleDocument = new TypedDocumentString(`
+    mutation UpdateSchedule($workflowId: UUID!, $cronExpression: String, $timezone: String, $isEnabled: Boolean) {
+  updateSchedule(
+    workflowId: $workflowId
+    cronExpression: $cronExpression
+    timezone: $timezone
+    isEnabled: $isEnabled
+  ) {
+    id
+    workflowId
+    cronExpression
+    timezone
+    isEnabled
+    nextTriggerAt
+    updatedAt
+  }
+}
+    `);
+
+export const useUpdateScheduleMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    UpdateScheduleMutation,
+    TError,
+    UpdateScheduleMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    UpdateScheduleMutation,
+    TError,
+    UpdateScheduleMutationVariables,
+    TContext
+  >({
+    mutationKey: ["UpdateSchedule"],
+    mutationFn: (variables?: UpdateScheduleMutationVariables) =>
+      graphqlFetcher<UpdateScheduleMutation, UpdateScheduleMutationVariables>(
+        UpdateScheduleDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const DeleteScheduleDocument = new TypedDocumentString(`
+    mutation DeleteSchedule($workflowId: UUID!) {
+  deleteSchedule(workflowId: $workflowId)
+}
+    `);
+
+export const useDeleteScheduleMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    DeleteScheduleMutation,
+    TError,
+    DeleteScheduleMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    DeleteScheduleMutation,
+    TError,
+    DeleteScheduleMutationVariables,
+    TContext
+  >({
+    mutationKey: ["DeleteSchedule"],
+    mutationFn: (variables?: DeleteScheduleMutationVariables) =>
+      graphqlFetcher<DeleteScheduleMutation, DeleteScheduleMutationVariables>(
+        DeleteScheduleDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const SetConcurrencyLimitDocument = new TypedDocumentString(`
+    mutation SetConcurrencyLimit($workflowId: UUID!, $maxConcurrent: Int) {
+  setConcurrencyLimit(workflowId: $workflowId, maxConcurrent: $maxConcurrent)
+}
+    `);
+
+export const useSetConcurrencyLimitMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    SetConcurrencyLimitMutation,
+    TError,
+    SetConcurrencyLimitMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    SetConcurrencyLimitMutation,
+    TError,
+    SetConcurrencyLimitMutationVariables,
+    TContext
+  >({
+    mutationKey: ["SetConcurrencyLimit"],
+    mutationFn: (variables?: SetConcurrencyLimitMutationVariables) =>
+      graphqlFetcher<
+        SetConcurrencyLimitMutation,
+        SetConcurrencyLimitMutationVariables
+      >(SetConcurrencyLimitDocument, variables)(),
+    ...options,
+  });
+};
+
+export const DeleteWorkflowDocument = new TypedDocumentString(`
+    mutation DeleteWorkflow($id: UUID!) {
+  deleteWorkflow(id: $id)
+}
+    `);
+
+export const useDeleteWorkflowMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    DeleteWorkflowMutation,
+    TError,
+    DeleteWorkflowMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    DeleteWorkflowMutation,
+    TError,
+    DeleteWorkflowMutationVariables,
+    TContext
+  >({
+    mutationKey: ["DeleteWorkflow"],
+    mutationFn: (variables?: DeleteWorkflowMutationVariables) =>
+      graphqlFetcher<DeleteWorkflowMutation, DeleteWorkflowMutationVariables>(
+        DeleteWorkflowDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const TestWorkflowDocument = new TypedDocumentString(`
+    mutation TestWorkflow($workflowId: UUID!, $mockInputs: String) {
+  testWorkflow(workflowId: $workflowId, mockInputs: $mockInputs) {
+    executionId
+    status
+    durationMs
+    error
+    schemaWarnings
+    nodeTraces {
+      nodeId
+      status
+      input
+      output
+      error
+    }
+  }
+}
+    `);
+
+export const useTestWorkflowMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    TestWorkflowMutation,
+    TError,
+    TestWorkflowMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    TestWorkflowMutation,
+    TError,
+    TestWorkflowMutationVariables,
+    TContext
+  >({
+    mutationKey: ["TestWorkflow"],
+    mutationFn: (variables?: TestWorkflowMutationVariables) =>
+      graphqlFetcher<TestWorkflowMutation, TestWorkflowMutationVariables>(
+        TestWorkflowDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const ResumeWorkflowDocument = new TypedDocumentString(`
+    mutation ResumeWorkflow($executionId: UUID!) {
+  resumeWorkflow(executionId: $executionId)
+}
+    `);
+
+export const useResumeWorkflowMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    ResumeWorkflowMutation,
+    TError,
+    ResumeWorkflowMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    ResumeWorkflowMutation,
+    TError,
+    ResumeWorkflowMutationVariables,
+    TContext
+  >({
+    mutationKey: ["ResumeWorkflow"],
+    mutationFn: (variables?: ResumeWorkflowMutationVariables) =>
+      graphqlFetcher<ResumeWorkflowMutation, ResumeWorkflowMutationVariables>(
+        ResumeWorkflowDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const RetryExecutionDocument = new TypedDocumentString(`
+    mutation RetryExecution($executionId: UUID!) {
+  retryExecution(executionId: $executionId)
+}
+    `);
+
+export const useRetryExecutionMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    RetryExecutionMutation,
+    TError,
+    RetryExecutionMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    RetryExecutionMutation,
+    TError,
+    RetryExecutionMutationVariables,
+    TContext
+  >({
+    mutationKey: ["RetryExecution"],
+    mutationFn: (variables?: RetryExecutionMutationVariables) =>
+      graphqlFetcher<RetryExecutionMutation, RetryExecutionMutationVariables>(
+        RetryExecutionDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const WorkflowVersionsDocument = new TypedDocumentString(`
+    query WorkflowVersions($workflowId: UUID!, $limit: Int) {
+  workflowVersions(workflowId: $workflowId, limit: $limit) {
+    id
+    workflowId
+    versionNumber
+    description
+    publishedAt
+    publishedBy
+    isActive
+    createdAt
+  }
+}
+    `);
+
+export const useWorkflowVersionsQuery = <
+  TData = WorkflowVersionsQuery,
+  TError = unknown,
+>(
+  variables: WorkflowVersionsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<WorkflowVersionsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      WorkflowVersionsQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<WorkflowVersionsQuery, TError, TData>({
+    queryKey: ["WorkflowVersions", variables],
+    queryFn: graphqlFetcher<
+      WorkflowVersionsQuery,
+      WorkflowVersionsQueryVariables
+    >(WorkflowVersionsDocument, variables),
+    ...options,
+  });
+};
+
+export const PublishWorkflowVersionDocument = new TypedDocumentString(`
+    mutation PublishWorkflowVersion($workflowId: UUID!, $description: String) {
+  publishWorkflowVersion(workflowId: $workflowId, description: $description) {
+    id
+    workflowId
+    versionNumber
+    description
+    publishedAt
+    publishedBy
+    isActive
+    createdAt
+  }
+}
+    `);
+
+export const usePublishWorkflowVersionMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    PublishWorkflowVersionMutation,
+    TError,
+    PublishWorkflowVersionMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    PublishWorkflowVersionMutation,
+    TError,
+    PublishWorkflowVersionMutationVariables,
+    TContext
+  >({
+    mutationKey: ["PublishWorkflowVersion"],
+    mutationFn: (variables?: PublishWorkflowVersionMutationVariables) =>
+      graphqlFetcher<
+        PublishWorkflowVersionMutation,
+        PublishWorkflowVersionMutationVariables
+      >(PublishWorkflowVersionDocument, variables)(),
+    ...options,
+  });
+};
+
+export const RollbackWorkflowVersionDocument = new TypedDocumentString(`
+    mutation RollbackWorkflowVersion($workflowId: UUID!, $versionId: UUID!) {
+  rollbackWorkflowVersion(workflowId: $workflowId, versionId: $versionId) {
+    id
+    workflowId
+    versionNumber
+    description
+    publishedAt
+    isActive
+    createdAt
+  }
+}
+    `);
+
+export const useRollbackWorkflowVersionMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    RollbackWorkflowVersionMutation,
+    TError,
+    RollbackWorkflowVersionMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    RollbackWorkflowVersionMutation,
+    TError,
+    RollbackWorkflowVersionMutationVariables,
+    TContext
+  >({
+    mutationKey: ["RollbackWorkflowVersion"],
+    mutationFn: (variables?: RollbackWorkflowVersionMutationVariables) =>
+      graphqlFetcher<
+        RollbackWorkflowVersionMutation,
+        RollbackWorkflowVersionMutationVariables
+      >(RollbackWorkflowVersionDocument, variables)(),
+    ...options,
+  });
+};
+
+export const GetVersionDiffSummaryDocument = new TypedDocumentString(`
+    query GetVersionDiffSummary($workflowId: UUID!) {
+  getVersionDiffSummary(workflowId: $workflowId) {
+    hasPublishedVersion
+    nodesAdded
+    nodesChanged
+    nodesRemoved
+    edgesAdded
+    edgesRemoved
+    summary
+  }
+}
+    `);
+
 export const useGetVersionDiffSummaryQuery = <
   TData = GetVersionDiffSummaryQuery,
   TError = unknown,
@@ -4712,8 +4183,8 @@ export const useGetVersionDiffSummaryQuery = <
       TData
     >["queryKey"];
   },
-) =>
-  useQuery<GetVersionDiffSummaryQuery, TError, TData>({
+) => {
+  return useQuery<GetVersionDiffSummaryQuery, TError, TData>({
     queryKey: ["GetVersionDiffSummary", variables],
     queryFn: graphqlFetcher<
       GetVersionDiffSummaryQuery,
@@ -4721,33 +4192,19 @@ export const useGetVersionDiffSummaryQuery = <
     >(GetVersionDiffSummaryDocument, variables),
     ...options,
   });
-
-// ---------------------------------------------------------------------------
-// getWorkflowChangelog query
-// ---------------------------------------------------------------------------
-export type GetWorkflowChangelogQueryVariables = Exact<{
-  workflowId: Scalars["UUID"]["input"];
-}>;
-export type GetWorkflowChangelogQuery = {
-  __typename?: "QueryRoot";
-  getWorkflowChangelog: Array<{
-    __typename?: "ChangelogEntry";
-    versionNumber: number;
-    summary: string;
-    description?: string | null;
-    publishedAt: string;
-  }>;
 };
-const GetWorkflowChangelogDocument = `
-  query GetWorkflowChangelog($workflowId: UUID!) {
-    getWorkflowChangelog(workflowId: $workflowId) {
-      versionNumber
-      summary
-      description
-      publishedAt
-    }
+
+export const GetWorkflowChangelogDocument = new TypedDocumentString(`
+    query GetWorkflowChangelog($workflowId: UUID!) {
+  getWorkflowChangelog(workflowId: $workflowId) {
+    versionNumber
+    summary
+    description
+    publishedAt
   }
-`;
+}
+    `);
+
 export const useGetWorkflowChangelogQuery = <
   TData = GetWorkflowChangelogQuery,
   TError = unknown,
@@ -4763,8 +4220,8 @@ export const useGetWorkflowChangelogQuery = <
       TData
     >["queryKey"];
   },
-) =>
-  useQuery<GetWorkflowChangelogQuery, TError, TData>({
+) => {
+  return useQuery<GetWorkflowChangelogQuery, TError, TData>({
     queryKey: ["GetWorkflowChangelog", variables],
     queryFn: graphqlFetcher<
       GetWorkflowChangelogQuery,
@@ -4772,62 +4229,457 @@ export const useGetWorkflowChangelogQuery = <
     >(GetWorkflowChangelogDocument, variables),
     ...options,
   });
-
-// ---------------------------------------------------------------------------
-// myModules query — list the current user's installed WASM modules
-// ---------------------------------------------------------------------------
-
-export type MyModulesQueryVariables = Exact<{
-  limit?: InputMaybe<Scalars["Int"]["input"]>;
-  offset?: InputMaybe<Scalars["Int"]["input"]>;
-}>;
-
-export type MyModulesQuery = {
-  __typename?: "QueryRoot";
-  myModules: Array<{
-    __typename?: "WasmModule";
-    id: any;
-    name: string;
-    capabilityWorld?: string | null;
-    language?: string | null;
-    sizeBytes: number;
-    compiledAt: string;
-    contentHash: string;
-    capabilityDescription?: string | null;
-    importedInterfaces?: Array<string> | null;
-    config: string;
-  }>;
 };
 
-export const MyModulesDocument = `
-    query MyModules($limit: Int, $offset: Int) {
-  myModules(pagination: {limit: $limit, offset: $offset}) {
+export const WebhookTriggersDocument = new TypedDocumentString(`
+    query WebhookTriggers {
+  webhookTriggers {
     id
     name
-    capabilityWorld
-    language
-    sizeBytes
-    compiledAt
-    contentHash
-    capabilityDescription
-    importedInterfaces
-    config
+    webhookUrl
+    enabled
+    triggerCount
+    successCount
+    errorCount
+    maxRequestsPerMinute
+    lastTriggeredAt
+    verificationToken
   }
 }
-    `;
+    `);
 
-export const useMyModulesQuery = <TData = MyModulesQuery, TError = unknown>(
-  variables?: MyModulesQueryVariables,
-  options?: Omit<UseQueryOptions<MyModulesQuery, TError, TData>, "queryKey"> & {
-    queryKey?: UseQueryOptions<MyModulesQuery, TError, TData>["queryKey"];
+export const useWebhookTriggersQuery = <
+  TData = WebhookTriggersQuery,
+  TError = unknown,
+>(
+  variables?: WebhookTriggersQueryVariables,
+  options?: Omit<
+    UseQueryOptions<WebhookTriggersQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<WebhookTriggersQuery, TError, TData>["queryKey"];
   },
-) =>
-  useQuery<MyModulesQuery, TError, TData>({
+) => {
+  return useQuery<WebhookTriggersQuery, TError, TData>({
     queryKey:
-      variables === undefined ? ["MyModules"] : ["MyModules", variables],
-    queryFn: graphqlFetcher<MyModulesQuery, MyModulesQueryVariables>(
-      MyModulesDocument,
+      variables === undefined
+        ? ["WebhookTriggers"]
+        : ["WebhookTriggers", variables],
+    queryFn: graphqlFetcher<
+      WebhookTriggersQuery,
+      WebhookTriggersQueryVariables
+    >(WebhookTriggersDocument, variables),
+    ...options,
+  });
+};
+
+export const CreateWebhookTriggerDocument = new TypedDocumentString(`
+    mutation CreateWebhookTrigger($input: CreateWebhookTriggerInput!) {
+  createWebhookTrigger(input: $input) {
+    id
+    name
+    webhookUrl
+    verificationToken
+  }
+}
+    `);
+
+export const useCreateWebhookTriggerMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    CreateWebhookTriggerMutation,
+    TError,
+    CreateWebhookTriggerMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    CreateWebhookTriggerMutation,
+    TError,
+    CreateWebhookTriggerMutationVariables,
+    TContext
+  >({
+    mutationKey: ["CreateWebhookTrigger"],
+    mutationFn: (variables?: CreateWebhookTriggerMutationVariables) =>
+      graphqlFetcher<
+        CreateWebhookTriggerMutation,
+        CreateWebhookTriggerMutationVariables
+      >(CreateWebhookTriggerDocument, variables)(),
+    ...options,
+  });
+};
+
+export const WorkflowExecutionHistoryDocument = new TypedDocumentString(`
+    query WorkflowExecutionHistory($workflowId: UUID!, $limit: Int, $offset: Int) {
+  workflowExecutionHistory(
+    workflowId: $workflowId
+    pagination: {limit: $limit, offset: $offset}
+  ) {
+    id
+    workflowId
+    status
+    startedAt
+    completedAt
+    triggerType
+    actorId
+    errorMessage
+    createdAt
+    durationMs
+  }
+}
+    `);
+
+export const useWorkflowExecutionHistoryQuery = <
+  TData = WorkflowExecutionHistoryQuery,
+  TError = unknown,
+>(
+  variables: WorkflowExecutionHistoryQueryVariables,
+  options?: Omit<
+    UseQueryOptions<WorkflowExecutionHistoryQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      WorkflowExecutionHistoryQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<WorkflowExecutionHistoryQuery, TError, TData>({
+    queryKey: ["WorkflowExecutionHistory", variables],
+    queryFn: graphqlFetcher<
+      WorkflowExecutionHistoryQuery,
+      WorkflowExecutionHistoryQueryVariables
+    >(WorkflowExecutionHistoryDocument, variables),
+    ...options,
+  });
+};
+
+export const GetWorkflowExecutionHistoryDocument = new TypedDocumentString(`
+    query GetWorkflowExecutionHistory($workflowId: UUID!, $pagination: PaginationInput) {
+  workflowExecutionHistory(workflowId: $workflowId, pagination: $pagination) {
+    id
+    status
+    startedAt
+    completedAt
+    durationMs
+    errorMessage
+    outputData
+    triggerType
+    actorId
+  }
+}
+    `);
+
+export const useGetWorkflowExecutionHistoryQuery = <
+  TData = GetWorkflowExecutionHistoryQuery,
+  TError = unknown,
+>(
+  variables: GetWorkflowExecutionHistoryQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetWorkflowExecutionHistoryQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetWorkflowExecutionHistoryQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetWorkflowExecutionHistoryQuery, TError, TData>({
+    queryKey: ["GetWorkflowExecutionHistory", variables],
+    queryFn: graphqlFetcher<
+      GetWorkflowExecutionHistoryQuery,
+      GetWorkflowExecutionHistoryQueryVariables
+    >(GetWorkflowExecutionHistoryDocument, variables),
+    ...options,
+  });
+};
+
+export const ListWorkflowNamesDocument = new TypedDocumentString(`
+    query ListWorkflowNames {
+  workflows {
+    id
+    name
+  }
+}
+    `);
+
+export const useListWorkflowNamesQuery = <
+  TData = ListWorkflowNamesQuery,
+  TError = unknown,
+>(
+  variables?: ListWorkflowNamesQueryVariables,
+  options?: Omit<
+    UseQueryOptions<ListWorkflowNamesQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      ListWorkflowNamesQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<ListWorkflowNamesQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["ListWorkflowNames"]
+        : ["ListWorkflowNames", variables],
+    queryFn: graphqlFetcher<
+      ListWorkflowNamesQuery,
+      ListWorkflowNamesQueryVariables
+    >(ListWorkflowNamesDocument, variables),
+    ...options,
+  });
+};
+
+export const TriggerWorkflowAsActorDocument = new TypedDocumentString(`
+    mutation TriggerWorkflowAsActor($workflowId: UUID!, $actorId: UUID) {
+  triggerWorkflow(workflowId: $workflowId, actorId: $actorId) {
+    id
+  }
+}
+    `);
+
+export const useTriggerWorkflowAsActorMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    TriggerWorkflowAsActorMutation,
+    TError,
+    TriggerWorkflowAsActorMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    TriggerWorkflowAsActorMutation,
+    TError,
+    TriggerWorkflowAsActorMutationVariables,
+    TContext
+  >({
+    mutationKey: ["TriggerWorkflowAsActor"],
+    mutationFn: (variables?: TriggerWorkflowAsActorMutationVariables) =>
+      graphqlFetcher<
+        TriggerWorkflowAsActorMutation,
+        TriggerWorkflowAsActorMutationVariables
+      >(TriggerWorkflowAsActorDocument, variables)(),
+    ...options,
+  });
+};
+
+export const GetWorkflowLoaderDocument = new TypedDocumentString(`
+    query GetWorkflowLoader($id: UUID!) {
+  workflow(id: $id) {
+    id
+    name
+    graphJson
+    actorId
+    maxConcurrentExecutions
+    intent
+  }
+}
+    `);
+
+export const useGetWorkflowLoaderQuery = <
+  TData = GetWorkflowLoaderQuery,
+  TError = unknown,
+>(
+  variables: GetWorkflowLoaderQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetWorkflowLoaderQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetWorkflowLoaderQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetWorkflowLoaderQuery, TError, TData>({
+    queryKey: ["GetWorkflowLoader", variables],
+    queryFn: graphqlFetcher<
+      GetWorkflowLoaderQuery,
+      GetWorkflowLoaderQueryVariables
+    >(GetWorkflowLoaderDocument, variables),
+    ...options,
+  });
+};
+
+export const GetModulesLoaderDocument = new TypedDocumentString(`
+    query GetModulesLoader($ids: [UUID!]!) {
+  wasmModules(ids: $ids) {
+    id
+    name
+    config
+    sourceCode
+    capabilityWorld
+    importedInterfaces
+  }
+}
+    `);
+
+export const useGetModulesLoaderQuery = <
+  TData = GetModulesLoaderQuery,
+  TError = unknown,
+>(
+  variables: GetModulesLoaderQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetModulesLoaderQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetModulesLoaderQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetModulesLoaderQuery, TError, TData>({
+    queryKey: ["GetModulesLoader", variables],
+    queryFn: graphqlFetcher<
+      GetModulesLoaderQuery,
+      GetModulesLoaderQueryVariables
+    >(GetModulesLoaderDocument, variables),
+    ...options,
+  });
+};
+
+export const ListActorsDocument = new TypedDocumentString(`
+    query ListActors {
+  actors {
+    id
+    name
+    status
+    executionCount
+  }
+}
+    `);
+
+export const useListActorsQuery = <TData = ListActorsQuery, TError = unknown>(
+  variables?: ListActorsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<ListActorsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<ListActorsQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<ListActorsQuery, TError, TData>({
+    queryKey:
+      variables === undefined ? ["ListActors"] : ["ListActors", variables],
+    queryFn: graphqlFetcher<ListActorsQuery, ListActorsQueryVariables>(
+      ListActorsDocument,
       variables,
     ),
     ...options,
   });
+};
+
+export const WorkflowsDocument = new TypedDocumentString(`
+    query Workflows {
+  workflows {
+    id
+    name
+    graphJson
+    actorId
+    maxConcurrentExecutions
+    intent
+  }
+}
+    `);
+
+export const useWorkflowsQuery = <TData = WorkflowsQuery, TError = unknown>(
+  variables?: WorkflowsQueryVariables,
+  options?: Omit<UseQueryOptions<WorkflowsQuery, TError, TData>, "queryKey"> & {
+    queryKey?: UseQueryOptions<WorkflowsQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<WorkflowsQuery, TError, TData>({
+    queryKey:
+      variables === undefined ? ["Workflows"] : ["Workflows", variables],
+    queryFn: graphqlFetcher<WorkflowsQuery, WorkflowsQueryVariables>(
+      WorkflowsDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const TriggerWorkflowDocument = new TypedDocumentString(`
+    mutation TriggerWorkflow($workflowId: UUID!) {
+  triggerWorkflow(workflowId: $workflowId) {
+    id
+    status
+  }
+}
+    `);
+
+export const useTriggerWorkflowMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    TriggerWorkflowMutation,
+    TError,
+    TriggerWorkflowMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    TriggerWorkflowMutation,
+    TError,
+    TriggerWorkflowMutationVariables,
+    TContext
+  >({
+    mutationKey: ["TriggerWorkflow"],
+    mutationFn: (variables?: TriggerWorkflowMutationVariables) =>
+      graphqlFetcher<TriggerWorkflowMutation, TriggerWorkflowMutationVariables>(
+        TriggerWorkflowDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const LatestWorkflowExecutionsDocument = new TypedDocumentString(`
+    query LatestWorkflowExecutions($workflowIds: [UUID!]!) {
+  latestWorkflowExecutions(workflowIds: $workflowIds) {
+    workflowId
+    status
+    startedAt
+    errorMessage
+  }
+}
+    `);
+
+export const useLatestWorkflowExecutionsQuery = <
+  TData = LatestWorkflowExecutionsQuery,
+  TError = unknown,
+>(
+  variables: LatestWorkflowExecutionsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<LatestWorkflowExecutionsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      LatestWorkflowExecutionsQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<LatestWorkflowExecutionsQuery, TError, TData>({
+    queryKey: ["LatestWorkflowExecutions", variables],
+    queryFn: graphqlFetcher<
+      LatestWorkflowExecutionsQuery,
+      LatestWorkflowExecutionsQueryVariables
+    >(LatestWorkflowExecutionsDocument, variables),
+    ...options,
+  });
+};

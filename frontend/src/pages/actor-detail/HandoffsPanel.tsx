@@ -1,7 +1,7 @@
 import React, { useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { Bot, GitBranch, Shuffle } from "lucide-react";
-import { type ActorActionLogEntry } from "@/lib/graphqlClient";
+import { type ActorActionLogEntry } from "@/lib/graphqlApi";
 import { LocalEmptyState, relativeTime } from "./shared";
 
 /** Extract partner actor name + ID from a handoff summary string. */

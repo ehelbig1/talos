@@ -14,7 +14,7 @@ import {
   type ActorDetails,
   type ActorActionLogEntry,
   type ActorWorkflowItem,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
 
 import { statusColors, TabBar, type Tab } from "./actor-detail/shared";
 import { SummaryPanel } from "./actor-detail/SummaryPanel";

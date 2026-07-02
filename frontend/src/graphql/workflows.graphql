@@ -1,0 +1,164 @@
+# Operations previously hand-maintained inside src/generated/graphql.ts.
+# They now live here as codegen source documents: `npm run codegen` regenerates
+# the typed react-query hooks + Document constants from these definitions.
+
+mutation SetConcurrencyLimit($workflowId: UUID!, $maxConcurrent: Int) {
+  setConcurrencyLimit(workflowId: $workflowId, maxConcurrent: $maxConcurrent)
+}
+
+mutation DeleteWorkflow($id: UUID!) {
+  deleteWorkflow(id: $id)
+}
+
+mutation TestWorkflow($workflowId: UUID!, $mockInputs: String) {
+  testWorkflow(workflowId: $workflowId, mockInputs: $mockInputs) {
+    executionId
+    status
+    durationMs
+    error
+    schemaWarnings
+    nodeTraces {
+      nodeId
+      status
+      input
+      output
+      error
+    }
+  }
+}
+
+mutation ResumeWorkflow($executionId: UUID!) {
+  resumeWorkflow(executionId: $executionId)
+}
+
+mutation RetryExecution($executionId: UUID!) {
+  retryExecution(executionId: $executionId)
+}
+
+query WorkflowVersions($workflowId: UUID!, $limit: Int) {
+  workflowVersions(workflowId: $workflowId, limit: $limit) {
+    id
+    workflowId
+    versionNumber
+    description
+    publishedAt
+    publishedBy
+    isActive
+    createdAt
+  }
+}
+
+mutation PublishWorkflowVersion($workflowId: UUID!, $description: String) {
+  publishWorkflowVersion(workflowId: $workflowId, description: $description) {
+    id
+    workflowId
+    versionNumber
+    description
+    publishedAt
+    publishedBy
+    isActive
+    createdAt
+  }
+}
+
+mutation RollbackWorkflowVersion($workflowId: UUID!, $versionId: UUID!) {
+  rollbackWorkflowVersion(workflowId: $workflowId, versionId: $versionId) {
+    id
+    workflowId
+    versionNumber
+    description
+    publishedAt
+    isActive
+    createdAt
+  }
+}
+
+query GetVersionDiffSummary($workflowId: UUID!) {
+  getVersionDiffSummary(workflowId: $workflowId) {
+    hasPublishedVersion
+    nodesAdded
+    nodesChanged
+    nodesRemoved
+    edgesAdded
+    edgesRemoved
+    summary
+  }
+}
+
+query GetWorkflowChangelog($workflowId: UUID!) {
+  getWorkflowChangelog(workflowId: $workflowId) {
+    versionNumber
+    summary
+    description
+    publishedAt
+  }
+}
+
+query WebhookTriggers {
+  webhookTriggers {
+    id
+    name
+    webhookUrl
+    enabled
+    triggerCount
+    successCount
+    errorCount
+    maxRequestsPerMinute
+    lastTriggeredAt
+    verificationToken
+  }
+}
+
+mutation CreateWebhookTrigger($input: CreateWebhookTriggerInput!) {
+  createWebhookTrigger(input: $input) {
+    id
+    name
+    webhookUrl
+    verificationToken
+  }
+}
+
+query WorkflowExecutionHistory($workflowId: UUID!, $limit: Int, $offset: Int) {
+  workflowExecutionHistory(workflowId: $workflowId, pagination: {limit: $limit, offset: $offset}) {
+    id
+    workflowId
+    status
+    startedAt
+    completedAt
+    triggerType
+    actorId
+    errorMessage
+    createdAt
+    durationMs
+  }
+}
+
+query GetWorkflowExecutionHistory(
+  $workflowId: UUID!
+  $pagination: PaginationInput
+) {
+  workflowExecutionHistory(workflowId: $workflowId, pagination: $pagination) {
+    id
+    status
+    startedAt
+    completedAt
+    durationMs
+    errorMessage
+    outputData
+    triggerType
+    actorId
+  }
+}
+
+query ListWorkflowNames {
+  workflows {
+    id
+    name
+  }
+}
+
+mutation TriggerWorkflowAsActor($workflowId: UUID!, $actorId: UUID) {
+  triggerWorkflow(workflowId: $workflowId, actorId: $actorId) {
+    id
+  }
+}

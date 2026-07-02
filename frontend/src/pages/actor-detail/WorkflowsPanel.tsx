@@ -6,10 +6,10 @@ import { Sparkles, Play, RefreshCw, Shuffle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
-  graphqlRequest,
   getActorWorkflows,
+  triggerWorkflowAsActor,
   type ActorWorkflowItem,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
 import { isAiWorkflow } from "@/lib/capabilityConfig";
 import { SkeletonTable } from "@/components/ui";
 import { workflowStatusColor, LocalEmptyState, relativeTime } from "./shared";
@@ -26,15 +26,8 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
   const handleTrigger = async (workflowId: string) => {
     setTriggeringId(workflowId);
     try {
-      const data = await graphqlRequest<{ triggerWorkflow: { id: string } }>(
-        `mutation TriggerAsActor($workflowId: UUID!, $actorId: UUID) {
-           triggerWorkflow(workflowId: $workflowId, actorId: $actorId) { id }
-         }`,
-        { workflowId, actorId },
-      );
-      toast.success(
-        `Execution started: ${data.triggerWorkflow.id.slice(0, 8)}…`,
-      );
+      const execution = await triggerWorkflowAsActor(workflowId, actorId);
+      toast.success(`Execution started: ${execution.id.slice(0, 8)}…`);
     } catch (e) {
       toast.error(
         sanitizeErrorMessage(e instanceof Error ? e.message : String(e)),

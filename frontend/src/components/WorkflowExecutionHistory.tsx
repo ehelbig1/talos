@@ -1,11 +1,11 @@
 import React, { useState, useCallback, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { subscribeWorkflowExecutions } from "@/lib/graphqlClient";
 import {
   getWorkflowExecutionHistory,
   listActors,
-  WorkflowExecution,
-  subscribeWorkflowExecutions,
-} from "../lib/graphqlClient";
+  type WorkflowExecution,
+} from "@/lib/graphqlApi";
 import { useEffect } from "react";
 import {
   useRetryExecutionMutation,

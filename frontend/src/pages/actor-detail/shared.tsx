@@ -19,7 +19,10 @@ import {
 import { cn } from "@/lib/utils";
 import { getCapabilityConfig } from "@/lib/capabilityConfig";
 import { relativeTime } from "@/lib/formatTime";
-import { graphqlRequest, type ActorActionLogEntry } from "@/lib/graphqlClient";
+import {
+  getWorkflowExecutionHistory,
+  type ActorActionLogEntry,
+} from "@/lib/graphqlApi";
 
 // Re-export so callers can import relativeTime from one place within this feature.
 export { relativeTime };
@@ -305,25 +308,8 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
     if (output !== null || !entry.workflowId || !entry.executionId) return;
     setLoadingOutput(true);
     try {
-      const res = await graphqlRequest<{
-        workflowExecutionHistory: Array<{
-          id: string;
-          status: string;
-          outputData: string | null;
-          errorMessage: string | null;
-          durationMs: number | null;
-        }>;
-      }>(
-        `query ($wfId: UUID!, $p: PaginationInput) {
-          workflowExecutionHistory(workflowId: $wfId, pagination: $p) {
-            id status outputData errorMessage durationMs
-          }
-        }`,
-        { wfId: entry.workflowId, p: { limit: 100 } },
-      );
-      const match = res.workflowExecutionHistory.find(
-        (e) => e.id === entry.executionId,
-      );
+      const history = await getWorkflowExecutionHistory(entry.workflowId, 100);
+      const match = history.find((e) => e.id === entry.executionId);
       if (match) {
         const text =
           match.outputData != null

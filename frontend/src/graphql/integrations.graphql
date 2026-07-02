@@ -1,0 +1,29 @@
+# Service integration + MCP agent operations. Source documents for
+# graphql-codegen — `npm run codegen` regenerates hooks + Document constants.
+
+query ListServiceIntegrations {
+  serviceIntegrations {
+    id
+    service
+    accountIdentifier
+    connectedAt
+    status
+  }
+}
+
+mutation DisconnectServiceIntegration($id: UUID!, $service: IntegrationService!) {
+  disconnectServiceIntegration(id: $id, service: $service)
+}
+
+query ListMcpAgents {
+  mcpAgents {
+    id
+    name
+    createdAt
+    lastUsedAt
+  }
+}
+
+mutation RevokeMcpAgent($id: UUID!) {
+  revokeMcpAgent(id: $id)
+}

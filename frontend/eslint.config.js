@@ -95,6 +95,46 @@ export default [
         },
     },
 
+    // GraphQL data-layer boundary: components and pages must not talk to the
+    // transport directly. Add the operation to src/graphql/*.graphql (or a
+    // component-local gql`...` tag), run `npm run codegen`, and use the
+    // generated react-query hook from @/generated/graphql — or, for genuinely
+    // imperative call sites, a typed wrapper in @/lib/graphqlApi.
+    {
+        files: ["src/components/**/*.{ts,tsx}", "src/pages/**/*.{ts,tsx}"],
+        ignores: ["**/*.test.ts", "**/*.test.tsx"],
+        rules: {
+            "no-restricted-imports": [
+                "error",
+                {
+                    paths: [
+                        {
+                            name: "@/lib/graphqlClient",
+                            importNames: ["graphqlRequest", "graphqlFetcher"],
+                            message:
+                                "Don't call the GraphQL transport from components/pages. Use the generated react-query hooks from '@/generated/graphql' (add the operation to src/graphql/*.graphql and run `npm run codegen`), or a typed wrapper in '@/lib/graphqlApi'.",
+                        },
+                    ],
+                },
+            ],
+        },
+    },
+    // Grandfathered violations — legacy direct-transport call sites that
+    // predate the rule. Migrate to generated hooks / graphqlApi wrappers when
+    // touching these files, then remove them from this list. Do NOT add files.
+    {
+        files: [
+            "src/components/CreateModuleDialog.tsx",
+            "src/components/builder/ModuleBuilder.tsx",
+            "src/components/settings/CapabilityCeilingManager.tsx",
+            "src/components/settings/OAuthManager.tsx",
+            "src/components/templates/TemplateLibrary.tsx",
+        ],
+        rules: {
+            "no-restricted-imports": "off",
+        },
+    },
+
     // Disable rules that conflict with Prettier
     prettierConfig,
 ];

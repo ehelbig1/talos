@@ -22,7 +22,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
-  WorkflowExecutionItem,
+  WorkflowExecution,
   useWorkflowExecutionHistoryQuery,
   useRetryExecutionMutation,
   useResumeWorkflowMutation,
@@ -238,7 +238,7 @@ export default function WorkflowExecutionHistory({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/[0.04]">
-                  {executions.map((exec: WorkflowExecutionItem) => {
+                  {executions.map((exec: WorkflowExecution) => {
                     const style = statusStyle(exec.status);
                     const statusLower = exec.status.toLowerCase();
                     const isErrorExpanded = expandedErrors.has(exec.id);

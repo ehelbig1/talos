@@ -1,4 +1,16 @@
-schema: "http://127.0.0.1:8000/graphql"
+# Checked-in SDL snapshot of the controller's GraphQL schema so codegen runs
+# offline (no dev server needed). Refresh it after backend schema changes by
+# either:
+#   - dumping from the Rust schema: build a tiny bin that prints
+#     `Schema::build(QueryRoot::default(), MutationRoot::default(), SubscriptionRoot).finish().sdl()`
+#     from the `talos-api` crate, or
+#   - pointing this at a running dev controller instead:
+#     schema: "http://127.0.0.1:8000/graphql"
+schema: "schema.graphql"
+# Operation documents are discovered from:
+#   - src/graphql/*.graphql        (canonical home for shared operations)
+#   - gql`...` tagged templates    (component-local operations)
+#   - /* GraphQL */ magic comments
 documents: "src/**/*.{ts,tsx,graphql}"
 hooks:
   afterOneFileWrite:
@@ -13,9 +25,29 @@ config:
     magicComments:
       - "graphql"
 generates:
-  src/generated/graphql.ts:
+  # Schema-level types (object types, enums, inputs) — imported by components
+  # that need e.g. ApiKeyInfo or OrgMemberObj. Re-exported from graphql.ts so
+  # `@/generated/graphql` stays the single import surface.
+  src/generated/schema.ts:
     plugins:
       - "typescript"
+    config:
+      scalars:
+        UUID:
+          input: string
+          output: string
+        JSON:
+          input: unknown
+          output: unknown
+  # Operation types + typed react-query hooks + Document constants.
+  # NOTE: typescript-operations v6 emits its own (resolved) input/enum types,
+  # so the `typescript` plugin must NOT be combined into this file — that
+  # duplicates every input type. Locally declared names shadow the
+  # `export * from "./schema"` re-export, which is the intended precedence.
+  src/generated/graphql.ts:
+    plugins:
+      - add:
+          content: 'export * from "./schema";'
       - "typescript-operations"
       - "typescript-react-query"
     config:
@@ -29,4 +61,3 @@ generates:
         JSON:
           input: unknown
           output: unknown
-

@@ -1,15 +1,16 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+// Data layer: generated react-query hooks (one per operation in
+// src/graphql/*.graphql) — no direct graphqlRequest calls in pages.
 import {
-  listActors,
-  getWorkflowStats,
-  getMySchedules,
-  getSecrets,
-  graphqlRequest,
-  type WorkflowStats,
-  type WorkflowSchedule,
-} from "@/lib/graphqlClient";
+  useGetAllWorkflowStatsQuery,
+  useGetSecretsQuery,
+  useListActorSummariesQuery,
+  useListWorkflowNamesQuery,
+  useMySchedulesQuery,
+  type GetAllWorkflowStatsQuery,
+  type MySchedulesQuery,
+} from "@/generated/graphql";
 import { cn } from "@/lib/utils";
 import { relativeTime, futureTime, formatDurationSecs } from "@/lib/formatTime";
 import {
@@ -33,7 +34,10 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function successRate(stat: WorkflowStats): number {
+type WorkflowStat = GetAllWorkflowStatsQuery["getAllWorkflowStats"][number];
+type ScheduleItem = MySchedulesQuery["mySchedules"][number];
+
+function successRate(stat: WorkflowStat): number {
   if (stat.total === 0) return 0;
   return Math.round((stat.succeeded / stat.total) * 100);
 }
@@ -184,11 +188,10 @@ function SectionHeader({
 // ---------------------------------------------------------------------------
 
 function ActorBreakdown() {
-  const { data: actors = [], isLoading } = useQuery({
-    queryKey: ["health-actors"],
-    queryFn: listActors,
-    staleTime: 30_000,
-  });
+  const { data: actors = [], isLoading } = useListActorSummariesQuery(
+    undefined,
+    { staleTime: 30_000, select: (d) => d.actors },
+  );
   const navigate = useNavigate();
 
   const counts = useMemo(
@@ -285,15 +288,14 @@ function ActorBreakdown() {
 // Upcoming schedules panel
 // ---------------------------------------------------------------------------
 
-interface ScheduleWithWorkflow extends WorkflowSchedule {
+type ScheduleWithWorkflow = ScheduleItem & {
   workflowName?: string;
-}
+};
 
 function UpcomingSchedules() {
-  const { data: schedules = [], isLoading } = useQuery({
-    queryKey: ["health-schedules"],
-    queryFn: getMySchedules,
+  const { data: schedules = [], isLoading } = useMySchedulesQuery(undefined, {
     staleTime: 60_000,
+    select: (d) => d.mySchedules,
   });
 
   const workflowIds = useMemo(
@@ -301,17 +303,11 @@ function UpcomingSchedules() {
     [schedules],
   );
 
-  const { data: workflowNames } = useQuery({
-    queryKey: ["schedule-workflow-names", workflowIds.join(",")],
-    queryFn: async () => {
-      if (workflowIds.length === 0) return {} as Record<string, string>;
-      const result = await graphqlRequest<{
-        workflows: { id: string; name: string }[];
-      }>(`query { workflows { id name } }`);
-      return Object.fromEntries(result.workflows.map((w) => [w.id, w.name]));
-    },
+  const { data: workflowNames } = useListWorkflowNamesQuery(undefined, {
     enabled: workflowIds.length > 0,
     staleTime: 60_000,
+    select: (d): Record<string, string> =>
+      Object.fromEntries(d.workflows.map((w) => [w.id, w.name])),
   });
 
   // Wall-clock time for the "overdue" check, refreshed on an interval so a
@@ -411,11 +407,10 @@ function UpcomingSchedules() {
 // ---------------------------------------------------------------------------
 
 function WorkflowHealth() {
-  const { data: stats = [], isLoading } = useQuery({
-    queryKey: ["health-workflow-stats"],
-    queryFn: () => getWorkflowStats(7),
-    staleTime: 60_000,
-  });
+  const { data: stats = [], isLoading } = useGetAllWorkflowStatsQuery(
+    { days: 7 },
+    { staleTime: 60_000, select: (d) => d.getAllWorkflowStats },
+  );
 
   const sorted = useMemo(
     () =>
@@ -562,39 +557,32 @@ function WorkflowHealth() {
 // ---------------------------------------------------------------------------
 
 export default function Health() {
-  const { data: actors = [], isLoading: actorsLoading } = useQuery({
-    queryKey: ["health-actors"],
-    queryFn: listActors,
-    staleTime: 30_000,
-  });
+  const { data: actors = [], isLoading: actorsLoading } =
+    useListActorSummariesQuery(undefined, {
+      staleTime: 30_000,
+      select: (d) => d.actors,
+    });
 
-  const { data: stats = [], isLoading: statsLoading } = useQuery({
-    queryKey: ["health-workflow-stats"],
-    queryFn: () => getWorkflowStats(7),
+  const { data: stats = [], isLoading: statsLoading } =
+    useGetAllWorkflowStatsQuery(
+      { days: 7 },
+      { staleTime: 60_000, select: (d) => d.getAllWorkflowStats },
+    );
+
+  const { data: schedules = [], isLoading: schedulesLoading } =
+    useMySchedulesQuery(undefined, {
+      staleTime: 60_000,
+      select: (d) => d.mySchedules,
+    });
+
+  const { data: secrets = [], isLoading: secretsLoading } = useGetSecretsQuery(
+    undefined,
+    { staleTime: 120_000, select: (d) => d.secrets },
+  );
+
+  const { data: workflows } = useListWorkflowNamesQuery(undefined, {
     staleTime: 60_000,
-  });
-
-  const { data: schedules = [], isLoading: schedulesLoading } = useQuery({
-    queryKey: ["health-schedules"],
-    queryFn: getMySchedules,
-    staleTime: 60_000,
-  });
-
-  const { data: secrets = [], isLoading: secretsLoading } = useQuery({
-    queryKey: ["health-secrets"],
-    queryFn: getSecrets,
-    staleTime: 120_000,
-  });
-
-  const { data: workflows } = useQuery({
-    queryKey: ["health-workflow-list"],
-    queryFn: async () => {
-      const result = await graphqlRequest<{ workflows: { id: string }[] }>(
-        `query { workflows { id } }`,
-      );
-      return result.workflows;
-    },
-    staleTime: 60_000,
+    select: (d) => d.workflows,
   });
 
   const activeActors = useMemo(

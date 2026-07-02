@@ -3,13 +3,14 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
+import { subscribeExecution, type ExecutionUpdate } from "@/lib/graphqlClient";
 import {
+  getWorkflowExecutionHistory,
   listActors,
-  graphqlRequest,
-  subscribeExecution,
+  triggerWorkflowAsActor,
   type ActorSummary,
-  type ExecutionUpdate,
-} from "@/lib/graphqlClient";
+} from "@/lib/graphqlApi";
+import { useListWorkflowNamesQuery } from "@/generated/graphql";
 import { cn } from "@/lib/utils";
 import {
   ChevronLeft,
@@ -323,17 +324,10 @@ export default function ActorCompare() {
     queryFn: listActors,
   });
 
-  const { data: workflows = [], isLoading: loadingWorkflows } = useQuery<
-    WorkflowOption[]
-  >({
-    queryKey: ["workflows-for-compare"],
-    queryFn: async () => {
-      const result = await graphqlRequest<{
-        workflows: { id: string; name: string }[];
-      }>(`query { workflows { id name } }`);
-      return result.workflows;
-    },
-  });
+  const { data: workflows = [], isLoading: loadingWorkflows } =
+    useListWorkflowNamesQuery(undefined, {
+      select: (result): WorkflowOption[] => result.workflows,
+    });
 
   const activeActors = actors.filter((a) => a.status === "active");
 
@@ -409,13 +403,11 @@ export default function ActorCompare() {
     // Trigger one execution per actor (sequentially to avoid rate-limiting)
     for (const actor of chosenActors) {
       try {
-        const data = await graphqlRequest<{ triggerWorkflow: { id: string } }>(
-          `mutation ($workflowId: UUID!, $actorId: UUID) {
-            triggerWorkflow(workflowId: $workflowId, actorId: $actorId) { id }
-          }`,
-          { workflowId: selectedWorkflowId, actorId: actor.id },
+        const execution = await triggerWorkflowAsActor(
+          selectedWorkflowId,
+          actor.id,
         );
-        const execId = data.triggerWorkflow.id;
+        const execId = execution.id;
 
         // Capture the queued-at timestamp inside the state updater (as the
         // live-update handler below does) so Date.now() isn't called in
@@ -518,28 +510,9 @@ export default function ActorCompare() {
             actorIds.includes(l.actor.id)
           ) {
             // Fire-and-forget fetch
-            graphqlRequest<{
-              workflowExecutionHistory: Array<{
-                id: string;
-                outputData: string | null;
-                errorMessage: string | null;
-                durationMs: number | null;
-              }>;
-            }>(
-              `query ($wfId: UUID!, $p: PaginationInput) {
-                workflowExecutionHistory(workflowId: $wfId, pagination: $p) {
-                  id outputData errorMessage durationMs
-                }
-              }`,
-              {
-                wfId: selectedWorkflowId,
-                p: { limit: 50 },
-              },
-            )
-              .then((res) => {
-                const match = res.workflowExecutionHistory.find(
-                  (e) => e.id === l.executionId,
-                );
+            getWorkflowExecutionHistory(selectedWorkflowId, 50)
+              .then((history) => {
+                const match = history.find((e) => e.id === l.executionId);
                 if (match) {
                   setLanes((prev) =>
                     prev.map((lane) =>
