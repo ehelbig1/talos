@@ -37,7 +37,7 @@ use uuid::Uuid;
 /// Errors at any resolve step are logged and the offending set is
 /// skipped — the node still gets whatever secrets *did* resolve. If
 /// the combined map is empty, the function returns
-/// `EncryptedSecrets::default()` (empty ciphertext) rather than
+/// `EncryptedSecrets::empty()` (empty ciphertext) rather than
 /// encrypting an empty map.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_encrypted_secrets_for(
@@ -153,7 +153,7 @@ pub(crate) async fn build_encrypted_secrets_for(
     // matches the reference impl's sentinel; callers read an empty
     // ciphertext as "no secrets to forward."
     if secrets_map.is_empty() {
-        return talos_workflow_job_protocol::EncryptedSecrets::default();
+        return talos_workflow_job_protocol::EncryptedSecrets::empty();
     }
     // L-1: route through the AAD-binding seal so the per-job AEAD
     // context is part of the AES-GCM tag. The default trait impl
@@ -177,7 +177,7 @@ pub(crate) async fn build_encrypted_secrets_for(
                     error = %e,
                     "SecretEnvelope::seal output failed structural validation — dispatching with empty ciphertext"
                 );
-                return talos_workflow_job_protocol::EncryptedSecrets::default();
+                return talos_workflow_job_protocol::EncryptedSecrets::empty();
             }
             // Separate check: the envelope accepted the structural
             // contract (returned the empty-empty sentinel) but did so
@@ -199,7 +199,7 @@ pub(crate) async fn build_encrypted_secrets_for(
                 %node_id,
                 "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
             );
-            talos_workflow_job_protocol::EncryptedSecrets::default()
+            talos_workflow_job_protocol::EncryptedSecrets::empty()
         }
     }
 }

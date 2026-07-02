@@ -289,7 +289,7 @@ impl ParallelWorkflowEngine {
                 )
                 .await
             }
-            _ => Default::default(),
+            _ => talos_workflow_job_protocol::EncryptedSecrets::empty(),
         };
 
         // Wire-format WASM budget. The dispatcher internally adds its

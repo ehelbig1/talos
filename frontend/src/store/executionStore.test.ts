@@ -45,6 +45,12 @@ describe("executionStore", () => {
       expect(useEphemeralExecutionStore.getState().events).toHaveLength(1);
     });
 
+    it("stores the event payload it was given", () => {
+      const event = { executionId: "1", status: "ok", elapsedMs: 100 } as any;
+      useEphemeralExecutionStore.getState().addEvent(event);
+      expect(useEphemeralExecutionStore.getState().events[0]).toEqual(event);
+    });
+
     it("starts running and clears previous state", () => {
       const store = useEphemeralExecutionStore.getState();
       store.setNodeStatus("old-node", { status: "success" });

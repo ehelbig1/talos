@@ -346,8 +346,8 @@ function ExecutionRow({
   );
 }
 
-export const WorkflowExecutionHistory = React.memo(
-  function WorkflowExecutionHistory({
+export const WorkflowExecutionHistoryPanel = React.memo(
+  function WorkflowExecutionHistoryPanel({
     workflowId,
     workflowName,
     onClose,

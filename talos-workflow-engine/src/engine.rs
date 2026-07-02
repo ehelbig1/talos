@@ -1753,7 +1753,7 @@ impl ParallelWorkflowEngine {
     ) -> talos_workflow_job_protocol::EncryptedSecrets {
         let (Some(resolver), Some(key)) = (self.secrets_resolver.as_ref(), worker_shared_key)
         else {
-            return talos_workflow_job_protocol::EncryptedSecrets::default();
+            return talos_workflow_job_protocol::EncryptedSecrets::empty();
         };
         let vault_paths = self
             .node_configs

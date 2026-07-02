@@ -3,8 +3,7 @@ import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 import { Star } from "lucide-react";
 import { SectionHeader } from "@/components/ui/SectionHeader";
-import { useQuery } from "@tanstack/react-query";
-import { graphqlRequest } from "@/lib/graphqlClient";
+import { useNodeTemplatesQuery } from "@/generated/graphql";
 import { useUIStore } from "@/store/uiStore";
 import { Input } from "@/components/ui/input";
 
@@ -30,30 +29,8 @@ export function TemplateLibrary({
     addRecentTemplate,
   } = useUIStore();
 
-  const {
-    data: templates,
-    isLoading,
-    error,
-  } = useQuery({
-    queryKey: ["templates"],
-    queryFn: async () => {
-      const query = `
-        query {
-          nodeTemplates {
-            id
-            name
-            category
-            description
-            icon
-          }
-        }
-      `;
-      const result = await graphqlRequest<{ nodeTemplates: NodeTemplate[] }>(
-        query,
-      );
-      return result.nodeTemplates;
-    },
-  });
+  const { data, isLoading, error } = useNodeTemplatesQuery();
+  const templates = data?.nodeTemplates as NodeTemplate[] | undefined;
 
   // Derive unique categories from the full templates list
   const categories = useMemo(
@@ -206,7 +183,7 @@ export function TemplateLibrary({
                 </p>
               </div>
             )}
-            {error && (
+            {!!error && (
               <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-[2.5rem] text-destructive text-[10px] font-black uppercase tracking-widest col-span-full text-center shadow-2xl animate-in shake duration-500">
                 Registry Sync Failure:{" "}
                 {sanitizeErrorMessage((error as Error).message)}

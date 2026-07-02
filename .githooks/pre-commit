@@ -9,21 +9,33 @@ if git diff --cached --name-only | grep -q '\.env$'; then
     exit 1
 fi
 
-# 2. Check for credential logging patterns in staged Rust files
+# 2. Block credential logging in staged Rust files.
 # `|| true`: grep exits 1 when no staged .rs files match, which under `set -e`
 # would abort the hook and wrongly block every non-Rust commit.
+#
+# This was warn-only (printed WARNING, continued) — a gate that never blocks
+# trains you to skim past it. It now FAILS the commit. The pattern is tight
+# (`tracing::debug!` over a `Cookie` value interpolation) and the codebase is
+# clean, so a hit is almost certainly a real leak. Genuine exception: append
+# `// allow-credential-log: <reason>` on the offending line.
+#
+# The former raw-error-to-client heuristic (`error.*Some(e.to_string())`) was
+# REMOVED rather than promoted: it's too broad — it matched internal error
+# structs, DLP-redacted engine step results, and safe test-tool outputs, so
+# hard-failing it would block legitimate work. The real enforcement of "no
+# internal error string reaches an API client" lives in the CI-level structural
+# lints: check 14 (talos-api GraphQL `.extend_safe()`) and the REST-handler
+# error-leak discipline (MCP-923..927). Those block at push; this heuristic
+# added noise without adding coverage.
 STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -v '_test\|tests/' || true)
 if [ -n "$STAGED_RS" ]; then
-    # Check for raw token/cookie logging
-    if echo "$STAGED_RS" | xargs grep -ln 'tracing::debug!.*Cookie.*{:' 2>/dev/null | grep -v 'is_some\|is_none'; then
-        echo "WARNING: Potential credential logging detected in staged files."
-        echo "Log presence (is_some/is_none), not values."
-    fi
-
-    # Check for raw error returns to API clients
-    if echo "$STAGED_RS" | xargs grep -ln 'error.*Some(e\.to_string())' 2>/dev/null; then
-        echo "WARNING: Raw error strings returned to API clients in staged files."
-        echo "Use generic error messages for client responses."
+    CRED_HITS=$(echo "$STAGED_RS" | xargs grep -n 'tracing::debug!.*Cookie.*{:' 2>/dev/null \
+        | grep -v 'is_some\|is_none\|allow-credential-log' || true)
+    if [ -n "$CRED_HITS" ]; then
+        echo "ERROR: potential credential logging in staged files — log presence (is_some/is_none), not values."
+        echo "$CRED_HITS"
+        echo "  (genuine exception: append // allow-credential-log: <reason> on the line)"
+        exit 1
     fi
 fi
 

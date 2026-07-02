@@ -1,6 +1,10 @@
 import React, { useCallback } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { graphqlRequest } from "@/lib/graphqlClient";
+import {
+  useGetCapabilityCeilingDetailQuery,
+  useGetCapabilityWorldHierarchyQuery,
+  useRevokeCapabilityCeilingMutation,
+  useGetCurrentUserIdQuery,
+} from "@/generated/graphql";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -28,34 +32,6 @@ interface CapabilityWorldInfo {
   name: string;
   rank: number;
   description: string;
-}
-
-// ── GraphQL queries ───────────────────────────────────────────────────────
-
-async function fetchCeilingDetail(): Promise<CapabilityCeilingDetail> {
-  const data = await graphqlRequest<{
-    capabilityCeilingDetail: CapabilityCeilingDetail;
-  }>(
-    `query { capabilityCeilingDetail { ceiling source grantedByEmail grantedAt notes } }`,
-  );
-  return data.capabilityCeilingDetail;
-}
-
-async function fetchWorldHierarchy(): Promise<CapabilityWorldInfo[]> {
-  const data = await graphqlRequest<{
-    capabilityWorldHierarchy: CapabilityWorldInfo[];
-  }>(`query { capabilityWorldHierarchy { name rank description } }`);
-  return data.capabilityWorldHierarchy;
-}
-
-async function revokeCeiling(userId: string): Promise<boolean> {
-  const data = await graphqlRequest<{ revokeCapabilityCeiling: boolean }>(
-    `mutation RevokeCeiling($userId: UUID!) {
-      revokeCapabilityCeiling(userId: $userId)
-    }`,
-    { userId },
-  );
-  return data.revokeCapabilityCeiling;
 }
 
 // ── Tier color helpers ────────────────────────────────────────────────────
@@ -91,27 +67,22 @@ function worldRank(
 // ── Component ─────────────────────────────────────────────────────────────
 
 export default function CapabilityCeilingManager() {
-  // Ceiling + world hierarchy are fetched together via react-query so the
-  // loading/data/error state is derived, not mirrored through a
-  // setState-in-effect. `refetch` backs the manual refresh / retry buttons
-  // and the post-revoke reload below.
-  const {
-    data,
-    isLoading: loading,
-    error: queryError,
-    refetch,
-  } = useQuery({
-    queryKey: ["capabilityCeiling"],
-    queryFn: async () => {
-      const [detail, worlds] = await Promise.all([
-        fetchCeilingDetail(),
-        fetchWorldHierarchy(),
-      ]);
-      return { detail, worlds };
-    },
-  });
-  const ceiling = data?.detail ?? null;
-  const hierarchy = data?.worlds ?? [];
+  // Ceiling + world hierarchy are fetched via the generated react-query hooks
+  // so the loading/data/error state is derived, not mirrored through a
+  // setState-in-effect. Their refetchers back the manual refresh / retry
+  // buttons and the post-revoke reload below.
+  const detailQuery = useGetCapabilityCeilingDetailQuery();
+  const hierarchyQuery = useGetCapabilityWorldHierarchyQuery();
+  // Resolve the current user's id for the revoke mutation. Kept out of the
+  // event handler (no imperative transport call) — react-query caches it.
+  const currentUserQuery = useGetCurrentUserIdQuery();
+
+  const ceiling: CapabilityCeilingDetail | null =
+    detailQuery.data?.capabilityCeilingDetail ?? null;
+  const hierarchy: CapabilityWorldInfo[] =
+    hierarchyQuery.data?.capabilityWorldHierarchy ?? [];
+  const loading = detailQuery.isLoading || hierarchyQuery.isLoading;
+  const queryError = detailQuery.error ?? hierarchyQuery.error;
   const error = queryError
     ? sanitizeErrorMessage(
         queryError instanceof Error ? queryError.message : "Failed to load",
@@ -120,29 +91,28 @@ export default function CapabilityCeilingManager() {
   // Wrap so onClick handlers don't pass the MouseEvent through as
   // react-query RefetchOptions.
   const loadData = useCallback(() => {
-    refetch();
-  }, [refetch]);
+    detailQuery.refetch();
+    hierarchyQuery.refetch();
+  }, [detailQuery, hierarchyQuery]);
 
-  const handleRevoke = async () => {
-    if (!ceiling) return;
-    try {
-      const data = await graphqlRequest<{ currentUser: { id: string } }>(
-        `query { currentUser { id } }`,
-      ).catch(() => null);
-      if (!data?.currentUser?.id) {
-        toast.error("Could not determine your user ID");
-        return;
-      }
-      await revokeCeiling(data.currentUser.id);
+  const revokeMutation = useRevokeCapabilityCeilingMutation({
+    onSuccess: () => {
       toast.success("Capability ceiling reverted to default (http-node)");
       loadData();
-    } catch (e) {
-      toast.error(
-        sanitizeErrorMessage(
-          e instanceof Error ? e.message : "Failed to revoke",
-        ),
-      );
+    },
+    onError: (e: Error) => {
+      toast.error(sanitizeErrorMessage(e.message || "Failed to revoke"));
+    },
+  });
+
+  const handleRevoke = () => {
+    if (!ceiling) return;
+    const userId = currentUserQuery.data?.me?.id;
+    if (!userId) {
+      toast.error("Could not determine your user ID");
+      return;
     }
+    revokeMutation.mutate({ userId });
   };
 
   if (loading) {

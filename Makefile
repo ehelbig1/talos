@@ -159,14 +159,36 @@ audit: ## Supply-chain gates — cargo-deny (advisories + licenses + bans + sour
 	    printf '\033[1;31m✗ hardcoded secret pattern detected\033[0m\n'; exit 1; \
 	fi
 	@printf '▶ migration idempotency check\n'
-	@set +e; flagged=0; for f in migrations/*.sql; do \
+	@# FAILS the build on a NEW non-idempotent migration (was warn-only —
+	@# a gate that never fails trains operators to skim yellow output, the
+	@# same failure mode that let the RLS suite sit red). Two escape valves:
+	@#   * migrations/.idempotency-grandfathered — the 16 pre-convention
+	@#     migrations that are already APPLIED and therefore can't be edited
+	@#     (adding a marker would change the sqlx checksum). One filename
+	@#     per line; this list is frozen and must not grow.
+	@#   * `-- allow-non-idempotent: <reason>` inline marker — legal on a
+	@#     NEW migration (not yet applied, so the comment is part of its
+	@#     first-apply checksum) for a genuinely one-shot data migration.
+	@set +e; failed=0; for f in migrations/*.sql; do \
+	    base="$$(basename "$$f")"; \
 	    if grep -qE '^(CREATE TABLE|CREATE INDEX|ALTER TABLE)' "$$f" \
 	            && ! grep -qE 'IF NOT EXISTS|IF EXISTS|DO \$$\$$' "$$f"; then \
-	        printf '  \033[33m⚠ %s\033[0m may not be idempotent\n' "$$f"; \
-	        flagged=1; \
+	        if grep -qxF "$$base" migrations/.idempotency-grandfathered 2>/dev/null; then \
+	            continue; \
+	        fi; \
+	        if grep -qE 'allow-non-idempotent:' "$$f"; then \
+	            continue; \
+	        fi; \
+	        printf '  \033[1;31m✗ %s\033[0m is not idempotent (no IF NOT EXISTS / IF EXISTS / DO $$$$)\n' "$$f"; \
+	        failed=1; \
 	    fi; \
 	done; \
-	[ "$$flagged" -eq 0 ] && printf '  all migrations use IF NOT EXISTS / IF EXISTS / DO $$$$\n' || true
+	if [ "$$failed" -ne 0 ]; then \
+	    printf '  \033[1;31mNew migrations must be idempotent.\033[0m Add IF NOT EXISTS / IF EXISTS,\n'; \
+	    printf '  or `-- allow-non-idempotent: <reason>` for a genuine one-shot data migration.\n'; \
+	    exit 1; \
+	fi; \
+	printf '  all migrations idempotent (or grandfathered/marked)\n'
 
 check-catalog: ## Compile every module-templates/* against current WIT (used by CI)
 	@bash scripts/check-catalog.sh
@@ -181,6 +203,12 @@ drill: ## Run the backup→restore drill (pg_dump + vault snapshot → scratch s
 
 smoke: ## End-to-end probe of a deployed cluster (BASE_URL=https://… SMOKE_AGENT_TOKEN=… SMOKE_ACTOR_ID=…)
 	@bash scripts/smoke.sh
+
+schema-baseline: ## Generate the migration baseline snapshot + seed (RFC 0009; BASELINE_DATABASE_URL=… disposable PG)
+	@bash scripts/generate-schema-baseline.sh
+
+verify-schema-baseline: ## Prove baseline+seed+tail == full chain (RFC 0009; CHAIN_DATABASE_URL=… BASELINE_DATABASE_URL=…)
+	@bash scripts/verify-schema-baseline.sh
 
 rls-preflight: ## Verify Postgres is ready for RLS SET-ROLE enforcement (DATABASE_URL=… controller's role)
 	@bash scripts/rls-preflight.sh

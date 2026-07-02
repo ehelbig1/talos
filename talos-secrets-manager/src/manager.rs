@@ -15,6 +15,7 @@
 // because they pull in axum / oauth respectively; this crate is the
 // transport-free core (envelope encryption, KEK providers, DEK cache).
 
+use crate::errors::SecretsError;
 use crate::kek_provider;
 
 use aes_gcm::{
@@ -852,7 +853,7 @@ impl SecretsManager {
     /// Performance: Uses in-memory cache with 5-minute TTL
     /// - Cache hit: <1ms (50x+ faster than DB + decrypt)
     /// - Cache miss: ~50ms (DB query + AES-256-GCM decryption)
-    async fn get_dek(&self, key_id: Uuid) -> Result<DataEncryptionKey> {
+    async fn get_dek(&self, key_id: Uuid) -> Result<DataEncryptionKey, SecretsError> {
         let now = Instant::now();
 
         // 1️⃣ Check cache first
@@ -875,13 +876,18 @@ impl SecretsManager {
 
         // 2️⃣ Cache miss - fetch from database and decrypt
         tracing::trace!(dek_id = %key_id, "DEK cache miss - fetching from database");
+        // Distinguish "no such DEK row" (→ MissingDek, a classifiable
+        // resolution failure) from a transient/connection sqlx error
+        // (→ Database, `#[from]`). `fetch_optional` + explicit None arm
+        // rather than mapping `RowNotFound` after the fact so a genuine
+        // connection error can't be miscategorised as a missing key.
         let record = sqlx::query!(
             "SELECT id, encrypted_key FROM encryption_keys WHERE id = $1",
             key_id
         )
-        .fetch_one(&self.db_pool)
-        .await
-        .context("Encryption key not found")?;
+        .fetch_optional(&self.db_pool)
+        .await?
+        .ok_or(SecretsError::MissingDek { key_id })?;
 
         let dek = self.decrypt_dek(record.id, &record.encrypted_key).await?;
 
@@ -1638,7 +1644,7 @@ impl SecretsManager {
         &self,
         key_id: Uuid,
         encrypted: &[u8],
-    ) -> Result<Zeroizing<String>> {
+    ) -> Result<Zeroizing<String>, SecretsError> {
         // Empty AAD path. Equivalent to the v0 ciphertext format.
         self.decrypt_value_by_key_with_aad(key_id, encrypted, &[])
             .await
@@ -1748,7 +1754,7 @@ impl SecretsManager {
         key_id: Uuid,
         encrypted: &[u8],
         format_version: i16,
-    ) -> Result<Zeroizing<String>> {
+    ) -> Result<Zeroizing<String>, SecretsError> {
         // 2026-05-28 audit S2#9 follow-up: explicit-version match
         // (sibling of `decrypt_versioned` below). `>=` invited a
         // forward-compat trap; tighten to `==` and fail-closed on
@@ -1768,12 +1774,7 @@ impl SecretsManager {
                 self.decrypt_value_derived_with_aad(key_id, encrypted, secret_id.as_bytes())
                     .await
             }
-            other => Err(anyhow!(
-                "unknown secrets encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), {} (v3 per-context-derived), and {} (v4 per-org per-context-derived). Row may have been written by a newer code version.",
-                Self::SECRETS_AAD_FORMAT_V1,
-                Self::AAD_FORMAT_V3_DERIVED,
-                Self::AAD_FORMAT_V4_ORG_DERIVED
-            )),
+            other => Err(SecretsError::UnknownFormat(other)),
         }
     }
 
@@ -1798,7 +1799,7 @@ impl SecretsManager {
         encrypted: &[u8],
         aad: &[u8],
         format_version: i16,
-    ) -> Result<Zeroizing<String>> {
+    ) -> Result<Zeroizing<String>, SecretsError> {
         // 2026-05-28 audit S2#9 follow-up: explicit-version match.
         // Pre-fix `>= AAD_FORMAT_V1` meant a future v2 ciphertext with
         // a NEW AAD shape (e.g. different separator, different bound
@@ -1833,13 +1834,7 @@ impl SecretsManager {
                 self.decrypt_value_derived_with_aad(key_id, encrypted, aad)
                     .await
             }
-            other => Err(anyhow!(
-                "unknown encryption_format_version {other}; this build only knows 0 (legacy no-AAD), {} (v1 AAD-bound), {} (v2 slot-bound AAD), {} (v3 per-context-derived), and {} (v4 per-org per-context-derived). Caller may be reading rows written by a newer code version.",
-                Self::AAD_FORMAT_V1,
-                Self::AAD_FORMAT_V2,
-                Self::AAD_FORMAT_V3_DERIVED,
-                Self::AAD_FORMAT_V4_ORG_DERIVED
-            )),
+            other => Err(SecretsError::UnknownFormat(other)),
         }
     }
 
@@ -2024,30 +2019,32 @@ impl SecretsManager {
         key_id: Uuid,
         encrypted: &[u8],
         aad: &[u8],
-    ) -> Result<Zeroizing<String>> {
+    ) -> Result<Zeroizing<String>, SecretsError> {
         if encrypted.len() < 12 {
-            return Err(anyhow!("Invalid encrypted value: too short"));
+            return Err(SecretsError::Aead);
         }
         let nonce = Nonce::from_slice(&encrypted[..12]);
         let ciphertext = &encrypted[12..];
 
         let dek = self.get_dek(key_id).await?;
-        let subkey = Self::derive_per_context_subkey(&dek.key, aad)?;
-        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())?;
+        let subkey = Self::derive_per_context_subkey(&dek.key, aad)
+            .map_err(|e| SecretsError::Internal(anyhow!(e)))?;
+        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())
+            .map_err(|e| SecretsError::Internal(anyhow!(e)))?;
         let payload = aes_gcm::aead::Payload {
             msg: ciphertext,
             aad,
         };
         // Same plaintext-hygiene discipline as the v1/v2 path: hold the
         // GCM output in Zeroizing<Vec<u8>> so it is wiped on drop even on
-        // the UTF-8 error branch.
+        // the UTF-8 error branch. Tag mismatch / wrong key / wrong AAD →
+        // SecretsError::Aead (no detail carried).
         let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(
             cipher
                 .decrypt(nonce, payload)
-                .map_err(|e| anyhow!("Decryption failed: {}", e))?,
+                .map_err(|_| SecretsError::Aead)?,
         );
-        let plaintext =
-            std::str::from_utf8(&decrypted).context("Invalid UTF-8 in decrypted value")?;
+        let plaintext = std::str::from_utf8(&decrypted).map_err(|_| SecretsError::Serde)?;
         Ok(Zeroizing::new(plaintext.to_string()))
     }
 
@@ -2105,15 +2102,21 @@ impl SecretsManager {
         key_id: Uuid,
         encrypted: &[u8],
         aad: &[u8],
-    ) -> Result<Zeroizing<String>> {
+    ) -> Result<Zeroizing<String>, SecretsError> {
+        // A ciphertext shorter than the 12-byte nonce can never open —
+        // classify as an AEAD failure (tamper/corruption), carrying no
+        // length or byte detail.
         if encrypted.len() < 12 {
-            return Err(anyhow!("Invalid encrypted value: too short"));
+            return Err(SecretsError::Aead);
         }
         let nonce = Nonce::from_slice(&encrypted[..12]);
         let ciphertext = &encrypted[12..];
 
         let dek = self.get_dek(key_id).await?;
-        let cipher = Aes256Gcm::new_from_slice(&dek.key)?;
+        // Cipher construction only fails on a wrong-length key, which the
+        // DEK contract guarantees can't happen; treat as Internal.
+        let cipher =
+            Aes256Gcm::new_from_slice(&dek.key).map_err(|e| SecretsError::Internal(anyhow!(e)))?;
         let payload = aes_gcm::aead::Payload {
             msg: ciphertext,
             aad,
@@ -2121,15 +2124,14 @@ impl SecretsManager {
         // L T2-3 + N T2-N1: keep decrypted bytes in Zeroizing<Vec<u8>>
         // so the AES-GCM output buffer is wiped on drop, even on the
         // UTF-8 validation error branch. AES-GCM rejects mismatched
-        // AAD with a generic decryption error; we don't surface AAD
-        // details in the error message to avoid an oracle.
+        // AAD/key/tag with a generic error; we map to SecretsError::Aead
+        // (which carries NO detail) so no oracle leaks.
         let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(
             cipher
                 .decrypt(nonce, payload)
-                .map_err(|e| anyhow!("Decryption failed: {}", e))?,
+                .map_err(|_| SecretsError::Aead)?,
         );
-        let plaintext =
-            std::str::from_utf8(&decrypted).context("Invalid UTF-8 in decrypted value")?;
+        let plaintext = std::str::from_utf8(&decrypted).map_err(|_| SecretsError::Serde)?;
         Ok(Zeroizing::new(plaintext.to_string()))
     }
 
@@ -4074,7 +4076,10 @@ impl SecretsManager {
     /// sibling shape eliminates the asymmetry. Same secret-handling
     /// invariant as `decrypt_value_by_key` (line 1418) and
     /// `decrypt_secret_record` (line 1440).
-    pub async fn decrypt_value(&self, ciphertext: &[u8]) -> Result<Zeroizing<String>> {
+    pub async fn decrypt_value(
+        &self,
+        ciphertext: &[u8],
+    ) -> Result<Zeroizing<String>, SecretsError> {
         /// Byte length of a UUID (16 bytes) stored as raw bytes at the start of the blob.
         const KEY_ID_LEN: usize = 16;
         /// AES-GCM nonce length in bytes (96-bit nonce = 12 bytes).
@@ -4082,27 +4087,28 @@ impl SecretsManager {
         /// Total header = key_id || nonce.
         const HEADER_LEN: usize = KEY_ID_LEN + NONCE_LEN; // 28
 
+        // A blob too short to even carry the header can't be a valid
+        // ciphertext — classify as AEAD failure (no detail carried).
         if ciphertext.len() < HEADER_LEN {
-            return Err(anyhow!("Invalid ciphertext: too short"));
+            return Err(SecretsError::Aead);
         }
         // Parse: KEY_ID_LEN-byte key_id UUID || NONCE_LEN-byte nonce || ciphertext
-        let key_id = Uuid::from_slice(&ciphertext[..KEY_ID_LEN])
-            .map_err(|_| anyhow!("Invalid ciphertext: bad key_id"))?;
+        let key_id = Uuid::from_slice(&ciphertext[..KEY_ID_LEN]).map_err(|_| SecretsError::Aead)?;
         let nonce = Nonce::from_slice(&ciphertext[KEY_ID_LEN..HEADER_LEN]);
         let payload = &ciphertext[HEADER_LEN..];
 
         let dek = self.get_dek(key_id).await?;
-        let cipher = Aes256Gcm::new_from_slice(&dek.key)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&dek.key).map_err(|e| SecretsError::Internal(anyhow!(e)))?;
         // Keep the AES-GCM output in Zeroizing<Vec<u8>> so the plaintext
         // buffer is wiped on drop — including the UTF-8 error branch
         // below. Mirrors `decrypt_value_by_key_with_aad`.
         let plaintext_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
             cipher
                 .decrypt(nonce, payload)
-                .map_err(|e| anyhow!("Decryption failed: {}", e))?,
+                .map_err(|_| SecretsError::Aead)?,
         );
-        let plaintext = std::str::from_utf8(&plaintext_bytes)
-            .map_err(|_| anyhow!("Decrypted value is not valid UTF-8"))?;
+        let plaintext = std::str::from_utf8(&plaintext_bytes).map_err(|_| SecretsError::Serde)?;
         Ok(Zeroizing::new(plaintext.to_string()))
     }
 
@@ -5577,6 +5583,7 @@ mod aad_binding_tests {
 
     #[tokio::test]
     async fn decrypt_versioned_rejects_unknown_format_with_clear_error() {
+        use crate::errors::SecretsError;
         let sm = super::SecretsManager::test_stub_for_cache();
         let bogus_key_id = Uuid::nil();
         let bogus_encrypted = vec![0u8; 28]; // 12-nonce + 16-tag minimum
@@ -5585,14 +5592,18 @@ mod aad_binding_tests {
             .decrypt_versioned(bogus_key_id, &bogus_encrypted, bogus_aad, 99)
             .await
             .expect_err("unknown format_version must fail-closed at dispatch");
+        // Typed classification: caller can match the variant without
+        // string-matching (the whole point of the SecretsError arc).
+        assert!(
+            matches!(err, SecretsError::UnknownFormat(99)),
+            "unknown format must classify as UnknownFormat(99); got: {err:?}"
+        );
+        // The operator-facing Display still names the class + version (for
+        // logs), but the user-facing message must NOT.
         let msg = err.to_string();
         assert!(
-            msg.contains("unknown encryption_format_version"),
-            "error must name the unknown version class; got: {msg}"
-        );
-        assert!(
-            msg.contains("99"),
-            "error must include the offending version number; got: {msg}"
+            msg.contains("unknown encryption_format_version") && msg.contains("99"),
+            "operator Display must name the unknown version class + number; got: {msg}"
         );
     }
 
@@ -5600,6 +5611,7 @@ mod aad_binding_tests {
     async fn decrypt_versioned_rejects_negative_format_version() {
         // A buggy SELECT could return -1 (e.g. via misuse of NULLABLE
         // coalesce). Same dispatch path should reject as "unknown".
+        use crate::errors::SecretsError;
         let sm = super::SecretsManager::test_stub_for_cache();
         let bogus_key_id = Uuid::nil();
         let bogus_encrypted = vec![0u8; 28];
@@ -5609,10 +5621,143 @@ mod aad_binding_tests {
             .await
             .expect_err("negative format_version must fail-closed at dispatch");
         assert!(
-            err.to_string()
-                .contains("unknown encryption_format_version"),
-            "got: {err}"
+            matches!(err, SecretsError::UnknownFormat(-1)),
+            "negative format must classify as UnknownFormat(-1); got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn decrypt_secret_record_rejects_unknown_format() {
+        // Sibling dispatcher to `decrypt_versioned` — same fail-closed
+        // contract, keyed on the secrets-table format column.
+        use crate::errors::SecretsError;
+        let sm = super::SecretsManager::test_stub_for_cache();
+        let err = sm
+            .decrypt_secret_record(Uuid::nil(), Uuid::nil(), &[0u8; 28], 42)
+            .await
+            .expect_err("unknown secrets format_version must fail-closed");
+        assert!(
+            matches!(err, SecretsError::UnknownFormat(42)),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypt_v0_missing_dek_classifies_as_missing_dek() {
+        // v0 dispatch routes to `decrypt_value_by_key` → `get_dek`. With a
+        // non-existent key id and a lazy pool that would error on connect,
+        // we can't hit the DB — so this asserts the v0 arm is reached and
+        // the error surfaces as a typed SecretsError (not anyhow). The
+        // strict MissingDek-vs-Database classification is exercised in the
+        // DB-backed integration tests; here we pin the *typed-boundary*.
+        use crate::errors::SecretsError;
+        let sm = super::SecretsManager::test_stub_for_cache();
+        // 28 bytes = 12-byte nonce + 16-byte tag, so length passes and we
+        // proceed to DEK resolution rather than short-circuiting on Aead.
+        let err = sm
+            .decrypt_versioned(Uuid::nil(), &[0u8; 28], &[], 0)
+            .await
+            .expect_err("v0 decrypt against a lazy pool must error");
+        // A lazy pool that can't connect surfaces as a Database error from
+        // get_dek's SELECT; either way it is a typed SecretsError, never an
+        // AeadFailure or UnknownFormat for this input.
+        assert!(
+            matches!(
+                err,
+                SecretsError::Database(_) | SecretsError::MissingDek { .. }
+            ),
+            "v0 DEK-resolve failure must classify as Database or MissingDek; got: {err:?}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // AEAD-failure classification: a too-short / malformed ciphertext can
+    // never open, so it must classify as SecretsError::Aead BEFORE any DEK
+    // resolution (no DB round-trip, no oracle detail). This is the tamper /
+    // corruption / AAD-mismatch signal the audit pipeline keys on.
+    // ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn short_ciphertext_classifies_as_aead_without_db() {
+        use crate::errors::SecretsError;
+        let sm = super::SecretsManager::test_stub_for_cache();
+        // < 12 bytes → cannot even carry a nonce. Must short-circuit to
+        // Aead before touching get_dek (the lazy pool would panic/hang if
+        // reached), proving no DEK lookup happens for a malformed blob.
+        for (aad, fmt) in [(&b""[..], 0i16), (&b"ctx"[..], 3i16)] {
+            let err = sm
+                .decrypt_versioned(Uuid::nil(), &[0u8; 4], aad, fmt)
+                .await
+                .expect_err("too-short ciphertext must fail closed");
+            assert!(
+                matches!(err, SecretsError::Aead),
+                "malformed ciphertext (fmt {fmt}) must classify as Aead; got: {err:?}"
+            );
+            assert!(err.is_tamper_signal());
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypt_value_short_blob_classifies_as_aead() {
+        use crate::errors::SecretsError;
+        let sm = super::SecretsManager::test_stub_for_cache();
+        // Below the 28-byte key_id||nonce header — cannot be a valid blob.
+        let err = sm
+            .decrypt_value(&[0u8; 10])
+            .await
+            .expect_err("too-short self-describing blob must fail closed");
+        assert!(matches!(err, SecretsError::Aead), "got: {err:?}");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // SECURITY: user_facing_message must never leak a key id, a format
+    // version number, the word "aead"/"decrypt", ciphertext, or crypto
+    // internals — matching the ManifestError/ReplayError redaction contract.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn user_facing_message_leaks_nothing() {
+        use crate::errors::SecretsError;
+        let leaky_key = Uuid::from_u128(0xdead_beef_dead_beef_dead_beef_dead_beef);
+        let variants = [
+            SecretsError::UnknownFormat(99),
+            SecretsError::MissingDek { key_id: leaky_key },
+            SecretsError::Aead,
+            SecretsError::Serde,
+            SecretsError::Internal(anyhow::anyhow!(
+                "vault transit unwrap failed for dek {leaky_key}"
+            )),
+        ];
+        for v in &variants {
+            let m = v.user_facing_message().to_lowercase();
+            // No key id (or any fragment of it).
+            assert!(
+                !m.contains(&leaky_key.to_string()) && !m.contains("dead"),
+                "user_facing_message leaked a key id: {m}"
+            );
+            // No format version number.
+            assert!(!m.contains("99"), "leaked a format version number: {m}");
+            // No crypto internals / oracle-ish terms.
+            for banned in ["aead", "tag", "nonce", "gcm", "hkdf", "vault", "utf"] {
+                assert!(
+                    !m.contains(banned),
+                    "user_facing_message leaked crypto internal {banned:?}: {m}"
+                );
+            }
+            // It is a fixed, generic string.
+            assert_eq!(v.user_facing_message(), "Secret decryption failed");
+        }
+    }
+
+    #[test]
+    fn missing_dek_display_is_for_operators_only() {
+        // Display MAY name the key id (operator log context); the
+        // user-facing message must not — the split is the whole contract.
+        use crate::errors::SecretsError;
+        let key_id = Uuid::from_u128(0x1234);
+        let e = SecretsError::MissingDek { key_id };
+        assert!(e.to_string().contains(&key_id.to_string()));
+        assert!(!e.user_facing_message().contains(&key_id.to_string()));
     }
 }
 
@@ -6074,12 +6219,18 @@ mod llm_keys_cache_tests {
     #[test]
     fn default_ttl_is_short_enough_for_rotation() {
         // Rotation-propagation window must be smaller than any sane
-        // "my API key stopped working, why?" debugging window.
-        assert!(
-            LLM_KEYS_CACHE_DEFAULT_TTL_SECS <= 300,
-            "default TTL {} exceeds 5 minutes — rotations won't propagate quickly",
-            LLM_KEYS_CACHE_DEFAULT_TTL_SECS
-        );
+        // "my API key stopped working, why?" debugging window. This is a
+        // deliberate compile-time-ish guard over a const, so clippy's
+        // `assertions_on_constants` (which fires under newer toolchains)
+        // is expected here — the assertion IS the intent.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                LLM_KEYS_CACHE_DEFAULT_TTL_SECS <= 300,
+                "default TTL {} exceeds 5 minutes — rotations won't propagate quickly",
+                LLM_KEYS_CACHE_DEFAULT_TTL_SECS
+            );
+        }
     }
 
     #[tokio::test]

@@ -25,6 +25,28 @@ use crate::wit_inspector::CapabilityWorld;
 /// and matches the wall-clock-timeout granularity operators expect.
 pub const EPOCH_TICK_INTERVAL_MS: u64 = 100;
 
+/// Upper bound on concurrently-instantiated components under the pooling
+/// allocator (`PoolingAllocationConfig::total_component_instances`). This
+/// is the HARD ceiling on in-flight WASM instances the runtime can hold —
+/// a job that acquires its concurrency permit but cannot get a pooling
+/// slot fails to instantiate.
+///
+/// Exposed as a `pub const` (rather than an inline literal) so the job-
+/// dispatch layer in `main.rs` can assert its concurrency-semaphore
+/// capacity never exceeds this ceiling — otherwise the two configs could
+/// silently disagree: permits granted for jobs that can't get a slot,
+/// producing instantiation failures under saturation instead of clean
+/// back-pressure at the semaphore.
+///
+/// MAINTENANCE CONTRACT: the `ENGINE_CONFIG_FINGERPRINT` line
+/// `pooling.total_component_instances=500` mirrors this value as a string
+/// literal (the fingerprint is a `&[u8]` literal, so it can't interpolate
+/// a const). Keep the two in lockstep — `engine_config_fingerprint_is_pinned`
+/// trips if the fingerprint changes, but it does NOT observe this const, so
+/// bumping the number here without editing the fingerprint line would rot
+/// AOT-cache invalidation silently. Bump both together.
+pub const TOTAL_COMPONENT_INSTANCES: u32 = 500;
+
 /// Convert a wall-clock duration into the equivalent number of epoch
 /// ticks (rounded UP so we never trip the interrupt before the
 /// wall-clock timeout would have fired). Returns at least 1 — a
@@ -1848,7 +1870,9 @@ impl TalosRuntime {
         if !disable_pooling {
             let mut pooling_config = PoolingAllocationConfig::default();
             pooling_config
-                .total_component_instances(500)
+                // Keep in sync with the `pooling.total_component_instances`
+                // fingerprint line above; see `TOTAL_COMPONENT_INSTANCES`.
+                .total_component_instances(TOTAL_COMPONENT_INSTANCES)
                 .max_component_instance_size(10 * 1024 * 1024)
                 .max_core_instances_per_component(20)
                 .max_memories_per_component(20)

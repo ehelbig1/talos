@@ -803,6 +803,44 @@ export type UpdateSecretMutation = {
   updateSecret: { id: string; name: string; keyPath: string };
 };
 
+export type GetCapabilityCeilingDetailQueryVariables = Exact<{
+  [key: string]: never;
+}>;
+
+export type GetCapabilityCeilingDetailQuery = {
+  capabilityCeilingDetail: {
+    ceiling: string;
+    source: string;
+    grantedByEmail: string | null;
+    grantedAt: string | null;
+    notes: string | null;
+  };
+};
+
+export type GetCapabilityWorldHierarchyQueryVariables = Exact<{
+  [key: string]: never;
+}>;
+
+export type GetCapabilityWorldHierarchyQuery = {
+  capabilityWorldHierarchy: Array<{
+    name: string;
+    rank: number;
+    description: string;
+  }>;
+};
+
+export type RevokeCapabilityCeilingMutationVariables = Exact<{
+  userId: string;
+}>;
+
+export type RevokeCapabilityCeilingMutation = {
+  revokeCapabilityCeiling: boolean;
+};
+
+export type GetCurrentUserIdQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GetCurrentUserIdQuery = { me: { id: string } };
+
 export type ListServiceIntegrationsQueryVariables = Exact<{
   [key: string]: never;
 }>;
@@ -868,7 +906,7 @@ export type CreateModuleFromTemplateMutationVariables = Exact<{
 }>;
 
 export type CreateModuleFromTemplateMutation = {
-  createModuleFromTemplate: { id: string; config: string };
+  createModuleFromTemplate: { id: string; name: string; config: string };
 };
 
 export type NodeTemplatesQueryVariables = Exact<{
@@ -900,6 +938,21 @@ export type GetNodeTemplatesQuery = {
     icon: string | null;
     allowedHosts: Array<string>;
   }>;
+};
+
+export type GetNodeTemplateQueryVariables = Exact<{
+  id: string;
+}>;
+
+export type GetNodeTemplateQuery = {
+  nodeTemplate: {
+    id: string;
+    name: string;
+    category: string;
+    description: string | null;
+    configSchema: string;
+    icon: string | null;
+  };
 };
 
 export type AnalyzeRhaiQueryVariables = Exact<{
@@ -3350,6 +3403,156 @@ export const useUpdateSecretMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
+export const GetCapabilityCeilingDetailDocument = new TypedDocumentString(`
+    query GetCapabilityCeilingDetail {
+  capabilityCeilingDetail {
+    ceiling
+    source
+    grantedByEmail
+    grantedAt
+    notes
+  }
+}
+    `);
+
+export const useGetCapabilityCeilingDetailQuery = <
+  TData = GetCapabilityCeilingDetailQuery,
+  TError = unknown,
+>(
+  variables?: GetCapabilityCeilingDetailQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetCapabilityCeilingDetailQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetCapabilityCeilingDetailQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetCapabilityCeilingDetailQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["GetCapabilityCeilingDetail"]
+        : ["GetCapabilityCeilingDetail", variables],
+    queryFn: graphqlFetcher<
+      GetCapabilityCeilingDetailQuery,
+      GetCapabilityCeilingDetailQueryVariables
+    >(GetCapabilityCeilingDetailDocument, variables),
+    ...options,
+  });
+};
+
+export const GetCapabilityWorldHierarchyDocument = new TypedDocumentString(`
+    query GetCapabilityWorldHierarchy {
+  capabilityWorldHierarchy {
+    name
+    rank
+    description
+  }
+}
+    `);
+
+export const useGetCapabilityWorldHierarchyQuery = <
+  TData = GetCapabilityWorldHierarchyQuery,
+  TError = unknown,
+>(
+  variables?: GetCapabilityWorldHierarchyQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetCapabilityWorldHierarchyQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetCapabilityWorldHierarchyQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetCapabilityWorldHierarchyQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["GetCapabilityWorldHierarchy"]
+        : ["GetCapabilityWorldHierarchy", variables],
+    queryFn: graphqlFetcher<
+      GetCapabilityWorldHierarchyQuery,
+      GetCapabilityWorldHierarchyQueryVariables
+    >(GetCapabilityWorldHierarchyDocument, variables),
+    ...options,
+  });
+};
+
+export const RevokeCapabilityCeilingDocument = new TypedDocumentString(`
+    mutation RevokeCapabilityCeiling($userId: UUID!) {
+  revokeCapabilityCeiling(userId: $userId)
+}
+    `);
+
+export const useRevokeCapabilityCeilingMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    RevokeCapabilityCeilingMutation,
+    TError,
+    RevokeCapabilityCeilingMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    RevokeCapabilityCeilingMutation,
+    TError,
+    RevokeCapabilityCeilingMutationVariables,
+    TContext
+  >({
+    mutationKey: ["RevokeCapabilityCeiling"],
+    mutationFn: (variables?: RevokeCapabilityCeilingMutationVariables) =>
+      graphqlFetcher<
+        RevokeCapabilityCeilingMutation,
+        RevokeCapabilityCeilingMutationVariables
+      >(RevokeCapabilityCeilingDocument, variables)(),
+    ...options,
+  });
+};
+
+export const GetCurrentUserIdDocument = new TypedDocumentString(`
+    query GetCurrentUserId {
+  me {
+    id
+  }
+}
+    `);
+
+export const useGetCurrentUserIdQuery = <
+  TData = GetCurrentUserIdQuery,
+  TError = unknown,
+>(
+  variables?: GetCurrentUserIdQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetCurrentUserIdQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetCurrentUserIdQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetCurrentUserIdQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["GetCurrentUserId"]
+        : ["GetCurrentUserId", variables],
+    queryFn: graphqlFetcher<
+      GetCurrentUserIdQuery,
+      GetCurrentUserIdQueryVariables
+    >(GetCurrentUserIdDocument, variables),
+    ...options,
+  });
+};
+
 export const ListServiceIntegrationsDocument = new TypedDocumentString(`
     query ListServiceIntegrations {
   serviceIntegrations {
@@ -3528,6 +3731,7 @@ export const CreateModuleFromTemplateDocument = new TypedDocumentString(`
     mutation CreateModuleFromTemplate($input: CreateModuleInput!) {
   createModuleFromTemplate(input: $input) {
     id
+    name
     config
   }
 }
@@ -3637,6 +3841,41 @@ export const useGetNodeTemplatesQuery = <
       GetNodeTemplatesQuery,
       GetNodeTemplatesQueryVariables
     >(GetNodeTemplatesDocument, variables),
+    ...options,
+  });
+};
+
+export const GetNodeTemplateDocument = new TypedDocumentString(`
+    query GetNodeTemplate($id: UUID!) {
+  nodeTemplate(id: $id) {
+    id
+    name
+    category
+    description
+    configSchema
+    icon
+  }
+}
+    `);
+
+export const useGetNodeTemplateQuery = <
+  TData = GetNodeTemplateQuery,
+  TError = unknown,
+>(
+  variables: GetNodeTemplateQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetNodeTemplateQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<GetNodeTemplateQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<GetNodeTemplateQuery, TError, TData>({
+    queryKey: ["GetNodeTemplate", variables],
+    queryFn: graphqlFetcher<
+      GetNodeTemplateQuery,
+      GetNodeTemplateQueryVariables
+    >(GetNodeTemplateDocument, variables),
     ...options,
   });
 };

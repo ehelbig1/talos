@@ -21,6 +21,7 @@
 //! inside workflow node configs) lives in `talos-workflow-engine` and is
 //! re-exported by `controller::secrets::vault_resolver` for convenience.
 
+pub mod errors;
 pub mod integration_state_crypto;
 pub mod kek_provider;
 pub mod kek_rewrap;
@@ -30,6 +31,7 @@ pub mod vault_kek_provider;
 mod identifier;
 mod manager;
 
+pub use errors::SecretsError;
 pub use identifier::{SecretIdentifier, SecretResolveError};
 pub use manager::*;
 

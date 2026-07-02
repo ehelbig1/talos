@@ -24,7 +24,6 @@
     "@radix-ui/react-tabs": "^1.1.13",
     "@radix-ui/react-tooltip": "^1.2.8",
     "@tanstack/react-query": "^5.90.21",
-    "@vitejs/plugin-react": "^5.1.4",
     "@xyflow/react": "^12.6.0",
     "clsx": "^2.1.1",
     "dagre": "^0.8.5",
@@ -35,7 +34,7 @@
     "react-dom": "^19.2.4",
     "react-router-dom": "^7.13.0",
     "sonner": "^2.0.7",
-    "zod": "^3.22.4",
+    "zod": "^3.25.76",
     "zustand": "^5.0.11"
   },
   "devDependencies": {
@@ -54,6 +53,7 @@
     "@types/react-dom": "^19.2.3",
     "@typescript-eslint/eslint-plugin": "^8.57.0",
     "@typescript-eslint/parser": "^8.57.0",
+    "@vitejs/plugin-react": "^5.1.4",
     "@vitest/coverage-v8": "^4.0.18",
     "autoprefixer": "^10.4.24",
     "cors": "^2.8.5",

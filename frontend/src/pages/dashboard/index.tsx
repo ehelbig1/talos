@@ -3,8 +3,8 @@ import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
-const WorkflowExecutionHistory = lazy(
-  () => import("@/components/settings/WorkflowExecutionHistory"),
+const WorkflowExecutionHistoryDialog = lazy(
+  () => import("@/components/settings/WorkflowExecutionHistoryDialog"),
 );
 const WorkflowVersionsPanel = lazy(
   () => import("@/components/settings/WorkflowVersionsPanel"),
@@ -515,7 +515,7 @@ export default function Dashboard() {
 
       <Suspense fallback={null}>
         {historyWorkflow && (
-          <WorkflowExecutionHistory
+          <WorkflowExecutionHistoryDialog
             workflowId={historyWorkflow.id}
             workflowName={historyWorkflow.name}
             onClose={() => setHistoryWorkflow(null)}

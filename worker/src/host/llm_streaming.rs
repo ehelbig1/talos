@@ -42,7 +42,7 @@ impl TalosContext {
 
         // Enforce concurrent stream cap to prevent resource leaks from unbounded creation.
         {
-            let streams = self.llm_streams.lock().map_err(|_| {
+            let streams = self.streams.llm.lock().map_err(|_| {
                 wit_llm_streaming::Error::ApiError("Failed to acquire stream lock".to_string())
             })?;
             if streams.len() >= MAX_LLM_STREAMS_PER_EXECUTION {
@@ -61,7 +61,7 @@ impl TalosContext {
 
         // Store receiver so `next_event` can poll it.
         {
-            let mut streams = self.llm_streams.lock().map_err(|_| {
+            let mut streams = self.streams.llm.lock().map_err(|_| {
                 wit_llm_streaming::Error::ApiError("Failed to acquire stream lock".to_string())
             })?;
             streams.insert(stream_id.clone(), rx);
@@ -578,7 +578,7 @@ impl wit_llm_streaming::Host for TalosContext {
     async fn next_event(&mut self, stream_id: String) -> Option<wit_llm_streaming::StreamEvent> {
         // Take the receiver out of the map so we don't hold the mutex during await.
         let mut rx = {
-            let mut streams = self.llm_streams.lock().ok()?;
+            let mut streams = self.streams.llm.lock().ok()?;
             streams.remove(&stream_id)?
         };
 
@@ -590,7 +590,7 @@ impl wit_llm_streaming::Host for TalosContext {
 
         // Put the receiver back unless the channel is closed (None = sender dropped).
         if event.is_some() {
-            if let Ok(mut streams) = self.llm_streams.lock() {
+            if let Ok(mut streams) = self.streams.llm.lock() {
                 streams.insert(stream_id, rx);
             }
         }
@@ -642,7 +642,7 @@ impl wit_llm_streaming::Host for TalosContext {
 
     async fn cancel_stream(&mut self, stream_id: String) {
         // Remove the receiver — the sender task will detect the closed channel and stop.
-        if let Ok(mut streams) = self.llm_streams.lock() {
+        if let Ok(mut streams) = self.streams.llm.lock() {
             streams.remove(&stream_id);
         }
     }

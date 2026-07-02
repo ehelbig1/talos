@@ -14,9 +14,11 @@
 
 mod common;
 
-use controller::workflow_repository::{
-    ConcurrencyAdmission, InitialExecutionStatus, WorkflowRepository,
-};
+// Import from the canonical crate, not the controller's `pub(crate)`
+// re-export shim (the shim was `pub` until the main.rs decomposition in
+// #381 narrowed it; per the architectural mandate, external code — tests
+// included — depends on `talos_*` crates directly).
+use talos_workflow_repository::{ConcurrencyAdmission, InitialExecutionStatus, WorkflowRepository};
 use uuid::Uuid;
 
 async fn status(pool: &sqlx::Pool<sqlx::Postgres>, id: Uuid) -> String {

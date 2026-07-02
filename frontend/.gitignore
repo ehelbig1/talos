@@ -1,0 +1,13 @@
+# Build output
+dist/
+.vite/
+
+# Test / coverage artifacts
+coverage/
+playwright-report/
+test-results/
+
+# Debug artifacts (screenshots, lint dumps, bundle stats) — never commit
+*.png
+lint_errors.txt
+stats.html

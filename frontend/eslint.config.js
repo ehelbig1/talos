@@ -119,22 +119,6 @@ export default [
             ],
         },
     },
-    // Grandfathered violations — legacy direct-transport call sites that
-    // predate the rule. Migrate to generated hooks / graphqlApi wrappers when
-    // touching these files, then remove them from this list. Do NOT add files.
-    {
-        files: [
-            "src/components/CreateModuleDialog.tsx",
-            "src/components/builder/ModuleBuilder.tsx",
-            "src/components/settings/CapabilityCeilingManager.tsx",
-            "src/components/settings/OAuthManager.tsx",
-            "src/components/templates/TemplateLibrary.tsx",
-        ],
-        rules: {
-            "no-restricted-imports": "off",
-        },
-    },
-
     // Disable rules that conflict with Prettier
     prettierConfig,
 ];

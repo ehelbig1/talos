@@ -178,6 +178,28 @@ describe("workflowStore", () => {
     expect(state.edges[1].target).toBe(nodes[0].id);
   });
 
+  it("should load a workflow and set its metadata", () => {
+    const { clearWorkflow, loadWorkflow, setWorkflowMeta } =
+      useWorkflowStore.getState();
+    clearWorkflow();
+    const dummyNode = {
+      id: "n1",
+      type: "talosNode",
+      position: { x: 0, y: 0 },
+      data: { label: "", moduleId: "m", moduleName: "M" },
+    } as any;
+    const dummyEdge = { id: "e1", source: "n1", target: "n2" } as any;
+
+    loadWorkflow({ nodes: [dummyNode], edges: [dummyEdge] });
+    setWorkflowMeta("id123", "Demo");
+
+    const state = useWorkflowStore.getState();
+    expect(state.nodes).toEqual([dummyNode]);
+    expect(state.edges).toEqual([dummyEdge]);
+    expect(state.workflowId).toBe("id123");
+    expect(state.workflowName).toBe("Demo");
+  });
+
   it("should mark state as dirty on position changes", () => {
     const { addNode, onNodesChange } = useWorkflowStore.getState();
     addNode("m1", "N1", { x: 0, y: 0 });
