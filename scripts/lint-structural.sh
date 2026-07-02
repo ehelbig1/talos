@@ -2299,8 +2299,10 @@ echo
 bold "▶ check 29: no bare engine.set_actor_id() outside the actor-application path"
 
 # Per-actor `max_llm_tier` is the tier-1 data-egress ceiling (tier1 = local
-# Ollama only, "data must not leave host"). `ActorRepository::apply_actor_to_engine`
-# stamps actor_id AND max_llm_tier together and fail-closes to Tier-1 on DB error.
+# Ollama only, "data must not leave host").
+# `talos_engine::actor_binding::apply_actor_to_engine` (moved there from
+# `ActorRepository` in 2026-07 — see check 51 for the layering rule) stamps
+# actor_id AND max_llm_tier together and fail-closes to Tier-1 on DB error.
 # A bare `engine.set_actor_id(aid)` in a consumer crate sets the actor WITHOUT the
 # tier, so the engine keeps the default Tier-2 — a tier-1 actor silently runs as
 # tier-2 and its data can leave the host. CLAUDE.md documents this ("never call
@@ -2308,8 +2310,8 @@ bold "▶ check 29: no bare engine.set_actor_id() outside the actor-application 
 # grep-by-hand enforced. This freezes it.
 #
 # Two legitimate definitions own the setter machinery and are exempt:
-#   * talos-workflow-engine/  — defines the engine + the `with_actor_id` builder.
-#   * talos-actor-repository/ — `apply_actor_to_engine` (the canonical stamp).
+#   * talos-workflow-engine/                — defines the engine + the `with_actor_id` builder.
+#   * talos-engine/src/actor_binding.rs     — `apply_actor_to_engine` (the canonical stamp).
 # Consumers must route through `apply_actor_to_engine`, or the builder's
 # `with_actor_id(...)` followed by `for_workflow(...)` (which re-applies the tier).
 # Opt out (a new path that stamps the tier itself) with
@@ -2319,7 +2321,7 @@ SET_ACTOR_VIOLATIONS=0
 if [ -n "$RG_BIN" ]; then
     sa_matches=$("$RG_BIN" -n --no-heading \
         -g '*.rs' \
-        -g '!talos-actor-repository/**' \
+        -g '!talos-engine/src/actor_binding.rs' \
         -g '!talos-workflow-engine/**' \
         -g '!**/tests/**' -g '!**/*_tests.rs' \
         -e '\.set_actor_id\(' \
@@ -2327,7 +2329,7 @@ if [ -n "$RG_BIN" ]; then
 else
     sa_matches=$(grep -rnE --include='*.rs' '\.set_actor_id\(' \
         talos-* worker controller 2>/dev/null \
-        | grep -vE 'talos-actor-repository/|talos-workflow-engine/|/tests/|_tests\.rs' || true)
+        | grep -vE 'talos-engine/src/actor_binding\.rs|talos-workflow-engine/|/tests/|_tests\.rs' || true)
 fi
 
 if [ -n "$sa_matches" ]; then
@@ -2354,8 +2356,8 @@ fi
 
 if [ "$SET_ACTOR_VIOLATIONS" -gt 0 ]; then
     red "✗ $SET_ACTOR_VIOLATIONS bare engine.set_actor_id() call(s) outside the actor-application path"
-    yellow "  → use ActorRepository::apply_actor_to_engine(&mut engine, actor_id) — it stamps"
-    yellow "    actor_id AND max_llm_tier (fail-closed to Tier-1), or the builder's"
+    yellow "  → use talos_engine::actor_binding::apply_actor_to_engine(&repo, &mut engine, actor_id)"
+    yellow "    — it stamps actor_id AND max_llm_tier (fail-closed to Tier-1), or the builder's"
     yellow "    with_actor_id(..) + for_workflow(..). Bare set_actor_id leaves a tier-1 actor at"
     yellow "    the default Tier-2 — a data-egress hole."
     yellow "  → Opt out (path stamps the tier itself): // allow-bare-set-actor-id: <reason>"
@@ -3393,7 +3395,60 @@ else
 fi
 echo
 
-# ── 51. Lint self-consistency (meta-check) ────────────────────────────
+# ── 51. No workflow-engine dep in repository crates (layering) ────────
+# Repository crates are the persistence layer; the workflow engine is the
+# execution layer above them. `talos-actor-repository` grew a dependency
+# on `talos-workflow-engine` (+ `-core`) purely to host
+# `apply_actor_to_engine(&mut ParallelWorkflowEngine, …)` — a
+# persistence crate reaching UP into the engine. Fixed 2026-07 by moving
+# the function to `talos_engine::actor_binding` (the application layer
+# that already composes repo + engine); this check freezes the fix so
+# the inverted edge can't creep back via the next "convenient helper".
+# Scope: the dep named exactly `talos-workflow-engine` in any
+# `talos-*-repository/Cargo.toml`. (`talos-workflow-engine-core` is the
+# dep-free trait-boundary crate and is deliberately NOT forbidden —
+# `talos-workflow-repository` legitimately implements its traits.)
+# Opt out with `# allow-repo-engine-dep: <reason>` on the dep line or
+# within 4 lines above it.
+bold "▶ check 51: no talos-workflow-engine dependency in talos-*-repository crates"
+
+REPO_ENGINE_DEP_VIOLATIONS=0
+for repo_toml in talos-*-repository/Cargo.toml; do
+    [ -f "$repo_toml" ] || continue
+    dep_matches=$(grep -nE '^[[:space:]]*talos-workflow-engine[[:space:]]*=' "$repo_toml" || true)
+    [ -n "$dep_matches" ] || continue
+    while IFS= read -r line; do
+        lineno=$(echo "$line" | cut -d: -f1)
+        body=$(echo "$line" | cut -d: -f2-)
+        # Same-line or nearby opt-out marker.
+        if echo "$body" | grep -q '# allow-repo-engine-dep:'; then
+            continue
+        fi
+        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
+            start=$((lineno > 4 ? lineno - 4 : 1))
+            ctx=$(sed -n "${start},${lineno}p" "$repo_toml" 2>/dev/null || true)
+            if echo "$ctx" | grep -q '# allow-repo-engine-dep:'; then
+                continue
+            fi
+        fi
+        printf '  %s:%s\n' "$repo_toml" "$line"
+        REPO_ENGINE_DEP_VIOLATIONS=$((REPO_ENGINE_DEP_VIOLATIONS + 1))
+    done <<< "$dep_matches"
+done
+
+if [ "$REPO_ENGINE_DEP_VIOLATIONS" -gt 0 ]; then
+    red "✗ $REPO_ENGINE_DEP_VIOLATIONS talos-workflow-engine dep(s) in repository crates (layering inversion)"
+    yellow "  → repository crates are the persistence layer; they must not depend on the"
+    yellow "    execution engine. Put engine-touching helpers in the application layer"
+    yellow "    (talos-engine — see actor_binding::apply_actor_to_engine for the pattern)."
+    yellow "  → documented exception: # allow-repo-engine-dep: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ no talos-workflow-engine dependency in repository crates"
+fi
+echo
+
+# ── 52. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
 # pre-push hook comment said 40 — three sources, three numbers. Assert
@@ -3401,7 +3456,7 @@ echo
 # a renumber went wrong or a check was deleted without renumbering), and
 # (b) CLAUDE.md's "N checks today" sentence matches the real count. The
 # pre-push hook no longer states a number (it points at --count).
-bold "▶ check 51: lint self-consistency (check numbering + documented count)"
+bold "▶ check 52: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"
 META_FAIL=0

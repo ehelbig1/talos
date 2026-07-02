@@ -392,9 +392,8 @@ pub async fn for_workflow(
     //    contract by giving the caller "no actor at all" instead of
     //    "actor with safe ceiling".
     if let Some(actor_id) = opts.effective_actor_id {
-        if let Err(e) = actor_repo
-            .apply_actor_to_engine(&mut engine, actor_id)
-            .await
+        if let Err(e) =
+            crate::actor_binding::apply_actor_to_engine(&actor_repo, &mut engine, actor_id).await
         {
             tracing::warn!(
                 workflow_id = %opts.workflow_id,

@@ -2,13 +2,166 @@
 
 All notable changes to the Talos platform are documented in this file.
 
-## [Unreleased] — 2026-05-05 → 2026-07-01
+## [Unreleased] — 2026-05-05 → 2026-07-02
 
 > Entries below dated after 2026-05-05 use **PR numbers** (the May→June work
 > landed as discrete PRs rather than the `rNNN` review-pass numbering of the
 > architectural-extraction sprint). The `rNNN` sections that follow are the
 > 2026-05-05 architectural-mandate batch, unchanged.
 
+
+### Auto-generated from merged PRs (review before release)
+
+* **#232** (2026-06-16) — sec(tenancy): remove two dead unscoped query paths (latent cross-tenant footguns)
+* **#233** (2026-06-14) — Codebase review follow-ups: RLS pre-flight gate, status reconciliation, devex
+* **#234** (2026-06-15) — test(controller): per-test DB isolation via template-database clone
+* **#235** (2026-06-16) — sec(crypto): zeroize derived AEAD subkeys + decrypted plaintext buffers
+* **#236** (2026-06-16) — chore(deps): bump wasmtime family 44.0.2 → 44.0.3 (RUSTSEC-2026-0182)
+* **#237** (2026-06-17) — sec(crypto): per-context HKDF subkeys for all shared-key AEAD paths (finding #1)
+* **#238** (2026-06-17) — sec(audit): cryptographic verification for the WORM audit ledger (finding #2)
+* **#239** (2026-06-17) — sec(audit): audit-chain verification exposure — continuous sweep + on-demand GraphQL query (finding #2)
+* **#240** (2026-06-17) — docs(deploy): expose AUDIT_CHAIN_SWEEP_INTERVAL_SECS via helm + deployment env reference
+* **#241** (2026-06-17) — sec: envelope-encryption hardening + KEK-backed OTLP auth-header encryption
+* **#242** (2026-06-17) — sec(audit): retire the legacy env-master-key OTLP encryption path
+* **#243** (2026-06-18) — sec(deploy): fail closed on plaintext backend connections in production (P1-A)
+* **#244** (2026-06-18) — sec(deploy): in-cluster TLS for Postgres + Neo4j (companion to #243)
+* **#245** (2026-06-18) — sec(deploy): in-cluster TLS for NATS — completes the prod-boot TLS set
+* **#246** (2026-06-18) — sec(deploy): refuse env-backed KEK in production unless explicitly acknowledged (P1-B)
+* **#247** (2026-06-18) — fix(rate-limit): bound Redis check with a timeout (fixes CI hang + outage stall)
+* **#248** (2026-06-18) — ci(nextest): terminate hung tests so a stuck test fails fast + named
+* **#249** (2026-06-24) — Codebase review remediation: 6 security + 6 performance findings + 2 lint gaps
+* **#250** (2026-06-24) — Review round 2: engine exactly-once fix + webhook dedup + circuit-breaker hardening
+* **#251** (2026-06-24) — Review follow-ups: fresh-run fencing + worker job idempotency + webhook workflow dedup
+* **#252** (2026-06-24) — Review round 3: deploy posture (2 HIGH) + scheduler concurrency + telemetry/sigstore hardening
+* **#253** (2026-06-24) — Scheduler: epoch-fence scheduled runs (FU-1 follow-up)
+* **#254** (2026-06-24) — Webhooks: epoch-fence the async webhook run (FU-1 follow-up)
+* **#255** (2026-06-24) — Worker: pipeline-path job_id idempotency (FU-2 follow-up)
+* **#256** (2026-06-24) — sec(mcp): gate catalog-module rate-limit writes on platform-admin
+* **#257** (2026-06-24) — sec(deploy): in-cluster TLS for Vault — completes the prod-boot TLS set
+* **#258** (2026-06-24) — fix: 6 bugs found by adversarially self-reviewing the review PRs (incl. 1 HIGH)
+* **#259** (2026-06-25) — fix(dev): make local-dev onboarding work — ollama opt-in, complete .env, /auth/csrf proxy
+* **#261** (2026-06-25) — fix(engine): promote queued→running so UI-triggered workflows finalize to completed
+* **#262** (2026-06-25) — fix(dev): restore onboarding fixes dropped from #259's squash merge
+* **#263** (2026-06-25) — fix(engine): record pipeline step module_executions with module id, not node id
+* **#264** (2026-06-25) — fix(secrets): drop secret_audit_log→secrets FK so secrets can be deleted
+* **#265** (2026-06-25) — fix(dev): default embedding model to 1024-dim mxbai-embed-large (semantic memory was broken)
+* **#266** (2026-06-25) — fix(audit): drop user_id FKs from auth_audit_log + admin_event_log (sibling of #264)
+* **#267** (2026-06-25) — fix(webhooks): finalize module_executions row after webhook-fired module run
+* **#268** (2026-06-25) — fix(engine): race-safe finalize of chained workflow executions
+* **#269** (2026-06-25) — fix(engine): store real workflow_id on approval requests so they can be approved
+* **#270** (2026-06-25) — docs: functional & governance audit findings (2026-06-25)
+* **#271** (2026-06-25) — fix(engine): finalize crash-recovered executions (stuck in 'resuming')
+* **#272** (2026-06-25) — lint: freeze the resume-finalize + audit-FK bug classes (checks 46/47)
+* **#273** (2026-06-25) — docs: fold #271 + #272 into the functional-audit findings
+* **#274** (2026-06-25) — docs: record OAuth CSRF/state security audit (verified clean)
+* **#275** (2026-06-25) — fix(mcp): compile_custom_sandbox pointed callers at a dead execution path
+* **#276** (2026-06-25) — docs: fold #275 + MCP untrusted-compile audit into findings
+* **#277** (2026-06-25) — fix(mcp): reject multi-node cycles in create_workflow
+* **#278** (2026-06-25) — fix(compile): isolate WASM artifact per job — concurrent compiles cross-contaminated
+* **#279** (2026-06-25) — docs: fold #277 + #278 + sub-workflow dispatch audit into findings
+* **#280** (2026-06-25) — docs: record structural-node + inline-Rust path audit (verified clean)
+* **#281** (2026-06-25) — fix(dev): align ollama EMBED_MODEL bake default with the 1024-dim runtime
+* **#282** (2026-06-25) — docs: add #281 + LLM-dispatch (tier-1 Ollama) to findings
+* **#283** (2026-06-25) — docs: record judge/reflective-retry/agent-loop orchestration nodes (verified clean)
+* **#284** (2026-06-26) — fix(governance): close actor-budget TOCTOU race at execution trigger
+* **#285** (2026-06-26) — fix(governance): stop advertising inert actor-budget caps as enforced safety caps
+* **#286** (2026-06-26) — feat(governance): enforce max_workflows_per_minute (atomic per-actor trigger-rate cap)
+* **#287** (2026-06-26) — feat(governance): enforce max_fuel_per_hour (rolling per-actor fuel cap)
+* **#288** (2026-06-26) — docs(governance): explain why the last two reserved caps aren't per-actor-enforceable
+* **#289** (2026-06-26) — docs: record battle-hardening phase (#284 TOCTOU + budget enforcement + clean sweeps)
+* **#290** (2026-06-26) — docs: record dependency failure-injection sweep (NATS/Redis/worker — all clean)
+* **#291** (2026-06-26) — fix(logs): route WASM logs without an FK-violation per standalone-module line
+* **#292** (2026-06-26) — fix(approval): mark module-approval pending with a stable [APPROVAL_PENDING] prefix
+* **#293** (2026-06-26) — docs: record 2026-06-26 penetration test (incl. deep specialist areas — no findings)
+* **#294** (2026-06-26) — sec(deps): bump quinn-proto 0.11.14 → 0.11.15 (RUSTSEC-2026-0185, CVSS 7.5)
+* **#295** (2026-06-26) — feat(graph-rag): persist Entity.properties with Cypher-injection-safe key sanitization
+* **#296** (2026-06-26) — fix(worker): correct rotted wasmtime version in AOT engine-config fingerprint
+* **#297** (2026-06-26) — docs: record DoS/resource-exhaustion posture verification
+* **#298** (2026-06-26) — fix(security): scope list_scaffolding_templates to caller — cross-tenant module-name leak
+* **#299** (2026-06-26) — docs: record frontend security review (code clean) + dependency remediation checklist
+* **#300** (2026-06-26) — ci(frontend): add advisory npm audit gate to quality.yml
+* **#301** (2026-06-26) — fix(frontend deps): clear advisory debt 33 → 2 (0 high/critical)
+* **#302** (2026-06-26) — ci(frontend): make npm audit gate blocking (backlog cleared in #301)
+* **#303** (2026-06-26) — fix(frontend deps): override monaco's dompurify to patched 3.4.11 (→ 0 vulns)
+* **#304** (2026-06-26) — ci(frontend): tighten npm audit gate to --audit-level=moderate (0 vulns)
+* **#305** (2026-06-26) — feat(dx): add `make doctor` — preflight for recurring local-dev traps
+* **#306** (2026-06-26) — feat(dx): add `make test-changed` — nextest only the crates you touched
+* **#307** (2026-06-26) — feat(actor): Phase A — attribute module_executions to an owning actor
+* **#308** (2026-06-26) — feat(actor): Phase B — default actor per user + resolve_effective_actor
+* **#309** (2026-06-26) — feat(actor): Phase C1 — route gmail/gcal push dispatch through resolve_effective_actor
+* **#310** (2026-06-26) — feat(actor): Phase C2 — route webhook dispatch through resolve_effective_actor
+* **#311** (2026-06-26) — feat(actor): Phase C3 — attribute test_workflow executions to an actor
+* **#312** (2026-06-26) — feat(actor): Phase D1 — universalize trigger enforcement (ceiling-exempt default)
+* **#313** (2026-06-26) — feat(actor): Phase D2 (part 1) — stamp the resolved actor on the main trigger path
+* **#314** (2026-06-26) — feat(actor): Phase D2.2 — auto-stamp the default actor on execution inserts
+* **#315** (2026-06-26) — feat(actor): Phase D2.3 — provision a default actor at signup
+* **#316** (2026-06-26) — feat(actor): Phase E (part 1) — backfill execution actor_id
+* **#317** (2026-06-26) — feat(actor): Phase E (part 2) — actor_id NOT NULL on both execution tables
+* **#318** (2026-06-26) — docs: correct the "DEK lineage is per-user" myth (the DEK is global)
+* **#319** (2026-06-26) — docs(schema): COMMENT the actor_id columns as execution-principal, not ownership
+* **#320** (2026-06-27) — feat(crypto): per-tenant root DEKs — Phase 1 (foundation, non-breaking)
+* **#321** (2026-06-27) — feat(crypto): per-org DEK cutover #1 — users.totp_secret (v4)
+* **#322** (2026-06-27) — feat(crypto): per-org DEK cutover #2 — OTLP audit auth headers (v4)
+* **#323** (2026-06-27) — feat(crypto): per-org DEK cutover #3 — webhook signing secrets (v4)
+* **#324** (2026-06-27) — feat(crypto): per-org DEK cutover #4 — secrets table (v4, shared-org)
+* **#325** (2026-06-27) — feat(crypto): per-org DEK cutover #5 — actor_memory (v4) + clone v3/v4 fix
+* **#326** (2026-06-27) — feat(crypto): per-org DEK cutover #6 — workflow execution output (v4)
+* **#327** (2026-06-27) — feat(crypto): per-org DEK sweep — migrate existing org-scoped secrets to v4
+* **#328** (2026-06-27) — feat(crypto): per-org DEK sweep — migrate existing actor_memory rows to v4
+* **#329** (2026-06-27) — feat(crypto): per-org DEK sweep — migrate existing execution outputs to v4
+* **#330** (2026-06-27) — feat(crypto): per-org DEK cutover #7 — module_executions payloads (v4)
+* **#331** (2026-06-27) — feat(crypto): per-org DEK sweep — migrate existing module payloads to v4
+* **#332** (2026-06-27) — feat(crypto): per-org DEK migration-status admin query
+* **#333** (2026-06-27) — chore(crypto): drop dead workspace_oci_settings table
+* **#334** (2026-06-27) — docs: correct the crypto model to per-ORG DEKs (formats v3/v4)
+* **#335** (2026-06-27) — docs: add a worked end-to-end example (AI PR reviewer)
+* **#336** (2026-06-27) — docs(rfc): RFC 0007 — native GitHub integration (Phase A: event-typed triggers)
+* **#337** (2026-06-27) — feat(webhooks): RFC 0007 Phase A.1 — event-typed webhook triggers (engine side)
+* **#338** (2026-06-27) — feat(webhooks): RFC 0007 Phase A.2 — set event_filter via GraphQL create + write-time validation
+* **#339** (2026-06-27) — feat(webhooks): RFC 0007 Phase A.3 — set event_filter via MCP create_webhook
+* **#340** (2026-06-27) — feat(webhooks): RFC 0007 Phase A.4 — read back event_filter on list queries
+* **#341** (2026-06-27) — feat(webhooks): RFC 0007 Phase A.5 — surface __webhook__ event metadata to trigger input
+* **#342** (2026-06-27) — docs(rfc): RFC 0008 — GitHub App authentication (Phase B of native GitHub)
+* **#343** (2026-06-28) — feat(github): RFC 0008 B1 — talos-github App JWT + installation-token primitives
+* **#344** (2026-06-29) — feat(github): RFC 0008 B2a — github_app_installations table + repository
+* **#345** (2026-06-29) — feat(github): RFC 0008 — async GitHub App API client (live mint + get-installation)
+* **#346** (2026-06-29) — feat(github): RFC 0008 — GithubAppConfig loader (resolves open-question 2)
+* **#347** (2026-06-29) — feat(github): RFC 0008 B2b-1 — connect-flow input-validation helpers
+* **#348** (2026-06-29) — fix(security): bump wasmtime 44→45.0.3 — RUSTSEC-2026-0188 (WASI FilePerms bypass)
+* **#349** (2026-06-29) — feat(github): RFC 0008 B2b-2 — connect/install flow service + handlers
+* **#350** (2026-06-29) — feat(github): RFC 0008 B2b-3 — wire GitHub App connect routes + helm env
+* **#351** (2026-06-29) — fix(security): bump anyhow 1.0.102→1.0.103 — RUSTSEC-2026-0190
+* **#352** (2026-06-29) — feat(github): RFC 0008 B3 — in-memory installation-token cache (auto-rotation)
+* **#353** (2026-06-29) — feat(github): RFC 0008 B5 — App webhook signature verifier
+* **#354** (2026-06-29) — test(github): add app_smoke example — live GitHub App credential check
+* **#355** (2026-06-29) — docs(github): GitHub App setup & testing runbook (RFC 0008)
+* **#356** (2026-06-29) — feat(github): RFC 0008 B4-core — GithubTokenResolver (App-first token resolution)
+* **#357** (2026-06-29) — feat(frontend): Connect GitHub App button (RFC 0008)
+* **#358** (2026-06-29) — chore(compose): wire GITHUB_APP_* into the controller (local-dev parity)
+* **#359** (2026-06-30) — feat(github): show connected installations on the Integrations card
+* **#360** (2026-06-30) — feat(github): RFC 0008 B4-wiring — resolve github_app:<owner> to an installation token
+* **#361** (2026-06-30) — fix(templates): github-pr-reviewer compile + make capability-world selection obvious
+* **#362** (2026-06-30) — fix(templates): github-pr-reviewer (compile + runtime) + lint-enforce capability-world selection
+* **#363** (2026-06-30) — fix(templates): github-pr-reviewer runtime — macro, data-flow, and secret API
+* **#364** (2026-06-30) — feat(templates): github-pr-reviewer uses host LLM service (local Ollama, no key)
+* **#365** (2026-06-30) — fix(worker): SSRF DNS resolver leaked port 80, breaking all outbound HTTPS
+* **#366** (2026-06-30) — fix(worker): fetch_with_bearer double-prefixed "Bearer" → 401 on all Bearer auth
+* **#367** (2026-06-30) — fix(worker): llm::complete routed local Ollama through the guest SSRF filter
+* **#368** (2026-06-30) — test(worker): regression guards for the outbound-egress bugs (#365/#366/#367)
+* **#369** (2026-07-01) — fix(engine): raise default node timeout 60s → 120s to match the worker op budget
+* **#370** (2026-07-01) — fix(worker): flush after publishing JobResult so a dropped reply can't silently hang the execution
+* **#371** (2026-07-01) — fix(api): detach test_workflow run so a client disconnect can't orphan the execution
+* **#372** (2026-07-01) — chore(dispatcher): gate signature_diag WARN behind TALOS_SIGNATURE_DIAG (default off)
+* **#373** (2026-07-01) — fix(test-run): complete the async test modal — output streaming, terminal-event durability, and the broken subscription query
+* **#374** (2026-07-01) — fix(github): scope github_app installation-token resolution to the owning user
+* **#375** (2026-07-01) — fix(integrations): harden OAuth/Gmail tenancy + cap unbounded response reads
+* **#376** (2026-07-01) — refactor(integrations): shared hardened HTTP client + lint (stage 1/3)
+* **#377** (2026-07-01) — refactor(integrations): shared OAuth authorize/consume flow helper (stage 2/3)
+* **#378** (2026-07-01) — feat(integrations): OAuthIntegration trait + authoritative guide (stage 3/3)
+* **#379** (2026-07-01) — feat(integrations): encrypt-at-rest for integration_state.value (AEAD)
+* **#380** (2026-07-02) — Codebase-review remediation: P0 correctness/security fixes + enforcement + structural refactors
+* **#381** (2026-07-02) — refactor(controller): decompose the 4,900-line async main() into phase functions
+* **#382** (2026-07-02) — Round 2 remediation: bus-factor, warn→fail gates, type-system graduation, typed errors, worker/frontend hardening
 ### 2026-07-01 — codebase-review remediation batch
 
 Follow-ups from a five-subsystem architecture/security review:

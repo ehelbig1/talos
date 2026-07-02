@@ -17,8 +17,6 @@ talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-memory = { path = "../talos-memory" }
 talos-text-util = { path = "../talos-text-util" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
-talos-workflow-engine = { path = "../talos-workflow-engine" }
-talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing.workspace = true

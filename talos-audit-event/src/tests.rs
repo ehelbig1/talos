@@ -118,7 +118,10 @@ fn verify_signature_round_trip() {
         hmac_signature: None,
     };
     event.hmac_signature = Some(hmac_sign(&event, &key));
-    assert_eq!(event.verify_signature(&[key.clone()]), Some(true));
+    assert_eq!(
+        event.verify_signature(std::slice::from_ref(&key)),
+        Some(true)
+    );
     // Wrong key -> invalid.
     assert_eq!(
         event.verify_signature(&[b"wrong-key".to_vec()]),
@@ -219,13 +222,13 @@ fn verify_chain_checks_signatures_when_keys_present() {
         e.hmac_signature = Some(hmac_sign(e, &key));
     }
     // All valid + signed.
-    let report = verify_chain("wf", "ex", &events, &[key.clone()]);
+    let report = verify_chain("wf", "ex", &events, std::slice::from_ref(&key));
     assert!(report.ok, "breaks: {:?}", report.breaks);
     assert!(report.signatures_checked);
 
     // Forge one signature -> BadSignature.
     events[1].hmac_signature = Some("deadbeef".to_string());
-    let report = verify_chain("wf", "ex", &events, &[key.clone()]);
+    let report = verify_chain("wf", "ex", &events, std::slice::from_ref(&key));
     assert!(report
         .breaks
         .iter()
@@ -238,6 +241,203 @@ fn verify_chain_checks_signatures_when_keys_present() {
         .breaks
         .iter()
         .any(|b| matches!(b, ChainBreak::Unsigned { seq: 2 })));
+}
+
+// ── verify_chain_anchored (terminal anchor / tail-truncation detection) ────
+
+#[test]
+fn terminal_anchor_intact_chain_passes() {
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    for i in 1..=3u64 {
+        ledger.append("worker", "act", &format!("payload-{i}"));
+    }
+    let mut events: Vec<AuditEvent> = Vec::new();
+    let mut rebuild = ExecutionLedger::new("wf", "ex");
+    for i in 1..=3u64 {
+        events.push(rebuild.append("worker", "act", &format!("payload-{i}")));
+    }
+    let anchor = rebuild.append_terminal_anchor("worker");
+    assert_eq!(anchor.action, TERMINAL_ANCHOR_ACTION);
+    assert_eq!(anchor.sequence_num, 4);
+    events.push(anchor);
+
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(report.ok, "chain breaks: {:?}", report.chain.breaks);
+    assert!(report.chain.ok);
+    assert_eq!(report.anchor, AnchorVerdict::Anchored { total_events: 4 });
+    assert!(!report.anchor.is_hard_failure());
+}
+
+#[test]
+fn terminal_anchor_detects_tail_truncation_before_anchor() {
+    // 5 events + anchor (6 total). Delete the two events immediately before
+    // the anchor — the classic "trim the incriminating tail but the anchor
+    // row survives" shape. Both the gap AND the anchor count check fire.
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    let mut events: Vec<AuditEvent> = (1..=5u64)
+        .map(|i| ledger.append("worker", "act", &format!("payload-{i}")))
+        .collect();
+    events.push(ledger.append_terminal_anchor("worker"));
+
+    events.remove(4); // seq 5
+    events.remove(3); // seq 4
+
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(!report.ok);
+    assert_eq!(
+        report.anchor,
+        AnchorVerdict::CountMismatch {
+            committed: 6,
+            found: 4
+        }
+    );
+    assert!(report.anchor.is_hard_failure());
+}
+
+#[test]
+fn terminal_anchor_deleted_tail_including_anchor_is_soft_unanchored() {
+    // Deleting the tail INCLUDING the anchor leaves a structurally valid
+    // 1..3 chain that is indistinguishable from a legacy pre-anchor chain —
+    // the verdict is the soft `Unanchored`, surfaced for callers that know
+    // the execution completed post-rollout, but `ok` is preserved.
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    let mut events: Vec<AuditEvent> = (1..=5u64)
+        .map(|i| ledger.append("worker", "act", &format!("payload-{i}")))
+        .collect();
+    events.push(ledger.append_terminal_anchor("worker"));
+
+    events.truncate(3); // drop seq 4, 5, and the anchor (seq 6)
+
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(report.chain.ok, "breaks: {:?}", report.chain.breaks);
+    assert_eq!(report.anchor, AnchorVerdict::Unanchored);
+    assert!(report.ok, "unanchored must NOT hard-fail");
+}
+
+#[test]
+fn unanchored_legacy_chain_gets_soft_verdict_not_failure() {
+    let events = build_chain("wf", "ex", 4);
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(report.ok);
+    assert!(report.chain.ok);
+    assert_eq!(report.anchor, AnchorVerdict::Unanchored);
+    assert!(!report.anchor.is_hard_failure());
+}
+
+#[test]
+fn terminal_anchor_tampered_count_is_caught_even_unsigned() {
+    // The anchor is the LAST event — nothing chains onto it, so (unsigned)
+    // its payload can be rewritten without any LinkageMismatch. The count
+    // check is what catches it.
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    let mut events: Vec<AuditEvent> = (1..=2u64)
+        .map(|i| ledger.append("worker", "act", &format!("payload-{i}")))
+        .collect();
+    events.push(ledger.append_terminal_anchor("worker"));
+    let last = events.len() - 1;
+    events[last].payload = format!("{{\"{TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD}\":7}}");
+
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(!report.ok);
+    assert_eq!(
+        report.anchor,
+        AnchorVerdict::CountMismatch {
+            committed: 7,
+            found: 3
+        }
+    );
+    // With HMAC keys configured the same tamper ALSO trips BadSignature.
+    let key = b"0123456789abcdef0123456789abcdef".to_vec();
+    let mut signed = events.clone();
+    for e in &mut signed {
+        e.hmac_signature = Some(hmac_sign(e, &key));
+    }
+    signed[last].payload = format!("{{\"{TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD}\":7}}");
+    signed[last].hmac_signature = events[last].hmac_signature.clone(); // keep pre-tamper (absent) sig? no — resign below
+    signed[last].hmac_signature = Some(hmac_sign(
+        &{
+            let mut clean = signed[last].clone();
+            clean.payload = format!("{{\"{TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD}\":3}}");
+            clean
+        },
+        &key,
+    )); // signature over the ORIGINAL (count=3) payload
+    let report = verify_chain_anchored("wf", "ex", &signed, &[key]);
+    assert!(!report.ok);
+    assert!(report
+        .chain
+        .breaks
+        .iter()
+        .any(|b| matches!(b, ChainBreak::BadSignature { seq: 3 })));
+}
+
+#[test]
+fn terminal_anchor_not_last_event_is_hard_failure() {
+    // Events appended AFTER the anchor = post-completion writes.
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    let mut events: Vec<AuditEvent> = (1..=2u64)
+        .map(|i| ledger.append("worker", "act", &format!("payload-{i}")))
+        .collect();
+    events.push(ledger.append_terminal_anchor("worker")); // seq 3
+    events.push(ledger.append("worker", "act", "sneaky-post-completion")); // seq 4
+
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(!report.ok);
+    assert_eq!(
+        report.anchor,
+        AnchorVerdict::NotTerminal {
+            anchor_seq: 3,
+            last_seq: 4
+        }
+    );
+    // The chain itself is structurally intact — only the anchor check fires.
+    assert!(report.chain.ok, "breaks: {:?}", report.chain.breaks);
+}
+
+#[test]
+fn terminal_anchor_malformed_payload_is_hard_failure() {
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    let mut events: Vec<AuditEvent> = (1..=2u64)
+        .map(|i| ledger.append("worker", "act", &format!("payload-{i}")))
+        .collect();
+    // An anchor-typed event appended with a junk payload (producer bug or
+    // tamper) must fail loud, never silently skip the count check.
+    events.push(ledger.append("worker", TERMINAL_ANCHOR_ACTION, "not-json"));
+
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(!report.ok);
+    assert_eq!(report.anchor, AnchorVerdict::MalformedAnchor { seq: 3 });
+}
+
+#[test]
+fn terminal_anchor_multiple_anchors_is_hard_failure() {
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    let mut events: Vec<AuditEvent> = (1..=2u64)
+        .map(|i| ledger.append("worker", "act", &format!("payload-{i}")))
+        .collect();
+    events.push(ledger.append_terminal_anchor("worker"));
+    events.push(ledger.append_terminal_anchor("worker"));
+
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(!report.ok);
+    assert_eq!(report.anchor, AnchorVerdict::MultipleAnchors { count: 2 });
+}
+
+#[test]
+fn terminal_anchor_commits_count_including_itself() {
+    // Producer invariant: committed total == anchor's own sequence_num ==
+    // full chain length including the anchor.
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    ledger.append("worker", "act", "p1");
+    let anchor = ledger.append_terminal_anchor("worker");
+    assert_eq!(anchor.sequence_num, 2);
+    let payload: serde_json::Value = serde_json::from_str(&anchor.payload).unwrap();
+    assert_eq!(
+        payload
+            .get(TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD)
+            .and_then(|v| v.as_u64()),
+        Some(2)
+    );
 }
 
 // ── audit_signing_key entropy floor (MCP-579 floor raise, 2026-06-23) ──

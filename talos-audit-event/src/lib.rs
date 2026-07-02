@@ -11,6 +11,35 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+// ============================================================================
+// Terminal anchor (tail-truncation detection)
+// ============================================================================
+//
+// The hash chain + HMAC detect gaps, reorders, and forgeries — but NOT tail
+// truncation: deleting the last N events leaves a perfectly valid 1..M chain.
+// The terminal anchor closes that gap. When an execution completes, the
+// producer appends one final event whose `action` is
+// [`TERMINAL_ANCHOR_ACTION`] and whose `payload` is a JSON object committing
+// the total chain length (INCLUDING the anchor itself) under
+// [`TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD`]. Because the anchor is an ordinary
+// [`AuditEvent`] appended through [`ExecutionLedger::append`], the committed
+// count is covered by the same length-prefixed hash + HMAC as every other
+// field — an attacker without the signing key cannot rewrite it.
+//
+// SINGLE SOURCE OF TRUTH: the producer ([`ExecutionLedger::append_terminal_anchor`])
+// and the verifier ([`verify_chain_anchored`]) both live in THIS crate and
+// both name these constants, so the event type / field name can never drift
+// between the worker and the offline sweep.
+
+/// `action` value of the terminal-anchor event the producer appends when an
+/// execution completes. Stable across releases — the offline verifier and
+/// operator dashboards key on this exact string.
+pub const TERMINAL_ANCHOR_ACTION: &str = "execution_complete";
+
+/// JSON field inside the terminal-anchor event's `payload` carrying the
+/// committed total number of chain events (including the anchor itself).
+pub const TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD: &str = "total_events";
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuditEvent {
     pub workflow_id: String,
@@ -335,6 +364,28 @@ impl ExecutionLedger {
 
         event
     }
+
+    /// Appends the TERMINAL ANCHOR — the final `execution_complete` event —
+    /// committing the total chain length into the signed, hash-chained
+    /// payload so tail truncation becomes detectable offline.
+    ///
+    /// The committed [`TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD`] count INCLUDES
+    /// the anchor itself, so for a well-formed chain it equals both the
+    /// anchor's own `sequence_num` and the total number of persisted events.
+    /// The anchor goes through the exact same [`ExecutionLedger::append`]
+    /// path as every other event (same length-prefixed encoding, same chain
+    /// link, same HMAC) — it is a NEW event type, not a wire-format change.
+    ///
+    /// Call exactly once, when the execution completes (success OR failure);
+    /// [`verify_chain_anchored`] hard-fails a chain with more than one anchor
+    /// or with events after the anchor.
+    pub fn append_terminal_anchor(&mut self, actor: &str) -> AuditEvent {
+        // +1: the anchor is itself part of the chain it is counting.
+        let total_events = self.current_sequence + 1;
+        let payload =
+            serde_json::json!({ TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD: total_events }).to_string();
+        self.append(actor, TERMINAL_ANCHOR_ACTION, &payload)
+    }
 }
 
 // ============================================================================
@@ -477,6 +528,156 @@ pub fn verify_chain(
         signatures_checked,
         breaks,
     }
+}
+
+// ============================================================================
+// Terminal-anchor verification (tail-truncation detection)
+// ============================================================================
+
+/// The terminal-anchor verdict for one persisted chain.
+///
+/// `Unanchored` is deliberately a SOFT verdict (it does not flip `ok`):
+/// chains produced before the anchor shipped legitimately have no terminal
+/// event, and `verify_chain_anchored` cannot distinguish a legacy chain from
+/// one whose tail (anchor included) was deleted. Callers that know the
+/// execution completed AFTER the anchor rollout should treat `Unanchored`
+/// as suspicious; everything in [`AnchorVerdict::is_hard_failure`] is
+/// positive tamper/corruption evidence regardless of era.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnchorVerdict {
+    /// A single terminal anchor is present as the last event and its
+    /// committed count matches the observed chain length.
+    Anchored { total_events: u64 },
+    /// No terminal anchor. Legacy pre-anchor chain OR the tail (including
+    /// the anchor) was deleted — indistinguishable from chain content alone,
+    /// hence soft. Historical chains MUST NOT hard-fail on this.
+    Unanchored,
+    /// Anchor present but its committed count does not match the number of
+    /// events observed — records are missing (or surplus). Hard failure.
+    CountMismatch { committed: u64, found: u64 },
+    /// Anchor present but NOT the last event — events were appended after
+    /// execution completion, or the anchor was moved. Hard failure.
+    NotTerminal { anchor_seq: u64, last_seq: u64 },
+    /// Anchor present but its payload is not a JSON object carrying a u64
+    /// [`TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD`] — tampered or producer bug.
+    /// Hard failure.
+    MalformedAnchor { seq: u64 },
+    /// More than one terminal anchor in the chain. Hard failure.
+    MultipleAnchors { count: u64 },
+}
+
+impl AnchorVerdict {
+    /// `true` for positive tamper/corruption evidence. `Anchored` and the
+    /// deliberately-soft `Unanchored` return `false`.
+    pub fn is_hard_failure(&self) -> bool {
+        !matches!(
+            self,
+            AnchorVerdict::Anchored { .. } | AnchorVerdict::Unanchored
+        )
+    }
+}
+
+/// [`ChainVerificationReport`] plus the terminal-anchor verdict.
+///
+/// This wraps (rather than extends) `ChainVerificationReport` so the
+/// existing report/break types stay source-compatible for downstream
+/// consumers that match on [`ChainBreak`] exhaustively or construct the
+/// report by struct literal (e.g. the GraphQL flattening layer). New
+/// verification callers should prefer [`verify_chain_anchored`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnchoredChainVerificationReport {
+    /// The structural + authenticity report from [`verify_chain`], unchanged.
+    pub chain: ChainVerificationReport,
+    /// The terminal-anchor verdict (tail-truncation detection).
+    pub anchor: AnchorVerdict,
+    /// `chain.ok` AND no hard anchor failure. `Unanchored` does NOT clear
+    /// this bit — legacy pre-anchor chains must keep verifying green.
+    pub ok: bool,
+}
+
+/// Derive the terminal-anchor verdict for a set of persisted events.
+/// Pure and deterministic; order-independent (keyed on `sequence_num`).
+fn anchor_verdict(events: &[AuditEvent]) -> AnchorVerdict {
+    let anchors: Vec<&AuditEvent> = events
+        .iter()
+        .filter(|e| e.action == TERMINAL_ANCHOR_ACTION)
+        .collect();
+    let anchor = match anchors.as_slice() {
+        [] => return AnchorVerdict::Unanchored,
+        [a] => *a,
+        many => {
+            return AnchorVerdict::MultipleAnchors {
+                count: many.len() as u64,
+            }
+        }
+    };
+
+    // The anchor certifies "nothing comes after me": it must carry the
+    // highest sequence number in the chain.
+    let last_seq = events.iter().map(|e| e.sequence_num).max().unwrap_or(0);
+    if anchor.sequence_num != last_seq {
+        return AnchorVerdict::NotTerminal {
+            anchor_seq: anchor.sequence_num,
+            last_seq,
+        };
+    }
+
+    // Committed count: a u64 under TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD in the
+    // anchor's JSON payload. Anything else is malformed — fail loud, never
+    // silently skip the count check (same fail-closed posture as the AAD
+    // value_format dispatch rule).
+    let committed = serde_json::from_str::<serde_json::Value>(&anchor.payload)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get(TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD))
+        .and_then(|v| v.as_u64());
+    let Some(committed) = committed else {
+        return AnchorVerdict::MalformedAnchor {
+            seq: anchor.sequence_num,
+        };
+    };
+
+    // Length check: the committed count includes the anchor itself, so it
+    // must equal the number of observed events. Note the anchor is the LAST
+    // event and nothing chains onto it — without this check an UNSIGNED
+    // anchor's payload (or a deleted run of trailing pre-anchor events whose
+    // absence the anchor survives) would go unnoticed. Duplicates inflate
+    // `found` and are additionally reported as `DuplicateSequence` by
+    // `verify_chain`.
+    let found = events.len() as u64;
+    if committed != found {
+        return AnchorVerdict::CountMismatch { committed, found };
+    }
+
+    AnchorVerdict::Anchored {
+        total_events: committed,
+    }
+}
+
+/// [`verify_chain`] plus the terminal-anchor check (tail-truncation
+/// detection). Prefer this for all new verification callers.
+///
+/// On top of the four structural/authenticity checks in [`verify_chain`],
+/// this verifies: when a terminal anchor ([`TERMINAL_ANCHOR_ACTION`]) is
+/// present it must be unique, must be the last event, and its committed
+/// [`TERMINAL_ANCHOR_TOTAL_EVENTS_FIELD`] count must equal the observed
+/// chain length. A chain WITHOUT an anchor yields the soft
+/// [`AnchorVerdict::Unanchored`] verdict — reported, but `ok` is preserved,
+/// because pre-anchor historical chains exist and must not hard-fail.
+///
+/// Pure and deterministic — unit-testable without S3, same as
+/// [`verify_chain`].
+pub fn verify_chain_anchored(
+    workflow_id: &str,
+    execution_id: &str,
+    events: &[AuditEvent],
+    keys: &[Vec<u8>],
+) -> AnchoredChainVerificationReport {
+    let chain = verify_chain(workflow_id, execution_id, events, keys);
+    let anchor = anchor_verdict(events);
+    let ok = chain.ok && !anchor.is_hard_failure();
+    AnchoredChainVerificationReport { chain, anchor, ok }
 }
 
 #[cfg(test)]

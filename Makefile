@@ -204,6 +204,9 @@ drill: ## Run the backup→restore drill (pg_dump + vault snapshot → scratch s
 smoke: ## End-to-end probe of a deployed cluster (BASE_URL=https://… SMOKE_AGENT_TOKEN=… SMOKE_ACTOR_ID=…)
 	@bash scripts/smoke.sh
 
+changelog: ## Print CHANGELOG entries missing for merged PRs (add --write via CHANGELOG_WRITE=1)
+	@bash scripts/changelog-update.sh $(if $(CHANGELOG_WRITE),--write,)
+
 schema-baseline: ## Generate the migration baseline snapshot + seed (RFC 0009; BASELINE_DATABASE_URL=… disposable PG)
 	@bash scripts/generate-schema-baseline.sh
 

@@ -75,7 +75,7 @@ impl GraphRagService {
     ///
     /// Fail-closed: if the tier lookup errors at extraction time,
     /// LLM extraction is skipped — same fail-closed contract as
-    /// `ActorRepository::apply_actor_to_engine`.
+    /// `talos_engine::actor_binding::apply_actor_to_engine`.
     #[must_use]
     pub fn with_actor_repo(
         mut self,
@@ -227,7 +227,7 @@ impl GraphRagService {
             // extraction would violate that ceiling, even though
             // graph-RAG itself is best-effort. Fail closed: if the
             // tier lookup errors, treat as Tier1 and skip — same
-            // contract as `ActorRepository::apply_actor_to_engine`.
+            // contract as `talos_engine::actor_binding::apply_actor_to_engine`.
             // When `actor_repo` is unset (e.g. unit tests), legacy
             // un-gated behaviour applies.
             if !self.actor_allows_external_llm(actor_id).await {
@@ -483,7 +483,7 @@ impl GraphRagService {
     ///     unusual; fail closed rather than leak data.
     ///   * `actor_repo` returns `Err(...)` → BLOCKED (DB error;
     ///     fail closed). Same contract as
-    ///     `ActorRepository::apply_actor_to_engine`.
+    ///     `talos_engine::actor_binding::apply_actor_to_engine`.
     async fn actor_allows_external_llm(&self, actor_id: Uuid) -> bool {
         let Some(repo) = &self.actor_repo else {
             // Legacy path — caller didn't wire in the repo, so don't
@@ -1455,7 +1455,7 @@ mod tier_gate_tests {
     #[test]
     fn db_error_fails_closed() {
         // Same fail-closed contract as
-        // ActorRepository::apply_actor_to_engine — never silently
+        // talos_engine::actor_binding::apply_actor_to_engine — never silently
         // promote to Tier2 on infra failure.
         assert!(!tier_decision_for_test(true, Some(Err(()))));
     }
@@ -1644,6 +1644,9 @@ mod batch_upsert_tests {
     }
 
     #[test]
+    // Deliberate constant assertions — a guard test that fails loudly
+    // if someone edits the cap outside its sane range.
+    #[allow(clippy::assertions_on_constants)]
     fn rule_based_cap_constant_is_a_sane_bound() {
         // The cap exists to stop an unbounded Jira sync from emitting
         // unbounded MERGE work. It must be > the LLM path's 20 (a real
