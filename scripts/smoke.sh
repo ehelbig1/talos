@@ -17,12 +17,16 @@
 # rolls back the operator's confidence before they walk away.
 #
 # Usage:
-#   smoke.sh                                          # default base, public paths only
-#   BASE_URL=https://talos.aegix.dev smoke.sh
-#   SMOKE_AGENT_TOKEN=... SMOKE_ACTOR_ID=... smoke.sh   # also exercise auth'd round-trip
+#   BASE_URL=https://talos.example.com smoke.sh          # public paths only
+#   SMOKE_AGENT_TOKEN=... SMOKE_ACTOR_ID=... smoke.sh     # also exercise auth'd round-trip
 #
 # Env vars:
-#   BASE_URL              Public URL of the deployment. Default: https://talos.aegix.dev
+#   BASE_URL              Public URL of the deployment. REQUIRED — no default.
+#                         (install.sh §9.1 passes the operator's own
+#                         TALOS_HOST-derived URL; there is deliberately no
+#                         baked-in default so the script can't silently
+#                         probe one operator's cluster from another's
+#                         machine.)
 #   SMOKE_AGENT_TOKEN     MCP agent token. Enables /mcp + GraphQL probes.
 #   SMOKE_ACTOR_ID        UUID of an actor to write a probe memory against.
 #                         If set together with SMOKE_AGENT_TOKEN, runs the
@@ -31,7 +35,13 @@
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-https://talos.aegix.dev}"
+BASE_URL="${BASE_URL:-}"
+if [ -z "$BASE_URL" ]; then
+    printf '\033[1;31m✗ BASE_URL is required\033[0m\n' >&2
+    printf '  Run: BASE_URL=https://your-deployment.example.com %s\n' "$0" >&2
+    printf '  (make smoke BASE_URL=... wires this through; install.sh passes it automatically.)\n' >&2
+    exit 2
+fi
 TIMEOUT="${SMOKE_TIMEOUT:-10}"
 PROBE_KEY="smoke/probe-$(date -u +%s)"
 PROBE_MAGIC="TALOS-SMOKE-$(openssl rand -hex 4)"
