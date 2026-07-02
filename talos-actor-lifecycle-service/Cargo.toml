@@ -1,0 +1,43 @@
+[package]
+name = "talos-actor-lifecycle-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-nats = "0.47"
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Talos crates — utility
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-memory = { path = "../talos-memory" }
+talos-text-util = { path = "../talos-text-util" }
+talos-validation = { path = "../talos-validation" }
+
+# Talos crates — repositories
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-module-repository = { path = "../talos-module-repository" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+
+# Talos crates — services
+talos-actor-scaffold = { path = "../talos-actor-scaffold" }
+talos-engine = { path = "../talos-engine" }
+talos-execution-result-collector = { path = "../talos-execution-result-collector" }
+talos-registry = { path = "../talos-registry" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true

@@ -18,88 +18,36 @@ use axum::{
 };
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
+use talos_integration_helpers::admin::{authorize_admin_request, require_uuid_field};
 use uuid::Uuid;
 
 /// Gate every request behind BOTH the big-red-button env var and a
 /// constant-time secret compare. Returns `Ok(())` on pass; the
 /// pre-built rejection response on fail.
+///
+/// The two-check defense (MCP-1064 canonical `admin_ops_enabled()`
+/// resolver + MCP-983 direct-slice `ct_eq`, no padded buffer) lives in
+/// `talos_integration_helpers::admin::authorize_admin_request` so the
+/// gmail/gcal skeletons can't drift and future security fixes land
+/// once.
 fn authorize(headers: &HeaderMap) -> Result<(), (StatusCode, Json<JsonValue>)> {
-    // MCP-1064 (2026-05-15): canonical `admin_ops_enabled()` resolver.
-    // Pre-fix this site accepted `1 | true` (case-insensitive); the
-    // controller secrets-admin sibling accepted ONLY `1`. Same env
-    // var, different behaviour across crates. Both now go through the
-    // canonical helper which accepts `true | 1 | yes | on`.
-    if !talos_config::admin_ops_enabled() {
-        tracing::warn!("admin gmail endpoint hit but ENABLE_ADMIN_OPS is unset/false");
-        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))));
-    }
-
-    let admin_secret = std::env::var("ADMIN_SECRET_KEY").unwrap_or_default();
-    let provided = headers
-        .get("X-Admin-Secret")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    // MCP-983 (2026-05-15): direct ct_eq on slices. Pre-fix used a
-    // 512-byte padded buffer with `a[..a.len().min(CT_BUF)].copy_...`
-    // — when `admin_secret.len() > 512` the comparison silently
-    // truncated to the first 512 bytes, so an attacker who knew the
-    // first 512 bytes (plus the true length, via the explicit
-    // `a.len() == b.len()` check) could authenticate against any
-    // longer secret. Subtle's slice `ct_eq` returns Choice(0)
-    // immediately on length mismatch and runs constant-time over
-    // equal-length contents — the implicit length compare leaks a
-    // negligible signal (microsecond timing on slice length, well
-    // under network jitter for sensibly-sized admin secrets). The
-    // 512-byte padding was a misguided attempt to mask length;
-    // removing it fixes the truncation bug and the length leak it
-    // tried to hide isn't exploitable for ≥16-char secrets anyway
-    // (search space dominates timing).
-    let bytes_ok = admin_secret.as_bytes().ct_eq(provided.as_bytes());
-    if admin_secret.is_empty() || bytes_ok.unwrap_u8() != 1 {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
-        ));
-    }
-    Ok(())
+    authorize_admin_request(headers, "gmail")
 }
 
+/// Audit-log a successful admin action. The MCP-1015 metadata DLP
+/// scrub + MCP-1197 measure-first-then-redact bound live in the shared
+/// helper; this wrapper pins Gmail's historical `admin_gmail_{action}`
+/// event_type and failure-warn text.
 async fn log_admin_action(pool: &sqlx::PgPool, user_id: Uuid, action: &str, metadata: JsonValue) {
-    // MCP-1015 (2026-05-15): DLP-redact metadata before persisting to
-    // the shared google_calendar_audit_log.metadata column. The
-    // `stop_all` caller below (line 283) packs `e.to_string()` of
-    // `stop_watch` failures into the `failed` array, and those error
-    // chains can carry Gmail API error bodies that echo refresh_token
-    // / access_token bytes on token-rejection paths. Same persistence-
-    // boundary rule as the sibling gcal helper at MCP-1015. Helper-
-    // level scrub means every current + future caller is covered
-    // without per-call discipline.
-    //
-    // MCP-1197 (2026-05-17): measure-first-then-redact via
-    // `redact_json_bounded`. Under a wide outage `stop_all` packs one
-    // entry per failed integration; with thousands of integrations the
-    // `failed` array can exceed 1 MiB and bloat the audit table + WAL.
-    // Returning `None` drops the metadata column to NULL (the
-    // event_type + success fields still persist, so operators retain
-    // the binary signal). Sibling of `bound_log_details` in
-    // talos-actor-repository (MCP-1195).
-    let scrubbed = talos_dlp_provider::redact_json_bounded(&metadata);
-    if let Err(e) = sqlx::query(
-        "INSERT INTO google_calendar_audit_log \
-         (user_id, event_type, success, metadata) \
-         VALUES ($1, $2, $3, $4)",
+    talos_integration_helpers::admin::log_admin_action(
+        pool,
+        user_id,
+        &format!("admin_gmail_{action}"),
+        action,
+        "admin gmail audit log insert failed",
+        metadata,
     )
-    .bind(user_id)
-    .bind(format!("admin_gmail_{action}"))
-    .bind(true)
-    .bind(scrubbed)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(error = %e, action, "admin gmail audit log insert failed");
-    }
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,31 +67,13 @@ pub async fn create_watch(
         return rejection;
     }
 
-    let user_id = match body
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "user_id required (uuid)"})),
-            )
-        }
+    let user_id = match require_uuid_field(&body, "user_id") {
+        Ok(id) => id,
+        Err(rejection) => return rejection,
     };
-    let integration_id = match body
-        .get("integration_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "integration_id required (uuid)"})),
-            )
-        }
+    let integration_id = match require_uuid_field(&body, "integration_id") {
+        Ok(id) => id,
+        Err(rejection) => return rejection,
     };
     let label_ids: Option<Vec<String>> =
         body.get("label_ids").and_then(|v| v.as_array()).map(|arr| {
@@ -232,18 +162,9 @@ pub async fn stop_all(
         return rejection;
     }
 
-    let user_id = match body
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "user_id required (uuid)"})),
-            )
-        }
+    let user_id = match require_uuid_field(&body, "user_id") {
+        Ok(id) => id,
+        Err(rejection) => return rejection,
     };
 
     // MCP-504: pair the `.unwrap_or_default()` zero-fallback with a

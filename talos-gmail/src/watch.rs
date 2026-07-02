@@ -51,14 +51,16 @@ use super::api::GmailWatchApiClient;
 use super::GmailIntegrationService;
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration, Utc};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use talos_integration_helpers::audit::{
+    insert_channel_audit, truncate_and_redact_error, ChannelAuditEvent,
+};
+use talos_integration_helpers::state_store::{ttl_with_grace, ChannelStore, CreateLockMap};
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{
     IndexedSlots, IntegrationOp, IntegrationOpResult, ListFilter, StoredEntry,
 };
-use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 pub(crate) const GMAIL_INTEGRATION_NAME: &str = "gmail";
@@ -86,10 +88,6 @@ pub(crate) struct GmailWatchRow {
     pub updated_at_ms: i64,
 }
 
-fn row_key(id: Uuid) -> String {
-    format!("watch/{id}")
-}
-
 fn decode_row(entry: &StoredEntry) -> Result<GmailWatchRow> {
     serde_json::from_str(&entry.value).context("decode gmail watch row")
 }
@@ -110,7 +108,7 @@ pub struct GmailWatchService {
     pub(crate) default_label_ids: Vec<String>,
     /// Serializes `create_watch` per `(user_id, integration_id)` so
     /// two concurrent callers can't register with Google twice.
-    create_locks: Arc<DashMap<(Uuid, Uuid), Arc<AsyncMutex<()>>>>,
+    create_locks: CreateLockMap<(Uuid, Uuid)>,
     /// API client — cheap to clone (reqwest internally Arcs).
     pub(crate) api: GmailWatchApiClient,
 }
@@ -127,16 +125,21 @@ impl GmailWatchService {
             integrations,
             topic_name,
             default_label_ids,
-            create_locks: Arc::new(DashMap::new()),
+            create_locks: CreateLockMap::new(),
             api: GmailWatchApiClient::new(),
         }
+    }
+
+    /// User-scoped handle over `integration_state` for gmail watch
+    /// rows. Cheap to construct per call (`PgPool` is `Arc`-backed).
+    fn store(&self) -> ChannelStore {
+        ChannelStore::new(self.pool.clone(), GMAIL_INTEGRATION_NAME, "watch/")
     }
 
     /// Evict idle create-locks. Paired with the webhook rate-limiter
     /// sweep in main.rs for consistency with gcal.
     pub fn cleanup_create_locks(&self) {
-        self.create_locks
-            .retain(|_k, lock| Arc::strong_count(lock) > 1);
+        self.create_locks.cleanup();
     }
 
     // ------------------------------------------------------------------
@@ -280,44 +283,28 @@ impl GmailWatchService {
         // Audit — mirrors gcal's channel_stopped event. Failures here
         // are non-fatal (visibility loss, not correctness).
         let success = google_err.is_none();
-        // MCP-980 (2026-05-15): DLP-redact Google API error string
-        // before bind. Sibling to the renewal-failed audit at
-        // scheduler.rs. Stop-watch failures can echo refresh_token
-        // / access_token via Google's error_description field on
-        // token-related rejections.
-        //
-        // MCP-1181 (2026-05-17): truncate-first at 1 KiB before
-        // redact_str so a verbose Google API error envelope can't
-        // amplify regex-pass cost or blow past reasonable column-
-        // storage size. Sibling of the gcal scheduler.rs +
-        // gcal/watch.rs + gmail/scheduler.rs renewal-failure sites,
-        // mirroring the MCP-1028 truncate-first pattern from the
-        // gmail_integration_audit_log / slack_integration_audit_log
-        // writers in this same crate.
-        let redacted_google_err = google_err.as_deref().map(|e| {
-            let truncated: &str = if e.len() > 1024 {
-                talos_text_util::truncate_at_char_boundary(e, 1024)
-            } else {
-                e
-            };
-            talos_dlp_provider::redact_str(truncated)
-        });
-        if let Err(e) = sqlx::query(
-            "INSERT INTO google_calendar_audit_log \
-             (integration_id, user_id, event_type, calendar_id, success, error_message, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        // MCP-980 (2026-05-15) + MCP-1181 (2026-05-17): the Google API
+        // error string is truncated at 1 KiB FIRST, then DLP-redacted
+        // before bind — stop-watch failures can echo refresh_token /
+        // access_token via Google's error_description field on
+        // token-related rejections. Both steps live in the canonical
+        // `truncate_and_redact_error` helper.
+        let redacted_google_err = google_err.as_deref().map(truncate_and_redact_error);
+        if let Err(e) = insert_channel_audit(
+            &self.pool,
+            ChannelAuditEvent {
+                integration_id: Some(row.integration_id),
+                user_id,
+                event_type: "gmail_channel_stopped",
+                target: Some(&row.email_address),
+                success,
+                error_message: redacted_google_err.as_deref(),
+                metadata: serde_json::json!({
+                    "channel_uuid": row.id.to_string(),
+                    "topic_name": row.topic_name,
+                }),
+            },
         )
-        .bind(row.integration_id)
-        .bind(user_id)
-        .bind("gmail_channel_stopped")
-        .bind(&row.email_address)
-        .bind(success)
-        .bind(redacted_google_err.as_deref())
-        .bind(serde_json::json!({
-            "channel_uuid": row.id.to_string(),
-            "topic_name": row.topic_name,
-        }))
-        .execute(&self.pool)
         .await
         {
             tracing::warn!(error = %e, "gmail channel_stopped audit log insert failed");
@@ -360,14 +347,10 @@ impl GmailWatchService {
                 idx_str_1_eq: Some(email.to_string()),
                 ..Default::default()
             };
-            if let Ok(IntegrationOpResult::Entries { entries }) = execute_op(
-                &self.pool,
-                GMAIL_INTEGRATION_NAME,
-                user_id,
-                IntegrationOp::List { filter, limit: 1 },
-            )
-            .await
-            {
+            // Errors are deliberately ignored (pre-extraction `if let
+            // Ok(...)` behavior): a failing user is skipped, the next
+            // owner is tried.
+            if let Ok(entries) = self.store().list_entries(user_id, filter, 1).await {
                 if let Some(entry) = entries.into_iter().next() {
                     let row = decode_row(&entry)?;
                     return Ok(Some((user_id, row)));
@@ -487,25 +470,25 @@ impl GmailWatchService {
         );
 
         // Audit — same table as gcal, distinct event_type.
-        if let Err(e) = sqlx::query(
-            "INSERT INTO google_calendar_audit_log \
-             (integration_id, user_id, event_type, calendar_id, success, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+        if let Err(e) = insert_channel_audit(
+            &self.pool,
+            ChannelAuditEvent {
+                integration_id: Some(row.integration_id),
+                user_id,
+                event_type: "gmail_channel_created",
+                target: Some(&row.email_address),
+                success: true,
+                error_message: None,
+                metadata: serde_json::json!({
+                    "channel_uuid": row.id.to_string(),
+                    "topic_name": row.topic_name,
+                    "history_id": row.history_id,
+                    "expiration": row.expiration_ms,
+                    "module_id": row.module_id,
+                    "label_ids": row.label_ids,
+                }),
+            },
         )
-        .bind(row.integration_id)
-        .bind(user_id)
-        .bind("gmail_channel_created")
-        .bind(&row.email_address)
-        .bind(true)
-        .bind(serde_json::json!({
-            "channel_uuid": row.id.to_string(),
-            "topic_name": row.topic_name,
-            "history_id": row.history_id,
-            "expiration": row.expiration_ms,
-            "module_id": row.module_id,
-            "label_ids": row.label_ids,
-        }))
-        .execute(&self.pool)
         .await
         {
             tracing::warn!(error = %e, "gmail channel_created audit log insert failed");
@@ -516,48 +499,28 @@ impl GmailWatchService {
     async fn upsert_row(&self, user_id: Uuid, row: &GmailWatchRow) -> Result<()> {
         let value = serde_json::to_value(row).context("encode gmail row")?;
         // Same 14-day grace as gcal so a streak of renewal failures
-        // doesn't sweep the row out of the scheduler's view.
-        const TTL_GRACE_SECONDS: i64 = 14 * 24 * 3600;
-        let ttl_ms = row.expiration_ms + TTL_GRACE_SECONDS * 1000 - Utc::now().timestamp_millis();
-        let ttl_seconds: Option<u64> = if ttl_ms > 0 {
-            Some((ttl_ms / 1000) as u64)
-        } else {
-            Some(3600) // floor: at least one scheduler cycle
-        };
+        // doesn't sweep the row out of the scheduler's view — the
+        // grace rule lives in `talos_integration_helpers::state_store`.
+        let ttl_seconds = ttl_with_grace(row.expiration_ms);
 
-        execute_op(
-            &self.pool,
-            GMAIL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::Set {
-                key: row_key(row.id),
+        self.store()
+            .set(
+                user_id,
+                row.id,
                 value,
                 ttl_seconds,
-                slots: IndexedSlots {
+                IndexedSlots {
                     idx_str_1: Some(row.email_address.clone()),
                     idx_str_2: Some(row.topic_name.clone()),
                     idx_ts_1_ms: Some(row.expiration_ms),
                     idx_int_1: None,
                 },
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state set failed: {:?}", e))?;
-        Ok(())
+            )
+            .await
     }
 
     async fn delete_row(&self, user_id: Uuid, channel_uuid: Uuid) -> Result<()> {
-        execute_op(
-            &self.pool,
-            GMAIL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::Delete {
-                key: row_key(channel_uuid),
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state delete failed: {:?}", e))?;
-        Ok(())
+        self.store().delete(user_id, channel_uuid).await
     }
 
     pub(crate) async fn find_by_id(
@@ -565,19 +528,9 @@ impl GmailWatchService {
         user_id: Uuid,
         channel_uuid: Uuid,
     ) -> Result<GmailWatchRow> {
-        match execute_op(
-            &self.pool,
-            GMAIL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::Get {
-                key: row_key(channel_uuid),
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state get failed: {:?}", e))?
-        {
-            IntegrationOpResult::Entry { entry } => decode_row(&entry),
-            _ => Err(anyhow!(
+        match self.store().get_entry(user_id, channel_uuid).await? {
+            Some(entry) => decode_row(&entry),
+            None => Err(anyhow!(
                 "gmail watch {} not found for user {}",
                 channel_uuid,
                 user_id
@@ -594,65 +547,48 @@ impl GmailWatchService {
         // (user, integration), but we still iterate the list to
         // defend against any bypass + to support a future
         // multi-label-filter shape.
-        let filter = ListFilter::default();
-        match execute_op(
-            &self.pool,
-            GMAIL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::List { filter, limit: 50 },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state list failed: {:?}", e))?
-        {
-            IntegrationOpResult::Entries { entries } => {
-                for entry in entries {
-                    let row = decode_row(&entry)?;
-                    if row.integration_id == integration_id {
-                        return Ok(Some(row));
-                    }
-                }
-                Ok(None)
+        let entries = self
+            .store()
+            .list_entries(user_id, ListFilter::default(), 50)
+            .await?;
+        for entry in entries {
+            let row = decode_row(&entry)?;
+            if row.integration_id == integration_id {
+                return Ok(Some(row));
             }
-            _ => Ok(None),
         }
+        Ok(None)
     }
 
     /// List every gmail watch row this user owns. Scheduler uses this
     /// enumerated per-user via `get_watches_needing_renewal`.
     pub(crate) async fn list_for_user(&self, user_id: Uuid) -> Result<Vec<GmailWatchRow>> {
-        match execute_op(
-            &self.pool,
-            GMAIL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::List {
-                filter: ListFilter::default(),
-                limit: 500,
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state list failed: {:?}", e))?
-        {
-            IntegrationOpResult::Entries { entries } => {
-                let mut out = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    match decode_row(&entry) {
-                        Ok(row) => out.push(row),
-                        Err(e) => tracing::warn!(
-                            key = %entry.key,
-                            error = %e,
-                            "skipping malformed gmail watch row"
-                        ),
-                    }
-                }
-                Ok(out)
+        let entries = self
+            .store()
+            .list_entries(user_id, ListFilter::default(), 500)
+            .await?;
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match decode_row(&entry) {
+                Ok(row) => out.push(row),
+                Err(e) => tracing::warn!(
+                    key = %entry.key,
+                    error = %e,
+                    "skipping malformed gmail watch row"
+                ),
             }
-            _ => Ok(vec![]),
         }
+        Ok(out)
     }
 
     /// List `(user_id, row)` pairs needing renewal in the next 24h.
     /// Iterates every user with an active Gmail integration — the
     /// same pattern gcal uses.
+    ///
+    /// Deliberately kept on raw `execute_op` (not `ChannelStore`):
+    /// the per-user error arm carries the bespoke MCP-993 DLP
+    /// redaction over the RAW `IntegrationStateError` Debug output,
+    /// which the store's anyhow wrapping would alter.
     pub(crate) async fn get_watches_needing_renewal(&self) -> Result<Vec<(Uuid, GmailWatchRow)>> {
         let threshold_ms = (Utc::now() + Duration::hours(24)).timestamp_millis();
         let users: Vec<Uuid> = sqlx::query_scalar(
@@ -716,12 +652,6 @@ impl GmailWatchService {
         user_id: Uuid,
         integration_id: Uuid,
     ) -> tokio::sync::OwnedMutexGuard<()> {
-        let key = (user_id, integration_id);
-        let lock = self
-            .create_locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone();
-        lock.lock_owned().await
+        self.create_locks.acquire((user_id, integration_id)).await
     }
 }

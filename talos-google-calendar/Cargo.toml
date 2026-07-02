@@ -10,6 +10,7 @@ publish.workspace = true
 talos-http-utils = { path = "../talos-http-utils" }
 anyhow.workspace = true
 async-nats = "0.47"
+async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 chrono.workspace = true
@@ -26,6 +27,8 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 subtle = "2.4"
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+# talos-text-util removed 2026-07: the truncate-then-redact scrub
+# (MCP-1181) moved to talos-integration-helpers::audit.
 talos-engine = { path = "../talos-engine" }
 talos-http-body = { path = "../talos-http-body" }
 talos-integration-helpers = { path = "../talos-integration-helpers" }
@@ -36,7 +39,6 @@ talos-actor-repository = { path = "../talos-actor-repository" }
 talos-oauth = { path = "../talos-oauth" }
 talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
-talos-text-util = { path = "../talos-text-util" }
 talos-trace-nats = { path = "../talos-trace-nats" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }

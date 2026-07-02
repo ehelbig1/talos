@@ -2618,6 +2618,9 @@ impl TalosRuntime {
         }
 
         // Set execution context for automatic logging
+        let mut ledger_for_anchor: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>,
+        > = None;
         if let Some((workflow_id, exec_id, module_id)) = execution_context {
             context.set_workflow_context(workflow_id.clone(), exec_id.clone(), module_id.clone());
             // Correlate logs across controller and worker using the workflow ID.
@@ -2627,6 +2630,10 @@ impl TalosRuntime {
             let ledger = std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::audit::ExecutionLedger::new(&workflow_id, &exec_id),
             ));
+            // Held past the run so the terminal anchor (below) can commit
+            // the chain length after the module finishes — the Store owns
+            // the context (and its Arc) inside the call closure.
+            ledger_for_anchor = Some(ledger.clone());
             context.set_audit_ledger(ledger);
         }
 
@@ -2792,6 +2799,50 @@ impl TalosRuntime {
         })?;
 
         metrics.execution_ms = execution_start.elapsed().as_millis() as u64;
+
+        // Terminal audit anchor (tail-truncation detection — the producer
+        // half of talos-audit-event's verify_chain_anchored). Fires on
+        // module success AND module-level failure (the chain completed
+        // either way); deliberately NOT on the wall-clock-timeout early
+        // return above — a killed execution never completed, and its
+        // unanchored chain reads as the softer 'unanchored' verdict.
+        // Same replicate-to-NATS shape as every other ledger event
+        // (local append is the WORM source of truth; the publish is
+        // best-effort SIEM replication, WARN on failure per MCP-735).
+        if let Some(ledger_mutex) = ledger_for_anchor {
+            let anchor = {
+                let mut ledger = ledger_mutex.lock().await;
+                ledger.append_terminal_anchor("worker")
+            };
+            if let Some(nats) = &self.nats_client {
+                let nats = nats.clone();
+                tokio::spawn(async move {
+                    let hash = anchor.calculate_hash();
+                    let msg = serde_json::json!({ "event": anchor, "hash": hash });
+                    match serde_json::to_vec(&msg) {
+                        Ok(bytes) => {
+                            if let Err(e) = nats
+                                .publish("talos.audit.ledger".to_string(), bytes.into())
+                                .await
+                            {
+                                tracing::warn!(
+                                    target: "talos_rpc",
+                                    error = %e,
+                                    "audit terminal-anchor NATS replication failed \
+                                     (local WORM append succeeded; chain will verify \
+                                     as anchored from the local ledger)"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            target: "talos_rpc",
+                            error = %e,
+                            "audit terminal-anchor serialization failed for NATS replication"
+                        ),
+                    }
+                });
+            }
+        }
 
         let _duration_ms = start_time.elapsed().as_millis() as u64;
 

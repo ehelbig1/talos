@@ -40,7 +40,6 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-policies = { path = "../talos-actor-policies" }
 talos-actor-repository = { path = "../talos-actor-repository" }
-talos-actor-scaffold = { path = "../talos-actor-scaffold" }
 talos-advanced-repository = { path = "../talos-advanced-repository" }
 talos-analytics-repository = { path = "../talos-analytics-repository" }
 talos-capability-world = { path = "../talos-capability-world" }
@@ -65,6 +64,8 @@ talos-replay-diff = { path = "../talos-replay-diff" }
 talos-replay-service = { path = "../talos-replay-service" }
 talos-inline-compile-service = { path = "../talos-inline-compile-service" }
 talos-search-service = { path = "../talos-search-service" }
+talos-failure-analysis-service = { path = "../talos-failure-analysis-service" }
+talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }
 talos-scheduler = { path = "../talos-scheduler" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }

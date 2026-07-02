@@ -36,6 +36,33 @@ If you can't answer all five from upstream docs, STOP and
 research before coding. Answering mid-implementation produces
 re-architecture.
 
+## Shared kernel — `talos-integration-helpers`
+
+The skeleton the checklist below describes is EXTRACTED. Do not
+copy-adapt gmail/gcal code for pieces the helper crate already owns —
+implement against these and keep only the provider-specific literals
+(log text, audit event_types, metadata shapes) in your crate:
+
+| Helper | Replaces hand-rolling |
+|---|---|
+| `renewal::RenewableIntegration` + `renewal::run_renewal_scheduler` | The hourly renewal loop (step 4): shutdown-aware `tokio::select!`, keep-row-on-failure batch semantics. You implement the trait's list/renew/log/audit hooks; the kernel owns control flow only, so your `tracing` targets and message text stay provider-side. |
+| `state_store::ChannelStore` | The `execute_op` boilerplate over `integration_state` (set/delete/get/list + the `"integration_state <op> failed: {:?}"` error wrapping). |
+| `state_store::ttl_with_grace` | The 14-day TTL grace rule (+ 1-hour floor for already-past expirations). |
+| `state_store::CreateLockMap` | The per-key create/renew serialization mutex map + the idle-lock `cleanup()` sweep. Key it at your uniqueness grain: gmail `(user, integ)`, gcal `(user, integ, calendar)`. |
+| `admin::authorize_admin_request` | The two-gate admin defense (step 7): `ENABLE_ADMIN_OPS` via canonical `talos_config::admin_ops_enabled()` (MCP-1064) + constant-time `X-Admin-Secret` compare with the direct-slice `ct_eq` discipline (MCP-983 — no padded buffer, empty secret fails closed). |
+| `admin::log_admin_action` | The `admin_*` audit write with MCP-1015 metadata DLP scrub + MCP-1197 `redact_json_bounded` size bound. You pass your historical `event_type` prefix and failure-warn text. |
+| `admin::require_uuid_field` | The `400 {"error": "<field> required (uuid)"}` body-parse rejection. |
+| `audit::insert_channel_audit` | The `google_calendar_audit_log` channel-lifecycle INSERT (created/renewed/renewal_failed/stopped). `target` is the log's `calendar_id` column — the shared "which upstream target" slot. |
+| `audit::truncate_and_redact_error` | The MCP-980/MCP-1181 truncate-at-1-KiB-FIRST-then-DLP-redact scrub for upstream error text headed for `error_message` columns. |
+| `RenewalFailure` + `looks_like_oauth_failure` (crate root) | The step-8 failure-enrichment shape + the single canonical OAuth-dead heuristic. |
+
+`talos-gmail/src/{scheduler,admin,watch}.rs` and
+`talos-google-calendar/src/{scheduler,admin,watch}.rs` are the
+reference consumers. Where gmail and gcal genuinely diverge (log
+literals, event_type names, lock-key grain, metadata keys), the
+divergence rides the trait hooks / parameters — the kernel does NOT
+unify it, and neither should you.
+
 ## Table of contents
 
 - [Architecture — three layers](#architecture--three-layers)
@@ -231,17 +258,24 @@ A service struct + five methods:
   filter)
 - `idx_int_1` = a fourth slot, usually unused
 
-**TTL grace**: always 14 days past the upstream expiration. Gives
+**TTL grace**: always 14 days past the upstream expiration — use
+`talos_integration_helpers::state_store::ttl_with_grace`. Gives
 the renewal scheduler ≥14 full-day retry windows past expiry before
 the row is swept. The 5-minute grace we started with in gcal caused
 silent disappearance during OAuth-dead streaks — see commit
 `e43430b`.
 
-**Concurrency lock**: `tokio::sync::Mutex` in a `DashMap` keyed by
+**Concurrency lock**: use
+`talos_integration_helpers::state_store::CreateLockMap`, keyed by
 the uniqueness granularity (for gcal: `(user, integ, calendar)`;
 for gmail: `(user, integ)`). Serialize across create AND renew.
-Sweep idle locks hourly — see `cleanup_create_locks` + the hourly
-spawn in `main.rs`.
+Sweep idle locks hourly — call `.cleanup()` from an hourly spawn in
+`main.rs` (see `cleanup_create_locks`).
+
+**Row CRUD**: route set/delete/get/list through
+`talos_integration_helpers::state_store::ChannelStore` — it owns the
+`execute_op` plumbing and error wrapping. Row structs, decode
+context strings, and not-found messages stay in your crate.
 
 **Audit rows**: write `<integration>_channel_created`,
 `<integration>_channel_renewed`,
@@ -260,13 +294,26 @@ to cancel the push. gcal lost this and had to document
 Hourly tokio task. Lists rows with `idx_ts_1 < now + 24h`, renews
 each in sequence.
 
+**Do not write the loop.** Implement
+`talos_integration_helpers::renewal::RenewableIntegration` on a
+private adapter struct and spawn
+`renewal::run_renewal_scheduler(adapter, shutdown_rx)` — see
+`talos_gmail::scheduler::GmailRenewer` / `talos_google_calendar::
+scheduler::GcalRenewer`. The kernel owns control flow (tick,
+shutdown-aware `tokio::select!`, keep-row-on-failure); your hooks own
+every observable emission:
+
 - Audit-log every attempt (`<integration>_channel_renewed` on
-  success, `<integration>_channel_renewal_failed` with the error
-  text on failure).
+  success, `<integration>_channel_renewal_failed` with the
+  `audit::truncate_and_redact_error`-scrubbed error text on failure)
+  via `audit::insert_channel_audit` in `on_renewed` /
+  `on_renewal_failed`.
 - On failure, **keep the row** — the 14-day TTL grace means the
   scheduler sees it again next hour. Don't delete on single failures.
-- Spawn once, forever. No shutdown awareness; tokio task drops
-  cleanly when the runtime shuts down.
+  (The kernel enforces this: `on_renewal_failed` has no delete path.)
+- Spawn once, forever; the loop exits cleanly when the controller's
+  shutdown `watch` channel fires (MCP-1156) and emits your
+  `log_shutdown` hook's `<integ>_renewal_task_shutdown` event.
 
 ### 5. WASM dispatch — `<integration>/dispatch.rs`
 
@@ -324,10 +371,18 @@ The list endpoint's enrichment + shape projection belongs in
 
 ### 7. Admin endpoints — `<integration>/admin.rs`
 
-Two-gate defense:
+Two-gate defense — call
+`talos_integration_helpers::admin::authorize_admin_request(headers,
+"<integ>")`, do not re-implement:
 
 1. `ENABLE_ADMIN_OPS=1` env var — "big red button," unset in prod
-2. `X-Admin-Secret` header vs `ADMIN_SECRET_KEY`, constant-time compare
+   (canonical `talos_config::admin_ops_enabled()` resolver, MCP-1064)
+2. `X-Admin-Secret` header vs `ADMIN_SECRET_KEY`, constant-time
+   compare (direct-slice `ct_eq`, MCP-983; empty secret fails closed)
+
+Body-field parsing uses `admin::require_uuid_field`; the success
+audit row goes through `admin::log_admin_action` with your
+`admin_<integ>_*` event_type prefix.
 
 Endpoints:
 
@@ -353,8 +408,9 @@ the list-view projection:
   batched `DISTINCT ON (channel_uuid)` audit query. Looks back 25
   hours so old failures don't flag self-healed channels.
 - **Reuse `RenewalFailure` and `looks_like_oauth_failure`** from
-  `google_calendar::watch_channel_service`. Single canonical OAuth-
-  dead heuristic. Do NOT re-implement.
+  `talos_integration_helpers` (the historical
+  `google_calendar::watch_channel_service` path re-exports them).
+  Single canonical OAuth-dead heuristic. Do NOT re-implement.
 - Batched module-name resolution via one UNION query filtered by
   `user_id IS NULL OR user_id = $caller` (defense-in-depth).
 
@@ -607,6 +663,9 @@ Live-test harness:
 
 ## Cross-references
 
+- `talos-integration-helpers/` — the extracted shared kernel (renewal
+  scheduler, admin gate, audit writers, `integration_state` channel
+  store). See the "Shared kernel" section above.
 - `docs/platform-primitive-checklist.md` — how to add a NEW signed-
   NATS-RPC primitive (layer below this).
 - `docs/gcal-live-test.md` — gcal-specific live test walkthrough.

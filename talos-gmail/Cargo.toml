@@ -22,7 +22,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
-subtle = "2.4"
+# `subtle` removed 2026-07: the admin ct_eq gate (MCP-983) moved to
+# talos-integration-helpers::admin.
 # MCP-1021: canonical FRONTEND_URL validation (rejects ? and # in addition
 # to /; the inline validator we removed only checked /).
 talos-config = { path = "../talos-config" }

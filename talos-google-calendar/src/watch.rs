@@ -38,6 +38,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use talos_integration_helpers::audit::{
+    insert_channel_audit, truncate_and_redact_error, ChannelAuditEvent,
+};
+use talos_integration_helpers::state_store::{ttl_with_grace, ChannelStore};
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{
     IndexedSlots, IntegrationOp, IntegrationOpResult, ListFilter, StoredEntry,
@@ -108,11 +112,6 @@ fn decode_row(entry: &StoredEntry) -> Result<WatchChannelRow> {
         .context("failed to decode gcal watch channel JSON from integration_state")
 }
 
-/// Build the `key` column value for a given channel uuid.
-fn row_key(id: Uuid) -> String {
-    format!("channel/{}", id)
-}
-
 /// Resolve `(integration_id) -> user_id` once up-front. Every gcal
 /// integration row has exactly one owning user; we need that user
 /// before we can write to integration_state.
@@ -128,6 +127,12 @@ async fn user_id_for_integration(pool: &sqlx::PgPool, integration_id: Uuid) -> R
 }
 
 impl GoogleCalendarService {
+    /// User-scoped handle over `integration_state` for gcal watch
+    /// rows. Cheap to construct per call (`PgPool` is `Arc`-backed).
+    fn store(&self) -> ChannelStore {
+        ChannelStore::new(self.db_pool.clone(), GCAL_INTEGRATION_NAME, "channel/")
+    }
+
     /// Create a new watch channel, or re-point an existing one at a
     /// different module. Creates a Google-side watch iff no active
     /// `(integration_id, calendar_id)` row exists in integration_state.
@@ -312,25 +317,25 @@ impl GoogleCalendarService {
         // API). Errors here are non-fatal — the watch was
         // successfully created, losing the audit row is a
         // visibility regression, not a correctness one.
-        if let Err(e) = sqlx::query(
-            "INSERT INTO google_calendar_audit_log \
-             (integration_id, user_id, event_type, calendar_id, success, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+        if let Err(e) = insert_channel_audit(
+            &self.db_pool,
+            ChannelAuditEvent {
+                integration_id: Some(integration_id),
+                user_id,
+                event_type: "channel_created",
+                target: Some(calendar_id),
+                success: true,
+                error_message: None,
+                metadata: serde_json::json!({
+                    "channel_uuid": row.id.to_string(),
+                    "google_channel_id": row.channel_id,
+                    "resource_id": row.resource_id,
+                    "expiration": row.expiration_ms,
+                    "module_id": row.module_id,
+                    "preserved_sync_token": preserved_sync_token.is_some(),
+                }),
+            },
         )
-        .bind(integration_id)
-        .bind(user_id)
-        .bind("channel_created")
-        .bind(calendar_id)
-        .bind(true)
-        .bind(serde_json::json!({
-            "channel_uuid": row.id.to_string(),
-            "google_channel_id": row.channel_id,
-            "resource_id": row.resource_id,
-            "expiration": row.expiration_ms,
-            "module_id": row.module_id,
-            "preserved_sync_token": preserved_sync_token.is_some(),
-        }))
-        .execute(&self.db_pool)
         .await
         {
             tracing::warn!(error = %e, "gcal channel_created audit log insert failed");
@@ -451,13 +456,9 @@ impl GoogleCalendarService {
         integration_id: Uuid,
         calendar_id: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock_key = (user_id, integration_id, calendar_id.to_string());
-        let lock = self
-            .create_channel_locks
-            .entry(lock_key)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        lock.lock_owned().await
+        self.create_channel_locks
+            .acquire((user_id, integration_id, calendar_id.to_string()))
+            .await
     }
 
     /// List channels that expire within the next 24 hours. Uses the
@@ -468,6 +469,11 @@ impl GoogleCalendarService {
     /// If cardinality ever grows past ~10k users this should move to a
     /// paginated per-user iterator — for now a one-shot per user is
     /// acceptable.
+    ///
+    /// Deliberately kept on raw `execute_op` (not `ChannelStore`): the
+    /// per-user tri-arm handling (unexpected-variant error line + raw
+    /// `IntegrationStateError` Debug in the failure log) predates the
+    /// store and must stay byte-for-byte.
     pub async fn get_channels_needing_renewal(&self) -> Result<Vec<(Uuid, WatchChannel)>> {
         let threshold_ms = (Utc::now() + Duration::hours(24)).timestamp_millis();
 
@@ -597,41 +603,26 @@ impl GoogleCalendarService {
         // Audit-log the stop. Records both success AND partial-failure
         // (Google side refused). Non-fatal on insert failure.
         let success = google_stop_error.is_none();
-        // MCP-980: DLP-redact Google stop-watch error. Sibling to
-        // gmail/watch.rs google_err redaction.
-        //
-        // MCP-1181 (2026-05-17): truncate-first at 1 KiB before
-        // redact_str so a verbose Google API error envelope can't
-        // amplify regex-pass cost or blow past reasonable column-
-        // storage size. Sibling of the gcal scheduler.rs +
-        // gmail/watch.rs + gmail/scheduler.rs renewal-failure sites,
-        // mirroring the MCP-1028 truncate-first pattern from
-        // gmail_integration_audit_log / slack_integration_audit_log
-        // writers.
-        let redacted_stop_err = google_stop_error.as_deref().map(|e| {
-            let truncated: &str = if e.len() > 1024 {
-                talos_text_util::truncate_at_char_boundary(e, 1024)
-            } else {
-                e
-            };
-            talos_dlp_provider::redact_str(truncated)
-        });
-        if let Err(e) = sqlx::query(
-            "INSERT INTO google_calendar_audit_log \
-             (integration_id, user_id, event_type, calendar_id, success, error_message, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        // MCP-980 + MCP-1181: the Google stop-watch error is truncated
+        // at 1 KiB FIRST, then DLP-redacted before bind — sibling to
+        // the gmail/watch.rs google_err redaction. Both steps live in
+        // the canonical `truncate_and_redact_error` helper.
+        let redacted_stop_err = google_stop_error.as_deref().map(truncate_and_redact_error);
+        if let Err(e) = insert_channel_audit(
+            &self.db_pool,
+            ChannelAuditEvent {
+                integration_id: Some(row.integration_id),
+                user_id,
+                event_type: "channel_stopped",
+                target: Some(&row.calendar_id),
+                success,
+                error_message: redacted_stop_err.as_deref(),
+                metadata: serde_json::json!({
+                    "channel_uuid": row.id.to_string(),
+                    "google_channel_id": row.channel_id,
+                }),
+            },
         )
-        .bind(row.integration_id)
-        .bind(user_id)
-        .bind("channel_stopped")
-        .bind(&row.calendar_id)
-        .bind(success)
-        .bind(redacted_stop_err.as_deref())
-        .bind(serde_json::json!({
-            "channel_uuid": row.id.to_string(),
-            "google_channel_id": row.channel_id,
-        }))
-        .execute(&self.db_pool)
         .await
         {
             tracing::warn!(error = %e, "gcal channel_stopped audit log insert failed");
@@ -653,19 +644,9 @@ impl GoogleCalendarService {
         user_id: Uuid,
         channel_uuid: Uuid,
     ) -> Result<WatchChannelRow> {
-        match execute_op(
-            &self.db_pool,
-            GCAL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::Get {
-                key: row_key(channel_uuid),
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state get failed: {:?}", e))?
-        {
-            IntegrationOpResult::Entry { entry } => decode_row(&entry),
-            _ => Err(anyhow!(
+        match self.store().get_entry(user_id, channel_uuid).await? {
+            Some(entry) => decode_row(&entry),
+            None => Err(anyhow!(
                 "channel {} not found for user {}",
                 channel_uuid,
                 user_id
@@ -685,24 +666,17 @@ impl GoogleCalendarService {
             idx_str_1_eq: Some(google_channel_id.to_string()),
             ..Default::default()
         };
-        match execute_op(
-            &self.db_pool,
-            GCAL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::List { filter, limit: 1 },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state list failed: {:?}", e))?
+        if let Some(entry) = self
+            .store()
+            .list_entries(user_id, filter, 1)
+            .await?
+            .into_iter()
+            .next()
         {
-            IntegrationOpResult::Entries { entries } => {
-                if let Some(entry) = entries.into_iter().next() {
-                    let row = decode_row(&entry)?;
-                    Ok(Some(row.to_watch_channel(user_id)))
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
+            let row = decode_row(&entry)?;
+            Ok(Some(row.to_watch_channel(user_id)))
+        } else {
+            Ok(None)
         }
     }
 
@@ -731,19 +705,9 @@ impl GoogleCalendarService {
         channel_uuid: Uuid,
         msg_num: i64,
     ) -> Result<bool> {
-        let entry = match execute_op(
-            &self.db_pool,
-            GCAL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::Get {
-                key: row_key(channel_uuid),
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state get failed: {:?}", e))?
-        {
-            IntegrationOpResult::Entry { entry } => entry,
-            _ => {
+        let entry = match self.store().get_entry(user_id, channel_uuid).await? {
+            Some(entry) => entry,
+            None => {
                 return Err(anyhow!(
                     "channel {} not found during msg-num advance",
                     channel_uuid
@@ -770,62 +734,33 @@ impl GoogleCalendarService {
         let value = serde_json::to_value(row).context("encode gcal watch row")?;
         // Keep the row visible well past Google's advertised
         // expiration so a run of renewal failures doesn't cause the
-        // row to vanish between scheduler ticks. Without grace, if
-        // every hourly renewal attempt errors in the ~24h window
-        // before expiry, the row gets swept ~5 min past expiry and
-        // the dead Google channel becomes invisible — permanent
-        // garbage on our side. 14 days is a wide-enough belt + safety
-        // net that the scheduler has ~336 hourly attempts after
-        // Google expiry to successfully re-create.
+        // row to vanish between scheduler ticks — the 14-day grace
+        // rule (and the 1-hour floor for already-past expirations)
+        // lives in `talos_integration_helpers::state_store`.
         //
         // Happy-path rows are deleted explicitly by `renew_watch_
         // channel` / `stop_watch_channel` / `deactivate_integration`,
         // so this TTL only fires for truly abandoned rows.
-        const TTL_GRACE_SECONDS: i64 = 14 * 24 * 3600;
-        let ttl_ms = row.expiration_ms + TTL_GRACE_SECONDS * 1000 - Utc::now().timestamp_millis();
-        let ttl_seconds: Option<u64> = if ttl_ms > 0 {
-            Some((ttl_ms / 1000) as u64)
-        } else {
-            // Google returned an expiration already in the past —
-            // unexpected, but give the scheduler at least one hour
-            // to see + retry. Refusing to write would break
-            // create entirely.
-            Some(3600)
-        };
+        let ttl_seconds = ttl_with_grace(row.expiration_ms);
 
-        execute_op(
-            &self.db_pool,
-            GCAL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::Set {
-                key: row_key(row.id),
+        self.store()
+            .set(
+                user_id,
+                row.id,
                 value,
                 ttl_seconds,
-                slots: IndexedSlots {
+                IndexedSlots {
                     idx_str_1: Some(row.channel_id.clone()),
                     idx_str_2: Some(row.calendar_id.clone()),
                     idx_ts_1_ms: Some(row.expiration_ms),
                     idx_int_1: None,
                 },
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state set failed: {:?}", e))?;
-        Ok(())
+            )
+            .await
     }
 
     async fn delete_channel_row(&self, user_id: Uuid, channel_uuid: Uuid) -> Result<()> {
-        execute_op(
-            &self.db_pool,
-            GCAL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::Delete {
-                key: row_key(channel_uuid),
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state delete failed: {:?}", e))?;
-        Ok(())
+        self.store().delete(user_id, channel_uuid).await
     }
 
     async fn update_channel_sync_token(
@@ -834,19 +769,9 @@ impl GoogleCalendarService {
         channel_uuid: Uuid,
         sync_token: &str,
     ) -> Result<()> {
-        let entry = match execute_op(
-            &self.db_pool,
-            GCAL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::Get {
-                key: row_key(channel_uuid),
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state get failed: {:?}", e))?
-        {
-            IntegrationOpResult::Entry { entry } => entry,
-            _ => anyhow::bail!("channel {} not found", channel_uuid),
+        let entry = match self.store().get_entry(user_id, channel_uuid).await? {
+            Some(entry) => entry,
+            None => anyhow::bail!("channel {} not found", channel_uuid),
         };
         let mut row = decode_row(&entry)?;
         row.sync_token = Some(sync_token.to_string());
@@ -864,26 +789,14 @@ impl GoogleCalendarService {
             idx_str_2_eq: Some(calendar_id.to_string()),
             ..Default::default()
         };
-        match execute_op(
-            &self.db_pool,
-            GCAL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::List { filter, limit: 50 },
-        )
-        .await
-        .map_err(|e| anyhow!("integration_state list failed: {:?}", e))?
-        {
-            IntegrationOpResult::Entries { entries } => {
-                for entry in entries {
-                    let row = decode_row(&entry)?;
-                    if row.integration_id == integration_id {
-                        return Ok(Some(row));
-                    }
-                }
-                Ok(None)
+        let entries = self.store().list_entries(user_id, filter, 50).await?;
+        for entry in entries {
+            let row = decode_row(&entry)?;
+            if row.integration_id == integration_id {
+                return Ok(Some(row));
             }
-            _ => Ok(None),
         }
+        Ok(None)
     }
 
     /// Accessor for the HMAC key used to sign webhook tokens. Held by

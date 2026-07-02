@@ -18,6 +18,21 @@
 //!   account" banner when the real issue is transient; false
 //!   negatives mean the per-row badge still fires but the banner
 //!   stays hidden, so the user always sees SOMETHING is wrong.
+//! - [`admin`] — the two-gate operator-endpoint auth
+//!   (`ENABLE_ADMIN_OPS` + constant-time `X-Admin-Secret`) and the
+//!   `admin_*` audit writer.
+//! - [`audit`] — writers for the shared channel-lifecycle audit log
+//!   plus the canonical truncate-then-DLP-redact error scrub.
+//! - [`renewal`] — the generic renewal-scheduler kernel
+//!   ([`renewal::RenewableIntegration`] + [`renewal::run_renewal_scheduler`]).
+//! - [`state_store`] — watch-row plumbing over `integration_state`
+//!   ([`state_store::ChannelStore`], [`state_store::ttl_with_grace`],
+//!   [`state_store::CreateLockMap`]).
+
+pub mod admin;
+pub mod audit;
+pub mod renewal;
+pub mod state_store;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;

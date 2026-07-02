@@ -64,6 +64,8 @@ talos-replay-diff = { path = "../talos-replay-diff" }
 talos-replay-service = { path = "../talos-replay-service" }
 talos-inline-compile-service = { path = "../talos-inline-compile-service" }
 talos-search-service = { path = "../talos-search-service" }
+talos-failure-analysis-service = { path = "../talos-failure-analysis-service" }
+talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
 talos-trace = { path = "../talos-trace" }
 talos-mcp-tool-schema = { path = "../talos-mcp-tool-schema" }
 talos-organizations = { path = "../talos-organizations" }
