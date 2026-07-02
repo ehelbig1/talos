@@ -30,9 +30,12 @@ green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 
 : "${BASELINE_DATABASE_URL:?set BASELINE_DATABASE_URL to a DISPOSABLE empty Postgres}"
-command -v psql    >/dev/null || { red "psql not found"; exit 1; }
-command -v pg_dump >/dev/null || { red "pg_dump not found"; exit 1; }
-command -v sqlx    >/dev/null || { red "sqlx-cli not found — cargo install sqlx-cli"; exit 1; }
+# PG_DUMP_BIN override: pg_dump refuses servers NEWER than itself, so a
+# host with an older client (e.g. Homebrew pg 14 vs the pg17 server) can
+# point this at a matching binary or a docker-run wrapper.
+PG_DUMP="${PG_DUMP_BIN:-pg_dump}"
+command -v sqlx >/dev/null || { red "sqlx-cli not found — cargo install sqlx-cli"; exit 1; }
+"$PG_DUMP" --version >/dev/null 2>&1 || { red "pg_dump not usable (PG_DUMP_BIN=$PG_DUMP)"; exit 1; }
 
 # sqlx computes migration checksums as SHA-384 of the raw file bytes.
 # Match that exactly (openssl is portable; shasum -a 384 is the fallback).
@@ -66,8 +69,14 @@ mkdir -p "$BASELINE_DIR"
 # 2. Dump the schema (structure only — no data, no owner/priv noise so the
 #    snapshot is portable and diff-stable for the verifier).
 bold "▶ dumping schema snapshot → $BASELINE_DIR/schema.sql"
-pg_dump --schema-only --no-owner --no-privileges --no-comments \
-    "$BASELINE_DATABASE_URL" > "$BASELINE_DIR/schema.sql"
+# The grep strips the \restrict/\unrestrict psql meta-commands newer
+# pg_dump point releases emit (a psql-injection hardening irrelevant to
+# a self-generated schema artifact): older psql clients reject them, and
+# stripping keeps the artifact stable across pg_dump point versions —
+# which matters because the verifier diffs dumps.
+"$PG_DUMP" --schema-only --no-owner --no-privileges --no-comments \
+    "$BASELINE_DATABASE_URL" \
+    | grep -vE '^\\(un)?restrict ' > "$BASELINE_DIR/schema.sql"
 
 # 3. Emit the _sqlx_migrations seed for every migration <= cutpoint, using
 #    the same SHA-384 sqlx computes. `\x` bytea hex-literal form; success=true;

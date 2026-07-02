@@ -325,3 +325,62 @@ jobs:
         # this so a freshly-disclosed advisory surfaces within 24h even with no
         # open PR.
         run: npm audit --audit-level=moderate
+
+  # ── Migration baseline verifier (RFC 0009 phase 1) ─────────────────────────
+  # Proves the committed migrations/.baseline/ artifacts (schema snapshot +
+  # _sqlx_migrations seed) reproduce a schema BYTE-IDENTICAL to running the
+  # full migration chain. Nothing consumes the baseline until phase 2, but
+  # this gate must be continuously green first — a tail migration that
+  # mutates something below the cutpoint, a hand-edited snapshot, or a bad
+  # seed checksum all fail here instead of at a fresh install. First real
+  # run already caught a dump-fixed-point subtlety (see migration
+  # 20260702160000).
+  schema-baseline:
+    name: Migration baseline verifier (RFC 0009)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: verify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install sqlx-cli
+        uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
+        with:
+          tool: sqlx-cli
+
+      - name: Install PostgreSQL 17 client
+        # pg_dump refuses servers NEWER than itself; ubuntu-latest ships
+        # client 16 vs the pg17 service. The scripts honor PG_DUMP_BIN /
+        # PSQL_BIN overrides.
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17
+          echo "PG_DUMP_BIN=/usr/lib/postgresql/17/bin/pg_dump" >> "$GITHUB_ENV"
+          echo "PSQL_BIN=/usr/lib/postgresql/17/bin/psql" >> "$GITHUB_ENV"
+
+      - name: Create the two disposable databases
+        run: |
+          "$PSQL_BIN" "postgres://postgres:verify@localhost:5432/postgres" \
+            -c "CREATE DATABASE verify_chain;" \
+            -c "CREATE DATABASE verify_baseline;"
+
+      - name: Verify baseline == full chain
+        env:
+          CHAIN_DATABASE_URL: postgres://postgres:verify@localhost:5432/verify_chain
+          BASELINE_DATABASE_URL: postgres://postgres:verify@localhost:5432/verify_baseline
+        run: bash scripts/verify-schema-baseline.sh
