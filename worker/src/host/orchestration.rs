@@ -19,14 +19,25 @@ use super::*;
 /// every `talos.agent.*` subscriber. Caps + signed envelope close both
 /// arms in one change.
 const MAX_AGENT_PAYLOAD_BYTES: usize = 64 * 1024;
-// Dead-by-accident cap from the H-4 review: intended bound for the
-// guest-supplied `correlation_id` envelope field, never wired up (the
-// call-site comment assumed correlation_id was a naturally-bounded u64,
-// but the WIT type is `option<string>`). Enforcing it now would be a
-// behavior change; kept (narrow allow) as the documented intended value
-// until the enforcement gap is closed.
-#[allow(dead_code)]
+/// Cap on the guest-supplied `correlation_id` envelope field, from the
+/// same H-4 review as `MAX_AGENT_PAYLOAD_BYTES`. The WIT type is
+/// `option<string>`, not a naturally-bounded u64 as the original
+/// call-site comment assumed, so an unbounded value would flow into the
+/// signed envelope, logs, and the response. Enforced fail-closed (reject,
+/// never truncate — truncating a correlation identifier silently breaks
+/// the guest's request/response matching) in `invoke` and `send`.
 const MAX_AGENT_CORRELATION_ID_BYTES: usize = 256;
+
+/// H-4: byte-length cap check for the guest-supplied `correlation_id`.
+/// `None` always passes; `Some` passes iff its UTF-8 byte length is
+/// within `MAX_AGENT_CORRELATION_ID_BYTES`. Byte-based (not char-based)
+/// because the cap bounds the NATS envelope size. Pure function so the
+/// boundary is unit-testable without a live host context.
+fn correlation_id_exceeds_cap(correlation_id: &Option<String>) -> bool {
+    correlation_id
+        .as_ref()
+        .is_some_and(|cid| cid.len() > MAX_AGENT_CORRELATION_ID_BYTES)
+}
 
 /// Build the signed NATS envelope for an agent invocation / message.
 ///
@@ -46,7 +57,7 @@ const MAX_AGENT_CORRELATION_ID_BYTES: usize = 256;
 ///   "source_actor": "<uuid|nil>",
 ///   "source_worker": "<worker_id>",
 ///   "payload": <guest-supplied json>,
-///   "correlation_id": <int|null>,
+///   "correlation_id": <string|null>,
 ///   "signature": "<hex>"
 /// }
 /// ```
@@ -252,14 +263,26 @@ impl wit_agent_orchestration::Host for TalosContext {
 
         // H-4: per-field caps to bound the NATS envelope size. The host
         // stamps source_module / source_execution / nonce / signature
-        // itself; the only guest-controlled blobs are `payload` and
-        // `correlation_id` (a u64, naturally bounded).
+        // itself; the only guest-controlled blobs are `payload`, `target`
+        // (length+charset checked above), and `correlation_id` (an
+        // `option<string>` in the WIT, capped below).
         if msg.payload.len() > MAX_AGENT_PAYLOAD_BYTES {
             tracing::warn!(
                 module_id = ?self.module_id,
                 payload_bytes = msg.payload.len(),
                 cap = MAX_AGENT_PAYLOAD_BYTES,
                 "agent payload exceeds cap"
+            );
+            return Err(wit_agent_orchestration::Error::InvocationFailed);
+        }
+        if correlation_id_exceeds_cap(&msg.correlation_id) {
+            // Log length only — an oversized attacker-controlled blob must
+            // not itself be blasted into the logs.
+            tracing::warn!(
+                module_id = ?self.module_id,
+                correlation_id_bytes = msg.correlation_id.as_ref().map(|c| c.len()).unwrap_or(0),
+                cap = MAX_AGENT_CORRELATION_ID_BYTES,
+                "agent correlation_id exceeds cap"
             );
             return Err(wit_agent_orchestration::Error::InvocationFailed);
         }
@@ -399,6 +422,16 @@ impl wit_agent_orchestration::Host for TalosContext {
             );
             return Err(wit_agent_orchestration::Error::InvocationFailed);
         }
+        if correlation_id_exceeds_cap(&msg.correlation_id) {
+            // Log length only — see invoke() above.
+            tracing::warn!(
+                module_id = ?self.module_id,
+                correlation_id_bytes = msg.correlation_id.as_ref().map(|c| c.len()).unwrap_or(0),
+                cap = MAX_AGENT_CORRELATION_ID_BYTES,
+                "agent send correlation_id exceeds cap"
+            );
+            return Err(wit_agent_orchestration::Error::InvocationFailed);
+        }
 
         let topic = format!("talos.agent.{}.message", msg.target);
 
@@ -462,6 +495,46 @@ impl wit_agent_orchestration::Host for TalosContext {
         // Query available agents via NATS subject enumeration.
         // Returns empty list until agent registry is implemented.
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod correlation_id_cap_tests {
+    use super::{correlation_id_exceeds_cap, MAX_AGENT_CORRELATION_ID_BYTES};
+
+    #[test]
+    fn none_is_within_cap() {
+        assert!(!correlation_id_exceeds_cap(&None));
+    }
+
+    #[test]
+    fn exactly_at_cap_is_accepted() {
+        let cid = "a".repeat(MAX_AGENT_CORRELATION_ID_BYTES);
+        assert_eq!(cid.len(), MAX_AGENT_CORRELATION_ID_BYTES);
+        assert!(!correlation_id_exceeds_cap(&Some(cid)));
+    }
+
+    #[test]
+    fn one_over_cap_is_rejected() {
+        let cid = "a".repeat(MAX_AGENT_CORRELATION_ID_BYTES + 1);
+        assert!(correlation_id_exceeds_cap(&Some(cid)));
+    }
+
+    #[test]
+    fn multibyte_utf8_cap_is_byte_based_not_char_based() {
+        // 'é' is 2 bytes in UTF-8. 129 of them = 258 bytes > 256-byte cap
+        // even though the CHAR count (129) is well under the cap. The cap
+        // bounds envelope bytes, so this must be rejected — and because we
+        // reject rather than truncate, there is no fixed-byte-offset slice
+        // that could panic on a codepoint boundary.
+        let cid = "é".repeat(129);
+        assert_eq!(cid.len(), 258);
+        assert!(correlation_id_exceeds_cap(&Some(cid)));
+
+        // 128 × 'é' = 256 bytes = exactly at cap → accepted.
+        let cid = "é".repeat(128);
+        assert_eq!(cid.len(), MAX_AGENT_CORRELATION_ID_BYTES);
+        assert!(!correlation_id_exceeds_cap(&Some(cid)));
     }
 }
 
