@@ -38,7 +38,7 @@ use uuid::Uuid;
 ///   3. AES-256-GCM-encrypt the merged map under
 ///      `WORKER_SHARED_KEY` for transport on the wire.
 ///
-/// Returns `EncryptedSecrets::default()` (empty ciphertext) when:
+/// Returns `EncryptedSecrets::empty()` (empty ciphertext) when:
 ///   * `secrets_manager` is `None` (dev/bootstrap path),
 ///   * `WORKER_SHARED_KEY` is not configured, or
 ///   * encryption itself fails.
@@ -70,7 +70,7 @@ pub async fn build_dispatch_encrypted_secrets(
             module_id = %module_id,
             "encrypted_secrets skipped: SecretsManager unavailable in dispatch context"
         );
-        return EncryptedSecrets::default();
+        return EncryptedSecrets::empty();
     };
 
     let Ok(key) = talos_workflow_job_protocol::load_worker_shared_key() else {
@@ -78,7 +78,7 @@ pub async fn build_dispatch_encrypted_secrets(
             module_id = %module_id,
             "encrypted_secrets skipped: WORKER_SHARED_KEY not configured"
         );
-        return EncryptedSecrets::default();
+        return EncryptedSecrets::empty();
     };
 
     // MCP-589: route through the user-scoped variant so a malicious
@@ -134,7 +134,7 @@ pub async fn build_dispatch_encrypted_secrets(
     // L-1: bind execution_id as AEAD AAD on the AES-GCM tag — the
     // worker decrypts with the same AAD pulled from
     // `JobRequest.workflow_execution_id`. Empty secrets_map still
-    // returns `EncryptedSecrets::default()` (empty ciphertext +
+    // returns `EncryptedSecrets::empty()` (empty ciphertext +
     // empty nonce) — that path bypasses AAD entirely on both sides.
     match EncryptedSecrets::encrypt_with_aad(&secrets_map, key.as_bytes(), execution_id.as_bytes())
     {
@@ -145,7 +145,7 @@ pub async fn build_dispatch_encrypted_secrets(
                 error = %e,
                 "Failed to encrypt dispatch secrets — proceeding without them"
             );
-            EncryptedSecrets::default()
+            EncryptedSecrets::empty()
         }
     }
 }

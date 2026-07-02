@@ -210,7 +210,7 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 }
-                _ => Default::default(),
+                _ => talos_workflow_job_protocol::EncryptedSecrets::empty(),
             };
             step_jobs.push(DispatchJob {
                 execution_id,

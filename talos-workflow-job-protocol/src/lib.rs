@@ -1284,12 +1284,36 @@ mod vault_matcher_tests {
 ///
 /// The plaintext is JSON-serialized `HashMap<String, String>` encrypted
 /// with AES-256-GCM using the pre-shared `WORKER_SHARED_KEY`.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+///
+/// **Intentionally NOT `Default`.** An empty `EncryptedSecrets` is a
+/// legitimate value (a job with no secrets), but it must be constructed
+/// via the explicitly-named [`EncryptedSecrets::empty`] so it can never
+/// arise by *accident* — e.g. `encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty()` in
+/// a dispatch path that should have called `build_encrypted_secrets()`,
+/// which silently strips a module's secret access (the real loop-node
+/// bug, 2026-04-16). This makes lint check 17 a compiler guarantee: the
+/// empty case now costs a deliberate `::empty()` at the call site.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EncryptedSecrets {
     /// AES-256-GCM ciphertext.
     pub ciphertext: Vec<u8>,
     /// 12-byte random nonce (unique per encryption).
     pub nonce: Vec<u8>,
+}
+
+impl EncryptedSecrets {
+    /// The empty secret store — a job that legitimately carries no
+    /// secrets. Deliberately named (not `Default`) so choosing "no
+    /// secrets" is always an explicit decision at the call site. If a
+    /// module is *expected* to have secrets, do NOT use this — go through
+    /// the engine's `build_encrypted_secrets()` prefetch instead.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            ciphertext: Vec::new(),
+            nonce: Vec::new(),
+        }
+    }
 }
 
 /// Reference [`SecretEnvelope`] impl backing the workspace's default
@@ -1562,7 +1586,11 @@ pub struct JobRequest {
     /// AES-256-GCM encrypted `HashMap<String, String>` of secret values.
     /// Encrypted with the pre-shared `WORKER_SHARED_KEY`.
     /// Never log or expose directly.
-    #[serde(default)]
+    // `default = "…::empty"` (not bare `#[serde(default)]`) because
+    // EncryptedSecrets is intentionally non-Default; the produced value
+    // (empty ciphertext) is byte-identical to the old Default, so the
+    // wire format is unchanged.
+    #[serde(default = "EncryptedSecrets::empty")]
     pub encrypted_secrets: EncryptedSecrets,
 
     pub timeout_ms: u64,
@@ -3352,7 +3380,7 @@ mod tests {
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
             input_payload: serde_json::json!({"replay_test": true}),
-            encrypted_secrets: EncryptedSecrets::default(),
+            encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
             deadline_unix_secs: 0,
@@ -3400,7 +3428,7 @@ mod tests {
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
             input_payload: serde_json::json!({}),
-            encrypted_secrets: EncryptedSecrets::default(),
+            encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
             deadline_unix_secs: 0,
@@ -3440,7 +3468,7 @@ mod tests {
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
             input_payload: serde_json::json!({}),
-            encrypted_secrets: EncryptedSecrets::default(),
+            encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
             deadline_unix_secs: 0,
@@ -3598,7 +3626,7 @@ mod tests {
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
             input_payload: serde_json::json!({}),
-            encrypted_secrets: EncryptedSecrets::default(),
+            encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
             deadline_unix_secs: 0,
@@ -3638,7 +3666,7 @@ mod tests {
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
             input_payload: serde_json::json!({}),
-            encrypted_secrets: EncryptedSecrets::default(),
+            encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
             deadline_unix_secs: 0,
@@ -3693,7 +3721,7 @@ mod tests {
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://m/v1".to_string(),
             input_payload: serde_json::json!({}),
-            encrypted_secrets: EncryptedSecrets::default(),
+            encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
             deadline_unix_secs: 0,
@@ -4132,7 +4160,7 @@ mod tests {
             allowed_secrets: vec!["slack/token".to_string()],
             allowed_sql_operations: vec!["SELECT".to_string()],
             allow_tier2_exposure: false,
-            encrypted_secrets: EncryptedSecrets::default(),
+            encrypted_secrets: EncryptedSecrets::empty(),
             max_fuel: 1_000_000,
             max_memory_mb: 64,
             timeout_ms: 30_000,

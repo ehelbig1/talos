@@ -461,7 +461,7 @@ mod signature_failure_payload_tests {
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://attacker-chosen/v1".to_string(),
             input_payload: serde_json::json!({"x": 1}),
-            encrypted_secrets: EncryptedSecrets::default(),
+            encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
             deadline_unix_secs: 0,
