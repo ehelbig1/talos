@@ -123,6 +123,7 @@ thiserror = "2.0.18"
 [dev-dependencies]
 wat = "1"  # Convert WAT text to a minimal component for AOT tests
 wit-component = "0.224"
+wit-parser = "0.224"  # Resolve the minimal-node world for kill-switch integration fixtures
 proptest = "1.6"  # Property-based testing for capability world lattice verification
 
 [features]

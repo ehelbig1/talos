@@ -32,10 +32,36 @@ use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
 
 use worker::runtime::TalosRuntime;
 
-/// Maximum concurrent single-node job executions
-const MAX_CONCURRENT_JOBS: usize = 100;
-/// Maximum concurrent pipeline job executions (heavier — multi-step)
-const MAX_CONCURRENT_PIPELINE_JOBS: usize = 20;
+/// Default maximum concurrent single-node job executions. Overridable via
+/// `TALOS_MAX_CONCURRENT_JOBS`; see [`max_concurrent_jobs`].
+const DEFAULT_MAX_CONCURRENT_JOBS: usize = 100;
+/// Default maximum concurrent pipeline job executions (heavier — multi-step).
+/// Overridable via `TALOS_MAX_CONCURRENT_PIPELINE_JOBS`; see
+/// [`max_concurrent_pipeline_jobs`].
+const DEFAULT_MAX_CONCURRENT_PIPELINE_JOBS: usize = 20;
+
+/// Maximum concurrent single-node job executions (env `TALOS_MAX_CONCURRENT_JOBS`).
+///
+/// Reuses the canonical `nonzero_env_or_default` footgun guard: a
+/// non-numeric or `<= 0` value would create a `Semaphore` that permits
+/// nothing (silent worker stall), so it is rejected with a WARN and the
+/// default is substituted (`>= 1` by construction). Same class as the
+/// documented `=0`/negative env-var footgun pattern.
+fn max_concurrent_jobs() -> usize {
+    worker::runtime::nonzero_env_or_default(
+        "TALOS_MAX_CONCURRENT_JOBS",
+        DEFAULT_MAX_CONCURRENT_JOBS,
+    )
+}
+
+/// Maximum concurrent pipeline job executions (env `TALOS_MAX_CONCURRENT_PIPELINE_JOBS`).
+/// Same footgun guard as [`max_concurrent_jobs`].
+fn max_concurrent_pipeline_jobs() -> usize {
+    worker::runtime::nonzero_env_or_default(
+        "TALOS_MAX_CONCURRENT_PIPELINE_JOBS",
+        DEFAULT_MAX_CONCURRENT_PIPELINE_JOBS,
+    )
+}
 
 // ============================================================================
 // RELIABILITY: Result Publishing with Retry
@@ -1663,8 +1689,41 @@ async fn main() -> anyhow::Result<()> {
         nats_url, single_job_topic
     );
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS));
-    let pipeline_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PIPELINE_JOBS));
+    // Resolve concurrency caps ONCE and bind to locals — the shutdown
+    // drain loop below compares `available_permits()` against these same
+    // values, so they must not be re-read from env (an operator changing
+    // the env mid-process can't happen, but re-reading would also re-emit
+    // the WARN and risk drift).
+    let max_concurrent_jobs = max_concurrent_jobs();
+    let max_concurrent_pipeline_jobs = max_concurrent_pipeline_jobs();
+
+    // Capacity sanity gate: the single-job semaphore must never hand out
+    // more permits than the pooling allocator can instantiate. If
+    // `max_concurrent_jobs > TOTAL_COMPONENT_INSTANCES`, a job could
+    // acquire a permit, then fail to get a pooling slot at instantiation
+    // — turning clean semaphore back-pressure into instantiation errors
+    // under saturation. Pipeline jobs each fan out into sub-instances, so
+    // the single-job cap is the tightest of the two to check. WARN rather
+    // than panic so an operator who deliberately raised the allocator's
+    // total isn't blocked, but the misconfiguration is loud.
+    let total_component_instances = worker::runtime::TOTAL_COMPONENT_INSTANCES as usize;
+    if max_concurrent_jobs > total_component_instances {
+        ::tracing::warn!(
+            max_concurrent_jobs,
+            total_component_instances,
+            "TALOS_MAX_CONCURRENT_JOBS exceeds the pooling allocator's total_component_instances — jobs may acquire a concurrency permit but fail to instantiate under saturation; lower the concurrency cap or raise total_component_instances in runtime.rs"
+        );
+    } else {
+        ::tracing::info!(
+            max_concurrent_jobs,
+            max_concurrent_pipeline_jobs,
+            total_component_instances,
+            "Job concurrency caps within pooling-allocator capacity"
+        );
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_jobs));
+    let pipeline_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_pipeline_jobs));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -2178,8 +2237,8 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_timeout = tokio::time::Duration::from_secs(30);
     let drain_start = std::time::Instant::now();
 
-    while (semaphore.available_permits() < MAX_CONCURRENT_JOBS
-        || pipeline_semaphore.available_permits() < MAX_CONCURRENT_PIPELINE_JOBS
+    while (semaphore.available_permits() < max_concurrent_jobs
+        || pipeline_semaphore.available_permits() < max_concurrent_pipeline_jobs
         || runtime.active_executions() > 0)
         && drain_start.elapsed() < shutdown_timeout
     {
@@ -2286,6 +2345,78 @@ mod result_publish_tests {
         std::env::set_var("WORKER_MAX_JOB_RESULT_BYTES", "8388608"); // 8 MiB
         assert_eq!(max_job_result_bytes(), 8_388_608);
         std::env::remove_var("WORKER_MAX_JOB_RESULT_BYTES");
+    }
+
+    // ─── B2: env-tunable concurrency caps ─────────────────────────────────
+
+    #[test]
+    fn concurrency_caps_use_defaults_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TALOS_MAX_CONCURRENT_JOBS");
+        std::env::remove_var("TALOS_MAX_CONCURRENT_PIPELINE_JOBS");
+        assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+        assert_eq!(
+            max_concurrent_pipeline_jobs(),
+            DEFAULT_MAX_CONCURRENT_PIPELINE_JOBS
+        );
+    }
+
+    #[test]
+    fn concurrency_caps_respect_positive_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TALOS_MAX_CONCURRENT_JOBS", "42");
+        std::env::set_var("TALOS_MAX_CONCURRENT_PIPELINE_JOBS", "7");
+        assert_eq!(max_concurrent_jobs(), 42);
+        assert_eq!(max_concurrent_pipeline_jobs(), 7);
+        std::env::remove_var("TALOS_MAX_CONCURRENT_JOBS");
+        std::env::remove_var("TALOS_MAX_CONCURRENT_PIPELINE_JOBS");
+    }
+
+    #[test]
+    fn concurrency_cap_zero_falls_back_to_default() {
+        // =0/negative footgun guard: a 0 Semaphore permits nothing and
+        // would silently stall the worker. `nonzero_env_or_default`
+        // substitutes the default (>= 1) with a WARN.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TALOS_MAX_CONCURRENT_JOBS", "0");
+        assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+        std::env::remove_var("TALOS_MAX_CONCURRENT_JOBS");
+    }
+
+    #[test]
+    fn concurrency_cap_negative_falls_back_to_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TALOS_MAX_CONCURRENT_PIPELINE_JOBS", "-5");
+        assert_eq!(
+            max_concurrent_pipeline_jobs(),
+            DEFAULT_MAX_CONCURRENT_PIPELINE_JOBS
+        );
+        std::env::remove_var("TALOS_MAX_CONCURRENT_PIPELINE_JOBS");
+    }
+
+    #[test]
+    fn concurrency_cap_non_numeric_falls_back_to_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TALOS_MAX_CONCURRENT_JOBS", "lots");
+        assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+        std::env::remove_var("TALOS_MAX_CONCURRENT_JOBS");
+    }
+
+    #[test]
+    fn default_concurrency_within_pooling_capacity() {
+        // The startup capacity gate in `main()` WARNs when
+        // max_concurrent_jobs > TOTAL_COMPONENT_INSTANCES. Pin the
+        // shipped defaults so a future bump that would silently exceed
+        // the pooling allocator's instance ceiling trips here first.
+        let total = worker::runtime::TOTAL_COMPONENT_INSTANCES as usize;
+        assert!(
+            DEFAULT_MAX_CONCURRENT_JOBS <= total,
+            "default single-job concurrency {DEFAULT_MAX_CONCURRENT_JOBS} exceeds pooling total_component_instances {total}"
+        );
+        assert!(
+            DEFAULT_MAX_CONCURRENT_PIPELINE_JOBS <= total,
+            "default pipeline concurrency {DEFAULT_MAX_CONCURRENT_PIPELINE_JOBS} exceeds pooling total_component_instances {total}"
+        );
     }
 
     // ─── H-1: pick_trusted_reply_topic decision matrix ────────────────────

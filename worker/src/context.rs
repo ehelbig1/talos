@@ -66,11 +66,11 @@ pub struct TalosContext {
 
     /// Rate-limit counter for Tier-2 `expose-secret` calls.
     /// Capped at MAX_EXPOSE_CALLS (10) per execution.
-    pub expose_call_count: std::sync::atomic::AtomicU64,
+    pub(crate) expose_call_count: std::sync::atomic::AtomicU64,
 
     /// Set to true when any Tier-2 `expose-secret` call succeeds.
     /// The execution trace is marked to indicate explicit secret exposure occurred.
-    pub secret_tier2_exposed: std::sync::atomic::AtomicBool,
+    pub(crate) secret_tier2_exposed: std::sync::atomic::AtomicBool,
 
     /// When false, `expose_secret` returns Unauthorized before any plaintext
     /// crosses the WASM boundary. Default: false (Tier-1-only). Modules must
@@ -173,15 +173,32 @@ pub struct TalosContext {
     /// Remaining crypto compute budget in microseconds.
     /// Shared across all `hash()` and `hmac()` calls in this execution.
     /// Default: 5 seconds (5_000_000 us). When exhausted, crypto calls return empty.
-    pub crypto_budget_us: AtomicU64,
+    pub(crate) crypto_budget_us: AtomicU64,
 
     /// In-memory quota tracking for this execution.
     /// Each entry maps a metric name to (used, limit).
-    pub quota_usage: std::sync::Mutex<HashMap<String, (u64, u64)>>,
+    pub(crate) quota_usage: std::sync::Mutex<HashMap<String, (u64, u64)>>,
 
+    // ── Field-grouping status (B1, 2026-07) ──────────────────────────────
+    // The active-stream receivers were grouped into `StreamRegistry`
+    // (`self.streams`), and every host-internal per-execution counter /
+    // budget below was narrowed `pub` → `pub(crate)` (the WASM guest never
+    // touches them — it drives everything through WIT host functions).
+    //
+    // DEFERRED (left flat, on purpose): the per-execution rate-limit
+    // counters were NOT collapsed into a single `RateLimitCounters`
+    // sub-struct because each is a distinct budget passed by-reference into
+    // `check_rate_limit(&self.<counter>, MAX_*)` from a different host
+    // file, and re-nesting them buys little while touching ~13 sites across
+    // ~10 files. The `ExecutionIdentity` cluster (`actor_id` /
+    // `execution_id` / `max_llm_tier`, ~60 call sites, `max_llm_tier` read
+    // by integration tests) was also left flat — regrouping it is a large,
+    // higher-risk mechanical churn out of scope for a behaviour-preserving
+    // pass. Both remain clean single-field accesses; group them later only
+    // if a new consumer makes it worthwhile.
     /// Per-execution call counters for rate-limited host functions.
     /// Each counter tracks calls within the current execution.
-    pub http_call_count: AtomicU64,
+    pub(crate) http_call_count: AtomicU64,
     /// M-6: per-host HTTP counter. The global `http_call_count` caps
     /// total fetches at `MAX_HTTP_CALLS_PER_EXECUTION` (1000); without
     /// a per-host cap, a single guest can issue all 1000 calls to one
@@ -192,22 +209,22 @@ pub struct TalosContext {
     /// at insertion so `Example.com` and `example.com` share a slot.
     /// `DashMap` chosen for lock-free updates on the hot path —
     /// `Mutex<HashMap>` would serialize every HTTP call.
-    pub http_calls_per_host: dashmap::DashMap<String, u64>,
-    pub db_query_count: AtomicU64,
-    pub messaging_publish_count: AtomicU64,
+    pub(crate) http_calls_per_host: dashmap::DashMap<String, u64>,
+    pub(crate) db_query_count: AtomicU64,
+    pub(crate) messaging_publish_count: AtomicU64,
     /// MCP-523: per-execution email-send count. Pre-fix `wit_email::send`
     /// had no rate limit — see `MAX_EMAIL_SENDS_PER_EXECUTION` in
     /// `host_impl.rs`.
-    pub email_send_count: AtomicU64,
+    pub(crate) email_send_count: AtomicU64,
     /// MCP-537: per-execution webhook-send count. Pre-fix `wit_webhook::send`
     /// had no rate limit — a WASM module could fire arbitrarily many
     /// outbound POSTs (each up to 1 + max_retries actual requests).
     /// See `MAX_WEBHOOK_SENDS_PER_EXECUTION` in `host_impl.rs`.
-    pub webhook_send_count: AtomicU64,
+    pub(crate) webhook_send_count: AtomicU64,
     /// MCP-537: per-execution GraphQL-query count. Same gap as
     /// `wit_webhook::send` — `wit_graphql::execute` and
     /// `execute_with_retry` had no per-execution cap.
-    pub graphql_query_count: AtomicU64,
+    pub(crate) graphql_query_count: AtomicU64,
     /// MCP-588: per-execution `wit_secrets::get_secret` count. Pre-fix
     /// guest-initiated secret access had no rate limit — a module could
     /// loop `get_secret` thousands of times within its fuel budget,
@@ -219,26 +236,22 @@ pub struct TalosContext {
     /// graphql / webhook headers) are bounded by their parent surface's
     /// per-execution cap, but the direct `get_secret` path was the
     /// straggler.
-    pub secret_access_count: AtomicU64,
+    pub(crate) secret_access_count: AtomicU64,
 
     /// Cumulative bytes written to the sandbox filesystem in this execution.
-    pub fs_bytes_written: AtomicU64,
+    pub(crate) fs_bytes_written: AtomicU64,
 
     /// Number of log messages emitted in this execution.
-    pub log_message_count: AtomicU64,
-
-    /// Active LLM streams indexed by stream ID.
-    /// Each stream holds a receiver channel for SSE events stored as JSON values.
-    pub llm_streams:
-        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<serde_json::Value>>>,
+    pub(crate) log_message_count: AtomicU64,
 
     /// Per-execution event emission counter for the events interface.
-    pub event_emit_count: AtomicU64,
+    pub(crate) event_emit_count: AtomicU64,
 
-    /// Active SSE streams indexed by stream ID.
-    /// Each stream holds a receiver for parsed SSE events (None = stream ended).
-    pub sse_streams:
-        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<SseEventInternal>>>,
+    /// Host-internal registry of active LLM / SSE stream receivers for
+    /// this execution. Grouped (was two loose `llm_streams` /
+    /// `sse_streams` fields) — the guest only ever holds an opaque
+    /// `stream_id` string, so this is `pub(crate)`.
+    pub(crate) streams: StreamRegistry,
 
     /// L-finding-7 (2026-05-23): per-host CUMULATIVE SSE connect
     /// counter — sibling to `http_calls_per_host` (M-6). The global
@@ -255,7 +268,7 @@ pub struct TalosContext {
     /// `http_calls_per_host` so the matcher (`per_host_check_and_bump`)
     /// stays shared. Cap value lives in `host_impl.rs` as
     /// `MAX_SSE_CONNECTS_PER_HOST_PER_EXECUTION`.
-    pub sse_connects_per_host: dashmap::DashMap<String, u64>,
+    pub(crate) sse_connects_per_host: dashmap::DashMap<String, u64>,
 
     /// Shared HTTP client for all outbound requests in this execution.
     ///
@@ -485,6 +498,41 @@ pub struct SseEventInternal {
     pub event_type: Option<String>,
     pub data: String,
     pub id: Option<String>,
+}
+
+/// Host-internal registry of active streaming receivers for one execution.
+///
+/// Groups the two per-execution stream maps that were previously loose
+/// `TalosContext` fields. Both are host-side plumbing — the WASM guest
+/// only ever holds an opaque string `stream_id` and drives the streams
+/// through the `llm-streaming` / `http-stream` WIT host functions, so
+/// these are `pub(crate)` (the guest never accesses them directly).
+///
+/// Behaviour is unchanged from the flat fields: each map is an
+/// independent `Mutex<HashMap<..>>` keyed by stream id, and the two
+/// budgets (`MAX_LLM_STREAMS_PER_EXECUTION` /
+/// `MAX_SSE_STREAMS_PER_EXECUTION`) stay separate. The per-host
+/// CUMULATIVE connect budget (`sse_connects_per_host`) is intentionally
+/// NOT here — it pairs with `http_calls_per_host` as a rate-limit
+/// counter, not with the active-stream registry.
+pub struct StreamRegistry {
+    /// Active LLM streams indexed by stream ID. Each holds a receiver
+    /// channel for SSE events stored as JSON values.
+    pub(crate) llm:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<serde_json::Value>>>,
+    /// Active HTTP SSE streams indexed by stream ID. Each holds a
+    /// receiver for parsed SSE events (`None` = stream ended).
+    pub(crate) sse:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<SseEventInternal>>>,
+}
+
+impl StreamRegistry {
+    fn new() -> Self {
+        Self {
+            llm: std::sync::Mutex::new(HashMap::new()),
+            sse: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 /// Per-execution hardened reqwest client.
@@ -834,9 +882,8 @@ impl TalosContext {
             secret_access_count: AtomicU64::new(0),
             fs_bytes_written: AtomicU64::new(0),
             log_message_count: AtomicU64::new(0),
-            llm_streams: std::sync::Mutex::new(HashMap::new()),
             event_emit_count: AtomicU64::new(0),
-            sse_streams: std::sync::Mutex::new(HashMap::new()),
+            streams: StreamRegistry::new(),
             sse_connects_per_host: dashmap::DashMap::new(),
             // MCP-471: tighten the SSRF-redirect fallback. The
             // `redirect(Policy::none())` above closes the redirect-

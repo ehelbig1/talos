@@ -58,7 +58,8 @@ impl wit_http_stream::Host for TalosContext {
         // Enforce concurrent stream cap.
         {
             let streams = self
-                .sse_streams
+                .streams
+                .sse
                 .lock()
                 .map_err(|_| wit_http_stream::Error::ConnectionFailed)?;
             if streams.len() >= MAX_SSE_STREAMS_PER_EXECUTION {
@@ -198,7 +199,8 @@ impl wit_http_stream::Host for TalosContext {
 
         {
             let mut streams = self
-                .sse_streams
+                .streams
+                .sse
                 .lock()
                 .map_err(|_| wit_http_stream::Error::ConnectionFailed)?;
             streams.insert(stream_id.clone(), rx);
@@ -411,7 +413,7 @@ impl wit_http_stream::Host for TalosContext {
     async fn next_event(&mut self, stream_id: String) -> Option<wit_http_stream::SseEvent> {
         // Take the receiver out so we don't hold the mutex during await.
         let mut rx = {
-            let mut streams = self.sse_streams.lock().ok()?;
+            let mut streams = self.streams.sse.lock().ok()?;
             streams.remove(&stream_id)?
         };
 
@@ -419,7 +421,7 @@ impl wit_http_stream::Host for TalosContext {
 
         // Put back if we got an event; if None (channel closed), stream is done.
         if event.is_some() {
-            if let Ok(mut streams) = self.sse_streams.lock() {
+            if let Ok(mut streams) = self.streams.sse.lock() {
                 streams.insert(stream_id, rx);
             }
         }
@@ -434,7 +436,7 @@ impl wit_http_stream::Host for TalosContext {
     async fn close(&mut self, stream_id: String) {
         // Removing the receiver causes the spawned task's tx.send() to fail,
         // which makes it exit cleanly.
-        if let Ok(mut streams) = self.sse_streams.lock() {
+        if let Ok(mut streams) = self.streams.sse.lock() {
             streams.remove(&stream_id);
         }
     }
