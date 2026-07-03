@@ -1,13 +1,6 @@
 import * as React from "react";
 import { Button, Textarea, Dialog } from "@/components/ui";
-import {
-  Loader2,
-  XCircle,
-  CheckCircle2,
-  Terminal,
-  Code2,
-  Play,
-} from "lucide-react";
+import { XCircle, CheckCircle2, Terminal, Code2, Play } from "lucide-react";
 import { testRhaiExpression } from "@/lib/graphqlApi";
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";

@@ -30,7 +30,6 @@ import {
 } from "@/lib/capabilityConfig";
 import { ageDays } from "@/lib/formatTime";
 import {
-  statusColors,
   CapabilityBadge,
   StatCard,
   ACTION_ICONS,
@@ -60,7 +59,6 @@ export function SummaryPanel({
   const [showTerminateConfirm, setShowTerminateConfirm] = useState(false);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const colors = statusColors(actor.status);
   const isTerminated = actor.status === "terminated";
 
   const [editing, setEditing] = useState(false);

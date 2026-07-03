@@ -1,6 +1,5 @@
 import React from "react";
 import { Box, Zap } from "lucide-react";
-import { cn } from "@/lib/utils";
 
 interface ResourceStatsProps {
   nodeCount: number;

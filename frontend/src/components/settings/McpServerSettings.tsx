@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { SectionHeader } from "@/components/ui/SectionHeader";
 import { CopyField } from "@/components/ui/CopyField";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import type { McpAgent } from "@/lib/graphqlApi";
@@ -19,7 +18,6 @@ export const REGISTER_MCP_AGENT = gql`
     }
   }
 `;
-import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { toast } from "sonner";
@@ -32,7 +30,6 @@ import {
   Shield,
   Copy,
   Check,
-  ChevronRight,
   Server,
   Zap,
   UserCheck,

@@ -10,7 +10,7 @@ const WorkflowVersionsPanel = lazy(
   () => import("@/components/settings/WorkflowVersionsPanel"),
 );
 import { gql, subscribeWorkflowExecutions } from "@/lib/graphqlClient";
-import { useEffect, useCallback } from "react";
+import { useEffect } from "react";
 import type {
   WorkflowsQuery,
   ListActorsQuery,
@@ -31,17 +31,7 @@ import { ConfirmDialog, SkeletonStatRow } from "@/components/ui";
 import { usePersistedExecutionStore } from "@/store/executionStore";
 import { cn } from "@/lib/utils";
 import type { WorkflowRunStatus } from "@/store/executionStore";
-import {
-  Bot,
-  Search,
-  X,
-  Filter,
-  Activity,
-  Plus,
-  Command,
-  ArrowRight,
-  ChevronDown,
-} from "lucide-react";
+import { Search, Activity, Plus, ChevronDown } from "lucide-react";
 
 import WorkflowStatsPanel from "./WorkflowStatsPanel";
 import ActorsPanel from "./ActorsPanel";
@@ -192,9 +182,6 @@ export default function Dashboard() {
   // ---------------------------------------------------------------------
   // Periodic refetch of latest workflow execution status.
   // ---------------------------------------------------------------------
-  const hasRunningWorkflow = Object.values(workflowStatuses).some(
-    (s) => s.status === "running",
-  );
   const { data: latestExecutionsData } = useLatestWorkflowExecutionsQuery(
     { workflowIds: workflows.map((w) => w.id) },
     {
@@ -535,7 +522,7 @@ export default function Dashboard() {
   );
 }
 
-const LIST_ACTORS = gql`
+const _LIST_ACTORS = gql`
   query ListActors {
     actors {
       id
@@ -546,7 +533,7 @@ const LIST_ACTORS = gql`
   }
 `;
 
-const WORKFLOWS_QUERY = gql`
+const _WORKFLOWS_QUERY = gql`
   query Workflows {
     workflows {
       id
@@ -559,7 +546,7 @@ const WORKFLOWS_QUERY = gql`
   }
 `;
 
-const TRIGGER_WORKFLOW = gql`
+const _TRIGGER_WORKFLOW = gql`
   mutation TriggerWorkflow($workflowId: UUID!) {
     triggerWorkflow(workflowId: $workflowId) {
       id
@@ -568,7 +555,7 @@ const TRIGGER_WORKFLOW = gql`
   }
 `;
 
-const LATEST_WORKFLOW_EXECUTIONS = gql`
+const _LATEST_WORKFLOW_EXECUTIONS = gql`
   query LatestWorkflowExecutions($workflowIds: [UUID!]!) {
     latestWorkflowExecutions(workflowIds: $workflowIds) {
       workflowId

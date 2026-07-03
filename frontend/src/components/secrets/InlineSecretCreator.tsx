@@ -4,16 +4,10 @@ import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
 import { FormField } from "@/components/ui/FormField";
 import { Input } from "@/components/ui/input";
-import {
-  Collapsible,
-  CollapsibleTrigger,
-  CollapsibleContent,
-} from "@/components/ui/collapsible";
 import { AlertTriangle, Plus, X, Check, ExternalLink } from "lucide-react";
 import {
   useCreateSecretMutation,
   useGetSecretsQuery,
-  Secret,
 } from "@/generated/graphql";
 
 export interface InlineSecretCreatorProps {
@@ -23,7 +17,6 @@ export interface InlineSecretCreatorProps {
 
 export function InlineSecretCreator({
   onSecretCreated,
-  fieldLabel = "Secret",
 }: InlineSecretCreatorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [name, setName] = useState("");

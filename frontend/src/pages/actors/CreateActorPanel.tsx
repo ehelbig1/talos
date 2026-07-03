@@ -212,8 +212,6 @@ export function CreateActorPanel({
   const [budgetId, setBudgetId] = useState<BudgetPresetId>("standard");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  const selectedCapIdx = CAPABILITY_LADDER.indexOf(capWorld);
-
   const { data: ceilingWorld = "automation-node" } = useQuery({
     queryKey: ["myCapabilityCeiling"],
     queryFn: getMyCapabilityCeiling,

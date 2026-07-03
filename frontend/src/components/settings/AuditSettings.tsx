@@ -11,7 +11,6 @@ import {
 } from "@/generated/graphql";
 import {
   Shield,
-  Activity,
   Database,
   Lock,
   Settings2,
@@ -19,8 +18,6 @@ import {
   Server,
   CloudUpload,
   Check,
-  Zap,
-  Globe,
   Loader2,
 } from "lucide-react";
 import { Label } from "@/components/ui/label";

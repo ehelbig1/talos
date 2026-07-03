@@ -8,12 +8,10 @@ import {
   Copy,
   CheckCircle2,
   XCircle,
-  Activity,
   Zap,
   Clock,
   X,
   Shield,
-  AlertTriangle,
   TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";

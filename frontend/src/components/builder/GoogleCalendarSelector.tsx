@@ -8,7 +8,6 @@ import {
   Check,
   CheckCircle,
   Loader2,
-  Settings,
   Shield,
   ArrowRight,
   Globe,
@@ -53,7 +52,6 @@ interface GoogleCalendarSelectorProps {
 
 export function GoogleCalendarSelector({
   onSelect,
-  currentConfig,
 }: GoogleCalendarSelectorProps) {
   // Integrations are fetched on mount via react-query so the loading/data
   // state is derived, not mirrored through a setState-in-effect.

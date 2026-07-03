@@ -1,16 +1,8 @@
 import React, { memo, useState } from "react";
-import {
-  ErrorBanner,
-  Dialog,
-  InfoTip,
-  Button,
-  DarkInput,
-  InfoBanner,
-} from "@/components/ui";
+import { ErrorBanner, Dialog, Button, DarkInput } from "@/components/ui";
 import { ModuleItem } from "@/components/dialogs/ModuleItem";
 import { useAddExistingNode } from "@/hooks/useAddExistingNode";
 import { Search, Library } from "lucide-react";
-import type { WasmModule } from "@/hooks/useAddExistingNode";
 
 interface AddExistingNodeDialogProps {
   onNodeAdded: (

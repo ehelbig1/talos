@@ -1,20 +1,16 @@
 import React, { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Card } from "@/components/ui/card";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Dialog } from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import {
   Clock,
   Calendar,
   Plus,
   Trash2,
   Edit2,
-  Check,
   X,
   ToggleLeft,
   ToggleRight,

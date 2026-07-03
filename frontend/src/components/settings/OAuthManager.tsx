@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Card } from "@/components/ui/card";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
@@ -23,13 +22,12 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { gql } from "@/lib/graphqlClient";
 import { getOAuthLoginUrl } from "@/lib/graphqlApi";
 import { validateOAuthUrl, loadOAuthHosts } from "@/lib/oauthUtils";
-import type { ListLinkedAccountsQuery } from "@/generated/graphql";
 import {
   useListLinkedAccountsQuery,
   useUnlinkOAuthMutation,
 } from "@/generated/graphql";
 
-const LIST_LINKED_ACCOUNTS = gql`
+const _LIST_LINKED_ACCOUNTS = gql`
   query ListLinkedAccounts {
     linkedOauthAccounts {
       id
@@ -43,7 +41,7 @@ const LIST_LINKED_ACCOUNTS = gql`
   }
 `;
 
-const GET_OAUTH_URL = gql`
+const _GET_OAUTH_URL = gql`
   query GetOAuthUrl($provider: String!) {
     oauthLoginUrl(provider: $provider) {
       authUrl
@@ -51,13 +49,11 @@ const GET_OAUTH_URL = gql`
   }
 `;
 
-const UNLINK_OAUTH = gql`
+const _UNLINK_OAUTH = gql`
   mutation UnlinkOAuth($provider: String!) {
     unlinkOauthAccount(provider: $provider)
   }
 `;
-
-type OAuthAccount = ListLinkedAccountsQuery["linkedOauthAccounts"][number];
 
 const PROVIDERS = [
   {

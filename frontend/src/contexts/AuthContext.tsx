@@ -43,7 +43,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (mounted) {
           setUser(currentUser);
         }
-      } catch (err) {
+      } catch {
         // Not logged in or token expired/invalid
       } finally {
         if (mounted) {

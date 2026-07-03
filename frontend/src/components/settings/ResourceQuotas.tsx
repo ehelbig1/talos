@@ -1,5 +1,4 @@
 import React, { useState } from "react";
-import { gql } from "@/lib/graphqlClient";
 import {
   useGetResourceQuotasQuery,
   useUpdateResourceQuotasMutation,
@@ -15,8 +14,6 @@ import {
   Edit2,
   Save,
   X,
-  ShieldCheck,
-  LayoutGrid,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";

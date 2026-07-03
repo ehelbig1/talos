@@ -7,7 +7,6 @@ import { SectionHeader } from "@/components/ui";
 import {
   Search,
   Users,
-  CheckCircle,
   X,
   Lock,
   Hash,
@@ -48,7 +47,6 @@ interface SlackUser {
 
 export function SlackBrowser({
   botToken,
-  fieldName,
   currentValue,
   onSelect,
   resourceType,

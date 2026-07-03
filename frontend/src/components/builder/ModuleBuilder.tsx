@@ -1,12 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import {
-  Dialog,
-  Section,
-  Button,
-  Badge,
-  DarkInput,
-  SectionHeader,
-} from "@/components/ui";
+import { Dialog, Button, Badge, DarkInput } from "@/components/ui";
 import { CopyField } from "@/components/ui/CopyField";
 import { lazy, Suspense } from "react";
 const TemplateLibrary = lazy(() =>
@@ -23,18 +16,14 @@ import {
   useCreateWebhookTriggerMutation,
   useGetNodeTemplateQuery,
 } from "@/generated/graphql";
-import { InfoTip } from "@/components/ui/InfoTip";
-import { InfoBanner } from "@/components/ui/InfoBanner";
 import {
   ArrowLeft,
   Webhook,
   CheckCircle,
   X,
   Loader2,
-  Sparkles,
   Database,
   Shield,
-  Globe,
   Zap,
   Bot,
 } from "lucide-react";
@@ -140,7 +129,7 @@ export function ModuleBuilder({
         resetAndClose();
       }
     },
-    onError: (error) => {
+    onError: () => {
       // Error handled by UI
     },
   });
@@ -162,7 +151,7 @@ export function ModuleBuilder({
         url: data.createWebhookTrigger.webhookUrl,
       });
     },
-    onError: (error) => {
+    onError: () => {
       toast.error("Failed to create webhook trigger");
     },
   });
@@ -546,7 +535,7 @@ function WebhookSuccessView({
         setCopied(false);
         copyTimeoutRef.current = null;
       }, 2000);
-    } catch (err) {
+    } catch {
       // Failed to copy
     }
   };

@@ -1,5 +1,4 @@
 import React, { useState } from "react";
-import { Card } from "@/components/ui/card";
 import { useQueryClient } from "@tanstack/react-query";
 import { gql } from "@/lib/graphqlClient";
 import type { Secret } from "@/generated/graphql";
@@ -14,9 +13,6 @@ import { CreateSecretDialog } from "./CreateSecretDialog";
 import { AuditLogViewer } from "./AuditLogViewer";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { formatDate } from "@/lib/format";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
-import { Button } from "@/components/ui/button";
-import { SectionHeader } from "@/components/ui/SectionHeader";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
@@ -35,7 +31,7 @@ import {
   X,
 } from "lucide-react";
 
-const GET_SECRETS = gql`
+const _GET_SECRETS = gql`
   query GetSecrets($pagination: PaginationInput) {
     secrets(pagination: $pagination) {
       id
@@ -50,13 +46,13 @@ const GET_SECRETS = gql`
   }
 `;
 
-const DELETE_SECRET = gql`
+const _DELETE_SECRET = gql`
   mutation DeleteSecret($keyPath: String!) {
     deleteSecret(keyPath: $keyPath)
   }
 `;
 
-const ROTATE_ENCRYPTION_KEY = gql`
+const _ROTATE_ENCRYPTION_KEY = gql`
   mutation RotateEncryptionKey {
     rotateEncryptionKey
   }

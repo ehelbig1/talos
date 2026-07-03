@@ -1,10 +1,7 @@
 import { config } from "@/config";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import React, { useState, useEffect } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
-import { Button } from "@/components/ui/button";
-import { SectionHeader } from "@/components/ui/SectionHeader";
+import { useQuery } from "@tanstack/react-query";
 import { getCsrfToken } from "@/lib/csrf";
 import { validateOAuthUrl, loadOAuthHosts } from "@/lib/oauthUtils";
 import { toast } from "sonner";
@@ -20,12 +17,10 @@ import {
   XCircle,
   AlertTriangle,
   HelpCircle,
-  CloudOff,
   Loader2,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Dialog } from "@/components/ui";
-import { cn } from "@/lib/utils";
 import { GoogleCalendarWatchChannels } from "./GoogleCalendarWatchChannels";
 import { GmailWatchChannels } from "./GmailWatchChannels";
 
@@ -84,7 +79,6 @@ function getIcon(iconName: string): LucideIcon {
 }
 
 export function IntegrationsManager() {
-  const queryClient = useQueryClient();
   // Service integrations are fetched via react-query so the loading/data
   // state is derived, not mirrored through a setState-in-effect. `refetch`
   // is used by the connect / disconnect / OAuth-callback paths below.

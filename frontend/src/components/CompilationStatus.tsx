@@ -1,7 +1,7 @@
 import React, { useEffect } from "react";
 import { subscribeCompilation } from "@/lib/graphqlClient";
 import { useCompilationStore } from "@/store/compilationStore";
-import { Loader2, CheckCircle2, AlertCircle, Cpu, Zap, X } from "lucide-react";
+import { CheckCircle2, AlertCircle, Cpu, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /**

@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Plus, X, Check, Target, Settings, Shield, Zap } from "lucide-react";
+import { Plus, X, Check, Target, Shield } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { EndpointSelector } from "./EndpointSelector";
 import { Button, Badge } from "@/components/ui";
@@ -208,11 +208,11 @@ export function ManualEndpointCreator({
               Operational Parameters
             </h5>
             <div className="flex gap-2">
-              {["path", "query", "header"].map((type) => (
+              {(["path", "query", "header"] as const).map((type) => (
                 <button
                   key={type}
                   type="button"
-                  onClick={() => addParameter(type as any)}
+                  onClick={() => addParameter(type)}
                   className="h-7 px-3 bg-white/5 hover:bg-white/10 text-[8px] font-black text-white uppercase tracking-widest rounded-lg border border-white/5 transition-premium"
                 >
                   <Plus className="h-3 w-3 mr-1.5 inline" /> {type}

@@ -8,8 +8,6 @@ import {
   useInviteMemberMutation,
   useUpdateMemberRoleMutation,
   useTransferOwnershipMutation,
-  OrganizationObj,
-  OrgMemberObj as OrgMember,
 } from "@/generated/graphql";
 import { gql } from "@/lib/graphqlClient";
 import { Card } from "@/components/ui/card";
@@ -22,14 +20,11 @@ import {
   Building2,
   Plus,
   Users,
-  Settings2,
   UserPlus,
   Trash2,
   ShieldCheck,
   Globe,
-  MoreVertical,
   Mail,
-  X,
   AlertTriangle,
   ArrowRightLeft,
 } from "lucide-react";
@@ -41,7 +36,7 @@ import { Badge } from "@/components/ui/badge";
 import { useAuth } from "@/contexts/AuthContext";
 
 // GQL tags for codegen
-const LIST_ORGS = gql`
+const _LIST_ORGS = gql`
   query ListOrgs {
     myOrganizations {
       id
@@ -54,7 +49,7 @@ const LIST_ORGS = gql`
   }
 `;
 
-const LIST_ORG_MEMBERS = gql`
+const _LIST_ORG_MEMBERS = gql`
   query ListOrgMembers($orgId: UUID!) {
     organizationMembers(orgId: $orgId) {
       id
@@ -67,7 +62,7 @@ const LIST_ORG_MEMBERS = gql`
   }
 `;
 
-const CREATE_ORG = gql`
+const _CREATE_ORG = gql`
   mutation CreateOrg($name: String!, $slug: String!) {
     createOrganization(name: $name, slug: $slug) {
       id
@@ -76,13 +71,13 @@ const CREATE_ORG = gql`
   }
 `;
 
-const REMOVE_MEMBER = gql`
+const _REMOVE_MEMBER = gql`
   mutation RemoveMember($orgId: UUID!, $userId: UUID!) {
     removeMember(orgId: $orgId, targetUserId: $userId)
   }
 `;
 
-const INVITE_MEMBER = gql`
+const _INVITE_MEMBER = gql`
   mutation InviteMember($orgId: UUID!, $targetUserId: UUID!, $role: String!) {
     inviteMember(orgId: $orgId, targetUserId: $targetUserId, role: $role) {
       id
@@ -95,7 +90,7 @@ const INVITE_MEMBER = gql`
   }
 `;
 
-const UPDATE_MEMBER_ROLE = gql`
+const _UPDATE_MEMBER_ROLE = gql`
   mutation UpdateMemberRole(
     $orgId: UUID!
     $targetUserId: UUID!
@@ -111,7 +106,7 @@ const UPDATE_MEMBER_ROLE = gql`
   }
 `;
 
-const TRANSFER_OWNERSHIP = gql`
+const _TRANSFER_OWNERSHIP = gql`
   mutation TransferOwnership($orgId: UUID!, $newOwnerId: UUID!) {
     transferOwnership(orgId: $orgId, newOwnerId: $newOwnerId) {
       id

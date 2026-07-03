@@ -1,5 +1,4 @@
 import { useGetAllWorkflowStatsQuery } from "@/generated/graphql";
-import { SkeletonStatRow } from "@/components/ui";
 import { Zap, TrendingUp, CheckCircle, XCircle, Clock } from "lucide-react";
 
 export default function WorkflowStatsPanel() {

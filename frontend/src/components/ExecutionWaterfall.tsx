@@ -64,8 +64,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
         ev.status === "FAILED"
       ) {
         const startMs = nodeStarts.get(nodeId) ?? relativeMs;
-        const durationMs =
-          (ev as any).durationMs ?? Math.max(1, relativeMs - startMs);
+        const durationMs = ev.durationMs ?? Math.max(1, relativeMs - startMs);
         const isFailed = ev.status === "NodeFailed" || ev.status === "FAILED";
 
         result.push({

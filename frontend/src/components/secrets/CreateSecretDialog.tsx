@@ -7,20 +7,11 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { SecurityNotice } from "@/components/ui/SecurityNotice";
-import { TextButton } from "@/components/ui/TextButton";
-import { FlexContainer } from "@/components/ui/FlexContainer";
-import {
-  AlertTriangle,
-  Check,
-  X,
-  Eye,
-  EyeOff,
-  ShieldCheck,
-} from "lucide-react";
+import { AlertTriangle, Check, Eye, EyeOff } from "lucide-react";
 import { useCreateSecretMutation } from "@/generated/graphql";
 import { gql } from "@/lib/graphqlClient";
 
-const CREATE_SECRET = gql`
+const _CREATE_SECRET = gql`
   mutation CreateSecret($input: CreateSecretInput!) {
     createSecret(input: $input) {
       id

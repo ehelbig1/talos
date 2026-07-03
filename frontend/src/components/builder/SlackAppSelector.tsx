@@ -10,13 +10,11 @@ import {
   Hash,
   Plus,
   MessageSquare,
-  Globe,
   Check,
   Loader2,
   AlertTriangle,
   Rocket,
   ArrowRight,
-  Shield,
   Zap,
 } from "lucide-react";
 
