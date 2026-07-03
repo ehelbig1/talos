@@ -58,7 +58,7 @@ describe("graphqlClient", () => {
         vi.stubGlobal("document", { cookie: "talos_csrf_token=mock-token" });
         return HttpResponse.text("ok");
       }),
-      graphql.operation(({ request, query }) => {
+      graphql.operation(({ query }) => {
         if (query.includes("RefreshToken")) {
           refreshCalled = true;
           return HttpResponse.json({

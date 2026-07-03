@@ -1,6 +1,6 @@
 import { renderHook, waitFor } from "../test-utils";
 import { useTemplates } from "./useTemplates";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { server } from "../../vitest.setup";
 import { http, HttpResponse } from "msw";
 

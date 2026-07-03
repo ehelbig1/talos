@@ -468,9 +468,10 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
   // strict-mode warnings and (in dev) leaked closure references.
   const flashTimersRef = useRef<Set<number>>(new Set());
   useEffect(() => {
+    const timers = flashTimersRef.current;
     return () => {
-      flashTimersRef.current.forEach(clearTimeout);
-      flashTimersRef.current.clear();
+      timers.forEach(clearTimeout);
+      timers.clear();
     };
   }, []);
   const triggerFlash = (channelUuid: string) => {

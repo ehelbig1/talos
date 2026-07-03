@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "codegen": "graphql-codegen --config codegen.yml",
     "lint:prettier": "npx prettier --check 'src/**/*.{js,ts,tsx,css,md}'",
-    "lint:eslint": "eslint src/**/*.ts src/**/*.tsx",
+    "lint:eslint": "eslint 'src/**/*.{ts,tsx}' --max-warnings 0",
     "lint": "npm run lint:eslint && npm run lint:prettier",
     "test": "vitest run",
     "test:watch": "vitest watch",

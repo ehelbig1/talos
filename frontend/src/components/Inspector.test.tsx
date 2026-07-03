@@ -132,7 +132,7 @@ describe("Inspector Component", () => {
       sourceHandle: "out",
       targetHandle: "in",
     });
-    const edge = useWorkflowStore.getState().edges[0];
+    const _edge = useWorkflowStore.getState().edges[0];
 
     useWorkflowStore.setState({
       edges: useWorkflowStore.getState().edges.map((e) => ({

@@ -310,9 +310,10 @@ export function GmailWatchChannels(): React.ReactElement | null {
   // setState doesn't fire on an unmounted component.
   const flashTimersRef = React.useRef<Set<number>>(new Set());
   React.useEffect(() => {
+    const timers = flashTimersRef.current;
     return () => {
-      flashTimersRef.current.forEach(clearTimeout);
-      flashTimersRef.current.clear();
+      timers.forEach(clearTimeout);
+      timers.clear();
     };
   }, []);
   const triggerFlash = (ch: string) => {

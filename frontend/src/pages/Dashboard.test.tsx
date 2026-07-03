@@ -1,15 +1,8 @@
-import {
-  render,
-  screen,
-  fireEvent,
-  waitFor,
-  act,
-} from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import Dashboard from "./dashboard";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { graphqlRequest } from "@/lib/graphqlClient";
 import { loadWorkflowById } from "@/lib/workflowLoader";
 
 const mockNavigate = vi.fn();
@@ -29,7 +22,7 @@ vi.mock("@/lib/graphqlClient", () => ({
   listActors: vi.fn().mockResolvedValue([]),
   subscribeExecution: vi.fn(() => vi.fn()),
   subscribeWorkflowExecutions: vi.fn(() => vi.fn()),
-  gql: (strings: TemplateStringsArray, ...values: unknown[]) =>
+  gql: (strings: TemplateStringsArray, ..._values: unknown[]) =>
     strings.join(""),
 }));
 
@@ -96,7 +89,7 @@ vi.mock("@/store/workflowStore", () => ({
 }));
 
 vi.mock("@/store/executionStore", () => ({
-  usePersistedExecutionStore: vi.fn((selector) => {
+  usePersistedExecutionStore: vi.fn((_selector) => {
     // Basic mock for execution store
     return {};
   }),

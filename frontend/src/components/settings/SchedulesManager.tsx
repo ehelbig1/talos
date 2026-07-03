@@ -507,7 +507,10 @@ export default function SchedulesManager() {
   const { data: workflowsData } = useWorkflowsQuery({});
 
   const schedules = schedulesData?.mySchedules ?? [];
-  const workflows = workflowsData?.workflows ?? [];
+  const workflows = React.useMemo(
+    () => workflowsData?.workflows ?? [],
+    [workflowsData],
+  );
 
   // Build a quick-lookup map: workflowId → name
   const workflowNameMap = React.useMemo<Record<string, string>>(() => {

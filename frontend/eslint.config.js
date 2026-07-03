@@ -123,6 +123,18 @@ export default [
             ],
         },
     },
+    // Test files: allow `any`. Test doubles, mock fetch signatures, and
+    // fixture payloads are deliberately loosely typed — enforcing precise
+    // types on mocks adds churn without protecting production code. The rule
+    // stays ON (warn) for all non-test source, so production type safety is
+    // unaffected. no-unused-vars stays ON for tests too (dead test imports are
+    // still worth catching).
+    {
+        files: ["**/*.test.{ts,tsx}", "**/__tests__/**/*.{ts,tsx}"],
+        rules: {
+            "@typescript-eslint/no-explicit-any": "off",
+        },
+    },
     // Disable rules that conflict with Prettier
     prettierConfig,
 ];

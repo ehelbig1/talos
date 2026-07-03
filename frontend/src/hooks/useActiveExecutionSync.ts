@@ -121,6 +121,7 @@ export function useActiveExecutionSync(workflowId: string | null) {
         watchdogIntervalRef.current = null;
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `setupDetailSubscription` is intentionally omitted: it's a plain (non-memoized) function recreated every render, so listing it would re-run this effect on every render and tear down + re-establish the NATS lifecycle subscription each time. It's only ever invoked from inside the async subscription callback (see the forward-reference note above), where the latest closure is fine. The listed deps are the store setters + ids that actually affect what the subscription does.
   }, [
     workflowId,
     queryClient,

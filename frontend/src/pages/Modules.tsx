@@ -277,7 +277,7 @@ export default function Modules() {
     { limit: 200 },
     { staleTime: 5 * 60_000, refetchOnWindowFocus: false },
   );
-  const modules = data?.myModules ?? [];
+  const modules = useMemo(() => data?.myModules ?? [], [data]);
 
   const worlds = useMemo(() => {
     const seen = new Set<string>();

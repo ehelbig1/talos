@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@/test-utils";
+import { render, screen, fireEvent } from "@/test-utils";
 import { ModuleBuilder } from "./ModuleBuilder";
 import { server } from "@/../vitest.setup";
 import { http, HttpResponse } from "msw";

@@ -78,7 +78,7 @@ describe("graphqlRequest Concurrency", () => {
 
     // After refresh starts, mock success for the retries
     setTimeout(() => {
-      vi.mocked(fetch).mockImplementation(async (url, init) => {
+      vi.mocked(fetch).mockImplementation(async (_url, _init) => {
         return {
           ok: true,
           text: () =>
