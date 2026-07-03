@@ -298,6 +298,7 @@ fn truncate_oversized_job_result(
     cap: usize,
 ) -> JobResult {
     JobResult {
+        crypto_scheme: 0,
         job_id: result.job_id,
         status: JobStatus::Failed,
         output_payload: serde_json::json!({
@@ -383,6 +384,7 @@ async fn publish_result_with_retry(
 /// empty logs/signature/nonce/worker-id (the publish path signs it).
 fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> JobResult {
     JobResult {
+        crypto_scheme: 0,
         job_id,
         status: JobStatus::Failed,
         output_payload: json!({ "error": msg }),
@@ -620,6 +622,7 @@ async fn execute_job(
         // enable the env on both sides while investigating a real
         // controller↔worker signing divergence, then unset it.
         return JobResult {
+            crypto_scheme: 0,
             job_id: req.job_id,
             status: JobStatus::Failed,
             output_payload: signature_failure_payload(*WORKER_SIGNATURE_DIAG_ENABLED, &req, &e),
@@ -859,6 +862,7 @@ async fn execute_job(
             _span.end_success();
 
             JobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Success,
                 output_payload: output,
@@ -878,6 +882,7 @@ async fn execute_job(
             _span.end_error(&sanitized_error);
 
             JobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Failed,
                 output_payload: json!({"error": sanitized_error}),
@@ -896,6 +901,7 @@ async fn execute_job(
             _span.end_error(&error_msg);
 
             JobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Failed,
                 output_payload: json!({"error": error_msg}),
@@ -938,6 +944,7 @@ async fn execute_pipeline_job(
         _span.set_attribute("error", "signature_verification_failed");
         _span.end_error("Signature verification failed");
         return PipelineJobResult {
+            crypto_scheme: 0,
             job_id: req.job_id,
             overall_status: JobStatus::Failed,
             step_results: vec![],
@@ -964,6 +971,7 @@ async fn execute_pipeline_job(
         );
         _span.end_error("Timeout exceeds maximum");
         return PipelineJobResult {
+            crypto_scheme: 0,
             job_id: req.job_id,
             overall_status: JobStatus::Failed,
             step_results: vec![],
@@ -992,6 +1000,7 @@ async fn execute_pipeline_job(
                     ::tracing::error!(job_id = %req.job_id, error = %e, "Failed to decrypt pipeline step secrets");
                     _span.end_error("Secret decryption failed");
                     return PipelineJobResult {
+                        crypto_scheme: 0,
                         job_id: req.job_id,
                         overall_status: JobStatus::Failed,
                         step_results: vec![],
@@ -1057,6 +1066,7 @@ async fn execute_pipeline_job(
                 .collect();
 
             PipelineJobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 overall_status: JobStatus::Success,
                 step_results,
@@ -1076,6 +1086,7 @@ async fn execute_pipeline_job(
             _span.end_error(&sanitized_error);
 
             PipelineJobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 overall_status: JobStatus::Failed,
                 step_results: vec![],
@@ -2188,6 +2199,7 @@ async fn main() -> anyhow::Result<()> {
                                         "PipelineJobResult exceeds NATS publish cap — substituting Failed status"
                                     );
                                     let mut replacement = PipelineJobResult {
+                                        crypto_scheme: 0,
                                         job_id: result.job_id,
                                         overall_status: JobStatus::Failed,
                                         step_results: vec![],
@@ -2340,6 +2352,7 @@ mod result_publish_tests {
     #[test]
     fn truncate_oversized_replaces_payload_and_marks_failed() {
         let original = JobResult {
+            crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"huge": "x".repeat(10_000)}),
@@ -2374,6 +2387,7 @@ mod result_publish_tests {
         // The replacement itself must fit comfortably under any
         // reasonable cap, otherwise we'd loop forever.
         let original = JobResult {
+            crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"huge": "x".repeat(10_000_000)}),

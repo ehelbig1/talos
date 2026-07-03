@@ -47,6 +47,7 @@ fn job_request_roundtrip() {
 #[test]
 fn job_result_roundtrip() {
     let res = JobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
         output_payload: json!({"out": 42}),
@@ -176,6 +177,7 @@ fn pipeline_job_request_tampered_step_fails() {
 fn pipeline_job_result_roundtrip() {
     let step_id = Uuid::new_v4();
     let res = PipelineJobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         overall_status: JobStatus::Success,
         step_results: vec![PipelineStepResult {
@@ -205,6 +207,7 @@ fn pipeline_job_result_roundtrip() {
 fn pipeline_job_result_sign_and_verify() {
     let key = test_key();
     let mut res = PipelineJobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         overall_status: JobStatus::Success,
         step_results: vec![],
@@ -226,6 +229,7 @@ fn pipeline_job_result_sign_and_verify() {
 fn pipeline_job_result_tampered_output_fails() {
     let key = test_key();
     let mut res = PipelineJobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         overall_status: JobStatus::Success,
         step_results: vec![],

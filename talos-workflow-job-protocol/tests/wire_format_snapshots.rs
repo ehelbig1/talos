@@ -248,6 +248,7 @@ fn job_request_signature_snapshot() {
 #[test]
 fn job_result_json_snapshot() {
     let result = JobResult {
+        crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
         status: JobStatus::Success,
         output_payload: json!({"out": 42}),
@@ -262,7 +263,7 @@ fn job_result_json_snapshot() {
         worker_id: "snapshot-worker-01".into(),
     };
     let actual = serde_json::to_string(&result).expect("serialize");
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","status":"Success","output_payload":{"out":42},"logs":["info: ok"],"execution_time_ms":7,"signature":[222,173,190,239],"result_nonce":"0:00000000000000000000000000000000","worker_id":"snapshot-worker-01"}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","status":"Success","output_payload":{"out":42},"logs":["info: ok"],"execution_time_ms":7,"signature":[222,173,190,239],"result_nonce":"0:00000000000000000000000000000000","worker_id":"snapshot-worker-01","crypto_scheme":0}"#;
     assert_eq!(
         actual, expected,
         "JobResult wire format drifted — see test docstring for resolution"
@@ -316,6 +317,7 @@ fn pipeline_job_request_json_snapshot() {
 #[test]
 fn pipeline_job_result_json_snapshot() {
     let res = PipelineJobResult {
+        crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0010),
         step_results: vec![PipelineStepResult {
             module_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0013),
@@ -333,7 +335,7 @@ fn pipeline_job_result_json_snapshot() {
         worker_id: "snapshot-worker-01".into(),
     };
     let actual = serde_json::to_string(&res).expect("serialize");
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000010","overall_status":"Success","step_results":[{"module_id":"00000000-0000-0000-0000-000000000013","status":"Success","output":{"step":"ok"},"execution_time_ms":12,"error":null}],"final_output":{"step":"ok"},"total_time_ms":12,"signature":[186,173],"result_nonce":"0:00000000000000000000000000000000","worker_id":"snapshot-worker-01"}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000010","overall_status":"Success","step_results":[{"module_id":"00000000-0000-0000-0000-000000000013","status":"Success","output":{"step":"ok"},"execution_time_ms":12,"error":null}],"final_output":{"step":"ok"},"total_time_ms":12,"signature":[186,173],"result_nonce":"0:00000000000000000000000000000000","worker_id":"snapshot-worker-01","crypto_scheme":0}"#;
     assert_eq!(
         actual, expected,
         "PipelineJobResult wire format drifted — see test docstring for resolution"

@@ -2507,6 +2507,16 @@ pub struct JobResult {
     /// [`JobResult::sign_with_worker_id`].
     #[serde(default)]
     pub worker_id: String,
+
+    /// RFC 0010 P2: signature scheme this result was signed under.
+    /// [`CRYPTO_SCHEME_HMAC`] (0, default) = legacy `WORKER_SHARED_KEY` HMAC;
+    /// [`CRYPTO_SCHEME_ED25519`] (1) = the worker's own Ed25519 private key
+    /// (verified by the controller against the worker's registered public key,
+    /// keyed by `worker_id`). Unsigned dispatch hint — a flip routes to the wrong
+    /// verify method where the scheme-specific signature fails. NOT part of the
+    /// HMAC `signing_payload()`, so scheme-0 bytes stay identical to pre-P2.
+    #[serde(default)]
+    pub crypto_scheme: u8,
 }
 
 impl JobResult {
@@ -2675,6 +2685,75 @@ impl JobResult {
     /// chain, use `verify()` (not this method).
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
+    }
+
+    // ── RFC 0010 P2: per-worker Ed25519 result signing ────────────────────
+
+    /// Sign under the worker's Ed25519 key (scheme 1) and bind `worker_id`.
+    /// The controller verifies against the public key registered for that
+    /// `worker_id`, so a compromised worker holding only its own private key can
+    /// sign results only as itself. `worker_id` is validated (charset) and MUST
+    /// be non-empty under Ed25519 — an empty id has no registered key to verify
+    /// against.
+    pub fn sign_ed25519_with_worker_id(
+        &mut self,
+        signing_key: &DispatchSigningKey,
+        worker_id: &str,
+    ) -> Result<(), String> {
+        validate_worker_id(worker_id)?;
+        if worker_id.is_empty() {
+            return Err("Ed25519 result signing requires a non-empty worker_id".to_string());
+        }
+        self.worker_id = worker_id.to_string();
+        self.crypto_scheme = CRYPTO_SCHEME_ED25519;
+        self.sign_core_ed25519(signing_key)
+    }
+
+    /// **Primary** Ed25519 result verify (controller): freshness + signature
+    /// against the worker's public key(s), then record the nonce (verify-once).
+    pub fn verify_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        self.verify_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Observer Ed25519 result verify: freshness + signature only, no replay
+    /// write. For passive audit subscribers (see the verify-once rule).
+    pub fn verify_no_replay_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        self.verify_no_replay_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Scheme-dispatching **primary** verify for the controller. Routes on
+    /// `self.crypto_scheme`: Ed25519 against `worker_ed_keys` (the keys
+    /// registered for `self.worker_id`), or legacy HMAC against `hmac_ring` when
+    /// `accept_legacy_hmac` (the P4 flip refuses HMAC once the fleet is on
+    /// Ed25519). Records the nonce exactly once. Use [`Verifier`] semantics via
+    /// [`Self::verify_as`] for the HMAC path when you need Observer.
+    pub fn verify_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        worker_ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), String> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(worker_ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(
+                        "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
+                    );
+                }
+                self.verify_with_ring(hmac_ring, max_age_secs)
+            }
+            other => Err(format!("unknown result crypto_scheme: {other}")),
+        }
     }
 }
 
@@ -3176,6 +3255,10 @@ pub struct PipelineJobResult {
     /// for the security rationale — same model for both result types.
     #[serde(default)]
     pub worker_id: String,
+
+    /// RFC 0010 P2: signature scheme (see [`JobResult::crypto_scheme`]).
+    #[serde(default)]
+    pub crypto_scheme: u8,
 }
 
 impl PipelineJobResult {
@@ -3336,6 +3419,64 @@ impl PipelineJobResult {
     /// ways at once differs — every accept/reject outcome is identical.)
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
+    }
+
+    // ── RFC 0010 P2: per-worker Ed25519 result signing (mirror of JobResult) ──
+
+    /// Sign under the worker's Ed25519 key + bind `worker_id`. See
+    /// [`JobResult::sign_ed25519_with_worker_id`].
+    pub fn sign_ed25519_with_worker_id(
+        &mut self,
+        signing_key: &DispatchSigningKey,
+        worker_id: &str,
+    ) -> Result<(), String> {
+        validate_worker_id(worker_id)?;
+        if worker_id.is_empty() {
+            return Err("Ed25519 result signing requires a non-empty worker_id".to_string());
+        }
+        self.worker_id = worker_id.to_string();
+        self.crypto_scheme = CRYPTO_SCHEME_ED25519;
+        self.sign_core_ed25519(signing_key)
+    }
+
+    /// Primary Ed25519 result verify. See [`JobResult::verify_ed25519`].
+    pub fn verify_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        self.verify_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Observer Ed25519 result verify. See [`JobResult::verify_no_replay_ed25519`].
+    pub fn verify_no_replay_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        self.verify_no_replay_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Scheme-dispatching primary verify. See [`JobResult::verify_dispatch`].
+    pub fn verify_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        worker_ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), String> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(worker_ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(
+                        "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
+                    );
+                }
+                self.verify_with_ring(hmac_ring, max_age_secs)
+            }
+            other => Err(format!("unknown result crypto_scheme: {other}")),
+        }
     }
 }
 
@@ -3970,6 +4111,7 @@ mod tests {
     fn test_job_result_sign_and_verify() {
         let key = test_key();
         let mut result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"answer": 42}),
@@ -3991,6 +4133,7 @@ mod tests {
     fn test_job_result_tampered_fails() {
         let key = test_key();
         let mut result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"answer": 42}),
@@ -4016,6 +4159,7 @@ mod tests {
     fn verifier_primary_records_replay_observer_does_not() {
         let key = test_key();
         let mut a = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({}),
@@ -4053,6 +4197,7 @@ mod tests {
     fn verifier_observer_then_primary_both_succeed() {
         let key = test_key();
         let mut a = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({}),
@@ -4072,6 +4217,7 @@ mod tests {
     fn verifier_rejects_tampered_signature_in_both_roles() {
         let key = test_key();
         let mut a = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"answer": 42}),
@@ -4171,6 +4317,7 @@ mod tests {
     fn test_job_result_unsigned_fails() {
         let key = test_key();
         let result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({}),
@@ -4228,6 +4375,106 @@ mod tests {
         talos_workflow_engine_core::WorkerKeyRing::single(
             talos_workflow_engine_core::WorkerSharedKey::new(key.to_vec()),
         )
+    }
+
+    fn make_test_result() -> JobResult {
+        JobResult {
+            crypto_scheme: 0,
+            job_id: Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"ok": true}),
+            logs: vec![],
+            execution_time_ms: 12,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        }
+    }
+
+    // ── RFC 0010 P2: per-worker Ed25519 RESULT signing tests ──────────────
+
+    #[test]
+    fn result_ed25519_sign_verify_roundtrip() {
+        let worker_sk = ed_keypair();
+        let worker_pk = worker_sk.verifying_key();
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&worker_sk, "talos-worker-7")
+            .unwrap();
+        assert_eq!(r.crypto_scheme, CRYPTO_SCHEME_ED25519);
+        assert_eq!(r.worker_id, "talos-worker-7");
+        r.verify_no_replay_ed25519(&[worker_pk], 300)
+            .expect("controller verifies against the worker's public key");
+    }
+
+    #[test]
+    fn result_ed25519_requires_worker_id() {
+        let worker_sk = ed_keypair();
+        let mut r = make_test_result();
+        assert!(
+            r.sign_ed25519_with_worker_id(&worker_sk, "").is_err(),
+            "empty worker_id has no registered key to verify against"
+        );
+    }
+
+    #[test]
+    fn result_ed25519_wrong_worker_key_fails() {
+        // A result signed by worker-A's key does not verify against worker-B's
+        // key — a compromised worker can only sign results as itself.
+        let a = ed_keypair();
+        let b_pk = ed_keypair().verifying_key();
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&a, "worker-a").unwrap();
+        assert!(r.verify_no_replay_ed25519(&[b_pk], 300).is_err());
+    }
+
+    #[test]
+    fn result_ed25519_tampered_output_fails() {
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
+        r.output_payload = serde_json::json!({"ok": false});
+        assert!(r.verify_no_replay_ed25519(&[pk], 300).is_err());
+    }
+
+    #[test]
+    fn result_verify_dispatch_routes_and_enforces_p4() {
+        let key = test_key();
+        let ring = hmac_ring(&key);
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+
+        // HMAC result: accepted during rollout, refused under enforcement.
+        let mut hmac_r = make_test_result();
+        hmac_r.sign_with_worker_id(&key, "worker-a").unwrap();
+        hmac_r
+            .verify_dispatch(&ring, &[pk], 300, true)
+            .expect("HMAC result accepted during rollout");
+        let mut hmac_r2 = make_test_result();
+        hmac_r2.sign_with_worker_id(&key, "worker-a").unwrap();
+        assert!(
+            hmac_r2.verify_dispatch(&ring, &[pk], 300, false).is_err(),
+            "P4: HMAC result refused under Ed25519-only enforcement"
+        );
+
+        // Ed25519 result: accepted regardless of the legacy flag.
+        let mut ed_r = make_test_result();
+        ed_r.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
+        ed_r.verify_dispatch(&ring, &[pk], 300, false)
+            .expect("Ed25519 result accepted under enforcement");
+    }
+
+    #[test]
+    fn result_downgrade_flip_rejected() {
+        let key = test_key();
+        let ring = hmac_ring(&key);
+        let sk = ed_keypair();
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
+        r.crypto_scheme = CRYPTO_SCHEME_HMAC; // tamper the hint
+        assert!(r
+            .verify_dispatch(&ring, &[sk.verifying_key()], 300, true)
+            .is_err());
     }
 
     #[test]
@@ -4545,6 +4792,7 @@ mod tests {
     fn tampered_job_result_logs_fails_verification() {
         let key = test_key();
         let mut result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"answer": 42}),
@@ -4647,6 +4895,7 @@ mod tests {
     fn job_result_with_empty_logs_round_trips() {
         let key = test_key();
         let mut result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({}),

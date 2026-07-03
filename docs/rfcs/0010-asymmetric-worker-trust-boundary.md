@@ -160,6 +160,20 @@ envelope deploy-ordering rule).
   registration CLI records worker public keys in a `worker_identities` table.
   Controller verifies `JobResult`/RPC under Ed25519-or-HMAC. Workers stop
   mounting `WORKER_SHARED_KEY` for *signing*.
+
+  > **P2 increment 1 landed (protocol foundation).** `crypto_scheme` +
+  > `sign_ed25519_with_worker_id` / `verify_ed25519` / `verify_dispatch` on
+  > `JobResult` and `PipelineJobResult` (`talos-workflow-job-protocol`, 6 unit
+  > tests: roundtrip, non-empty-worker-id requirement, wrong-worker-key,
+  > tamper, dispatch routing + P4 enforcement, downgrade-flip). Mirrors the P1
+  > `JobRequest` machinery exactly; scheme-0 HMAC bytes unchanged. **Remaining
+  > P2 increments:** (2) the worker-id→public-key resolver + wiring — worker
+  > signs results with a provisioned `TALOS_WORKER_SIGNING_KEY`, controller
+  > resolves the worker's pubkey by `worker_id` at the dispatcher verify sites;
+  > (3) the same for the four RPC protocols (needs a signed `worker_id` on the
+  > RPC types, which they don't carry today); (4) the `worker_identities`
+  > registration table + endpoint for the autoscaling fleet (the config-map
+  > resolver covers the static case first).
 - **P3 — Envelope sealing (D3a or D3b).** Land the chosen sealing scheme behind
   `TALOS_ENVELOPE_SEALING`. This is the phase that removes the last
   root-equivalent decryption key from the worker.
