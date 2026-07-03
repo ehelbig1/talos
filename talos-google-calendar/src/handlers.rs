@@ -1343,18 +1343,31 @@ pub async fn process_webhook_events(
         // rejected by the worker anyway, so publishing it is pointless.
         // If an execution record was already created, mark it as failed so it is
         // not orphaned indefinitely in the database.
-        let sign_result = match &worker_shared_key {
-            Some(key) => job_request.sign(key.as_bytes()).map_err(|e| {
-                format!(
-                    "Failed to sign job {} for event '{}': {}",
-                    job_id, event_summary, e
-                )
-            }),
-            None => Err(format!(
-                "WORKER_SHARED_KEY not configured — cannot sign job {} for event '{}'",
-                job_id, event_summary
-            )),
-        };
+        // RFC 0010 P1: prefer the configured Ed25519 dispatch signer; else the
+        // legacy HMAC path (unsigned jobs are rejected by the worker, so a
+        // missing key is a hard error here).
+        let sign_result =
+            if let Some(signer) = talos_workflow_job_protocol::configured_dispatch_signer() {
+                signer.sign_job(&mut job_request).map_err(|e| {
+                    format!(
+                        "Failed to sign job {} for event '{}': {}",
+                        job_id, event_summary, e
+                    )
+                })
+            } else {
+                match &worker_shared_key {
+                    Some(key) => job_request.sign(key.as_bytes()).map_err(|e| {
+                        format!(
+                            "Failed to sign job {} for event '{}': {}",
+                            job_id, event_summary, e
+                        )
+                    }),
+                    None => Err(format!(
+                        "WORKER_SHARED_KEY not configured — cannot sign job {} for event '{}'",
+                        job_id, event_summary
+                    )),
+                }
+            };
 
         if let Err(sign_err) = sign_result {
             tracing::error!("❌ {sign_err}. Skipping event.");

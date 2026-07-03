@@ -316,10 +316,15 @@ async fn dispatch_single_message(
         user_id,
     };
 
-    // Signing is mandatory. An unsigned JobRequest is rejected by
-    // the worker at HMAC verify anyway, so publishing it would just
-    // burn NATS bandwidth — bail early with a clear error.
-    if let Err(e) = job_request.sign(ctx.worker_shared_key.as_bytes()) {
+    // Signing is mandatory. An unsigned JobRequest is rejected by the worker at
+    // verify anyway, so publishing it would just burn NATS bandwidth — bail
+    // early with a clear error. RFC 0010 P1: prefer the configured Ed25519
+    // dispatch signer; else the legacy HMAC path.
+    let sign_result = match talos_workflow_job_protocol::configured_dispatch_signer() {
+        Some(signer) => signer.sign_job(&mut job_request),
+        None => job_request.sign(ctx.worker_shared_key.as_bytes()),
+    };
+    if let Err(e) = sign_result {
         let err_msg = format!("failed to sign gmail job: {e}");
         ctx.execution_service
             .fail_execution_best_effort(

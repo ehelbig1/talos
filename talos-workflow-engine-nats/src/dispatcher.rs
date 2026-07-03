@@ -223,7 +223,13 @@ fn resign_pipeline_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u
             return None;
         }
     };
-    if let Err(e) = req.sign(key) {
+    // RFC 0010 P1: re-sign under the configured dispatch scheme (see the
+    // single-job resign path for rationale).
+    let sign_result = match talos_workflow_job_protocol::configured_dispatch_signer() {
+        Some(signer) => signer.sign_pipeline(&mut req),
+        None => req.sign(key),
+    };
+    if let Err(e) = sign_result {
         tracing::warn!(
             error = %e,
             job_id = %req.job_id,
@@ -602,7 +608,13 @@ fn resign_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
     };
-    if let Err(e) = req.sign(key) {
+    // RFC 0010 P1: re-sign under the configured dispatch scheme so a retry
+    // matches the primary path (Ed25519 when configured, else HMAC).
+    let sign_result = match talos_workflow_job_protocol::configured_dispatch_signer() {
+        Some(signer) => signer.sign_job(&mut req),
+        None => req.sign(key),
+    };
+    if let Err(e) = sign_result {
         tracing::warn!(
             error = %e,
             job_id = %req.job_id,

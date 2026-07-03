@@ -508,6 +508,40 @@ impl DispatchSigner {
     }
 }
 
+/// The process-wide Ed25519 dispatch signer, resolved once from env, or `None`
+/// when Ed25519 dispatch is not configured (the default) — in which case every
+/// sign site keeps its legacy HMAC path. `Some` is returned only when
+/// `TALOS_DISPATCH_SCHEME=ed25519` AND a valid 32-byte-hex-seed
+/// `TALOS_CONTROLLER_SIGNING_KEY` is present. A requested-but-misconfigured
+/// setup logs an error and returns `None` (fall back to HMAC, which the
+/// dual-verify worker still accepts, so a bad key can't strand dispatch during
+/// rollout). Single source of truth for ALL controller sign sites (engine
+/// dispatcher, retry re-sign, module-push paths) so the scheme can't diverge
+/// between them.
+///
+/// Reads env like the sibling `load_worker_key_ring` / `load_worker_shared_key_previous`
+/// helpers; cached in a `OnceLock` so the key is parsed once.
+#[must_use]
+pub fn configured_dispatch_signer() -> Option<DispatchSigner> {
+    static CACHE: std::sync::OnceLock<Option<DispatchSigner>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let scheme = std::env::var("TALOS_DISPATCH_SCHEME").unwrap_or_default();
+            if !scheme.eq_ignore_ascii_case("ed25519") {
+                return None;
+            }
+            let Ok(hex_seed) = std::env::var("TALOS_CONTROLLER_SIGNING_KEY") else {
+                // NB: this crate has no `tracing` dep by design; the controller's
+                // `talos-engine` wrapper logs the same condition loudly at boot.
+                return None;
+            };
+            parse_ed25519_signing_key_hex(&hex_seed)
+                .ok()
+                .map(|sk| DispatchSigner::Ed25519(std::sync::Arc::new(sk)))
+        })
+        .clone()
+}
+
 /// Crate-private core shared by every signed NATS message type.
 ///
 /// Implementors provide the canonical signing payload plus nonce/signature
