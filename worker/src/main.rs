@@ -354,11 +354,9 @@ async fn publish_result_with_retry(
         let mut replacement = truncate_oversized_job_result(result, serialized.len(), cap);
         // L-11: bind the worker's identity into the signature so the
         // controller's audit log records which pod emitted the
-        // truncated-replacement result. See `worker_identity` for the
-        // resolution chain.
-        if let Err(e) =
-            replacement.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity())
-        {
+        // truncated-replacement result. RFC 0010 P2: prefer the per-worker
+        // Ed25519 key when configured, else legacy HMAC. See `sign_job_result`.
+        if let Err(e) = sign_job_result(&mut replacement, shared_key) {
             return Err(format!("Failed to sign oversized-result replacement: {e}"));
         }
         match serde_json::to_vec(&replacement) {
@@ -569,6 +567,70 @@ fn dispatch_verify_config() -> &'static DispatchVerifyConfig {
         }
         DispatchVerifyConfig { ed_keys, accept_legacy_hmac: !require_ed25519 }
     })
+}
+
+/// RFC 0010 P2: the worker's per-instance Ed25519 **result-signing** key,
+/// resolved once from `TALOS_WORKER_SIGNING_KEY` (a 32-byte hex seed sourced
+/// from a Secret / KMS — never a committed plaintext). `None` (the default) ⇒
+/// results keep the legacy `WORKER_SHARED_KEY` HMAC path (scheme 0). `Some` ⇒
+/// every `JobResult` / `PipelineJobResult` is signed Ed25519 (scheme 1) under
+/// this key; the controller verifies against the matching public key registered
+/// for this worker's id in `TALOS_WORKER_PUBLIC_KEYS`. Because the controller
+/// holds only the public half, a compromised worker can forge results as itself
+/// but never as another worker — the asymmetric result-path boundary.
+///
+/// A present-but-malformed seed fails closed to HMAC (loud error) rather than
+/// stranding the worker with no way to sign a result at all.
+fn worker_result_signing_key() -> Option<&'static talos_workflow_job_protocol::DispatchSigningKey> {
+    static CFG: std::sync::OnceLock<Option<talos_workflow_job_protocol::DispatchSigningKey>> =
+        std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let raw = std::env::var("TALOS_WORKER_SIGNING_KEY").ok()?;
+        match talos_workflow_job_protocol::parse_ed25519_signing_key_hex(&raw) {
+            Ok(sk) => {
+                ::tracing::info!(
+                    target: "talos_security",
+                    "TALOS_WORKER_SIGNING_KEY loaded — signing job results with per-worker Ed25519 (RFC 0010 P2)"
+                );
+                Some(sk)
+            }
+            Err(e) => {
+                ::tracing::error!(
+                    target: "talos_security",
+                    error = %e,
+                    "TALOS_WORKER_SIGNING_KEY is invalid — falling back to legacy HMAC result signing"
+                );
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Sign a `JobResult`, preferring the per-worker Ed25519 key when configured
+/// (RFC 0010 P2) and falling back to the legacy `WORKER_SHARED_KEY` HMAC. Binds
+/// the worker's identity into the signature either way (L-11). Single source of
+/// truth for every `JobResult` sign site so the scheme can't diverge between the
+/// happy path and the oversized-result replacement path.
+fn sign_job_result(
+    result: &mut JobResult,
+    shared_key: &talos_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    match worker_result_signing_key() {
+        Some(sk) => result.sign_ed25519_with_worker_id(sk, worker_identity()),
+        None => result.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity()),
+    }
+}
+
+/// Ed25519-preferring signer for `PipelineJobResult`; see [`sign_job_result`].
+fn sign_pipeline_result(
+    result: &mut PipelineJobResult,
+    shared_key: &talos_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    match worker_result_signing_key() {
+        Some(sk) => result.sign_ed25519_with_worker_id(sk, worker_identity()),
+        None => result.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity()),
+    }
 }
 
 /// Execute the Wasm module for a given job with observability.
@@ -1949,10 +2011,8 @@ async fn main() -> anyhow::Result<()> {
                                 let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
 
                                 // L-11: bind worker identity for audit attribution.
-                                if let Err(e) = result.sign_with_worker_id(
-                                    key_clone.signing_key().as_bytes(),
-                                    worker_identity(),
-                                ) {
+                                // RFC 0010 P2: Ed25519 when configured, else HMAC.
+                                if let Err(e) = sign_job_result(&mut result, &key_clone) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign job result");
                                 }
 
@@ -2158,10 +2218,8 @@ async fn main() -> anyhow::Result<()> {
                                     execute_pipeline_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
 
                                 // L-11: bind worker identity for audit attribution.
-                                if let Err(e) = result.sign_with_worker_id(
-                                    key_clone.signing_key().as_bytes(),
-                                    worker_identity(),
-                                ) {
+                                // RFC 0010 P2: Ed25519 when configured, else HMAC.
+                                if let Err(e) = sign_pipeline_result(&mut result, &key_clone) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign pipeline result");
                                 }
 
@@ -2219,10 +2277,8 @@ async fn main() -> anyhow::Result<()> {
                                         worker_id: String::new(),
                                     };
                                     // L-11: bind worker identity for audit attribution.
-                                    if let Err(e) = replacement.sign_with_worker_id(
-                                        key_clone.signing_key().as_bytes(),
-                                        worker_identity(),
-                                    ) {
+                                    // RFC 0010 P2: Ed25519 when configured, else HMAC.
+                                    if let Err(e) = sign_pipeline_result(&mut replacement, &key_clone) {
                                         ::tracing::error!(
                                             job_id = %result.job_id,
                                             error = %e,

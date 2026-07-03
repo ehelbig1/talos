@@ -322,10 +322,21 @@ pub(crate) async fn execute_job_with_retry(
                 // separate `talos.results.*` topic uses
                 // `Verifier::Observer` (see controller/src/main.rs).
                 if let Some(ring) = verify_ring {
-                    if let Err(e) = job_result.verify_as_with_ring(
+                    // RFC 0010 P2: `verify_dispatch` routes on the result's
+                    // `crypto_scheme` — Ed25519 against the public key(s)
+                    // registered for THIS worker_id in TALOS_WORKER_PUBLIC_KEYS,
+                    // or legacy HMAC against the ring while
+                    // `result_accept_legacy_hmac()` (the rollout posture;
+                    // TALOS_RESULT_REQUIRE_ED25519 flips it off for P4). This is
+                    // the sole inline Primary consumer, so it records the nonce
+                    // exactly once (verify-once rule).
+                    let worker_ed_keys =
+                        talos_workflow_job_protocol::worker_public_keys(&job_result.worker_id);
+                    if let Err(e) = job_result.verify_dispatch(
                         ring,
+                        &worker_ed_keys,
                         300,
-                        talos_workflow_job_protocol::Verifier::Primary,
+                        talos_workflow_job_protocol::result_accept_legacy_hmac(),
                     ) {
                         return Err(format!("Job result signature verification failed: {}", e));
                     }
@@ -1030,10 +1041,19 @@ impl NodeDispatcher for NatsNodeDispatcher {
         let result: PipelineJobResult = serde_json::from_slice(&response_bytes)
             .map_err(|e| -> BoxError { format!("Failed to parse pipeline result: {e}").into() })?;
         if let Some(ring) = self.worker_key_ring.as_ref() {
-            // L-4: PipelineJobResult Primary verifier — same role as
-            // the JobResult dispatcher above. Ring-aware for rolling rotation.
+            // L-4 / RFC 0010 P2: PipelineJobResult Primary verifier — same role
+            // as the JobResult dispatcher above. `verify_dispatch` routes on the
+            // result's `crypto_scheme`: Ed25519 against the keys registered for
+            // this worker_id, or legacy HMAC against the ring while
+            // `result_accept_legacy_hmac()`. Records the nonce exactly once.
+            let worker_ed_keys = talos_workflow_job_protocol::worker_public_keys(&result.worker_id);
             result
-                .verify_as_with_ring(ring, 300, talos_workflow_job_protocol::Verifier::Primary)
+                .verify_dispatch(
+                    ring,
+                    &worker_ed_keys,
+                    300,
+                    talos_workflow_job_protocol::result_accept_legacy_hmac(),
+                )
                 .map_err(|e| -> BoxError {
                     format!("Pipeline result signature verification failed: {e}").into()
                 })?;

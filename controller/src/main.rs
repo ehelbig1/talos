@@ -3978,10 +3978,22 @@ fn spawn_nats_log_subscribers(
                             // accidentally convert this site to a primary
                             // verifier and reintroduce the r300 regression.
                             if let Some(ref ring) = worker_key_ring_for_results {
-                                if let Err(e) = result.verify_as_with_ring(
+                                // RFC 0010 P2: scheme-routing Observer verify —
+                                // Ed25519 against the keys registered for this
+                                // worker_id, or legacy HMAC against the ring
+                                // while `result_accept_legacy_hmac()`. NEVER
+                                // records the replay cache (Observer role): the
+                                // request-reply dispatcher is the sole Primary
+                                // verifier, per the verify-once rule.
+                                let worker_ed_keys =
+                                    talos_workflow_job_protocol::worker_public_keys(
+                                        &result.worker_id,
+                                    );
+                                if let Err(e) = result.verify_no_replay_dispatch(
                                     ring,
+                                    &worker_ed_keys,
                                     300,
-                                    talos_workflow_job_protocol::Verifier::Observer,
+                                    talos_workflow_job_protocol::result_accept_legacy_hmac(),
                                 ) {
                                     tracing::warn!(
                                     "Rejected job result {}: signature verification failed — {}",

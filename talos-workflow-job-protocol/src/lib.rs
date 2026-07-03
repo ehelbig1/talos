@@ -542,6 +542,91 @@ pub fn configured_dispatch_signer() -> Option<DispatchSigner> {
         .clone()
 }
 
+/// Per-worker Ed25519 **result-verifying** key registry, parsed once from
+/// `TALOS_WORKER_PUBLIC_KEYS` (RFC 0010 P2). Format: comma-separated
+/// `worker_id=hex32` pairs; a `worker_id` MAY repeat to publish several keys
+/// (rotation / blue-green rollout), and every key registered for that id is
+/// tried at verify time. Malformed or empty entries are skipped (that entry
+/// fails closed) rather than poisoning the whole registry — one bad line can't
+/// strand the fleet. An unknown `worker_id` yields an empty slice, so
+/// `verify_dispatch` fails closed because no key matches.
+///
+/// The controller holds only worker *public* keys, so it can verify a
+/// worker-signed result but cannot forge one — the asymmetric half of the
+/// result-path trust boundary, mirroring the worker holding only the
+/// controller's public key on the dispatch path.
+fn worker_public_key_registry(
+) -> &'static std::collections::HashMap<String, Vec<DispatchVerifyingKey>> {
+    static CACHE: std::sync::OnceLock<
+        std::collections::HashMap<String, Vec<DispatchVerifyingKey>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::env::var("TALOS_WORKER_PUBLIC_KEYS")
+            .map(|raw| parse_worker_public_keys(&raw))
+            .unwrap_or_default()
+    })
+}
+
+/// Pure parser for the `TALOS_WORKER_PUBLIC_KEYS` value — extracted from
+/// [`worker_public_key_registry`] so the skip-malformed / repeat-id-for-rotation
+/// behaviour is unit-testable without mutating process env. See that function
+/// for the format and fail-closed semantics.
+fn parse_worker_public_keys(
+    raw: &str,
+) -> std::collections::HashMap<String, Vec<DispatchVerifyingKey>> {
+    let mut map: std::collections::HashMap<String, Vec<DispatchVerifyingKey>> =
+        std::collections::HashMap::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((wid, hexk)) = entry.split_once('=') else {
+            continue;
+        };
+        let wid = wid.trim();
+        if wid.is_empty() {
+            continue;
+        }
+        let Ok(vk) = parse_ed25519_verifying_key_hex(hexk) else {
+            continue;
+        };
+        map.entry(wid.to_string()).or_default().push(vk);
+    }
+    map
+}
+
+/// Ed25519 result-verifying key(s) registered for `worker_id` (possibly several,
+/// for rotation). Empty when the worker is unknown or `TALOS_WORKER_PUBLIC_KEYS`
+/// is unset — `JobResult::verify_dispatch` then fails closed on an Ed25519-scheme
+/// result. Cached; see [`worker_public_key_registry`].
+#[must_use]
+pub fn worker_public_keys(worker_id: &str) -> Vec<DispatchVerifyingKey> {
+    worker_public_key_registry()
+        .get(worker_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether the controller still accepts legacy-HMAC-signed job/pipeline results.
+/// Default `true` (accept — the rollout posture while workers migrate to
+/// per-worker Ed25519). `TALOS_RESULT_REQUIRE_ED25519` ∈ {`1`,`true`,`yes`,`on`}
+/// flips it to `false`: the RFC 0010 P4 enforcement flip that refuses HMAC
+/// results once every worker signs Ed25519. Cached; single source of truth for
+/// the `accept_legacy_hmac` argument at every controller result-verify site.
+#[must_use]
+pub fn result_accept_legacy_hmac() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            std::env::var("TALOS_RESULT_REQUIRE_ED25519")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
+}
+
 /// Crate-private core shared by every signed NATS message type.
 ///
 /// Implementors provide the canonical signing payload plus nonce/signature
@@ -2755,6 +2840,36 @@ impl JobResult {
             other => Err(format!("unknown result crypto_scheme: {other}")),
         }
     }
+
+    /// Scheme-dispatching **Observer** verify (passive audit subscribers on
+    /// `talos.results.*`): freshness + signature only, NEVER touching the
+    /// process-local replay cache. Routes on `self.crypto_scheme` exactly like
+    /// [`Self::verify_dispatch`] but uses the no-replay primitive on both arms,
+    /// honouring the verify-once rule (the request-reply dispatcher is the sole
+    /// Primary verifier). Use this at any site whose only side effect is an
+    /// idempotent DB write.
+    pub fn verify_no_replay_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        worker_ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), String> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self
+                .verify_no_replay_ed25519(worker_ed_keys, max_age_secs)
+                .map(|_| ()),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(
+                        "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
+                    );
+                }
+                self.verify_as_with_ring(hmac_ring, max_age_secs, Verifier::Observer)
+            }
+            other => Err(format!("unknown result crypto_scheme: {other}")),
+        }
+    }
 }
 
 impl SignedMessage for JobResult {
@@ -4475,6 +4590,54 @@ mod tests {
         assert!(r
             .verify_dispatch(&ring, &[sk.verifying_key()], 300, true)
             .is_err());
+    }
+
+    #[test]
+    fn worker_public_key_registry_parses_and_verifies() {
+        // Two workers, plus a rotated-in second key for worker-a — the exact
+        // shape the controller loads from TALOS_WORKER_PUBLIC_KEYS.
+        let a_old = ed_keypair();
+        let a_new = ed_keypair();
+        let b = ed_keypair();
+        let raw = format!(
+            "worker-a={},worker-b={},worker-a={}",
+            hex::encode(a_old.verifying_key().to_bytes()),
+            hex::encode(b.verifying_key().to_bytes()),
+            hex::encode(a_new.verifying_key().to_bytes()),
+        );
+        let reg = parse_worker_public_keys(&raw);
+
+        // worker-a carries BOTH keys (rotation overlap); worker-b carries one.
+        assert_eq!(reg.get("worker-a").map(Vec::len), Some(2));
+        assert_eq!(reg.get("worker-b").map(Vec::len), Some(1));
+        assert!(reg.get("worker-c").is_none());
+
+        // A result signed under either of worker-a's keys verifies against the
+        // registered set (first match wins).
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&a_new, "worker-a").unwrap();
+        r.verify_no_replay_ed25519(reg.get("worker-a").unwrap(), 300)
+            .expect("rotated-in worker key must verify");
+    }
+
+    #[test]
+    fn worker_public_key_registry_skips_malformed_entries() {
+        let good = ed_keypair();
+        // Garbage, a keyless bareword, an empty worker_id, and trailing commas
+        // are all skipped without poisoning the one valid pair.
+        let raw = format!(
+            "  , notanentry , =deadbeef , worker-x=zzzz , worker-ok={} ,,",
+            hex::encode(good.verifying_key().to_bytes()),
+        );
+        let reg = parse_worker_public_keys(&raw);
+        assert_eq!(reg.len(), 1, "only the one well-formed pair survives");
+        assert_eq!(reg.get("worker-ok").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn worker_public_keys_empty_input_is_empty() {
+        assert!(parse_worker_public_keys("").is_empty());
+        assert!(parse_worker_public_keys("   ,  , ").is_empty());
     }
 
     #[test]

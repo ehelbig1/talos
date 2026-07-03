@@ -166,14 +166,33 @@ envelope deploy-ordering rule).
   > `JobResult` and `PipelineJobResult` (`talos-workflow-job-protocol`, 6 unit
   > tests: roundtrip, non-empty-worker-id requirement, wrong-worker-key,
   > tamper, dispatch routing + P4 enforcement, downgrade-flip). Mirrors the P1
-  > `JobRequest` machinery exactly; scheme-0 HMAC bytes unchanged. **Remaining
-  > P2 increments:** (2) the worker-id→public-key resolver + wiring — worker
-  > signs results with a provisioned `TALOS_WORKER_SIGNING_KEY`, controller
-  > resolves the worker's pubkey by `worker_id` at the dispatcher verify sites;
-  > (3) the same for the four RPC protocols (needs a signed `worker_id` on the
-  > RPC types, which they don't carry today); (4) the `worker_identities`
-  > registration table + endpoint for the autoscaling fleet (the config-map
-  > resolver covers the static case first).
+  > `JobRequest` machinery exactly; scheme-0 HMAC bytes unchanged.
+  >
+  > **P2 increment 2 landed (result-path wiring, end-to-end).** The worker
+  > signs every `JobResult` / `PipelineJobResult` with a per-instance Ed25519
+  > key when `TALOS_WORKER_SIGNING_KEY` (32-byte hex seed) is provisioned,
+  > else keeps the legacy HMAC path — resolved once via
+  > `worker::worker_result_signing_key()` and centralised in the
+  > `sign_job_result` / `sign_pipeline_result` helpers so all four worker sign
+  > sites (happy path + oversized-replacement, single + pipeline) share one
+  > scheme decision. The controller resolves a worker's public key(s) by
+  > `worker_id` from `TALOS_WORKER_PUBLIC_KEYS` (`worker_id=hex32` pairs,
+  > repeat-id for rotation) via `job_protocol::worker_public_keys`, and every
+  > result-verify site now routes on `crypto_scheme`:
+  > `JobResult::verify_dispatch` (Primary — engine dispatcher, pipeline
+  > dispatcher, webhook reply inbox) and `verify_no_replay_dispatch` (Observer
+  > — the `talos.results.*` audit subscriber), both honouring
+  > `job_protocol::result_accept_legacy_hmac()` (default accept;
+  > `TALOS_RESULT_REQUIRE_ED25519` flips to refuse for P4). 3 new parser unit
+  > tests (registry parse + verify, skip-malformed, empty-input). Default env
+  > = unchanged HMAC behaviour; a compromised worker can forge results as
+  > *itself* but never as another worker, and never a dispatch.
+  >
+  > **Remaining P2 increments:** (3) the same for the four RPC protocols
+  > (needs a signed `worker_id` on the RPC types, which they don't carry
+  > today); (4) the `worker_identities` registration table + endpoint for the
+  > autoscaling fleet (the `TALOS_WORKER_PUBLIC_KEYS` config-map resolver
+  > covers the static case first).
 - **P3 — Envelope sealing (D3a or D3b).** Land the chosen sealing scheme behind
   `TALOS_ENVELOPE_SEALING`. This is the phase that removes the last
   root-equivalent decryption key from the worker.

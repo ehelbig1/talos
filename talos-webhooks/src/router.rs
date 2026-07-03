@@ -1198,10 +1198,19 @@ impl WebhookRouter {
                     // explicit at the call site — this is the canonical
                     // primary verifier for results on this reply inbox.
                     if let Some(ring) = &worker_key_ring_clone {
-                        if let Err(e) = result.verify_as_with_ring(
+                        // RFC 0010 P2: scheme-routing Primary verify — Ed25519
+                        // against the keys registered for this worker_id, or
+                        // legacy HMAC against the ring while
+                        // `result_accept_legacy_hmac()`. Canonical Primary
+                        // verifier for results on this reply inbox (records the
+                        // nonce exactly once).
+                        let worker_ed_keys =
+                            talos_workflow_job_protocol::worker_public_keys(&result.worker_id);
+                        if let Err(e) = result.verify_dispatch(
                             ring,
+                            &worker_ed_keys,
                             300,
-                            talos_workflow_job_protocol::Verifier::Primary,
+                            talos_workflow_job_protocol::result_accept_legacy_hmac(),
                         ) {
                             tracing::warn!(
                                 trigger_id = %trigger_id,
