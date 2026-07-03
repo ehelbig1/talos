@@ -2,7 +2,6 @@ import React, { useState, useMemo } from "react";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 import { Star } from "lucide-react";
-import { SectionHeader } from "@/components/ui/SectionHeader";
 import { useNodeTemplatesQuery } from "@/generated/graphql";
 import { useUIStore } from "@/store/uiStore";
 import { Input } from "@/components/ui/input";

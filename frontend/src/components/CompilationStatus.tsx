@@ -1,7 +1,7 @@
 import React, { useEffect } from "react";
 import { subscribeCompilation } from "@/lib/graphqlClient";
 import { useCompilationStore } from "@/store/compilationStore";
-import { Loader2, CheckCircle2, AlertCircle, Cpu, Zap, X } from "lucide-react";
+import { CheckCircle2, AlertCircle, Cpu, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /**
@@ -85,11 +85,14 @@ export function CompilationStatus() {
     }, 30 * 1000);
 
     // On unmount: unsubscribe from the stream and cancel all pending timers.
+    // Capture the ref's Map now so cleanup clears the same instance that was
+    // live for this effect run (ref.current could be swapped before cleanup).
+    const timers = dismissTimers.current;
     return () => {
       unsubscribe();
       clearInterval(watchdog);
-      dismissTimers.current.forEach((timer) => clearTimeout(timer));
-      dismissTimers.current.clear();
+      timers.forEach((timer) => clearTimeout(timer));
+      timers.clear();
     };
   }, [updateJob, removeJob]);
 

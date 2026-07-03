@@ -1,14 +1,11 @@
 import React, { useState } from "react";
 import {
-  MapPin,
   Link,
   Search,
   Clipboard,
   FileText,
-  Check,
   X,
   Target,
-  ArrowRight,
   Settings,
   Zap,
 } from "lucide-react";

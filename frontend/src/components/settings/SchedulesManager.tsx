@@ -1,20 +1,16 @@
 import React, { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Card } from "@/components/ui/card";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Dialog } from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import {
   Clock,
   Calendar,
   Plus,
   Trash2,
   Edit2,
-  Check,
   X,
   ToggleLeft,
   ToggleRight,
@@ -25,13 +21,13 @@ import { formatDate } from "@/lib/format";
 import { relativeTime } from "@/lib/formatTime";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
+import type { WorkflowScheduleObj } from "@/generated/graphql";
 import {
   useMySchedulesQuery,
   useCreateScheduleMutation,
   useUpdateScheduleMutation,
   useDeleteScheduleMutation,
   useWorkflowsQuery,
-  WorkflowScheduleObj,
 } from "@/generated/graphql";
 
 // ─── Cron examples ────────────────────────────────────────────────────────────
@@ -511,7 +507,10 @@ export default function SchedulesManager() {
   const { data: workflowsData } = useWorkflowsQuery({});
 
   const schedules = schedulesData?.mySchedules ?? [];
-  const workflows = workflowsData?.workflows ?? [];
+  const workflows = React.useMemo(
+    () => workflowsData?.workflows ?? [],
+    [workflowsData],
+  );
 
   // Build a quick-lookup map: workflowId → name
   const workflowNameMap = React.useMemo<Record<string, string>>(() => {

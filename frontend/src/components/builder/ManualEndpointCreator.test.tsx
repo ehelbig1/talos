@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, fireEvent, waitFor } from "../../test-utils";
+import { render, screen, fireEvent } from "../../test-utils";
 import { ManualEndpointCreator } from "./ManualEndpointCreator";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 
@@ -59,7 +59,7 @@ describe("ManualEndpointCreator", () => {
     expect(inputs).toHaveLength(2);
 
     // Remove first parameter
-    const removeBtns = screen
+    const _removeBtns = screen
       .getAllByRole("button")
       .filter((btn) => btn.innerHTML.includes("svg"));
     // There's 1 for close form, and 2 for parameters

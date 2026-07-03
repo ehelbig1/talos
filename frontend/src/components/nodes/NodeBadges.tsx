@@ -1,6 +1,7 @@
 import React from "react";
 import { cn } from "@/lib/utils";
 import { getCapabilityVisuals } from "@/lib/capabilityBadge";
+import type { LucideIcon } from "lucide-react";
 import {
   RotateCw,
   Shuffle,
@@ -14,7 +15,6 @@ import {
   Globe,
   Key,
   Database,
-  LucideIcon,
 } from "lucide-react";
 
 export function getSystemNodeStyle(kind?: string): {

@@ -8,7 +8,7 @@ import {
 } from "@/lib/auth";
 import { useAuth } from "@/contexts/AuthContext";
 import { DarkInput } from "@/components/ui/DarkInput";
-import { Zap, Loader2, ShieldCheck, ShieldAlert } from "lucide-react";
+import { Zap, Loader2, ShieldCheck } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const BACKEND_URL = config.apiUrl;

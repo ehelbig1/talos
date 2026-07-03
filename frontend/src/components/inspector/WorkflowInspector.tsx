@@ -9,7 +9,6 @@ import {
   Calendar,
   Webhook,
   Play,
-  Loader2,
   Clock,
   ChevronDown,
 } from "lucide-react";
@@ -19,7 +18,6 @@ import {
   TabsList,
   TabsTrigger,
   TabsContent,
-  SectionHeader,
   CopyField,
 } from "@/components/ui";
 import { WorkflowExecutionHistoryPanel } from "../WorkflowExecutionHistoryPanel";

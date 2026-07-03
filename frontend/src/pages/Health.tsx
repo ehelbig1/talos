@@ -12,7 +12,7 @@ import {
   type MySchedulesQuery,
 } from "@/generated/graphql";
 import { cn } from "@/lib/utils";
-import { relativeTime, futureTime, formatDurationSecs } from "@/lib/formatTime";
+import { futureTime, formatDurationSecs } from "@/lib/formatTime";
 import {
   Activity,
   Bot,

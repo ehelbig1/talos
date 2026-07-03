@@ -333,6 +333,126 @@ pub async fn warn_if_rls_will_be_bypassed(pool: &Pool<Postgres>) -> RlsRoleStatu
     status
 }
 
+/// Whether tenant-isolation RLS will *actually* enforce for request-path
+/// queries against this pool, resolving BOTH modes:
+///
+/// * **SET-ROLE mode** (`TALOS_RLS_SET_ROLE` on): enforcement depends on the
+///   `talos_app` role existing and being non-superuser / non-`BYPASSRLS` — the
+///   base connection's own privileges are irrelevant because every scoped tx
+///   runs `SET LOCAL ROLE talos_app`.
+/// * **Direct mode** (default): enforcement depends on the base connection's
+///   own role attributes.
+///
+/// Returns `Ok(false)` (not an error) when the configuration is valid but
+/// simply won't enforce — that's the case the production guard turns into a
+/// refusal. Propagates only genuine catalog-query errors.
+pub async fn rls_enforcement_effective(pool: &Pool<Postgres>) -> anyhow::Result<bool> {
+    if rls_set_role_enabled() {
+        // Enforcement rides on `talos_app`; the base role may be a superuser.
+        return Ok(matches!(
+            named_role_status(pool, RLS_APP_ROLE).await?,
+            Some(app) if app.rls_enforced()
+        ));
+    }
+    Ok(check_rls_role(pool).await?.rls_enforced())
+}
+
+/// Pure parse of a boolean opt-in flag value (`1` / `true` / `yes` / `on`,
+/// case-insensitive, surrounding whitespace ignored). `None` (unset) → `false`.
+/// Split out so the accept/reject logic is unit-tested without touching process
+/// env (which is global mutable state and racy across parallel tests).
+fn parse_opt_in(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("true")
+                || v == "1"
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
+/// Parse a boolean opt-in env var (`1` / `true` / `yes` / `on`, case-insensitive).
+fn env_opt_in(var: &str) -> bool {
+    parse_opt_in(std::env::var(var).ok().as_deref())
+}
+
+/// Production fail-closed RLS posture guard (RFC 0004 / RFC 0005 S3).
+///
+/// Mirrors the env-KEK production guard (`controller/src/main.rs`,
+/// `prod-kek-guard`): in production, refuse to boot when tenant-isolation RLS
+/// would silently be a no-op — UNLESS the operator explicitly acknowledges the
+/// weaker posture via `TALOS_ALLOW_RLS_DISABLED=1`.
+///
+/// Before this guard, RLS shipped OFF by default (`TALOS_RLS_SET_ROLE` unset)
+/// and the misconfiguration only produced a `warn!` that scrolled past in logs,
+/// leaving cross-tenant isolation resting entirely on app-layer query
+/// discipline. The guard makes "isolation is actually enforced" a boot
+/// precondition in production while keeping dev/test frictionless (the guard is
+/// a no-op when `is_production` is false).
+///
+/// The override is loud + SIEM-greppable (`target: "talos_security"`,
+/// `event_kind = "rls_disabled_in_production"`) so a homelab/single-tenant
+/// operator who legitimately runs without RLS is visible in audit, not silent.
+pub async fn enforce_production_rls_posture(
+    pool: &Pool<Postgres>,
+    is_production: bool,
+) -> anyhow::Result<()> {
+    if !is_production {
+        return Ok(());
+    }
+    // Catalog errors are non-fatal for the guard itself: if we cannot read
+    // pg_roles we cannot prove enforcement, but blocking boot on a transient
+    // catalog hiccup is worse than the warn that `warn_if_rls_will_be_bypassed`
+    // already emitted. Treat an error as "cannot confirm" and fall through to
+    // the opt-in check rather than hard-failing on infrastructure flakiness.
+    let effective = match rls_enforcement_effective(pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "RLS posture guard: could not determine enforcement status");
+            false
+        }
+    };
+    if effective {
+        return Ok(());
+    }
+
+    if env_opt_in("TALOS_ALLOW_RLS_DISABLED") {
+        tracing::error!(
+            target: "talos_security",
+            event_kind = "rls_disabled_in_production",
+            set_role_mode = rls_set_role_enabled(),
+            "Row-level tenant isolation is NOT enforced in production, accepted via \
+             TALOS_ALLOW_RLS_DISABLED. Cross-tenant isolation rests entirely on \
+             app-layer query scoping (OrgScope/TenantReadScope). Provision the \
+             `talos_app` role + set TALOS_RLS_SET_ROLE=1 (or connect as a \
+             non-superuser role) for a defence-in-depth posture."
+        );
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "Row-level security would be a NO-OP in production — refusing to boot. \
+         RFC 0004 tenant-isolation policies do not enforce because {}. Fix by one \
+         of: (a) set TALOS_RLS_SET_ROLE=1 AND apply migration \
+         20260529220000_talos_app_role.sql so request transactions run as the \
+         non-bypass `talos_app` role; (b) connect the controller as a \
+         non-superuser role without BYPASSRLS. To run WITHOUT row-level isolation \
+         anyway (e.g. a single-tenant homelab), set TALOS_ALLOW_RLS_DISABLED=1 to \
+         acknowledge that cross-tenant isolation then rests solely on app-layer \
+         query scoping.",
+        if rls_set_role_enabled() {
+            "TALOS_RLS_SET_ROLE is on but the `talos_app` role is missing, a \
+             superuser, or has BYPASSRLS"
+        } else {
+            "TALOS_RLS_SET_ROLE is off and the connecting role is a superuser or \
+             has BYPASSRLS"
+        }
+    ))
+}
+
 /// Initialize database connection pool
 pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
     let _ = dotenvy::dotenv();
@@ -572,5 +692,40 @@ mod rls_role_prefix_tests {
     fn prefix_is_empty_when_disabled() {
         // Default-OFF must be byte-identical to the pre-S3 behavior.
         assert_eq!(rls_role_prefix_for(false), "");
+    }
+}
+
+#[cfg(test)]
+mod rls_prod_guard_tests {
+    use super::{enforce_production_rls_posture, parse_opt_in};
+    use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn opt_in_accepts_truthy_forms() {
+        for v in ["1", "true", "TRUE", "yes", "On", " true ", "\ton\n"] {
+            assert!(parse_opt_in(Some(v)), "should accept {v:?}");
+        }
+    }
+
+    #[test]
+    fn opt_in_rejects_falsy_and_unset() {
+        assert!(!parse_opt_in(None));
+        for v in ["", "0", "false", "no", "off", "enabled", "2", "y"] {
+            assert!(!parse_opt_in(Some(v)), "should reject {v:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_is_noop_outside_production() {
+        // is_production=false must return Ok WITHOUT touching the pool — a
+        // lazy pool to a bogus URL proves no query is issued (connecting would
+        // error). The guard must short-circuit before any catalog lookup so
+        // dev/test boots are never gated on RLS.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://nonexistent:5432/none")
+            .expect("connect_lazy never dials");
+        enforce_production_rls_posture(&pool, false)
+            .await
+            .expect("non-production must be a no-op");
     }
 }

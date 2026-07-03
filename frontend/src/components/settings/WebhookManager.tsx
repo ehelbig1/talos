@@ -8,21 +8,19 @@ import {
   Copy,
   CheckCircle2,
   XCircle,
-  Activity,
   Zap,
   Clock,
   X,
   Shield,
-  AlertTriangle,
   TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { relativeTime } from "@/lib/formatTime";
+import type { WorkflowsQuery } from "@/generated/graphql";
 import {
   useWebhookTriggersQuery,
   useCreateWebhookTriggerMutation,
   useWorkflowsQuery,
-  WorkflowsQuery,
 } from "@/generated/graphql";
 
 function CopyButton({ value }: { value: string }) {

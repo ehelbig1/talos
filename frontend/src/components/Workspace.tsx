@@ -1,7 +1,6 @@
 import React, {
   useCallback,
   Suspense,
-  useState,
   useMemo,
   useSyncExternalStore,
 } from "react";
@@ -17,13 +16,7 @@ import {
   BackgroundVariant,
   Panel,
 } from "@xyflow/react";
-import type {
-  Connection,
-  Node,
-  Edge,
-  OnNodesChange,
-  OnEdgesChange,
-} from "@xyflow/react";
+import type { Connection } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { TalosNode } from "@/components/TalosNode";
 import { ConditionEdge } from "@/components/ConditionEdge";

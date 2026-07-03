@@ -14,7 +14,7 @@ import { AuthForm } from "@/components/auth/AuthForm";
 import { OAuthCallback } from "@/components/auth/OAuthCallback";
 import { useTokenRefresh } from "@/hooks/useTokenRefresh";
 import { useGetApprovalsQuery } from "@/generated/graphql";
-import { Zap, Activity, Loader2 } from "lucide-react";
+import { Zap, Activity } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { CompilationStatus } from "@/components/CompilationStatus";
@@ -26,8 +26,6 @@ const Actors = lazy(() => import("@/pages/Actors"));
 const ActorDetail = lazy(() => import("@/pages/ActorDetail"));
 const ActorCompare = lazy(() => import("@/pages/ActorCompare"));
 const Health = lazy(() => import("@/pages/Health"));
-const Catalog = lazy(() => import("@/pages/Catalog"));
-const Modules = lazy(() => import("@/pages/Modules"));
 const Library = lazy(() => import("@/pages/Library"));
 
 function LoadingScreen() {

@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, fireEvent, waitFor } from "../../test-utils";
+import { render, screen, fireEvent } from "../../test-utils";
 import { EndpointSelector } from "./EndpointSelector";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 

@@ -24,7 +24,6 @@ import { BudgetPanel } from "./actor-detail/BudgetPanel";
 import { PoliciesPanel } from "./actor-detail/PoliciesPanel";
 import { LogPanel } from "./actor-detail/LogPanel";
 import { HandoffsPanel } from "./actor-detail/HandoffsPanel";
-import { SkeletonStatRow, SkeletonTable, ConfirmDialog } from "@/components/ui";
 
 export default function ActorDetail() {
   const { id } = useParams<{ id: string }>();

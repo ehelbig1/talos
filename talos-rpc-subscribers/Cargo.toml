@@ -27,6 +27,7 @@ talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
+talos-replay-guard = { path = "../talos-replay-guard" }
 # Wasm-security review 2026-05-22 (MEDIUM-1): canonical SQL function
 # deny-list lives here so worker + controller subscriber agree byte-
 # identically. Same single-source-of-truth pattern as

@@ -48,7 +48,7 @@ const errorMappings: Record<string, { title: string; suggestion: string }> = {
 
 function getErrorInfo(
   message: string,
-  error?: Error,
+  _error?: Error,
 ): { title: string; suggestion: string } {
   // Check for HTTP status codes
   const statusMatch = message.match(/status (\d+)/i);

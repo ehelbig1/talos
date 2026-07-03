@@ -1,4 +1,4 @@
-import React, { useState, useMemo, Suspense, lazy } from "react";
+import React, { useState, useMemo, Suspense } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -13,12 +13,10 @@ import {
   type ActorSummary,
 } from "@/lib/graphqlApi";
 import { cn } from "@/lib/utils";
-import { SkeletonCard } from "@/components/ui";
-import { ActorCard, CapabilityBadge } from "./actors/ActorCard";
+import { ActorCard } from "./actors/ActorCard";
 import { QuickRunModal } from "./actors/QuickRunModal";
 import {
   CreateActorPanel,
-  ACTOR_TEMPLATES,
   type ActorTemplate,
 } from "./actors/CreateActorPanel";
 import { Bot, Search, X, Plus, GitCompare, ChevronDown } from "lucide-react";

@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { useNavigate } from "react-router-dom";
-import { useAuth } from "@/contexts/AuthContext";
 import { Check, X } from "lucide-react";
 
 export function OAuthCallback() {
@@ -10,7 +9,6 @@ export function OAuthCallback() {
   );
   const [message, setMessage] = useState("Completing sign in...");
   const navigate = useNavigate();
-  const { login } = useAuth();
 
   const processedRef = React.useRef(false);
 

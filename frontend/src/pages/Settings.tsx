@@ -1,6 +1,5 @@
 import React, { Suspense, lazy, useCallback, useState, useEffect } from "react";
 import ErrorBoundary from "@/components/ErrorBoundary";
-import { SectionHeader } from "@/components/ui";
 import { useAuth } from "@/contexts/AuthContext";
 import { cn } from "@/lib/utils";
 import {

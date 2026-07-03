@@ -3448,7 +3448,51 @@ else
 fi
 echo
 
-# ── 52. Lint self-consistency (meta-check) ────────────────────────────
+# ── 52. Silent-swallow row reads in repository crates — RATCHET ───────
+# `row.try_get("col").unwrap_or(<default>)` turns a schema drift (a
+# renamed/retyped/dropped column) into a SILENT wrong value at runtime
+# instead of an error: a renamed column reads as None / false / 0 /
+# Default rather than failing, so the drift ships and surfaces as
+# mysterious "empty" data far from the cause. This is the read-side twin
+# of check 34 (which already forces the actor_memory value_format read to
+# fail loud because a silent 0 there mis-dispatches AEAD decryption). The
+# codebase-review (2026-07-03) flagged this as the single biggest
+# structural code-quality gap: hundreds of these reads across the
+# repository layer, invisible to `cargo check`.
+#
+# A blanket ban would block every PR touching the debt, and some sites are
+# legitimately nullable (a NULL column whose default IS the right value).
+# So this is a RATCHET like check 50: the count may only go DOWN. Burn it
+# down by converting a read to a fail-loud form — either a typed
+# `sqlx::query_as!` / `FromRow` mapping, or an explicit
+# `.try_get("col").map_err(|e| …context…)?` that names the column — and
+# lower the baseline. New silent reads fail the lint.
+bold "▶ check 52: silent try_get().unwrap_or reads in repository crates (ratchet — count must not grow)"
+# 526 at introduction (2026-07-03 codebase review); 524 after the
+# execution-output AEAD-format/id reads were made fail-loud (the highest-risk
+# sites — a silent v0 there = silent decryption failure / data loss).
+TALOS_REPO_SILENT_READ_BASELINE=524
+REPO_SILENT_READ_COUNT="$(grep -rEc '\.try_get\([^)]*\)\.unwrap_or' \
+        --include='*.rs' \
+        talos-*-repository 2>/dev/null \
+    | awk -F: '{s+=$2} END {print s+0}')"
+if [ "$REPO_SILENT_READ_COUNT" -gt "$TALOS_REPO_SILENT_READ_BASELINE" ]; then
+    red "✗ silent try_get().unwrap_or reads in repository crates grew: ${REPO_SILENT_READ_COUNT} > baseline ${TALOS_REPO_SILENT_READ_BASELINE}"
+    yellow "  → a renamed/dropped column would read as a silent default, not an error."
+    yellow "    Use a typed FromRow / query_as! mapping, or"
+    yellow "    .try_get(\"col\").map_err(|e| anyhow!(\"read col: {e}\"))? so drift fails loud."
+    yellow "  → if you MOVED existing SQL (net count unchanged), re-run; the ratchet counts sites."
+    EXIT_CODE=1
+elif [ "$REPO_SILENT_READ_COUNT" -lt "$TALOS_REPO_SILENT_READ_BASELINE" ]; then
+    yellow "⚠ repository silent-read debt burned down: ${REPO_SILENT_READ_COUNT} < baseline ${TALOS_REPO_SILENT_READ_BASELINE}"
+    yellow "  → lower TALOS_REPO_SILENT_READ_BASELINE in scripts/lint-structural.sh (check 52) to lock it in."
+    green "✓ repository silent-read ratchet holds (${REPO_SILENT_READ_COUNT}/${TALOS_REPO_SILENT_READ_BASELINE})"
+else
+    green "✓ repository silent-read ratchet holds (${REPO_SILENT_READ_COUNT}/${TALOS_REPO_SILENT_READ_BASELINE})"
+fi
+echo
+
+# ── 53. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
 # pre-push hook comment said 40 — three sources, three numbers. Assert
@@ -3456,7 +3500,7 @@ echo
 # a renumber went wrong or a check was deleted without renumbering), and
 # (b) CLAUDE.md's "N checks today" sentence matches the real count. The
 # pre-push hook no longer states a number (it points at --count).
-bold "▶ check 52: lint self-consistency (check numbering + documented count)"
+bold "▶ check 53: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"
 META_FAIL=0

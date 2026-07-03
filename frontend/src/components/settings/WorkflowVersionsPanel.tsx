@@ -5,11 +5,9 @@ import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
-  GitBranch,
   Plus,
   RotateCcw,
   CheckCircle2,
-  ChevronDown,
   Clock,
   Tag,
   GitCommit,

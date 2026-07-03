@@ -1,10 +1,6 @@
 import React, { useMemo, useState, useEffect, useRef } from "react";
 import { useUIStore } from "@/store/uiStore";
-import {
-  useEphemeralExecutionStore,
-  type TimedEvent,
-  type NodeStatus,
-} from "@/store/executionStore";
+import { useEphemeralExecutionStore } from "@/store/executionStore";
 import { cn } from "@/lib/utils";
 import {
   Terminal as TerminalIcon,

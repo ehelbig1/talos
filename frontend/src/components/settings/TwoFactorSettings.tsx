@@ -1,6 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { Input } from "@/components/ui/input";
@@ -27,7 +26,7 @@ import {
   useDisable2FaMutation,
 } from "@/generated/graphql";
 
-const SETUP_2FA = gql`
+const _SETUP_2FA = gql`
   mutation Setup2FA {
     setupTwoFactor {
       secret
@@ -37,7 +36,7 @@ const SETUP_2FA = gql`
   }
 `;
 
-const ENABLE_2FA = gql`
+const _ENABLE_2FA = gql`
   mutation Enable2FA($input: Enable2FAInput!) {
     enableTwoFactor(input: $input) {
       backupCodes
@@ -45,7 +44,7 @@ const ENABLE_2FA = gql`
   }
 `;
 
-const DISABLE_2FA = gql`
+const _DISABLE_2FA = gql`
   mutation Disable2FA {
     disableTwoFactor
   }

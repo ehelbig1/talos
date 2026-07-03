@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { CompilationUpdate } from "@/lib/graphqlClient";
+import type { CompilationUpdate } from "@/lib/graphqlClient";
 
 export interface CompilationJob extends CompilationUpdate {
   lastUpdated: number;

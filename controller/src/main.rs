@@ -416,6 +416,14 @@ async fn main() -> anyhow::Result<()> {
     // HMAC verify-ring registration MUST precede the RPC subscriber spawns,
     // otherwise verify() fails closed and every request returns Unauthorized.
     let rpc_subscribers_enabled = register_rpc_hmac_ring()?;
+    // Distributed replay-nonce guard (codebase-review finding #2). Opt-in via
+    // TALOS_DISTRIBUTED_REPLAY: when enabled AND Redis is configured, register a
+    // Redis-backed shared guard so a signed RPC replayed to a DIFFERENT
+    // controller replica within the freshness window is rejected fleet-wide (the
+    // per-replica nonce cache can't see cross-replica replays). Default OFF → no
+    // guard registered → subscriber behaviour identical to before. Registered
+    // before the subscribers spawn so no request races an unregistered guard.
+    register_distributed_replay_guard(redis_client.as_ref()).await;
     let rpc_shutdown_tx = wire_rpc_subscribers(
         db_pool.clone(),
         nats_client.clone(),
@@ -593,6 +601,13 @@ async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>> {
     // misconfiguration before it can turn the tenant-isolation policies
     // into a no-op. One catalog lookup, non-blocking.
     let _rls_role_status = talos_db::warn_if_rls_will_be_bypassed(&db_pool).await;
+
+    // RFC 0004 / RFC 0005 S3 production fail-closed posture. In production,
+    // refuse to boot if tenant-isolation RLS would silently be a no-op —
+    // unless the operator explicitly acknowledges the weaker posture via
+    // TALOS_ALLOW_RLS_DISABLED=1. Mirrors the env-KEK production guard
+    // (`prod-kek-guard`). No-op outside production, so dev/test is unaffected.
+    talos_db::enforce_production_rls_posture(&db_pool, config::is_production()).await?;
 
     {
         let migrate_start = std::time::Instant::now();
@@ -2836,6 +2851,53 @@ async fn init_graph_rag(
     }
 
     Ok(())
+}
+
+/// Opt-in registration of the Redis-backed distributed replay guard
+/// (codebase-review finding #2). No-op unless `TALOS_DISTRIBUTED_REPLAY` is
+/// truthy; logs loudly (but does not fail boot) if enabled without a reachable
+/// Redis, since HMAC + freshness + the per-replica nonce cache still protect
+/// against forgery and within-replica replay — the shared guard only adds
+/// cross-replica single-use.
+async fn register_distributed_replay_guard(redis_client: Option<&std::sync::Arc<redis::Client>>) {
+    let enabled = matches!(
+        std::env::var("TALOS_DISTRIBUTED_REPLAY").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    if !enabled {
+        return;
+    }
+    let Some(client) = redis_client else {
+        tracing::warn!(
+            target: "talos_security",
+            "TALOS_DISTRIBUTED_REPLAY is on but REDIS_URL is unset — cross-replica replay \
+             protection NOT active (per-replica nonce cache only)"
+        );
+        return;
+    };
+    match talos_replay_guard::RedisReplayGuard::connect(client).await {
+        Ok(guard) => {
+            match talos_replay_guard::register_shared_replay_guard(std::sync::Arc::new(guard)) {
+                Ok(()) => tracing::info!(
+                    target: "talos_security",
+                    fail_closed = talos_replay_guard::fail_closed_from_env(),
+                    "distributed replay guard registered (Redis) — cross-replica RPC replay \
+                     protection active"
+                ),
+                Err(e) => tracing::error!(
+                    target: "talos_security",
+                    error = %e,
+                    "failed to register distributed replay guard"
+                ),
+            }
+        }
+        Err(e) => tracing::error!(
+            target: "talos_security",
+            error = %e,
+            "TALOS_DISTRIBUTED_REPLAY is on but connecting the Redis replay guard failed — \
+             cross-replica protection NOT active"
+        ),
+    }
 }
 
 /// Register the HMAC verify-ring for the talos-memory RPC subscribers and

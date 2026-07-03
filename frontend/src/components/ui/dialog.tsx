@@ -1,6 +1,5 @@
 import * as React from "react";
 import { X } from "lucide-react";
-import { SectionHeader } from "@/components/ui/SectionHeader";
 import { DialogWrapper } from "@/components/ui/DialogWrapper";
 
 const FOCUSABLE_SELECTOR =

@@ -1,9 +1,11 @@
 import { graphqlRequest, gql } from "./graphqlClient";
+import type {
+  GetWorkflowLoaderQuery,
+  GetModulesLoaderQuery,
+} from "@/generated/graphql";
 import {
   GetWorkflowLoaderDocument,
   GetModulesLoaderDocument,
-  GetWorkflowLoaderQuery,
-  GetModulesLoaderQuery,
 } from "@/generated/graphql";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -11,7 +13,7 @@ import { toast } from "sonner";
 // Node/Edge types imported via workflowStore
 
 // Define queries for codegen to pick up
-const GET_WORKFLOW_LOADER = gql`
+const _GET_WORKFLOW_LOADER = gql`
   query GetWorkflowLoader($id: UUID!) {
     workflow(id: $id) {
       id
@@ -24,7 +26,7 @@ const GET_WORKFLOW_LOADER = gql`
   }
 `;
 
-const GET_MODULES_LOADER = gql`
+const _GET_MODULES_LOADER = gql`
   query GetModulesLoader($ids: [UUID!]!) {
     wasmModules(ids: $ids) {
       id
@@ -36,10 +38,6 @@ const GET_MODULES_LOADER = gql`
     }
   }
 `;
-
-// Use types from generated/graphql.ts
-type WorkflowData = GetWorkflowLoaderQuery["workflow"];
-type WasmModule = GetModulesLoaderQuery["wasmModules"][number];
 
 interface GraphNode {
   id: string;

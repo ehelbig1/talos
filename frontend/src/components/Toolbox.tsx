@@ -2,7 +2,6 @@ import React, { useState } from "react";
 import { Button, IconButton, SectionHeader } from "@/components/ui";
 import { ModuleBuilder } from "@/components/builder/ModuleBuilder";
 import { useUIStore } from "@/store/uiStore";
-import { cn } from "@/lib/utils";
 import { Menu, Plus, Star, ChevronsLeft, LayoutGrid } from "lucide-react";
 
 interface ToolboxProps {

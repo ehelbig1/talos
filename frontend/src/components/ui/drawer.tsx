@@ -21,7 +21,6 @@ const Drawer = React.forwardRef<HTMLDivElement, DrawerProps>(
       width = "400px",
       className,
       isOpen = true,
-      onClose,
     },
     ref,
   ) => {

@@ -1,20 +1,9 @@
 import React, { useState } from "react";
-import {
-  discoverOpenAPISpec,
-  parseOpenAPIEndpoints,
-  OpenAPISpec,
-} from "@/lib/openapi";
-import { EndpointSelector, Endpoint } from "./EndpointSelector";
-import {
-  Search,
-  X,
-  Lightbulb,
-  Loader2,
-  Globe,
-  Activity,
-  CheckCircle,
-  Zap,
-} from "lucide-react";
+import type { OpenAPISpec } from "@/lib/openapi";
+import { discoverOpenAPISpec, parseOpenAPIEndpoints } from "@/lib/openapi";
+import type { Endpoint } from "./EndpointSelector";
+import { EndpointSelector } from "./EndpointSelector";
+import { Search, X, Loader2, Globe, Activity, Zap } from "lucide-react";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui";
@@ -29,7 +18,7 @@ export function OpenAPIBrowser({
   onSelectEndpoint,
 }: OpenAPIBrowserProps) {
   const [loading, setLoading] = useState(false);
-  const [spec, setSpec] = useState<OpenAPISpec | null>(null);
+  const [, setSpec] = useState<OpenAPISpec | null>(null);
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showBrowser, setShowBrowser] = useState(false);

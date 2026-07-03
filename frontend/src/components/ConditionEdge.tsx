@@ -4,12 +4,11 @@ import type { EdgeProps, Edge } from "@xyflow/react";
 import { cn } from "@/lib/utils";
 import { useEphemeralExecutionStore } from "@/store/executionStore";
 import type { EdgeData } from "@/store/workflowStore";
-import { Zap, AlertTriangle, XCircle, Info, Activity } from "lucide-react";
+import { Zap, AlertTriangle } from "lucide-react";
 
 type ConditionEdgeType = Edge<EdgeData, "conditionEdge">;
 
 export function ConditionEdge({
-  id,
   source,
   sourceX,
   sourceY,

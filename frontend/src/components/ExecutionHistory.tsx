@@ -1,12 +1,13 @@
 import React from "react";
 import { sanitizeErrorMessage } from "../lib/sanitize";
-import { useQuery } from "@tanstack/react-query";
 import { gql } from "../lib/graphqlClient";
+import type {
+  GetModuleExecutionHistoryQuery,
+  GetModuleExecutionLogsQuery,
+} from "../generated/graphql";
 import {
   useGetModuleExecutionHistoryQuery,
   useGetModuleExecutionLogsQuery,
-  GetModuleExecutionHistoryQuery,
-  GetModuleExecutionLogsQuery,
 } from "../generated/graphql";
 import { formatDistanceToNow } from "date-fns";
 import {
@@ -19,13 +20,12 @@ import {
   RefreshCw,
   Activity,
   AlertTriangle,
-  ShieldAlert,
 } from "lucide-react";
 import { cn, formatDuration } from "@/lib/utils";
-import { Badge, Button } from "@/components/ui";
+import { Button } from "@/components/ui";
 
 // Define queries for codegen to pick up
-const GET_MODULE_EXECUTION_HISTORY = gql`
+const _GET_MODULE_EXECUTION_HISTORY = gql`
   query GetModuleExecutionHistory(
     $moduleId: UUID!
     $pagination: PaginationInput
@@ -41,7 +41,7 @@ const GET_MODULE_EXECUTION_HISTORY = gql`
   }
 `;
 
-const GET_MODULE_EXECUTION_LOGS = gql`
+const _GET_MODULE_EXECUTION_LOGS = gql`
   query GetModuleExecutionLogs($executionId: UUID!) {
     moduleExecutionLogs(executionId: $executionId) {
       id

@@ -21,20 +21,13 @@ import { getCapabilityVisuals } from "@/lib/capabilityBadge";
 
 import {
   Dialog,
-  Section,
   Button,
   Badge,
-  Input,
   Label,
   DarkInput,
   DarkSelect,
-  InfoTip,
-  InfoBanner,
   ErrorBanner,
 } from "@/components/ui";
-import { SectionHeader } from "@/components/ui/SectionHeader";
-import { FlexContainer } from "@/components/ui/FlexContainer";
-import { FormField } from "@/components/ui/FormField";
 
 interface CreateModuleDialogProps {
   onModuleCreated: (
@@ -97,7 +90,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
 
         setConfig(defaultConfig);
         setParsedSchema(schema);
-      } catch (e) {
+      } catch {
         toast.error("Failed to parse module template configuration schema.");
         setConfig({});
         setParsedSchema(null);

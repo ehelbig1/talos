@@ -15,13 +15,10 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { gql } from "@/lib/graphqlClient";
-import {
-  useGetSecretAuditLogQuery,
-  Secret,
-  SecretAuditLog,
-} from "@/generated/graphql";
+import type { Secret, SecretAuditLog } from "@/generated/graphql";
+import { useGetSecretAuditLogQuery } from "@/generated/graphql";
 
-const GET_SECRET_AUDIT_LOG = gql`
+const _GET_SECRET_AUDIT_LOG = gql`
   query GetSecretAuditLog($secretId: UUID!, $limit: Int) {
     secretAuditLog(secretId: $secretId, pagination: { limit: $limit }) {
       id

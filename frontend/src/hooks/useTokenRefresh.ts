@@ -21,7 +21,7 @@ export function useTokenRefresh() {
       try {
         await refreshAccessToken();
         // if (import.meta.env.DEV) console.log("[Auth] Access token refreshed successfully");
-      } catch (error) {
+      } catch {
         // if (import.meta.env.DEV) console.error("[Auth] Failed to refresh token:", error);
         // If refresh fails, user will be prompted to log in again on next request
         // The graphqlClient already handles this with automatic retry

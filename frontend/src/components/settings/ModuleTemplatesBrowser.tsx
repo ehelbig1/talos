@@ -14,10 +14,10 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { NodeTemplatesQuery } from "@/generated/graphql";
 import {
   useNodeTemplatesQuery,
   useCreateModuleFromTemplateMutation,
-  NodeTemplatesQuery,
 } from "@/generated/graphql";
 
 type NodeTemplate = NodeTemplatesQuery["nodeTemplates"][0];

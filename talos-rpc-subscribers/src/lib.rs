@@ -33,6 +33,44 @@ use talos_actor_memory_service as actor_memory_service;
 // `talos_integration_state` — they are utilities of that
 // data-plane module, reusable from any subscriber or direct caller.
 
+/// TTL for shared-store nonce entries. Must be `>=` the RPC freshness window
+/// (`rpc_auth::PAST_WINDOW_MS` = 60 s past + a few seconds future skew); a
+/// generous margin is harmless because a message can't be *fresh* after the
+/// window anyway, so an entry lingering longer never causes a false replay.
+const SHARED_NONCE_TTL_SECS: u64 = 120;
+
+/// Cross-replica replay check (codebase-review finding #2). Consulted AFTER the
+/// per-replica `req.verify()` (HMAC + freshness + process-local nonce) passes,
+/// so a nonce replayed to a *different* controller replica within the freshness
+/// window is also rejected — closing the "single-use degrades to
+/// freshness-window-bounded replay across the fleet" gap.
+///
+/// Returns `true` (admit) when NO shared guard is registered — the default, so
+/// behaviour is byte-identical to before this layer existed. When a guard IS
+/// registered, returns `false` (reject) on a cross-replica replay, and applies
+/// the operator's fail policy on backend unavailability (fail-open by default;
+/// HMAC + freshness + per-replica nonce still hold).
+///
+/// The key namespaces on `subject` so a memory-op nonce can't collide with a
+/// graph-search nonce, and on `actor_id` (host-supplied, not guest-controllable)
+/// so the single-use domain matches the signature's binding.
+async fn crossreplica_replay_ok(subject: &str, actor_id: uuid::Uuid, nonce: &str) -> bool {
+    let Some(guard) = talos_replay_guard::shared_replay_guard() else {
+        return true;
+    };
+    let key = format!("{subject}:{actor_id}:{nonce}");
+    let outcome = guard.check_and_record(&key, SHARED_NONCE_TTL_SECS).await;
+    if outcome == talos_replay_guard::ReplayOutcome::Replay {
+        tracing::warn!(
+            target: "talos_security",
+            %subject,
+            %actor_id,
+            "cross-replica replay rejected: nonce already seen on another controller replica"
+        );
+    }
+    talos_replay_guard::admit(outcome, talos_replay_guard::fail_closed_from_env())
+}
+
 // ============================================================================
 // talos-memory NATS-RPC subscribers
 // ============================================================================
@@ -455,7 +493,9 @@ pub fn spawn_graph_rpc_subscriber(
                 }
             };
 
-            if !req.verify() {
+            if !req.verify()
+                || !crossreplica_replay_ok(SUBJECT_GRAPH_SEARCH, req.actor_id, &req.nonce).await
+            {
                 tracing::warn!(
                     actor_id = %req.actor_id,
                     "graph-search RPC: HMAC or freshness verification failed"
@@ -730,7 +770,9 @@ pub fn spawn_memory_rpc_subscriber(
                 }
             };
 
-            if !req.verify() {
+            if !req.verify()
+                || !crossreplica_replay_ok(SUBJECT_MEMORY_OP, req.actor_id, &req.nonce).await
+            {
                 tracing::warn!(
                     actor_id = %req.actor_id,
                     "memory RPC: HMAC or freshness verification failed"
@@ -1106,7 +1148,9 @@ pub fn spawn_database_rpc_subscriber(
                 }
             };
 
-            if !req.verify() {
+            if !req.verify()
+                || !crossreplica_replay_ok(SUBJECT_DATABASE_QUERY, req.actor_id, &req.nonce).await
+            {
                 tracing::warn!(
                     actor_id = %req.actor_id,
                     "database RPC: HMAC or freshness verification failed"
@@ -1512,7 +1556,9 @@ pub fn spawn_state_write_subscriber(
                     return;
                 }
             };
-            if !req.verify() {
+            if !req.verify()
+                || !crossreplica_replay_ok(SUBJECT_STATE_WRITE, req.actor_id, &req.nonce).await
+            {
                 tracing::warn!(
                     actor_id = %req.actor_id,
                     execution_id = %req.execution_id,
@@ -1809,7 +1855,10 @@ pub fn spawn_integration_state_subscriber(
                 }
             };
 
-            if !req.verify() {
+            if !req.verify()
+                || !crossreplica_replay_ok(SUBJECT_INTEGRATION_STATE_OP, req.actor_id, &req.nonce)
+                    .await
+            {
                 tracing::warn!(
                     actor_id = %req.actor_id,
                     integration = %req.integration_name,

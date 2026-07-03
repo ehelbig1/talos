@@ -1,22 +1,7 @@
 import React from "react";
-import {
-  Brain,
-  ShieldCheck,
-  Settings,
-  ChevronDown,
-  Activity,
-} from "lucide-react";
-import {
-  FormField,
-  Input,
-  Textarea,
-  Collapsible,
-  CollapsibleTrigger,
-  CollapsibleContent,
-  CopyField,
-} from "@/components/ui";
+import { Brain, ShieldCheck, ChevronDown, Activity } from "lucide-react";
+import { CopyField } from "@/components/ui";
 import { cn } from "@/lib/utils";
-import { NodeStatusType } from "@/store/executionStore";
 import type { WorkflowNodeData } from "@/store/workflowStore";
 
 export function CapabilityBadge({

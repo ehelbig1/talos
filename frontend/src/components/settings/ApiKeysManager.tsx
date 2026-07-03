@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
-import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
@@ -25,16 +24,16 @@ import { formatDate } from "@/lib/format";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { gql } from "@/lib/graphqlClient";
+import type { ApiKeyInfo } from "@/generated/graphql";
 import {
   useListApiKeysQuery,
   useCreateApiKeyMutation,
   useRevokeApiKeyMutation,
   useRotateApiKeyMutation,
   useDeleteApiKeyMutation,
-  ApiKeyInfo,
 } from "@/generated/graphql";
 
-const LIST_API_KEYS = gql`
+const _LIST_API_KEYS = gql`
   query ListApiKeys($pagination: PaginationInput) {
     apiKeys(pagination: $pagination) {
       id
@@ -50,7 +49,7 @@ const LIST_API_KEYS = gql`
   }
 `;
 
-const CREATE_API_KEY = gql`
+const _CREATE_API_KEY = gql`
   mutation CreateApiKey($input: CreateApiKeyInput!) {
     createApiKey(input: $input) {
       id
@@ -62,13 +61,13 @@ const CREATE_API_KEY = gql`
   }
 `;
 
-const REVOKE_API_KEY = gql`
+const _REVOKE_API_KEY = gql`
   mutation RevokeApiKey($keyId: UUID!) {
     revokeApiKey(keyId: $keyId)
   }
 `;
 
-const ROTATE_API_KEY = gql`
+const _ROTATE_API_KEY = gql`
   mutation RotateApiKey($keyId: UUID!) {
     rotateApiKey(keyId: $keyId) {
       id
@@ -80,7 +79,7 @@ const ROTATE_API_KEY = gql`
   }
 `;
 
-const DELETE_API_KEY = gql`
+const _DELETE_API_KEY = gql`
   mutation DeleteApiKey($keyId: UUID!) {
     deleteApiKey(keyId: $keyId)
   }

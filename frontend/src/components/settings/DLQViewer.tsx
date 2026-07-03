@@ -1,6 +1,5 @@
 import React, { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
@@ -9,7 +8,6 @@ import {
   AlertCircle,
   Bug,
   ExternalLink,
-  Trash,
   Webhook,
   Loader2,
   Database,
@@ -26,7 +24,7 @@ import {
 import { gql, subscribeDlqUpdates } from "@/lib/graphqlClient";
 import { useEffect } from "react";
 
-const GET_DEAD_LETTER_QUEUE = gql`
+const _GET_DEAD_LETTER_QUEUE = gql`
   query GetDeadLetterQueue {
     deadLetterQueue {
       id
@@ -42,7 +40,7 @@ const GET_DEAD_LETTER_QUEUE = gql`
   }
 `;
 
-const GET_WEBHOOK_DEAD_LETTER_QUEUE = gql`
+const _GET_WEBHOOK_DEAD_LETTER_QUEUE = gql`
   query GetWebhookDeadLetterQueue {
     webhookDeadLetterQueue {
       id
@@ -58,13 +56,13 @@ const GET_WEBHOOK_DEAD_LETTER_QUEUE = gql`
   }
 `;
 
-const REPLAY_DEAD_LETTER_ENTRY = gql`
+const _REPLAY_DEAD_LETTER_ENTRY = gql`
   mutation ReplayDeadLetterEntry($id: UUID!) {
     replayDeadLetterEntry(id: $id)
   }
 `;
 
-const REPLAY_WEBHOOK_DEAD_LETTER_ENTRY = gql`
+const _REPLAY_WEBHOOK_DEAD_LETTER_ENTRY = gql`
   mutation ReplayWebhookDeadLetterEntry($id: UUID!) {
     replayWebhookDeadLetterEntry(id: $id)
   }

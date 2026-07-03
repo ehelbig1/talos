@@ -31,7 +31,7 @@ import {
   Copy,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { Button, Badge } from "@/components/ui";
+import { Button } from "@/components/ui";
 
 interface WorkflowExecutionHistoryProps {
   workflowId: string;

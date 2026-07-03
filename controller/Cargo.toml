@@ -47,6 +47,7 @@ talos-shutdown = { path = "../talos-shutdown" }
 talos-tenancy = { path = "../talos-tenancy" }
 talos-secrets-rotation = { path = "../talos-secrets-rotation" }
 talos-node-cache = { path = "../talos-node-cache" }
+talos-replay-guard = { path = "../talos-replay-guard" }
 talos-db-monitor = { path = "../talos-db-monitor" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }

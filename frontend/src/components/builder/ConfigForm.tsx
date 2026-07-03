@@ -1,9 +1,7 @@
-import React, { useState, useEffect } from "react";
-import { FlexContainer } from "@/components/ui/FlexContainer";
+import React, { useState } from "react";
 import { analyzeURL, applySuggestions, validateField } from "@/lib/smartConfig";
 import { OpenAPIBrowser } from "./OpenAPIBrowser";
 import { ManualEndpointCreator } from "./ManualEndpointCreator";
-import { SlackBrowser } from "./SlackBrowser";
 import { SlackAppSelector } from "./SlackAppSelector";
 import { GoogleCalendarSelector } from "./GoogleCalendarSelector";
 import {
@@ -25,14 +23,9 @@ import {
   CheckCircle,
   ChevronDown,
   X,
-  ArrowLeft,
-  FileText,
-  Calendar,
-  Search,
   Mail,
   Target,
   Plus,
-  Loader2,
   Settings,
   Zap,
 } from "lucide-react";
@@ -337,7 +330,7 @@ export const ConfigForm = React.memo(function ConfigForm({
       <div className="space-y-6">
         {requiredFields
           .filter(
-            ([field, fieldSchema]) =>
+            ([_field, fieldSchema]) =>
               !fieldSchema["x-hidden"] && !fieldSchema.readOnly,
           )
           .map(([field, fieldSchema]) => (
@@ -435,7 +428,7 @@ export const ConfigForm = React.memo(function ConfigForm({
           ))}
 
         {/* Advanced Section */}
-        {advancedFields.filter(([f, s]) => !s["x-hidden"] && !s.readOnly)
+        {advancedFields.filter(([_f, s]) => !s["x-hidden"] && !s.readOnly)
           .length > 0 && (
           <Accordion type="single" collapsible className="w-full">
             <AccordionItem value="advanced" className="border-white/5">
@@ -448,7 +441,7 @@ export const ConfigForm = React.memo(function ConfigForm({
               <AccordionContent className="pt-8 pb-4 space-y-8 animate-in fade-in slide-in-from-top-4">
                 {advancedFields
                   .filter(
-                    ([field, fieldSchema]) =>
+                    ([_field, fieldSchema]) =>
                       !fieldSchema["x-hidden"] && !fieldSchema.readOnly,
                   )
                   .map(([field, fieldSchema]) => (

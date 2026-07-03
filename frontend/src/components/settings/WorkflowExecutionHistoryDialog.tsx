@@ -21,8 +21,8 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { WorkflowExecution } from "@/generated/graphql";
 import {
-  WorkflowExecution,
   useWorkflowExecutionHistoryQuery,
   useRetryExecutionMutation,
   useResumeWorkflowMutation,

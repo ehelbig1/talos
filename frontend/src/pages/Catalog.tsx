@@ -18,7 +18,6 @@ import {
   Search,
   Shield,
   Webhook,
-  X,
   Zap,
 } from "lucide-react";
 import { Button, Input } from "@/components/ui";

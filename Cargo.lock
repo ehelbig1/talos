@@ -1756,6 +1756,7 @@ dependencies = [
  "talos-rate-limit",
  "talos-registry",
  "talos-replay-diff",
+ "talos-replay-guard",
  "talos-replay-service",
  "talos-retry-intelligence",
  "talos-rpc-subscribers",
@@ -8410,6 +8411,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-replay-guard"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "redis",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "talos-replay-service"
 version = "0.1.0"
 dependencies = [
@@ -8457,6 +8468,7 @@ dependencies = [
  "talos-graph-rag",
  "talos-integration-state",
  "talos-memory",
+ "talos-replay-guard",
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",

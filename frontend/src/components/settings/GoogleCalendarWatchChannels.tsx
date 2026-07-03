@@ -26,12 +26,12 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import type { QueryKey } from "@tanstack/react-query";
 import {
   useQuery,
   useMutation,
   useQueryClient,
   useIsFetching,
-  QueryKey,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -468,9 +468,10 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
   // strict-mode warnings and (in dev) leaked closure references.
   const flashTimersRef = useRef<Set<number>>(new Set());
   useEffect(() => {
+    const timers = flashTimersRef.current;
     return () => {
-      flashTimersRef.current.forEach(clearTimeout);
-      flashTimersRef.current.clear();
+      timers.forEach(clearTimeout);
+      timers.clear();
     };
   }, []);
   const triggerFlash = (channelUuid: string) => {
