@@ -26,6 +26,7 @@ members = [
     "talos-tenancy",
     "talos-secrets-rotation",
     "talos-node-cache",
+    "talos-replay-guard",
     "talos-db-monitor",
     "talos-worker-fleet",
     "talos-schedule-repo",
