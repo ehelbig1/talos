@@ -457,6 +457,7 @@ mod signature_failure_payload_tests {
 
     fn unauthenticated_req() -> JobRequest {
         JobRequest {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://attacker-chosen/v1".to_string(),
@@ -515,9 +516,62 @@ mod signature_failure_payload_tests {
     }
 }
 
+/// RFC 0010 P1: worker-side dispatch-verify configuration, resolved once from
+/// env. The worker holds only the controller's *public* key(s), so it can verify
+/// an Ed25519-signed dispatch but cannot forge one — the asymmetric half of the
+/// worker-trust boundary.
+struct DispatchVerifyConfig {
+    /// Controller Ed25519 public key(s). Index 0 is current;
+    /// `TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS` (comma-separated) adds rotated-out
+    /// keys for an overlap window. Empty ⇒ Ed25519 dispatches cannot be verified.
+    ed_keys: Vec<talos_workflow_job_protocol::DispatchVerifyingKey>,
+    /// Whether legacy HMAC (scheme 0) dispatches are still accepted. `true` (the
+    /// default) is the rollout posture; `TALOS_DISPATCH_REQUIRE_ED25519=1` flips
+    /// it to `false` — the RFC 0010 P4 enforcement flip that refuses HMAC once
+    /// the fleet is fully on Ed25519.
+    accept_legacy_hmac: bool,
+}
+
+/// Load [`DispatchVerifyConfig`] once. Malformed public keys are skipped with a
+/// loud warning (so one bad key can't strand the worker), and enabling
+/// enforcement without a usable key is logged as an error — the worker then
+/// fails closed per-request (rejecting is safe; admitting a forgery is not).
+fn dispatch_verify_config() -> &'static DispatchVerifyConfig {
+    static CFG: std::sync::OnceLock<DispatchVerifyConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let mut ed_keys = Vec::new();
+        if let Ok(cur) = std::env::var("TALOS_CONTROLLER_PUBLIC_KEY") {
+            match talos_workflow_job_protocol::parse_ed25519_verifying_key_hex(&cur) {
+                Ok(k) => ed_keys.push(k),
+                Err(e) => ::tracing::error!(error = %e, "TALOS_CONTROLLER_PUBLIC_KEY is invalid — Ed25519 dispatch verification disabled"),
+            }
+        }
+        if let Ok(prev) = std::env::var("TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS") {
+            for (i, part) in prev.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+                match talos_workflow_job_protocol::parse_ed25519_verifying_key_hex(part) {
+                    Ok(k) => ed_keys.push(k),
+                    Err(e) => ::tracing::warn!(index = i, error = %e, "skipping invalid TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS entry"),
+                }
+            }
+        }
+        let require_ed25519 = matches!(
+            std::env::var("TALOS_DISPATCH_REQUIRE_ED25519").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        );
+        if require_ed25519 && ed_keys.is_empty() {
+            ::tracing::error!(
+                target: "talos_security",
+                "TALOS_DISPATCH_REQUIRE_ED25519 is on but no valid TALOS_CONTROLLER_PUBLIC_KEY \
+                 is configured — the worker will reject ALL dispatches (fail-closed)"
+            );
+        }
+        DispatchVerifyConfig { ed_keys, accept_legacy_hmac: !require_ed25519 }
+    })
+}
+
 /// Execute the Wasm module for a given job with observability.
 ///
-/// * Verifies the HMAC signature before executing.
+/// * Verifies the dispatch signature (Ed25519 or legacy HMAC) before executing.
 /// * Decrypts secrets from `req.encrypted_secrets` using the shared key.
 /// * Passes decrypted secrets to the runtime so WASM modules can access them
 ///   via the `secrets::get-secret` host function.
@@ -537,10 +591,15 @@ async fn execute_job(
     _span.set_attribute("job_id", &req.job_id.to_string());
     _span.set_attribute("module_uri", &req.module_uri);
 
-    // SECURITY: Verify HMAC-SHA256 signature + nonce freshness (300 s window).
-    // Ring-aware: accepts the current key OR a staged WORKER_SHARED_KEY_PREVIOUS
-    // so a rolling rotation doesn't reject controller-signed jobs.
-    if let Err(e) = req.verify_with_ring(&shared_key, 300) {
+    // SECURITY: verify the dispatch signature + nonce freshness (300 s window).
+    // RFC 0010 P1: `verify_dispatch` routes on the request's `crypto_scheme` —
+    // Ed25519 against the controller public key(s), or legacy HMAC against the
+    // WORKER_SHARED_KEY ring (accepted while `accept_legacy_hmac`, refused once
+    // TALOS_DISPATCH_REQUIRE_ED25519 flips it off). Ring-aware on the HMAC side
+    // so a rolling WORKER_SHARED_KEY rotation doesn't reject controller-signed
+    // jobs.
+    let dvc = dispatch_verify_config();
+    if let Err(e) = req.verify_dispatch(&shared_key, &dvc.ed_keys, 300, dvc.accept_legacy_hmac) {
         ::tracing::error!(job_id = %req.job_id, error = %e, "Job signature verification failed");
         _span.set_attribute("error", "signature_verification_failed");
         _span.end_error("Signature verification failed");
@@ -870,9 +929,11 @@ async fn execute_pipeline_job(
     // propagated controller trace context (see `execute_job` for the rationale).
     let mut _span = JobSpan::current_with_parent(cx);
 
-    // SECURITY: Verify HMAC-SHA256 signature + nonce freshness (300 s window).
-    // Ring-aware (current OR staged previous key) for rolling rotation.
-    if let Err(e) = req.verify_with_ring(&shared_key, 300) {
+    // SECURITY: verify the dispatch signature + nonce freshness (300 s window).
+    // RFC 0010 P1: scheme-dispatched (Ed25519 or legacy HMAC), ring-aware on the
+    // HMAC side for rolling WORKER_SHARED_KEY rotation. See `execute_job`.
+    let dvc = dispatch_verify_config();
+    if let Err(e) = req.verify_dispatch(&shared_key, &dvc.ed_keys, 300, dvc.accept_legacy_hmac) {
         ::tracing::error!(job_id = %req.job_id, error = %e, "Pipeline job signature verification failed");
         _span.set_attribute("error", "signature_verification_failed");
         _span.end_error("Signature verification failed");

@@ -273,6 +273,7 @@ async fn dispatch_single_message(
     .await;
 
     let mut job_request = JobRequest {
+        crypto_scheme: 0,
         job_id: execution_id,
         workflow_execution_id: execution_id,
         module_uri: exec_info.module_uri.clone(),

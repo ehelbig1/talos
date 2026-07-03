@@ -1106,6 +1106,7 @@ impl WebhookRouter {
                         )
                         .await;
                     let mut req = talos_workflow_job_protocol::JobRequest {
+                        crypto_scheme: 0,
                         job_id,
                         workflow_execution_id: job_id, // Standalone webhook uses same ID
                         module_uri: exec_info.module_uri,
@@ -2530,6 +2531,7 @@ impl WebhookRouter {
                 };
 
                 let mut req = talos_workflow_job_protocol::JobRequest {
+                    crypto_scheme: 0,
                     job_id,
                     workflow_execution_id: job_id,
                     module_uri: exec_info.module_uri,

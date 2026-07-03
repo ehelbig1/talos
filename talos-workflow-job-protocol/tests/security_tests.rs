@@ -15,6 +15,7 @@ fn test_key() -> Vec<u8> {
 
 fn make_job_request() -> JobRequest {
     JobRequest {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         module_uri: "file://tmp/module.wasm".to_string(),
@@ -289,6 +290,7 @@ fn tampered_wasm_bytes_fails_verification() {
 fn pipeline_tampered_step_count_fails() {
     let key = test_key();
     let mut req = PipelineJobRequest {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![make_pipeline_step()],
@@ -316,6 +318,7 @@ fn pipeline_tampered_step_count_fails() {
 fn pipeline_tampered_share_sandbox_fails() {
     let key = test_key();
     let mut req = PipelineJobRequest {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![make_pipeline_step()],
@@ -500,6 +503,7 @@ fn tampered_job_request_integration_name_unset_to_set_fails() {
 fn tampered_pipeline_step_integration_name_fails() {
     let key = test_key();
     let mut req = PipelineJobRequest {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![{

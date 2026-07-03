@@ -1,8 +1,22 @@
 # RFC 0010 — Asymmetric worker-trust boundary
 
-**Status:** Draft
+**Status:** In progress (P1 landing)
 **Author:** Codebase review follow-up
 **Date:** 2026-07-03
+
+> **P1 status (landed, opt-in).** The Ed25519 dispatch scheme is implemented and
+> unit-tested end-to-end at the protocol layer, and wired into the primary
+> dispatch path: `crypto_scheme` discriminant + `sign_ed25519` / `verify_ed25519`
+> / `verify_dispatch` on `JobRequest`/`PipelineJobRequest`
+> (`talos-workflow-job-protocol`, 11 tests); `DispatchSigner` on the engine
+> `NatsNodeDispatcher`; controller selects it via `TALOS_DISPATCH_SCHEME=ed25519`
+> + `TALOS_CONTROLLER_SIGNING_KEY` (`talos-engine::nats_run`); the worker
+> dual-verifies via `TALOS_CONTROLLER_PUBLIC_KEY[_PREVIOUS]` and enforces
+> Ed25519-only under `TALOS_DISPATCH_REQUIRE_ED25519` (the P4 flip). **Default
+> off → HMAC unchanged.** Remaining P1 wiring (follow-up): the module-push sign
+> sites (`talos-webhooks`, `talos-gmail`, `talos-google-calendar`) and the
+> dispatcher retry re-sign paths still sign HMAC — safe during dual-verify, but
+> all must move to `DispatchSigner` before the P4 enforcement flip.
 **Related:** `docs/reviews/codebase-review-2026-07-03.md` (finding #1),
 `docs/reviews/security-hardening-followups-2026-07-03.md` (corrected Finding #1)
 

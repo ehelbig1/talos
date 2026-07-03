@@ -643,6 +643,13 @@ pub struct NatsNodeDispatcher {
     /// result signed under a staged previous key verify during a rolling
     /// `WORKER_SHARED_KEY` rotation.
     worker_key_ring: Option<talos_workflow_engine_core::WorkerKeyRing>,
+    /// RFC 0010 P1: optional dispatch signer. When `Some`, JobRequest /
+    /// PipelineJobRequest are signed under this signer's scheme (Ed25519 or
+    /// HMAC) instead of the bare `worker_shared_key` HMAC path. `None` (the
+    /// default) preserves the exact pre-P1 HMAC signing behavior, so a deploy
+    /// that doesn't configure Ed25519 is unchanged. Note `worker_shared_key`
+    /// remains for envelope encryption + result-verify regardless.
+    dispatch_signer: Option<talos_workflow_job_protocol::DispatchSigner>,
     /// Policy trait for classifying dispatch errors into
     /// transient-vs-permanent. Drives the "smart retry default" path
     /// (skip retries on auth / fuel / missing-secret errors even when
@@ -678,9 +685,22 @@ impl NatsNodeDispatcher {
             event_sink,
             worker_shared_key,
             worker_key_ring,
+            dispatch_signer: None,
             retry_classifier,
             expression_evaluator,
         }
+    }
+
+    /// RFC 0010 P1: install the dispatch signer (Ed25519 or explicit HMAC).
+    /// When set, it takes precedence over the bare `worker_shared_key` HMAC path
+    /// at every request-signing site. Omit it to keep the legacy HMAC behavior.
+    #[must_use]
+    pub fn with_dispatch_signer(
+        mut self,
+        signer: talos_workflow_job_protocol::DispatchSigner,
+    ) -> Self {
+        self.dispatch_signer = Some(signer);
+        self
     }
 
     /// Override the result verify-ring (e.g. to add `WORKER_SHARED_KEY_PREVIOUS`
@@ -741,6 +761,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
 
         // 1. Assemble the wire-format `JobRequest`.
         let mut req = JobRequest {
+            crypto_scheme: 0,
             // Reuse a caller-supplied job id when present so a
             // pre-INSERTed `module_executions` row with that id stays
             // correlated with the worker's update. Fresh UUID
@@ -784,8 +805,14 @@ impl NodeDispatcher for NatsNodeDispatcher {
             reply_topic: reply_inbox.clone(),
         };
 
-        // 2. Sign.
-        if let Some(key) = self.worker_shared_key.as_ref() {
+        // 2. Sign. RFC 0010 P1: prefer the configured dispatch signer (Ed25519
+        // or explicit HMAC); fall back to the bare worker_shared_key HMAC path
+        // when no signer is installed (unchanged pre-P1 behavior).
+        if let Some(signer) = self.dispatch_signer.as_ref() {
+            signer
+                .sign_job(&mut req)
+                .map_err(|e| -> BoxError { format!("Failed to sign job request: {e}").into() })?;
+        } else if let Some(key) = self.worker_shared_key.as_ref() {
             req.sign(key.as_bytes())
                 .map_err(|e| -> BoxError { format!("Failed to sign job request: {e}").into() })?;
         }
@@ -922,6 +949,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
 
         // 2. Assemble the chain-level wire request.
         let mut req = PipelineJobRequest {
+            crypto_scheme: 0,
             job_id: request.job_id.unwrap_or_else(uuid::Uuid::new_v4),
             workflow_execution_id: request.workflow_execution_id,
             steps,
@@ -939,8 +967,13 @@ impl NodeDispatcher for NatsNodeDispatcher {
             reply_topic: reply_inbox.clone(),
         };
 
-        // 3. Sign (chain-level HMAC, independent of any per-step signing).
-        if let Some(key) = self.worker_shared_key.as_ref() {
+        // 3. Sign (chain-level, independent of any per-step signing). RFC 0010
+        // P1: prefer the configured dispatch signer; else the legacy HMAC path.
+        if let Some(signer) = self.dispatch_signer.as_ref() {
+            signer.sign_pipeline(&mut req).map_err(|e| -> BoxError {
+                format!("Failed to sign pipeline request: {e}").into()
+            })?;
+        } else if let Some(key) = self.worker_shared_key.as_ref() {
             req.sign(key.as_bytes()).map_err(|e| -> BoxError {
                 format!("Failed to sign pipeline request: {e}").into()
             })?;

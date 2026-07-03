@@ -103,7 +103,63 @@ pub fn build_nats_dispatcher(
         }
         None => dispatcher,
     };
+    // RFC 0010 P1: when Ed25519 dispatch signing is configured, install the
+    // signer so JobRequest/PipelineJobRequest are signed with the controller's
+    // private key. Default (unconfigured) leaves it off → HMAC signing via
+    // worker_shared_key, unchanged.
+    let dispatcher = match resolve_dispatch_signer() {
+        Some(signer) => dispatcher.with_dispatch_signer(signer),
+        None => dispatcher,
+    };
     Arc::new(dispatcher)
+}
+
+/// RFC 0010 P1: resolve the controller's dispatch signer from env (cached).
+/// `TALOS_DISPATCH_SCHEME=ed25519` + a valid 32-byte-hex-seed
+/// `TALOS_CONTROLLER_SIGNING_KEY` selects Ed25519 signing; anything else (the
+/// default) returns `None`, and the dispatcher keeps signing HMAC via
+/// `worker_shared_key`. A requested-but-misconfigured Ed25519 setup logs an
+/// error and falls back to HMAC (which the dual-verify worker still accepts, so
+/// a bad key can't strand dispatch during rollout).
+fn resolve_dispatch_signer() -> Option<talos_workflow_job_protocol::DispatchSigner> {
+    static CACHE: std::sync::OnceLock<Option<talos_workflow_job_protocol::DispatchSigner>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let scheme = std::env::var("TALOS_DISPATCH_SCHEME").unwrap_or_default();
+            if !scheme.eq_ignore_ascii_case("ed25519") {
+                return None;
+            }
+            let Ok(hex_seed) = std::env::var("TALOS_CONTROLLER_SIGNING_KEY") else {
+                tracing::error!(
+                    target: "talos_security",
+                    "TALOS_DISPATCH_SCHEME=ed25519 but TALOS_CONTROLLER_SIGNING_KEY is unset — \
+                     falling back to HMAC dispatch signing"
+                );
+                return None;
+            };
+            match talos_workflow_job_protocol::parse_ed25519_signing_key_hex(&hex_seed) {
+                Ok(sk) => {
+                    tracing::info!(
+                        target: "talos_security",
+                        "dispatch signing scheme = Ed25519 (RFC 0010 P1)"
+                    );
+                    Some(talos_workflow_job_protocol::DispatchSigner::Ed25519(
+                        std::sync::Arc::new(sk),
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "talos_security",
+                        error = %e,
+                        "TALOS_DISPATCH_SCHEME=ed25519 but TALOS_CONTROLLER_SIGNING_KEY is invalid \
+                         — falling back to HMAC dispatch signing"
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
 }
 
 /// Controller-convenience: dispatch via a raw `async_nats::Client`.

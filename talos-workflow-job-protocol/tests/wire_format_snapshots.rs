@@ -63,6 +63,7 @@ fn det_uuid(n: u128) -> Uuid {
 /// `signature` after a `sign_with_fixed_nonce` round-trip.
 fn deterministic_job_request() -> JobRequest {
     JobRequest {
+        crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
         workflow_execution_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0002),
         module_uri: "redis:wasm:00000000-0000-0000-0000-000000000003".into(),
@@ -206,7 +207,7 @@ fn job_request_json_snapshot() {
     // Only the `signature` bytes change here (None options are
     // omitted from the JSON via `skip_serializing_if`, and the
     // numeric fields were already in the JSON shape).
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[108,221,81,114,64,235,122,86,157,6,85,137,44,226,239,251,120,12,56,194,144,134,25,218,236,69,204,68,53,242,107,87],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","dry_run":false}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[108,221,81,114,64,235,122,86,157,6,85,137,44,226,239,251,120,12,56,194,144,134,25,218,236,69,204,68,53,242,107,87],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","dry_run":false,"crypto_scheme":0}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted — see test docstring for resolution"
@@ -271,6 +272,7 @@ fn job_result_json_snapshot() {
 #[test]
 fn pipeline_job_request_json_snapshot() {
     let req = PipelineJobRequest {
+        crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0010),
         workflow_execution_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0011),
         user_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0012),
@@ -304,7 +306,7 @@ fn pipeline_job_request_json_snapshot() {
         reply_topic: None,
     };
     let actual = serde_json::to_string(&req).expect("serialize");
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000010","workflow_execution_id":"00000000-0000-0000-0000-000000000011","steps":[{"module_id":"00000000-0000-0000-0000-000000000013","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000013","wasm_bytes":[0,97,115,109],"config":{"setting":"value"},"allowed_hosts":["api.example.com"],"allowed_methods":["GET"],"allowed_secrets":[],"allowed_sql_operations":[],"allow_tier2_exposure":false,"encrypted_secrets":{"ciphertext":[170],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"max_fuel":1000000,"max_memory_mb":128,"timeout_ms":30000,"priority":100,"expected_wasm_hash":"deadbeef"}],"total_timeout_ms":60000,"share_sandbox":false,"signature":[202,254],"job_nonce":"0:00000000000000000000000000000000","user_id":"00000000-0000-0000-0000-000000000012","max_llm_tier":"tier2"}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000010","workflow_execution_id":"00000000-0000-0000-0000-000000000011","steps":[{"module_id":"00000000-0000-0000-0000-000000000013","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000013","wasm_bytes":[0,97,115,109],"config":{"setting":"value"},"allowed_hosts":["api.example.com"],"allowed_methods":["GET"],"allowed_secrets":[],"allowed_sql_operations":[],"allow_tier2_exposure":false,"encrypted_secrets":{"ciphertext":[170],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"max_fuel":1000000,"max_memory_mb":128,"timeout_ms":30000,"priority":100,"expected_wasm_hash":"deadbeef"}],"total_timeout_ms":60000,"share_sandbox":false,"signature":[202,254],"job_nonce":"0:00000000000000000000000000000000","user_id":"00000000-0000-0000-0000-000000000012","max_llm_tier":"tier2","crypto_scheme":0}"#;
     assert_eq!(
         actual, expected,
         "PipelineJobRequest wire format drifted — see test docstring for resolution"

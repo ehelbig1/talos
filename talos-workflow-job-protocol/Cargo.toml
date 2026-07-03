@@ -25,6 +25,9 @@ hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
+# RFC 0010 P1: Ed25519 for the controller→worker dispatch signature scheme
+# (asymmetric worker-trust boundary — the worker holds only the public key).
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [features]
 default = []
