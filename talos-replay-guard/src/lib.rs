@@ -321,4 +321,51 @@ mod tests {
             "second sighting within TTL must be Replay (cross-replica single-use)"
         );
     }
+
+    // Explicit cross-replica model: TWO independent RedisReplayGuard instances
+    // (each stands in for a separate controller replica) share ONE Redis. A
+    // nonce admitted by replica A must be rejected by replica B — the exact
+    // property `crossreplica_replay_ok` in the RPC subscribers relies on, which
+    // the per-process nonce caches cannot provide. Gated on TALOS_TEST_REDIS_URL.
+    #[tokio::test]
+    async fn two_replicas_share_single_use_via_redis() {
+        let Ok(url) = std::env::var("TALOS_TEST_REDIS_URL") else {
+            eprintln!("skipping: TALOS_TEST_REDIS_URL unset");
+            return;
+        };
+        let client = redis::Client::open(url).expect("open redis client");
+        // Two guards built independently, as two replicas would at their own boots.
+        let (replica_a, replica_b) = match (
+            RedisReplayGuard::connect(&client).await,
+            RedisReplayGuard::connect(&client).await,
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                eprintln!("skipping: cannot connect to Redis");
+                return;
+            }
+        };
+        let key = format!("itest-2rep:{}:{}", std::process::id(), now_secs());
+
+        // Replica A sees the message first → admits it.
+        assert_eq!(
+            replica_a.check_and_record(&key, 60).await,
+            ReplayOutcome::Fresh,
+            "replica A must admit the first sighting"
+        );
+        // The SAME signed message replayed to replica B → rejected fleet-wide,
+        // even though replica B's own process-local cache never saw it.
+        assert_eq!(
+            replica_b.check_and_record(&key, 60).await,
+            ReplayOutcome::Replay,
+            "replica B must reject a nonce already recorded by replica A"
+        );
+        // And a genuinely different nonce is still independently admitted by B.
+        let other = format!("{key}:other");
+        assert_eq!(
+            replica_b.check_and_record(&other, 60).await,
+            ReplayOutcome::Fresh,
+            "a distinct nonce must remain admissible"
+        );
+    }
 }

@@ -78,10 +78,12 @@ material from the worker, which requires asymmetric crypto:
   scheme. Needs a design spike; this is the piece that makes it RFC-scale rather
   than a patch.
 
-**Recommended next step:** open an RFC (`docs/rfcs/`) for an asymmetric
-worker-trust boundary covering the three directions above, the key-distribution /
-registration model, wire-format versioning, and a staged rollout. Until then,
-finding #1 is best treated as a **known, documented residual risk** whose actual
+**Next step — written:** [RFC 0010 — Asymmetric worker-trust
+boundary](../rfcs/0010-asymmetric-worker-trust-boundary.md) now specifies the
+genuine fix: Ed25519 for controller→worker dispatch, per-worker Ed25519 keypairs
+for worker→controller, envelope sealing (X25519/ECIES or per-execution), a
+`crypto_scheme`-versioned staged rollout, and the open questions that block P3.
+Until it ships, finding #1 is a **known, documented residual risk** whose actual
 mitigations today are the WASM sandbox itself (fuel/epoch/memory limits, proposal
 lockdown, per-tier linkers) keeping native-code escape hard, plus the tier-1
 data-egress gate — not the per-worker HMAC scheme.
