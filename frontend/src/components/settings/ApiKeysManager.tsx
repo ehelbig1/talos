@@ -25,13 +25,13 @@ import { formatDate } from "@/lib/format";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { gql } from "@/lib/graphqlClient";
+import type { ApiKeyInfo } from "@/generated/graphql";
 import {
   useListApiKeysQuery,
   useCreateApiKeyMutation,
   useRevokeApiKeyMutation,
   useRotateApiKeyMutation,
   useDeleteApiKeyMutation,
-  ApiKeyInfo,
 } from "@/generated/graphql";
 
 const LIST_API_KEYS = gql`

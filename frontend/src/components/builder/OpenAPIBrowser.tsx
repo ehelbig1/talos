@@ -1,10 +1,8 @@
 import React, { useState } from "react";
-import {
-  discoverOpenAPISpec,
-  parseOpenAPIEndpoints,
-  OpenAPISpec,
-} from "@/lib/openapi";
-import { EndpointSelector, Endpoint } from "./EndpointSelector";
+import type { OpenAPISpec } from "@/lib/openapi";
+import { discoverOpenAPISpec, parseOpenAPIEndpoints } from "@/lib/openapi";
+import type { Endpoint } from "./EndpointSelector";
+import { EndpointSelector } from "./EndpointSelector";
 import {
   Search,
   X,

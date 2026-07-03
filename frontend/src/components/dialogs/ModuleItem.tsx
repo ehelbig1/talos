@@ -1,5 +1,5 @@
 import React from "react";
-import { WasmModule } from "@/hooks/useAddExistingNode";
+import type { WasmModule } from "@/hooks/useAddExistingNode";
 import { darkSurface, darkerSurface, cardStyle } from "@/components/ui/styles";
 import { Badge } from "@/components/ui/badge";
 import { formatSize, formatDate } from "@/lib/format";

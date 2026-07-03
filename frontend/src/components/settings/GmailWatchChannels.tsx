@@ -9,12 +9,12 @@
  */
 
 import React, { useEffect, useState } from "react";
+import type { QueryKey } from "@tanstack/react-query";
 import {
   useQuery,
   useMutation,
   useQueryClient,
   useIsFetching,
-  QueryKey,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {

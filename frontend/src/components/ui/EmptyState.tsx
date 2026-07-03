@@ -1,6 +1,7 @@
 import React from "react";
 import { cn } from "@/lib/utils";
-import { LucideIcon, Inbox } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import { Inbox } from "lucide-react";
 import { Button } from "./button";
 
 interface EmptyStatePropsWithChildren {

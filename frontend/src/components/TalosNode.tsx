@@ -1,10 +1,8 @@
 import React, { useState, useMemo } from "react";
 import { Handle, Position } from "@xyflow/react";
 import type { NodeProps, Node } from "@xyflow/react";
-import {
-  useEphemeralExecutionStore,
-  NodeStatusType,
-} from "@/store/executionStore";
+import type { NodeStatusType } from "@/store/executionStore";
+import { useEphemeralExecutionStore } from "@/store/executionStore";
 import {
   Timer,
   CheckCircle2,

@@ -2,11 +2,13 @@ import React from "react";
 import { sanitizeErrorMessage } from "../lib/sanitize";
 import { useQuery } from "@tanstack/react-query";
 import { gql } from "../lib/graphqlClient";
+import type {
+  GetModuleExecutionHistoryQuery,
+  GetModuleExecutionLogsQuery,
+} from "../generated/graphql";
 import {
   useGetModuleExecutionHistoryQuery,
   useGetModuleExecutionLogsQuery,
-  GetModuleExecutionHistoryQuery,
-  GetModuleExecutionLogsQuery,
 } from "../generated/graphql";
 import { formatDistanceToNow } from "date-fns";
 import {

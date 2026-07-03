@@ -1,5 +1,6 @@
 import { sanitizeErrorMessage } from "@/lib/sanitize";
-import React, { Component, ReactNode } from "react";
+import type { ReactNode } from "react";
+import React, { Component } from "react";
 
 export default class ErrorBoundary extends Component<
   { children: ReactNode; fallback?: ReactNode | ((error: Error) => ReactNode) },

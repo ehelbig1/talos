@@ -23,10 +23,10 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { gql } from "@/lib/graphqlClient";
 import { getOAuthLoginUrl } from "@/lib/graphqlApi";
 import { validateOAuthUrl, loadOAuthHosts } from "@/lib/oauthUtils";
+import type { ListLinkedAccountsQuery } from "@/generated/graphql";
 import {
   useListLinkedAccountsQuery,
   useUnlinkOAuthMutation,
-  ListLinkedAccountsQuery,
 } from "@/generated/graphql";
 
 const LIST_LINKED_ACCOUNTS = gql`

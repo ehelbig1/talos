@@ -1,5 +1,5 @@
 import React from "react";
-import { NodeStatusType } from "@/store/executionStore";
+import type { NodeStatusType } from "@/store/executionStore";
 
 export const STATUS_BORDER: Record<NodeStatusType, string> = {
   idle: "border-l-muted-foreground/30",

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { useWorkflowStore } from "./workflowStore";
-import { Connection } from "@xyflow/react";
+import type { Connection } from "@xyflow/react";
 
 describe("workflowStore", () => {
   beforeEach(() => {

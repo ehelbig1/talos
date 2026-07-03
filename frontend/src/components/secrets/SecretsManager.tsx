@@ -2,12 +2,12 @@ import React, { useState } from "react";
 import { Card } from "@/components/ui/card";
 import { useQueryClient } from "@tanstack/react-query";
 import { gql } from "@/lib/graphqlClient";
+import type { Secret } from "@/generated/graphql";
 import {
   useGetSecretsQuery,
   useDeleteSecretMutation,
   useRotateEncryptionKeyMutation,
   useUpdateSecretMutation,
-  Secret,
 } from "@/generated/graphql";
 import { cn } from "@/lib/utils";
 import { CreateSecretDialog } from "./CreateSecretDialog";

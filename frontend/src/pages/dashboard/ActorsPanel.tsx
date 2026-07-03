@@ -1,5 +1,6 @@
 import { useNavigate } from "react-router-dom";
-import { useListActorsQuery, ListActorsQuery } from "@/generated/graphql";
+import type { ListActorsQuery } from "@/generated/graphql";
+import { useListActorsQuery } from "@/generated/graphql";
 import { Bot, Zap, ArrowRight } from "lucide-react";
 
 export default function ActorsPanel() {

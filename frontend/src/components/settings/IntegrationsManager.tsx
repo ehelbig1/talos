@@ -29,11 +29,13 @@ import { cn } from "@/lib/utils";
 import { GoogleCalendarWatchChannels } from "./GoogleCalendarWatchChannels";
 import { GmailWatchChannels } from "./GmailWatchChannels";
 
-import {
+import type {
   IntegrationService,
+  ServiceIntegration as GqlServiceIntegration,
+} from "@/lib/graphqlApi";
+import {
   listServiceIntegrations,
   disconnectServiceIntegration,
-  ServiceIntegration as GqlServiceIntegration,
 } from "@/lib/graphqlApi";
 
 function authedFetch(

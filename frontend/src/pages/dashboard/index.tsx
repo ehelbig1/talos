@@ -11,6 +11,12 @@ const WorkflowVersionsPanel = lazy(
 );
 import { gql, subscribeWorkflowExecutions } from "@/lib/graphqlClient";
 import { useEffect, useCallback } from "react";
+import type {
+  WorkflowsQuery,
+  ListActorsQuery,
+  LatestWorkflowExecutionsQuery,
+  MySchedulesQuery,
+} from "@/generated/graphql";
 import {
   useListActorsQuery,
   useWorkflowsQuery,
@@ -19,10 +25,6 @@ import {
   useDeleteWorkflowMutation,
   useGetApprovalsQuery,
   useMySchedulesQuery,
-  WorkflowsQuery,
-  ListActorsQuery,
-  LatestWorkflowExecutionsQuery,
-  MySchedulesQuery,
 } from "@/generated/graphql";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { ConfirmDialog, SkeletonStatRow } from "@/components/ui";

@@ -1,9 +1,11 @@
 import { graphqlRequest, gql } from "./graphqlClient";
+import type {
+  GetWorkflowLoaderQuery,
+  GetModulesLoaderQuery,
+} from "@/generated/graphql";
 import {
   GetWorkflowLoaderDocument,
   GetModulesLoaderDocument,
-  GetWorkflowLoaderQuery,
-  GetModulesLoaderQuery,
 } from "@/generated/graphql";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { sanitizeErrorMessage } from "@/lib/sanitize";

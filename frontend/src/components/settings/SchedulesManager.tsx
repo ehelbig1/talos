@@ -25,13 +25,13 @@ import { formatDate } from "@/lib/format";
 import { relativeTime } from "@/lib/formatTime";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
+import type { WorkflowScheduleObj } from "@/generated/graphql";
 import {
   useMySchedulesQuery,
   useCreateScheduleMutation,
   useUpdateScheduleMutation,
   useDeleteScheduleMutation,
   useWorkflowsQuery,
-  WorkflowScheduleObj,
 } from "@/generated/graphql";
 
 // ─── Cron examples ────────────────────────────────────────────────────────────

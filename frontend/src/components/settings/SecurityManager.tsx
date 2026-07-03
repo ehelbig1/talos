@@ -21,14 +21,16 @@ import {
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { toast } from "sonner";
+import type {
+  DekRotationResult,
+  ReEncryptionResult,
+  MasterKeyRotationResult,
+} from "@/generated/graphql";
 import {
   useRotateDekMutation,
   useReEncryptSecretsMutation,
   useRotateMasterKeyMutation,
   useRotateEncryptionKeyMutation,
-  DekRotationResult,
-  ReEncryptionResult,
-  MasterKeyRotationResult,
 } from "@/generated/graphql";
 
 // ─── Sub-types for result state ───────────────────────────────────────────────
