@@ -3468,8 +3468,10 @@ echo
 # `.try_get("col").map_err(|e| …context…)?` that names the column — and
 # lower the baseline. New silent reads fail the lint.
 bold "▶ check 52: silent try_get().unwrap_or reads in repository crates (ratchet — count must not grow)"
-# 526 at introduction (2026-07-03 codebase review).
-TALOS_REPO_SILENT_READ_BASELINE=526
+# 526 at introduction (2026-07-03 codebase review); 524 after the
+# execution-output AEAD-format/id reads were made fail-loud (the highest-risk
+# sites — a silent v0 there = silent decryption failure / data loss).
+TALOS_REPO_SILENT_READ_BASELINE=524
 REPO_SILENT_READ_COUNT="$(grep -rEc '\.try_get\([^)]*\)\.unwrap_or' \
         --include='*.rs' \
         talos-*-repository 2>/dev/null \

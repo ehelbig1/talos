@@ -533,13 +533,37 @@ impl ExecutionRepository {
     async fn read_output_from_row(&self, row: &sqlx::postgres::PgRow) -> Option<serde_json::Value> {
         let enc_bytes: Option<Vec<u8>> = row.try_get("output_data_enc").unwrap_or(None);
         let enc_key_id: Option<Uuid> = row.try_get("output_enc_key_id").unwrap_or(None);
-        // try_get for the AAD format column: if the SELECT didn't
-        // include it (legacy caller), default to v0. Same for `id`.
-        let format_version: i16 = row.try_get("output_data_format").unwrap_or(0);
-        let exec_id: Uuid = row.try_get("id").unwrap_or(Uuid::nil());
 
         if let (Some(bytes), Some(key_id)) = (enc_bytes, enc_key_id) {
-            // Encrypted row — decrypt or fail. Do NOT fall back to plaintext.
+            // Encrypted row — the AAD format version and row `id` are
+            // load-bearing for AEAD dispatch. MCP-S2 twin of lint check 34:
+            // a MISSING/renamed `output_data_format` column must NOT silently
+            // default to v0 here (that would dispatch the wrong AAD and fail
+            // decryption on a v3/v4 row → silent data loss). The contract above
+            // requires callers to SELECT `id` + `output_data_format`; enforce
+            // it by failing loud (return None + error log) instead of guessing.
+            let format_version: i16 = match row.try_get("output_data_format") {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(
+                        err = ?e,
+                        "output_data_format unreadable for an encrypted row — cannot dispatch AEAD; \
+                         returning None (caller must SELECT output_data_format)"
+                    );
+                    return None;
+                }
+            };
+            let exec_id: Uuid = match row.try_get("id") {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(
+                        err = ?e,
+                        "row id unreadable for an encrypted row — cannot supply AEAD AAD; returning None"
+                    );
+                    return None;
+                }
+            };
+            // Decrypt or fail. Do NOT fall back to plaintext.
             match self
                 .decrypt_output(exec_id, key_id, &bytes, format_version)
                 .await

@@ -8,87 +8,91 @@ that must be completed in a compile-capable, integration-testable environment.
 
 | # | Finding | Status |
 |---|---------|--------|
-| 1 | Single fleet-wide `WORKER_SHARED_KEY` roots all signing → sandbox escape = cross-tenant forgery | **Primitive landed**, wiring specified below |
+| 1 | Single fleet-wide `WORKER_SHARED_KEY` roots all signing → sandbox escape = cross-tenant forgery | **Reclassified** — per-worker HMAC does NOT fix this (see corrected analysis); genuine fix is an asymmetric-crypto RFC. HKDF primitive kept as a building block only |
 | 2 | Process-local replay caches → replay across HA replicas | **Design specified below** |
 | 3 | RLS shipped OFF by default | **Done** — `talos_db::enforce_production_rls_posture` fail-closes prod boot (opt-out `TALOS_ALLOW_RLS_DISABLED=1`) |
-| 4 | Silent `try_get().unwrap_or()` masks schema drift | **Done** — structural-lint ratchet (check 52), baseline 526, may only go down |
+| 4 | Silent `try_get().unwrap_or()` masks schema drift | **Done** — structural-lint ratchet (check 52); highest-risk AEAD-format/id reads made fail-loud in `talos-execution-repository` + `talos-module-executions`; baseline lowered 526→524 |
 | 5 | Aspiration-vs-reality doc gaps | **Done** — LLM-provider docs corrected (`llm_tier.rs`, `provider_tier`); sub-workflow-checkpoint and raw-socket `allowed_hosts` caveats documented in code; stale `update_protocol.py` deleted |
 
-Items 3–5 are committed. Items 1–2 change the signed data plane — the area
-`CLAUDE.md` flags as total-outage-prone (r300/r301) — so they must land with
-`cargo check`/`cargo test` green AND an integration run against live NATS
-(+ Redis for #2), which the review sandbox could not provide (crates.io is
-proxy-blocked there, so nothing compiles). What is landed now is the safe,
+Items 3–5 are committed. Item 1 is **reclassified as an RFC-scale asymmetric
+redesign** (a quick per-worker-key wire-up was found to be security theater under
+symmetric HMAC — see the corrected Finding #1). Item 2 (distributed nonce) is a
+genuine, tractable fix whose design is below; it changes the signed data-plane
+verify path — the area `CLAUDE.md` flags as total-outage-prone (r300/r301) — so it
+must land with `cargo check`/`cargo test` green AND an integration run against
+live NATS + Redis. What is landed now is the safe,
 additive foundation for #1.
 
 ---
 
-## Finding #1 — Per-worker derived signing keys
+## Finding #1 — Single fleet-wide worker key (CORRECTED: needs asymmetric crypto)
 
-### What's landed (additive, zero behavior change)
+> **Correction (2026-07-03, verified against the code).** An earlier draft of
+> this doc proposed per-worker HKDF *signing* keys as the fix and described a
+> wiring plan. **That plan does not actually reduce the blast radius of a worker
+> compromise under the current symmetric-HMAC architecture, and should not be
+> shipped as a fix.** The analysis below supersedes it. The HKDF primitive that
+> did land (`derive_worker_signing_key`) is kept only as a building block for the
+> asymmetric redesign — it is not, on its own, a mitigation.
 
-`talos_workflow_job_protocol::derive_worker_signing_key(root, worker_id)` —
-`HKDF-SHA256(ikm = root, salt = "talos/worker-shared-key/per-worker-signing/v1",
-info = worker_id)`, domain-separated from every envelope-AEAD subkey. Six unit
-tests pin determinism, per-`worker_id` distinctness, per-root distinctness,
-envelope-key domain separation, label stability, and empty-id definedness. No
-existing sign/verify path calls it yet.
+### Why HKDF-per-worker signing keys don't help here
 
-### The threat it closes
+The worker holds the fleet root (`WORKER_SHARED_KEY`, loaded as a
+`WorkerKeyRing` in `worker/src/main.rs:1050`) because it needs it for three
+things a compromise cannot avoid:
 
-Today a worker signs with the raw root, and `JobResult.worker_id` is
-self-reported (`worker/src/worker_identity.rs:31` — *"any process holding
-`WORKER_SHARED_KEY` can sign as any `worker_id`"*). A wasmtime sandbox escape
-extracts the root from worker memory → the attacker forges signed RPC for any
-`actor_id`/tenant and decrypts any job envelope. The fix makes each worker hold
-**only its own derived key**, never the root.
+1. **Verify the controller's `JobRequest`** — symmetric HMAC (`verify_with_ring`,
+   `worker/src/main.rs:543`). With HMAC, the ability to *verify* is the ability
+   to *forge*: any key the worker can check controller messages with, it can also
+   mint controller messages with.
+2. **Decrypt the per-job secret envelope** — the AES key is HKDF-derived from the
+   same root (`decrypt_with_ring`, `worker/src/main.rs:600`).
+3. **Sign `JobResult` and all memory/graph/database/state RPC** — also the root
+   (`worker/src/main.rs:359`; `talos-memory/src/rpc_auth.rs:5` states plainly it
+   uses "the same `WORKER_SHARED_KEY`").
 
-### Wiring plan (must be compiled + integration-tested)
+So a wasmtime sandbox escape recovers the root regardless of how `JobResult` is
+signed. Once the attacker has the root they can derive **any** worker's HKDF
+signing key at will, so per-worker signing keys add nothing. Deriving JobResult
+signing per-worker while the worker still holds the root for (1) and (2) is
+security theater: it changes the wire format without moving the trust boundary.
 
-1. **Signature-scheme discriminant.** Add a `sig_scheme: u8` field (`#[serde(default)]`
-   → 0) to `JobResult` and `PipelineJobResult`, appended at the END of each
-   `signing_payload()` per the wire-format-stability rule. `0` = root-direct
-   (legacy), `1` = per-worker-derived. Bind it into the HMAC so it can't be
-   downgraded on the wire.
-2. **Worker sign path.** `sign_with_worker_id` selects the key:
-   - If a derived key was provisioned (see step 4), sign with it and set
-     `sig_scheme = 1`.
-   - Else derive from the root in-process (transitional) and set `sig_scheme = 1`.
-   - The bare `sign()` back-compat wrapper stays `sig_scheme = 0` for test fixtures.
-3. **Controller verify path.** In `verify_*_core`, branch on `sig_scheme`:
-   - `1` → `key = derive_worker_signing_key(root_or_ring_member, self.worker_id)`,
-     then the existing HMAC+freshness+replay logic against that derived key.
-     Reject empty `worker_id` under scheme 1 (an empty id is not a real worker).
-   - `0` → today's root-direct verification, but gate acceptance behind
-     `TALOS_ACCEPT_LEGACY_ROOT_SIG` (default ON during rollout). The key-ring
-     variants (`verify_with_ring`) derive per ring member so rotation composes.
-4. **Provisioning (the part that actually reduces blast radius).** A worker must
-   run with its derived key and NOT the root. Options, cheapest first:
-   - Env `TALOS_WORKER_DERIVED_KEY` (hex) injected per-pod by an init container
-     that calls a controller endpoint `POST /internal/worker-key` (mTLS-authed,
-     in-cluster only, NetworkPolicy-restricted) returning
-     `derive_worker_signing_key(root, pod_name)`. The controller holds the root;
-     the worker Deployment stops mounting `WORKER_SHARED_KEY`.
-   - Until provisioning is deployed, the worker derives from the root in-process
-     (step 2 fallback): the wire format and verify path are already correct, so
-     provisioning becomes a pure ops change with no code churn.
-5. **Enforcement flip.** Once all workers run scheme 1 with provisioned keys, set
-   `TALOS_ACCEPT_LEGACY_ROOT_SIG=0` so root-direct signatures are refused —
-   closing the forge path. Mirror the env-KEK/RLS guard style: loud SIEM log when
-   a legacy signature is accepted during the window.
-6. **RPC layer parity.** Apply the same scheme to `talos_memory::rpc_auth` (the
-   memory/graph/database/state RPCs share the root). Same discriminant approach;
-   `actor_id` is already host-supplied (not guest-controllable), so the RPC side
-   binds the derived key to the signing worker identically.
+### The genuine fix (asymmetric — RFC-scale, out of scope for a wire-up)
 
-### Test matrix
+The single-key blast radius can only be closed by removing root-equivalent
+material from the worker, which requires asymmetric crypto:
 
-Unit: sign-scheme-1 → verify-scheme-1 round-trip; scheme-1 signature from
-worker-A rejected when re-labeled worker-B; scheme-0 rejected when
-`TALOS_ACCEPT_LEGACY_ROOT_SIG=0`; ring rotation across derived keys; empty
-worker_id rejected under scheme 1. Integration: a real worker pod signing a
-`JobResult` over NATS and the controller verifying it end-to-end, plus the
-crash-recovery resume path (which re-stamps tier) still verifying.
+- **Controller→worker (`JobRequest`):** replace HMAC with an Ed25519 signature.
+  The controller holds the private key; workers hold only the controller's
+  **public** key, so a compromised worker can verify JobRequests but cannot forge
+  them. This alone closes the JobRequest-forgery half.
+- **Worker→controller (`JobResult`, RPC):** each worker gets its own Ed25519
+  keypair; the controller registers worker public keys. The worker signs with its
+  private key; a compromise lets it sign only as itself. (This is where the landed
+  HKDF primitive could instead become per-worker keypair *derivation* if a
+  symmetric root-of-trust for provisioning is retained.)
+- **Secret envelope:** the hard part. The worker must decrypt secrets without
+  holding a fleet-wide decryption key. Options: seal each envelope to the
+  dequeuing worker's X25519 public key (requires dispatching to a *known* worker,
+  losing NATS queue-group load-balancing), or a per-execution ephemeral-key
+  scheme. Needs a design spike; this is the piece that makes it RFC-scale rather
+  than a patch.
+
+**Recommended next step:** open an RFC (`docs/rfcs/`) for an asymmetric
+worker-trust boundary covering the three directions above, the key-distribution /
+registration model, wire-format versioning, and a staged rollout. Until then,
+finding #1 is best treated as a **known, documented residual risk** whose actual
+mitigations today are the WASM sandbox itself (fuel/epoch/memory limits, proposal
+lockdown, per-tier linkers) keeping native-code escape hard, plus the tier-1
+data-egress gate — not the per-worker HMAC scheme.
+
+### What remains landed
+
+`talos_workflow_job_protocol::derive_worker_signing_key(root, worker_id)` +
+its six unit tests stay in the tree as a **building block** (a domain-separated
+per-identity KDF) for the eventual asymmetric scheme. Its doc comment already
+states it is a primitive, not a wired fix. No sign/verify path calls it, so it is
+inert and harmless.
 
 ---
 

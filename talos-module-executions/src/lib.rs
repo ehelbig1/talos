@@ -906,7 +906,20 @@ impl ModuleExecutionService {
         let enc_input: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
         let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
         let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
-        let payload_format: i16 = r.try_get("payload_format").unwrap_or(0);
+        // Fail loud: payload_format drives AEAD dispatch. Defaulting to v0 is
+        // only safe when the row carries NO encrypted payload; with ciphertext
+        // present a silent v0 dispatches the wrong AAD and fails decryption on a
+        // v3/v4 row (MCP-S2 / lint-check-34 twin).
+        let payload_format: i16 = match r.try_get("payload_format") {
+            Ok(v) => v,
+            Err(e) if enc_trigger.is_some() || enc_input.is_some() || enc_output.is_some() => {
+                return Err(anyhow::anyhow!(
+                    "payload_format unreadable for an encrypted module-execution row — cannot \
+                     dispatch AEAD (caller must SELECT payload_format): {e}"
+                ));
+            }
+            Err(_) => 0,
+        };
         use talos_module_payload_encryption::PayloadSlot;
         let trigger_metadata = self
             .read_payload(
@@ -1006,7 +1019,18 @@ impl ModuleExecutionService {
             let enc_input: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
             let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
             let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
-            let payload_format: i16 = r.try_get("payload_format").unwrap_or(0);
+            // Fail loud (same rule as the single-row path): payload_format is
+            // load-bearing for AEAD dispatch when ciphertext is present.
+            let payload_format: i16 = match r.try_get("payload_format") {
+                Ok(v) => v,
+                Err(e) if enc_trigger.is_some() || enc_input.is_some() || enc_output.is_some() => {
+                    return Err(anyhow::anyhow!(
+                        "payload_format unreadable for an encrypted module-execution row — cannot \
+                         dispatch AEAD (caller must SELECT payload_format): {e}"
+                    ));
+                }
+                Err(_) => 0,
+            };
             use talos_module_payload_encryption::PayloadSlot;
             let trigger_metadata = self
                 .read_payload(

@@ -85,31 +85,25 @@ const WORKER_SIGNING_KEY_LABEL: &[u8] = b"talos/worker-shared-key/per-worker-sig
 ///
 /// `key = HKDF-SHA256(ikm = root, salt = WORKER_SIGNING_KEY_LABEL, info = worker_id)`
 ///
-/// # Why this exists
+/// # Status: building block only — NOT a standalone mitigation
 ///
-/// Today every worker signs `JobResult`/RPC with the raw shared root, so any
-/// process holding the root can forge a signature for *any* `worker_id` — the
-/// `worker_id` in the payload is self-reported and only forensic (see
-/// [`JobResult::worker_id`]). This primitive is the cryptographic half of the
-/// fix: when a worker is provisioned with ONLY its derived key (never the root),
-/// a compromise of that worker can produce valid signatures for its own
-/// `worker_id` alone. To sign as worker-B an attacker would need worker-B's
-/// derived key, which requires the root the compromised worker never held.
+/// This is a domain-separated per-identity KDF, kept as a foundation for a
+/// future asymmetric worker-trust redesign. It is **inert** (no sign/verify path
+/// calls it) and, on its own, does **not** reduce the blast radius of a worker
+/// compromise.
 ///
-/// The controller — which does hold the root — re-derives the same key from the
-/// `worker_id` claimed in the message and verifies against it, so no per-worker
-/// key registry is needed on the verify side.
-///
-/// # Status: primitive only (not yet wired)
-///
-/// This function is deliberately additive and changes NO existing signing or
-/// verification path. Wiring it into the live sign/verify flow (a signature
-/// scheme byte, worker-side derived-key provisioning, controller-side
-/// derive-from-claimed-id verification, and the transitional back-compat that
-/// still accepts root-direct signatures during rollout) is a multi-file change
-/// that must be compiled and integration-tested against live NATS before it can
-/// ship — see `docs/reviews/security-hardening-followups-2026-07-03.md`. The
-/// primitive lands first so the derivation contract is fixed and unit-tested.
+/// Why not: under the current *symmetric*-HMAC architecture the worker must hold
+/// the fleet root anyway — to verify the controller's `JobRequest` (with HMAC,
+/// verify-capability == forge-capability) and to decrypt the per-job secret
+/// envelope. A wasmtime sandbox escape therefore recovers the root regardless of
+/// how `JobResult` is signed, and with the root the attacker can derive *any*
+/// worker's key from this very function. Signing `JobResult` per-worker while the
+/// root is still resident is security theater. The genuine fix removes
+/// root-equivalent material from the worker, which requires asymmetric crypto
+/// (Ed25519 for controller→worker verification; per-worker keypairs for
+/// worker→controller; an ECIES/per-execution scheme for the secret envelope).
+/// See `docs/reviews/security-hardening-followups-2026-07-03.md` (corrected
+/// Finding #1) for the analysis and the RFC-scoped plan.
 ///
 /// Pure and deterministic: worker (sign) and controller (verify) derive it
 /// identically. `worker_id` should already be [`validate_worker_id`]-clean at
