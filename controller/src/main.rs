@@ -594,6 +594,13 @@ async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>> {
     // into a no-op. One catalog lookup, non-blocking.
     let _rls_role_status = talos_db::warn_if_rls_will_be_bypassed(&db_pool).await;
 
+    // RFC 0004 / RFC 0005 S3 production fail-closed posture. In production,
+    // refuse to boot if tenant-isolation RLS would silently be a no-op —
+    // unless the operator explicitly acknowledges the weaker posture via
+    // TALOS_ALLOW_RLS_DISABLED=1. Mirrors the env-KEK production guard
+    // (`prod-kek-guard`). No-op outside production, so dev/test is unaffected.
+    talos_db::enforce_production_rls_posture(&db_pool, config::is_production()).await?;
+
     {
         let migrate_start = std::time::Instant::now();
         match sqlx::migrate!("../migrations").run(&db_pool).await {

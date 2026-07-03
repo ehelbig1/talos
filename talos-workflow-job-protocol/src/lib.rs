@@ -74,6 +74,54 @@ fn envelope_seal_key(root: &[u8], aad: &[u8]) -> [u8; 32] {
     }
 }
 
+/// HKDF-SHA256 `info` label for the per-worker HMAC signing subkey (codebase
+/// review 2026-07-03, item #1). Distinct from the envelope-AEAD labels so the
+/// signing subkey is domain-separated from every encryption subkey derived from
+/// the same `WORKER_SHARED_KEY` root.
+const WORKER_SIGNING_KEY_LABEL: &[u8] = b"talos/worker-shared-key/per-worker-signing/v1";
+
+/// Derive a **per-worker** HMAC signing subkey from the fleet root
+/// (`WORKER_SHARED_KEY`) bound to a specific `worker_id`.
+///
+/// `key = HKDF-SHA256(ikm = root, salt = WORKER_SIGNING_KEY_LABEL, info = worker_id)`
+///
+/// # Why this exists
+///
+/// Today every worker signs `JobResult`/RPC with the raw shared root, so any
+/// process holding the root can forge a signature for *any* `worker_id` — the
+/// `worker_id` in the payload is self-reported and only forensic (see
+/// [`JobResult::worker_id`]). This primitive is the cryptographic half of the
+/// fix: when a worker is provisioned with ONLY its derived key (never the root),
+/// a compromise of that worker can produce valid signatures for its own
+/// `worker_id` alone. To sign as worker-B an attacker would need worker-B's
+/// derived key, which requires the root the compromised worker never held.
+///
+/// The controller — which does hold the root — re-derives the same key from the
+/// `worker_id` claimed in the message and verifies against it, so no per-worker
+/// key registry is needed on the verify side.
+///
+/// # Status: primitive only (not yet wired)
+///
+/// This function is deliberately additive and changes NO existing signing or
+/// verification path. Wiring it into the live sign/verify flow (a signature
+/// scheme byte, worker-side derived-key provisioning, controller-side
+/// derive-from-claimed-id verification, and the transitional back-compat that
+/// still accepts root-direct signatures during rollout) is a multi-file change
+/// that must be compiled and integration-tested against live NATS before it can
+/// ship — see `docs/reviews/security-hardening-followups-2026-07-03.md`. The
+/// primitive lands first so the derivation contract is fixed and unit-tested.
+///
+/// Pure and deterministic: worker (sign) and controller (verify) derive it
+/// identically. `worker_id` should already be [`validate_worker_id`]-clean at
+/// the call site; the derivation itself is defined for any byte string.
+pub fn derive_worker_signing_key(root: &[u8], worker_id: &str) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(WORKER_SIGNING_KEY_LABEL), root);
+    let mut subkey = [0u8; 32];
+    hk.expand(worker_id.as_bytes(), &mut subkey)
+        .expect("HKDF-SHA256 expand to 32 bytes is always a valid length");
+    subkey
+}
+
 /// Length-prefix a variable-width string segment for a canonical signing
 /// payload: `"<byte-len>:<value>"`. Prefixing makes the boundary against the
 /// next segment unambiguous, so two adjacent free-form fields can't be shifted
@@ -536,6 +584,75 @@ fn default_priority() -> u8 {
     100
 }
 
+#[cfg(test)]
+mod per_worker_signing_key_tests {
+    use super::{derive_envelope_aead_key_v1, derive_worker_signing_key, WORKER_SIGNING_KEY_LABEL};
+
+    const ROOT: &[u8] = b"0123456789abcdef0123456789abcdef"; // 32 bytes
+
+    #[test]
+    fn deterministic_for_same_inputs() {
+        // Worker (sign) and controller (verify) must derive byte-identical keys.
+        assert_eq!(
+            derive_worker_signing_key(ROOT, "talos-worker-abc-12345"),
+            derive_worker_signing_key(ROOT, "talos-worker-abc-12345"),
+        );
+    }
+
+    #[test]
+    fn distinct_per_worker_id() {
+        // The whole point: worker-A's key cannot sign as worker-B. Different
+        // worker_id ⇒ different key, so a compromised worker holding only its
+        // own derived key can't forge worker-B's signatures.
+        let a = derive_worker_signing_key(ROOT, "worker-a");
+        let b = derive_worker_signing_key(ROOT, "worker-b");
+        assert_ne!(a, b, "distinct worker_ids must yield distinct signing keys");
+    }
+
+    #[test]
+    fn distinct_per_root() {
+        // A different fleet root ⇒ different key for the same worker_id.
+        let root2: &[u8] = b"ffffffffffffffffffffffffffffffff";
+        assert_ne!(
+            derive_worker_signing_key(ROOT, "worker-a"),
+            derive_worker_signing_key(root2, "worker-a"),
+        );
+    }
+
+    #[test]
+    fn domain_separated_from_envelope_key() {
+        // The signing subkey must not collide with the envelope-AEAD subkey
+        // derived from the same root — distinct HKDF labels guarantee it. A
+        // collision would let an envelope key be used as a signing key or vice
+        // versa. (Empty worker_id vs. the v1 envelope's no-info derivation is
+        // the closest-adjacent pair; assert they differ.)
+        assert_ne!(
+            derive_worker_signing_key(ROOT, ""),
+            derive_envelope_aead_key_v1(ROOT),
+        );
+    }
+
+    #[test]
+    fn label_is_stable() {
+        // The label is part of the wire contract: changing it silently breaks
+        // verification fleet-wide (worker signs under new label, controller
+        // verifies under old). Pin it so a bump is a deliberate, reviewed change.
+        assert_eq!(
+            WORKER_SIGNING_KEY_LABEL,
+            b"talos/worker-shared-key/per-worker-signing/v1"
+        );
+    }
+
+    #[test]
+    fn empty_worker_id_is_defined() {
+        // The back-compat `sign()` wrapper uses an empty worker_id; derivation
+        // must be well-defined (not panic) for it even though production uses a
+        // real id.
+        let k = derive_worker_signing_key(ROOT, "");
+        assert_eq!(k.len(), 32);
+    }
+}
+
 // ============================================================================
 // Reserved host vault paths — LLM provider API keys
 // ============================================================================
@@ -587,6 +704,11 @@ pub use talos_workflow_engine_core::LlmTier;
 /// (local). Unknown providers default to Tier 2 (treat as external
 /// until proven local) — fail-closed against future providers that
 /// haven't been classified yet.
+///
+/// NB: classification ≠ an implemented client. `talos-llm` currently ships
+/// Anthropic (Tier 2) and Ollama (Tier 1) clients only; OpenAI/Gemini are
+/// classified here (and in [`EXTERNAL_LLM_HOSTS`]) purely so the Tier-1 egress
+/// gate denies them ahead of any client existing.
 pub fn provider_tier(provider_name: &str) -> LlmTier {
     // The explicit Tier2 arm is intentional: it documents which
     // providers we have classified. Unknown providers also fall

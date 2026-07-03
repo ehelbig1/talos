@@ -3362,6 +3362,18 @@ impl ParallelWorkflowEngine {
     /// Returns `Ok(JsonValue)` with the collapsed output, or [`SubflowError`]
     /// which each caller converts into their own error envelope via
     /// [`SubflowError::into_error_envelope`].
+    ///
+    /// # Durability limitation (by design)
+    ///
+    /// The sub-engine built here is **not** given a `CheckpointStore`, so a
+    /// sub-workflow does not checkpoint its own progress. If the controller
+    /// crashes mid-sub-workflow, crash-recovery resumes the PARENT execution
+    /// from its last checkpoint and the sub-workflow re-runs from the start —
+    /// it is not resumed mid-flight the way a top-level execution is. This is
+    /// an intentional cost/complexity trade-off (per-sub-workflow durable state
+    /// would multiply checkpoint volume), but callers whose sub-workflows have
+    /// non-idempotent side effects must make those steps idempotent themselves;
+    /// the engine will not dedupe a re-run sub-workflow's effects.
     #[tracing::instrument(
         level = "info",
         name = "subworkflow",

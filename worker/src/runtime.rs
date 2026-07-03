@@ -2558,6 +2558,17 @@ impl TalosRuntime {
         // exfiltrate to any public IP over raw TCP. There is no legitimate tier-1
         // raw-socket use: local Ollama goes through the native `llm::*` path, and
         // loopback/private targets are SSRF-blocked regardless.
+        //
+        // CONTAINMENT CAVEAT (Tier-2 network/database/trusted worlds): when raw
+        // sockets ARE granted below, the per-module `allowed_hosts` list is NOT a
+        // containment boundary for that module — `allowed_hosts` is enforced only
+        // on the `talos:core/http` host-fn path, whereas raw `wasi:sockets` traffic
+        // is gated ONLY by the private-IP SSRF classifier. A Tier-2 module in these
+        // worlds can therefore reach any PUBLIC host over raw TCP regardless of its
+        // configured `allowed_hosts`. This is by design for the socket-capable
+        // worlds; operators who need host-level egress confinement for such a module
+        // must run it Tier-1 (raw sockets denied, forcing traffic through the
+        // host-fn allowlist) or not grant it a socket-capable world.
         let allow_wasi_network =
             matches!(
                 cap,
