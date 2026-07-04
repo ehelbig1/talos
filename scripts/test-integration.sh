@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Run the env-gated integration tests against disposable Redis + Postgres, then
-# tear the datastores down. These tests no-op under a plain `cargo test`
+# Run the env-gated integration tests against disposable Redis + Postgres + NATS,
+# then tear the datastores down. These tests no-op under a plain `cargo test`
 # (they return early unless TALOS_TEST_*_URL is set), so without this target
-# they never actually run.
+# they never actually run. NATS backs the RFC 0010 P3 (D3b) envelope-sealing
+# claim-protocol tests (the full dispatch→claim→seal→open loop over a real broker).
 #
 # Two Postgres databases are provisioned on one pgvector instance:
 #   * `talos`    — the FULL migrated schema (`sqlx migrate run`), for tests that
@@ -19,13 +20,15 @@ set -euo pipefail
 
 REDIS_PORT="${TALOS_IT_REDIS_PORT:-16399}"
 PG_PORT="${TALOS_IT_PG_PORT:-15435}"
+NATS_PORT="${TALOS_IT_NATS_PORT:-14222}"
 REDIS_NAME="talos-it-redis"
 PG_NAME="talos-it-pgvector"
+NATS_NAME="talos-it-nats"
 PG_USER="postgres"
 PG_PASS="test"
 
 cleanup() {
-    docker rm -f "$REDIS_NAME" "$PG_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$REDIS_NAME" "$PG_NAME" "$NATS_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 cleanup # remove any stale containers from a previous interrupted run
@@ -33,11 +36,14 @@ cleanup # remove any stale containers from a previous interrupted run
 command -v sqlx >/dev/null 2>&1 \
     || { echo "✗ sqlx-cli missing — install: cargo install sqlx-cli --locked"; exit 1; }
 
-echo "▶ starting disposable Redis + pgvector…"
+echo "▶ starting disposable Redis + pgvector + NATS…"
 docker run -d --rm --name "$REDIS_NAME" -p "${REDIS_PORT}:6379" redis:7-alpine >/dev/null
 docker run -d --rm --name "$PG_NAME" \
     -e "POSTGRES_USER=${PG_USER}" -e "POSTGRES_PASSWORD=${PG_PASS}" -e POSTGRES_DB=talos \
     -p "${PG_PORT}:5432" pgvector/pgvector:pg17 >/dev/null
+# NATS for the RFC 0010 P3 (D3b) claim-protocol integration tests (envelope-seal
+# responder↔worker handshake + the engine-nats full dispatch→claim→open loop).
+docker run -d --rm --name "$NATS_NAME" -p "${NATS_PORT}:4222" nats:2.10-alpine >/dev/null
 
 echo "▶ waiting for Postgres…"
 for _ in $(seq 1 60); do
@@ -63,6 +69,7 @@ docker exec "$PG_NAME" psql -U "$PG_USER" -d talos -c "CREATE DATABASE talos_ctl
 DATABASE_URL="$CTL_URL" sqlx migrate run --source migrations >/dev/null
 
 export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
+export TALOS_TEST_NATS_URL="nats://127.0.0.1:${NATS_PORT}"
 
 # crate : integration-test-binary : datastore (redis | migrated | selfcontained)
 TESTS=(
@@ -96,6 +103,25 @@ for entry in "${TESTS[@]}"; do
         rc=1
     fi
 done
+
+# ── RFC 0010 P3 (D3b) envelope-sealing claim protocol ───────────────────────
+# These are gated on TALOS_TEST_NATS_URL / TALOS_TEST_REDIS_URL (exported above)
+# and no-op under a plain `cargo test`. They exercise the claim protocol against
+# a REAL broker: the crypto seal/open, the Redis lease CAS, the responder↔worker
+# handshake, and the FULL dispatch→claim→seal→open loop through the real
+# NatsNodeDispatcher (asserting no plaintext ever crosses the wire).
+#   * `talos-envelope-seal`      — lib (RedisLease CAS) + `nats_claim_integration`
+#   * `talos-workflow-engine-nats` — the `full_claim_loop_over_live_nats` lib test
+echo
+echo "▶ RFC 0010 P3 claim protocol :: talos-envelope-seal  [nats + redis]"
+if ! cargo test -p talos-envelope-seal; then
+    rc=1
+fi
+echo
+echo "▶ RFC 0010 P3 claim protocol :: talos-workflow-engine-nats full loop  [nats]"
+if ! cargo test -p talos-workflow-engine-nats --lib full_claim_loop; then
+    rc=1
+fi
 
 # ── Controller DB-harness binaries ──────────────────────────────────────────
 # These predate the TALOS_TEST_DATABASE_URL convention: they read DATABASE_URL
