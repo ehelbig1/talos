@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn mode_from_env_parsing() {
         // Default (unset) is Off; parsing is case-insensitive.
-        assert_eq!(EnvelopeSealingMode::Off.seals_claim_based(), false);
+        assert!(!EnvelopeSealingMode::Off.seals_claim_based());
         assert!(EnvelopeSealingMode::Audit.seals_claim_based());
         assert!(EnvelopeSealingMode::Required.seals_claim_based());
         assert!(EnvelopeSealingMode::Required.refuses_inline());

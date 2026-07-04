@@ -1,6 +1,8 @@
 # RFC 0010 — Asymmetric worker-trust boundary
 
-**Status:** In progress — P1 + P2 (inc.1–3) landed; D3b chosen for P3 (spec below)
+**Status:** In progress — P1 + P2 (inc.1–4) landed; P3 (D3b) crypto core + claim
+service + worker client + responder landed & tested, dispatch-loop wiring remains
+(see the P3-status note below)
 **Author:** Codebase review follow-up
 **Date:** 2026-07-03
 
@@ -257,6 +259,62 @@ envelope deploy-ordering rule).
   [P3 detailed design](#p3-detailed-design--d3b-claimlease-envelope-sealing) below.
   Gradual per-worker rollout depends on the P2 inc.4 `worker_identities`
   capability bit; an all-at-once fleet flip does not (see the rollout subsection).
+  >
+  > **P3 status (2026-07-04) — building blocks landed + tested, dispatch-loop
+  > wiring is the remaining increment.** Everything that can be built and tested
+  > without a live controller+worker+NATS+Redis cluster is done and green:
+  > - **Crypto core** (`talos-workflow-job-protocol::envelope_seal`): `seal_secrets`
+  >   / `WorkerEphemeral::open` (ephemeral-ephemeral X25519 → HKDF-SHA256(salt=
+  >   exec_id) → AES-256-GCM, AAD = `exec_id||lp(worker_id)||epk_w`, non-contributory
+  >   rejection, zeroize), and the `SecretClaim` / `SealedSecrets` / `ClaimResponse`
+  >   signed wire types. 12 unit tests.
+  > - **Wire fields**: `JobRequest`/`PipelineJobRequest` gained `sealing` +
+  >   `secret_paths`; `JobRequest` gained `claim_inbox`. All bound into
+  >   `signing_payload` only when `sealing != 0` and `skip_serializing_if`-omitted
+  >   when default, so a legacy message is **byte-identical** on the wire AND in
+  >   the signing payload (proven by the unchanged wire snapshots).
+  > - **Controller claim service** (new crate `talos-envelope-seal`):
+  >   `EnvelopeSealingMode` (off/audit/required), `InFlightSeals` (atomic-`take`
+  >   single-claim), `handle_secret_claim` (authenticate via the P2 registry →
+  >   take → seal), `RedisLease` (Lua-CAS durability), and `run_claim_responder`
+  >   (the single primary `verify()` caller, per the r300/r301 rule). 7 unit tests
+  >   + a live-Redis lease CAS test (validated).
+  > - **Worker claim client** (`worker::secret_claim`): `build_claim` /
+  >   `process_reply` (fail-closed, forward-secret) + the `claim_secrets` NATS
+  >   wrapper. 3 unit tests (roundtrip vs a simulated controller, rejection,
+  >   wrong-controller-key).
+  > - **Live-NATS integration test** (`talos-envelope-seal/tests/`, gated on
+  >   `TALOS_TEST_NATS_URL`): responder↔worker-client handshake, single-claim,
+  >   unknown-execution. Compiles; runs in `quality.yml`'s env-gated suite (no
+  >   broker in the dev sandbox).
+  >
+  > **Remaining increment — the dispatch/receive-loop wiring** (each item is on a
+  > hot path `CLAUDE.md` flags total-outage-prone, so land it only with the
+  > integration test green against a live broker):
+  > 1. `DispatchJob` (`talos-workflow-engine-core`) gains `plaintext_secrets:
+  >    Option<HashMap>` + `secret_paths`. When `EnvelopeSealingMode::seals_claim_based()`,
+  >    the engine calls the already-extracted `resolve_secrets_map_for` and puts
+  >    the plaintext there instead of sealing (step 6 skipped).
+  > 2. `NatsNodeDispatcher` holds `Option<Arc<InFlightSeals>>` + the per-replica
+  >    `claim_subject` (injected via a setter so existing construction is
+  >    unchanged). When `job.plaintext_secrets.is_some()`: register
+  >    `InFlightSeals[job_id]`, set `req.sealing=1` / `req.claim_inbox` /
+  >    `req.secret_paths` / empty `encrypted_secrets`. Discard the context on
+  >    dispatch failure.
+  > 3. Controller `main.rs`: create the shared `Arc<InFlightSeals>`, allocate the
+  >    claim subject (`client.new_inbox()`), `tokio::spawn(run_claim_responder(...))`,
+  >    and inject both into the dispatcher. (Requires building the controller
+  >    binary — deferred here on the dev sandbox's disk budget.)
+  > 4. Worker `execute_job`: thread the NATS client in; when `req.sealing ==
+  >    SEALING_CLAIM_ECIES`, call `secret_claim::claim_secrets` instead of
+  >    decrypting `encrypted_secrets`; under `TALOS_ENVELOPE_SEALING=required`
+  >    refuse a `sealing==0` dispatch (downgrade guard).
+  > 5. Fleet-wide, not per-worker: under queue-group dispatch the controller can't
+  >    pick the worker, so `audit`/`required` seals **every** dispatch and every
+  >    worker must understand claims first (the RFC's all-at-once flip). The
+  >    `supports_sealing` capability bit is informational here, not a per-dispatch
+  >    gate. Pipeline-step claim-sealing (each step's own secrets) is a follow-up;
+  >    pipelines stay inline until then.
 - **P4 — Enforcement flip.** Once all workers run Ed25519 + sealed envelopes, set
   `TALOS_DISPATCH_SCHEME=ed25519-only` / refuse legacy HMAC and stop distributing
   `WORKER_SHARED_KEY` to workers entirely. Loud SIEM log on any legacy-scheme
