@@ -40,6 +40,14 @@ pub mod responder;
 pub use lease::{ClaimLeaseOutcome, RedisLease};
 pub use responder::run_claim_responder;
 
+// The worker-verifying-key registry (`set_dynamic_worker_public_keys`) is a
+// process-global that REPLACES its contents, so every test that mutates it must
+// hold THIS one lock — a per-module lock wouldn't serialize across modules in the
+// same test binary (lib::tests vs responder::tests). nextest isolates by process,
+// but `cargo test` runs them as threads, so the shared lock is required there.
+#[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// P3 secret-delivery policy, mirroring the Sigstore three-policy shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopeSealingMode {
@@ -239,11 +247,7 @@ mod tests {
     use super::*;
     use talos_workflow_job_protocol::{set_dynamic_worker_public_keys, WorkerEphemeral};
 
-    // `set_dynamic_worker_public_keys` REPLACES the whole process-global dynamic
-    // overlay, so registry-touching tests must not run concurrently (under
-    // thread-based `cargo test`; nextest already isolates by process). Serialize
-    // them on this lock.
-    static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::REGISTRY_TEST_LOCK as REGISTRY_LOCK;
 
     fn ctx_of(pairs: &[(&str, &str)]) -> SealContext {
         let map: HashMap<String, String> = pairs

@@ -121,10 +121,9 @@ fn build_response(
 mod tests {
     use super::*;
     use crate::SealContext;
+    use crate::REGISTRY_TEST_LOCK as REGISTRY_LOCK;
     use std::collections::HashMap;
     use talos_workflow_job_protocol::{set_dynamic_worker_public_keys, WorkerEphemeral};
-
-    static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn build_response_seals_valid_claim_and_rejects_garbage() {
