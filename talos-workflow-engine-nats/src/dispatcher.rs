@@ -1429,4 +1429,51 @@ mod p3_full_loop_tests {
             "replayed claim for a consumed execution must be rejected"
         );
     }
+
+    /// Security-critical fail-closed path (no broker needed, so it always runs):
+    /// if a dispatch carries resolved PLAINTEXT secrets but no envelope handle is
+    /// wired (a misconfiguration — sealing on without the controller Ed25519 key),
+    /// the dispatcher MUST refuse rather than let plaintext fall onto the wire.
+    /// The transport panics if used, proving nothing is sent.
+    #[tokio::test]
+    async fn dispatch_with_plaintext_but_no_envelope_handle_fails_closed() {
+        use async_trait::async_trait;
+
+        struct PanicTransport;
+        #[async_trait]
+        impl talos_workflow_engine_core::JobTransport for PanicTransport {
+            async fn request(&self, _topic: &str, _payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+                panic!("transport must NOT be used when a plaintext dispatch is refused");
+            }
+        }
+
+        // No `with_envelope_sealing` → no handle.
+        let dispatcher = NatsNodeDispatcher::new(
+            Arc::new(PanicTransport),
+            None,
+            None,
+            Arc::new(NoRetry),
+            Arc::new(TrueEval),
+        );
+
+        let secret_map: HashMap<String, String> =
+            [("anthropic/api_key".to_string(), "sk-ant-SECRET".to_string())]
+                .into_iter()
+                .collect();
+        let job = DispatchJob {
+            plaintext_secrets: Some(secret_map),
+            timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
+        };
+
+        let err = dispatcher
+            .dispatch(job)
+            .await
+            .expect_err("dispatch with plaintext but no handle must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("envelope") && msg.contains("fail-closed"),
+            "expected a fail-closed envelope error, got: {msg}"
+        );
+    }
 }
