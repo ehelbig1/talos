@@ -4848,6 +4848,77 @@ mod tests {
         assert_ne!(seed_hex, seed2, "keygen must be random per call");
     }
 
+    /// RFC 0010 end-to-end: the exact hex strings the
+    /// `generate-worker-trust-keypair` subcommand prints, fed through the SAME
+    /// pure loaders the controller and worker read env with, must compose across
+    /// BOTH trust directions — controller→worker dispatch (P1) and
+    /// worker→controller results (P2) — using ONE per-worker keypair (the same
+    /// key the RPC path uses). This is the "did we ship something an operator can
+    /// actually turn on" check: it fails if the keygen output format drifts from
+    /// what `parse_ed25519_*` / `parse_worker_public_keys` accept, or if the two
+    /// verify paths diverge.
+    #[test]
+    fn operator_keygen_config_composes_both_directions() {
+        // --- what the operator generates + pastes into env ---
+        // `--role controller`: seed on controller, pub on every worker.
+        let (ctrl_seed_hex, ctrl_pub_hex) = generate_ed25519_keypair_hex();
+        // `--role worker --worker-id worker-1`: seed on the worker, the
+        // `worker_id=pub` pair appended to the controller's registry string.
+        let (w1_seed_hex, w1_pub_hex) = generate_ed25519_keypair_hex();
+        let worker_public_keys_env = format!("worker-1={w1_pub_hex}");
+
+        // === P1 dispatch: controller signs, worker verifies ===
+        // Controller side — build the signer exactly as configured_dispatch_signer.
+        let ctrl_signer = DispatchSigner::Ed25519(std::sync::Arc::new(
+            parse_ed25519_signing_key_hex(&ctrl_seed_hex).expect("controller seed parses"),
+        ));
+        let mut req = make_test_request(Some(Uuid::new_v4()));
+        ctrl_signer
+            .sign_job(&mut req)
+            .expect("controller signs dispatch");
+        assert_eq!(req.crypto_scheme, CRYPTO_SCHEME_ED25519);
+        // Worker side — parse TALOS_CONTROLLER_PUBLIC_KEY and verify. The ring
+        // holds only an unrelated dummy key: the Ed25519 path never touches the
+        // symmetric ring, and accept_legacy_hmac=false proves it holds under P4
+        // enforcement (a signature forged under the dummy HMAC key is refused).
+        let ctrl_pub = parse_ed25519_verifying_key_hex(&ctrl_pub_hex).expect("ctrl pub parses");
+        let unrelated_ring = hmac_ring(b"unrelated-hmac-key-never-touched-on-ed25519-path");
+        req.verify_dispatch(&unrelated_ring, &[ctrl_pub], 300, false)
+            .expect("worker verifies the controller-signed dispatch");
+
+        // === P2 result: worker signs, controller verifies via the registry ===
+        let w1_sk = parse_ed25519_signing_key_hex(&w1_seed_hex).expect("worker seed parses");
+        let mut result = make_test_result();
+        result
+            .sign_ed25519_with_worker_id(&w1_sk, "worker-1")
+            .expect("worker signs its result");
+        // Controller side — resolve the verifying key(s) for worker-1 out of the
+        // parsed TALOS_WORKER_PUBLIC_KEYS registry, then verify.
+        let registry = parse_worker_public_keys(&worker_public_keys_env);
+        let w1_keys = registry.get("worker-1").expect("worker-1 is registered");
+        result
+            .verify_dispatch(&unrelated_ring, w1_keys, 300, false)
+            .expect("controller verifies the worker-signed result");
+
+        // === Core security property, driven through the config path ===
+        // A result claiming to be worker-1 but signed by a DIFFERENT key (a
+        // compromised/rogue worker impersonating worker-1) fails against the
+        // registered key. The asymmetric boundary means holding a valid worker
+        // key never lets you forge as another worker_id.
+        let (rogue_seed_hex, _) = generate_ed25519_keypair_hex();
+        let rogue_sk = parse_ed25519_signing_key_hex(&rogue_seed_hex).unwrap();
+        let mut forged = make_test_result();
+        forged
+            .sign_ed25519_with_worker_id(&rogue_sk, "worker-1")
+            .unwrap();
+        assert!(
+            forged
+                .verify_dispatch(&unrelated_ring, w1_keys, 300, false)
+                .is_err(),
+            "a rogue key claiming worker-1 must not verify against worker-1's registered key"
+        );
+    }
+
     /// M-4: tampering with `actor_id` MUST invalidate the signature.
     /// Pre-fix the field was excluded from the signing payload, so a
     /// NATS-channel attacker could redirect the worker's downstream

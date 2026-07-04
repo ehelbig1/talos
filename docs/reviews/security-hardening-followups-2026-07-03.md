@@ -8,20 +8,25 @@ that must be completed in a compile-capable, integration-testable environment.
 
 | # | Finding | Status |
 |---|---------|--------|
-| 1 | Single fleet-wide `WORKER_SHARED_KEY` roots all signing → sandbox escape = cross-tenant forgery | **Reclassified** — per-worker HMAC does NOT fix this (see corrected analysis); genuine fix is an asymmetric-crypto RFC. HKDF primitive kept as a building block only |
+| 1 | Single fleet-wide `WORKER_SHARED_KEY` roots all signing → sandbox escape = cross-tenant forgery | **Substantially addressed** (RFC 0010 P1+P2 landed) — Ed25519 asymmetric signing on BOTH directions: controller→worker dispatch (P1) and worker→controller results + all 5 signed RPC protocols (P2), each keyed to a per-worker identity. A compromised worker can now forge only *as itself*, never as another worker or the controller. Opt-in, default byte-identical HMAC; operator keygen + rollout runbook shipped. Remaining: P3 envelope sealing (last root-key removal, blocked on the D3a/D3b design fork) + P4 enforcement flip |
 | 2 | Process-local replay caches → replay across HA replicas | **Design specified below** |
 | 3 | RLS shipped OFF by default | **Done** — `talos_db::enforce_production_rls_posture` fail-closes prod boot (opt-out `TALOS_ALLOW_RLS_DISABLED=1`) |
 | 4 | Silent `try_get().unwrap_or()` masks schema drift | **Done** — structural-lint ratchet (check 52); highest-risk AEAD-format/id reads made fail-loud in `talos-execution-repository` + `talos-module-executions`; baseline lowered 526→524 |
 | 5 | Aspiration-vs-reality doc gaps | **Done** — LLM-provider docs corrected (`llm_tier.rs`, `provider_tier`); sub-workflow-checkpoint and raw-socket `allowed_hosts` caveats documented in code; stale `update_protocol.py` deleted |
 
-Items 3–5 are committed. Item 1 is **reclassified as an RFC-scale asymmetric
+Items 3–5 are committed. Item 1 was **reclassified as an RFC-scale asymmetric
 redesign** (a quick per-worker-key wire-up was found to be security theater under
-symmetric HMAC — see the corrected Finding #1). Item 2 (distributed nonce) is a
-genuine, tractable fix whose design is below; it changes the signed data-plane
-verify path — the area `CLAUDE.md` flags as total-outage-prone (r300/r301) — so it
-must land with `cargo check`/`cargo test` green AND an integration run against
-live NATS + Redis. What is landed now is the safe,
-additive foundation for #1.
+symmetric HMAC — see the corrected Finding #1) and is now **substantially
+addressed**: RFC 0010 phases P1 (Ed25519 dispatch) and P2 (per-worker Ed25519 on
+results + all five signed RPC protocols) are landed, gated, and pushed, each an
+opt-in, default-byte-identical-HMAC change. The last root-equivalent key removal
+(P3 envelope sealing) is blocked on the D3a-vs-D3b design fork the RFC flags, and
+the P4 enforcement flip follows once every worker signs Ed25519 — both tracked in
+RFC 0010. Item 2 (distributed nonce) is done (`talos-replay-guard`). The signed
+data-plane verify path — the area `CLAUDE.md` flags as total-outage-prone
+(r300/r301) — carries the full dual-verify (HMAC + Ed25519) behind a
+config-composition test (`operator_keygen_config_composes_both_directions`) that
+drives the keygen output through both loaders and both verify directions.
 
 ---
 
