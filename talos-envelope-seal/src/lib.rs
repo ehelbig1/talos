@@ -36,7 +36,9 @@ use talos_workflow_job_protocol::{
 };
 
 pub mod lease;
+pub mod responder;
 pub use lease::{ClaimLeaseOutcome, RedisLease};
+pub use responder::run_claim_responder;
 
 /// P3 secret-delivery policy, mirroring the Sigstore three-policy shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

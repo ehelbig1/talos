@@ -7634,7 +7634,9 @@ dependencies = [
 name = "talos-envelope-seal"
 version = "0.1.0"
 dependencies = [
+ "async-nats",
  "dashmap 6.2.1",
+ "futures",
  "rand 0.8.6",
  "redis",
  "serde_json",

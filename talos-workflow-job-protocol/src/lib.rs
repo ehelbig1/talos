@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 /// RFC 0010 P3 (D3b) — per-execution ephemeral secret-envelope sealing.
 pub mod envelope_seal;
-pub use envelope_seal::{seal_secrets, SealOutput, SealedSecrets, SecretClaim, WorkerEphemeral};
+pub use envelope_seal::{
+    seal_secrets, ClaimResponse, SealOutput, SealedSecrets, SecretClaim, WorkerEphemeral,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -2388,6 +2390,16 @@ pub struct JobRequest {
     /// cannot widen scope. When `sealing == 1`, `encrypted_secrets` is empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secret_paths: Vec<String>,
+
+    /// RFC 0010 P3 (D3b): the NATS subject the worker sends its `SecretClaim` to.
+    /// Set by the dispatcher (to the dispatching replica's per-process claim
+    /// responder inbox) ONLY when `sealing == SEALING_CLAIM_ECIES`. Bound into
+    /// `signing_payload()` when sealing is non-zero — same reasoning as
+    /// `reply_topic`: an on-wire attacker must not redirect the claim (which
+    /// carries the worker's ephemeral public key) to a subject they control and
+    /// have the controller seal the secrets straight to them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_inbox: Option<String>,
 }
 
 impl JobRequest {
@@ -2584,7 +2596,16 @@ impl JobRequest {
             use std::fmt::Write as _;
             let mut paths = self.secret_paths.clone();
             paths.sort_unstable();
-            let _ = write!(payload, ":{}:{}", self.sealing, lp(&paths.join(",")));
+            // claim_inbox bound with a `-` sentinel for None so its absence is
+            // tamper-evident (an attacker can't strip it to redirect the claim).
+            let claim_inbox = self.claim_inbox.as_deref().unwrap_or("-");
+            let _ = write!(
+                payload,
+                ":{}:{}:{}",
+                self.sealing,
+                lp(&paths.join(",")),
+                lp(claim_inbox)
+            );
         }
 
         payload.into_bytes()
@@ -4339,6 +4360,7 @@ mod tests {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4390,6 +4412,7 @@ mod tests {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4433,6 +4456,7 @@ mod tests {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4599,6 +4623,7 @@ mod tests {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4642,6 +4667,7 @@ mod tests {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4701,6 +4727,7 @@ mod tests {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://m/v1".to_string(),

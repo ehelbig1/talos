@@ -473,6 +473,17 @@ impl SealedSecrets {
     }
 }
 
+/// The controller's reply to a `SecretClaim` on the claim inbox: either the
+/// sealed secrets, or a generic rejection (unknown/already-claimed execution,
+/// unauthorized claim, seal failure — all collapsed so the worker learns
+/// nothing about which check failed). The worker drops the job without running
+/// on `Rejected`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClaimResponse {
+    Sealed(SealedSecrets),
+    Rejected { reason: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

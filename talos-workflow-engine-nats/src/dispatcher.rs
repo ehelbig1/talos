@@ -787,6 +787,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             // Reuse a caller-supplied job id when present so a
             // pre-INSERTed `module_executions` row with that id stays
             // correlated with the worker's update. Fresh UUID

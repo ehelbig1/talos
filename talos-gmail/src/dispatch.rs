@@ -276,6 +276,7 @@ async fn dispatch_single_message(
         crypto_scheme: 0,
         sealing: 0,
         secret_paths: Vec::new(),
+        claim_inbox: None,
         job_id: execution_id,
         workflow_execution_id: execution_id,
         module_uri: exec_info.module_uri.clone(),

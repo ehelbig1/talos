@@ -66,6 +66,7 @@ fn deterministic_job_request() -> JobRequest {
         crypto_scheme: 0,
         sealing: 0,
         secret_paths: Vec::new(),
+        claim_inbox: None,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
         workflow_execution_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0002),
         module_uri: "redis:wasm:00000000-0000-0000-0000-000000000003".into(),

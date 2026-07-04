@@ -1109,6 +1109,7 @@ impl WebhookRouter {
                         crypto_scheme: 0,
                         sealing: 0,
                         secret_paths: Vec::new(),
+                        claim_inbox: None,
                         job_id,
                         workflow_execution_id: job_id, // Standalone webhook uses same ID
                         module_uri: exec_info.module_uri,
@@ -2552,6 +2553,7 @@ impl WebhookRouter {
                     crypto_scheme: 0,
                     sealing: 0,
                     secret_paths: Vec::new(),
+                    claim_inbox: None,
                     job_id,
                     workflow_execution_id: job_id,
                     module_uri: exec_info.module_uri,

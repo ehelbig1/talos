@@ -1294,6 +1294,7 @@ pub async fn process_webhook_events(
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id,
             workflow_execution_id: job_id, // Single node execution, use same ID
             module_uri: exec_info.module_uri.clone(),
