@@ -8971,6 +8971,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "futures",
+ "rand 0.8.6",
  "serde_json",
  "talos-envelope-seal",
  "talos-trace-nats",
