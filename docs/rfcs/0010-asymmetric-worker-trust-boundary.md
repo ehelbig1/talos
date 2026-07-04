@@ -1,8 +1,10 @@
 # RFC 0010 — Asymmetric worker-trust boundary
 
-**Status:** In progress — P1 + P2 (inc.1–4) landed; P3 (D3b) crypto core + claim
-service + worker client + responder landed & tested, dispatch-loop wiring remains
-(see the P3-status note below)
+**Status:** In progress — P1 + P2 (inc.1–4) landed; P3 (D3b) fully wired &
+compile-verified behind default-off `TALOS_ENVELOPE_SEALING` (crypto + claim
+service + responder + engine/dispatcher/worker dispatch-loop wiring); remaining:
+the live-NATS end-to-end run + canary before production enablement (see the
+P3-status note below)
 **Author:** Codebase review follow-up
 **Date:** 2026-07-03
 
@@ -288,33 +290,42 @@ envelope deploy-ordering rule).
   >   unknown-execution. Compiles; runs in `quality.yml`'s env-gated suite (no
   >   broker in the dev sandbox).
   >
-  > **Remaining increment — the dispatch/receive-loop wiring** (each item is on a
-  > hot path `CLAUDE.md` flags total-outage-prone, so land it only with the
-  > integration test green against a live broker):
-  > 1. `DispatchJob` (`talos-workflow-engine-core`) gains `plaintext_secrets:
-  >    Option<HashMap>` + `secret_paths`. When `EnvelopeSealingMode::seals_claim_based()`,
-  >    the engine calls the already-extracted `resolve_secrets_map_for` and puts
+  > **Dispatch/receive-loop wiring — LANDED (compile-verified; end-to-end run
+  > gated on the live-NATS integration test).** All behind default-off
+  > `TALOS_ENVELOPE_SEALING`; unset ⇒ byte-identical to today.
+  > 1. `DispatchJob` (`talos-workflow-engine-core`) gained `plaintext_secrets`
+  >    (redacted `Debug`) + `secret_paths`. When claim-based sealing is on the
+  >    engine (`engine_dispatch_single`) calls `resolve_secrets_map_for` and puts
   >    the plaintext there instead of sealing (step 6 skipped).
-  > 2. `NatsNodeDispatcher` holds `Option<Arc<InFlightSeals>>` + the per-replica
-  >    `claim_subject` (injected via a setter so existing construction is
-  >    unchanged). When `job.plaintext_secrets.is_some()`: register
-  >    `InFlightSeals[job_id]`, set `req.sealing=1` / `req.claim_inbox` /
-  >    `req.secret_paths` / empty `encrypted_secrets`. Discard the context on
-  >    dispatch failure.
-  > 3. Controller `main.rs`: create the shared `Arc<InFlightSeals>`, allocate the
-  >    claim subject (`client.new_inbox()`), `tokio::spawn(run_claim_responder(...))`,
-  >    and inject both into the dispatcher. (Requires building the controller
-  >    binary — deferred here on the dev sandbox's disk budget.)
-  > 4. Worker `execute_job`: thread the NATS client in; when `req.sealing ==
-  >    SEALING_CLAIM_ECIES`, call `secret_claim::claim_secrets` instead of
-  >    decrypting `encrypted_secrets`; under `TALOS_ENVELOPE_SEALING=required`
-  >    refuse a `sealing==0` dispatch (downgrade guard).
+  > 2. `NatsNodeDispatcher` gained `with_envelope_sealing(EnvelopeSealingHandle
+  >    { Arc<InFlightSeals>, claim_subject })`. When a job carries
+  >    `plaintext_secrets`: register `InFlightSeals[job_id]`, stamp `req.sealing=1`
+  >    / `claim_inbox` / `secret_paths` BEFORE signing; empty `encrypted_secrets`.
+  >    Fail-closed if plaintext arrives without a handle (never plaintext on the
+  >    wire). Discards the context after dispatch (bounds the map on pre-claim
+  >    failure).
+  > 3. `talos-engine::build_nats_dispatcher` (the single dispatcher construction
+  >    point the controller already calls — so **no controller `main.rs` change**)
+  >    lazily creates a process-wide `InFlightSeals` + claim subject
+  >    (`client.new_inbox()`) and spawns `run_claim_responder` once (memoized in a
+  >    `OnceLock`), then injects the handle. Requires the controller Ed25519
+  >    signing key (P3 builds on P1); if sealing is on without it, it logs and
+  >    attaches no handle so claim dispatches fail closed loudly.
+  > 4. Worker `execute_job` threads the NATS client in; `req.sealing==1` →
+  >    `secret_claim::claim_secrets` instead of decrypting; downgrade guard
+  >    (`worker_sealing_required()`) refuses `sealing==0` under `required`.
   > 5. Fleet-wide, not per-worker: under queue-group dispatch the controller can't
   >    pick the worker, so `audit`/`required` seals **every** dispatch and every
   >    worker must understand claims first (the RFC's all-at-once flip). The
   >    `supports_sealing` capability bit is informational here, not a per-dispatch
-  >    gate. Pipeline-step claim-sealing (each step's own secrets) is a follow-up;
-  >    pipelines stay inline until then.
+  >    gate. Pipeline-step + loop-body claim-sealing (each step's own secrets) is a
+  >    follow-up; those paths stay inline (`plaintext_secrets: None`) until then.
+  >
+  > **Remaining before production enablement:** run the live-NATS integration
+  > test (+ a Redis lease) against a real cluster, then a canary with
+  > `TALOS_ENVELOPE_SEALING=audit` before `required`. The dev sandbox has no
+  > `nats-server`, so the end-to-end path is compile-verified + unit/component-
+  > tested here, not yet run.
 - **P4 — Enforcement flip.** Once all workers run Ed25519 + sealed envelopes, set
   `TALOS_DISPATCH_SCHEME=ed25519-only` / refuse legacy HMAC and stop distributing
   `WORKER_SHARED_KEY` to workers entirely. Loud SIEM log on any legacy-scheme

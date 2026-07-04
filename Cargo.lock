@@ -7594,6 +7594,7 @@ dependencies = [
  "talos-dlp",
  "talos-dlp-provider",
  "talos-engine-events",
+ "talos-envelope-seal",
  "talos-http-utils",
  "talos-memory",
  "talos-metrics",

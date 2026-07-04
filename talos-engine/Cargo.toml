@@ -49,6 +49,9 @@ talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-engine-nats = { path = "../talos-workflow-engine-nats" }
+# RFC 0010 P3 (D3b): shared InFlightSeals + the claim responder singleton wired
+# into the dispatcher when TALOS_ENVELOPE_SEALING is on.
+talos-envelope-seal = { path = "../talos-envelope-seal" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }

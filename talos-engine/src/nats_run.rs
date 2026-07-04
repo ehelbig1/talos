@@ -69,6 +69,9 @@ pub fn build_nats_dispatcher(
     nats_client: Arc<async_nats::Client>,
     worker_shared_key: Option<WorkerSharedKey>,
 ) -> Arc<dyn NodeDispatcher> {
+    // RFC 0010 P3 (D3b): keep a client handle for the claim responder before the
+    // transport consumes `nats_client`.
+    let nats_client_for_seal = nats_client.clone();
     let transport = NatsTransport::shared(nats_client);
     // Fall back to the default Talos adapters when the engine was
     // constructed without explicit policy wiring (bare test engines).
@@ -108,10 +111,90 @@ pub fn build_nats_dispatcher(
     // private key. Default (unconfigured) leaves it off → HMAC signing via
     // worker_shared_key, unchanged.
     let dispatcher = match resolve_dispatch_signer() {
-        Some(signer) => dispatcher.with_dispatch_signer(signer),
+        Some(signer) => {
+            // RFC 0010 P3 (D3b): when TALOS_ENVELOPE_SEALING is on AND the
+            // controller signs Ed25519 (required to sign SealedSecrets — P3
+            // builds on P1), wire the shared claim responder + InFlightSeals
+            // handle into the dispatcher. When sealing is on but no Ed25519
+            // signing key is configured, we log and DON'T attach a handle —
+            // the engine still resolved plaintext, so the dispatcher will
+            // fail-closed per job (never leaking plaintext to the wire), making
+            // the misconfiguration loud rather than silent.
+            let dispatcher = dispatcher.with_dispatch_signer(signer.clone());
+            if talos_envelope_seal::EnvelopeSealingMode::from_env().seals_claim_based() {
+                if let talos_workflow_job_protocol::DispatchSigner::Ed25519(sk) = &signer {
+                    let handle = envelope_sealing_handle(&nats_client_for_seal, sk.clone());
+                    dispatcher.with_envelope_sealing(handle)
+                } else {
+                    tracing::error!(
+                        target: "talos_security",
+                        "TALOS_ENVELOPE_SEALING is on but no Ed25519 controller signing key is \
+                         configured (TALOS_CONTROLLER_SIGNING_KEY) — claim-based sealing needs it \
+                         to sign SealedSecrets. Claim dispatches will fail closed until it is set."
+                    );
+                    dispatcher
+                }
+            } else {
+                dispatcher
+            }
+        }
         None => dispatcher,
     };
     Arc::new(dispatcher)
+}
+
+/// RFC 0010 P3 (D3b): the process-wide claim responder singleton + its
+/// `InFlightSeals` + subject, created on first use. `build_nats_dispatcher` runs
+/// per dispatch, but there must be exactly ONE responder + one shared store per
+/// process — so it is memoized in a `OnceLock` and the responder task is spawned
+/// once. Subsequent calls (and every dispatcher) reuse the same handle.
+fn envelope_sealing_handle(
+    nats_client: &Arc<async_nats::Client>,
+    controller_key: Arc<talos_workflow_job_protocol::DispatchSigningKey>,
+) -> talos_workflow_engine_nats::EnvelopeSealingHandle {
+    static HANDLE: std::sync::OnceLock<talos_workflow_engine_nats::EnvelopeSealingHandle> =
+        std::sync::OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            let in_flight = Arc::new(talos_envelope_seal::InFlightSeals::new());
+            // Per-replica claim subject the dispatcher stamps into every
+            // sealing=1 JobRequest.claim_inbox; the responder subscribes to it.
+            // Because a NATS reply inbox is connection-scoped, the claim returns
+            // to THIS replica (which holds the in-flight context).
+            let claim_subject = nats_client.new_inbox();
+            let nc = nats_client.clone();
+            let subject = claim_subject.clone();
+            let inf = in_flight.clone();
+            tokio::spawn(async move {
+                if let Err(e) = talos_envelope_seal::run_claim_responder(
+                    nc,
+                    subject,
+                    inf,
+                    controller_key,
+                    // Freshness window for incoming claims (matches the worker's
+                    // SealedSecrets window + the dispatch-verify window).
+                    300,
+                )
+                .await
+                {
+                    tracing::error!(
+                        target: "talos_security",
+                        error = %e,
+                        "RFC 0010 P3 claim responder exited"
+                    );
+                }
+            });
+            tracing::info!(
+                target: "talos_security",
+                %claim_subject,
+                "RFC 0010 P3 (D3b) claim responder started; claim-based secret sealing active"
+            );
+            talos_workflow_engine_nats::EnvelopeSealingHandle {
+                in_flight,
+                claim_subject,
+            }
+        })
+        .clone()
 }
 
 /// RFC 0010 P1: resolve the controller's dispatch signer. Delegates resolution
