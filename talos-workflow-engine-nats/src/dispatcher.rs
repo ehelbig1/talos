@@ -1001,9 +1001,36 @@ impl NodeDispatcher for NatsNodeDispatcher {
         &self,
         request: ChainDispatchRequest,
     ) -> Result<ChainDispatchResult, BoxError> {
+        // RFC 0010 P3 (D3b): claim-based sealing is active for this pipeline when
+        // the engine resolved PLAINTEXT for any step (`build_dispatch_secrets_for`
+        // sets `plaintext_secrets` under the flag; the per-step
+        // `encrypted_secrets_ciphertext` is empty in that case). We collect every
+        // step's plaintext into ONE per-step vector, sealed in a single claim.
+        let job_id = request.job_id.unwrap_or_else(uuid::Uuid::new_v4);
+        let claim_based = request.steps.iter().any(|j| j.plaintext_secrets.is_some());
+        // Per-step plaintext maps, aligned index-for-index with `steps`. Steps
+        // with no secrets contribute an empty map so the vector stays aligned.
+        let per_step_secrets: Vec<std::collections::HashMap<String, String>> = request
+            .steps
+            .iter()
+            .map(|j| j.plaintext_secrets.clone().unwrap_or_default())
+            .collect();
+        // Union of the per-step secret NAMES (not values) for the signed
+        // `secret_paths` metadata.
+        let claim_secret_paths: Vec<String> = {
+            let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for j in &request.steps {
+                names.extend(j.secret_paths.iter().cloned());
+            }
+            names.into_iter().collect()
+        };
+
         // 1. Map `DispatchJob`s into wire-format `PipelineStep`s. The
         // step shape is a strict subset of JobRequest's per-node fields
         // (no per-step user/actor/dry_run — those are chain-level).
+        // Under claim-based sealing every step's `encrypted_secrets` is already
+        // empty (the engine put the values in `plaintext_secrets` instead), so
+        // this mapping is correct for both paths without a branch.
         let steps: Vec<PipelineStep> = request
             .steps
             .iter()
@@ -1046,7 +1073,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
-            job_id: request.job_id.unwrap_or_else(uuid::Uuid::new_v4),
+            claim_inbox: None,
+            job_id,
             workflow_execution_id: request.workflow_execution_id,
             steps,
             total_timeout_ms: request.total_timeout.as_millis() as u64,
@@ -1062,6 +1090,28 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // payload. Worker will refuse to publish anywhere else.
             reply_topic: reply_inbox.clone(),
         };
+
+        // RFC 0010 P3 (D3b): register the per-step plaintext as ONE sealed claim
+        // for this pipeline BEFORE signing (so `sealing`/`secret_paths`/
+        // `claim_inbox` are bound). The worker claims once and gets the per-step
+        // vector back. No plaintext reaches the wire. Fail-closed if plaintext was
+        // resolved but no envelope handle is wired.
+        if claim_based {
+            let handle = self.envelope.as_ref().ok_or_else(|| -> BoxError {
+                "RFC 0010 P3: pipeline carried plaintext_secrets but no envelope sealing handle \
+                 is wired — refusing to dispatch (fail-closed, no plaintext on the wire)"
+                    .into()
+            })?;
+            let bytes = serde_json::to_vec(&per_step_secrets).map_err(|e| -> BoxError {
+                format!("serialize pipeline seal payload: {e}").into()
+            })?;
+            handle
+                .in_flight
+                .register(job_id, talos_envelope_seal::SealContext::from_bytes(bytes));
+            req.sealing = talos_workflow_job_protocol::SEALING_CLAIM_ECIES;
+            req.claim_inbox = Some(handle.claim_subject.clone());
+            req.secret_paths = claim_secret_paths;
+        }
 
         // 3. Sign (chain-level, independent of any per-step signing). RFC 0010
         // P1: prefer the configured dispatch signer; else the legacy HMAC path.
@@ -1107,8 +1157,16 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // pipeline result to the HMAC-bound subject only.
             reply_inbox,
         )
-        .await
-        .map_err(|e| -> BoxError { e.into() })?;
+        .await;
+
+        // RFC 0010 P3: discard the pipeline seal context after dispatch (the
+        // worker's claim TOOK it on success; this bounds InFlightSeals if the
+        // pipeline failed before any claim). No-op when unregistered/taken.
+        if let Some(handle) = self.envelope.as_ref() {
+            handle.in_flight.discard(job_id);
+        }
+
+        let response_bytes = response_bytes.map_err(|e| -> BoxError { e.into() })?;
 
         // 7. Parse + verify.
         let result: PipelineJobResult = serde_json::from_slice(&response_bytes)
@@ -1245,12 +1303,21 @@ mod p3_full_loop_tests {
             .filter(|s| !s.is_empty())
     }
 
+    /// `set_dynamic_worker_public_keys` REPLACES the process-global worker-key
+    /// registry, so the two live-NATS tests (different worker ids) must not run
+    /// concurrently or one clobbers the other's key → claims get rejected. An
+    /// async mutex serializes them across their `.await` points (a std mutex held
+    /// across await would not be Send-safe). `--test-threads=1` would also fix it,
+    /// but the lock keeps the tests robust under the default parallel runner.
+    static NATS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_claim_loop_over_live_nats() {
         let Some(url) = nats_url() else {
             eprintln!("skipping: set TALOS_TEST_NATS_URL to run");
             return;
         };
+        let _reg_guard = NATS_TEST_LOCK.lock().await;
         const SECRET_VALUE: &str = "sk-ant-SUPERSECRET-DO-NOT-LEAK";
         let worker_id = "e2e-worker";
 
@@ -1427,6 +1494,194 @@ mod p3_full_loop_tests {
         assert!(
             matches!(resp, ClaimResponse::Rejected { .. }),
             "replayed claim for a consumed execution must be rejected"
+        );
+    }
+
+    /// RFC 0010 P3 (D3b) — full PIPELINE claim loop over live NATS. Drives the
+    /// real `dispatch_chain` (Ed25519 signer + envelope handle) and the responder,
+    /// with an in-test worker running the exact pipeline claim path
+    /// (`execute_pipeline_job` uses `claim_secrets_raw` → per-step `Vec<HashMap>`).
+    /// Asserts: the wire `PipelineJobRequest` is sealing=1 + claim_inbox with EVERY
+    /// step's `encrypted_secrets` empty and NO plaintext on the wire; the signed
+    /// sealing fields verify; ONE claim yields the per-step secret vector aligned
+    /// to the steps; the seal context is consumed after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_pipeline_claim_loop_over_live_nats() {
+        use super::get_pipeline_job_topic;
+        use talos_workflow_engine_core::ChainDispatchRequest;
+        use talos_workflow_job_protocol::{PipelineJobRequest, PipelineJobResult};
+
+        let Some(url) = nats_url() else {
+            eprintln!("skipping: set TALOS_TEST_NATS_URL to run");
+            return;
+        };
+        let _reg_guard = NATS_TEST_LOCK.lock().await;
+        const S0: &str = "sk-STEP0-SUPERSECRET";
+        const S1: &str = "sk-STEP1-SUPERSECRET";
+        let worker_id = "e2e-pipe-worker";
+
+        let controller_sk = Arc::new(DispatchSigningKey::generate(&mut rand::rngs::OsRng));
+        let controller_vk = controller_sk.verifying_key();
+        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        set_dynamic_worker_public_keys(vec![(worker_id.to_string(), worker_sk.verifying_key())]);
+        let shared = WorkerSharedKey::new(vec![9u8; 32]);
+        let ring = WorkerKeyRing::single(shared.clone());
+
+        let nc = Arc::new(async_nats::connect(&url).await.expect("connect nats"));
+        let in_flight = Arc::new(talos_envelope_seal::InFlightSeals::new());
+        let claim_subject = nc.new_inbox();
+        {
+            let (nc2, subj, inf, ck) = (
+                nc.clone(),
+                claim_subject.clone(),
+                in_flight.clone(),
+                controller_sk.clone(),
+            );
+            tokio::spawn(async move {
+                let _ = talos_envelope_seal::run_claim_responder(nc2, subj, inf, ck, 300).await;
+            });
+        }
+
+        let dispatcher = NatsNodeDispatcher::new(
+            crate::NatsTransport::shared(nc.clone()),
+            None,
+            Some(shared.clone()),
+            Arc::new(NoRetry),
+            Arc::new(TrueEval),
+        )
+        .with_dispatch_signer(DispatchSigner::Ed25519(controller_sk.clone()))
+        .with_envelope_sealing(EnvelopeSealingHandle {
+            in_flight: in_flight.clone(),
+            claim_subject: claim_subject.clone(),
+        });
+
+        let topic = get_pipeline_job_topic(None, 100);
+        let mut sub = nc.subscribe(topic).await.expect("worker subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let observed: Arc<tokio::sync::Mutex<Option<Vec<HashMap<String, String>>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let worker_task = {
+            let (nc, ring, observed, controller_vk) =
+                (nc.clone(), ring.clone(), observed.clone(), controller_vk);
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let msg = sub.next().await.expect("worker received a pipeline job");
+                let raw = msg.payload.clone();
+                let req: PipelineJobRequest = serde_json::from_slice(&raw).expect("parse pipeline");
+
+                assert_eq!(req.sealing, SEALING_CLAIM_ECIES, "wire must be sealing=1");
+                assert!(req.claim_inbox.is_some(), "wire must carry claim_inbox");
+                assert!(
+                    req.steps
+                        .iter()
+                        .all(|s| s.encrypted_secrets.ciphertext.is_empty()),
+                    "no inline step ciphertext on a claim pipeline"
+                );
+                assert!(
+                    !String::from_utf8_lossy(&raw).contains("SUPERSECRET"),
+                    "PLAINTEXT SECRET LEAKED ONTO THE WIRE"
+                );
+                req.verify_dispatch(&ring, &[controller_vk], 300, true)
+                    .expect("pipeline dispatch signature (with sealing fields) must verify");
+
+                // ONE claim → per-step secret vector.
+                let we = WorkerEphemeral::generate();
+                let claim = SecretClaim::new_signed(
+                    req.job_id,
+                    worker_id.to_string(),
+                    we.public_key(),
+                    &worker_sk,
+                );
+                let reply = nc
+                    .request(
+                        req.claim_inbox.clone().unwrap(),
+                        serde_json::to_vec(&claim).unwrap().into(),
+                    )
+                    .await
+                    .expect("claim request");
+                let resp: ClaimResponse = serde_json::from_slice(&reply.payload).unwrap();
+                let sealed = match resp {
+                    ClaimResponse::Sealed(s) => s,
+                    ClaimResponse::Rejected { reason } => panic!("claim rejected: {reason}"),
+                };
+                sealed.verify(&controller_vk, 300).expect("controller sig");
+                let plaintext = we
+                    .open(
+                        &sealed.epk_c,
+                        req.job_id,
+                        worker_id,
+                        &sealed.ciphertext,
+                        &sealed.nonce,
+                    )
+                    .expect("open sealed secrets");
+                let per_step: Vec<HashMap<String, String>> =
+                    serde_json::from_slice(&plaintext).unwrap();
+                *observed.lock().await = Some(per_step);
+
+                let mut pr = PipelineJobResult {
+                    job_id: req.job_id,
+                    overall_status: talos_workflow_job_protocol::JobStatus::Success,
+                    step_results: vec![],
+                    final_output: serde_json::json!({"ok": true}),
+                    total_time_ms: 1,
+                    signature: vec![],
+                    result_nonce: String::new(),
+                    worker_id: String::new(),
+                    crypto_scheme: 0,
+                };
+                pr.sign_with_worker_id(shared.as_bytes(), worker_id)
+                    .unwrap();
+                nc.publish(
+                    req.reply_topic.clone().unwrap(),
+                    serde_json::to_vec(&pr).unwrap().into(),
+                )
+                .await
+                .unwrap();
+                let _ = nc.flush().await;
+            })
+        };
+
+        let mk = |v: &str| DispatchJob {
+            module_uri: "test:noop".to_string(),
+            input_payload: serde_json::json!({}),
+            plaintext_secrets: Some(HashMap::from([("api/key".to_string(), v.to_string())])),
+            secret_paths: vec!["api/key".to_string()],
+            timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
+        };
+        let job_id = uuid::Uuid::new_v4();
+        let request = ChainDispatchRequest {
+            workflow_execution_id: uuid::Uuid::new_v4(),
+            user_id: None,
+            job_id: Some(job_id),
+            steps: vec![mk(S0), mk(S1)],
+            share_sandbox: false,
+            max_llm_tier: talos_workflow_engine_core::LlmTier::Tier2,
+            total_timeout: std::time::Duration::from_secs(20),
+            max_retries: 0,
+            backoff_ms: 0,
+            retry_condition: None,
+            retry_delay_expr: None,
+        };
+
+        dispatcher
+            .dispatch_chain(request)
+            .await
+            .expect("chain dispatch completes");
+        worker_task.await.unwrap();
+
+        let per_step = observed
+            .lock()
+            .await
+            .take()
+            .expect("worker saw per-step secrets");
+        assert_eq!(per_step.len(), 2, "one map per step");
+        assert_eq!(per_step[0].get("api/key").unwrap(), S0);
+        assert_eq!(per_step[1].get("api/key").unwrap(), S1);
+        assert!(
+            in_flight.is_empty(),
+            "pipeline seal context must be consumed"
         );
     }
 

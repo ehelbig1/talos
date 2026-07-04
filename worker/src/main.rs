@@ -734,15 +734,21 @@ async fn execute_job(
     }
 
     // RFC 0010 P3 (D3b): downgrade guard. Under `TALOS_ENVELOPE_SEALING=required`
-    // the worker refuses a legacy inline (`sealing == 0`) dispatch — the
-    // enforcement point that stops an on-wire downgrade from forcing the WSK
-    // envelope back on. Under `off`/`audit` (default) both schemes are handled.
-    if worker_sealing_required() && req.sealing != talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+    // the worker refuses a legacy inline dispatch that would DECRYPT a WSK
+    // envelope — the enforcement point that stops an on-wire downgrade from
+    // forcing the fleet-wide key back into use. A `sealing == 0` dispatch with an
+    // EMPTY `encrypted_secrets` decrypts nothing (a no-secret node), so it is
+    // allowed even under `required` — otherwise every secretless node (transforms,
+    // routers, …) would break. Only a non-empty WSK ciphertext under `required` is
+    // a refused downgrade. Under `off`/`audit` both schemes are handled.
+    if worker_sealing_required()
+        && req.sealing != talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+        && !req.encrypted_secrets.ciphertext.is_empty()
     {
         ::tracing::error!(
             target: "talos_security",
             job_id = %req.job_id,
-            "TALOS_ENVELOPE_SEALING=required but dispatch is sealing=0 (inline WSK) — refusing"
+            "TALOS_ENVELOPE_SEALING=required but dispatch carries a sealing=0 WSK envelope — refusing"
         );
         _span.end_error("envelope sealing required; inline dispatch refused");
         return failed_result(
@@ -777,8 +783,15 @@ async fn execute_job(
                 "sealing=1 dispatch requires a worker signing key",
             );
         };
-        match secret_claim::claim_secrets(nc, &req, worker_identity(), signing_key, &dvc.ed_keys)
-            .await
+        match secret_claim::claim_secrets(
+            nc,
+            req.job_id,
+            req.claim_inbox.as_deref(),
+            worker_identity(),
+            signing_key,
+            &dvc.ed_keys,
+        )
+        .await
         {
             Ok(map) => map,
             Err(e) => {
@@ -1065,6 +1078,9 @@ async fn execute_pipeline_job(
     req: PipelineJobRequest,
     runtime: Arc<TalosRuntime>,
     shared_key: talos_workflow_engine_core::WorkerKeyRing,
+    // RFC 0010 P3 (D3b): NATS client for the secret-claim round-trip when a
+    // pipeline dispatch arrives with `sealing == SEALING_CLAIM_ECIES`.
+    nc: &async_nats::Client,
 ) -> PipelineJobResult {
     use talos_workflow_job_protocol::JobStatus;
 
@@ -1094,33 +1110,39 @@ async fn execute_pipeline_job(
         };
     }
 
-    // RFC 0010 P3 (D3b) downgrade guard (defense in depth — the engine already
-    // refuses to DISPATCH pipelines under `required`). Pipeline steps have no
-    // claim-based sealing path yet, so under `TALOS_ENVELOPE_SEALING=required`
-    // any pipeline job that reaches a worker must be refused rather than
-    // silently WSK-decrypted — otherwise `required` would give a false "no
-    // fleet-wide decryption key on the worker" guarantee for pipelines.
-    if worker_sealing_required() {
+    // Helper for the fail-closed returns below (span mutation stays inline).
+    let fail = |msg: &str| PipelineJobResult {
+        crypto_scheme: 0,
+        job_id: req.job_id,
+        overall_status: JobStatus::Failed,
+        step_results: vec![],
+        final_output: serde_json::json!({ "error": msg }),
+        total_time_ms: start.elapsed().as_millis() as u64,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+    };
+
+    // RFC 0010 P3 (D3b) downgrade guard: under `TALOS_ENVELOPE_SEALING=required`
+    // refuse a legacy pipeline that would DECRYPT a WSK envelope in ANY step. A
+    // `sealing == 1` pipeline uses the claim path below; a `sealing == 0` pipeline
+    // whose steps all carry empty envelopes (no-secret steps) decrypts nothing and
+    // is allowed even under `required`. Only a non-empty WSK ciphertext under
+    // `required` is a refused downgrade.
+    if worker_sealing_required()
+        && req.sealing != talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+        && req
+            .steps
+            .iter()
+            .any(|s| !s.encrypted_secrets.ciphertext.is_empty())
+    {
         ::tracing::error!(
             target: "talos_security",
             job_id = %req.job_id,
-            "TALOS_ENVELOPE_SEALING=required: refusing pipeline job (per-step claim sealing \
-             is not yet implemented; pipelines would fall back to the inline WSK envelope)"
+            "TALOS_ENVELOPE_SEALING=required but a pipeline step carries a sealing=0 WSK envelope — refusing"
         );
-        _span.end_error("envelope sealing required; pipeline refused");
-        return PipelineJobResult {
-            crypto_scheme: 0,
-            job_id: req.job_id,
-            overall_status: JobStatus::Failed,
-            step_results: vec![],
-            final_output: serde_json::json!({
-                "error": "envelope sealing required; pipeline claim-sealing not yet supported"
-            }),
-            total_time_ms: start.elapsed().as_millis() as u64,
-            signature: vec![],
-            result_nonce: String::new(),
-            worker_id: String::new(),
-        };
+        _span.end_error("envelope sealing required; inline pipeline refused");
+        return fail("envelope sealing required; inline pipeline refused");
     }
 
     // Validate maximum pipeline timeout to prevent indefinitely tying up workers.
@@ -1150,12 +1172,62 @@ async fn execute_pipeline_job(
         };
     }
 
-    // Build PipelineStepSpecs by decrypting per-step secrets.
+    // RFC 0010 P3 (D3b): under claim-based sealing, ONE claim to the controller
+    // returns the per-step secrets vector (aligned index-for-index with
+    // `req.steps`). Fail-closed on any claim / verify / open / shape error — a
+    // pipeline whose secrets can't be obtained must not run secretless.
+    let claimed_secrets: Option<Vec<std::collections::HashMap<String, String>>> = if req.sealing
+        == talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+    {
+        let Some(signing_key) = worker_result_signing_key() else {
+            ::tracing::error!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                "sealing=1 pipeline requires TALOS_WORKER_SIGNING_KEY to sign the claim"
+            );
+            _span.end_error("sealing=1 requires a worker signing key");
+            return fail("sealing=1 pipeline requires a worker signing key");
+        };
+        match secret_claim::claim_secrets_raw(
+            nc,
+            req.job_id,
+            req.claim_inbox.as_deref(),
+            worker_identity(),
+            signing_key,
+            &dvc.ed_keys,
+        )
+        .await
+        {
+            Ok(raw) => {
+                match serde_json::from_slice::<Vec<std::collections::HashMap<String, String>>>(&raw)
+                {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        ::tracing::error!(target: "talos_security", job_id = %req.job_id, error = %e, "malformed pipeline claim payload");
+                        _span.end_error("malformed pipeline claim payload");
+                        return fail("malformed sealed pipeline secrets");
+                    }
+                }
+            }
+            Err(e) => {
+                ::tracing::error!(target: "talos_security", job_id = %req.job_id, error = %e, "RFC 0010 P3 pipeline secret claim failed");
+                _span.end_error("pipeline secret claim failed");
+                return fail("failed to obtain sealed pipeline secrets");
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build PipelineStepSpecs. Under claim-based sealing use the claimed per-step
+    // map for step `i`; otherwise decrypt the step's inline WSK envelope.
     // L-1: AAD = workflow_execution_id, shared across all steps in
     // this pipeline (matches the encryption-side binding).
     let mut step_specs: Vec<PipelineStepSpec> = Vec::with_capacity(req.steps.len());
-    for step in &req.steps {
-        let secrets = if step.encrypted_secrets.is_empty() {
+    for (i, step) in req.steps.iter().enumerate() {
+        let secrets = if let Some(ref per_step) = claimed_secrets {
+            per_step.get(i).cloned().unwrap_or_default()
+        } else if step.encrypted_secrets.is_empty() {
             std::collections::HashMap::new()
         } else {
             match step
@@ -2349,7 +2421,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
 
                                 let mut result =
-                                    execute_pipeline_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
+                                    execute_pipeline_job(&cx, req.clone(), runtime_clone, key_clone.clone(), &nc_clone).await;
 
                                 // L-11: bind worker identity for audit attribution.
                                 // RFC 0010 P2: Ed25519 when configured, else HMAC.

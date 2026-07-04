@@ -154,23 +154,6 @@ fn parse_claim_based_enabled(raw: Option<String>) -> bool {
     )
 }
 
-/// RFC 0010 P3 (D3b): is claim-based sealing in `required` (enforcement) mode?
-/// `required` refuses any legacy inline dispatch. Cached like
-/// [`claim_based_sealing_enabled`].
-pub(crate) fn envelope_sealing_required() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| parse_sealing_required(std::env::var("TALOS_ENVELOPE_SEALING").ok()))
-}
-
-/// Pure parser for [`envelope_sealing_required`] — only `required` (case-
-/// insensitive) is enforcement mode. Extracted for deterministic testing.
-fn parse_sealing_required(raw: Option<String>) -> bool {
-    matches!(
-        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("required")
-    )
-}
-
 /// The secret payload for one node dispatch, in whichever form the active sealing
 /// mode requires: the legacy inline WSK `encrypted` envelope, OR (when claim-based
 /// sealing is on) the resolved `plaintext` map for the dispatcher to register in
@@ -442,31 +425,22 @@ pub(crate) fn extract_vault_paths(config: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        filter_tier1_paths, parse_claim_based_enabled, parse_sealing_required,
-        retain_wire_safe_secrets,
-    };
+    use super::{filter_tier1_paths, parse_claim_based_enabled, retain_wire_safe_secrets};
     use std::collections::HashMap;
     use talos_workflow_engine_core::LlmTier;
 
     #[test]
-    fn sealing_mode_parsing() {
-        // off / unset / garbage → neither enabled nor required.
+    fn claim_based_sealing_mode_parsing() {
+        // off / unset / garbage → claim-based sealing NOT enabled.
         for v in [None, Some("off"), Some("nonsense"), Some("")] {
             let raw = v.map(std::string::ToString::to_string);
-            assert!(
-                !parse_claim_based_enabled(raw.clone()),
-                "{v:?} must not enable"
-            );
-            assert!(!parse_sealing_required(raw), "{v:?} must not be required");
+            assert!(!parse_claim_based_enabled(raw), "{v:?} must not enable");
         }
-        // audit → claim-based on, NOT required.
-        assert!(parse_claim_based_enabled(Some("audit".into())));
-        assert!(!parse_sealing_required(Some("audit".into())));
-        // required → both on. Case-insensitive + whitespace-tolerant.
-        for v in ["required", "REQUIRED", "  Required  "] {
+        // audit AND required both enable the claim-based resolve path (the engine
+        // resolves plaintext for both; enforcement of `required` is worker-side).
+        // Case-insensitive + whitespace-tolerant.
+        for v in ["audit", "AUDIT", "required", "REQUIRED", "  Required  "] {
             assert!(parse_claim_based_enabled(Some(v.into())), "{v} enables");
-            assert!(parse_sealing_required(Some(v.into())), "{v} is required");
         }
     }
 

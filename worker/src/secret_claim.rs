@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use talos_workflow_job_protocol::{
-    ClaimResponse, DispatchSigningKey, DispatchVerifyingKey, JobRequest, SecretClaim,
-    WorkerEphemeral,
+    ClaimResponse, DispatchSigningKey, DispatchVerifyingKey, SecretClaim, WorkerEphemeral,
 };
+use uuid::Uuid;
 
 /// How long the worker waits for the controller's `SealedSecrets` reply before
 /// giving up (and failing the job). The claim is an in-cluster request/reply;
@@ -68,19 +68,19 @@ impl std::fmt::Display for ClaimClientError {
 
 impl std::error::Error for ClaimClientError {}
 
-/// Generate the ephemeral keypair and build the signed `SecretClaim` for a
-/// dispatch. Returns the ephemeral (to open the reply with) and the serialized
-/// claim payload. Pure except for the ephemeral RNG.
+/// Generate the ephemeral keypair and build the signed `SecretClaim` for an
+/// execution. `exec_id` is the id the controller registered the seal context
+/// under (the dispatch `job_id` for both single-node and pipeline jobs). Returns
+/// the ephemeral (to open the reply with) and the serialized claim payload. Pure
+/// except for the ephemeral RNG.
 pub fn build_claim(
-    req: &JobRequest,
+    exec_id: Uuid,
     worker_id: &str,
     worker_signing_key: &DispatchSigningKey,
 ) -> Result<(WorkerEphemeral, Vec<u8>), ClaimClientError> {
     let we = WorkerEphemeral::generate();
-    // exec_id = job_id (unique per dispatch); the controller registered the seal
-    // context under this same id.
     let claim = SecretClaim::new_signed(
-        req.job_id,
+        exec_id,
         worker_id.to_string(),
         we.public_key(),
         worker_signing_key,
@@ -89,15 +89,18 @@ pub fn build_claim(
     Ok((we, payload))
 }
 
-/// Verify + open the controller's reply, returning the plaintext secrets map.
-/// Consumes the ephemeral (single-use → forward secrecy). Pure and testable.
-pub fn process_reply(
+/// Verify + open the controller's reply, returning the RAW opened plaintext
+/// bytes. Consumes the ephemeral (single-use → forward secrecy). The caller
+/// deserializes the bytes into whatever shape it sealed — a flat
+/// `HashMap<String,String>` (single-node) or a per-step
+/// `Vec<HashMap<String,String>>` (pipeline). Pure and testable.
+pub fn process_reply_raw(
     we: WorkerEphemeral,
-    req: &JobRequest,
+    exec_id: Uuid,
     worker_id: &str,
     controller_keys: &[DispatchVerifyingKey],
     reply_bytes: &[u8],
-) -> Result<HashMap<String, String>, ClaimClientError> {
+) -> Result<Vec<u8>, ClaimClientError> {
     if controller_keys.is_empty() {
         return Err(ClaimClientError::NoControllerKey);
     }
@@ -115,37 +118,47 @@ pub fn process_reply(
     {
         return Err(ClaimClientError::VerifyFailed);
     }
-    let plaintext = we
-        .open(
-            &sealed.epk_c,
-            req.job_id,
-            worker_id,
-            &sealed.ciphertext,
-            &sealed.nonce,
-        )
-        .map_err(ClaimClientError::OpenFailed)?;
+    we.open(
+        &sealed.epk_c,
+        exec_id,
+        worker_id,
+        &sealed.ciphertext,
+        &sealed.nonce,
+    )
+    .map_err(ClaimClientError::OpenFailed)
+}
+
+/// Verify + open the controller's reply into a flat secrets map (single-node
+/// convenience over [`process_reply_raw`]).
+pub fn process_reply(
+    we: WorkerEphemeral,
+    exec_id: Uuid,
+    worker_id: &str,
+    controller_keys: &[DispatchVerifyingKey],
+    reply_bytes: &[u8],
+) -> Result<HashMap<String, String>, ClaimClientError> {
+    let plaintext = process_reply_raw(we, exec_id, worker_id, controller_keys, reply_bytes)?;
     serde_json::from_slice(&plaintext).map_err(|e| ClaimClientError::Serde(e.to_string()))
 }
 
-/// Full claim round-trip over NATS: build the claim, request it on the
-/// dispatch's `claim_inbox`, and verify+open the reply. Returns the plaintext
-/// secrets map to load into the `SecretProvider`.
-pub async fn claim_secrets(
+/// Full claim round-trip over NATS returning the RAW opened plaintext bytes.
+/// `claim_inbox` is the subject the dispatch named (`None` ⇒ malformed dispatch).
+/// The caller deserializes the bytes into the shape it expects (flat map for a
+/// single node, per-step vector for a pipeline).
+pub async fn claim_secrets_raw(
     nc: &async_nats::Client,
-    req: &JobRequest,
+    exec_id: Uuid,
+    claim_inbox: Option<&str>,
     worker_id: &str,
     worker_signing_key: &DispatchSigningKey,
     controller_keys: &[DispatchVerifyingKey],
-) -> Result<HashMap<String, String>, ClaimClientError> {
-    let claim_inbox = req
-        .claim_inbox
-        .as_deref()
-        .ok_or(ClaimClientError::MissingClaimInbox)?;
+) -> Result<Vec<u8>, ClaimClientError> {
+    let claim_inbox = claim_inbox.ok_or(ClaimClientError::MissingClaimInbox)?;
     if controller_keys.is_empty() {
         return Err(ClaimClientError::NoControllerKey);
     }
 
-    let (we, payload) = build_claim(req, worker_id, worker_signing_key)?;
+    let (we, payload) = build_claim(exec_id, worker_id, worker_signing_key)?;
 
     let reply = tokio::time::timeout(
         CLAIM_TIMEOUT,
@@ -155,7 +168,29 @@ pub async fn claim_secrets(
     .map_err(|_| ClaimClientError::Transport("claim request timed out".to_string()))?
     .map_err(|e| ClaimClientError::Transport(e.to_string()))?;
 
-    process_reply(we, req, worker_id, controller_keys, &reply.payload)
+    process_reply_raw(we, exec_id, worker_id, controller_keys, &reply.payload)
+}
+
+/// Full claim round-trip over NATS returning a flat secrets map (single-node
+/// convenience over [`claim_secrets_raw`]).
+pub async fn claim_secrets(
+    nc: &async_nats::Client,
+    exec_id: Uuid,
+    claim_inbox: Option<&str>,
+    worker_id: &str,
+    worker_signing_key: &DispatchSigningKey,
+    controller_keys: &[DispatchVerifyingKey],
+) -> Result<HashMap<String, String>, ClaimClientError> {
+    let plaintext = claim_secrets_raw(
+        nc,
+        exec_id,
+        claim_inbox,
+        worker_id,
+        worker_signing_key,
+        controller_keys,
+    )
+    .await?;
+    serde_json::from_slice(&plaintext).map_err(|e| ClaimClientError::Serde(e.to_string()))
 }
 
 #[cfg(test)]
@@ -163,35 +198,15 @@ mod tests {
     use super::*;
     use talos_workflow_job_protocol::{seal_secrets, SealedSecrets};
 
-    // A JobRequest with the fields the claim path reads; the rest are defaults
-    // that don't affect the crypto.
-    fn dispatch(job_id: uuid::Uuid) -> JobRequest {
-        let mut req: JobRequest = serde_json::from_value(serde_json::json!({
-            "job_id": job_id,
-            "workflow_execution_id": uuid::Uuid::new_v4(),
-            "module_uri": "redis:wasm:x",
-            "input_payload": {},
-            "timeout_ms": 1000,
-            "allowed_hosts": [],
-            "signature": [],
-            "job_nonce": "0:00",
-        }))
-        .expect("construct JobRequest");
-        req.sealing = talos_workflow_job_protocol::SEALING_CLAIM_ECIES;
-        req.claim_inbox = Some("talos.claims.replica-1".to_string());
-        req
-    }
-
     #[test]
     fn build_and_process_roundtrip_against_simulated_controller() {
         let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
         let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
         let controller_vk = controller_sk.verifying_key();
         let job_id = uuid::Uuid::new_v4();
-        let req = dispatch(job_id);
 
         // Worker builds the claim.
-        let (we, claim_payload) = build_claim(&req, "worker-7", &worker_sk).unwrap();
+        let (we, claim_payload) = build_claim(job_id, "worker-7", &worker_sk).unwrap();
         let claim: SecretClaim = serde_json::from_slice(&claim_payload).unwrap();
         assert_eq!(claim.exec_id, job_id);
 
@@ -207,7 +222,7 @@ mod tests {
         let reply = serde_json::to_vec(&ClaimResponse::Sealed(sealed)).unwrap();
 
         // Worker opens the reply.
-        let map = process_reply(we, &req, "worker-7", &[controller_vk], &reply).unwrap();
+        let map = process_reply(we, job_id, "worker-7", &[controller_vk], &reply).unwrap();
         assert_eq!(map.get("anthropic/api_key").unwrap(), "sk-ant-x");
     }
 
@@ -215,13 +230,13 @@ mod tests {
     fn rejected_reply_fails_closed() {
         let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
         let controller_vk = DispatchSigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
-        let req = dispatch(uuid::Uuid::new_v4());
-        let (we, _payload) = build_claim(&req, "w", &worker_sk).unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        let (we, _payload) = build_claim(job_id, "w", &worker_sk).unwrap();
         let reply = serde_json::to_vec(&ClaimResponse::Rejected {
             reason: "unknown execution".to_string(),
         })
         .unwrap();
-        let err = process_reply(we, &req, "w", &[controller_vk], &reply).unwrap_err();
+        let err = process_reply(we, job_id, "w", &[controller_vk], &reply).unwrap_err();
         assert!(matches!(err, ClaimClientError::Rejected(_)));
     }
 
@@ -231,14 +246,13 @@ mod tests {
         let real_controller = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
         let wrong_vk = DispatchSigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
         let job_id = uuid::Uuid::new_v4();
-        let req = dispatch(job_id);
-        let (we, claim_payload) = build_claim(&req, "w", &worker_sk).unwrap();
+        let (we, claim_payload) = build_claim(job_id, "w", &worker_sk).unwrap();
         let claim: SecretClaim = serde_json::from_slice(&claim_payload).unwrap();
         let out = seal_secrets(&claim.epk_w, claim.exec_id, &claim.worker_id, b"{}").unwrap();
         let sealed = SealedSecrets::new_signed(claim.exec_id, out, &real_controller);
         let reply = serde_json::to_vec(&ClaimResponse::Sealed(sealed)).unwrap();
         // Worker only trusts `wrong_vk` → verify fails.
-        let err = process_reply(we, &req, "w", &[wrong_vk], &reply).unwrap_err();
+        let err = process_reply(we, job_id, "w", &[wrong_vk], &reply).unwrap_err();
         assert!(matches!(err, ClaimClientError::VerifyFailed));
     }
 }

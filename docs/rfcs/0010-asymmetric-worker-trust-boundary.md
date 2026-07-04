@@ -320,17 +320,27 @@ envelope deploy-ordering rule).
   >    The `supports_sealing` capability bit is informational here, not a
   >    per-dispatch gate.
   >
-  > **`required`-mode coverage (2026-07-04 follow-up).** Single-node AND **loop-body**
-  > dispatches both seal under the flag — they share the `build_dispatch_secrets_for`
-  > decision helper, so a loop body is no longer left inline (which would have failed
-  > the worker downgrade guard under `required`). **Pipelines** have no per-step claim
-  > path yet, so they are **fail-closed** under `required`: the engine refuses to
-  > dispatch a pipeline (`run_pipeline_chain_dispatch` returns an error) and the worker
-  > refuses one defensively (`execute_pipeline_job`), rather than silently shipping a
-  > WSK envelope that would break the enforcement promise. So `required` is safe to
-  > enable for single-node + loop workflows today; per-step pipeline claim-sealing is
-  > the remaining follow-up before pipelines can run under `required`. `audit`/`off`
-  > leave pipelines on the inline envelope unchanged.
+  > **`required`-mode coverage (2026-07-04).** ALL workflow shapes now seal under
+  > the flag — single-node, **loop-body**, AND **pipeline** dispatches:
+  > - Single-node + loop-body share the `build_dispatch_secrets_for` decision helper
+  >   (a loop body is no longer left inline).
+  > - **Pipelines** seal per step in ONE claim: the engine resolves each step's
+  >   plaintext, the dispatcher (`dispatch_chain`) collects them into a per-step
+  >   `Vec<HashMap<String,String>>` sealed as a single `InFlightSeals` entry keyed on
+  >   the pipeline `job_id` (`SealContext::from_bytes`), stamps `PipelineJobRequest`
+  >   `sealing=1`/`claim_inbox`/`secret_paths`, and clears every step's inline
+  >   envelope. The worker (`execute_pipeline_job`) does ONE `claim_secrets_raw`,
+  >   deserializes the per-step vector, and feeds step `i` its own map — so per-step
+  >   isolation is preserved with a single round-trip.
+  > - **Downgrade guard is precise**: the worker refuses a `sealing=0` dispatch under
+  >   `required` ONLY when it carries a non-empty WSK envelope (a real decryption). A
+  >   no-secret node/step (empty envelope) decrypts nothing and is allowed, so
+  >   secretless transforms/routers don't break under `required`.
+  >
+  > `required` is now safe to enable for every workflow shape. Validated end-to-end
+  > over live NATS: `full_claim_loop_over_live_nats` (single-node) and
+  > `full_pipeline_claim_loop_over_live_nats` (2-step pipeline, per-step secrets), both
+  > asserting no plaintext on the wire.
   >
   > **Remaining before production enablement:** run the live-NATS integration
   > test (+ a Redis lease) against a real cluster, then a canary with

@@ -279,6 +279,7 @@ fn pipeline_job_request_json_snapshot() {
         crypto_scheme: 0,
         sealing: 0,
         secret_paths: Vec::new(),
+        claim_inbox: None,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0010),
         workflow_execution_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0011),
         user_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0012),

@@ -3261,6 +3261,16 @@ pub struct PipelineJobRequest {
     /// `sealing == SEALING_CLAIM_ECIES`. See [`JobRequest::secret_paths`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secret_paths: Vec<String>,
+
+    /// RFC 0010 P3 (D3b): the subject the worker sends its `SecretClaim` to
+    /// (the controller replica's claim-responder inbox) when
+    /// `sealing == SEALING_CLAIM_ECIES`. The claim delivers ONE sealed payload —
+    /// a per-step `Vec<HashMap<String,String>>` aligned to `steps` — so the whole
+    /// pipeline is a single claim round-trip. Bound into `signing_payload()` when
+    /// sealing is non-zero (same reasoning as [`JobRequest::claim_inbox`]); omitted
+    /// from wire JSON when `None` so a legacy pipeline message is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_inbox: Option<String>,
 }
 
 impl PipelineJobRequest {
@@ -3459,7 +3469,17 @@ impl PipelineJobRequest {
             use std::fmt::Write as _;
             let mut paths = self.secret_paths.clone();
             paths.sort_unstable();
-            let _ = write!(payload, ":{}:{}", self.sealing, lp(&paths.join(",")));
+            // Bind claim_inbox too (the worker sends its ephemeral-key-bearing
+            // claim here — a tamperer must not redirect it). Appended after
+            // sealing/secret_paths, still inside the `sealing != 0` guard so
+            // legacy bytes are unchanged.
+            let _ = write!(
+                payload,
+                ":{}:{}:{}",
+                self.sealing,
+                lp(&paths.join(",")),
+                lp(self.claim_inbox.as_deref().unwrap_or("-")),
+            );
         }
 
         payload.into_bytes()
@@ -5523,6 +5543,7 @@ mod tests {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             steps: vec![],
@@ -5733,6 +5754,7 @@ mod tests {
             crypto_scheme: 0,
             sealing: 0,
             secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             steps,

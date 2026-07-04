@@ -119,6 +119,19 @@ impl SealContext {
         })
     }
 
+    /// Seal a pre-serialized JSON payload directly. Used by the pipeline path,
+    /// where one claim delivers a per-step `Vec<HashMap<String,String>>` (aligned
+    /// to the pipeline's steps) rather than a single flat map — the caller
+    /// serializes that structure and hands the bytes here. The worker opens the
+    /// same bytes and deserializes them back into the per-step vector. The bytes
+    /// are zeroized on drop.
+    #[must_use]
+    pub fn from_bytes(json: Vec<u8>) -> Self {
+        Self {
+            secrets_json: Zeroizing::new(json),
+        }
+    }
+
     /// The serialized secret bytes to seal (borrowed; not cloned).
     fn bytes(&self) -> &[u8] {
         &self.secrets_json
