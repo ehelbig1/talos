@@ -282,6 +282,11 @@ async fn main() -> anyhow::Result<()> {
             "generate-worker-trust-keypair" => {
                 return run_generate_worker_trust_keypair_cli(&args[2..]);
             }
+            "register-worker-identity"
+            | "list-worker-identities"
+            | "deactivate-worker-identity" => {
+                return run_worker_identity_cli(sub, &args[2..]).await;
+            }
             "--help" | "-h" => {
                 println!("Usage:");
                 println!("  controller                            Run the HTTP server (default)");
@@ -302,6 +307,24 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!(
                     "                                        boundary and print the env block."
+                );
+                println!(
+                    "  controller register-worker-identity --worker-id <id> --public-key <hex>"
+                );
+                println!(
+                    "                                        [--supports-sealing]  Operator-register"
+                );
+                println!(
+                    "                                        a worker's Ed25519 key in the DB registry."
+                );
+                println!(
+                    "  controller list-worker-identities     List the DB worker-identity registry."
+                );
+                println!(
+                    "  controller deactivate-worker-identity --worker-id <id> --public-key <hex>"
+                );
+                println!(
+                    "                                        Soft-retire one registered key (rotation)."
                 );
                 return Ok(());
             }
@@ -5903,6 +5926,107 @@ async fn refresh_worker_key_overlay(
     let installed = mapped.len();
     talos_workflow_job_protocol::set_dynamic_worker_public_keys(mapped);
     Ok(installed)
+}
+
+// ---------- worker-identity registry subcommands (RFC 0010 P2 inc.4) --------
+//
+// Operator-facing management of the `worker_identities` DB registry. Workers are
+// credential-free (no Postgres), so THEY self-register over the HTTP endpoint;
+// these subcommands are the OPERATOR path — pre-registering keys, auditing the
+// registry, and retiring rotated-out keys — run from a context that already
+// holds DB credentials (the controller image as a one-shot Job). Direct DB
+// access is its own authorization, so no proof-of-possession is required here
+// (that gate exists on the network self-registration endpoint).
+async fn run_worker_identity_cli(sub: &str, args: &[String]) -> anyhow::Result<()> {
+    use talos_worker_identity_repository::{RegisterOutcome, WorkerIdentityRepository};
+
+    let mut worker_id: Option<String> = None;
+    let mut public_key_hex: Option<String> = None;
+    let mut supports_sealing = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--worker-id" => {
+                worker_id = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--worker-id requires a value"))?
+                        .clone(),
+                );
+            }
+            "--public-key" => {
+                public_key_hex = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--public-key requires a value"))?
+                        .clone(),
+                );
+            }
+            "--supports-sealing" => supports_sealing = true,
+            other => anyhow::bail!("unknown {sub} flag: {other}"),
+        }
+    }
+
+    let pool = crate::db::init_pool().await?;
+    let repo = WorkerIdentityRepository::new(pool);
+
+    // Shared parse+validate for the two subcommands that take a key.
+    let resolve_key =
+        |worker_id: &Option<String>, hex: &Option<String>| -> anyhow::Result<(String, [u8; 32])> {
+            let wid = worker_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--worker-id is required"))?;
+            talos_workflow_job_protocol::validate_worker_id(&wid)
+                .map_err(|e| anyhow::anyhow!("invalid --worker-id: {e}"))?;
+            let hex = hex.clone().ok_or_else(|| {
+                anyhow::anyhow!("--public-key is required (64-char hex Ed25519 key)")
+            })?;
+            // Parse through the canonical loader so a non-point is rejected here, not
+            // at verify time — the stored key is guaranteed a valid Ed25519 point.
+            let vk = talos_workflow_job_protocol::parse_ed25519_verifying_key_hex(&hex)
+                .map_err(|e| anyhow::anyhow!("invalid --public-key: {e}"))?;
+            Ok((wid, vk.to_bytes()))
+        };
+
+    match sub {
+        "register-worker-identity" => {
+            let (wid, pk) = resolve_key(&worker_id, &public_key_hex)?;
+            match repo.register(&wid, &pk, supports_sealing).await? {
+                RegisterOutcome::Registered => {
+                    println!("registered worker '{wid}' (supports_sealing={supports_sealing})");
+                }
+                RegisterOutcome::CapReached => anyhow::bail!(
+                    "worker '{wid}' already holds the maximum active keys \
+                     ({}); deactivate one before adding another",
+                    talos_worker_identity_repository::MAX_ACTIVE_KEYS_PER_WORKER
+                ),
+            }
+        }
+        "deactivate-worker-identity" => {
+            let (wid, pk) = resolve_key(&worker_id, &public_key_hex)?;
+            if repo.deactivate(&wid, &pk).await? {
+                println!("deactivated one key for worker '{wid}'");
+            } else {
+                println!("no active key matched for worker '{wid}' (already retired or absent)");
+            }
+        }
+        "list-worker-identities" => {
+            let rows = repo.list().await?;
+            if rows.is_empty() {
+                println!("(worker-identity registry is empty)");
+            }
+            for r in rows {
+                println!(
+                    "{wid}\t{key}\tsealing={sealing}\tactive={active}\tlast_seen={seen}",
+                    wid = r.worker_id,
+                    key = hex::encode(r.public_key),
+                    sealing = r.supports_sealing,
+                    active = r.active,
+                    seen = r.last_seen_at.to_rfc3339(),
+                );
+            }
+        }
+        _ => unreachable!("dispatch guarded by the match in main()"),
+    }
+    Ok(())
 }
 
 // ---------- `controller generate-worker-trust-keypair` subcommand ----------

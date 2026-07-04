@@ -455,6 +455,96 @@ pub fn parse_ed25519_verifying_key_bytes(bytes: &[u8; 32]) -> Result<DispatchVer
         .map_err(|_| "worker public key: not a valid Ed25519 point".to_string())
 }
 
+/// Domain-separation prefix for the worker-registration proof-of-possession
+/// message (RFC 0010 P2 inc.4). A version bump invalidates every older proof.
+const WORKER_REGISTRATION_POP_DOMAIN: &[u8] = b"talos/worker-key-registration/v1";
+
+/// Build the canonical proof-of-possession message a worker signs to prove it
+/// holds the private key for `public_key` when self-registering over the network.
+/// Length-prefixed, domain-separated, fixed-little-endian so two distinct field
+/// tuples can never collide onto the same bytes. Pure and deterministic.
+#[must_use]
+pub fn worker_registration_pop_message(
+    worker_id: &str,
+    public_key: &[u8; 32],
+    supports_sealing: bool,
+    issued_at_ms: u64,
+    nonce: &str,
+) -> Vec<u8> {
+    let wid = worker_id.as_bytes();
+    let non = nonce.as_bytes();
+    let mut msg = Vec::with_capacity(
+        WORKER_REGISTRATION_POP_DOMAIN.len() + 8 + wid.len() + 32 + 1 + 8 + 8 + non.len(),
+    );
+    msg.extend_from_slice(WORKER_REGISTRATION_POP_DOMAIN);
+    msg.extend_from_slice(&(wid.len() as u64).to_le_bytes());
+    msg.extend_from_slice(wid);
+    msg.extend_from_slice(public_key);
+    msg.push(u8::from(supports_sealing));
+    msg.extend_from_slice(&issued_at_ms.to_le_bytes());
+    msg.extend_from_slice(&(non.len() as u64).to_le_bytes());
+    msg.extend_from_slice(non);
+    msg
+}
+
+/// Sign a worker-registration proof-of-possession with the worker's Ed25519
+/// signing key; returns the 64-byte signature. Used by the worker's boot-time
+/// self-registration client. The controller checks it with
+/// [`verify_worker_registration_proof`].
+#[must_use]
+pub fn sign_worker_registration_proof(
+    signing_key: &DispatchSigningKey,
+    worker_id: &str,
+    public_key: &[u8; 32],
+    supports_sealing: bool,
+    issued_at_ms: u64,
+    nonce: &str,
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let msg = worker_registration_pop_message(
+        worker_id,
+        public_key,
+        supports_sealing,
+        issued_at_ms,
+        nonce,
+    );
+    signing_key.sign(&msg).to_bytes().to_vec()
+}
+
+/// Verify a worker-registration proof-of-possession: `proof` MUST be a valid
+/// Ed25519 signature by `public_key` over the canonical message for these exact
+/// fields. Proves the registrant holds the private key for the key it registers,
+/// so it cannot register a public key it does not control, nor alter any signed
+/// field without invalidating the proof. Uses `verify_strict` (rejects
+/// small-order keys and signature malleability). Fails closed on a malformed
+/// signature or any field mismatch. Does NOT check freshness or caller
+/// authorization — the endpoint layers a bearer-token gate and a freshness
+/// window on top.
+pub fn verify_worker_registration_proof(
+    public_key: &[u8; 32],
+    worker_id: &str,
+    supports_sealing: bool,
+    issued_at_ms: u64,
+    nonce: &str,
+    proof: &[u8],
+) -> Result<(), String> {
+    let vk = DispatchVerifyingKey::from_bytes(public_key)
+        .map_err(|_| "registration proof: public_key is not a valid Ed25519 point".to_string())?;
+    let sig_bytes: [u8; 64] = proof
+        .try_into()
+        .map_err(|_| "registration proof: signature must be 64 bytes".to_string())?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let msg = worker_registration_pop_message(
+        worker_id,
+        public_key,
+        supports_sealing,
+        issued_at_ms,
+        nonce,
+    );
+    vk.verify_strict(&msg, &sig)
+        .map_err(|_| "registration proof: signature verification failed".to_string())
+}
+
 /// Parse a 32-byte Ed25519 **private** (signing) key seed from hex. Used by the
 /// controller to load its dispatch signing key. The seed is secret — callers
 /// must source it from a Secret / KMS, never a plaintext config committed to
@@ -4929,6 +5019,60 @@ mod tests {
         // Wrong lengths fail closed.
         assert!(parse_ed25519_verifying_key_hex("deadbeef").is_err());
         assert!(parse_ed25519_signing_key_hex("").is_err());
+    }
+
+    #[test]
+    fn worker_registration_proof_roundtrip_and_field_binding() {
+        let sk = ed_keypair();
+        let pk = sk.verifying_key().to_bytes();
+        let (wid, sealing, ts, nonce) = ("worker-9", true, 1_700_000_000_000u64, "nonce-abc");
+
+        let proof = sign_worker_registration_proof(&sk, wid, &pk, sealing, ts, nonce);
+        assert_eq!(proof.len(), 64, "Ed25519 signature is 64 bytes");
+        verify_worker_registration_proof(&pk, wid, sealing, ts, nonce, &proof)
+            .expect("a faithfully-signed proof verifies");
+
+        // EVERY signed field is bound — flipping any one breaks verification.
+        assert!(
+            verify_worker_registration_proof(&pk, "worker-8", sealing, ts, nonce, &proof).is_err()
+        );
+        assert!(verify_worker_registration_proof(&pk, wid, !sealing, ts, nonce, &proof).is_err());
+        assert!(
+            verify_worker_registration_proof(&pk, wid, sealing, ts + 1, nonce, &proof).is_err()
+        );
+        assert!(
+            verify_worker_registration_proof(&pk, wid, sealing, ts, "nonce-xyz", &proof).is_err()
+        );
+
+        // A proof for a DIFFERENT key does not verify against this key — the
+        // registrant can only prove possession of a key it actually holds, so it
+        // cannot register another party's (or another worker's) public key.
+        let other_pk = ed_keypair().verifying_key().to_bytes();
+        assert!(
+            verify_worker_registration_proof(&other_pk, wid, sealing, ts, nonce, &proof).is_err()
+        );
+
+        // Tampered / malformed signatures fail closed.
+        let mut bad = proof.clone();
+        bad[0] ^= 0x01;
+        assert!(verify_worker_registration_proof(&pk, wid, sealing, ts, nonce, &bad).is_err());
+        assert!(
+            verify_worker_registration_proof(&pk, wid, sealing, ts, nonce, &proof[..63]).is_err()
+        );
+        // A non-point public_key is rejected before any verify.
+        assert!(
+            verify_worker_registration_proof(&[2u8; 32], wid, sealing, ts, nonce, &proof).is_err()
+        );
+    }
+
+    #[test]
+    fn worker_registration_pop_message_is_unambiguous() {
+        // Length-prefixing prevents a field-boundary collision: moving a byte
+        // from the end of worker_id to the start of nonce must change the bytes.
+        let pk = [7u8; 32];
+        let a = worker_registration_pop_message("ab", &pk, false, 1, "cd");
+        let b = worker_registration_pop_message("abc", &pk, false, 1, "d");
+        assert_ne!(a, b, "ambiguous concatenation would make these equal");
     }
 
     #[test]
