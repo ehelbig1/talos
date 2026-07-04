@@ -1,6 +1,6 @@
 # RFC 0010 — Asymmetric worker-trust boundary
 
-**Status:** In progress (P1 landing)
+**Status:** In progress — P1 + P2 (inc.1–3) landed; D3b chosen for P3 (spec below)
 **Author:** Codebase review follow-up
 **Date:** 2026-07-03
 
@@ -114,27 +114,39 @@ signed, non-guest-controllable `worker_id` / `actor_id`.
   worker identities. Registration (D2) still publishes only the *public* half.
 - **Alternative — keep per-worker HMAC:** rejected (theater, per Context).
 
-### D3 — Secret-envelope sealing (the hard part)
+### D3 — Secret-envelope sealing (the hard part) — **CHOSEN: D3b**
 
 The worker must open per-job secrets without a fleet-wide decryption key. Two
-viable shapes; **pick one in the Open Questions before P3**:
+shapes were considered; **D3b is chosen** (decision recorded 2026-07-04; see the
+full protocol in [P3 detailed design](#p3-detailed-design--d3b-claimlease-envelope-sealing)):
 
-- **D3a — Seal to the dequeuing worker's X25519 public key (ECIES).** The
+- **D3a — Seal to the dequeuing worker's *static* X25519 public key (ECIES).** The
   controller encrypts each job's envelope to the *specific* worker that will run
   it. Requires **directed dispatch** (publish to a per-worker subject) instead of
-  a NATS queue group, trading away automatic load-balancing for per-job
-  confidentiality. Fits a scheduler that picks the worker.
-- **D3b — Per-execution ephemeral sealing.** The worker sends an ephemeral X25519
-  public key as part of claiming a job (a signed "claim" message under D2); the
-  controller seals the envelope to that ephemeral key in the reply. Preserves
-  queue-group load-balancing (any worker can claim) at the cost of an extra
-  round-trip per job and a claim/lease protocol.
+  a NATS queue group, trading away automatic load-balancing. **Rejected on two
+  counts:** (1) *security* — sealing to a long-lived recipient key has **no
+  forward secrecy**; a sandbox escape that recovers the static X25519 private key
+  decrypts *every envelope ever sealed to that worker*, including ciphertexts an
+  attacker captured off the bus earlier. (2) *architecture* — today's dispatch is
+  a **NATS queue group** (`{prefix}.jobs.{uid}`, the controller does not pick the
+  worker); D3a forces the controller to become a scheduler and loses free
+  load-balancing + failover (a job stranded on a worker that dies between publish
+  and dequeue).
+- **D3b — Per-execution ephemeral sealing (CHOSEN).** The worker generates a fresh
+  ephemeral X25519 keypair per execution and sends the public half in a "claim"
+  message signed with its long-term D2 worker identity; the controller verifies
+  the claim, then seals the envelope to that ephemeral key. **Forward secrecy**
+  (ephemeral–ephemeral ECDH) bounds a key compromise to the *single execution*
+  whose ephemeral secret leaks — exactly the RFC's stated goal. **Preserves the
+  queue-group model** unchanged (any worker claims). Cost: one added control-plane
+  round-trip per job and a claim/lease state machine — both analysed and bounded
+  in the detailed design below.
 
 - **Alternative — keep the symmetric envelope but bound its exposure:** partial
-  credit. Even sealing only *reduces* exposure to in-flight jobs; the current
-  per-job AAD-derived envelope key (`envelope-aead/v2-per-job`) already limits a
-  *leaked ciphertext* to one job, but not a *leaked root* — D3 is what closes the
-  root exposure.
+  credit, and the **legitimate fallback if P3 is deferred.** Even sealing only
+  *reduces* exposure to in-flight jobs; the current per-job AAD-derived envelope
+  key (`envelope-aead/v2-per-job`) already limits a *leaked ciphertext* to one
+  job, but not a *leaked root* — D3b is what closes the root exposure.
 
 ### D4 — Wire-format versioning + verify-once discipline
 
@@ -212,13 +224,256 @@ envelope deploy-ordering rule).
   > **Remaining P2 increment:** (4) the `worker_identities` registration table +
   > endpoint for the autoscaling fleet (the `TALOS_WORKER_PUBLIC_KEYS`
   > config-map resolver covers the static case first).
-- **P3 — Envelope sealing (D3a or D3b).** Land the chosen sealing scheme behind
-  `TALOS_ENVELOPE_SEALING`. This is the phase that removes the last
-  root-equivalent decryption key from the worker.
+- **P3 — Envelope sealing (D3b, chosen).** Land the claim/lease ephemeral-sealing
+  scheme behind `TALOS_ENVELOPE_SEALING`. This is the phase that removes the last
+  root-equivalent *secret-decryption* key from the worker. **Full protocol spec:**
+  [P3 detailed design](#p3-detailed-design--d3b-claimlease-envelope-sealing) below.
+  Gradual per-worker rollout depends on the P2 inc.4 `worker_identities`
+  capability bit; an all-at-once fleet flip does not (see the rollout subsection).
 - **P4 — Enforcement flip.** Once all workers run Ed25519 + sealed envelopes, set
   `TALOS_DISPATCH_SCHEME=ed25519-only` / refuse legacy HMAC and stop distributing
   `WORKER_SHARED_KEY` to workers entirely. Loud SIEM log on any legacy-scheme
   message during the window (mirror the env-KEK / RLS guard style).
+
+## P3 detailed design — D3b claim/lease envelope sealing
+
+This section is the implementation spec for P3. It is deliberately concrete: the
+envelope leg is the highest-blast-radius change in the RFC (it sits on the signed
+data plane `CLAUDE.md` flags as total-outage-prone, r300/r301), so the message
+shapes, state machine, and failure recovery are pinned down here before any code.
+
+### What changes, and what does not
+
+**Changes:** *only the secret-delivery leg.* Today the controller pre-seals the
+job's secrets under a `WORKER_SHARED_KEY` (WSK) HKDF subkey and embeds the
+`EncryptedSecrets { ciphertext, nonce }` inside the `JobRequest` at publish time;
+the worker opens it with the same fleet-wide root. Under D3b the `JobRequest`
+carries **no sealed secrets** — instead the worker claims the job with a fresh
+ephemeral X25519 public key and the controller seals to *that* key.
+
+**Unchanged:** the `JobResult` / `PipelineJobResult` signing path (P2 inc.1/2),
+the five signed RPC protocols (P2 inc.3), dispatch signing (P1), the replay-nonce
+guard (finding #2), the checkpoint AEAD (`checkpoint-aead/v2-per-execution`) and
+OTLP-header folds — those are **separate WSK derivations** (per `CLAUDE.md`) that
+P3 does **not** close and does **not** need to. P3's scope is precisely: *remove
+WSK as a secret-decryption root on the worker.* After P3 + P4, WSK is no longer
+distributed for signing (P2) or secret-sealing (P3); any residual WSK-derived
+material (checkpoints) is tracked separately and called out as a known non-goal
+here so nobody reads P4 as "WSK fully gone."
+
+### Message flow
+
+Four messages replace today's two. "RTT+1" = one added control-plane round-trip.
+
+```
+  Controller                         NATS                          Worker (queue group)
+     │                                                                   │
+  1. │ JobDispatch (no secrets,        ──▶  {prefix}.jobs.{uid}  ──▶      │  dequeue (LB picks one)
+     │   secret_paths, exec_id,             (queue group)                │  verify controller Ed25519 sig
+     │   reply=R1)  Ed25519-signed                                       │  gen ephemeral (esk_w, epk_w)
+     │                                                                   │
+  2. │            claim on R1  ◀──────────────────────────────────────  │  SecretClaim{exec_id, worker_id,
+     │  verify worker Ed25519 sig (D2 registered key)                    │    epk_w, claim_nonce}
+     │  CAS lease exec_id: dispatched → claimed_by(worker_id)            │    Ed25519-signed (long-term)
+     │  seal secrets to epk_w (ephemeral-ephemeral ECDH)                 │
+     │                                                                   │
+  3. │  SealedSecrets{exec_id, epk_c,  ──▶  reply to claim (R2)  ──▶      │  verify controller sig
+     │    ciphertext, nonce}                                             │  ECDH(esk_w, epk_c) → open
+     │    Ed25519-signed                                                 │  run job; zeroize esk_w
+     │                                                                   │
+  4. │            JobResult  ◀─────────────────────────────────────────  │  (unchanged P2 path)
+     │  verify_dispatch (Ed25519-or-HMAC)                                │  Ed25519-signed by worker
+```
+
+Messages 2 and 3 are the added round-trip. Message 1 is the existing dispatch
+minus the inline envelope plus a `secret_paths` list and a `sealing` discriminant;
+message 4 is the existing result, untouched.
+
+### New wire types (append-only, `#[serde(default)]`)
+
+Per the D4 wire-stability rule, every new field is appended and defaulted so a
+scheme-0 (inline-WSK) message stays byte-identical.
+
+- **`JobRequest` / `PipelineJobRequest` gain:**
+  - `sealing: u8` (default `0`) — `0` = inline WSK envelope (legacy, today);
+    `1` = claim-based ECIES (D3b). Bound into the dispatch signing payload (it is
+    security-relevant: an attacker must not downgrade `1`→`0` to force the worker
+    back onto a WSK envelope, so it is appended to the signed bytes exactly like
+    `crypto_scheme` was).
+  - `secret_paths: Vec<String>` (default empty) — the vault paths this job is
+    permitted to resolve, sent in the clear (paths are not secrets; values are).
+    Only populated when `sealing == 1`; the controller resolves + seals the
+    *values* on claim. Reuses the existing per-module allowlist
+    (`job_protocol::vault_path_permitted`) so the claim can't widen scope.
+  - When `sealing == 1`, `encrypted_secrets` is `EncryptedSecrets::empty()`.
+- **`SecretClaim` (new signed message, worker→controller):**
+  `{ exec_id: Uuid, worker_id: String, epk_w: [u8;32], claim_nonce: String,
+  issued_at_ms: u64, crypto_scheme: u8, signature: Vec<u8> }`. Signed with the
+  worker's **long-term** D2 Ed25519 key (NOT the ephemeral key) — this is the
+  binding that authenticates *who* is claiming; the ephemeral key only provides
+  confidentiality. Verified via `job_protocol::worker_public_keys(worker_id)`,
+  reusing the P2 registry verbatim. Carries a nonce + timestamp so the existing
+  freshness window + replay-nonce guard apply unchanged.
+- **`SealedSecrets` (new signed message, controller→worker):**
+  `{ exec_id: Uuid, epk_c: [u8;32], ciphertext: Vec<u8>, nonce: [u8;12],
+  issued_at_ms: u64, signature: Vec<u8> }`. Signed with the controller's P1
+  Ed25519 key; the worker verifies with `TALOS_CONTROLLER_PUBLIC_KEY` (same key
+  already pinned for dispatch). The `epk_c` is the controller's per-seal ephemeral
+  X25519 public key.
+
+### Cryptographic construction (the seal)
+
+Ephemeral–ephemeral X25519 ECDH so **both** ends contribute forward secrecy;
+worker identity is bound out-of-band by the Ed25519 claim signature (clean
+separation: **Ed25519 authenticates *who*, X25519 provides *confidentiality +
+FS***). No new primitive families — all four crates are already in-tree
+(`ed25519-dalek`, `aes-gcm`, `hkdf`; add `x25519-dalek`, same dalek family).
+
+```
+worker:      (esk_w, epk_w) = X25519::generate()          # per execution, zeroized after open
+controller:  (esk_c, epk_c) = X25519::generate()          # per seal
+shared:      ss   = X25519(esk_c, epk_w)  ==  X25519(esk_w, epk_c)
+             key  = HKDF-SHA256(ikm = ss,
+                                salt = exec_id.as_bytes(),
+                                info = b"talos/envelope-seal/v3-ecies")   # 32 bytes
+             aad  = exec_id || worker_id || epk_w          # transposition-proof binding
+             ct   = AES-256-GCM(key, nonce=random-96-bit, plaintext=secrets_json, aad)
+```
+
+`ss` MUST be rejected if it is the all-zero output (contributory-behaviour check —
+`x25519-dalek` returns a zero shared secret for low-order points; fail closed).
+The AAD binds the ciphertext to the exact `(execution, worker, ephemeral key)`, so
+a `SealedSecrets` cannot be replayed against a different execution or a different
+claim even by a party who captured it.
+
+### Security properties (each tied to the threat)
+
+1. **Ephemeral-key authenticity (the critical one).** `epk_w` is signed *inside*
+   the `SecretClaim` by the worker's registered long-term Ed25519 key. The
+   controller verifies that signature before sealing. Without this, a rogue
+   worker or an on-bus attacker substitutes its own `epk_w` and the controller
+   seals the secrets straight to the attacker. This is the property that makes
+   the ephemeral-ephemeral construction safe.
+2. **Forward secrecy (the reason D3b beats D3a).** `esk_w` and `esk_c` are
+   per-execution/per-seal and zeroized after use. A later compromise of the
+   worker's long-term Ed25519 key — or of the controller's — does **not** decrypt
+   any captured past `SealedSecrets`; the ECDH secrets that opened them no longer
+   exist. Blast radius of a sandbox escape = the secrets of the jobs whose
+   ephemeral key is *currently resident*, i.e. in-flight on that worker.
+3. **Single-claim / no double-run.** The controller CAS-es a per-`exec_id` lease
+   (`dispatched → claimed_by`); a second claim (NATS redelivery, or a racing rogue
+   worker) is rejected with `ClaimRejected`, and the loser aborts without secrets.
+   Exactly one worker ever receives the sealed values.
+4. **Freshness / anti-replay.** The claim's nonce + `issued_at_ms` ride the
+   existing asymmetric freshness window and the distributed replay-nonce guard
+   (finding #2) — no new replay surface.
+5. **Downgrade resistance.** `sealing` is in the signed dispatch payload; an
+   attacker cannot flip `1`→`0` to force a WSK envelope. Under
+   `TALOS_ENVELOPE_SEALING=required` the worker refuses a `sealing==0` dispatch
+   outright.
+6. **Confidentiality vs. the transport.** NATS operators / bus sniffers see only
+   ciphertext sealed to an ephemeral key they do not hold. (Complementary to, not
+   dependent on, NATS mTLS.)
+
+### Lease / single-claim state machine
+
+State lives in **Redis** (already present for the replay guard), keyed
+`seal:lease:{exec_id}`, value `{state, worker_id?, dispatched_at}`, `PX =
+lease_ms` (default 30 s, ≥ the dispatch-to-claim budget). Because a NATS reply
+inbox is connection-scoped, the claim (msg 2) returns to the **same controller
+replica** that dispatched (msg 1); Redis is used not for cross-replica handoff but
+for crash-recovery + the re-dispatch decision.
+
+```
+   (msg1 dispatch)      SET NX seal:lease:{exec_id} = {dispatched}  PX lease_ms
+   (msg2 claim)         CAS {dispatched} → {claimed_by:wid}
+                          ├─ success → seal + send SealedSecrets (msg3)
+                          ├─ already {claimed_by:other} → ClaimRejected (loser aborts)
+                          └─ key missing/expired → ClaimRejected (lease lost; job re-dispatched)
+   (lease expiry)       no valid claim within lease_ms → re-dispatch OR fail execution
+```
+
+### Failure modes & recovery
+
+| Event | Handling |
+|---|---|
+| Worker dequeues, dies before claim | Lease expires → controller re-dispatches (bounded retry) → different worker, new ephemeral. |
+| Two workers dequeue (NATS redelivery) | Both claim; CAS admits one; loser gets `ClaimRejected` and drops the job **without** running (no secretless execution). |
+| Controller replica dies between dispatch and claim | Claim's reply inbox is dead → worker's claim request times out → worker aborts → lease expires → surviving replica re-dispatches. |
+| Worker claims, opens, then dies mid-run | Existing crash-recovery/`resuming` path (unchanged). Resume issues a **new** dispatch → new ephemeral → new seal; the dead ephemeral is irrelevant. |
+| Oversized secrets | Unchanged semantics; only the `SealedSecrets` ciphertext is larger. |
+| `sealing==0` under `required` | Worker refuses (downgrade guard). |
+
+### Performance analysis
+
+- **Latency:** +1 control-plane RTT per job (claim + sealed-secrets). In-cluster
+  NATS request/reply is sub-ms p50 / low-single-digit-ms p99 — negligible against
+  WASM execution (tens of ms to seconds). Confirm with the same bench harness
+  Open-Question 4 mandates for P2.
+- **CPU:** +2 X25519 scalar mults (one per side, ~tens of µs each) + 1 HKDF + the
+  AES-GCM already performed today; +1 Ed25519 sign (worker claim) + 1 verify
+  (controller). Sub-100 µs total added per job. Negligible.
+- **Memory / state:** one short-lived, auto-expiring Redis key per in-flight job
+  (`SET NX PX`). Bounded by concurrency, not by jobs-ever-seen — no monotonic
+  growth (the cache-pattern rule).
+- **Wire bytes:** dispatch **shrinks** (inline envelope removed); two small
+  control messages added. Roughly net-neutral.
+
+Net: the cost is dominated by one small, constant RTT — an acceptable price for
+forward secrecy while keeping queue-group load-balancing.
+
+### Rollout, flags, deploy ordering, rollback
+
+- **Flag:** `TALOS_ENVELOPE_SEALING` ∈ `{off, audit, required}`, mirroring the
+  Sigstore three-policy shape. `off` (default) = today's inline WSK envelope,
+  byte-identical. `audit` = controller uses claim-based sealing for
+  claim-capable workers, still accepts inline for others (migration window).
+  `required` = refuse `sealing==0` (the P4-adjacent enforcement point for
+  secrets).
+- **Gradual (heterogeneous) rollout depends on P2 inc.4.** To seal claim-based to
+  *some* workers and inline to others, the controller must know which workers
+  speak the claim protocol — a `supports_sealing` capability bit in the
+  `worker_identities` table (P2 inc.4). **This is where inc.4 becomes
+  load-bearing**, and the reason inc.4 should land before a mixed-fleet P3.
+- **All-at-once flip does NOT need inc.4.** With the static
+  `TALOS_WORKER_PUBLIC_KEYS` registry, an operator upgrades every worker (claim
+  protocol understood, still defaulting to inline), then flips
+  `TALOS_ENVELOPE_SEALING=required` fleet-wide — same shape as the dispatch-scheme
+  flip. Fine for single/few-worker (homelab) deploys.
+- **Deploy ordering (existing rule):** workers roll **before/with** controllers.
+  A claim-based controller talking to a pre-P3 worker that never sends a claim
+  would strand the job; so upgrade workers first (they understand claims, default
+  inline), then flip the controller. **Rollback:** set `TALOS_ENVELOPE_SEALING=off`
+  — the controller reverts to inline WSK sealing with zero worker change.
+
+### New dependencies
+
+- `x25519-dalek` (ECDH) — same dalek family already pulled for Ed25519 via the
+  Sigstore path; `zeroize` (already in-tree) for `esk_*`.
+
+### Verify-once / D4 discipline
+
+`SecretClaim` and `SealedSecrets` are new signed message types, so — per the
+r300/r301 rule in `CLAUDE.md` — each ships with **both** `verify()` and
+`verify_no_replay()` from the start, and each has **exactly one** primary
+`verify()` caller per controller process (the claim handler for `SecretClaim`; the
+worker for `SealedSecrets`). No passive observer double-verifies. The claim is
+single-published to its reply inbox only.
+
+### Test plan (gate on live NATS, not just `cargo test`)
+
+- **Unit (pure):** ECDH seal/open roundtrip; wrong-`epk` fails; AAD transposition
+  (swap `exec_id`/`worker_id`) fails; low-order-point/zero-`ss` rejected;
+  `sealing` downgrade rejected under `required`; claim signature bound to
+  long-term key (a claim signed by a different key fails); `SealedSecrets` AAD
+  binding; append-only wire snapshots prove scheme-0 bytes unchanged.
+- **State machine (Redis harness):** CAS single-claim (second claim rejected);
+  lease-expiry re-dispatch; loser-aborts-without-secrets.
+- **Integration (live NATS + Redis, in `quality.yml`'s env-gated suite):** full
+  dispatch→claim→seal→open→result happy path; NATS-redelivery double-claim; worker
+  death before/after claim; controller-replica death between dispatch and claim.
+  This is the phase where unit tests are **not** sufficient — the claim/lease
+  timing and reply-inbox routing only exercise against a real broker.
 
 ## Operator runbook (turning it on)
 
@@ -275,9 +530,13 @@ drop the old key.
 
 ## Open questions
 
-1. **D3a vs D3b** — directed dispatch (lose queue-group LB) vs. claim-protocol
-   (extra round-trip). Depends on how much the scheduler already knows the target
-   worker. **Blocks P3.**
+1. ~~**D3a vs D3b** — directed dispatch (lose queue-group LB) vs. claim-protocol
+   (extra round-trip).~~ **RESOLVED (2026-07-04): D3b.** Today's dispatch is a NATS
+   queue group (the controller does not pick the worker), so D3a's directed
+   dispatch would mean building a scheduler and losing free load-balancing +
+   failover; and D3a's static-key seal has no forward secrecy. D3b keeps the queue
+   group and gives per-execution forward secrecy for one added round-trip. Full
+   protocol in [P3 detailed design](#p3-detailed-design--d3b-claimlease-envelope-sealing).
 2. **Worker key lifecycle** — generated-and-registered per pod (ephemeral,
    re-register on restart) vs. derived-from-provisioning-root (stable, no
    registration write). Affects P2's registration surface.
