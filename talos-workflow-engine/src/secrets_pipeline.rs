@@ -63,6 +63,94 @@ pub(crate) async fn build_encrypted_secrets_for(
     // unseals with the same AAD from `JobRequest.workflow_execution_id`.
     aad: &[u8],
 ) -> talos_workflow_job_protocol::EncryptedSecrets {
+    // Steps 1-5 (resolve the plaintext secrets map) live in the shared
+    // `resolve_secrets_map_for` so the RFC 0010 P3 claim-based sealing path
+    // can reuse the exact same resolution + tier-1 filtering without duplicating
+    // it. This function then performs step 6 (the WSK seal) — the legacy inline
+    // envelope. The P3 path skips step 6 entirely and instead registers the
+    // plaintext in `InFlightSeals` for on-claim ephemeral sealing.
+    let secrets_map = resolve_secrets_map_for(
+        resolver,
+        node_id,
+        user_id,
+        vault_paths,
+        extra_paths,
+        max_llm_tier,
+    )
+    .await;
+
+    // 6. Seal via the pluggable envelope. Empty-map short-circuit
+    // matches the reference impl's sentinel; callers read an empty
+    // ciphertext as "no secrets to forward."
+    if secrets_map.is_empty() {
+        return talos_workflow_job_protocol::EncryptedSecrets::empty();
+    }
+    // L-1: route through the AAD-binding seal so the per-job AEAD
+    // context is part of the AES-GCM tag. The default trait impl
+    // falls back to plain `seal` (no AAD) so custom envelopes that
+    // haven't migrated still compile and produce decryptable bytes
+    // when paired with a worker on the legacy decrypt path.
+    match envelope
+        .seal_with_aad(&secrets_map, worker_shared_key, aad)
+        .await
+    {
+        Ok((ciphertext, nonce)) => {
+            // Validate the seal output structurally — a misconfigured
+            // envelope that returns a short nonce or a mismatched
+            // empty/non-empty pair would send corrupted bytes on the
+            // wire. Fail closed (empty ciphertext → node dispatches
+            // with no secrets → node fails cleanly) rather than
+            // forwarding the bad output.
+            if let Err(e) = talos_workflow_engine_core::validate_seal_output(&ciphertext, &nonce) {
+                tracing::error!(
+                    %node_id,
+                    error = %e,
+                    "SecretEnvelope::seal output failed structural validation — dispatching with empty ciphertext"
+                );
+                return talos_workflow_job_protocol::EncryptedSecrets::empty();
+            }
+            // Separate check: the envelope accepted the structural
+            // contract (returned the empty-empty sentinel) but did so
+            // on a non-empty input. We forwarded no secrets; the node
+            // is about to fail with a secrets-unavailable error, so
+            // surface the root cause in the logs.
+            if ciphertext.is_empty() && nonce.is_empty() {
+                tracing::error!(
+                    %node_id,
+                    secret_count = secrets_map.len(),
+                    "SecretEnvelope::seal returned the empty sentinel for a non-empty secrets map — node will dispatch without secrets"
+                );
+            }
+            talos_workflow_job_protocol::EncryptedSecrets { ciphertext, nonce }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                %node_id,
+                "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
+            );
+            talos_workflow_job_protocol::EncryptedSecrets::empty()
+        }
+    }
+}
+
+/// Resolve the plaintext secrets map for a node dispatch (steps 1-5 of the
+/// secret pipeline: module grants, declared extra paths, OAuth refresh + dynamic
+/// vault paths, the resolved-set tier-1 backstop, and the LLM-provider prefetch).
+///
+/// Extracted from [`build_encrypted_secrets_for`] so the RFC 0010 P3 (D3b)
+/// claim-based sealing path can obtain the SAME plaintext map — with identical
+/// tier-1 filtering — to register in `InFlightSeals` for on-claim ephemeral
+/// sealing, instead of the legacy inline WSK seal (step 6). Behaviour for the
+/// legacy path is unchanged: `build_encrypted_secrets_for` calls this then seals.
+pub(crate) async fn resolve_secrets_map_for(
+    resolver: &dyn SecretsResolver,
+    node_id: Uuid,
+    user_id: Option<Uuid>,
+    vault_paths: &[String],
+    extra_paths: &[String],
+    max_llm_tier: talos_workflow_engine_core::LlmTier,
+) -> std::collections::HashMap<String, String> {
     // 1. Module-grant secrets.
     let mut secrets_map = resolver
         .resolve_module_secrets(node_id)
@@ -149,59 +237,7 @@ pub(crate) async fn build_encrypted_secrets_for(
         );
     }
 
-    // 6. Seal via the pluggable envelope. Empty-map short-circuit
-    // matches the reference impl's sentinel; callers read an empty
-    // ciphertext as "no secrets to forward."
-    if secrets_map.is_empty() {
-        return talos_workflow_job_protocol::EncryptedSecrets::empty();
-    }
-    // L-1: route through the AAD-binding seal so the per-job AEAD
-    // context is part of the AES-GCM tag. The default trait impl
-    // falls back to plain `seal` (no AAD) so custom envelopes that
-    // haven't migrated still compile and produce decryptable bytes
-    // when paired with a worker on the legacy decrypt path.
-    match envelope
-        .seal_with_aad(&secrets_map, worker_shared_key, aad)
-        .await
-    {
-        Ok((ciphertext, nonce)) => {
-            // Validate the seal output structurally — a misconfigured
-            // envelope that returns a short nonce or a mismatched
-            // empty/non-empty pair would send corrupted bytes on the
-            // wire. Fail closed (empty ciphertext → node dispatches
-            // with no secrets → node fails cleanly) rather than
-            // forwarding the bad output.
-            if let Err(e) = talos_workflow_engine_core::validate_seal_output(&ciphertext, &nonce) {
-                tracing::error!(
-                    %node_id,
-                    error = %e,
-                    "SecretEnvelope::seal output failed structural validation — dispatching with empty ciphertext"
-                );
-                return talos_workflow_job_protocol::EncryptedSecrets::empty();
-            }
-            // Separate check: the envelope accepted the structural
-            // contract (returned the empty-empty sentinel) but did so
-            // on a non-empty input. We forwarded no secrets; the node
-            // is about to fail with a secrets-unavailable error, so
-            // surface the root cause in the logs.
-            if ciphertext.is_empty() && nonce.is_empty() {
-                tracing::error!(
-                    %node_id,
-                    secret_count = secrets_map.len(),
-                    "SecretEnvelope::seal returned the empty sentinel for a non-empty secrets map — node will dispatch without secrets"
-                );
-            }
-            talos_workflow_job_protocol::EncryptedSecrets { ciphertext, nonce }
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                %node_id,
-                "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
-            );
-            talos_workflow_job_protocol::EncryptedSecrets::empty()
-        }
-    }
+    secrets_map
 }
 
 /// Tier-1 LLM-provider path filter (single source of truth for the
