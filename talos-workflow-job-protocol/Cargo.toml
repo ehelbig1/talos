@@ -32,6 +32,12 @@ hkdf = "0.12"
 # RFC 0010 P1: Ed25519 for the controller→worker dispatch signature scheme
 # (asymmetric worker-trust boundary — the worker holds only the public key).
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# RFC 0010 P3 (D3b): ephemeral-ephemeral X25519 ECDH for per-execution secret
+# envelope sealing (forward secrecy). Same dalek family as ed25519-dalek above.
+# `zeroize` (already transitively present) clears the ephemeral secret + derived
+# key material after each open.
+x25519-dalek = "2"
+zeroize = "1"
 
 [features]
 default = []

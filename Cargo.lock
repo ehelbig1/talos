@@ -7631,6 +7631,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-envelope-seal"
+version = "0.1.0"
+dependencies = [
+ "dashmap 6.2.1",
+ "rand 0.8.6",
+ "redis",
+ "serde_json",
+ "talos-workflow-job-protocol",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "talos-errors"
 version = "0.1.0"
 dependencies = [
@@ -8993,6 +9008,8 @@ dependencies = [
  "sha2 0.10.9",
  "talos-workflow-engine-core",
  "uuid",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -11294,6 +11311,18 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "xattr"

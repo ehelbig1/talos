@@ -79,6 +79,8 @@ async fn main() -> Result<()> {
     // 5. HMAC binding — tampering with tier on the wire breaks signature.
     let mut req = JobRequest {
         crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         module_uri: "redis:wasm:test".to_string(),
@@ -132,6 +134,8 @@ async fn main() -> Result<()> {
     use talos_workflow_job_protocol::{PipelineJobRequest, PipelineStep};
     let mut pipeline = PipelineJobRequest {
         crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![PipelineStep {

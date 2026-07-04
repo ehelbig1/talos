@@ -11,6 +11,8 @@ use uuid::Uuid;
 fn job_request_roundtrip() {
     let req = JobRequest {
         crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         module_uri: "file://tmp/module.wasm".to_string(),
@@ -98,6 +100,8 @@ fn make_pipeline_step() -> PipelineStep {
 fn pipeline_job_request_roundtrip() {
     let req = PipelineJobRequest {
         crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![make_pipeline_step(), make_pipeline_step()],
@@ -126,6 +130,8 @@ fn pipeline_job_request_sign_and_verify() {
     let key = test_key();
     let mut req = PipelineJobRequest {
         crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![make_pipeline_step()],
@@ -151,6 +157,8 @@ fn pipeline_job_request_tampered_step_fails() {
     let key = test_key();
     let mut req = PipelineJobRequest {
         crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![make_pipeline_step()],

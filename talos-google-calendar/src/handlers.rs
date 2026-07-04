@@ -1292,6 +1292,8 @@ pub async fn process_webhook_events(
         // Create job request for worker
         let mut job_request = JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id,
             workflow_execution_id: job_id, // Single node execution, use same ID
             module_uri: exec_info.module_uri.clone(),

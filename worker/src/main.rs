@@ -458,6 +458,8 @@ mod signature_failure_payload_tests {
     fn unauthenticated_req() -> JobRequest {
         JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://attacker-chosen/v1".to_string(),

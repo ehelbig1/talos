@@ -64,6 +64,8 @@ fn det_uuid(n: u128) -> Uuid {
 fn deterministic_job_request() -> JobRequest {
     JobRequest {
         crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
         workflow_execution_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0002),
         module_uri: "redis:wasm:00000000-0000-0000-0000-000000000003".into(),
@@ -274,6 +276,8 @@ fn job_result_json_snapshot() {
 fn pipeline_job_request_json_snapshot() {
     let req = PipelineJobRequest {
         crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0010),
         workflow_execution_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0011),
         user_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0012),

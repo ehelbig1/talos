@@ -785,6 +785,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // 1. Assemble the wire-format `JobRequest`.
         let mut req = JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             // Reuse a caller-supplied job id when present so a
             // pre-INSERTed `module_executions` row with that id stays
             // correlated with the worker's update. Fresh UUID
@@ -973,6 +975,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // 2. Assemble the chain-level wire request.
         let mut req = PipelineJobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: request.job_id.unwrap_or_else(uuid::Uuid::new_v4),
             workflow_execution_id: request.workflow_execution_id,
             steps,

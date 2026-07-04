@@ -18,7 +18,29 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// RFC 0010 P3 (D3b) — per-execution ephemeral secret-envelope sealing.
+pub mod envelope_seal;
+pub use envelope_seal::{seal_secrets, SealOutput, SealedSecrets, SecretClaim, WorkerEphemeral};
+
 type HmacSha256 = Hmac<Sha256>;
+
+/// RFC 0010 P3 secret-delivery scheme carried by `JobRequest` /
+/// `PipelineJobRequest`. `0` = legacy inline WSK envelope (today, default);
+/// `1` = claim-based ECIES sealing (D3b). Security-relevant (an attacker must
+/// not downgrade `1`→`0` to force a WSK envelope), so it is bound into the
+/// dispatch signing payload — but ONLY when non-zero, so a scheme-`0` message's
+/// signed bytes stay byte-identical to the pre-P3 wire format.
+pub const SEALING_INLINE_WSK: u8 = 0;
+/// See [`SEALING_INLINE_WSK`]. Claim-based ephemeral ECIES sealing.
+pub const SEALING_CLAIM_ECIES: u8 = 1;
+
+/// `skip_serializing_if` predicate: omit `sealing` from the wire JSON when it is
+/// the legacy default, so a scheme-0 (inline-WSK) message serializes
+/// byte-identically to the pre-P3 format. Signature is fixed by serde (`&T`).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn sealing_is_default(v: &u8) -> bool {
+    *v == SEALING_INLINE_WSK
+}
 
 /// HKDF-SHA256 `info` label for the secret-envelope AES-256-GCM subkey.
 ///
@@ -2348,6 +2370,24 @@ pub struct JobRequest {
     /// HMAC `signing_payload()`, so scheme-0 bytes stay identical to pre-P1.
     #[serde(default)]
     pub crypto_scheme: u8,
+
+    /// RFC 0010 P3 (D3b): secret-delivery scheme. [`SEALING_INLINE_WSK`] (0,
+    /// default) = the inline WSK envelope in `encrypted_secrets` (today);
+    /// [`SEALING_CLAIM_ECIES`] (1) = claim-based ephemeral sealing — the worker
+    /// claims the job with an ephemeral key and the controller seals to it.
+    /// Bound into `signing_payload()` ONLY when non-zero (so scheme-0 bytes are
+    /// unchanged), which makes a `1`→`0` downgrade invalidate the signature.
+    /// Omitted from the wire JSON when 0 so a legacy message is byte-identical.
+    #[serde(default, skip_serializing_if = "sealing_is_default")]
+    pub sealing: u8,
+
+    /// RFC 0010 P3: the vault paths this job is permitted to resolve, sent in
+    /// the clear (paths are not secrets; values are). Populated ONLY when
+    /// `sealing == SEALING_CLAIM_ECIES`; the controller resolves + seals the
+    /// *values* on claim, reusing the existing per-module allowlist so the claim
+    /// cannot widen scope. When `sealing == 1`, `encrypted_secrets` is empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_paths: Vec<String>,
 }
 
 impl JobRequest {
@@ -2487,7 +2527,7 @@ impl JobRequest {
         let capability_world_str = self.capability_world.as_deref().unwrap_or("-");
         let cancellation_token_str = self.cancellation_token.as_deref().unwrap_or("-");
 
-        format!(
+        let mut payload = format!(
             "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
@@ -2531,8 +2571,23 @@ impl JobRequest {
             self.deadline_unix_secs,
             // H-7 (2026-05-23): cancellation_token appended AT THE END.
             lp(cancellation_token_str),
-        )
-        .into_bytes()
+        );
+
+        // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
+        // non-legacy sealing scheme is in effect. For `sealing == 0` (today's
+        // inline WSK envelope) nothing is appended, so the signed bytes are
+        // byte-identical to the pre-P3 wire format — no coordinated restart for
+        // the legacy path. When `sealing == 1`, appending the marker + sorted
+        // paths makes a `1`→`0` downgrade (or a widened `secret_paths`) fail
+        // verification, because the two produce different signed bytes.
+        if self.sealing != 0 {
+            use std::fmt::Write as _;
+            let mut paths = self.secret_paths.clone();
+            paths.sort_unstable();
+            let _ = write!(payload, ":{}:{}", self.sealing, lp(&paths.join(",")));
+        }
+
+        payload.into_bytes()
     }
 
     /// Diagnostic snapshot of the per-field hashes that
@@ -3174,6 +3229,17 @@ pub struct PipelineJobRequest {
     /// [`CRYPTO_SCHEME_HMAC`] (0, default) or [`CRYPTO_SCHEME_ED25519`] (1).
     #[serde(default)]
     pub crypto_scheme: u8,
+
+    /// RFC 0010 P3 (D3b): secret-delivery scheme (see [`JobRequest::sealing`]).
+    /// Bound into `signing_payload()` only when non-zero; omitted from wire JSON
+    /// when 0 so a legacy pipeline message is byte-identical.
+    #[serde(default, skip_serializing_if = "sealing_is_default")]
+    pub sealing: u8,
+
+    /// RFC 0010 P3: vault paths this pipeline is permitted to resolve when
+    /// `sealing == SEALING_CLAIM_ECIES`. See [`JobRequest::secret_paths`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_paths: Vec<String>,
 }
 
 impl PipelineJobRequest {
@@ -3334,7 +3400,7 @@ impl PipelineJobRequest {
             .collect();
         let step_policies_str = step_policies.join(";;");
 
-        format!(
+        let mut payload = format!(
             "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
@@ -3362,8 +3428,20 @@ impl PipelineJobRequest {
             // cancellation_token) appended AT THE END per the
             // wire-format stability rule.
             lp(&step_policies_str),
-        )
-        .into_bytes()
+        );
+
+        // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
+        // non-legacy sealing scheme is in effect, so `sealing == 0` bytes stay
+        // byte-identical to the pre-P3 wire format. See
+        // `JobRequest::signing_payload` for the downgrade-resistance reasoning.
+        if self.sealing != 0 {
+            use std::fmt::Write as _;
+            let mut paths = self.secret_paths.clone();
+            paths.sort_unstable();
+            let _ = write!(payload, ":{}:{}", self.sealing, lp(&paths.join(",")));
+        }
+
+        payload.into_bytes()
     }
 
     /// Sign the pipeline request using the pre-shared `key`.
@@ -4259,6 +4337,8 @@ mod tests {
         let key = test_key();
         let mut req = JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4308,6 +4388,8 @@ mod tests {
         let key = test_key();
         let mut req = JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4349,6 +4431,8 @@ mod tests {
         let key = test_key();
         let mut req = JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4513,6 +4597,8 @@ mod tests {
         let key = test_key();
         let mut req = JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4554,6 +4640,8 @@ mod tests {
         let key = test_key();
         let mut req = JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -4611,6 +4699,8 @@ mod tests {
     fn make_test_request(actor_id: Option<Uuid>) -> JobRequest {
         JobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://m/v1".to_string(),
@@ -5404,6 +5494,8 @@ mod tests {
         let key = test_key();
         let mut req = PipelineJobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             steps: vec![],
@@ -5612,6 +5704,8 @@ mod tests {
     fn make_test_pipeline(steps: Vec<PipelineStep>) -> PipelineJobRequest {
         PipelineJobRequest {
             crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             steps,
