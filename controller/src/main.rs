@@ -1807,6 +1807,79 @@ fn spawn_maintenance_sweeps(
         }
     });
 
+    // ---------- RFC 0010 P2 inc.4: dynamic worker-identity key refresh ---------
+    //
+    // Merges the DB-backed `worker_identities` registry into job_protocol's
+    // dynamic verifying-key overlay (union with the static
+    // `TALOS_WORKER_PUBLIC_KEYS` env base) so an autoscaling fleet can register
+    // keys without an operator editing a ConfigMap. Verify-path reads are
+    // lock-free (ArcSwap); this task just re-publishes the active set on an
+    // interval, so max staleness for a rotation/revocation = one interval.
+    //
+    // Initial load is SYNCHRONOUS so DB-registered keys can verify the very first
+    // job result after boot; a transient DB error there is non-fatal (env
+    // registry stays live, the loop retries). `TALOS_WORKER_KEY_REFRESH_SECS=0`
+    // disables the loop for deploys that use the env registry only.
+    let worker_key_refresh_secs: u64 = std::env::var("TALOS_WORKER_KEY_REFRESH_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    if worker_key_refresh_secs == 0 {
+        tracing::info!(
+            "Dynamic worker-identity key refresh disabled (TALOS_WORKER_KEY_REFRESH_SECS=0); \
+             TALOS_WORKER_PUBLIC_KEYS env registry only"
+        );
+    } else {
+        let refresh_secs = worker_key_refresh_secs.clamp(10, 3600);
+        let worker_id_repo =
+            talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool.clone());
+        let refresh_shutdown = bg_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut shutdown = refresh_shutdown;
+            // Immediate load so DB-registered keys go live shortly after boot; a
+            // transient error here is non-fatal (env registry stays active, the
+            // loop retries on the interval).
+            match refresh_worker_key_overlay(&worker_id_repo).await {
+                Ok(n) => tracing::info!(
+                    target: "talos_engine",
+                    event_kind = "worker_key_overlay_refresh",
+                    installed = n,
+                    "loaded dynamic worker-identity keys at boot"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "talos_engine",
+                    error = %e,
+                    "initial worker-identity key load failed; env registry still active, \
+                     will retry on interval"
+                ),
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+            // Burn the immediate first tick — we just loaded above.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if let Err(e) = refresh_worker_key_overlay(&worker_id_repo).await {
+                            tracing::warn!(
+                                target: "talos_engine",
+                                error = %e,
+                                "worker-identity key refresh failed; keeping last snapshot"
+                            );
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            tracing::info!(
+                                "worker-identity key refresh loop received shutdown signal"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // ---------- Audit-chain verification sweep (finding #2, Layer 2) ----------
     //
     // Continuously verifies the WORM audit ledger: each tick runs the offline
@@ -5803,6 +5876,34 @@ use rpc_subscribers::{
     spawn_database_rpc_subscriber, spawn_graph_rpc_subscriber, spawn_integration_state_subscriber,
     spawn_integration_state_sweeper, spawn_memory_rpc_subscriber, spawn_state_write_subscriber,
 };
+
+/// RFC 0010 P2 inc.4: load the active `worker_identities` registry and install it
+/// as job_protocol's dynamic verifying-key overlay (union with the env base).
+/// Returns the number of keys installed. A stored key that is not a canonical
+/// Ed25519 point is skipped with a warning rather than poisoning the snapshot —
+/// one bad row can't strand the fleet (same fail-open-per-entry posture as the
+/// env-registry parser). Shared by the boot load, the periodic refresh task, and
+/// (inc.4c) the eager refresh after a registration write.
+async fn refresh_worker_key_overlay(
+    repo: &talos_worker_identity_repository::WorkerIdentityRepository,
+) -> anyhow::Result<usize> {
+    let entries = repo.load_active_registry().await?;
+    let mut mapped = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match talos_workflow_job_protocol::parse_ed25519_verifying_key_bytes(&entry.public_key) {
+            Ok(vk) => mapped.push((entry.worker_id, vk)),
+            Err(err) => tracing::warn!(
+                target: "talos_engine",
+                worker_id = %entry.worker_id,
+                error = %err,
+                "skipping malformed worker_identities public key"
+            ),
+        }
+    }
+    let installed = mapped.len();
+    talos_workflow_job_protocol::set_dynamic_worker_public_keys(mapped);
+    Ok(installed)
+}
 
 // ---------- `controller generate-worker-trust-keypair` subcommand ----------
 //

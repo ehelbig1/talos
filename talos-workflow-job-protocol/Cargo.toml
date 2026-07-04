@@ -13,6 +13,10 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+# RFC 0010 P2 inc.4: lock-free swap of the worker-verifying-key snapshot so the
+# controller can merge the DB-backed dynamic registry over the env base without
+# blocking the verify hot path.
+arc-swap = "1.7"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

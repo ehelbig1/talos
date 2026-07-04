@@ -1780,6 +1780,7 @@ dependencies = [
  "talos-webhook-repository",
  "talos-webhooks",
  "talos-worker-fleet",
+ "talos-worker-identity-repository",
  "talos-workflow-authorization",
  "talos-workflow-creation",
  "talos-workflow-creation-helpers",
@@ -8980,6 +8981,7 @@ name = "talos-workflow-job-protocol"
 version = "0.3.0"
 dependencies = [
  "aes-gcm",
+ "arc-swap",
  "async-trait",
  "ed25519-dalek",
  "hex",

@@ -445,6 +445,16 @@ pub fn parse_ed25519_verifying_key_hex(hex_str: &str) -> Result<DispatchVerifyin
         .map_err(|_| "controller public key: not a valid Ed25519 point".to_string())
 }
 
+/// Parse a 32-byte Ed25519 **public** (verifying) key from raw bytes. Used by the
+/// controller's RFC 0010 P2 inc.4 refresh task to turn a `worker_identities`
+/// `bytea` column into a verifying key before merging it into the dynamic
+/// overlay. Fails closed on a non-canonical point — a bad row is skipped rather
+/// than poisoning the snapshot. Keeps callers off a direct `ed25519-dalek` dep.
+pub fn parse_ed25519_verifying_key_bytes(bytes: &[u8; 32]) -> Result<DispatchVerifyingKey, String> {
+    DispatchVerifyingKey::from_bytes(bytes)
+        .map_err(|_| "worker public key: not a valid Ed25519 point".to_string())
+}
+
 /// Parse a 32-byte Ed25519 **private** (signing) key seed from hex. Used by the
 /// controller to load its dispatch signing key. The seed is secret — callers
 /// must source it from a Secret / KMS, never a plaintext config committed to
@@ -571,16 +581,58 @@ pub fn configured_dispatch_signer() -> Option<DispatchSigner> {
 /// worker-signed result but cannot forge one — the asymmetric half of the
 /// result-path trust boundary, mirroring the worker holding only the
 /// controller's public key on the dispatch path.
-fn worker_public_key_registry(
-) -> &'static std::collections::HashMap<String, Vec<DispatchVerifyingKey>> {
-    static CACHE: std::sync::OnceLock<
-        std::collections::HashMap<String, Vec<DispatchVerifyingKey>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
+type WorkerKeyMap = std::collections::HashMap<String, Vec<DispatchVerifyingKey>>;
+
+/// The env-parsed base registry (`TALOS_WORKER_PUBLIC_KEYS`), parsed exactly
+/// once. Immutable; the dynamic (DB-backed, RFC 0010 P2 inc.4) overlay is merged
+/// on top of a clone of this by [`set_dynamic_worker_public_keys`].
+fn env_worker_public_key_registry() -> &'static WorkerKeyMap {
+    static ENV: std::sync::OnceLock<WorkerKeyMap> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| {
         std::env::var("TALOS_WORKER_PUBLIC_KEYS")
             .map(|raw| parse_worker_public_keys(&raw))
             .unwrap_or_default()
     })
+}
+
+/// The live verifying-key snapshot readers hit on the hot `verify_dispatch` path.
+/// Seeded lazily from the env registry — so a worker (which never installs a
+/// dynamic overlay) keeps pure env-only behaviour — and atomically replaced by
+/// the controller's refresh task via [`set_dynamic_worker_public_keys`].
+///
+/// `ArcSwap` gives lock-free O(1) reads on the verify hot path and an atomic
+/// pointer swap on refresh (no reader ever blocks on a writer), the same shape
+/// `rpc_auth` uses for its rotating nonce cache.
+fn worker_public_key_snapshot() -> &'static arc_swap::ArcSwap<WorkerKeyMap> {
+    static SNAP: std::sync::OnceLock<arc_swap::ArcSwap<WorkerKeyMap>> = std::sync::OnceLock::new();
+    SNAP.get_or_init(|| arc_swap::ArcSwap::from_pointee(env_worker_public_key_registry().clone()))
+}
+
+/// **Controller-only.** Replace the dynamic worker-key overlay with `dynamic`,
+/// rebuilding the live snapshot as `union(env static registry, dynamic)` and
+/// atomically swapping it in. Full-replacement (NOT additive): each call rebuilds
+/// from the immutable env base, so a key that was deactivated in the DB and hence
+/// dropped from `dynamic` disappears from the snapshot on the next refresh — the
+/// controller's refresh task passes the complete active DB set every interval.
+///
+/// Env-registered keys always survive (they are the operator-pinned base);
+/// dynamic keys byte-identical to an env key are de-duplicated so a worker whose
+/// key is in both places is not verified against twice. The worker never calls
+/// this, so its behaviour is unchanged. Idempotent and safe to call repeatedly.
+pub fn set_dynamic_worker_public_keys(
+    dynamic: impl IntoIterator<Item = (String, DispatchVerifyingKey)>,
+) {
+    let mut merged = env_worker_public_key_registry().clone();
+    for (worker_id, vk) in dynamic {
+        let slot = merged.entry(worker_id).or_default();
+        if !slot
+            .iter()
+            .any(|existing| existing.to_bytes() == vk.to_bytes())
+        {
+            slot.push(vk);
+        }
+    }
+    worker_public_key_snapshot().store(std::sync::Arc::new(merged));
 }
 
 /// Pure parser for the `TALOS_WORKER_PUBLIC_KEYS` value — extracted from
@@ -613,12 +665,14 @@ fn parse_worker_public_keys(
 }
 
 /// Ed25519 result-verifying key(s) registered for `worker_id` (possibly several,
-/// for rotation). Empty when the worker is unknown or `TALOS_WORKER_PUBLIC_KEYS`
-/// is unset — `JobResult::verify_dispatch` then fails closed on an Ed25519-scheme
-/// result. Cached; see [`worker_public_key_registry`].
+/// for rotation). Reads the live snapshot = `union(env registry, dynamic DB
+/// overlay)`. Empty when the worker is unknown or no key is registered anywhere —
+/// `JobResult::verify_dispatch` then fails closed on an Ed25519-scheme result.
+/// Lock-free; see [`worker_public_key_snapshot`] / [`set_dynamic_worker_public_keys`].
 #[must_use]
 pub fn worker_public_keys(worker_id: &str) -> Vec<DispatchVerifyingKey> {
-    worker_public_key_registry()
+    worker_public_key_snapshot()
+        .load()
         .get(worker_id)
         .cloned()
         .unwrap_or_default()
@@ -4656,6 +4710,56 @@ mod tests {
         assert!(parse_worker_public_keys("   ,  , ").is_empty());
     }
 
+    // RFC 0010 P2 inc.4: the DB-backed dynamic overlay. Uses a worker_id no other
+    // test references and no TALOS_WORKER_PUBLIC_KEYS env (unset in the test proc),
+    // so the env base is empty and this test owns its slice of the global snapshot.
+    #[test]
+    fn dynamic_worker_public_keys_overlay_union_dedup_and_replace() {
+        let a = ed_keypair();
+        let b = ed_keypair();
+        let wid = "inc4-dynamic-worker";
+
+        // Install two keys for the worker (rotation overlap): both resolve.
+        set_dynamic_worker_public_keys([
+            (wid.to_string(), a.verifying_key()),
+            (wid.to_string(), b.verifying_key()),
+        ]);
+        let keys = worker_public_keys(wid);
+        assert_eq!(keys.len(), 2, "both dynamic keys present");
+
+        // Dedup: re-installing with a byte-identical repeat does not double it.
+        set_dynamic_worker_public_keys([
+            (wid.to_string(), a.verifying_key()),
+            (wid.to_string(), a.verifying_key()),
+        ]);
+        assert_eq!(
+            worker_public_keys(wid).len(),
+            1,
+            "byte-identical keys dedup"
+        );
+        assert_eq!(
+            worker_public_keys(wid)[0].to_bytes(),
+            a.verifying_key().to_bytes()
+        );
+
+        // Full-replacement: an empty overlay drops the worker entirely (models a
+        // worker whose every key was deactivated in the DB).
+        set_dynamic_worker_public_keys(std::iter::empty());
+        assert!(
+            worker_public_keys(wid).is_empty(),
+            "empty refresh clears the dynamic overlay for this worker"
+        );
+
+        // A result signed by the worker verifies only while its key is installed.
+        set_dynamic_worker_public_keys([(wid.to_string(), a.verifying_key())]);
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&a, wid).unwrap();
+        r.verify_no_replay_ed25519(&worker_public_keys(wid), 300)
+            .expect("installed dynamic key verifies the worker's result");
+        // Reset the global so we don't leak state into other tests.
+        set_dynamic_worker_public_keys(std::iter::empty());
+    }
+
     #[test]
     fn ed25519_sign_verify_roundtrip() {
         let sk = ed_keypair();
@@ -4825,6 +4929,20 @@ mod tests {
         // Wrong lengths fail closed.
         assert!(parse_ed25519_verifying_key_hex("deadbeef").is_err());
         assert!(parse_ed25519_signing_key_hex("").is_err());
+    }
+
+    #[test]
+    fn verifying_key_from_bytes_roundtrips_and_rejects_noncanonical() {
+        // The bytes path (used by the inc.4 DB-overlay refresh) agrees with the
+        // hex path and with the key's own encoding.
+        let pk = ed_keypair().verifying_key();
+        let bytes = pk.to_bytes();
+        let parsed = parse_ed25519_verifying_key_bytes(&bytes).expect("canonical point parses");
+        assert_eq!(parsed.to_bytes(), bytes);
+        // A value that is not a valid curve point fails closed rather than
+        // yielding a key that would silently never verify. (`[2u8; 32]` does not
+        // decompress to an Edwards point.)
+        assert!(parse_ed25519_verifying_key_bytes(&[2u8; 32]).is_err());
     }
 
     #[test]
