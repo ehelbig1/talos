@@ -315,11 +315,22 @@ envelope deploy-ordering rule).
   >    `secret_claim::claim_secrets` instead of decrypting; downgrade guard
   >    (`worker_sealing_required()`) refuses `sealing==0` under `required`.
   > 5. Fleet-wide, not per-worker: under queue-group dispatch the controller can't
-  >    pick the worker, so `audit`/`required` seals **every** dispatch and every
-  >    worker must understand claims first (the RFC's all-at-once flip). The
-  >    `supports_sealing` capability bit is informational here, not a per-dispatch
-  >    gate. Pipeline-step + loop-body claim-sealing (each step's own secrets) is a
-  >    follow-up; those paths stay inline (`plaintext_secrets: None`) until then.
+  >    pick the worker, so `audit`/`required` seals **every** single-node dispatch
+  >    and every worker must understand claims first (the RFC's all-at-once flip).
+  >    The `supports_sealing` capability bit is informational here, not a
+  >    per-dispatch gate.
+  >
+  > **`required`-mode coverage (2026-07-04 follow-up).** Single-node AND **loop-body**
+  > dispatches both seal under the flag — they share the `build_dispatch_secrets_for`
+  > decision helper, so a loop body is no longer left inline (which would have failed
+  > the worker downgrade guard under `required`). **Pipelines** have no per-step claim
+  > path yet, so they are **fail-closed** under `required`: the engine refuses to
+  > dispatch a pipeline (`run_pipeline_chain_dispatch` returns an error) and the worker
+  > refuses one defensively (`execute_pipeline_job`), rather than silently shipping a
+  > WSK envelope that would break the enforcement promise. So `required` is safe to
+  > enable for single-node + loop workflows today; per-step pipeline claim-sealing is
+  > the remaining follow-up before pipelines can run under `required`. `audit`/`off`
+  > leave pipelines on the inline envelope unchanged.
   >
   > **Remaining before production enablement:** run the live-NATS integration
   > test (+ a Redis lease) against a real cluster, then a canary with

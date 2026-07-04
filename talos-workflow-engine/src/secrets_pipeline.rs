@@ -141,15 +141,121 @@ pub(crate) async fn build_encrypted_secrets_for(
 /// on `talos-envelope-seal` (and thus on `async-nats`) just to branch.
 pub(crate) fn claim_based_sealing_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        matches!(
-            std::env::var("TALOS_ENVELOPE_SEALING")
-                .ok()
-                .map(|v| v.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("audit") | Some("required")
+    *CACHE.get_or_init(|| parse_claim_based_enabled(std::env::var("TALOS_ENVELOPE_SEALING").ok()))
+}
+
+/// Pure parser for [`claim_based_sealing_enabled`] — `audit`/`required` (case-
+/// insensitive) enable claim-based sealing; anything else (incl. `off`/unset)
+/// does not. Extracted so the mode decision is deterministically testable.
+fn parse_claim_based_enabled(raw: Option<String>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("audit" | "required")
+    )
+}
+
+/// RFC 0010 P3 (D3b): is claim-based sealing in `required` (enforcement) mode?
+/// `required` refuses any legacy inline dispatch. Cached like
+/// [`claim_based_sealing_enabled`].
+pub(crate) fn envelope_sealing_required() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| parse_sealing_required(std::env::var("TALOS_ENVELOPE_SEALING").ok()))
+}
+
+/// Pure parser for [`envelope_sealing_required`] — only `required` (case-
+/// insensitive) is enforcement mode. Extracted for deterministic testing.
+fn parse_sealing_required(raw: Option<String>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("required")
+    )
+}
+
+/// The secret payload for one node dispatch, in whichever form the active sealing
+/// mode requires: the legacy inline WSK `encrypted` envelope, OR (when claim-based
+/// sealing is on) the resolved `plaintext` map for the dispatcher to register in
+/// `InFlightSeals`. Exactly one of `encrypted` (non-empty) / `plaintext` (`Some`)
+/// is populated. `Clone` so the loop-node path can resolve once and reuse per
+/// iteration.
+#[derive(Clone)]
+pub(crate) struct DispatchSecrets {
+    pub encrypted: talos_workflow_job_protocol::EncryptedSecrets,
+    pub plaintext: Option<std::collections::HashMap<String, String>>,
+    pub secret_paths: Vec<String>,
+}
+
+impl Default for DispatchSecrets {
+    /// The "no secrets" dispatch — empty inline envelope, no claim. Uses the
+    /// deliberate `EncryptedSecrets::empty()` (the type is intentionally
+    /// non-`Default`; see lint check 17).
+    fn default() -> Self {
+        Self {
+            encrypted: talos_workflow_job_protocol::EncryptedSecrets::empty(),
+            plaintext: None,
+            secret_paths: Vec::new(),
+        }
+    }
+}
+
+/// Single decision point for "seal inline (WSK) vs. resolve plaintext for
+/// claim-based sealing", shared by EVERY single-node dispatch builder
+/// (`engine_dispatch_single`, the loop-body path) so `TALOS_ENVELOPE_SEALING`
+/// applies uniformly — the drift that let loop bodies stay inline (and thus fail
+/// the worker downgrade guard under `required`) can't recur. When claim-based
+/// sealing is on, resolves the plaintext via [`resolve_secrets_map_for`] and
+/// leaves `encrypted` empty (no plaintext ever reaches the wire — the dispatcher
+/// registers it in `InFlightSeals` and the worker claims it). Otherwise seals the
+/// inline WSK envelope exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_dispatch_secrets_for(
+    resolver: &dyn SecretsResolver,
+    envelope: &dyn SecretEnvelope,
+    node_id: Uuid,
+    user_id: Option<Uuid>,
+    vault_paths: &[String],
+    extra_paths: &[String],
+    worker_shared_key: &[u8],
+    max_llm_tier: talos_workflow_engine_core::LlmTier,
+    aad: &[u8],
+) -> DispatchSecrets {
+    if claim_based_sealing_enabled() {
+        let map = resolve_secrets_map_for(
+            resolver,
+            node_id,
+            user_id,
+            vault_paths,
+            extra_paths,
+            max_llm_tier,
         )
-    })
+        .await;
+        // secret_paths = resolved secret NAMES (not values) — clear-text
+        // metadata bound into the dispatch signature (tamper-evident).
+        let mut names: Vec<String> = map.keys().cloned().collect();
+        names.sort_unstable();
+        DispatchSecrets {
+            encrypted: talos_workflow_job_protocol::EncryptedSecrets::empty(),
+            plaintext: if map.is_empty() { None } else { Some(map) },
+            secret_paths: names,
+        }
+    } else {
+        let encrypted = build_encrypted_secrets_for(
+            resolver,
+            envelope,
+            node_id,
+            user_id,
+            vault_paths,
+            extra_paths,
+            worker_shared_key,
+            max_llm_tier,
+            aad,
+        )
+        .await;
+        DispatchSecrets {
+            encrypted,
+            plaintext: None,
+            secret_paths: Vec::new(),
+        }
+    }
 }
 
 /// Resolve the plaintext secrets map for a node dispatch (steps 1-5 of the
@@ -336,9 +442,33 @@ pub(crate) fn extract_vault_paths(config: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_tier1_paths, retain_wire_safe_secrets};
+    use super::{
+        filter_tier1_paths, parse_claim_based_enabled, parse_sealing_required,
+        retain_wire_safe_secrets,
+    };
     use std::collections::HashMap;
     use talos_workflow_engine_core::LlmTier;
+
+    #[test]
+    fn sealing_mode_parsing() {
+        // off / unset / garbage → neither enabled nor required.
+        for v in [None, Some("off"), Some("nonsense"), Some("")] {
+            let raw = v.map(std::string::ToString::to_string);
+            assert!(
+                !parse_claim_based_enabled(raw.clone()),
+                "{v:?} must not enable"
+            );
+            assert!(!parse_sealing_required(raw), "{v:?} must not be required");
+        }
+        // audit → claim-based on, NOT required.
+        assert!(parse_claim_based_enabled(Some("audit".into())));
+        assert!(!parse_sealing_required(Some("audit".into())));
+        // required → both on. Case-insensitive + whitespace-tolerant.
+        for v in ["required", "REQUIRED", "  Required  "] {
+            assert!(parse_claim_based_enabled(Some(v.into())), "{v} enables");
+            assert!(parse_sealing_required(Some(v.into())), "{v} is required");
+        }
+    }
 
     fn paths() -> Vec<String> {
         vec![

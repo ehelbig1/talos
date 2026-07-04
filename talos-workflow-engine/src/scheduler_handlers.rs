@@ -1650,8 +1650,13 @@ impl ParallelWorkflowEngine {
                 None
             }
         };
-        let cached_encrypted_secrets = self
-            .build_encrypted_secrets(body_module_id, execution_id, worker_shared_key)
+        // RFC 0010 P3 (D3b): resolve once in whichever form the sealing mode
+        // needs (inline WSK envelope OR plaintext for claim-based sealing), then
+        // clone per iteration. Using the shared helper means loop bodies seal
+        // exactly like single-node dispatches, so they don't fail the worker
+        // downgrade guard under `TALOS_ENVELOPE_SEALING=required`.
+        let cached_dispatch_secrets = self
+            .build_dispatch_secrets(body_module_id, execution_id, worker_shared_key)
             .await;
 
         while iteration < max_iters {
@@ -1737,9 +1742,9 @@ impl ParallelWorkflowEngine {
             // MCP-H6: reuse the prefetched encrypted_secrets. The DEK,
             // module-grant secrets, and LLM keys are invariant across
             // loop iterations, so re-resolving + re-encrypting per
-            // iteration is wasted work. Clone is cheap (it's an
-            // EncryptedSecrets containing a small Vec<u8> + nonce).
-            let encrypted_secrets = cached_encrypted_secrets.clone();
+            // iteration is wasted work. Clone is cheap (a small Vec<u8> +
+            // nonce, or the resolved plaintext map under claim-based sealing).
+            let dispatch_secrets = cached_dispatch_secrets.clone();
             let body_job = DispatchJob {
                 execution_id,
                 node_id: body_uuid,
@@ -1804,13 +1809,13 @@ impl ParallelWorkflowEngine {
                 allowed_secrets: wasm_module.allowed_secrets.clone(),
                 allowed_sql_operations: vec![],
                 allow_tier2_exposure: false,
-                encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
-                encrypted_secrets_nonce: encrypted_secrets.nonce,
-                // Loop-body dispatch stays on the legacy inline WSK envelope
-                // for now (P3 claim-based sealing wires the single-node path
-                // first — see RFC 0010).
-                plaintext_secrets: None,
-                secret_paths: Vec::new(),
+                encrypted_secrets_ciphertext: dispatch_secrets.encrypted.ciphertext,
+                encrypted_secrets_nonce: dispatch_secrets.encrypted.nonce,
+                // RFC 0010 P3 (D3b): claim-based sealing when the flag is on
+                // (else these are None/empty and the inline ciphertext above is
+                // used) — loop bodies now seal like single-node dispatches.
+                plaintext_secrets: dispatch_secrets.plaintext,
+                secret_paths: dispatch_secrets.secret_paths,
                 priority: 100,
                 dry_run: self.dry_run,
                 max_llm_tier: self.max_llm_tier,

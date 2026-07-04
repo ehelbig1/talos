@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::emit_event_spawn;
 use crate::engine::{ParallelWorkflowEngine, DEFAULT_NODE_TIMEOUT_SECS};
-use crate::secrets_pipeline::{build_encrypted_secrets_for, extract_vault_paths};
+use crate::secrets_pipeline::extract_vault_paths;
 
 impl ParallelWorkflowEngine {
     /// Build and await the full single-node dispatch future.
@@ -271,64 +271,32 @@ impl ParallelWorkflowEngine {
             .unwrap_or(wasm_module.max_fuel)
             .min(self.max_fuel_per_node);
 
-        // Resolve secrets. RFC 0010 P3 (D3b): when claim-based sealing is on
-        // (`TALOS_ENVELOPE_SEALING=audit|required`), resolve the PLAINTEXT map
-        // and hand it to the dispatcher via `plaintext_secrets` (registered in
-        // `InFlightSeals`, sealed on the worker's claim to its ephemeral key) —
-        // `encrypted_secrets` stays empty and NO plaintext reaches the wire.
-        // Otherwise take the legacy inline WSK envelope path (seal here, ship
-        // ciphertext). Both use the same `resolve_secrets_map_for` steps 1-5, so
-        // tier-1 filtering is identical across the two paths.
-        // L-1: AAD = execution_id binds the legacy AES-GCM tag to this dispatch.
+        // Resolve secrets. RFC 0010 P3 (D3b): `build_dispatch_secrets_for` is the
+        // single decision point — under claim-based sealing it returns the
+        // PLAINTEXT map (registered in `InFlightSeals`, sealed on the worker's
+        // claim; NO plaintext on the wire), otherwise the legacy inline WSK
+        // envelope. The SAME helper backs the loop-body path so sealing applies
+        // uniformly. L-1: AAD = execution_id binds the legacy AES-GCM tag.
+        let secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
+            (Some(resolver), Some(key)) => {
+                let vault_paths = extract_vault_paths(&module_config);
+                crate::secrets_pipeline::build_dispatch_secrets_for(
+                    resolver.as_ref(),
+                    self.secret_envelope.as_ref(),
+                    module_id_resolved,
+                    self.user_id,
+                    &vault_paths,
+                    &wasm_module.allowed_secrets,
+                    key.as_bytes(),
+                    self.max_llm_tier,
+                    execution_id.as_bytes(),
+                )
+                .await
+            }
+            _ => crate::secrets_pipeline::DispatchSecrets::default(),
+        };
         let (encrypted_secrets, plaintext_secrets, secret_paths) =
-            match (self.secrets_resolver.as_ref(), &worker_shared_key) {
-                (Some(resolver), Some(key)) => {
-                    let vault_paths = extract_vault_paths(&module_config);
-                    if crate::secrets_pipeline::claim_based_sealing_enabled() {
-                        let map = crate::secrets_pipeline::resolve_secrets_map_for(
-                            resolver.as_ref(),
-                            module_id_resolved,
-                            self.user_id,
-                            &vault_paths,
-                            &wasm_module.allowed_secrets,
-                            self.max_llm_tier,
-                        )
-                        .await;
-                        // secret_paths = the resolved secret NAMES (not values) —
-                        // sent in the clear for audit/observability and bound into
-                        // the dispatch signature (tamper-evident). Empty map ⇒ no
-                        // claim needed; leave plaintext None so the worker skips
-                        // the claim round-trip.
-                        let mut names: Vec<String> = map.keys().cloned().collect();
-                        names.sort_unstable();
-                        let plaintext = if map.is_empty() { None } else { Some(map) };
-                        (
-                            talos_workflow_job_protocol::EncryptedSecrets::empty(),
-                            plaintext,
-                            names,
-                        )
-                    } else {
-                        let sealed = build_encrypted_secrets_for(
-                            resolver.as_ref(),
-                            self.secret_envelope.as_ref(),
-                            module_id_resolved,
-                            self.user_id,
-                            &vault_paths,
-                            &wasm_module.allowed_secrets,
-                            key.as_bytes(),
-                            self.max_llm_tier,
-                            execution_id.as_bytes(),
-                        )
-                        .await;
-                        (sealed, None, Vec::new())
-                    }
-                }
-                _ => (
-                    talos_workflow_job_protocol::EncryptedSecrets::empty(),
-                    None,
-                    Vec::new(),
-                ),
-            };
+            (secrets.encrypted, secrets.plaintext, secrets.secret_paths);
 
         // Wire-format WASM budget. The dispatcher internally adds its
         // own Tokio-outer grace on top (see TOKIO_WRAP_GRACE_SECS).

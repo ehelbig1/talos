@@ -42,6 +42,28 @@ impl ParallelWorkflowEngine {
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> (NodeIndex, Result<JsonValue, String>) {
         let chain_tail = chain[chain.len() - 1];
+
+        // RFC 0010 P3 (D3b): pipeline steps still use the inline WSK envelope —
+        // per-step claim-based sealing is a follow-up. Under
+        // `TALOS_ENVELOPE_SEALING=required` (enforcement), refuse the pipeline
+        // rather than silently ship WSK-sealed secrets, which would violate the
+        // "no fleet-wide secret-decryption key on the worker" promise. Operators
+        // needing pipelines must keep sealing at `audit` (or split into
+        // single-node workflows) until pipeline sealing lands. `audit`/`off`
+        // dispatch inline as before.
+        if crate::secrets_pipeline::envelope_sealing_required() {
+            return (
+                chain_tail,
+                Err(
+                    "TALOS_ENVELOPE_SEALING=required refuses pipeline dispatch: per-step \
+                     claim-based sealing is not yet implemented, so pipeline secrets would \
+                     fall back to the inline WSK envelope. Run pipelines under audit, or split \
+                     into single-node workflows, until pipeline sealing lands (RFC 0010 P3)."
+                        .to_string(),
+                ),
+            );
+        }
+
         let chain_node_ids: Vec<Uuid> = chain.iter().map(|&n| self.graph[n]).collect();
         // Pre-resolve graph node UUIDs → module UUIDs. Graph node IDs
         // are SHA256-derived from the node label string and don't

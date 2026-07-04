@@ -1094,6 +1094,35 @@ async fn execute_pipeline_job(
         };
     }
 
+    // RFC 0010 P3 (D3b) downgrade guard (defense in depth — the engine already
+    // refuses to DISPATCH pipelines under `required`). Pipeline steps have no
+    // claim-based sealing path yet, so under `TALOS_ENVELOPE_SEALING=required`
+    // any pipeline job that reaches a worker must be refused rather than
+    // silently WSK-decrypted — otherwise `required` would give a false "no
+    // fleet-wide decryption key on the worker" guarantee for pipelines.
+    if worker_sealing_required() {
+        ::tracing::error!(
+            target: "talos_security",
+            job_id = %req.job_id,
+            "TALOS_ENVELOPE_SEALING=required: refusing pipeline job (per-step claim sealing \
+             is not yet implemented; pipelines would fall back to the inline WSK envelope)"
+        );
+        _span.end_error("envelope sealing required; pipeline refused");
+        return PipelineJobResult {
+            crypto_scheme: 0,
+            job_id: req.job_id,
+            overall_status: JobStatus::Failed,
+            step_results: vec![],
+            final_output: serde_json::json!({
+                "error": "envelope sealing required; pipeline claim-sealing not yet supported"
+            }),
+            total_time_ms: start.elapsed().as_millis() as u64,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        };
+    }
+
     // Validate maximum pipeline timeout to prevent indefinitely tying up workers.
     // MCP-642: =0 would reject every pipeline job (req.total_timeout_ms > 0
     // always exceeds 0). Substitute default + WARN.
