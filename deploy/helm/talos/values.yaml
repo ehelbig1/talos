@@ -956,6 +956,15 @@ networkPolicy:
     namespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: "monitoring"
+  # RFC 0010 P2 inc.4c: allow worker pods to reach the controller for
+  # POST /internal/worker-key (dynamic Ed25519 self-registration). OFF by
+  # default — enabling it opens controller:8000 to workers at the network
+  # layer (the endpoint's bearer-token + proof-of-possession auth is the real
+  # gate). Turn on only alongside TALOS_WORKER_REGISTRATION_TOKEN when using
+  # dynamic registration; leave off for the static TALOS_WORKER_PUBLIC_KEYS or
+  # register-worker-identity CLI path.
+  workerRegistrationIngress:
+    enabled: false
   # CIDRs the controller is allowed to reach for outbound LLM / SaaS calls.
   # Restrict in production to the exact hostnames' IP ranges if desired.
   externalEgressCIDRs:

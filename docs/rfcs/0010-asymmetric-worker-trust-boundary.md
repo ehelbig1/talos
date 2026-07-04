@@ -221,9 +221,30 @@ envelope deploy-ordering rule).
   > input domain separation). Landed in two commits: 3a (rpc_auth primitives),
   > 3b (thread through the five types + worker registration).
   >
-  > **Remaining P2 increment:** (4) the `worker_identities` registration table +
-  > endpoint for the autoscaling fleet (the `TALOS_WORKER_PUBLIC_KEYS`
-  > config-map resolver covers the static case first).
+  > **P2 increment 4 landed (dynamic registration).** `worker_identities` table
+  > (migration `20260704120000`) + `talos-worker-identity-repository`
+  > (advisory-lock-gated idempotent upsert with a per-worker active-key cap,
+  > fail-loud `[u8;32]` decode, soft-retire, `supports_sealing` bit for P3/D3b),
+  > verified against real Postgres. job_protocol's verifying-key registry became
+  > an `ArcSwap` snapshot (lock-free reads; env base + controller-installable
+  > dynamic overlay via `set_dynamic_worker_public_keys`, union + dedup +
+  > full-replacement) so the DB registry merges in without touching the five
+  > `worker_public_keys()` verify call sites. A controller refresh task
+  > (`TALOS_WORKER_KEY_REFRESH_SECS`, default 60) re-publishes the active set;
+  > eager-refresh after each registration write. Two paths write the table: the
+  > operator CLI (`register/list/deactivate-worker-identity`, DB-credentialed,
+  > verified end-to-end) and the in-cluster `POST /internal/worker-key` endpoint
+  > for autoscaling self-registration — mounted only when
+  > `TALOS_WORKER_REGISTRATION_TOKEN` is set, gated by a constant-time bearer
+  > token + an Ed25519 proof-of-possession (`verify_strict`) over a canonical
+  > domain-separated message + a freshness window, `no-nginx-route`, and an
+  > opt-in `networkPolicy.workerRegistrationIngress` (default off). **Residual:**
+  > the shared token authenticates "a legit worker pod", not a specific
+  > `worker_id`, so a compromised token-holder could register its own key under
+  > another `worker_id` — strictly smaller than the WSK model (any compromised
+  > worker forges as ANY worker), with per-worker tokens / mTLS-SAN binding as
+  > the hardening path. **Remaining P2 increment:** the worker-side boot-time
+  > self-registration client that calls the endpoint (inc.4d).
 - **P3 — Envelope sealing (D3b, chosen).** Land the claim/lease ephemeral-sealing
   scheme behind `TALOS_ENVELOPE_SEALING`. This is the phase that removes the last
   root-equivalent *secret-decryption* key from the worker. **Full protocol spec:**

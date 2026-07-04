@@ -45,6 +45,26 @@ spec:
         - protocol: TCP
           port: {{ .Values.controller.service.port }}
     {{- end }}
+    # RFC 0010 P2 inc.4c: worker → controller for POST /internal/worker-key
+    # (self-registration). OPT-IN (default false) because NetworkPolicy is
+    # port-level, not path-level: this rule opens controller:{{ .Values.controller.service.port }}
+    # to worker pods, which also serves /graphql, /mcp, /auth on the same port
+    # (the endpoint's bearer-token + proof-of-possession auth is still the gate;
+    # see the MCP-896 note above on the same tradeoff for monitoring). Enable it
+    # only alongside TALOS_WORKER_REGISTRATION_TOKEN when using dynamic worker
+    # registration; leave off for the static TALOS_WORKER_PUBLIC_KEYS / CLI path.
+    # A dedicated internal listener port would isolate this fully — tracked as a
+    # hardening follow-up.
+    {{- if .Values.networkPolicy.workerRegistrationIngress.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.controller.service.port }}
+    {{- end }}
   egress:
     # DNS
     - to:
