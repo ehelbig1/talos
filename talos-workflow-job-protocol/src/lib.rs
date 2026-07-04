@@ -458,6 +458,22 @@ pub fn parse_ed25519_signing_key_hex(hex_str: &str) -> Result<DispatchSigningKey
     Ok(DispatchSigningKey::from_bytes(&arr))
 }
 
+/// Generate a fresh Ed25519 keypair for the RFC 0010 worker-trust boundary,
+/// returned as `(signing_seed_hex, verifying_key_hex)` — both 64-char lowercase
+/// hex, in the exact shape [`parse_ed25519_signing_key_hex`] /
+/// [`parse_ed25519_verifying_key_hex`] accept. The seed is SECRET (store it in a
+/// Secret / KMS and hand it to exactly one process); the verifying key is public
+/// and is what the peer configures. Backs the `controller
+/// generate-worker-trust-keypair` operator subcommand — the ONE supported way
+/// to mint keys for `TALOS_{CONTROLLER,WORKER}_SIGNING_KEY` +
+/// `TALOS_{CONTROLLER_PUBLIC_KEY,WORKER_PUBLIC_KEYS}`.
+#[must_use]
+pub fn generate_ed25519_keypair_hex() -> (String, String) {
+    let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+    let vk = sk.verifying_key();
+    (hex::encode(sk.to_bytes()), hex::encode(vk.to_bytes()))
+}
+
 /// The controller's dispatch-signing choice, constructed once at boot from
 /// config and used at every `JobRequest` / `PipelineJobRequest` sign site so the
 /// scheme lives in ONE place. `Hmac` keeps the legacy `WORKER_SHARED_KEY` path;
@@ -4809,6 +4825,27 @@ mod tests {
         // Wrong lengths fail closed.
         assert!(parse_ed25519_verifying_key_hex("deadbeef").is_err());
         assert!(parse_ed25519_signing_key_hex("").is_err());
+    }
+
+    #[test]
+    fn generated_keypair_hex_roundtrips_and_matches() {
+        let (seed_hex, pub_hex) = generate_ed25519_keypair_hex();
+        assert_eq!(seed_hex.len(), 64, "seed is 32 bytes = 64 hex chars");
+        assert_eq!(pub_hex.len(), 64, "public key is 32 bytes = 64 hex chars");
+        // Both parse in the exact shape the env loaders accept.
+        let sk = parse_ed25519_signing_key_hex(&seed_hex).expect("seed parses");
+        let pk = parse_ed25519_verifying_key_hex(&pub_hex).expect("pubkey parses");
+        // The emitted public key is the one derived from the emitted seed —
+        // an operator pasting the two halves into peer processes gets a
+        // matching pair, and a signature made with the seed verifies under it.
+        assert_eq!(sk.verifying_key().to_bytes(), pk.to_bytes());
+        let mut req = make_test_request(None);
+        req.sign_ed25519(&sk).unwrap();
+        req.verify_no_replay_ed25519(&[pk], 300)
+            .expect("seed-signed request verifies under the emitted public key");
+        // Two calls yield distinct keys (not a constant).
+        let (seed2, _) = generate_ed25519_keypair_hex();
+        assert_ne!(seed_hex, seed2, "keygen must be random per call");
     }
 
     /// M-4: tampering with `actor_id` MUST invalidate the signature.

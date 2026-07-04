@@ -220,6 +220,48 @@ envelope deploy-ordering rule).
   `WORKER_SHARED_KEY` to workers entirely. Loud SIEM log on any legacy-scheme
   message during the window (mirror the env-KEK / RLS guard style).
 
+## Operator runbook (turning it on)
+
+Keys are minted with the controller binary — the ONE supported generator (hand-
+rolling with `openssl` produces a PKCS#8/PEM wrapper the loaders reject; they
+want a raw 32-byte seed / point in hex):
+
+```
+# Controller dispatch keypair (P1: controller signs dispatches, workers verify)
+controller generate-worker-trust-keypair --role controller
+
+# Per-worker keypair (P2: worker signs results + RPC, controller verifies)
+controller generate-worker-trust-keypair --role worker --worker-id <worker-id>
+```
+
+Each invocation prints a copy-pasteable env block labelled by which process gets
+which half. The `SIGNING` values are secrets → put them in the pod's Secret, not
+`values.yaml`. Rollout order (each step is safe to sit in for as long as needed —
+every verify path dual-accepts HMAC while the scheme flags are unset/false):
+
+1. **Dispatch (P1).** Set `TALOS_CONTROLLER_PUBLIC_KEY` on all workers first
+   (they now *accept* Ed25519 but still accept HMAC), then flip
+   `TALOS_DISPATCH_SCHEME=ed25519` + `TALOS_CONTROLLER_SIGNING_KEY` on the
+   controller. Roll workers to enforce with `TALOS_DISPATCH_REQUIRE_ED25519=1`.
+2. **Results + RPC (P2).** Register every worker's public key in the controller's
+   `TALOS_WORKER_PUBLIC_KEYS` (comma-separated `worker_id=hex`) first, then set
+   each worker's `TALOS_WORKER_SIGNING_KEY` (one key covers both result and RPC
+   signing). Enforce later with `TALOS_RESULT_REQUIRE_ED25519=1` /
+   `TALOS_RPC_REQUIRE_ED25519=1`.
+3. **P4 flip** once every worker signs Ed25519: set the three `*_REQUIRE_ED25519`
+   flags and stop distributing `WORKER_SHARED_KEY` for signing.
+
+Rotation: publish the new public key alongside the old (workers accept a
+comma-separated `TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS`; the controller accepts a
+repeated `worker_id=` entry in `TALOS_WORKER_PUBLIC_KEYS`), roll the signer, then
+drop the old key.
+
+> **Not yet wired into the Helm chart.** The env vars above are read by the
+> controller/worker binaries but the chart does not expose them yet (the signing
+> keys need Secret plumbing, not `values.yaml`). Until then, set them via the
+> deployment's existing Secret/env mechanism. Chart plumbing is tracked with the
+> P2 inc.4 registration work.
+
 ## Non-goals
 
 - **Replacing the controller↔Vault / KEK trust** — the controller is still the

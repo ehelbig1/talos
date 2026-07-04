@@ -279,6 +279,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(sub) = args.get(1) {
         match sub.as_str() {
             "publish-templates" => return run_publish_templates_cli(&args[2..]).await,
+            "generate-worker-trust-keypair" => {
+                return run_generate_worker_trust_keypair_cli(&args[2..]);
+            }
             "--help" | "-h" => {
                 println!("Usage:");
                 println!("  controller                            Run the HTTP server (default)");
@@ -290,6 +293,16 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("                                        for `oras push`. See");
                 println!("                                        .github/workflows/template-publish.yml");
+                println!("  controller generate-worker-trust-keypair --role <controller|worker>");
+                println!(
+                    "                                        [--worker-id <id>]  Mint an Ed25519"
+                );
+                println!(
+                    "                                        keypair for the RFC 0010 worker-trust"
+                );
+                println!(
+                    "                                        boundary and print the env block."
+                );
                 return Ok(());
             }
             // Anything else: fall through to server mode (preserves existing
@@ -5790,6 +5803,94 @@ use rpc_subscribers::{
     spawn_database_rpc_subscriber, spawn_graph_rpc_subscriber, spawn_integration_state_subscriber,
     spawn_integration_state_sweeper, spawn_memory_rpc_subscriber, spawn_state_write_subscriber,
 };
+
+// ---------- `controller generate-worker-trust-keypair` subcommand ----------
+//
+// RFC 0010 (asymmetric worker-trust boundary). Mints an Ed25519 keypair in the
+// exact hex shape the env loaders accept and prints a copy-pasteable env block
+// telling the operator which half goes on which process. This is the ONE
+// supported way to generate keys for the boundary — hand-rolling with openssl
+// produces the wrong encoding (the loaders want a raw 32-byte seed / point in
+// hex, not a PKCS#8/PEM wrapper).
+//
+// Two roles, because the boundary has two independent keypairs:
+//   --role controller            controller SIGNS dispatches, workers VERIFY.
+//                                seed → TALOS_CONTROLLER_SIGNING_KEY (controller)
+//                                pub  → TALOS_CONTROLLER_PUBLIC_KEY  (workers)
+//   --role worker --worker-id ID this worker SIGNS results + RPC, controller VERIFIES.
+//                                seed → TALOS_WORKER_SIGNING_KEY (this worker)
+//                                pub  → TALOS_WORKER_PUBLIC_KEYS entry (controller)
+//
+// The seed is a PRIVATE key: it prints to stdout (the standard keygen pattern,
+// like `wg genkey`) so the operator can capture it into a Secret, and a loud
+// stderr banner reminds them never to commit it. Nothing is logged via
+// `tracing` — the value never touches the structured log surface.
+fn run_generate_worker_trust_keypair_cli(args: &[String]) -> anyhow::Result<()> {
+    let mut role: Option<String> = None;
+    let mut worker_id: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--role" => {
+                role = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--role requires a value"))?
+                        .clone(),
+                );
+            }
+            "--worker-id" => {
+                worker_id = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--worker-id requires a value"))?
+                        .clone(),
+                );
+            }
+            other => anyhow::bail!("unknown generate-worker-trust-keypair flag: {other}"),
+        }
+    }
+    let role = role.ok_or_else(|| anyhow::anyhow!("--role is required (controller|worker)"))?;
+
+    let (seed_hex, pub_hex) = talos_workflow_job_protocol::generate_ed25519_keypair_hex();
+
+    // Secret-handling banner on stderr so it's visible even when stdout is
+    // piped into a file/secret.
+    eprintln!("# ─────────────────────────────────────────────────────────────────────");
+    eprintln!("# RFC 0010 worker-trust keypair ({role}). The SIGNING key below is");
+    eprintln!("# SECRET — store it in a Kubernetes Secret / KMS, hand it to exactly");
+    eprintln!("# one process, and NEVER commit it. The PUBLIC key is safe to share.");
+    eprintln!("# ─────────────────────────────────────────────────────────────────────");
+
+    match role.as_str() {
+        "controller" => {
+            println!("# ── on the CONTROLLER (signs dispatches) ──");
+            println!("TALOS_DISPATCH_SCHEME=ed25519");
+            println!("TALOS_CONTROLLER_SIGNING_KEY={seed_hex}");
+            println!();
+            println!("# ── on EVERY WORKER (verifies dispatches) ──");
+            println!("TALOS_CONTROLLER_PUBLIC_KEY={pub_hex}");
+            println!("# During a controller-key rotation, keep the previous public key for an");
+            println!("# overlap window: TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS=<old_pub>[,<older>]");
+        }
+        "worker" => {
+            let wid = worker_id
+                .ok_or_else(|| anyhow::anyhow!("--worker-id is required for --role worker"))?;
+            // The id is bound into every Ed25519 result/RPC signature and used
+            // as the controller's lookup key, so it must satisfy the same
+            // validator the worker applies at sign time.
+            talos_workflow_job_protocol::validate_worker_id(&wid)
+                .map_err(|e| anyhow::anyhow!("invalid --worker-id: {e}"))?;
+            println!("# ── on WORKER '{wid}' (signs job results + RPC) ──");
+            println!("TALOS_WORKER_SIGNING_KEY={seed_hex}");
+            println!();
+            println!("# ── on the CONTROLLER (verifies this worker) ──");
+            println!("# Append to TALOS_WORKER_PUBLIC_KEYS (comma-separated worker_id=hex pairs;");
+            println!("# repeat the same id with a new key for a rotation overlap window):");
+            println!("TALOS_WORKER_PUBLIC_KEYS={wid}={pub_hex}");
+        }
+        other => anyhow::bail!("unknown --role '{other}' (expected controller|worker)"),
+    }
+    Ok(())
+}
 
 // ---------- `controller publish-templates` subcommand ----------
 //
