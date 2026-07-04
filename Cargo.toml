@@ -66,6 +66,7 @@ members = [
     "talos-secrets-manager",
     "talos-module-payload-encryption",
     "talos-webhook-repository",
+    "talos-worker-identity-repository",
     "talos-totp-2fa",
     "talos-oauth",
     "talos-integrations",

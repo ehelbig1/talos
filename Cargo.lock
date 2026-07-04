@@ -8851,6 +8851,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-worker-identity-repository"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "talos-workflow-authorization"
 version = "0.1.0"
 dependencies = [
