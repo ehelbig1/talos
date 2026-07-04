@@ -19,6 +19,7 @@ pub mod metrics_server;
 pub mod module_fetcher;
 pub mod runtime;
 pub mod s3_signer;
+pub mod self_register;
 pub mod sql_validator;
 pub mod ssrf_resolver;
 pub mod trace_nats;

@@ -243,8 +243,14 @@ envelope deploy-ordering rule).
   > `worker_id`, so a compromised token-holder could register its own key under
   > another `worker_id` — strictly smaller than the WSK model (any compromised
   > worker forges as ANY worker), with per-worker tokens / mTLS-SAN binding as
-  > the hardening path. **Remaining P2 increment:** the worker-side boot-time
-  > self-registration client that calls the endpoint (inc.4d).
+  > the hardening path. **inc.4d landed (worker client):**
+  > `worker::self_register` POSTs a PoP-signed registration at boot (detached,
+  > best-effort, exponential-backoff retries, bails on non-429 4xx, no-op when
+  > `TALOS_CONTROLLER_URL` / `TALOS_WORKER_REGISTRATION_TOKEN` are unset). A unit
+  > test proves the worker-built body's proof verifies under the controller's
+  > `verify_worker_registration_proof` — the cross-process contract. **P2 is now
+  > complete** (inc.1–4); the boundary is Ed25519 end-to-end in both directions
+  > with both static (env/CLI) and dynamic (self-registration) key distribution.
 - **P3 — Envelope sealing (D3b, chosen).** Land the claim/lease ephemeral-sealing
   scheme behind `TALOS_ENVELOPE_SEALING`. This is the phase that removes the last
   root-equivalent *secret-decryption* key from the worker. **Full protocol spec:**

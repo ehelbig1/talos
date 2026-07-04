@@ -1485,6 +1485,15 @@ async fn main() -> anyhow::Result<()> {
             worker_id = %worker_identity(),
             "Registered per-worker Ed25519 RPC signing identity (RFC 0010 P2 inc.3)"
         );
+
+        // RFC 0010 P2 inc.4d: self-register this worker's public key with the
+        // controller (if TALOS_CONTROLLER_URL + TALOS_WORKER_REGISTRATION_TOKEN
+        // are set). Best-effort and detached so it never blocks boot or job
+        // processing; the signing key is `&'static` (OnceLock), so it moves into
+        // the task cleanly.
+        tokio::spawn(worker::self_register::register_worker_identity_at_boot(
+            rpc_signing_key,
+        ));
     }
 
     // M-3 (2026-05-22): log the SQL empty-allowlist policy at startup
