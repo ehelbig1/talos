@@ -27,6 +27,7 @@ use worker::module_fetcher::{
     SigstorePolicy,
 };
 use worker::runtime::{PipelineStepSpec, RetryPolicy, SecurityPolicy};
+use worker::secret_claim;
 use worker::worker_identity;
 use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
 
@@ -535,6 +536,23 @@ struct DispatchVerifyConfig {
     accept_legacy_hmac: bool,
 }
 
+/// RFC 0010 P3 (D3b): whether `TALOS_ENVELOPE_SEALING=required` — the worker
+/// downgrade-guard flag. Under `required` the worker refuses a `sealing == 0`
+/// (inline WSK) dispatch. `off`/`audit`/unset → `false` (both schemes handled).
+/// Cached; the flag is fixed for the process lifetime.
+fn worker_sealing_required() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("TALOS_ENVELOPE_SEALING")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("required")
+        )
+    })
+}
+
 /// Load [`DispatchVerifyConfig`] once. Malformed public keys are skipped with a
 /// loud warning (so one bad key can't strand the worker), and enabling
 /// enforcement without a usable key is logged as an error — the worker then
@@ -648,6 +666,9 @@ async fn execute_job(
     req: JobRequest,
     runtime: Arc<TalosRuntime>,
     shared_key: talos_workflow_engine_core::WorkerKeyRing,
+    // RFC 0010 P3 (D3b): NATS client for the secret-claim round-trip when a
+    // dispatch arrives with `sealing == SEALING_CLAIM_ECIES`.
+    nc: &async_nats::Client,
 ) -> JobResult {
     let start = std::time::Instant::now();
 
@@ -712,14 +733,66 @@ async fn execute_job(
         }
     }
 
-    // SECURITY: Decrypt secrets from the encrypted payload.
-    // L-1 (2026-05-22): AAD = workflow_execution_id. Controller-side
-    // encryption binds this same identifier into the AES-GCM tag, so
-    // a ciphertext transposed between executions (under the same
-    // shared key) fails the tag check here. The execution_id is
-    // already HMAC-bound in the JobRequest signing payload, so it
-    // can't be tampered with on the wire.
-    let secrets: HashMap<String, String> = if req.encrypted_secrets.is_empty() {
+    // RFC 0010 P3 (D3b): downgrade guard. Under `TALOS_ENVELOPE_SEALING=required`
+    // the worker refuses a legacy inline (`sealing == 0`) dispatch — the
+    // enforcement point that stops an on-wire downgrade from forcing the WSK
+    // envelope back on. Under `off`/`audit` (default) both schemes are handled.
+    if worker_sealing_required() && req.sealing != talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+    {
+        ::tracing::error!(
+            target: "talos_security",
+            job_id = %req.job_id,
+            "TALOS_ENVELOPE_SEALING=required but dispatch is sealing=0 (inline WSK) — refusing"
+        );
+        _span.end_error("envelope sealing required; inline dispatch refused");
+        return failed_result(
+            req.job_id,
+            &start,
+            "envelope sealing required; inline dispatch refused",
+        );
+    }
+
+    // SECURITY: obtain the job's secrets.
+    // - `sealing == 1` (P3): claim them via a signed `SecretClaim` to the
+    //   controller's `claim_inbox`; the controller seals to this worker's fresh
+    //   ephemeral key and the reply opens under it (forward secrecy). Fail-closed
+    //   on any claim/verify/open error — never run secretless.
+    // - `sealing == 0` (legacy): decrypt the inline WSK envelope. L-1
+    //   (2026-05-22): AAD = workflow_execution_id binds the AES-GCM tag to this
+    //   execution (already HMAC-bound in the signing payload), so a transposed
+    //   ciphertext fails the tag check here.
+    let secrets: HashMap<String, String> = if req.sealing
+        == talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+    {
+        let Some(signing_key) = worker_result_signing_key() else {
+            ::tracing::error!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                "sealing=1 dispatch requires TALOS_WORKER_SIGNING_KEY to sign the claim"
+            );
+            _span.end_error("sealing=1 requires a worker signing key");
+            return failed_result(
+                req.job_id,
+                &start,
+                "sealing=1 dispatch requires a worker signing key",
+            );
+        };
+        match secret_claim::claim_secrets(nc, &req, worker_identity(), signing_key, &dvc.ed_keys)
+            .await
+        {
+            Ok(map) => map,
+            Err(e) => {
+                ::tracing::error!(
+                    target: "talos_security",
+                    job_id = %req.job_id,
+                    error = %e,
+                    "RFC 0010 P3 secret claim failed"
+                );
+                _span.end_error("secret claim failed");
+                return failed_result(req.job_id, &start, "failed to obtain sealed secrets");
+            }
+        }
+    } else if req.encrypted_secrets.is_empty() {
         HashMap::new()
     } else {
         match req
@@ -2040,7 +2113,7 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
 
-                                let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
+                                let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone(), &nc_clone).await;
 
                                 // L-11: bind worker identity for audit attribution.
                                 // RFC 0010 P2: Ed25519 when configured, else HMAC.

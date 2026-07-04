@@ -134,6 +134,24 @@ pub(crate) async fn build_encrypted_secrets_for(
     }
 }
 
+/// RFC 0010 P3 (D3b): is claim-based ephemeral sealing enabled process-wide?
+/// True when `TALOS_ENVELOPE_SEALING` is `audit` or `required`. Cached — the flag
+/// is fixed for the process lifetime (a change needs a restart, like the dispatch
+/// scheme flags). Kept as a local env read so the engine doesn't take a dependency
+/// on `talos-envelope-seal` (and thus on `async-nats`) just to branch.
+pub(crate) fn claim_based_sealing_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("TALOS_ENVELOPE_SEALING")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("audit") | Some("required")
+        )
+    })
+}
+
 /// Resolve the plaintext secrets map for a node dispatch (steps 1-5 of the
 /// secret pipeline: module grants, declared extra paths, OAuth refresh + dynamic
 /// vault paths, the resolved-set tier-1 backstop, and the LLM-provider prefetch).

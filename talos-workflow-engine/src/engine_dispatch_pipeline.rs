@@ -279,6 +279,10 @@ impl ParallelWorkflowEngine {
                 allow_tier2_exposure: false,
                 encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
                 encrypted_secrets_nonce: encrypted_secrets.nonce,
+                // Pipelines stay on the legacy inline WSK envelope for now;
+                // per-step claim-based sealing is a P3 follow-up (see RFC 0010).
+                plaintext_secrets: None,
+                secret_paths: Vec::new(),
                 priority: 100,
                 dry_run: self.dry_run,
                 // Inherit the engine's tier ceiling (stamped from

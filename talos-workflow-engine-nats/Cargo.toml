@@ -20,6 +20,9 @@ async-trait = "0.1"
 # pre-allocation path in `transport.rs`.
 futures = "0.3"
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
+# RFC 0010 P3 (D3b): register per-dispatch plaintext secrets in InFlightSeals for
+# on-claim ephemeral sealing when TALOS_ENVELOPE_SEALING is on.
+talos-envelope-seal = { path = "../talos-envelope-seal" }
 # W3C trace-context injection into the outbound job NATS headers so worker
 # job/pipeline spans link to the controller's `workflow` span. No talos-* deps
 # of its own, so no dependency cycle.

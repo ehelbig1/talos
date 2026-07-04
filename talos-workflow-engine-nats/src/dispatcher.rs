@@ -682,6 +682,22 @@ pub struct NatsNodeDispatcher {
     /// expressions against the error payload. Wraps the sandboxed
     /// `rhai::Engine` in production; tests plug in their own impl.
     expression_evaluator: Arc<dyn ExpressionEvaluator>,
+    /// RFC 0010 P3 (D3b): claim-based sealing handle. `Some` when the controller
+    /// wired an `InFlightSeals` + the process claim-responder subject (via
+    /// [`with_envelope_sealing`](Self::with_envelope_sealing)); `None` (default)
+    /// keeps the legacy inline WSK envelope path. A `DispatchJob` that arrives
+    /// with `plaintext_secrets` but no handle here is refused (fail-closed) —
+    /// plaintext must never fall back onto the wire.
+    envelope: Option<EnvelopeSealingHandle>,
+}
+
+/// The controller-provided pieces the dispatcher needs to route a claim-based
+/// dispatch: the shared in-flight seal store (also read by the claim responder)
+/// and the responder's subject (stamped into `JobRequest.claim_inbox`).
+#[derive(Clone)]
+pub struct EnvelopeSealingHandle {
+    pub in_flight: Arc<talos_envelope_seal::InFlightSeals>,
+    pub claim_subject: String,
 }
 
 impl NatsNodeDispatcher {
@@ -711,7 +727,19 @@ impl NatsNodeDispatcher {
             dispatch_signer: None,
             retry_classifier,
             expression_evaluator,
+            envelope: None,
         }
+    }
+
+    /// RFC 0010 P3 (D3b): install the claim-based sealing handle. When set, a
+    /// `DispatchJob` carrying `plaintext_secrets` is registered in
+    /// `handle.in_flight` (keyed on the wire `job_id`) and its `JobRequest` is
+    /// stamped `sealing = 1` + `claim_inbox = handle.claim_subject`, with no
+    /// secrets on the wire. Omit it to keep the legacy inline WSK path.
+    #[must_use]
+    pub fn with_envelope_sealing(mut self, handle: EnvelopeSealingHandle) -> Self {
+        self.envelope = Some(handle);
+        self
     }
 
     /// RFC 0010 P1: install the dispatch signer (Ed25519 or explicit HMAC).
@@ -757,7 +785,7 @@ const TOKIO_WRAP_GRACE_SECS: u64 = 5;
 
 #[async_trait]
 impl NodeDispatcher for NatsNodeDispatcher {
-    async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+    async fn dispatch(&self, mut job: DispatchJob) -> Result<DispatchResult, BoxError> {
         // Zero-timeout sanity check: combined with the outer grace this
         // would surface as "cancel after ~5 s" for every job, which is
         // almost certainly not what the caller intended. `DispatchJob`'s
@@ -782,6 +810,13 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // `msg.reply` against the HMAC-protected value.
         let reply_inbox = self.transport.new_reply_inbox();
 
+        // RFC 0010 P3 (D3b): pull out the claim-based sealing inputs before the
+        // literal moves the rest of `job`. `job_id` is the wire id AND the
+        // InFlightSeals key the worker's claim will name (SecretClaim.exec_id).
+        let job_id = job.job_id.unwrap_or_else(uuid::Uuid::new_v4);
+        let claim_plaintext = job.plaintext_secrets.take();
+        let claim_secret_paths = std::mem::take(&mut job.secret_paths);
+
         // 1. Assemble the wire-format `JobRequest`.
         let mut req = JobRequest {
             crypto_scheme: 0,
@@ -792,7 +827,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // pre-INSERTed `module_executions` row with that id stays
             // correlated with the worker's update. Fresh UUID
             // otherwise.
-            job_id: job.job_id.unwrap_or_else(uuid::Uuid::new_v4),
+            job_id,
             workflow_execution_id: job.execution_id,
             module_uri: job.module_uri,
             input_payload: job.input_payload,
@@ -830,6 +865,31 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // results to anything else.
             reply_topic: reply_inbox.clone(),
         };
+
+        // RFC 0010 P3 (D3b): when the engine resolved PLAINTEXT secrets for this
+        // dispatch (claim-based sealing on), register them in InFlightSeals keyed
+        // on the wire job_id and stamp the sealing fields into the request BEFORE
+        // signing (so `sealing` + `secret_paths` + `claim_inbox` are bound and a
+        // downgrade / claim-redirect fails verification). No plaintext reaches
+        // the wire — the worker obtains the values via a signed claim to
+        // `claim_inbox`, sealed to its ephemeral key. Fail-closed when plaintext
+        // was resolved but no envelope handle is wired.
+        if let Some(plaintext) = claim_plaintext {
+            let handle = self.envelope.as_ref().ok_or_else(|| -> BoxError {
+                "RFC 0010 P3: dispatch carried plaintext_secrets but no envelope \
+                 sealing handle is wired — refusing to dispatch (fail-closed, no \
+                 plaintext on the wire)"
+                    .into()
+            })?;
+            let ctx = talos_envelope_seal::SealContext::new(&plaintext)
+                .map_err(|e| -> BoxError { format!("build seal context: {e}").into() })?;
+            handle.in_flight.register(job_id, ctx);
+            req.sealing = talos_workflow_job_protocol::SEALING_CLAIM_ECIES;
+            req.claim_inbox = Some(handle.claim_subject.clone());
+            req.secret_paths = claim_secret_paths;
+            // encrypted_secrets stays empty (the engine set ciphertext/nonce
+            // empty on the claim-based path).
+        }
 
         // 2. Sign. RFC 0010 P1: prefer the configured dispatch signer (Ed25519
         // or explicit HMAC); fall back to the bare worker_shared_key HMAC path
@@ -900,7 +960,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
         } else {
             None
         };
-        let output = execute_job_with_retry(
+        let result = execute_job_with_retry(
             self.transport.as_ref(),
             topic,
             payload,
@@ -923,9 +983,17 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // of the unsigned-reply `request`.
             reply_inbox,
         )
-        .await
-        .map_err(|e| -> BoxError { e.into() })?;
+        .await;
 
+        // RFC 0010 P3: the worker's claim TAKES the seal context on success;
+        // discard here bounds InFlightSeals if the job failed before any claim
+        // (worker died / claim rejected). No-op when nothing was registered or
+        // the context was already taken.
+        if let Some(handle) = self.envelope.as_ref() {
+            handle.in_flight.discard(job_id);
+        }
+
+        let output = result.map_err(|e| -> BoxError { e.into() })?;
         Ok(DispatchResult { output })
     }
 

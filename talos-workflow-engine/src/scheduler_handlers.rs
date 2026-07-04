@@ -1806,6 +1806,11 @@ impl ParallelWorkflowEngine {
                 allow_tier2_exposure: false,
                 encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
                 encrypted_secrets_nonce: encrypted_secrets.nonce,
+                // Loop-body dispatch stays on the legacy inline WSK envelope
+                // for now (P3 claim-based sealing wires the single-node path
+                // first — see RFC 0010).
+                plaintext_secrets: None,
+                secret_paths: Vec::new(),
                 priority: 100,
                 dry_run: self.dry_run,
                 max_llm_tier: self.max_llm_tier,

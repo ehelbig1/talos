@@ -135,6 +135,8 @@ mod tests {
             allow_tier2_exposure: false,
             encrypted_secrets_ciphertext: vec![],
             encrypted_secrets_nonce: vec![],
+            plaintext_secrets: None,
+            secret_paths: Vec::new(),
             priority: 100,
             dry_run: false,
             max_llm_tier: talos_workflow_engine_core::LlmTier::default(),
