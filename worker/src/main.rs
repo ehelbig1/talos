@@ -1467,6 +1467,26 @@ async fn main() -> anyhow::Result<()> {
         shared_key.signing_key().as_bytes().to_vec(),
     ));
 
+    // RFC 0010 P2 inc.3: when a per-worker Ed25519 key is provisioned
+    // (TALOS_WORKER_SIGNING_KEY — the SAME key used to sign job results),
+    // also register it as the RPC signing identity so memory/graph/database/
+    // state/integration-state requests are signed Ed25519 under this worker's
+    // id. The controller resolves the matching public key by worker_id and
+    // verifies asymmetrically; the HMAC key above stays registered so the
+    // controller's dual-verify accepts either scheme during rollout. Absent
+    // the key, RPC signing stays on the legacy HMAC path unchanged.
+    if let Some(rpc_signing_key) = worker_result_signing_key() {
+        talos_memory::rpc_auth::register_ed25519_signing_key(
+            worker_identity().to_string(),
+            Arc::new(rpc_signing_key.clone()),
+        );
+        ::tracing::info!(
+            target: "talos_security",
+            worker_id = %worker_identity(),
+            "Registered per-worker Ed25519 RPC signing identity (RFC 0010 P2 inc.3)"
+        );
+    }
+
     // M-3 (2026-05-22): log the SQL empty-allowlist policy at startup
     // so operators can confirm the mode they're running. Default is
     // `DenyMutations` (least-privilege); `AllowAllNonDdl` is the

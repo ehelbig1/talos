@@ -699,23 +699,46 @@ pub const RPC_CRYPTO_SCHEME_ED25519: u8 = 1;
 /// never be confused for another, and versioned for a future clean re-key.
 const RPC_ED25519_DOMAIN_TAG: &[u8] = b":talos-rpc-ed25519-v1";
 
-/// Process-wide Ed25519 RPC **signing** key slot. The worker registers its
-/// private key here at startup (from `TALOS_WORKER_SIGNING_KEY`) when Ed25519
-/// RPC signing is enabled. The controller never registers a signing key — it
-/// only verifies, against the per-worker public keys resolved from the
-/// `TALOS_WORKER_PUBLIC_KEYS` registry. `OnceLock`; idempotent registration.
-static ED25519_SIGNING: OnceLock<Arc<talos_workflow_job_protocol::DispatchSigningKey>> =
-    OnceLock::new();
-
-/// Install the worker's Ed25519 RPC signing key. Idempotent — a second call is
-/// silently ignored (first-registration wins), matching
-/// [`register_hmac_key_ring`]. Call once at worker startup alongside the HMAC
-/// registration; the controller does NOT call this.
-pub fn register_ed25519_signing_key(key: Arc<talos_workflow_job_protocol::DispatchSigningKey>) {
-    let _ = ED25519_SIGNING.set(key);
+/// The worker's registered RPC signing identity: its `worker_id` and private
+/// Ed25519 key, always installed together (the controller resolves the
+/// verifying key BY `worker_id`, so a key with no id is unverifiable).
+struct Ed25519RpcIdentity {
+    worker_id: String,
+    signing: Arc<talos_workflow_job_protocol::DispatchSigningKey>,
 }
 
-/// True when an Ed25519 RPC signing key has been registered (worker side).
+/// Process-wide Ed25519 RPC signing identity slot. The worker registers it at
+/// startup (from `TALOS_WORKER_SIGNING_KEY` + its worker id) when Ed25519 RPC
+/// signing is enabled. The controller never registers a signing key — it only
+/// verifies, against the per-worker public keys resolved from the
+/// `TALOS_WORKER_PUBLIC_KEYS` registry. `OnceLock`; idempotent registration.
+static ED25519_SIGNING: OnceLock<Ed25519RpcIdentity> = OnceLock::new();
+
+/// Install the worker's Ed25519 RPC signing identity (its `worker_id` + private
+/// key). Idempotent — a second call is silently ignored (first-registration
+/// wins), matching [`register_hmac_key_ring`]. Call once at worker startup
+/// alongside the HMAC registration; the controller does NOT call this. A blank
+/// `worker_id` is rejected (logged) — an Ed25519 RPC signature with no id can
+/// never be verified, so we keep the HMAC path instead of silently signing
+/// unverifiable requests.
+pub fn register_ed25519_signing_key(
+    worker_id: String,
+    key: Arc<talos_workflow_job_protocol::DispatchSigningKey>,
+) {
+    if worker_id.trim().is_empty() {
+        tracing::error!(
+            "register_ed25519_signing_key called with an empty worker_id — ignored; \
+             RPC signing stays on the legacy HMAC path"
+        );
+        return;
+    }
+    let _ = ED25519_SIGNING.set(Ed25519RpcIdentity {
+        worker_id,
+        signing: key,
+    });
+}
+
+/// True when an Ed25519 RPC signing identity has been registered (worker side).
 pub fn ed25519_signing_ready() -> bool {
     ED25519_SIGNING.get().is_some()
 }
@@ -754,20 +777,69 @@ fn sign_ed25519_with_key(
     sk.sign(&input).to_bytes().to_vec()
 }
 
-/// Sign an RPC request with the registered per-worker Ed25519 key. Returns
-/// `None` when no Ed25519 signing key has been registered (caller falls back to
-/// the HMAC path). The returned signature is 64 bytes.
-pub fn sign_ed25519(
+/// Sign an RPC body under the configured scheme, returning
+/// `(signature, worker_id, crypto_scheme)` for the request struct's three
+/// auth fields. Prefers per-worker Ed25519 when a signing identity is
+/// registered (RFC 0010 P2 inc.3), else the legacy `WORKER_SHARED_KEY` HMAC
+/// (with an empty `worker_id`). Returns `None` only when NEITHER key is
+/// registered — a misconfiguration the caller surfaces by refusing to sign.
+///
+/// This is the single scheme-decision point for all five RPC request types, so
+/// they can't diverge on which scheme they emit.
+pub fn sign_rpc(
+    subject: &str,
+    actor_id: Uuid,
+    nonce: &str,
+    body: &[u8],
+) -> Option<(Vec<u8>, String, u8)> {
+    if let Some(id) = ED25519_SIGNING.get() {
+        let sig = sign_ed25519_with_key(&id.signing, subject, actor_id, nonce, body, &id.worker_id);
+        return Some((sig, id.worker_id.clone(), RPC_CRYPTO_SCHEME_ED25519));
+    }
+    let sig = sign(subject, actor_id, nonce, body)?;
+    Some((sig, String::new(), RPC_CRYPTO_SCHEME_HMAC))
+}
+
+/// Whether the controller still accepts legacy-HMAC-signed RPC requests.
+/// Default `true` (accept — the rollout posture while workers migrate to
+/// per-worker Ed25519). `TALOS_RPC_REQUIRE_ED25519` ∈ {`1`,`true`,`yes`,`on`}
+/// flips it to `false`: the RFC 0010 P4 enforcement flip that refuses HMAC RPC
+/// once every worker signs Ed25519. Cached; single source of truth for the
+/// `accept_legacy_hmac` argument at every RPC verify site.
+pub fn rpc_accept_legacy_hmac() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            std::env::var("TALOS_RPC_REQUIRE_ED25519").ok().as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+/// Verify an RPC signature under the request's declared `crypto_scheme`
+/// (controller side). Ed25519 (scheme 1) against the keys registered for
+/// `worker_id`; legacy HMAC (scheme 0) against the shared ring, gated by
+/// `rpc_accept_legacy_hmac()`. Unknown scheme fails closed. Does NOT check
+/// freshness/replay — the caller runs `verify_freshness` + the nonce cache
+/// exactly as before, identically across schemes.
+pub fn verify_rpc(
     subject: &str,
     actor_id: Uuid,
     nonce: &str,
     body: &[u8],
     worker_id: &str,
-) -> Option<Vec<u8>> {
-    let sk = ED25519_SIGNING.get()?;
-    Some(sign_ed25519_with_key(
-        sk, subject, actor_id, nonce, body, worker_id,
-    ))
+    signature: &[u8],
+    crypto_scheme: u8,
+) -> bool {
+    match crypto_scheme {
+        RPC_CRYPTO_SCHEME_ED25519 => {
+            verify_ed25519(subject, actor_id, nonce, body, worker_id, signature)
+        }
+        RPC_CRYPTO_SCHEME_HMAC => {
+            rpc_accept_legacy_hmac() && verify(subject, actor_id, nonce, body, signature)
+        }
+        _ => false,
+    }
 }
 
 /// Pure Ed25519 verify core against an explicit key set (first match wins, so a

@@ -188,11 +188,30 @@ envelope deploy-ordering rule).
   > = unchanged HMAC behaviour; a compromised worker can forge results as
   > *itself* but never as another worker, and never a dispatch.
   >
-  > **Remaining P2 increments:** (3) the same for the four RPC protocols
-  > (needs a signed `worker_id` on the RPC types, which they don't carry
-  > today); (4) the `worker_identities` registration table + endpoint for the
-  > autoscaling fleet (the `TALOS_WORKER_PUBLIC_KEYS` config-map resolver
-  > covers the static case first).
+  > **P2 increment 3 landed (RPC-path Ed25519, all five signed protocols).**
+  > `talos-memory`'s `rpc_auth` gained the per-worker Ed25519 surface —
+  > `RPC_CRYPTO_SCHEME_*` + a domain-separated, `worker_id`-bound signing input,
+  > `register_ed25519_signing_key(worker_id, key)` (worker-only), `sign_rpc`
+  > (the single scheme-decision point returning `(signature, worker_id,
+  > crypto_scheme)`) and `verify_rpc` (routes on `crypto_scheme`; Ed25519 via
+  > `job_protocol::worker_public_keys`, else HMAC gated by
+  > `rpc_accept_legacy_hmac()` / `TALOS_RPC_REQUIRE_ED25519`). All five request
+  > types (`memory_rpc`, `graph_rpc`, `database_rpc`, `state_rpc`,
+  > `integration_state_rpc`) carry `#[serde(default)] worker_id + crypto_scheme`
+  > (absent ⇒ scheme-0, so wire bytes stay byte-identical) and route their
+  > `new_signed`/`verify` through the shared helpers. The worker registers its
+  > result-signing key (`TALOS_WORKER_SIGNING_KEY`) as the RPC identity too, so
+  > one keypair covers dispatch-reply AND all RPC. Freshness + the two-generation
+  > nonce replay cache are untouched — the subscriber still calls
+  > `check_and_record_nonce` separately, identically across schemes. 8 unit tests
+  > (roundtrip, wrong-worker-key, tampered worker_id/subject/actor/nonce/body,
+  > rotation overlap, empty-id/keyset + malformed-sig fail-closed, HMAC-vs-Ed25519
+  > input domain separation). Landed in two commits: 3a (rpc_auth primitives),
+  > 3b (thread through the five types + worker registration).
+  >
+  > **Remaining P2 increment:** (4) the `worker_identities` registration table +
+  > endpoint for the autoscaling fleet (the `TALOS_WORKER_PUBLIC_KEYS`
+  > config-map resolver covers the static case first).
 - **P3 — Envelope sealing (D3a or D3b).** Land the chosen sealing scheme behind
   `TALOS_ENVELOPE_SEALING`. This is the phase that removes the last
   root-equivalent decryption key from the worker.

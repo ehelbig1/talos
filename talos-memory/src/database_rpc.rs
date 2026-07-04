@@ -62,6 +62,14 @@ pub struct DatabaseRpcRequest {
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: Vec<u8>,
+    /// RFC 0010 P2 inc.3 — signer identity (empty under HMAC, worker id under
+    /// Ed25519). See `MemoryRpcRequest::worker_id`.
+    #[serde(default)]
+    pub worker_id: String,
+    /// Unsigned scheme hint: 0 = HMAC, 1 = Ed25519. See
+    /// `MemoryRpcRequest::crypto_scheme`.
+    #[serde(default)]
+    pub crypto_scheme: u8,
 }
 
 /// Variant tag byte. Single-byte discriminant for the only operation
@@ -141,7 +149,8 @@ impl DatabaseRpcRequest {
         let timestamp_ms = rpc_auth::now_ms();
         let nonce = rpc_auth::random_nonce();
         let body_bytes = sign_body_bytes(&sql, &params, is_fetch, timestamp_ms);
-        let signature = rpc_auth::sign(SUBJECT_NAME, actor_id, &nonce, &body_bytes)?;
+        let (signature, worker_id, crypto_scheme) =
+            rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body_bytes)?;
         Some(Self {
             actor_id,
             sql,
@@ -150,6 +159,8 @@ impl DatabaseRpcRequest {
             timestamp_ms,
             nonce,
             signature,
+            worker_id,
+            crypto_scheme,
         })
     }
 
@@ -165,12 +176,14 @@ impl DatabaseRpcRequest {
             return false;
         }
         let body_bytes = sign_body_bytes(&self.sql, &self.params, self.is_fetch, self.timestamp_ms);
-        rpc_auth::verify(
+        rpc_auth::verify_rpc(
             SUBJECT_NAME,
             self.actor_id,
             &self.nonce,
             &body_bytes,
+            &self.worker_id,
             &self.signature,
+            self.crypto_scheme,
         )
     }
 }
@@ -296,6 +309,8 @@ mod tests {
             timestamp_ms: rpc_auth::now_ms(),
             nonce: "abc".to_string(),
             signature: vec![],
+            worker_id: String::new(),
+            crypto_scheme: 0,
         };
         assert!(!req.verify());
 
@@ -308,6 +323,8 @@ mod tests {
             timestamp_ms: rpc_auth::now_ms(),
             nonce: "abc".to_string(),
             signature: vec![],
+            worker_id: String::new(),
+            crypto_scheme: 0,
         };
         assert!(!req_big.verify());
     }
