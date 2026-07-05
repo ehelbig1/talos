@@ -386,15 +386,16 @@ impl AdvancedRepository {
         .context("list_scratch_sessions")?;
         tx.commit().await.context("commit list_scratch_sessions")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ScratchSessionRow {
-                name: r.get("name"),
-                world: r.get("world"),
-                updated_at: r.get("updated_at"),
-                has_error: r.try_get("has_error").unwrap_or(false),
+        rows.into_iter()
+            .map(|r| -> Result<ScratchSessionRow> {
+                Ok(ScratchSessionRow {
+                    name: r.get("name"),
+                    world: r.get("world"),
+                    updated_at: r.get("updated_at"),
+                    has_error: r.try_get::<Option<bool>, _>("has_error")?.unwrap_or(false),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Delete a named scratch session. Returns the number of rows affected.
@@ -565,11 +566,14 @@ impl AdvancedRepository {
         .await
         .context("get_wasm_module_for_marketplace")?;
 
-        Ok(row.map(|r| WasmModuleRow {
-            name: r.get("name"),
-            capability_world: r.get("capability_world"),
-            source_code: r.try_get("source_code").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<WasmModuleRow> {
+            Ok(WasmModuleRow {
+                name: r.get("name"),
+                capability_world: r.get("capability_world"),
+                source_code: r.try_get::<Option<String>, _>("source_code")?,
+            })
+        })
+        .transpose()
     }
 
     /// Fetch sandbox template info for marketplace publishing (ownership-checked).
@@ -593,10 +597,13 @@ impl AdvancedRepository {
         .await
         .context("get_sandbox_for_marketplace")?;
 
-        Ok(row.map(|r| SandboxModuleRow {
-            name: r.get("name"),
-            wasm_bytes: r.try_get("wasm_bytes").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<SandboxModuleRow> {
+            Ok(SandboxModuleRow {
+                name: r.get("name"),
+                wasm_bytes: r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?,
+            })
+        })
+        .transpose()
     }
 
     /// Insert or update a marketplace listing. Returns the listing UUID.
@@ -681,19 +688,24 @@ impl AdvancedRepository {
         .await
         .context("get_wasm_module_source")?;
 
-        Ok(row.map(|r| TemplateSourceRow {
-            code_template: r
-                .try_get::<Option<String>, _>("source_code")
-                .unwrap_or(None)
-                .unwrap_or_default(),
-            wasm_bytes: normalize_wasm_bytes(
-                r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")
-                    .unwrap_or(None),
-            ),
-            config_schema: r.try_get("config_schema").unwrap_or(serde_json::json!({})),
-            allowed_secrets: r.try_get("allowed_secrets").unwrap_or_default(),
-            allowed_hosts: r.try_get("allowed_hosts").unwrap_or_default(),
-        }))
+        row.map(|r| -> Result<TemplateSourceRow> {
+            Ok(TemplateSourceRow {
+                code_template: r
+                    .try_get::<Option<String>, _>("source_code")?
+                    .unwrap_or_default(),
+                wasm_bytes: normalize_wasm_bytes(r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?),
+                config_schema: r
+                    .try_get::<Option<serde_json::Value>, _>("config_schema")?
+                    .unwrap_or(serde_json::json!({})),
+                allowed_secrets: r
+                    .try_get::<Option<Vec<String>>, _>("allowed_secrets")?
+                    .unwrap_or_default(),
+                allowed_hosts: r
+                    .try_get::<Option<Vec<String>>, _>("allowed_hosts")?
+                    .unwrap_or_default(),
+            })
+        })
+        .transpose()
     }
 
     /// Fetch a node template for marketplace installation.
@@ -710,18 +722,26 @@ impl AdvancedRepository {
         .await
         .context("get_template_source")?;
 
-        Ok(row.map(|r| TemplateSourceRow {
-            // `modules.source_code` is nullable (catalog-only rows have NULL);
-            // fall back to empty string to preserve the legacy non-null field shape.
-            code_template: r
-                .try_get::<Option<String>, _>("source_code")
-                .unwrap_or(None)
-                .unwrap_or_default(),
-            wasm_bytes: r.try_get("wasm_bytes").unwrap_or(None),
-            config_schema: r.try_get("config_schema").unwrap_or(serde_json::json!({})),
-            allowed_secrets: r.try_get("allowed_secrets").unwrap_or_default(),
-            allowed_hosts: r.try_get("allowed_hosts").unwrap_or_default(),
-        }))
+        row.map(|r| -> Result<TemplateSourceRow> {
+            Ok(TemplateSourceRow {
+                // `modules.source_code` is nullable (catalog-only rows have NULL);
+                // fall back to empty string to preserve the legacy non-null field shape.
+                code_template: r
+                    .try_get::<Option<String>, _>("source_code")?
+                    .unwrap_or_default(),
+                wasm_bytes: r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?,
+                config_schema: r
+                    .try_get::<Option<serde_json::Value>, _>("config_schema")?
+                    .unwrap_or(serde_json::json!({})),
+                allowed_secrets: r
+                    .try_get::<Option<Vec<String>>, _>("allowed_secrets")?
+                    .unwrap_or_default(),
+                allowed_hosts: r
+                    .try_get::<Option<Vec<String>>, _>("allowed_hosts")?
+                    .unwrap_or_default(),
+            })
+        })
+        .transpose()
     }
 
     /// Install a WASM module from the marketplace (atomic INSERT + download count increment).
@@ -867,10 +887,16 @@ impl AdvancedRepository {
         .context("get_marketplace_stats")?;
 
         Ok(MarketplaceStats {
-            total_listings: row.try_get("total_listings").unwrap_or(0),
-            total_downloads: row.try_get("total_downloads").unwrap_or(0),
-            unique_publishers: row.try_get("unique_publishers").unwrap_or(0),
-            world_count: row.try_get("world_count").unwrap_or(0),
+            total_listings: row
+                .try_get::<Option<i64>, _>("total_listings")?
+                .unwrap_or(0),
+            total_downloads: row
+                .try_get::<Option<i64>, _>("total_downloads")?
+                .unwrap_or(0),
+            unique_publishers: row
+                .try_get::<Option<i64>, _>("unique_publishers")?
+                .unwrap_or(0),
+            world_count: row.try_get::<Option<i64>, _>("world_count")?.unwrap_or(0),
         })
     }
 
@@ -896,15 +922,20 @@ impl AdvancedRepository {
         .await
         .context("get_marketplace_top_modules")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| MarketplaceTopModule {
-                name: r.try_get("name").unwrap_or_default(),
-                publisher_id: r.try_get("publisher_id").unwrap_or(Uuid::nil()),
-                downloads: r.try_get::<i64, _>("downloads").unwrap_or(0),
-                capability_world: r.try_get("capability_world").unwrap_or_default(),
+        rows.into_iter()
+            .map(|r| -> Result<MarketplaceTopModule> {
+                Ok(MarketplaceTopModule {
+                    name: r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+                    publisher_id: r
+                        .try_get::<Option<Uuid>, _>("publisher_id")?
+                        .unwrap_or(Uuid::nil()),
+                    downloads: r.try_get::<Option<i64>, _>("downloads")?.unwrap_or(0),
+                    capability_world: r
+                        .try_get::<Option<String>, _>("capability_world")?
+                        .unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// List public marketplace modules, optionally filtered by capability_world.
@@ -935,23 +966,30 @@ impl AdvancedRepository {
         .await
         .context("list_published_modules")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| PublishedModuleRow {
-                listing_id: r.try_get("id").unwrap_or(Uuid::nil()),
-                name: r.try_get("name").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or(None),
-                capability_world: r.try_get("capability_world").unwrap_or_default(),
-                version: r.try_get("version").unwrap_or_default(),
-                downloads: r.try_get::<i64, _>("downloads").unwrap_or(0),
-                star_count: r.try_get::<i32, _>("star_count").unwrap_or(0),
-                verified: r.try_get("verified").unwrap_or(false),
-                tags: r.try_get("tags").unwrap_or_default(),
-                published_at: r
-                    .try_get("created_at")
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+        rows.into_iter()
+            .map(|r| -> Result<PublishedModuleRow> {
+                Ok(PublishedModuleRow {
+                    listing_id: r.try_get::<Option<Uuid>, _>("id")?.unwrap_or(Uuid::nil()),
+                    name: r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+                    description: r.try_get::<Option<String>, _>("description")?,
+                    capability_world: r
+                        .try_get::<Option<String>, _>("capability_world")?
+                        .unwrap_or_default(),
+                    version: r
+                        .try_get::<Option<String>, _>("version")?
+                        .unwrap_or_default(),
+                    downloads: r.try_get::<Option<i64>, _>("downloads")?.unwrap_or(0),
+                    star_count: r.try_get::<Option<i32>, _>("star_count")?.unwrap_or(0),
+                    verified: r.try_get::<Option<bool>, _>("verified")?.unwrap_or(false),
+                    tags: r
+                        .try_get::<Option<Vec<String>>, _>("tags")?
+                        .unwrap_or_default(),
+                    published_at: r
+                        .try_get::<Option<DateTime<Utc>>, _>("created_at")?
+                        .unwrap_or_else(chrono::Utc::now),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Check whether a public listing exists.
@@ -1004,7 +1042,8 @@ impl AdvancedRepository {
         .await
         .context("increment_star_count")?;
 
-        Ok(row.map(|r| r.try_get("star_count").unwrap_or(0)))
+        row.map(|r| -> Result<i32> { Ok(r.try_get::<Option<i32>, _>("star_count")?.unwrap_or(0)) })
+            .transpose()
     }
 
     // ── Workflow operations ───────────────────────────────────────────────────
@@ -1044,11 +1083,12 @@ impl AdvancedRepository {
             .context("get_workflow_name_status")?;
         tx.commit().await?;
 
-        Ok(row.map(|r| {
-            let name: String = r.try_get("name").unwrap_or_default();
-            let status: Option<String> = r.try_get("status").unwrap_or(None);
-            (name, status)
-        }))
+        row.map(|r| -> Result<(String, Option<String>)> {
+            let name: String = r.try_get::<Option<String>, _>("name")?.unwrap_or_default();
+            let status: Option<String> = r.try_get("status")?;
+            Ok((name, status))
+        })
+        .transpose()
     }
 
     /// Set workflow status to 'active'.
@@ -1109,14 +1149,19 @@ impl AdvancedRepository {
         .await
         .context("get_source_workflow_for_promote")?;
 
-        Ok(row.map(|r| PromoteWorkflowRow {
-            name: r.try_get("name").unwrap_or_default(),
-            graph_json: r
-                .try_get("graph_json")
-                .unwrap_or_else(|_| r#"{"nodes":[],"edges":[]}"#.to_string()),
-            capabilities: r.try_get("capabilities").unwrap_or_default(),
-            intent: r.try_get("intent").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<PromoteWorkflowRow> {
+            Ok(PromoteWorkflowRow {
+                name: r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+                graph_json: r
+                    .try_get::<Option<String>, _>("graph_json")?
+                    .unwrap_or_else(|| r#"{"nodes":[],"edges":[]}"#.to_string()),
+                capabilities: r
+                    .try_get::<Option<Vec<String>>, _>("capabilities")?
+                    .unwrap_or_default(),
+                intent: r.try_get::<Option<serde_json::Value>, _>("intent")?,
+            })
+        })
+        .transpose()
     }
 
     /// Insert a new (promoted) workflow record.
@@ -1211,15 +1256,20 @@ impl AdvancedRepository {
         .await
         .context("get_node_templates_for_config")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| NodeTemplateConfigRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                config_schema: r.try_get("config_schema").unwrap_or(serde_json::json!({})),
-                allowed_secrets: r.try_get("allowed_secrets").unwrap_or_default(),
+        rows.into_iter()
+            .map(|r| -> Result<NodeTemplateConfigRow> {
+                Ok(NodeTemplateConfigRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    config_schema: r
+                        .try_get::<Option<serde_json::Value>, _>("config_schema")?
+                        .unwrap_or(serde_json::json!({})),
+                    allowed_secrets: r
+                        .try_get::<Option<Vec<String>>, _>("allowed_secrets")?
+                        .unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fetch all secret key_paths for a user (for vault cross-reference).
@@ -1252,12 +1302,13 @@ impl AdvancedRepository {
         tx.commit().await?;
 
         Ok(row
-            .map(|r| {
-                (
-                    r.try_get("total").unwrap_or(0),
-                    r.try_get("embedded").unwrap_or(0),
-                )
+            .map(|r| -> Result<(i64, i64)> {
+                Ok((
+                    r.try_get::<Option<i64>, _>("total")?.unwrap_or(0),
+                    r.try_get::<Option<i64>, _>("embedded")?.unwrap_or(0),
+                ))
             })
+            .transpose()?
             .unwrap_or((0, 0)))
     }
 
@@ -1295,17 +1346,18 @@ impl AdvancedRepository {
         .context("get_draft_workflows")?;
         tx.commit().await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| DraftWorkflowRow {
-                id: r.try_get("id").unwrap_or(Uuid::nil()),
-                name: r.try_get("name").unwrap_or_default(),
-                created_at: r
-                    .try_get("created_at")
-                    .unwrap_or_else(|_| chrono::Utc::now()),
-                graph_json: r.try_get("graph_json").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<DraftWorkflowRow> {
+                Ok(DraftWorkflowRow {
+                    id: r.try_get::<Option<Uuid>, _>("id")?.unwrap_or(Uuid::nil()),
+                    name: r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+                    created_at: r
+                        .try_get::<Option<DateTime<Utc>>, _>("created_at")?
+                        .unwrap_or_else(chrono::Utc::now),
+                    graph_json: r.try_get::<Option<String>, _>("graph_json")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Archive draft workflows with no executions older than `stale_days`. Returns count.
@@ -1404,12 +1456,19 @@ impl AdvancedRepository {
         .await
         .context("get_next_scheduled_run")?;
 
-        Ok(row.map(|r| NextScheduledRunRow {
-            cron_expression: r.try_get("cron_expression").unwrap_or_default(),
-            timezone: r.try_get("timezone").unwrap_or_else(|_| "UTC".to_string()),
-            next_trigger_at: r.try_get("next_trigger_at").ok(),
-            workflow_name: r.try_get("name").unwrap_or_default(),
-        }))
+        row.map(|r| -> Result<NextScheduledRunRow> {
+            Ok(NextScheduledRunRow {
+                cron_expression: r
+                    .try_get::<Option<String>, _>("cron_expression")?
+                    .unwrap_or_default(),
+                timezone: r
+                    .try_get::<Option<String>, _>("timezone")?
+                    .unwrap_or_else(|| "UTC".to_string()),
+                next_trigger_at: r.try_get("next_trigger_at").ok(),
+                workflow_name: r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+            })
+        })
+        .transpose()
     }
 
     /// Count active (non-archived) workflows for a user.
@@ -1555,14 +1614,15 @@ impl AdvancedRepository {
         .await
         .context("get_frequently_executed_unscheduled")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| PrevScheduledRow {
-                id: r.try_get("id").unwrap_or(Uuid::nil()),
-                name: r.try_get("name").unwrap_or_default(),
-                exec_count: r.try_get("exec_count").unwrap_or(0),
+        rows.into_iter()
+            .map(|r| -> Result<PrevScheduledRow> {
+                Ok(PrevScheduledRow {
+                    id: r.try_get::<Option<Uuid>, _>("id")?.unwrap_or(Uuid::nil()),
+                    name: r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+                    exec_count: r.try_get::<Option<i64>, _>("exec_count")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // ── Approval gates ────────────────────────────────────────────────────────
@@ -1695,25 +1755,29 @@ impl AdvancedRepository {
         }
         .context("list_approval_gates")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ApprovalGateRow {
-                id: r.try_get("id").unwrap_or(Uuid::nil()),
-                title: r.try_get("title").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or(None),
-                status: r.try_get("status").unwrap_or_default(),
-                continuation_workflow_id: r.try_get("continuation_workflow_id").unwrap_or(None),
-                created_at: r
-                    .try_get("created_at")
-                    .unwrap_or_else(|_| chrono::Utc::now()),
-                expires_at: r
-                    .try_get("expires_at")
-                    .unwrap_or_else(|_| chrono::Utc::now()),
-                resolved_at: r.try_get("resolved_at").unwrap_or(None),
-                resolved_by_type: r.try_get("resolved_by_type").unwrap_or(None),
-                resolved_by_note: r.try_get("resolved_by_note").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<ApprovalGateRow> {
+                Ok(ApprovalGateRow {
+                    id: r.try_get::<Option<Uuid>, _>("id")?.unwrap_or(Uuid::nil()),
+                    title: r.try_get::<Option<String>, _>("title")?.unwrap_or_default(),
+                    description: r.try_get::<Option<String>, _>("description")?,
+                    status: r
+                        .try_get::<Option<String>, _>("status")?
+                        .unwrap_or_default(),
+                    continuation_workflow_id: r
+                        .try_get::<Option<Uuid>, _>("continuation_workflow_id")?,
+                    created_at: r
+                        .try_get::<Option<DateTime<Utc>>, _>("created_at")?
+                        .unwrap_or_else(chrono::Utc::now),
+                    expires_at: r
+                        .try_get::<Option<DateTime<Utc>>, _>("expires_at")?
+                        .unwrap_or_else(chrono::Utc::now),
+                    resolved_at: r.try_get::<Option<DateTime<Utc>>, _>("resolved_at")?,
+                    resolved_by_type: r.try_get::<Option<String>, _>("resolved_by_type")?,
+                    resolved_by_note: r.try_get::<Option<String>, _>("resolved_by_note")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fetch the detail fields needed to resolve an approval gate.
@@ -1733,11 +1797,19 @@ impl AdvancedRepository {
         .await
         .context("get_approval_gate")?;
 
-        Ok(row.map(|r| ApprovalGateDetailRow {
-            status: r.try_get("status").unwrap_or_default(),
-            continuation_workflow_id: r.try_get("continuation_workflow_id").unwrap_or(None),
-            payload: r.try_get("payload").unwrap_or(serde_json::json!({})),
-        }))
+        row.map(|r| -> Result<ApprovalGateDetailRow> {
+            Ok(ApprovalGateDetailRow {
+                status: r
+                    .try_get::<Option<String>, _>("status")?
+                    .unwrap_or_default(),
+                continuation_workflow_id: r
+                    .try_get::<Option<Uuid>, _>("continuation_workflow_id")?,
+                payload: r
+                    .try_get::<Option<serde_json::Value>, _>("payload")?
+                    .unwrap_or(serde_json::json!({})),
+            })
+        })
+        .transpose()
     }
 
     /// Resolve a PENDING approval gate (approve/reject). Returns rows affected —
@@ -1806,13 +1878,14 @@ impl AdvancedRepository {
         .await
         .context("get_approval_gate_webhook")?;
 
-        Ok(row.map(|r| {
+        row.map(|r| -> Result<(String, Option<String>)> {
             let title: String = r
-                .try_get("title")
-                .unwrap_or_else(|_| "Approval Required".to_string());
-            let webhook: Option<String> = r.try_get("notification_webhook").unwrap_or(None);
-            (title, webhook)
-        }))
+                .try_get::<Option<String>, _>("title")?
+                .unwrap_or_else(|| "Approval Required".to_string());
+            let webhook: Option<String> = r.try_get("notification_webhook")?;
+            Ok((title, webhook))
+        })
+        .transpose()
     }
 
     // ── Continuation-workflow helpers ─────────────────────────────────────────
@@ -2096,11 +2169,16 @@ impl AdvancedRepository {
         .await
         .context("get_sla_threshold")?;
 
-        Ok(row.map(|r| SlaThresholdConfigRow {
-            notification_webhook: r.try_get("notification_webhook").unwrap_or_default(),
-            p95_latency_ms: r.try_get("p95_latency_ms").unwrap_or(None),
-            success_rate_pct: r.try_get("success_rate_pct").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<SlaThresholdConfigRow> {
+            Ok(SlaThresholdConfigRow {
+                notification_webhook: r
+                    .try_get::<Option<String>, _>("notification_webhook")?
+                    .unwrap_or_default(),
+                p95_latency_ms: r.try_get::<Option<i64>, _>("p95_latency_ms")?,
+                success_rate_pct: r.try_get::<Option<f64>, _>("success_rate_pct")?,
+            })
+        })
+        .transpose()
     }
 
     // ── Built-in templates ────────────────────────────────────────────────────
@@ -2447,19 +2525,22 @@ impl AdvancedRepository {
         q = q.bind(limit);
 
         let rows = q.fetch_all(&self.db_pool).await?;
-        Ok(rows
-            .iter()
-            .map(|r| MarketplaceSearchRow {
-                id: r.get("id"),
-                module_id: r.get("module_id"),
-                name: r.get("name"),
-                description: r.try_get("description").unwrap_or_default(),
-                capability_world: r.get("capability_world"),
-                version: r.get("version"),
-                downloads: r.get("downloads"),
-                tags: r.get("tags"),
+        rows.iter()
+            .map(|r| -> Result<MarketplaceSearchRow> {
+                Ok(MarketplaceSearchRow {
+                    id: r.get("id"),
+                    module_id: r.get("module_id"),
+                    name: r.get("name"),
+                    description: r
+                        .try_get::<Option<String>, _>("description")?
+                        .unwrap_or_default(),
+                    capability_world: r.get("capability_world"),
+                    version: r.get("version"),
+                    downloads: r.get("downloads"),
+                    tags: r.get("tags"),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Find groups of workflows with duplicate names (top 10 most-duplicated
@@ -2528,13 +2609,14 @@ impl AdvancedRepository {
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(rows
-            .iter()
-            .map(|r| PinnedModuleInstallStatus {
-                module_name: r.get("module_name"),
-                has_wasm: r.try_get("has_wasm").unwrap_or(false),
+        rows.iter()
+            .map(|r| -> Result<PinnedModuleInstallStatus> {
+                Ok(PinnedModuleInstallStatus {
+                    module_name: r.get("module_name"),
+                    has_wasm: r.try_get::<Option<bool>, _>("has_wasm")?.unwrap_or(false),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Active actors with active-memory count subquery. Used by
@@ -2558,25 +2640,26 @@ impl AdvancedRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ActiveActorWithMemoryRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.try_get("description").unwrap_or(None),
-                status: r
-                    .try_get::<Option<String>, _>("status")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "active".to_string()),
-                max_capability_world: r
-                    .try_get::<Option<String>, _>("max_capability_world")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "minimal-node".to_string()),
-                memory_count: r.try_get("memory_count").unwrap_or(0),
+        rows.iter()
+            .map(|r| -> Result<ActiveActorWithMemoryRow> {
+                Ok(ActiveActorWithMemoryRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    description: r.try_get::<Option<String>, _>("description")?,
+                    status: r
+                        .try_get::<Option<String>, _>("status")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "active".to_string()),
+                    max_capability_world: r
+                        .try_get::<Option<String>, _>("max_capability_world")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "minimal-node".to_string()),
+                    memory_count: r.try_get::<Option<i64>, _>("memory_count")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Recent execution activity for the agent's session-start awareness.
@@ -2631,18 +2714,21 @@ impl AdvancedRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| RecentExecutionRow {
-                execution_id: r.get("execution_id"),
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.try_get("workflow_name").unwrap_or_default(),
-                status: r.get("status"),
-                started_at: r.try_get("started_at").ok(),
-                completed_at: r.try_get("completed_at").ok(),
-                duration_ms: r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+        rows.iter()
+            .map(|r| -> Result<RecentExecutionRow> {
+                Ok(RecentExecutionRow {
+                    execution_id: r.get("execution_id"),
+                    workflow_id: r.get("workflow_id"),
+                    workflow_name: r
+                        .try_get::<Option<String>, _>("workflow_name")?
+                        .unwrap_or_default(),
+                    status: r.get("status"),
+                    started_at: r.try_get("started_at").ok(),
+                    completed_at: r.try_get("completed_at").ok(),
+                    duration_ms: r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Stuck executions: status = 'running' for more than `hours_threshold`
@@ -2669,14 +2755,15 @@ impl AdvancedRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| StuckExecutionRow {
-                execution_id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                hours_stuck: r.try_get("hours_stuck").unwrap_or(0.0),
+        rows.iter()
+            .map(|r| -> Result<StuckExecutionRow> {
+                Ok(StuckExecutionRow {
+                    execution_id: r.get("id"),
+                    workflow_id: r.get("workflow_id"),
+                    hours_stuck: r.try_get::<Option<f64>, _>("hours_stuck")?.unwrap_or(0.0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 }
 
