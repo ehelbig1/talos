@@ -247,7 +247,8 @@ envelope deploy-ordering rule).
   > `worker_id`, so a compromised token-holder could register its own key under
   > another `worker_id` — strictly smaller than the WSK model (any compromised
   > worker forges as ANY worker), with per-worker tokens / mTLS-SAN binding as
-  > the hardening path. **inc.4d landed (worker client):**
+  > the hardening path. *(Closed 2026-07-05 — see "P2 hardening landed" below:
+  > TOFU rule + single-use worker_id-bound provisioning tokens.)* **inc.4d landed (worker client):**
   > `worker::self_register` POSTs a PoP-signed registration at boot (detached,
   > best-effort, exponential-backoff retries, bails on non-429 4xx, no-op when
   > `TALOS_CONTROLLER_URL` / `TALOS_WORKER_REGISTRATION_TOKEN` are unset). A unit
@@ -255,6 +256,52 @@ envelope deploy-ordering rule).
   > `verify_worker_registration_proof` — the cross-process contract. **P2 is now
   > complete** (inc.1–4); the boundary is Ed25519 end-to-end in both directions
   > with both static (env/CLI) and dynamic (self-registration) key distribution.
+  >
+  > **P2 hardening landed (2026-07-05) — registration bound to worker_id.**
+  > Closes the shared-token impersonation residual above in three increments:
+  > 1. **TOFU rule** (`WorkerIdentityRepository::register_tofu`, the only path
+  >    the network endpoint now calls): a `worker_id`'s FIRST registered key
+  >    becomes its trusted identity; afterwards the shared-token path accepts
+  >    only an idempotent refresh of that exact ACTIVE key (bumps
+  >    `last_seen_at`/`supports_sealing`). A different key, a re-activation of
+  >    a deliberately deactivated key, or a new key for a fully-retired
+  >    `worker_id` all 409 with a loud `talos_security`
+  >    `worker_key_tofu_conflict` event. Deliberately stricter than
+  >    "refuse only while an active key exists": workers never generate signing
+  >    keys in-pod, so a legitimate new key always accompanies an operator, and
+  >    rotation/revocation-reversal go through the DB-credentialed
+  >    `register-worker-identity` CLI (unchanged `register()` semantics) or a
+  >    bound provisioning token.
+  > 2. **Single-use provisioning tokens** (`worker_provisioning_tokens`,
+  >    migration `20260705130000`): operator-minted, expiring, stored as
+  >    SHA-256 only (raw shown once at mint, never stored — the approval-gate
+  >    token_hash discipline), optionally BOUND to one `worker_id`. Any bearer
+  >    that is not the shared token takes this path (constant-time shared
+  >    compare; shape + proof-of-possession validated BEFORE any consumption so
+  >    garbage can't burn a token). Redemption is atomic inside the
+  >    registration transaction — `UPDATE … WHERE used_at IS NULL … RETURNING`
+  >    makes concurrent redeems admit exactly one, and a REFUSED registration
+  >    rolls the consumption back. Semantics by binding: BOUND token =
+  >    operator-grade `register()` (the mint was the explicit operator action —
+  >    this is also the sanctioned rotation path for autoscaled fleets);
+  >    WILDCARD token (`worker_id IS NULL`, migration compat) = TOFU semantics.
+  >    `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1` is the migration end-state:
+  >    shared token and wildcard tokens are refused (inside the consume SQL, so
+  >    nothing is burned), making every registration an explicit per-worker
+  >    operator grant — the accept-legacy-then-require rollout shape P1/P2
+  >    signing used. The endpoint also mounts in bound-token-only deployments
+  >    (flag set, no shared token).
+  > 3. **Ops surface**: `mint-worker-provisioning-token` (bound or explicit
+  >    `--wildcard`, TTL-clamped, prints the raw token once), `list-` (metadata
+  >    only, never the hash) and `revoke-worker-provisioning-token` (un-redeemed
+  >    only) CLI subcommands; mints/revokes append to `admin_event_log`
+  >    (`resource_type='worker_provisioning_token'`, `user_id` NULL on the CLI
+  >    path). **Remaining residual:** while enforcement is OFF, a shared-token
+  >    or wildcard holder can still claim a never-before-seen `worker_id`
+  >    first-come-first-served; flip `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1`
+  >    to close it. mTLS client-certs with a worker_id-bound SAN remain the
+  >    long-term alternative if the platform later wants to drop bearer
+  >    credentials entirely.
 - **P3 — Envelope sealing (D3b, chosen).** Land the claim/lease ephemeral-sealing
   scheme behind `TALOS_ENVELOPE_SEALING`. This is the phase that removes the last
   root-equivalent *secret-decryption* key from the worker. **Full protocol spec:**
