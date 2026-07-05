@@ -5350,17 +5350,31 @@ fn build_router(
         .layer(Extension(nats_client.clone()));
 
     // RFC 0010 P2 inc.4c: in-cluster worker self-registration. Mounted ONLY when
-    // TALOS_WORKER_REGISTRATION_TOKEN is configured (fail-closed: no token ⇒ no
-    // route ⇒ 404). Merged after the rate-limit layers like probe_routes, so it
-    // carries its own Extensions (db_pool + the token) and a small body cap.
-    // Access is further restricted to worker pods by the chart NetworkPolicy;
-    // it is never exposed via nginx (`no-nginx-route`).
-    let worker_reg_token = std::env::var("TALOS_WORKER_REGISTRATION_TOKEN")
+    // a registration credential scheme is configured — the legacy shared token
+    // (TALOS_WORKER_REGISTRATION_TOKEN) and/or bound-token enforcement
+    // (TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1, provisioning tokens minted via
+    // the mint-worker-provisioning-token CLI). Fail-closed: neither ⇒ no route
+    // ⇒ 404. Merged after the rate-limit layers like probe_routes, so it
+    // carries its own Extensions (db_pool + the auth config) and a small body
+    // cap. Access is further restricted to worker pods by the chart
+    // NetworkPolicy; it is never exposed via nginx (`no-nginx-route`).
+    let worker_reg_shared_token = std::env::var("TALOS_WORKER_REGISTRATION_TOKEN")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let internal_routes = if let Some(token) = worker_reg_token {
-        tracing::info!("Worker self-registration endpoint enabled at POST /internal/worker-key");
+        .filter(|s| !s.is_empty())
+        .map(std::sync::Arc::new);
+    let worker_reg_require_bound = std::env::var("TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    let internal_routes = if worker_reg_shared_token.is_some() || worker_reg_require_bound {
+        tracing::info!(
+            require_bound_token = worker_reg_require_bound,
+            shared_token_accepted = worker_reg_shared_token.is_some() && !worker_reg_require_bound,
+            "Worker self-registration endpoint enabled at POST /internal/worker-key"
+        );
         Router::new()
             .route(
                 "/internal/worker-key",
@@ -5368,11 +5382,15 @@ fn build_router(
             ) // no-nginx-route: RFC0010 in-cluster worker self-registration
             .layer(axum::extract::DefaultBodyLimit::max(4096))
             .layer(Extension(db_pool.clone()))
-            .layer(Extension(WorkerRegToken(std::sync::Arc::new(token))))
+            .layer(Extension(WorkerRegAuth {
+                shared_token: worker_reg_shared_token,
+                require_bound: worker_reg_require_bound,
+            }))
     } else {
         tracing::info!(
-            "Worker self-registration endpoint disabled (TALOS_WORKER_REGISTRATION_TOKEN unset); \
-             use the register-worker-identity CLI or TALOS_WORKER_PUBLIC_KEYS env"
+            "Worker self-registration endpoint disabled (TALOS_WORKER_REGISTRATION_TOKEN and \
+             TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN unset); use the register-worker-identity CLI \
+             or TALOS_WORKER_PUBLIC_KEYS env"
         );
         Router::new()
     };
@@ -5985,16 +6003,71 @@ async fn refresh_worker_key_overlay(
 //      generate keys in-pod, so a legitimate new key always accompanies an
 //      operator anyway.
 //
-// Residual (documented in the RFC): TOFU still lets a token-holder claim a
-// NEVER-BEFORE-SEEN worker_id first. The remaining hardening path is per-worker
-// provisioning tokens (single-use, worker_id-bound, hashed at rest) or an mTLS
-// client-cert whose SAN binds worker_id — tracked as a follow-up.
+//   7. PER-WORKER PROVISIONING TOKENS (P2 hardening inc.2): a bearer that is
+//      not the shared token is treated as a single-use provisioning token —
+//      operator-minted, expiring, stored as SHA-256 only, and (when bound to a
+//      worker_id) redeemable only for that worker. Consumption is atomic inside
+//      the registration transaction; a refused registration does not burn the
+//      token. `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1` is the migration
+//      end-state: shared token and wildcard tokens are refused, so EVERY
+//      registration is an explicit operator grant for one worker_id — closing
+//      the first-come-first-served residual TOFU leaves on never-before-seen
+//      worker_ids.
+//
+// Residual (documented in the RFC): while enforcement is OFF (migration
+// window), a shared-token/wildcard holder can still claim a never-before-seen
+// worker_id first. mTLS client-certs with a worker_id-bound SAN remain the
+// long-term alternative.
 
-/// The configured registration bearer token, injected as an axum `Extension` on
-/// the internal sub-router. Present only when the route is mounted (i.e. the env
-/// var is set and non-empty), so the handler always has a real token to compare.
+/// Registration-auth config, injected as an axum `Extension` on the internal
+/// sub-router. At least one scheme is configured whenever the route is mounted.
+/// No `Debug` derive — `shared_token` is a live bearer credential (check 37).
 #[derive(Clone)]
-struct WorkerRegToken(std::sync::Arc<String>);
+struct WorkerRegAuth {
+    /// Legacy shared bearer (`TALOS_WORKER_REGISTRATION_TOKEN`). `None` in a
+    /// bound-token-only deployment.
+    shared_token: Option<std::sync::Arc<String>>,
+    /// `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1` — the migration end-state:
+    /// only single-use provisioning tokens BOUND to a worker_id register;
+    /// the shared token and wildcard tokens are refused. Mirrors the
+    /// accept-legacy-then-require rollout P1/P2 used for signing schemes.
+    require_bound: bool,
+}
+
+/// Which authentication path a presented bearer takes. Decided by constant-time
+/// comparison against the shared token; everything that is NOT the shared
+/// token is treated as a provisioning-token candidate and resolved against the
+/// DB (hashed lookup), so the classifier itself leaks nothing about validity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegBearerPath {
+    /// Matches the shared token and enforcement is off → TOFU registration.
+    LegacyShared,
+    /// Matches the shared token but bound-token enforcement is on → refuse
+    /// (distinct variant only so the handler can log the policy hit; the
+    /// client response stays generic).
+    SharedRefusedByPolicy,
+    /// Anything else → try single-use provisioning-token redemption.
+    Provisioning,
+}
+
+/// Classify the presented (non-empty) bearer.
+fn classify_registration_bearer(
+    provided: &str,
+    shared: Option<&str>,
+    require_bound: bool,
+) -> RegBearerPath {
+    use subtle::ConstantTimeEq;
+    let is_shared = shared.is_some_and(|s| {
+        // Length check first (ct_eq requires equal length); the compare itself
+        // is constant-time so the token can't be recovered by timing.
+        provided.len() == s.len() && bool::from(provided.as_bytes().ct_eq(s.as_bytes()))
+    });
+    match (is_shared, require_bound) {
+        (true, false) => RegBearerPath::LegacyShared,
+        (true, true) => RegBearerPath::SharedRefusedByPolicy,
+        (false, _) => RegBearerPath::Provisioning,
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct WorkerKeyRegistrationRequest {
@@ -6016,29 +6089,14 @@ struct WorkerKeyRegistrationRequest {
 const WORKER_REG_PAST_MS: u64 = 300_000;
 const WORKER_REG_FUTURE_MS: u64 = 60_000;
 
-/// Pure authorization decision for a registration request: constant-time bearer
-/// compare + freshness window. Extracted so it is unit-testable without a live
-/// server. `expected_token` is always non-empty (the route is unmounted
-/// otherwise). Returns the client-facing `(status, message)` on rejection — none
-/// of these leak internal state.
-fn authorize_worker_registration(
-    provided_token: Option<&str>,
-    expected_token: &str,
+/// Freshness window for a registration request: reject stale (past the window)
+/// or future-dated requests. Pure so it is unit-testable without a live server.
+/// The client-facing message leaks no internal state.
+fn check_registration_freshness(
     issued_at_ms: u64,
     now_ms: u64,
 ) -> Result<(), (axum::http::StatusCode, &'static str)> {
     use axum::http::StatusCode;
-    use subtle::ConstantTimeEq;
-
-    let provided = provided_token.ok_or((StatusCode::UNAUTHORIZED, "missing bearer token"))?;
-    // Length check first (ct_eq requires equal length); the compare itself is
-    // constant-time so a wrong token can't be recovered by timing.
-    let ok: bool = provided.len() == expected_token.len()
-        && provided.as_bytes().ct_eq(expected_token.as_bytes()).into();
-    if !ok {
-        return Err((StatusCode::UNAUTHORIZED, "invalid registration token"));
-    }
-    // Freshness: reject stale (past the window) or future-dated requests.
     if issued_at_ms.saturating_add(WORKER_REG_PAST_MS) < now_ms {
         return Err((StatusCode::BAD_REQUEST, "registration request expired"));
     }
@@ -6049,6 +6107,14 @@ fn authorize_worker_registration(
         ));
     }
     Ok(())
+}
+
+/// SHA-256 hex of a presented bearer — the shape stored in
+/// `worker_provisioning_tokens.token_hash`. The raw token is neither stored
+/// nor used in any SQL comparison (lint check 41 discipline).
+fn provisioning_token_hash(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(raw.as_bytes()))
 }
 
 /// Extract a `Bearer <token>` value from the Authorization header.
@@ -6070,7 +6136,7 @@ fn worker_reg_error(
 
 async fn register_worker_key_handler(
     Extension(db_pool): Extension<sqlx::PgPool>,
-    Extension(reg_token): Extension<WorkerRegToken>,
+    Extension(auth): Extension<WorkerRegAuth>,
     headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<WorkerKeyRegistrationRequest>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
@@ -6081,13 +6147,13 @@ async fn register_worker_key_handler(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // 1) Bearer + freshness.
-    if let Err((status, msg)) = authorize_worker_registration(
-        bearer_token(&headers),
-        &reg_token.0,
-        req.issued_at_ms,
-        now_ms,
-    ) {
+    // 1) Bearer presence + freshness. Which auth path the bearer takes is
+    //    decided AFTER shape + proof-of-possession pass, so a garbage request
+    //    can never consume a single-use provisioning token.
+    let Some(provided_bearer) = bearer_token(&headers) else {
+        return worker_reg_error(StatusCode::UNAUTHORIZED, "missing bearer token");
+    };
+    if let Err((status, msg)) = check_registration_freshness(req.issued_at_ms, now_ms) {
         return worker_reg_error(status, msg);
     }
 
@@ -6128,15 +6194,60 @@ async fn register_worker_key_handler(
         return worker_reg_error(StatusCode::UNAUTHORIZED, "proof-of-possession failed");
     }
 
-    // 4) Persist under the TOFU rule (first key wins; only that key may
-    //    refresh itself here), then eagerly refresh the verify overlay so the
-    //    worker's very first result verifies immediately.
+    // 4) Auth-path decision + persistence, then (on success) an eager refresh
+    //    of the verify overlay so the worker's very first result verifies
+    //    immediately. Shared token → TOFU rule (first key wins; only that key
+    //    may refresh itself here). Anything else → single-use provisioning
+    //    token: bound tokens carry operator-grade rotation semantics, wildcard
+    //    tokens carry TOFU semantics and are refused entirely under
+    //    TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1.
     let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool);
-    match repo
-        .register_tofu(&req.worker_id, &public_key, req.supports_sealing)
-        .await
-    {
-        Ok(talos_worker_identity_repository::TofuOutcome::Registered) => {
+    let path = classify_registration_bearer(
+        provided_bearer,
+        auth.shared_token.as_deref().map(String::as_str),
+        auth.require_bound,
+    );
+    let outcome = match path {
+        RegBearerPath::SharedRefusedByPolicy => {
+            tracing::warn!(
+                target: "talos_security",
+                event_kind = "worker_reg_shared_token_refused",
+                worker_id = %req.worker_id,
+                "shared registration token presented but bound-token enforcement \
+                 (TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN) is on; refusing. Mint a \
+                 worker_id-bound provisioning token for this worker instead."
+            );
+            return worker_reg_error(StatusCode::UNAUTHORIZED, "invalid registration token");
+        }
+        RegBearerPath::LegacyShared => repo
+            .register_tofu(&req.worker_id, &public_key, req.supports_sealing)
+            .await
+            .map(|o| match o {
+                talos_worker_identity_repository::TofuOutcome::Registered => {
+                    talos_worker_identity_repository::TokenRegisterOutcome::Registered
+                }
+                talos_worker_identity_repository::TofuOutcome::IdentityConflict => {
+                    talos_worker_identity_repository::TokenRegisterOutcome::IdentityConflict
+                }
+            }),
+        RegBearerPath::Provisioning => {
+            // Hash the presented bearer; only the digest touches SQL. An
+            // unknown/used/expired/revoked/misbound token collapses into ONE
+            // client-facing 401 below.
+            let token_hash = provisioning_token_hash(provided_bearer);
+            repo.register_with_provisioning_token(
+                &token_hash,
+                &req.worker_id,
+                &public_key,
+                req.supports_sealing,
+                auth.require_bound,
+            )
+            .await
+        }
+    };
+
+    match outcome {
+        Ok(talos_worker_identity_repository::TokenRegisterOutcome::Registered) => {
             if let Err(e) = refresh_worker_key_overlay(&repo).await {
                 // Non-fatal: the periodic task will pick it up within its interval.
                 tracing::warn!(
@@ -6150,6 +6261,7 @@ async fn register_worker_key_handler(
                 event_kind = "worker_key_registered",
                 worker_id = %req.worker_id,
                 supports_sealing = req.supports_sealing,
+                auth_path = ?path,
                 "worker self-registered an Ed25519 identity key"
             );
             (
@@ -6157,7 +6269,20 @@ async fn register_worker_key_handler(
                 axum::Json(serde_json::json!({ "status": "registered" })),
             )
         }
-        Ok(talos_worker_identity_repository::TofuOutcome::IdentityConflict) => {
+        Ok(talos_worker_identity_repository::TokenRegisterOutcome::InvalidToken) => {
+            // Server-side detail, generic client response: presence only, never
+            // the token value.
+            tracing::warn!(
+                target: "talos_security",
+                event_kind = "worker_reg_token_invalid",
+                worker_id = %req.worker_id,
+                "worker-key registration refused: no eligible provisioning token \
+                 (unknown, used, expired, revoked, bound to another worker_id, or \
+                 wildcard under bound-token enforcement)"
+            );
+            worker_reg_error(StatusCode::UNAUTHORIZED, "invalid registration token")
+        }
+        Ok(talos_worker_identity_repository::TokenRegisterOutcome::IdentityConflict) => {
             // The single loudest signal this endpoint can emit: a token-holder
             // tried to bind a key that is NOT this worker_id's trusted key —
             // either in-fleet impersonation or an unmanaged rotation. Public
@@ -6167,16 +6292,22 @@ async fn register_worker_key_handler(
                 event_kind = "worker_key_tofu_conflict",
                 worker_id = %req.worker_id,
                 submitted_public_key = %hex::encode(public_key),
+                auth_path = ?path,
                 "worker-key registration REFUSED: worker_id already has a bound \
                  identity and the submitted key does not match its active key. \
                  Possible in-fleet impersonation attempt; legitimate rotation \
-                 goes through the register-worker-identity operator CLI."
+                 goes through the register-worker-identity operator CLI or a \
+                 worker_id-bound provisioning token."
             );
             worker_reg_error(
                 StatusCode::CONFLICT,
                 "worker_id already has a registered identity; rotation requires operator action",
             )
         }
+        Ok(talos_worker_identity_repository::TokenRegisterOutcome::CapReached) => worker_reg_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "worker already holds the maximum active keys; deactivate one first",
+        ),
         Err(e) => {
             // Log full error server-side; return a generic message (no schema leak).
             tracing::error!(
@@ -8248,70 +8379,83 @@ mod tenancy;
 
 #[cfg(test)]
 mod worker_registration_auth_tests {
-    use super::{authorize_worker_registration, WORKER_REG_FUTURE_MS, WORKER_REG_PAST_MS};
+    use super::{
+        check_registration_freshness, classify_registration_bearer, provisioning_token_hash,
+        RegBearerPath, WORKER_REG_FUTURE_MS, WORKER_REG_PAST_MS,
+    };
     use axum::http::StatusCode;
 
     const NOW: u64 = 1_700_000_000_000;
     const TOKEN: &str = "s3cret-registration-token";
 
     #[test]
-    fn accepts_valid_token_and_fresh_timestamp() {
-        assert!(authorize_worker_registration(Some(TOKEN), TOKEN, NOW, NOW).is_ok());
+    fn accepts_fresh_timestamps() {
+        assert!(check_registration_freshness(NOW, NOW).is_ok());
         // Within the past window and the future window.
-        assert!(authorize_worker_registration(
-            Some(TOKEN),
-            TOKEN,
-            NOW - WORKER_REG_PAST_MS + 1,
-            NOW
-        )
-        .is_ok());
-        assert!(
-            authorize_worker_registration(Some(TOKEN), TOKEN, NOW + WORKER_REG_FUTURE_MS, NOW)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn rejects_missing_wrong_and_mislength_token() {
-        assert_eq!(
-            authorize_worker_registration(None, TOKEN, NOW, NOW)
-                .unwrap_err()
-                .0,
-            StatusCode::UNAUTHORIZED
-        );
-        // Same length, different content.
-        let wrong = "S3cret-registration-token";
-        assert_eq!(wrong.len(), TOKEN.len());
-        assert_eq!(
-            authorize_worker_registration(Some(wrong), TOKEN, NOW, NOW)
-                .unwrap_err()
-                .0,
-            StatusCode::UNAUTHORIZED
-        );
-        // Different length (the length guard before ct_eq).
-        assert_eq!(
-            authorize_worker_registration(Some("short"), TOKEN, NOW, NOW)
-                .unwrap_err()
-                .0,
-            StatusCode::UNAUTHORIZED
-        );
+        assert!(check_registration_freshness(NOW - WORKER_REG_PAST_MS + 1, NOW).is_ok());
+        assert!(check_registration_freshness(NOW + WORKER_REG_FUTURE_MS, NOW).is_ok());
     }
 
     #[test]
     fn rejects_stale_and_future_dated() {
         // One ms past the past window.
         assert_eq!(
-            authorize_worker_registration(Some(TOKEN), TOKEN, NOW - WORKER_REG_PAST_MS - 1, NOW)
+            check_registration_freshness(NOW - WORKER_REG_PAST_MS - 1, NOW)
                 .unwrap_err()
                 .0,
             StatusCode::BAD_REQUEST
         );
         // One ms past the future window.
         assert_eq!(
-            authorize_worker_registration(Some(TOKEN), TOKEN, NOW + WORKER_REG_FUTURE_MS + 1, NOW)
+            check_registration_freshness(NOW + WORKER_REG_FUTURE_MS + 1, NOW)
                 .unwrap_err()
                 .0,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn shared_token_classification_respects_enforcement_flag() {
+        // Exact shared-token match, enforcement off → legacy TOFU path.
+        assert_eq!(
+            classify_registration_bearer(TOKEN, Some(TOKEN), false),
+            RegBearerPath::LegacyShared
+        );
+        // Same match under enforcement → refused-by-policy (handler logs, 401).
+        assert_eq!(
+            classify_registration_bearer(TOKEN, Some(TOKEN), true),
+            RegBearerPath::SharedRefusedByPolicy
+        );
+    }
+
+    #[test]
+    fn non_shared_bearers_route_to_the_provisioning_path() {
+        // Same length, different content (the ct_eq branch).
+        let wrong = "S3cret-registration-token";
+        assert_eq!(wrong.len(), TOKEN.len());
+        assert_eq!(
+            classify_registration_bearer(wrong, Some(TOKEN), false),
+            RegBearerPath::Provisioning
+        );
+        // Different length (the length guard before ct_eq).
+        assert_eq!(
+            classify_registration_bearer("short", Some(TOKEN), false),
+            RegBearerPath::Provisioning
+        );
+        // Bound-token-only deployment: no shared token configured at all.
+        assert_eq!(
+            classify_registration_bearer(TOKEN, None, true),
+            RegBearerPath::Provisioning
+        );
+    }
+
+    #[test]
+    fn token_hash_is_sha256_hex_of_the_raw_bearer() {
+        // Pinned vector so the CLI mint and the endpoint redeem can never
+        // drift: sha256("wpt_test") — independently verifiable.
+        assert_eq!(
+            provisioning_token_hash("wpt_test"),
+            "137e7e89843ad7a07606e9cf6fc91eb2e95f9be2612a320c3945dd2e22227da0"
         );
     }
 }

@@ -22,8 +22,12 @@
 //!
 //! Config (all must be present to enable self-registration):
 //!   * `TALOS_CONTROLLER_URL`            — controller base URL (in-cluster).
-//!   * `TALOS_WORKER_REGISTRATION_TOKEN` — shared bearer token (matches the
-//!                                         controller's env).
+//!   * `TALOS_WORKER_REGISTRATION_TOKEN` — bearer credential: either the
+//!                                         fleet-shared token (matches the
+//!                                         controller's env) or a single-use
+//!                                         provisioning token minted for THIS
+//!                                         worker_id via
+//!                                         `controller mint-worker-provisioning-token`.
 //!   * `TALOS_WORKER_SIGNING_KEY`        — already required for result signing;
 //!                                         the caller passes the resolved key in.
 //! Optional:

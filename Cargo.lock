@@ -8878,6 +8878,7 @@ dependencies = [
  "chrono",
  "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
