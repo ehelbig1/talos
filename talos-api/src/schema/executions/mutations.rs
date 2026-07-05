@@ -127,24 +127,20 @@ impl ExecutionsMutations {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let result = sqlx::query!(
-            "UPDATE execution_approvals \
-             SET status = 'approved', decided_at = NOW(), decided_by = $1, reason = $2 \
-             FROM workflows w \
-             WHERE execution_approvals.id = $3 AND w.id = execution_approvals.workflow_id AND w.user_id = $1",
-            user_id,
-            reason,
-            id
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
+        let rows_affected = exec_repo
+            .decide_execution_approval_scoped(&mut tx, id, user_id, "approved", reason.as_deref())
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: approve_execution decision write failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             return Err(
                 async_graphql::Error::new("Approval request not found or access denied")
                     .extend_safe(),
@@ -185,24 +181,20 @@ impl ExecutionsMutations {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let result = sqlx::query!(
-            "UPDATE execution_approvals \
-             SET status = 'denied', decided_at = NOW(), decided_by = $1, reason = $2 \
-             FROM workflows w \
-             WHERE execution_approvals.id = $3 AND w.id = execution_approvals.workflow_id AND w.user_id = $1",
-            user_id,
-            reason,
-            id
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
+        let rows_affected = exec_repo
+            .decide_execution_approval_scoped(&mut tx, id, user_id, "denied", reason.as_deref())
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: deny_execution decision write failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             return Err(
                 async_graphql::Error::new("Approval request not found or access denied")
                     .extend_safe(),

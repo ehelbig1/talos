@@ -27,6 +27,7 @@ use worker::module_fetcher::{
     SigstorePolicy,
 };
 use worker::runtime::{PipelineStepSpec, RetryPolicy, SecurityPolicy};
+use worker::secret_claim;
 use worker::worker_identity;
 use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
 
@@ -298,6 +299,7 @@ fn truncate_oversized_job_result(
     cap: usize,
 ) -> JobResult {
     JobResult {
+        crypto_scheme: 0,
         job_id: result.job_id,
         status: JobStatus::Failed,
         output_payload: serde_json::json!({
@@ -353,11 +355,9 @@ async fn publish_result_with_retry(
         let mut replacement = truncate_oversized_job_result(result, serialized.len(), cap);
         // L-11: bind the worker's identity into the signature so the
         // controller's audit log records which pod emitted the
-        // truncated-replacement result. See `worker_identity` for the
-        // resolution chain.
-        if let Err(e) =
-            replacement.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity())
-        {
+        // truncated-replacement result. RFC 0010 P2: prefer the per-worker
+        // Ed25519 key when configured, else legacy HMAC. See `sign_job_result`.
+        if let Err(e) = sign_job_result(&mut replacement, shared_key) {
             return Err(format!("Failed to sign oversized-result replacement: {e}"));
         }
         match serde_json::to_vec(&replacement) {
@@ -383,6 +383,7 @@ async fn publish_result_with_retry(
 /// empty logs/signature/nonce/worker-id (the publish path signs it).
 fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> JobResult {
     JobResult {
+        crypto_scheme: 0,
         job_id,
         status: JobStatus::Failed,
         output_payload: json!({ "error": msg }),
@@ -457,6 +458,10 @@ mod signature_failure_payload_tests {
 
     fn unauthenticated_req() -> JobRequest {
         JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://attacker-chosen/v1".to_string(),
@@ -515,9 +520,143 @@ mod signature_failure_payload_tests {
     }
 }
 
+/// RFC 0010 P1: worker-side dispatch-verify configuration, resolved once from
+/// env. The worker holds only the controller's *public* key(s), so it can verify
+/// an Ed25519-signed dispatch but cannot forge one — the asymmetric half of the
+/// worker-trust boundary.
+struct DispatchVerifyConfig {
+    /// Controller Ed25519 public key(s). Index 0 is current;
+    /// `TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS` (comma-separated) adds rotated-out
+    /// keys for an overlap window. Empty ⇒ Ed25519 dispatches cannot be verified.
+    ed_keys: Vec<talos_workflow_job_protocol::DispatchVerifyingKey>,
+    /// Whether legacy HMAC (scheme 0) dispatches are still accepted. `true` (the
+    /// default) is the rollout posture; `TALOS_DISPATCH_REQUIRE_ED25519=1` flips
+    /// it to `false` — the RFC 0010 P4 enforcement flip that refuses HMAC once
+    /// the fleet is fully on Ed25519.
+    accept_legacy_hmac: bool,
+}
+
+/// RFC 0010 P3 (D3b): whether `TALOS_ENVELOPE_SEALING=required` — the worker
+/// downgrade-guard flag. Under `required` the worker refuses a `sealing == 0`
+/// (inline WSK) dispatch. `off`/`audit`/unset → `false` (both schemes handled).
+/// Cached; the flag is fixed for the process lifetime.
+fn worker_sealing_required() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("TALOS_ENVELOPE_SEALING")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("required")
+        )
+    })
+}
+
+/// Load [`DispatchVerifyConfig`] once. Malformed public keys are skipped with a
+/// loud warning (so one bad key can't strand the worker), and enabling
+/// enforcement without a usable key is logged as an error — the worker then
+/// fails closed per-request (rejecting is safe; admitting a forgery is not).
+fn dispatch_verify_config() -> &'static DispatchVerifyConfig {
+    static CFG: std::sync::OnceLock<DispatchVerifyConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let mut ed_keys = Vec::new();
+        if let Ok(cur) = std::env::var("TALOS_CONTROLLER_PUBLIC_KEY") {
+            match talos_workflow_job_protocol::parse_ed25519_verifying_key_hex(&cur) {
+                Ok(k) => ed_keys.push(k),
+                Err(e) => ::tracing::error!(error = %e, "TALOS_CONTROLLER_PUBLIC_KEY is invalid — Ed25519 dispatch verification disabled"),
+            }
+        }
+        if let Ok(prev) = std::env::var("TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS") {
+            for (i, part) in prev.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+                match talos_workflow_job_protocol::parse_ed25519_verifying_key_hex(part) {
+                    Ok(k) => ed_keys.push(k),
+                    Err(e) => ::tracing::warn!(index = i, error = %e, "skipping invalid TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS entry"),
+                }
+            }
+        }
+        let require_ed25519 = matches!(
+            std::env::var("TALOS_DISPATCH_REQUIRE_ED25519").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        );
+        if require_ed25519 && ed_keys.is_empty() {
+            ::tracing::error!(
+                target: "talos_security",
+                "TALOS_DISPATCH_REQUIRE_ED25519 is on but no valid TALOS_CONTROLLER_PUBLIC_KEY \
+                 is configured — the worker will reject ALL dispatches (fail-closed)"
+            );
+        }
+        DispatchVerifyConfig { ed_keys, accept_legacy_hmac: !require_ed25519 }
+    })
+}
+
+/// RFC 0010 P2: the worker's per-instance Ed25519 **result-signing** key,
+/// resolved once from `TALOS_WORKER_SIGNING_KEY` (a 32-byte hex seed sourced
+/// from a Secret / KMS — never a committed plaintext). `None` (the default) ⇒
+/// results keep the legacy `WORKER_SHARED_KEY` HMAC path (scheme 0). `Some` ⇒
+/// every `JobResult` / `PipelineJobResult` is signed Ed25519 (scheme 1) under
+/// this key; the controller verifies against the matching public key registered
+/// for this worker's id in `TALOS_WORKER_PUBLIC_KEYS`. Because the controller
+/// holds only the public half, a compromised worker can forge results as itself
+/// but never as another worker — the asymmetric result-path boundary.
+///
+/// A present-but-malformed seed fails closed to HMAC (loud error) rather than
+/// stranding the worker with no way to sign a result at all.
+fn worker_result_signing_key() -> Option<&'static talos_workflow_job_protocol::DispatchSigningKey> {
+    static CFG: std::sync::OnceLock<Option<talos_workflow_job_protocol::DispatchSigningKey>> =
+        std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let raw = std::env::var("TALOS_WORKER_SIGNING_KEY").ok()?;
+        match talos_workflow_job_protocol::parse_ed25519_signing_key_hex(&raw) {
+            Ok(sk) => {
+                ::tracing::info!(
+                    target: "talos_security",
+                    "TALOS_WORKER_SIGNING_KEY loaded — signing job results with per-worker Ed25519 (RFC 0010 P2)"
+                );
+                Some(sk)
+            }
+            Err(e) => {
+                ::tracing::error!(
+                    target: "talos_security",
+                    error = %e,
+                    "TALOS_WORKER_SIGNING_KEY is invalid — falling back to legacy HMAC result signing"
+                );
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Sign a `JobResult`, preferring the per-worker Ed25519 key when configured
+/// (RFC 0010 P2) and falling back to the legacy `WORKER_SHARED_KEY` HMAC. Binds
+/// the worker's identity into the signature either way (L-11). Single source of
+/// truth for every `JobResult` sign site so the scheme can't diverge between the
+/// happy path and the oversized-result replacement path.
+fn sign_job_result(
+    result: &mut JobResult,
+    shared_key: &talos_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    match worker_result_signing_key() {
+        Some(sk) => result.sign_ed25519_with_worker_id(sk, worker_identity()),
+        None => result.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity()),
+    }
+}
+
+/// Ed25519-preferring signer for `PipelineJobResult`; see [`sign_job_result`].
+fn sign_pipeline_result(
+    result: &mut PipelineJobResult,
+    shared_key: &talos_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    match worker_result_signing_key() {
+        Some(sk) => result.sign_ed25519_with_worker_id(sk, worker_identity()),
+        None => result.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity()),
+    }
+}
+
 /// Execute the Wasm module for a given job with observability.
 ///
-/// * Verifies the HMAC signature before executing.
+/// * Verifies the dispatch signature (Ed25519 or legacy HMAC) before executing.
 /// * Decrypts secrets from `req.encrypted_secrets` using the shared key.
 /// * Passes decrypted secrets to the runtime so WASM modules can access them
 ///   via the `secrets::get-secret` host function.
@@ -527,6 +666,9 @@ async fn execute_job(
     req: JobRequest,
     runtime: Arc<TalosRuntime>,
     shared_key: talos_workflow_engine_core::WorkerKeyRing,
+    // RFC 0010 P3 (D3b): NATS client for the secret-claim round-trip when a
+    // dispatch arrives with `sealing == SEALING_CLAIM_ECIES`.
+    nc: &async_nats::Client,
 ) -> JobResult {
     let start = std::time::Instant::now();
 
@@ -537,10 +679,15 @@ async fn execute_job(
     _span.set_attribute("job_id", &req.job_id.to_string());
     _span.set_attribute("module_uri", &req.module_uri);
 
-    // SECURITY: Verify HMAC-SHA256 signature + nonce freshness (300 s window).
-    // Ring-aware: accepts the current key OR a staged WORKER_SHARED_KEY_PREVIOUS
-    // so a rolling rotation doesn't reject controller-signed jobs.
-    if let Err(e) = req.verify_with_ring(&shared_key, 300) {
+    // SECURITY: verify the dispatch signature + nonce freshness (300 s window).
+    // RFC 0010 P1: `verify_dispatch` routes on the request's `crypto_scheme` —
+    // Ed25519 against the controller public key(s), or legacy HMAC against the
+    // WORKER_SHARED_KEY ring (accepted while `accept_legacy_hmac`, refused once
+    // TALOS_DISPATCH_REQUIRE_ED25519 flips it off). Ring-aware on the HMAC side
+    // so a rolling WORKER_SHARED_KEY rotation doesn't reject controller-signed
+    // jobs.
+    let dvc = dispatch_verify_config();
+    if let Err(e) = req.verify_dispatch(&shared_key, &dvc.ed_keys, 300, dvc.accept_legacy_hmac) {
         ::tracing::error!(job_id = %req.job_id, error = %e, "Job signature verification failed");
         _span.set_attribute("error", "signature_verification_failed");
         _span.end_error("Signature verification failed");
@@ -561,6 +708,7 @@ async fn execute_job(
         // enable the env on both sides while investigating a real
         // controller↔worker signing divergence, then unset it.
         return JobResult {
+            crypto_scheme: 0,
             job_id: req.job_id,
             status: JobStatus::Failed,
             output_payload: signature_failure_payload(*WORKER_SIGNATURE_DIAG_ENABLED, &req, &e),
@@ -585,14 +733,79 @@ async fn execute_job(
         }
     }
 
-    // SECURITY: Decrypt secrets from the encrypted payload.
-    // L-1 (2026-05-22): AAD = workflow_execution_id. Controller-side
-    // encryption binds this same identifier into the AES-GCM tag, so
-    // a ciphertext transposed between executions (under the same
-    // shared key) fails the tag check here. The execution_id is
-    // already HMAC-bound in the JobRequest signing payload, so it
-    // can't be tampered with on the wire.
-    let secrets: HashMap<String, String> = if req.encrypted_secrets.is_empty() {
+    // RFC 0010 P3 (D3b): downgrade guard. Under `TALOS_ENVELOPE_SEALING=required`
+    // the worker refuses a legacy inline dispatch that would DECRYPT a WSK
+    // envelope — the enforcement point that stops an on-wire downgrade from
+    // forcing the fleet-wide key back into use. A `sealing == 0` dispatch with an
+    // EMPTY `encrypted_secrets` decrypts nothing (a no-secret node), so it is
+    // allowed even under `required` — otherwise every secretless node (transforms,
+    // routers, …) would break. Only a non-empty WSK ciphertext under `required` is
+    // a refused downgrade. Under `off`/`audit` both schemes are handled.
+    if worker_sealing_required()
+        && req.sealing != talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+        && !req.encrypted_secrets.ciphertext.is_empty()
+    {
+        ::tracing::error!(
+            target: "talos_security",
+            job_id = %req.job_id,
+            "TALOS_ENVELOPE_SEALING=required but dispatch carries a sealing=0 WSK envelope — refusing"
+        );
+        _span.end_error("envelope sealing required; inline dispatch refused");
+        return failed_result(
+            req.job_id,
+            &start,
+            "envelope sealing required; inline dispatch refused",
+        );
+    }
+
+    // SECURITY: obtain the job's secrets.
+    // - `sealing == 1` (P3): claim them via a signed `SecretClaim` to the
+    //   controller's `claim_inbox`; the controller seals to this worker's fresh
+    //   ephemeral key and the reply opens under it (forward secrecy). Fail-closed
+    //   on any claim/verify/open error — never run secretless.
+    // - `sealing == 0` (legacy): decrypt the inline WSK envelope. L-1
+    //   (2026-05-22): AAD = workflow_execution_id binds the AES-GCM tag to this
+    //   execution (already HMAC-bound in the signing payload), so a transposed
+    //   ciphertext fails the tag check here.
+    let secrets: HashMap<String, String> = if req.sealing
+        == talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+    {
+        let Some(signing_key) = worker_result_signing_key() else {
+            ::tracing::error!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                "sealing=1 dispatch requires TALOS_WORKER_SIGNING_KEY to sign the claim"
+            );
+            _span.end_error("sealing=1 requires a worker signing key");
+            return failed_result(
+                req.job_id,
+                &start,
+                "sealing=1 dispatch requires a worker signing key",
+            );
+        };
+        match secret_claim::claim_secrets(
+            nc,
+            req.job_id,
+            req.claim_inbox.as_deref(),
+            worker_identity(),
+            signing_key,
+            &dvc.ed_keys,
+        )
+        .await
+        {
+            Ok(map) => map,
+            Err(e) => {
+                ::tracing::error!(
+                    target: "talos_security",
+                    job_id = %req.job_id,
+                    error = %e,
+                    "RFC 0010 P3 secret claim failed"
+                );
+                _span.end_error("secret claim failed");
+                return failed_result(req.job_id, &start, "failed to obtain sealed secrets");
+            }
+        }
+    } else if req.encrypted_secrets.is_empty() {
         HashMap::new()
     } else {
         match req
@@ -800,6 +1013,7 @@ async fn execute_job(
             _span.end_success();
 
             JobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Success,
                 output_payload: output,
@@ -819,6 +1033,7 @@ async fn execute_job(
             _span.end_error(&sanitized_error);
 
             JobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Failed,
                 output_payload: json!({"error": sanitized_error}),
@@ -837,6 +1052,7 @@ async fn execute_job(
             _span.end_error(&error_msg);
 
             JobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Failed,
                 output_payload: json!({"error": error_msg}),
@@ -862,6 +1078,9 @@ async fn execute_pipeline_job(
     req: PipelineJobRequest,
     runtime: Arc<TalosRuntime>,
     shared_key: talos_workflow_engine_core::WorkerKeyRing,
+    // RFC 0010 P3 (D3b): NATS client for the secret-claim round-trip when a
+    // pipeline dispatch arrives with `sealing == SEALING_CLAIM_ECIES`.
+    nc: &async_nats::Client,
 ) -> PipelineJobResult {
     use talos_workflow_job_protocol::JobStatus;
 
@@ -870,13 +1089,16 @@ async fn execute_pipeline_job(
     // propagated controller trace context (see `execute_job` for the rationale).
     let mut _span = JobSpan::current_with_parent(cx);
 
-    // SECURITY: Verify HMAC-SHA256 signature + nonce freshness (300 s window).
-    // Ring-aware (current OR staged previous key) for rolling rotation.
-    if let Err(e) = req.verify_with_ring(&shared_key, 300) {
+    // SECURITY: verify the dispatch signature + nonce freshness (300 s window).
+    // RFC 0010 P1: scheme-dispatched (Ed25519 or legacy HMAC), ring-aware on the
+    // HMAC side for rolling WORKER_SHARED_KEY rotation. See `execute_job`.
+    let dvc = dispatch_verify_config();
+    if let Err(e) = req.verify_dispatch(&shared_key, &dvc.ed_keys, 300, dvc.accept_legacy_hmac) {
         ::tracing::error!(job_id = %req.job_id, error = %e, "Pipeline job signature verification failed");
         _span.set_attribute("error", "signature_verification_failed");
         _span.end_error("Signature verification failed");
         return PipelineJobResult {
+            crypto_scheme: 0,
             job_id: req.job_id,
             overall_status: JobStatus::Failed,
             step_results: vec![],
@@ -886,6 +1108,41 @@ async fn execute_pipeline_job(
             result_nonce: String::new(),
             worker_id: String::new(),
         };
+    }
+
+    // Helper for the fail-closed returns below (span mutation stays inline).
+    let fail = |msg: &str| PipelineJobResult {
+        crypto_scheme: 0,
+        job_id: req.job_id,
+        overall_status: JobStatus::Failed,
+        step_results: vec![],
+        final_output: serde_json::json!({ "error": msg }),
+        total_time_ms: start.elapsed().as_millis() as u64,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+    };
+
+    // RFC 0010 P3 (D3b) downgrade guard: under `TALOS_ENVELOPE_SEALING=required`
+    // refuse a legacy pipeline that would DECRYPT a WSK envelope in ANY step. A
+    // `sealing == 1` pipeline uses the claim path below; a `sealing == 0` pipeline
+    // whose steps all carry empty envelopes (no-secret steps) decrypts nothing and
+    // is allowed even under `required`. Only a non-empty WSK ciphertext under
+    // `required` is a refused downgrade.
+    if worker_sealing_required()
+        && req.sealing != talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+        && req
+            .steps
+            .iter()
+            .any(|s| !s.encrypted_secrets.ciphertext.is_empty())
+    {
+        ::tracing::error!(
+            target: "talos_security",
+            job_id = %req.job_id,
+            "TALOS_ENVELOPE_SEALING=required but a pipeline step carries a sealing=0 WSK envelope — refusing"
+        );
+        _span.end_error("envelope sealing required; inline pipeline refused");
+        return fail("envelope sealing required; inline pipeline refused");
     }
 
     // Validate maximum pipeline timeout to prevent indefinitely tying up workers.
@@ -903,6 +1160,7 @@ async fn execute_pipeline_job(
         );
         _span.end_error("Timeout exceeds maximum");
         return PipelineJobResult {
+            crypto_scheme: 0,
             job_id: req.job_id,
             overall_status: JobStatus::Failed,
             step_results: vec![],
@@ -914,12 +1172,62 @@ async fn execute_pipeline_job(
         };
     }
 
-    // Build PipelineStepSpecs by decrypting per-step secrets.
+    // RFC 0010 P3 (D3b): under claim-based sealing, ONE claim to the controller
+    // returns the per-step secrets vector (aligned index-for-index with
+    // `req.steps`). Fail-closed on any claim / verify / open / shape error — a
+    // pipeline whose secrets can't be obtained must not run secretless.
+    let claimed_secrets: Option<Vec<std::collections::HashMap<String, String>>> = if req.sealing
+        == talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+    {
+        let Some(signing_key) = worker_result_signing_key() else {
+            ::tracing::error!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                "sealing=1 pipeline requires TALOS_WORKER_SIGNING_KEY to sign the claim"
+            );
+            _span.end_error("sealing=1 requires a worker signing key");
+            return fail("sealing=1 pipeline requires a worker signing key");
+        };
+        match secret_claim::claim_secrets_raw(
+            nc,
+            req.job_id,
+            req.claim_inbox.as_deref(),
+            worker_identity(),
+            signing_key,
+            &dvc.ed_keys,
+        )
+        .await
+        {
+            Ok(raw) => {
+                match serde_json::from_slice::<Vec<std::collections::HashMap<String, String>>>(&raw)
+                {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        ::tracing::error!(target: "talos_security", job_id = %req.job_id, error = %e, "malformed pipeline claim payload");
+                        _span.end_error("malformed pipeline claim payload");
+                        return fail("malformed sealed pipeline secrets");
+                    }
+                }
+            }
+            Err(e) => {
+                ::tracing::error!(target: "talos_security", job_id = %req.job_id, error = %e, "RFC 0010 P3 pipeline secret claim failed");
+                _span.end_error("pipeline secret claim failed");
+                return fail("failed to obtain sealed pipeline secrets");
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build PipelineStepSpecs. Under claim-based sealing use the claimed per-step
+    // map for step `i`; otherwise decrypt the step's inline WSK envelope.
     // L-1: AAD = workflow_execution_id, shared across all steps in
     // this pipeline (matches the encryption-side binding).
     let mut step_specs: Vec<PipelineStepSpec> = Vec::with_capacity(req.steps.len());
-    for step in &req.steps {
-        let secrets = if step.encrypted_secrets.is_empty() {
+    for (i, step) in req.steps.iter().enumerate() {
+        let secrets = if let Some(ref per_step) = claimed_secrets {
+            per_step.get(i).cloned().unwrap_or_default()
+        } else if step.encrypted_secrets.is_empty() {
             std::collections::HashMap::new()
         } else {
             match step
@@ -931,6 +1239,7 @@ async fn execute_pipeline_job(
                     ::tracing::error!(job_id = %req.job_id, error = %e, "Failed to decrypt pipeline step secrets");
                     _span.end_error("Secret decryption failed");
                     return PipelineJobResult {
+                        crypto_scheme: 0,
                         job_id: req.job_id,
                         overall_status: JobStatus::Failed,
                         step_results: vec![],
@@ -996,6 +1305,7 @@ async fn execute_pipeline_job(
                 .collect();
 
             PipelineJobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 overall_status: JobStatus::Success,
                 step_results,
@@ -1015,6 +1325,7 @@ async fn execute_pipeline_job(
             _span.end_error(&sanitized_error);
 
             PipelineJobResult {
+                crypto_scheme: 0,
                 job_id: req.job_id,
                 overall_status: JobStatus::Failed,
                 step_results: vec![],
@@ -1332,6 +1643,35 @@ async fn main() -> anyhow::Result<()> {
     talos_memory::rpc_auth::register_hmac_key(Arc::new(
         shared_key.signing_key().as_bytes().to_vec(),
     ));
+
+    // RFC 0010 P2 inc.3: when a per-worker Ed25519 key is provisioned
+    // (TALOS_WORKER_SIGNING_KEY — the SAME key used to sign job results),
+    // also register it as the RPC signing identity so memory/graph/database/
+    // state/integration-state requests are signed Ed25519 under this worker's
+    // id. The controller resolves the matching public key by worker_id and
+    // verifies asymmetrically; the HMAC key above stays registered so the
+    // controller's dual-verify accepts either scheme during rollout. Absent
+    // the key, RPC signing stays on the legacy HMAC path unchanged.
+    if let Some(rpc_signing_key) = worker_result_signing_key() {
+        talos_memory::rpc_auth::register_ed25519_signing_key(
+            worker_identity().to_string(),
+            Arc::new(rpc_signing_key.clone()),
+        );
+        ::tracing::info!(
+            target: "talos_security",
+            worker_id = %worker_identity(),
+            "Registered per-worker Ed25519 RPC signing identity (RFC 0010 P2 inc.3)"
+        );
+
+        // RFC 0010 P2 inc.4d: self-register this worker's public key with the
+        // controller (if TALOS_CONTROLLER_URL + TALOS_WORKER_REGISTRATION_TOKEN
+        // are set). Best-effort and detached so it never blocks boot or job
+        // processing; the signing key is `&'static` (OnceLock), so it moves into
+        // the task cleanly.
+        tokio::spawn(worker::self_register::register_worker_identity_at_boot(
+            rpc_signing_key,
+        ));
+    }
 
     // M-3 (2026-05-22): log the SQL empty-allowlist policy at startup
     // so operators can confirm the mode they're running. Default is
@@ -1874,13 +2214,11 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
 
-                                let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
+                                let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone(), &nc_clone).await;
 
                                 // L-11: bind worker identity for audit attribution.
-                                if let Err(e) = result.sign_with_worker_id(
-                                    key_clone.signing_key().as_bytes(),
-                                    worker_identity(),
-                                ) {
+                                // RFC 0010 P2: Ed25519 when configured, else HMAC.
+                                if let Err(e) = sign_job_result(&mut result, &key_clone) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign job result");
                                 }
 
@@ -2083,13 +2421,11 @@ async fn main() -> anyhow::Result<()> {
                                 }
 
                                 let mut result =
-                                    execute_pipeline_job(&cx, req.clone(), runtime_clone, key_clone.clone()).await;
+                                    execute_pipeline_job(&cx, req.clone(), runtime_clone, key_clone.clone(), &nc_clone).await;
 
                                 // L-11: bind worker identity for audit attribution.
-                                if let Err(e) = result.sign_with_worker_id(
-                                    key_clone.signing_key().as_bytes(),
-                                    worker_identity(),
-                                ) {
+                                // RFC 0010 P2: Ed25519 when configured, else HMAC.
+                                if let Err(e) = sign_pipeline_result(&mut result, &key_clone) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign pipeline result");
                                 }
 
@@ -2127,6 +2463,7 @@ async fn main() -> anyhow::Result<()> {
                                         "PipelineJobResult exceeds NATS publish cap — substituting Failed status"
                                     );
                                     let mut replacement = PipelineJobResult {
+                                        crypto_scheme: 0,
                                         job_id: result.job_id,
                                         overall_status: JobStatus::Failed,
                                         step_results: vec![],
@@ -2146,10 +2483,8 @@ async fn main() -> anyhow::Result<()> {
                                         worker_id: String::new(),
                                     };
                                     // L-11: bind worker identity for audit attribution.
-                                    if let Err(e) = replacement.sign_with_worker_id(
-                                        key_clone.signing_key().as_bytes(),
-                                        worker_identity(),
-                                    ) {
+                                    // RFC 0010 P2: Ed25519 when configured, else HMAC.
+                                    if let Err(e) = sign_pipeline_result(&mut replacement, &key_clone) {
                                         ::tracing::error!(
                                             job_id = %result.job_id,
                                             error = %e,
@@ -2279,6 +2614,7 @@ mod result_publish_tests {
     #[test]
     fn truncate_oversized_replaces_payload_and_marks_failed() {
         let original = JobResult {
+            crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"huge": "x".repeat(10_000)}),
@@ -2313,6 +2649,7 @@ mod result_publish_tests {
         // The replacement itself must fit comfortably under any
         // reasonable cap, otherwise we'd loop forever.
         let original = JobResult {
+            crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"huge": "x".repeat(10_000_000)}),

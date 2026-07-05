@@ -663,6 +663,231 @@ pub fn is_ready() -> bool {
     HMAC_KEY.get().is_some()
 }
 
+// ============================================================================
+// Per-worker Ed25519 RPC signing (RFC 0010 P2 inc.3)
+// ============================================================================
+//
+// The HMAC path above is symmetric: worker and controller share
+// `WORKER_SHARED_KEY`, so a compromised worker that leaks the key can forge
+// requests for ANY actor AND impersonate any other worker. The Ed25519 path
+// makes the RPC boundary asymmetric, mirroring the dispatch (P1) and result
+// (P2 inc.2) paths: the worker holds a PRIVATE signing key, the controller
+// holds only the matching PUBLIC key (resolved by `worker_id` from
+// `talos_workflow_job_protocol::worker_public_keys` — the SAME
+// `TALOS_WORKER_PUBLIC_KEYS` registry used for result verification, so there is
+// one identity keypair per worker across every signed surface). A compromised
+// worker can then forge requests as ITSELF but can never impersonate another
+// worker, and — once the controller stops distributing the shared HMAC key for
+// signing (P4) — cannot mint the symmetric MAC at all.
+//
+// Wire compatibility: `crypto_scheme` is an UNSIGNED dispatch hint on the
+// request struct (never in the HMAC/Ed25519 signing input), so scheme-0 bytes
+// stay byte-identical to the pre-change format. The Ed25519 input is
+// domain-separated from the HMAC input AND binds `worker_id`, so a scheme flip
+// on the wire routes to a verify path whose signature can't be satisfied
+// without the corresponding private key.
+
+/// `crypto_scheme` values carried by the RPC request structs. Scheme 0 =
+/// legacy `WORKER_SHARED_KEY` HMAC; scheme 1 = per-worker Ed25519.
+pub const RPC_CRYPTO_SCHEME_HMAC: u8 = 0;
+/// See [`RPC_CRYPTO_SCHEME_HMAC`].
+pub const RPC_CRYPTO_SCHEME_ED25519: u8 = 1;
+
+/// Domain-separation suffix appended to the canonical RPC payload before
+/// Ed25519 signing/verification. Distinct from the dispatch/result tag in
+/// `talos_workflow_job_protocol` so an Ed25519 signature over one surface can
+/// never be confused for another, and versioned for a future clean re-key.
+const RPC_ED25519_DOMAIN_TAG: &[u8] = b":talos-rpc-ed25519-v1";
+
+/// The worker's registered RPC signing identity: its `worker_id` and private
+/// Ed25519 key, always installed together (the controller resolves the
+/// verifying key BY `worker_id`, so a key with no id is unverifiable).
+struct Ed25519RpcIdentity {
+    worker_id: String,
+    signing: Arc<talos_workflow_job_protocol::DispatchSigningKey>,
+}
+
+/// Process-wide Ed25519 RPC signing identity slot. The worker registers it at
+/// startup (from `TALOS_WORKER_SIGNING_KEY` + its worker id) when Ed25519 RPC
+/// signing is enabled. The controller never registers a signing key — it only
+/// verifies, against the per-worker public keys resolved from the
+/// `TALOS_WORKER_PUBLIC_KEYS` registry. `OnceLock`; idempotent registration.
+static ED25519_SIGNING: OnceLock<Ed25519RpcIdentity> = OnceLock::new();
+
+/// Install the worker's Ed25519 RPC signing identity (its `worker_id` + private
+/// key). Idempotent — a second call is silently ignored (first-registration
+/// wins), matching [`register_hmac_key_ring`]. Call once at worker startup
+/// alongside the HMAC registration; the controller does NOT call this. A blank
+/// `worker_id` is rejected (logged) — an Ed25519 RPC signature with no id can
+/// never be verified, so we keep the HMAC path instead of silently signing
+/// unverifiable requests.
+pub fn register_ed25519_signing_key(
+    worker_id: String,
+    key: Arc<talos_workflow_job_protocol::DispatchSigningKey>,
+) {
+    if worker_id.trim().is_empty() {
+        tracing::error!(
+            "register_ed25519_signing_key called with an empty worker_id — ignored; \
+             RPC signing stays on the legacy HMAC path"
+        );
+        return;
+    }
+    let _ = ED25519_SIGNING.set(Ed25519RpcIdentity {
+        worker_id,
+        signing: key,
+    });
+}
+
+/// True when an Ed25519 RPC signing identity has been registered (worker side).
+pub fn ed25519_signing_ready() -> bool {
+    ED25519_SIGNING.get().is_some()
+}
+
+/// Build the Ed25519 signing input: the canonical HMAC payload, then the
+/// domain tag, then `worker_id`. Binding `worker_id` here is what makes the
+/// signature non-transferable between workers — the controller resolves the
+/// verifying key BY `worker_id`, and a swapped id changes the signed bytes.
+fn ed25519_signing_input(
+    subject: &str,
+    actor_id: Uuid,
+    nonce: &str,
+    body: &[u8],
+    worker_id: &str,
+) -> Vec<u8> {
+    let mut out = signing_payload(subject, actor_id, nonce, body);
+    out.extend_from_slice(RPC_ED25519_DOMAIN_TAG);
+    out.push(0);
+    out.extend_from_slice(worker_id.as_bytes());
+    out
+}
+
+/// Pure Ed25519 sign core: sign the domain-separated, worker-id-bound input
+/// with an explicit key. Extracted from [`sign_ed25519`] so the crypto is
+/// unit-testable without touching the process-global signing slot. 64-byte out.
+fn sign_ed25519_with_key(
+    sk: &talos_workflow_job_protocol::DispatchSigningKey,
+    subject: &str,
+    actor_id: Uuid,
+    nonce: &str,
+    body: &[u8],
+    worker_id: &str,
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let input = ed25519_signing_input(subject, actor_id, nonce, body, worker_id);
+    sk.sign(&input).to_bytes().to_vec()
+}
+
+/// Sign an RPC body under the configured scheme, returning
+/// `(signature, worker_id, crypto_scheme)` for the request struct's three
+/// auth fields. Prefers per-worker Ed25519 when a signing identity is
+/// registered (RFC 0010 P2 inc.3), else the legacy `WORKER_SHARED_KEY` HMAC
+/// (with an empty `worker_id`). Returns `None` only when NEITHER key is
+/// registered — a misconfiguration the caller surfaces by refusing to sign.
+///
+/// This is the single scheme-decision point for all five RPC request types, so
+/// they can't diverge on which scheme they emit.
+pub fn sign_rpc(
+    subject: &str,
+    actor_id: Uuid,
+    nonce: &str,
+    body: &[u8],
+) -> Option<(Vec<u8>, String, u8)> {
+    if let Some(id) = ED25519_SIGNING.get() {
+        let sig = sign_ed25519_with_key(&id.signing, subject, actor_id, nonce, body, &id.worker_id);
+        return Some((sig, id.worker_id.clone(), RPC_CRYPTO_SCHEME_ED25519));
+    }
+    let sig = sign(subject, actor_id, nonce, body)?;
+    Some((sig, String::new(), RPC_CRYPTO_SCHEME_HMAC))
+}
+
+/// Whether the controller still accepts legacy-HMAC-signed RPC requests.
+/// Default `true` (accept — the rollout posture while workers migrate to
+/// per-worker Ed25519). `TALOS_RPC_REQUIRE_ED25519` ∈ {`1`,`true`,`yes`,`on`}
+/// flips it to `false`: the RFC 0010 P4 enforcement flip that refuses HMAC RPC
+/// once every worker signs Ed25519. Cached; single source of truth for the
+/// `accept_legacy_hmac` argument at every RPC verify site.
+pub fn rpc_accept_legacy_hmac() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            std::env::var("TALOS_RPC_REQUIRE_ED25519").ok().as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+/// Verify an RPC signature under the request's declared `crypto_scheme`
+/// (controller side). Ed25519 (scheme 1) against the keys registered for
+/// `worker_id`; legacy HMAC (scheme 0) against the shared ring, gated by
+/// `rpc_accept_legacy_hmac()`. Unknown scheme fails closed. Does NOT check
+/// freshness/replay — the caller runs `verify_freshness` + the nonce cache
+/// exactly as before, identically across schemes.
+pub fn verify_rpc(
+    subject: &str,
+    actor_id: Uuid,
+    nonce: &str,
+    body: &[u8],
+    worker_id: &str,
+    signature: &[u8],
+    crypto_scheme: u8,
+) -> bool {
+    match crypto_scheme {
+        RPC_CRYPTO_SCHEME_ED25519 => {
+            verify_ed25519(subject, actor_id, nonce, body, worker_id, signature)
+        }
+        RPC_CRYPTO_SCHEME_HMAC => {
+            rpc_accept_legacy_hmac() && verify(subject, actor_id, nonce, body, signature)
+        }
+        _ => false,
+    }
+}
+
+/// Pure Ed25519 verify core against an explicit key set (first match wins, so a
+/// rotation overlap verifies). Uses `verify_strict` (rejects non-canonical `R`
+/// / small-order points). Extracted from [`verify_ed25519`] so the crypto is
+/// unit-testable without the `TALOS_WORKER_PUBLIC_KEYS` registry. Fails closed
+/// on an empty key set, empty `worker_id`, or a malformed signature.
+fn verify_ed25519_with_keys(
+    subject: &str,
+    actor_id: Uuid,
+    nonce: &str,
+    body: &[u8],
+    worker_id: &str,
+    signature: &[u8],
+    keys: &[talos_workflow_job_protocol::DispatchVerifyingKey],
+) -> bool {
+    if worker_id.is_empty() || keys.is_empty() {
+        return false;
+    }
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(signature) else {
+        return false;
+    };
+    let input = ed25519_signing_input(subject, actor_id, nonce, body, worker_id);
+    keys.iter().any(|k| k.verify_strict(&input, &sig).is_ok())
+}
+
+/// Verify a per-worker Ed25519 RPC signature (controller side). Resolves the
+/// worker's public key(s) by `worker_id` from the shared
+/// `talos_workflow_job_protocol::worker_public_keys` registry and checks the
+/// signature with `verify_strict`. Multiple keys per worker are tried so a
+/// key-rotation overlap window verifies. Fails closed on an unknown worker,
+/// a malformed signature, or an empty `worker_id`.
+///
+/// This function does NOT check freshness or replay — the caller's `verify()`
+/// runs `verify_freshness` and the nonce cache exactly as on the HMAC path, so
+/// the freshness/replay discipline is identical across schemes.
+pub fn verify_ed25519(
+    subject: &str,
+    actor_id: Uuid,
+    nonce: &str,
+    body: &[u8],
+    worker_id: &str,
+    signature: &[u8],
+) -> bool {
+    let keys = talos_workflow_job_protocol::worker_public_keys(worker_id);
+    verify_ed25519_with_keys(subject, actor_id, nonce, body, worker_id, signature, &keys)
+}
+
 /// Build the canonical signing payload for an RPC request.
 ///
 /// Format: `subject || \0 || actor_id || \0 || nonce || \0 || body`
@@ -1073,5 +1298,208 @@ mod canonical_nonce_tests {
         assert!(check_and_record_nonce("memory_rpc", actor, &n));
         // Replay of the same canonical nonce: rejected as expected.
         assert!(!check_and_record_nonce("memory_rpc", actor, &n));
+    }
+}
+
+#[cfg(test)]
+mod ed25519_rpc_tests {
+    //! RFC 0010 P2 inc.3: per-worker Ed25519 RPC signing. These exercise the
+    //! pure key-explicit cores so they need neither the process-global signing
+    //! slot nor the `TALOS_WORKER_PUBLIC_KEYS` env registry.
+    use super::*;
+    use talos_workflow_job_protocol::DispatchSigningKey;
+
+    fn keypair() -> DispatchSigningKey {
+        DispatchSigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let sk = keypair();
+        let pk = sk.verifying_key();
+        let actor = Uuid::new_v4();
+        let nonce = random_nonce();
+        let body = b"canonical-body-bytes";
+        let sig = sign_ed25519_with_key(&sk, "memory_rpc", actor, &nonce, body, "worker-7");
+        assert_eq!(sig.len(), 64, "Ed25519 signatures are 64 bytes");
+        assert!(verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &nonce,
+            body,
+            "worker-7",
+            &sig,
+            &[pk]
+        ));
+    }
+
+    #[test]
+    fn wrong_worker_key_fails() {
+        // A request signed by worker-a's key must not verify against worker-b's
+        // key — a compromised worker can only sign as itself.
+        let a = keypair();
+        let b_pk = keypair().verifying_key();
+        let actor = Uuid::new_v4();
+        let nonce = random_nonce();
+        let sig = sign_ed25519_with_key(&a, "memory_rpc", actor, &nonce, b"x", "worker-a");
+        assert!(!verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &nonce,
+            b"x",
+            "worker-a",
+            &sig,
+            &[b_pk]
+        ));
+    }
+
+    #[test]
+    fn tampered_worker_id_fails() {
+        // `worker_id` is bound into the signed input, so swapping it (to try to
+        // impersonate another worker whose key the controller trusts) breaks
+        // the signature.
+        let sk = keypair();
+        let pk = sk.verifying_key();
+        let actor = Uuid::new_v4();
+        let nonce = random_nonce();
+        let sig = sign_ed25519_with_key(&sk, "memory_rpc", actor, &nonce, b"x", "worker-a");
+        assert!(!verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &nonce,
+            b"x",
+            "worker-b",
+            &sig,
+            &[pk]
+        ));
+    }
+
+    #[test]
+    fn tampered_subject_actor_nonce_body_fail() {
+        let sk = keypair();
+        let pk = sk.verifying_key();
+        let actor = Uuid::new_v4();
+        let nonce = random_nonce();
+        let sig = sign_ed25519_with_key(&sk, "memory_rpc", actor, &nonce, b"body", "w");
+        // Cross-subject replay (memory sig presented as graph) fails.
+        assert!(!verify_ed25519_with_keys(
+            "graph_rpc",
+            actor,
+            &nonce,
+            b"body",
+            "w",
+            &sig,
+            &[pk]
+        ));
+        // Cross-actor replay fails.
+        assert!(!verify_ed25519_with_keys(
+            "memory_rpc",
+            Uuid::new_v4(),
+            &nonce,
+            b"body",
+            "w",
+            &sig,
+            &[pk]
+        ));
+        // Tampered body fails.
+        assert!(!verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &nonce,
+            b"body2",
+            "w",
+            &sig,
+            &[pk]
+        ));
+        // Tampered nonce fails.
+        assert!(!verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &random_nonce(),
+            b"body",
+            "w",
+            &sig,
+            &[pk]
+        ));
+    }
+
+    #[test]
+    fn rotation_overlap_verifies() {
+        // Signed under the current key; a controller carrying [rotated_in, old]
+        // still validates (first match wins), so a worker-key rotation with an
+        // overlap window doesn't drop in-flight RPC.
+        let old = keypair();
+        let new_pk = keypair().verifying_key();
+        let actor = Uuid::new_v4();
+        let nonce = random_nonce();
+        let sig = sign_ed25519_with_key(&old, "memory_rpc", actor, &nonce, b"x", "w");
+        assert!(verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &nonce,
+            b"x",
+            "w",
+            &sig,
+            &[new_pk, old.verifying_key()]
+        ));
+    }
+
+    #[test]
+    fn empty_worker_id_or_keyset_fails_closed() {
+        let sk = keypair();
+        let pk = sk.verifying_key();
+        let actor = Uuid::new_v4();
+        let nonce = random_nonce();
+        let sig = sign_ed25519_with_key(&sk, "memory_rpc", actor, &nonce, b"x", "");
+        // Empty worker_id: fail closed even with a matching key.
+        assert!(!verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &nonce,
+            b"x",
+            "",
+            &sig,
+            &[pk]
+        ));
+        // Empty keyset (unknown worker): fail closed.
+        let sig2 = sign_ed25519_with_key(&sk, "memory_rpc", actor, &nonce, b"x", "w");
+        assert!(!verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &nonce,
+            b"x",
+            "w",
+            &sig2,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn malformed_signature_fails_closed() {
+        let pk = keypair().verifying_key();
+        let actor = Uuid::new_v4();
+        let nonce = random_nonce();
+        // Not 64 bytes → Signature::from_slice errors → false, no panic.
+        assert!(!verify_ed25519_with_keys(
+            "memory_rpc",
+            actor,
+            &nonce,
+            b"x",
+            "w",
+            b"short",
+            &[pk]
+        ));
+    }
+
+    #[test]
+    fn ed25519_input_domain_separated_from_hmac_payload() {
+        // The Ed25519 input must never equal the bare HMAC payload — otherwise
+        // a signature could be lifted between schemes. The domain tag + bound
+        // worker_id guarantee the extra suffix.
+        let actor = Uuid::new_v4();
+        let hmac_payload = signing_payload("memory_rpc", actor, "n", b"body");
+        let ed_input = ed25519_signing_input("memory_rpc", actor, "n", b"body", "w");
+        assert!(ed_input.len() > hmac_payload.len());
+        assert!(ed_input.starts_with(&hmac_payload));
     }
 }

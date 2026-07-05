@@ -1780,6 +1780,7 @@ dependencies = [
  "talos-webhook-repository",
  "talos-webhooks",
  "talos-worker-fleet",
+ "talos-worker-identity-repository",
  "talos-workflow-authorization",
  "talos-workflow-creation",
  "talos-workflow-creation-helpers",
@@ -2618,6 +2619,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
  "signature 2.2.0",
@@ -7243,6 +7245,7 @@ dependencies = [
  "talos-mcp-tool-schema",
  "talos-memory",
  "talos-module-executions",
+ "talos-module-repository",
  "talos-oauth",
  "talos-organizations",
  "talos-rate-limit",
@@ -7592,6 +7595,7 @@ dependencies = [
  "talos-dlp",
  "talos-dlp-provider",
  "talos-engine-events",
+ "talos-envelope-seal",
  "talos-http-utils",
  "talos-memory",
  "talos-metrics",
@@ -7626,6 +7630,23 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "talos-envelope-seal"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "dashmap 6.2.1",
+ "futures",
+ "rand 0.8.6",
+ "redis",
+ "serde_json",
+ "talos-workflow-job-protocol",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -8201,6 +8222,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "dashmap 6.2.1",
+ "ed25519-dalek",
  "hmac 0.12.1",
  "pgvector",
  "rand 0.8.6",
@@ -8212,6 +8234,7 @@ dependencies = [
  "subtle",
  "talos-http-body",
  "talos-text-util",
+ "talos-workflow-job-protocol",
  "tokio",
  "tracing",
  "uuid",
@@ -8848,6 +8871,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-worker-identity-repository"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "talos-workflow-authorization"
 version = "0.1.0"
 dependencies = [
@@ -8939,7 +8972,9 @@ dependencies = [
  "async-nats",
  "async-trait",
  "futures",
+ "rand 0.8.6",
  "serde_json",
+ "talos-envelope-seal",
  "talos-trace-nats",
  "talos-workflow-engine",
  "talos-workflow-engine-core",
@@ -8967,7 +9002,9 @@ name = "talos-workflow-job-protocol"
 version = "0.3.0"
 dependencies = [
  "aes-gcm",
+ "arc-swap",
  "async-trait",
+ "ed25519-dalek",
  "hex",
  "hkdf",
  "hmac 0.12.1",
@@ -8977,6 +9014,8 @@ dependencies = [
  "sha2 0.10.9",
  "talos-workflow-engine-core",
  "uuid",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -11278,6 +11317,18 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "xattr"

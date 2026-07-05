@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::emit_event_spawn;
 use crate::engine::{ParallelWorkflowEngine, DEFAULT_NODE_TIMEOUT_SECS};
-use crate::secrets_pipeline::{build_encrypted_secrets_for, extract_vault_paths};
+use crate::secrets_pipeline::extract_vault_paths;
 
 impl ParallelWorkflowEngine {
     /// Build and await the full single-node dispatch future.
@@ -271,12 +271,16 @@ impl ParallelWorkflowEngine {
             .unwrap_or(wasm_module.max_fuel)
             .min(self.max_fuel_per_node);
 
-        // Resolve encrypted secrets payload (opaque bytes at this layer).
-        // L-1: AAD = execution_id binds the AES-GCM tag to this dispatch.
-        let encrypted_secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
+        // Resolve secrets. RFC 0010 P3 (D3b): `build_dispatch_secrets_for` is the
+        // single decision point — under claim-based sealing it returns the
+        // PLAINTEXT map (registered in `InFlightSeals`, sealed on the worker's
+        // claim; NO plaintext on the wire), otherwise the legacy inline WSK
+        // envelope. The SAME helper backs the loop-body path so sealing applies
+        // uniformly. L-1: AAD = execution_id binds the legacy AES-GCM tag.
+        let secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
             (Some(resolver), Some(key)) => {
                 let vault_paths = extract_vault_paths(&module_config);
-                build_encrypted_secrets_for(
+                crate::secrets_pipeline::build_dispatch_secrets_for(
                     resolver.as_ref(),
                     self.secret_envelope.as_ref(),
                     module_id_resolved,
@@ -289,8 +293,10 @@ impl ParallelWorkflowEngine {
                 )
                 .await
             }
-            _ => talos_workflow_job_protocol::EncryptedSecrets::empty(),
+            _ => crate::secrets_pipeline::DispatchSecrets::default(),
         };
+        let (encrypted_secrets, plaintext_secrets, secret_paths) =
+            (secrets.encrypted, secrets.plaintext, secrets.secret_paths);
 
         // Wire-format WASM budget. The dispatcher internally adds its
         // own Tokio-outer grace on top (see TOKIO_WRAP_GRACE_SECS).
@@ -341,6 +347,8 @@ impl ParallelWorkflowEngine {
             allow_tier2_exposure: false,
             encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
             encrypted_secrets_nonce: encrypted_secrets.nonce,
+            plaintext_secrets,
+            secret_paths,
             priority: 100,
             dry_run: self.dry_run,
             max_llm_tier: self.max_llm_tier,

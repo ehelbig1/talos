@@ -1078,11 +1078,11 @@ impl AnalyticsRepository {
         .await?;
         tx.commit().await?;
         Ok(ExecStats {
-            total: row.try_get("total").unwrap_or(0),
-            succeeded: row.try_get("succeeded").unwrap_or(0),
-            failed: row.try_get("failed").unwrap_or(0),
-            running: row.try_get("running").unwrap_or(0),
-            avg_duration_secs: row.try_get("avg_duration_secs").unwrap_or(None),
+            total: row.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+            succeeded: row.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
+            failed: row.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
+            running: row.try_get::<Option<_>, _>("running")?.unwrap_or(0),
+            avg_duration_secs: row.try_get::<Option<_>, _>("avg_duration_secs")?,
         })
     }
 
@@ -1106,11 +1106,11 @@ impl AnalyticsRepository {
         .await?;
         tx.commit().await?;
         Ok(ExecStats {
-            total: row.try_get("total").unwrap_or(0),
-            succeeded: row.try_get("succeeded").unwrap_or(0),
-            failed: row.try_get("failed").unwrap_or(0),
-            running: row.try_get("running").unwrap_or(0),
-            avg_duration_secs: row.try_get("avg_duration_secs").unwrap_or(None),
+            total: row.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+            succeeded: row.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
+            failed: row.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
+            running: row.try_get::<Option<_>, _>("running")?.unwrap_or(0),
+            avg_duration_secs: row.try_get::<Option<_>, _>("avg_duration_secs")?,
         })
     }
 
@@ -1130,17 +1130,20 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| WorkflowGraphRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            graph_json: r.try_get("graph_json").unwrap_or(None),
-            status: r.try_get("status").unwrap_or(None),
-            is_enabled: r.try_get("is_enabled").unwrap_or(false),
-            workflow_type: r.try_get("workflow_type").unwrap_or(None),
-            tags: r.try_get("tags").unwrap_or(None),
-            created_at: r.try_get("created_at").unwrap_or(None),
-            updated_at: r.try_get("updated_at").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<WorkflowGraphRow> {
+            Ok(WorkflowGraphRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                status: r.try_get::<Option<_>, _>("status")?,
+                is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                workflow_type: r.try_get::<Option<_>, _>("workflow_type")?,
+                tags: r.try_get::<Option<_>, _>("tags")?,
+                created_at: r.try_get::<Option<_>, _>("created_at")?,
+                updated_at: r.try_get::<Option<_>, _>("updated_at")?,
+            })
+        })
+        .transpose()
     }
 
     pub async fn get_workflow_full(
@@ -1157,16 +1160,20 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| WorkflowFullRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            graph_json: r.try_get("graph_json").unwrap_or(None),
-            tags: r.try_get("tags").unwrap_or(None),
-            description: r.try_get("description").unwrap_or(None),
-            max_concurrent_executions: r.try_get("max_concurrent_executions").unwrap_or(None),
-            capabilities: r.try_get("capabilities").unwrap_or(None),
-            intent: r.try_get("intent").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<WorkflowFullRow> {
+            Ok(WorkflowFullRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                tags: r.try_get::<Option<_>, _>("tags")?,
+                description: r.try_get::<Option<_>, _>("description")?,
+                max_concurrent_executions: r
+                    .try_get::<Option<_>, _>("max_concurrent_executions")?,
+                capabilities: r.try_get::<Option<_>, _>("capabilities")?,
+                intent: r.try_get::<Option<_>, _>("intent")?,
+            })
+        })
+        .transpose()
     }
 
     pub async fn get_workflow_graph_json(
@@ -1181,7 +1188,10 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.and_then(|r| r.try_get("graph_json").unwrap_or(None)))
+        Ok(row
+            .map(|r| r.try_get::<Option<String>, _>("graph_json"))
+            .transpose()?
+            .flatten())
     }
 
     pub async fn list_workflows_for_user(&self, user_id: Uuid) -> Result<Vec<WorkflowBasicRow>> {
@@ -1198,21 +1208,22 @@ impl AnalyticsRepository {
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| WorkflowBasicRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                status: r.try_get("status").unwrap_or(None),
-                is_enabled: r.try_get("is_enabled").unwrap_or(false),
-                workflow_type: r.try_get("workflow_type").unwrap_or(None),
-                capabilities: r.try_get("capabilities").unwrap_or(None),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                description: r.try_get("description").unwrap_or(None),
-                created_at: r.try_get("created_at").unwrap_or(None),
-                updated_at: r.try_get("updated_at").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<WorkflowBasicRow> {
+                Ok(WorkflowBasicRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    status: r.try_get::<Option<_>, _>("status")?,
+                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                    workflow_type: r.try_get::<Option<_>, _>("workflow_type")?,
+                    capabilities: r.try_get::<Option<_>, _>("capabilities")?,
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    created_at: r.try_get::<Option<_>, _>("created_at")?,
+                    updated_at: r.try_get::<Option<_>, _>("updated_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn list_workflows_with_graphs(&self, user_id: Uuid) -> Result<Vec<WorkflowGraphRow>> {
@@ -1239,20 +1250,21 @@ impl AnalyticsRepository {
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| WorkflowGraphRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                graph_json: r.try_get("graph_json").unwrap_or(None),
-                status: r.try_get("status").unwrap_or(None),
-                is_enabled: r.try_get("is_enabled").unwrap_or(false),
-                workflow_type: r.try_get("workflow_type").unwrap_or(None),
-                tags: r.try_get("tags").unwrap_or(None),
-                created_at: r.try_get("created_at").unwrap_or(None),
-                updated_at: r.try_get("updated_at").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<WorkflowGraphRow> {
+                Ok(WorkflowGraphRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                    status: r.try_get::<Option<_>, _>("status")?,
+                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                    workflow_type: r.try_get::<Option<_>, _>("workflow_type")?,
+                    tags: r.try_get::<Option<_>, _>("tags")?,
+                    created_at: r.try_get::<Option<_>, _>("created_at")?,
+                    updated_at: r.try_get::<Option<_>, _>("updated_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// MCP-435 (2026-05-11): find workflows whose `graph_json` references
@@ -1358,13 +1370,13 @@ impl AnalyticsRepository {
         .await?;
         tx.commit().await?;
         Ok(SystemStatusCounts {
-            workflows: row.try_get("workflows").unwrap_or(0),
-            executions: row.try_get("executions").unwrap_or(0),
-            modules: row.try_get("modules").unwrap_or(0),
-            templates: row.try_get("templates").unwrap_or(0),
-            secrets: row.try_get("secrets").unwrap_or(0),
-            schedules: row.try_get("schedules").unwrap_or(0),
-            webhooks: row.try_get("webhooks").unwrap_or(0),
+            workflows: row.try_get::<Option<_>, _>("workflows")?.unwrap_or(0),
+            executions: row.try_get::<Option<_>, _>("executions")?.unwrap_or(0),
+            modules: row.try_get::<Option<_>, _>("modules")?.unwrap_or(0),
+            templates: row.try_get::<Option<_>, _>("templates")?.unwrap_or(0),
+            secrets: row.try_get::<Option<_>, _>("secrets")?.unwrap_or(0),
+            schedules: row.try_get::<Option<_>, _>("schedules")?.unwrap_or(0),
+            webhooks: row.try_get::<Option<_>, _>("webhooks")?.unwrap_or(0),
         })
     }
 
@@ -1405,15 +1417,16 @@ impl AnalyticsRepository {
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| FailingWorkflowRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                fail_count: r.try_get("fail_count").unwrap_or(0),
-                total_count: r.try_get("total_count").unwrap_or(0),
+        rows.into_iter()
+            .map(|r| -> Result<FailingWorkflowRow> {
+                Ok(FailingWorkflowRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
+                    total_count: r.try_get::<Option<_>, _>("total_count")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- Health dashboard -------------------------------------------------
@@ -1434,15 +1447,16 @@ impl AnalyticsRepository {
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| LongRunningRow {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                name: r.get("name"),
-                running_secs: r.try_get("running_secs").unwrap_or(0),
+        rows.into_iter()
+            .map(|r| -> Result<LongRunningRow> {
+                Ok(LongRunningRow {
+                    id: r.get("id"),
+                    workflow_id: r.get("workflow_id"),
+                    name: r.get("name"),
+                    running_secs: r.try_get::<Option<_>, _>("running_secs")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_health_summary_counts(&self, user_id: Uuid) -> Result<HealthSummaryCounts> {
@@ -1460,9 +1474,9 @@ impl AnalyticsRepository {
         .await?;
         tx.commit().await?;
         Ok(HealthSummaryCounts {
-            running: row.try_get("running").unwrap_or(0),
-            failed_24h: row.try_get("failed_24h").unwrap_or(0),
-            completed_24h: row.try_get("completed_24h").unwrap_or(0),
+            running: row.try_get::<Option<_>, _>("running")?.unwrap_or(0),
+            failed_24h: row.try_get::<Option<_>, _>("failed_24h")?.unwrap_or(0),
+            completed_24h: row.try_get::<Option<_>, _>("completed_24h")?.unwrap_or(0),
         })
     }
 
@@ -1529,9 +1543,9 @@ impl AnalyticsRepository {
         .fetch_one(&self.db_pool)
         .await?;
         Ok(LatencyPercentilesMs {
-            p50_ms: row.try_get("p50_ms").unwrap_or(None),
-            p95_ms: row.try_get("p95_ms").unwrap_or(None),
-            p99_ms: row.try_get("p99_ms").unwrap_or(None),
+            p50_ms: row.try_get::<Option<_>, _>("p50_ms")?,
+            p95_ms: row.try_get::<Option<_>, _>("p95_ms")?,
+            p99_ms: row.try_get::<Option<_>, _>("p99_ms")?,
         })
     }
 
@@ -1550,15 +1564,16 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| VersionChangelogRow {
-                version_number: r.try_get("version_number").unwrap_or(None),
-                graph_json: r.try_get("graph_json").unwrap_or(None),
-                description: r.try_get("description").unwrap_or(None),
-                published_at: r.try_get("published_at").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<VersionChangelogRow> {
+                Ok(VersionChangelogRow {
+                    version_number: r.try_get::<Option<_>, _>("version_number")?,
+                    graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    published_at: r.try_get::<Option<_>, _>("published_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn list_workflow_versions_audit(
@@ -1574,15 +1589,16 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| VersionAuditRow {
-                version_number: r.try_get("version_number").unwrap_or(None),
-                description: r.try_get("description").unwrap_or(None),
-                published_at: r.try_get("published_at").unwrap_or(None),
-                is_active: r.try_get("is_active").unwrap_or(false),
+        rows.into_iter()
+            .map(|r| -> Result<VersionAuditRow> {
+                Ok(VersionAuditRow {
+                    version_number: r.try_get::<Option<_>, _>("version_number")?,
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    published_at: r.try_get::<Option<_>, _>("published_at")?,
+                    is_active: r.try_get::<Option<_>, _>("is_active")?.unwrap_or(false),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn check_has_active_version(&self, wf_id: Uuid) -> Result<bool> {
@@ -1606,9 +1622,9 @@ impl AnalyticsRepository {
         .fetch_one(&self.db_pool)
         .await?;
         Ok(VersionSummaryRow {
-            total_versions: row.try_get("total_versions").unwrap_or(0),
-            latest_version: row.try_get("latest_version").unwrap_or(None),
-            last_published: row.try_get("last_published").unwrap_or(None),
+            total_versions: row.try_get::<Option<_>, _>("total_versions")?.unwrap_or(0),
+            latest_version: row.try_get::<Option<_>, _>("latest_version")?,
+            last_published: row.try_get::<Option<_>, _>("last_published")?,
         })
     }
 
@@ -1623,17 +1639,18 @@ impl AnalyticsRepository {
         .bind(wf_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ScheduleRow {
-                id: r.get("id"),
-                cron_expression: r.get("cron_expression"),
-                is_enabled: r.try_get("is_enabled").unwrap_or(false),
-                timezone: r.try_get("timezone").ok(),
-                last_triggered_at: r.try_get("last_triggered_at").ok(),
-                next_trigger_at: r.try_get("next_trigger_at").ok(),
+        rows.into_iter()
+            .map(|r| -> Result<ScheduleRow> {
+                Ok(ScheduleRow {
+                    id: r.get("id"),
+                    cron_expression: r.get("cron_expression"),
+                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                    timezone: r.try_get("timezone").ok(),
+                    last_triggered_at: r.try_get("last_triggered_at").ok(),
+                    next_trigger_at: r.try_get("next_trigger_at").ok(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn count_active_schedules(&self, wf_id: Uuid) -> Result<i64> {
@@ -1659,14 +1676,15 @@ impl AnalyticsRepository {
         .bind(wf_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| WebhookRow {
-                id: r.get("id"),
-                endpoint_path: r.get("endpoint_path"),
-                is_enabled: r.try_get("is_enabled").unwrap_or(false),
+        rows.into_iter()
+            .map(|r| -> Result<WebhookRow> {
+                Ok(WebhookRow {
+                    id: r.get("id"),
+                    endpoint_path: r.get("endpoint_path"),
+                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn list_webhooks_for_modules(
@@ -1682,14 +1700,15 @@ impl AnalyticsRepository {
         .bind(wf_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| WebhookRow {
-                id: r.get("id"),
-                endpoint_path: r.get("endpoint_path"),
-                is_enabled: r.try_get("is_enabled").unwrap_or(false),
+        rows.into_iter()
+            .map(|r| -> Result<WebhookRow> {
+                Ok(WebhookRow {
+                    id: r.get("id"),
+                    endpoint_path: r.get("endpoint_path"),
+                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn count_active_webhooks_for_modules(
@@ -1724,16 +1743,17 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| AuditEventRow {
-                id: r.get("id"),
-                event_type: r.get("event_type"),
-                description: r.try_get("description").unwrap_or(None),
-                created_at: r.get("created_at"),
-                actor_id: r.try_get("actor_id").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<AuditEventRow> {
+                Ok(AuditEventRow {
+                    id: r.get("id"),
+                    event_type: r.get("event_type"),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    created_at: r.get("created_at"),
+                    actor_id: r.try_get::<Option<_>, _>("actor_id")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn list_executions_for_audit(
@@ -1763,17 +1783,18 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ExecutionAuditRow {
-                id: r.get("id"),
-                status: r.get("status"),
-                started_at: r.try_get("started_at").unwrap_or(None),
-                completed_at: r.try_get("completed_at").unwrap_or(None),
-                error_message: r.try_get("error_message").unwrap_or(None),
-                trigger_type: r.try_get("trigger_type").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<ExecutionAuditRow> {
+                Ok(ExecutionAuditRow {
+                    id: r.get("id"),
+                    status: r.get("status"),
+                    started_at: r.try_get::<Option<_>, _>("started_at")?,
+                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+                    error_message: r.try_get::<Option<_>, _>("error_message")?,
+                    trigger_type: r.try_get::<Option<_>, _>("trigger_type")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- Error / node failures --------------------------------------------
@@ -1827,16 +1848,16 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                (
-                    r.try_get::<String, _>("error_message").unwrap_or_default(),
-                    r.try_get::<DateTime<Utc>, _>("started_at")
-                        .unwrap_or_else(|_| Utc::now()),
-                )
+        rows.into_iter()
+            .map(|r| -> Result<(String, DateTime<Utc>)> {
+                Ok((
+                    r.try_get::<Option<String>, _>("error_message")?
+                        .unwrap_or_default(),
+                    r.try_get::<Option<DateTime<Utc>>, _>("started_at")?
+                        .unwrap_or_else(Utc::now),
+                ))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_node_failure_counts(
@@ -1858,13 +1879,14 @@ impl AnalyticsRepository {
         .bind(days)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| NodeFailureCountRow {
-                node_id: r.get("node_id"),
-                fail_count: r.try_get("fail_count").unwrap_or(0),
+        rows.into_iter()
+            .map(|r| -> Result<NodeFailureCountRow> {
+                Ok(NodeFailureCountRow {
+                    node_id: r.get("node_id"),
+                    fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_node_failure_details(
@@ -1888,15 +1910,16 @@ impl AnalyticsRepository {
         .bind(days)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| NodeFailureDetailRow {
-                node_id: r.get("node_id"),
-                fail_count: r.try_get("fail_count").unwrap_or(0),
-                latest_at: r.try_get("latest_at").unwrap_or(None),
-                latest_error: r.try_get("latest_error").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<NodeFailureDetailRow> {
+                Ok(NodeFailureDetailRow {
+                    node_id: r.get("node_id"),
+                    fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
+                    latest_at: r.try_get::<Option<_>, _>("latest_at")?,
+                    latest_error: r.try_get::<Option<_>, _>("latest_error")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_hourly_failure_breakdown(
@@ -1917,13 +1940,14 @@ impl AnalyticsRepository {
         .bind(days)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| HourlyFailureRow {
-                hour: r.try_get("hour").unwrap_or(0),
-                fail_count: r.try_get("fail_count").unwrap_or(0),
+        rows.into_iter()
+            .map(|r| -> Result<HourlyFailureRow> {
+                Ok(HourlyFailureRow {
+                    hour: r.try_get::<Option<_>, _>("hour")?.unwrap_or(0),
+                    fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- All-workflow stats -----------------------------------------------
@@ -1956,17 +1980,18 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| WorkflowStatSummaryRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                total: r.try_get("total").unwrap_or(0),
-                succeeded: r.try_get("succeeded").unwrap_or(0),
-                failed: r.try_get("failed").unwrap_or(0),
-                avg_duration_secs: r.try_get("avg_duration_secs").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<WorkflowStatSummaryRow> {
+                Ok(WorkflowStatSummaryRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    total: r.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+                    succeeded: r.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
+                    failed: r.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
+                    avg_duration_secs: r.try_get::<Option<_>, _>("avg_duration_secs")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- Unused secrets ---------------------------------------------------
@@ -1979,16 +2004,17 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| UnusedSecretRow {
-                name: r.get("name"),
-                key_path: r.get("key_path"),
-                description: r.try_get("description").unwrap_or(None),
-                created_at: r.try_get("created_at").unwrap_or(None),
-                namespace: r.try_get("namespace").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<UnusedSecretRow> {
+                Ok(UnusedSecretRow {
+                    name: r.get("name"),
+                    key_path: r.get("key_path"),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    created_at: r.try_get::<Option<_>, _>("created_at")?,
+                    namespace: r.try_get::<Option<_>, _>("namespace")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_secrets_allowed_by_modules(&self, user_id: Uuid) -> Result<Vec<String>> {
@@ -2029,10 +2055,13 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| ModuleInfoRow {
-            name: r.get("name"),
-            capability_world: r.try_get("capability_world").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<ModuleInfoRow> {
+            Ok(ModuleInfoRow {
+                name: r.get("name"),
+                capability_world: r.try_get::<Option<_>, _>("capability_world")?,
+            })
+        })
+        .transpose()
     }
 
     // -- Capabilities -----------------------------------------------------
@@ -2070,17 +2099,18 @@ impl AnalyticsRepository {
         .bind(capabilities)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| WorkflowCapabilityRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.try_get("description").unwrap_or(None),
-                capabilities: r.try_get("capabilities").unwrap_or(None),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                success_rate: r.try_get("success_rate").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<WorkflowCapabilityRow> {
+                Ok(WorkflowCapabilityRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    capabilities: r.try_get::<Option<_>, _>("capabilities")?,
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    success_rate: r.try_get::<Option<_>, _>("success_rate")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_workflow_capabilities(
@@ -2093,7 +2123,10 @@ impl AnalyticsRepository {
             .bind(user_id)
             .fetch_optional(&self.db_pool)
             .await?;
-        Ok(row.and_then(|r| r.try_get("capabilities").unwrap_or(None)))
+        Ok(row
+            .map(|r| r.try_get::<Option<Vec<String>>, _>("capabilities"))
+            .transpose()?
+            .flatten())
     }
 
     pub async fn get_untagged_workflows(
@@ -2126,20 +2159,21 @@ impl AnalyticsRepository {
             .fetch_all(&self.db_pool)
             .await?
         };
-        Ok(rows
-            .into_iter()
-            .map(|r| WorkflowGraphRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                graph_json: r.try_get("graph_json").unwrap_or(None),
-                status: r.try_get("status").unwrap_or(None),
-                is_enabled: r.try_get("is_enabled").unwrap_or(false),
-                workflow_type: r.try_get("workflow_type").unwrap_or(None),
-                tags: r.try_get("tags").unwrap_or(None),
-                created_at: r.try_get("created_at").unwrap_or(None),
-                updated_at: r.try_get("updated_at").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<WorkflowGraphRow> {
+                Ok(WorkflowGraphRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                    status: r.try_get::<Option<_>, _>("status")?,
+                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                    workflow_type: r.try_get::<Option<_>, _>("workflow_type")?,
+                    tags: r.try_get::<Option<_>, _>("tags")?,
+                    created_at: r.try_get::<Option<_>, _>("created_at")?,
+                    updated_at: r.try_get::<Option<_>, _>("updated_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn set_workflow_capabilities_if_empty(
@@ -2173,11 +2207,14 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| {
-            let gj: String = r.try_get("graph_json").unwrap_or_default();
-            let caps: Vec<String> = r.try_get("capabilities").unwrap_or_default();
-            (gj, caps)
-        }))
+        row.map(|r| -> Result<(String, Vec<String>)> {
+            let gj: String = r.try_get::<Option<_>, _>("graph_json")?.unwrap_or_default();
+            let caps: Vec<String> = r
+                .try_get::<Option<_>, _>("capabilities")?
+                .unwrap_or_default();
+            Ok((gj, caps))
+        })
+        .transpose()
     }
 
     // -- Capability suggestion helpers ------------------------------------
@@ -2253,16 +2290,17 @@ impl AnalyticsRepository {
         .bind(days)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ReuseStatRow {
-                workflow_id: r.get("workflow_id"),
-                name: r.get("name"),
-                graph_json: r.try_get("graph_json").unwrap_or(None),
-                total_invocations: r.try_get("total_invocations").unwrap_or(0),
-                unique_days: r.try_get("unique_days").unwrap_or(0),
+        rows.into_iter()
+            .map(|r| -> Result<ReuseStatRow> {
+                Ok(ReuseStatRow {
+                    workflow_id: r.get("workflow_id"),
+                    name: r.get("name"),
+                    graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                    total_invocations: r.try_get::<Option<_>, _>("total_invocations")?.unwrap_or(0),
+                    unique_days: r.try_get::<Option<_>, _>("unique_days")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- Fuel / output data -----------------------------------------------
@@ -2376,8 +2414,8 @@ impl AnalyticsRepository {
         .fetch_one(&self.db_pool)
         .await?;
         Ok(ReadinessExecData {
-            success_rate: row.try_get("success_rate").unwrap_or(None),
-            total_count: row.try_get("total_count").unwrap_or(0),
+            success_rate: row.try_get::<Option<_>, _>("success_rate")?,
+            total_count: row.try_get::<Option<_>, _>("total_count")?.unwrap_or(0),
         })
     }
 
@@ -2543,17 +2581,22 @@ impl AnalyticsRepository {
         .bind(include_archived)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ReadinessScoreRow {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                readiness_scored_at: r.try_get("readiness_scored_at").unwrap_or(None),
-                has_description: r.try_get("has_description").unwrap_or(false),
-                has_capabilities: r.try_get("has_capabilities").unwrap_or(false),
+        rows.iter()
+            .map(|r| -> Result<ReadinessScoreRow> {
+                Ok(ReadinessScoreRow {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    readiness_scored_at: r.try_get::<Option<_>, _>("readiness_scored_at")?,
+                    has_description: r
+                        .try_get::<Option<_>, _>("has_description")?
+                        .unwrap_or(false),
+                    has_capabilities: r
+                        .try_get::<Option<_>, _>("has_capabilities")?
+                        .unwrap_or(false),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // ── alerts.rs MCP-handler support ──────────────────────────────────────
@@ -2593,25 +2636,34 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
+        rows.iter()
+            .map(|r| -> Result<WorkflowAlertRow> {
                 let created_at: chrono::DateTime<chrono::Utc> =
-                    r.try_get("created_at").unwrap_or_default();
-                WorkflowAlertRow {
-                    id: r.try_get("id").unwrap_or_default(),
-                    workflow_id: r.try_get("workflow_id").unwrap_or_default(),
-                    execution_id: r.try_get("execution_id").unwrap_or_default(),
-                    alert_type: r.try_get("alert_type").unwrap_or_default(),
-                    message: r.try_get("message").unwrap_or_default(),
+                    r.try_get::<Option<_>, _>("created_at")?.unwrap_or_default();
+                Ok(WorkflowAlertRow {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    workflow_id: r
+                        .try_get::<Option<_>, _>("workflow_id")?
+                        .unwrap_or_default(),
+                    execution_id: r
+                        .try_get::<Option<_>, _>("execution_id")?
+                        .unwrap_or_default(),
+                    alert_type: r.try_get::<Option<_>, _>("alert_type")?.unwrap_or_default(),
+                    message: r.try_get::<Option<_>, _>("message")?.unwrap_or_default(),
                     created_at,
-                    workflow_name: r.try_get("workflow_name").unwrap_or_default(),
-                    occurrence_count: r.try_get("occurrence_count").unwrap_or(1),
-                    last_occurred_at: r.try_get("last_occurred_at").unwrap_or(created_at),
-                    execution_archived: r.try_get("execution_archived").unwrap_or(false),
-                }
+                    workflow_name: r
+                        .try_get::<Option<_>, _>("workflow_name")?
+                        .unwrap_or_default(),
+                    occurrence_count: r.try_get::<Option<_>, _>("occurrence_count")?.unwrap_or(1),
+                    last_occurred_at: r
+                        .try_get::<Option<_>, _>("last_occurred_at")?
+                        .unwrap_or(created_at),
+                    execution_archived: r
+                        .try_get::<Option<_>, _>("execution_archived")?
+                        .unwrap_or(false),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Mark a single alert acknowledged (scoped to user).
@@ -2746,8 +2798,8 @@ impl AnalyticsRepository {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        let total: i64 = row.try_get("total").unwrap_or(0);
-        let failed: i64 = row.try_get("failed").unwrap_or(0);
+        let total: i64 = row.try_get::<Option<_>, _>("total")?.unwrap_or(0);
+        let failed: i64 = row.try_get::<Option<_>, _>("failed")?.unwrap_or(0);
         Ok((total, failed))
     }
 
@@ -2792,13 +2844,16 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| WaterfallExecRow {
-            status: r.get("status"),
-            started_at: r.try_get("started_at").unwrap_or(None),
-            completed_at: r.try_get("completed_at").unwrap_or(None),
-            output_data: r.try_get("output_data").unwrap_or(None),
-            workflow_id: r.get("workflow_id"),
-        }))
+        row.map(|r| -> Result<WaterfallExecRow> {
+            Ok(WaterfallExecRow {
+                status: r.get("status"),
+                started_at: r.try_get::<Option<_>, _>("started_at")?,
+                completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+                output_data: r.try_get::<Option<_>, _>("output_data")?,
+                workflow_id: r.get("workflow_id"),
+            })
+        })
+        .transpose()
     }
 
     pub async fn list_execution_events_waterfall(
@@ -2814,14 +2869,15 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| WaterfallEventRow {
-                event_type: r.get("event_type"),
-                node_id: r.try_get("node_id").unwrap_or(None),
-                created_at: r.get("created_at"),
+        rows.into_iter()
+            .map(|r| -> Result<WaterfallEventRow> {
+                Ok(WaterfallEventRow {
+                    event_type: r.get("event_type"),
+                    node_id: r.try_get::<Option<_>, _>("node_id")?,
+                    created_at: r.get("created_at"),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- Performance metrics ----------------------------------------------
@@ -2855,11 +2911,11 @@ impl AnalyticsRepository {
         .fetch_one(&self.db_pool)
         .await?;
         Ok(PerformanceMetricsRow {
-            total: row.try_get("total").unwrap_or(0),
-            p50_ms: row.try_get("p50_ms").unwrap_or(None),
-            p95_ms: row.try_get("p95_ms").unwrap_or(None),
-            p99_ms: row.try_get("p99_ms").unwrap_or(None),
-            avg_ms: row.try_get("avg_ms").unwrap_or(None),
+            total: row.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+            p50_ms: row.try_get::<Option<_>, _>("p50_ms")?,
+            p95_ms: row.try_get::<Option<_>, _>("p95_ms")?,
+            p99_ms: row.try_get::<Option<_>, _>("p99_ms")?,
+            avg_ms: row.try_get::<Option<_>, _>("avg_ms")?,
         })
     }
 
@@ -2884,8 +2940,8 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_one(&self.db_pool)
         .await?;
-        let recent: Option<f64> = row.try_get("recent_avg_ms").unwrap_or(None);
-        let previous: Option<f64> = row.try_get("previous_avg_ms").unwrap_or(None);
+        let recent: Option<f64> = row.try_get::<Option<_>, _>("recent_avg_ms")?;
+        let previous: Option<f64> = row.try_get::<Option<_>, _>("previous_avg_ms")?;
         Ok((recent, previous))
     }
 
@@ -2969,11 +3025,11 @@ impl AnalyticsRepository {
         let mut slowest: Option<ExtremeExecution> = None;
         let mut fastest: Option<ExtremeExecution> = None;
         for r in &rows {
-            let bucket: String = r.try_get("bucket").unwrap_or_default();
+            let bucket: String = r.try_get::<Option<_>, _>("bucket")?.unwrap_or_default();
             let item = ExtremeExecution {
                 id: r.get("id"),
-                started_at: r.try_get("started_at").unwrap_or_default(),
-                duration_ms: r.try_get("duration_ms").unwrap_or(0.0),
+                started_at: r.try_get::<Option<_>, _>("started_at")?.unwrap_or_default(),
+                duration_ms: r.try_get::<Option<_>, _>("duration_ms")?.unwrap_or(0.0),
             };
             match bucket.as_str() {
                 "slowest" => slowest = Some(item),
@@ -3002,11 +3058,11 @@ impl AnalyticsRepository {
         .await?;
         tx.commit().await?;
         Ok(DailyExecSummary {
-            total: row.try_get("total").unwrap_or(0),
-            succeeded: row.try_get("succeeded").unwrap_or(0),
-            failed: row.try_get("failed").unwrap_or(0),
-            cancelled: row.try_get("cancelled").unwrap_or(0),
-            running: row.try_get("running").unwrap_or(0),
+            total: row.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+            succeeded: row.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
+            failed: row.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
+            cancelled: row.try_get::<Option<_>, _>("cancelled")?.unwrap_or(0),
+            running: row.try_get::<Option<_>, _>("running")?.unwrap_or(0),
         })
     }
 
@@ -3025,14 +3081,15 @@ impl AnalyticsRepository {
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| TopWorkflowRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                exec_count: r.try_get("exec_count").unwrap_or(0),
+        rows.into_iter()
+            .map(|r| -> Result<TopWorkflowRow> {
+                Ok(TopWorkflowRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    exec_count: r.try_get::<Option<_>, _>("exec_count")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_top_failing_workflows_24h(
@@ -3053,15 +3110,16 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| FailingWorkflowRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                fail_count: r.try_get("fail_count").unwrap_or(0),
-                total_count: r.try_get("total_count").unwrap_or(0),
+        rows.into_iter()
+            .map(|r| -> Result<FailingWorkflowRow> {
+                Ok(FailingWorkflowRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
+                    total_count: r.try_get::<Option<_>, _>("total_count")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_upcoming_schedules_for_user(
@@ -3084,16 +3142,17 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ScheduleUpcomingRow {
-                id: r.get("id"),
-                cron_expression: r.get("cron_expression"),
-                timezone: r.try_get("timezone").unwrap_or(None),
-                workflow_name: r.get("workflow_name"),
-                workflow_id: r.get("workflow_id"),
+        rows.into_iter()
+            .map(|r| -> Result<ScheduleUpcomingRow> {
+                Ok(ScheduleUpcomingRow {
+                    id: r.get("id"),
+                    cron_expression: r.get("cron_expression"),
+                    timezone: r.try_get::<Option<_>, _>("timezone")?,
+                    workflow_name: r.get("workflow_name"),
+                    workflow_id: r.get("workflow_id"),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- Retry config data ------------------------------------------------
@@ -3113,14 +3172,13 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
+        rows.into_iter()
+            .map(|r| -> Result<(String, Option<String>)> {
                 let status: String = r.get("status");
-                let error_message: Option<String> = r.try_get("error_message").unwrap_or(None);
-                (status, error_message)
+                let error_message: Option<String> = r.try_get::<Option<_>, _>("error_message")?;
+                Ok((status, error_message))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- Risk assessment data ---------------------------------------------
@@ -3180,15 +3238,14 @@ impl AnalyticsRepository {
         .bind(module_ids)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
+        rows.into_iter()
+            .map(|r| -> Result<(Uuid, String, Option<String>)> {
                 let id: Uuid = r.get("id");
                 let name: String = r.get("name");
-                let category: Option<String> = r.try_get("category").unwrap_or(None);
-                (id, name, category)
+                let category: Option<String> = r.try_get::<Option<_>, _>("category")?;
+                Ok((id, name, category))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Returns (id, name) for any module_id that is a user-authored sandbox
@@ -3306,15 +3363,17 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| HygieneWorkflowRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                description: r.try_get("description").unwrap_or(None),
-                created_at: r.get("created_at"),
+            .map(|r| -> Result<HygieneWorkflowRow> {
+                Ok(HygieneWorkflowRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    created_at: r.get("created_at"),
+                })
             })
-            .collect();
-            rows
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 2. Uncapabilized workflows
@@ -3334,15 +3393,17 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| HygieneWorkflowRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                description: r.try_get("description").unwrap_or(None),
-                created_at: r.get("created_at"),
+            .map(|r| -> Result<HygieneWorkflowRow> {
+                Ok(HygieneWorkflowRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    created_at: r.get("created_at"),
+                })
             })
-            .collect();
-            rows
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 3. Suppressed count (internal/test workflow types)
@@ -3408,8 +3469,8 @@ impl AnalyticsRepository {
             unembedded_count,
             total_workflow_count,
         ): (
-            Vec<HygieneWorkflowRow>,
-            Vec<HygieneWorkflowRow>,
+            anyhow::Result<Vec<HygieneWorkflowRow>>,
+            anyhow::Result<Vec<HygieneWorkflowRow>>,
             i64,
             i64,
             i64,
@@ -3422,6 +3483,8 @@ impl AnalyticsRepository {
             unembedded_count_fut,
             total_workflow_count_fut,
         );
+        let undescribed = undescribed?;
+        let uncapabilized = uncapabilized?;
 
         // 6. Orphaned modules — Phase 4 prep: query the unified `modules`
         // table and treat a module as orphan when no workflow graph_json
@@ -3451,14 +3514,16 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| OrphanedModuleRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                size_bytes: r.try_get("size_bytes").unwrap_or(None),
-                compiled_at: r.get("compiled_at"),
+            .map(|r| -> Result<OrphanedModuleRow> {
+                Ok(OrphanedModuleRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    size_bytes: r.try_get::<Option<_>, _>("size_bytes")?,
+                    compiled_at: r.get("compiled_at"),
+                })
             })
-            .collect();
-            rows
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 7. Stale executions
@@ -3503,14 +3568,14 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| DormantWorkflowRow {
+            .map(|r| -> Result<DormantWorkflowRow> { Ok(DormantWorkflowRow {
                 id: r.get("id"),
                 name: r.get("name"),
                 created_at: r.get("created_at"),
-                last_execution: r.try_get("last_execution").unwrap_or(None),
-            })
-            .collect();
-            rows
+                last_execution: r.try_get::<Option<_>, _>("last_execution")?,
+            }) })
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 9. Stale draft workflows.
@@ -3530,14 +3595,16 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| StaleDraftRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                created_at: r.get("created_at"),
-                graph_json: r.try_get("graph_json").unwrap_or(None),
+            .map(|r| -> Result<StaleDraftRow> {
+                Ok(StaleDraftRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    created_at: r.get("created_at"),
+                    graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                })
             })
-            .collect();
-            rows
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 10. Idle actors
@@ -3570,15 +3637,15 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| IdleActorRow {
+            .map(|r| -> Result<IdleActorRow> { Ok(IdleActorRow {
                 id: r.get("id"),
                 name: r.get("name"),
                 status: r.get("status"),
-                last_active: r.try_get("last_active").unwrap_or(None),
-                total_executions: r.try_get("total_executions").unwrap_or(0),
-            })
-            .collect();
-            rows
+                last_active: r.try_get::<Option<_>, _>("last_active")?,
+                total_executions: r.try_get::<Option<_>, _>("total_executions")?.unwrap_or(0),
+            }) })
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 11. Wildcard module check + attribution
@@ -3611,11 +3678,11 @@ impl AnalyticsRepository {
             idle_actors,
             wildcard_module_names,
         ): (
-            Vec<OrphanedModuleRow>,
+            anyhow::Result<Vec<OrphanedModuleRow>>,
             Vec<StaleExecutionRow>,
-            Vec<DormantWorkflowRow>,
-            Vec<StaleDraftRow>,
-            Vec<IdleActorRow>,
+            anyhow::Result<Vec<DormantWorkflowRow>>,
+            anyhow::Result<Vec<StaleDraftRow>>,
+            anyhow::Result<Vec<IdleActorRow>>,
             Vec<String>,
         ) = tokio::join!(
             orphaned_modules_fut,
@@ -3625,6 +3692,10 @@ impl AnalyticsRepository {
             idle_actors_fut,
             wildcard_module_names_fut,
         );
+        let orphaned_modules = orphaned_modules?;
+        let dormant_workflows = dormant_workflows?;
+        let stale_draft_workflows = stale_draft_workflows?;
+        let idle_actors = idle_actors?;
         let has_wildcard_module = !wildcard_module_names.is_empty();
 
         // 12. Orphaned secrets (only when no wildcard module).
@@ -3645,7 +3716,7 @@ impl AnalyticsRepository {
         // the user's secrets + the union of their grant entries, then filter
         // in Rust using a matcher that mirrors the host-side logic exactly.
         let orphaned_secrets_fut = async {
-            if !has_wildcard_module {
+            Ok(if !has_wildcard_module {
                 // The secrets list and the grants union are independent of
                 // each other — run them concurrently (still gated on
                 // !has_wildcard_module so behavior is unchanged).
@@ -3674,7 +3745,7 @@ impl AnalyticsRepository {
 
                 secrets_rows
                     .into_iter()
-                    .filter_map(|r| {
+                    .map(|r| -> anyhow::Result<Option<OrphanedSecretRow>> {
                         let key_path: String = r.get("key_path");
                         // Suppress controller-internal paths (LLM provider keys, OAuth
                         // refresh tokens) — these are by-design absent from every
@@ -3683,25 +3754,28 @@ impl AnalyticsRepository {
                         // the LLM cache or the next OAuth refresh cycle.
                         if talos_workflow_job_protocol::is_controller_internal_vault_path(&key_path)
                         {
-                            return None;
+                            return Ok(None);
                         }
                         if secret_path_in_any_grant(&grants, &key_path) {
-                            None
+                            Ok(None)
                         } else {
-                            Some(OrphanedSecretRow {
+                            Ok(Some(OrphanedSecretRow {
                                 name: r.get("name"),
                                 key_path,
-                                namespace: r.try_get("namespace").unwrap_or(None),
+                                namespace: r.try_get::<Option<_>, _>("namespace")?,
                                 created_at: r.get("created_at"),
-                                expires_at: r.try_get("expires_at").unwrap_or(None),
-                            })
+                                expires_at: r.try_get::<Option<_>, _>("expires_at")?,
+                            }))
                         }
                     })
+                    .collect::<anyhow::Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
                     .take(25)
                     .collect()
             } else {
                 Vec::new()
-            }
+            })
         };
 
         // 13. Secrets without expiry
@@ -3742,15 +3816,17 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| ExpiringMemoryRow {
-                actor_id: r.get("actor_id"),
-                key: r.get("key"),
-                memory_type: r.try_get("memory_type").unwrap_or(None),
-                expires_at: r.get("expires_at"),
-                actor_name: r.get("actor_name"),
+            .map(|r| -> Result<ExpiringMemoryRow> {
+                Ok(ExpiringMemoryRow {
+                    actor_id: r.get("actor_id"),
+                    key: r.get("key"),
+                    memory_type: r.try_get::<Option<_>, _>("memory_type")?,
+                    expires_at: r.get("expires_at"),
+                    actor_name: r.get("actor_name"),
+                })
             })
-            .collect();
-            rows
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 15. Workflows needing schema
@@ -3771,14 +3847,14 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| NeedsSchemaRow {
+            .map(|r| -> Result<NeedsSchemaRow> { Ok(NeedsSchemaRow {
                 id: r.get("id"),
                 name: r.get("name"),
-                execution_count: r.try_get("execution_count").unwrap_or(0),
-                last_run: r.try_get("last_run").unwrap_or(None),
-            })
-            .collect();
-            rows
+                execution_count: r.try_get::<Option<_>, _>("execution_count")?.unwrap_or(0),
+                last_run: r.try_get::<Option<_>, _>("last_run")?,
+            }) })
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 16. Untyped serde_json::Value parser lint — performance anti-pattern.
@@ -3860,10 +3936,10 @@ impl AnalyticsRepository {
             workflows_needing_schema,
             untyped_value_modules,
         ): (
-            Vec<OrphanedSecretRow>,
+            anyhow::Result<Vec<OrphanedSecretRow>>,
             Vec<SecretWithoutExpiryRow>,
-            Vec<ExpiringMemoryRow>,
-            Vec<NeedsSchemaRow>,
+            anyhow::Result<Vec<ExpiringMemoryRow>>,
+            anyhow::Result<Vec<NeedsSchemaRow>>,
             Vec<UntypedValueModuleRow>,
         ) = tokio::join!(
             orphaned_secrets_fut,
@@ -3872,6 +3948,9 @@ impl AnalyticsRepository {
             workflows_needing_schema_fut,
             untyped_value_modules_fut,
         );
+        let orphaned_secrets = orphaned_secrets?;
+        let expiring_actor_memories = expiring_actor_memories?;
+        let workflows_needing_schema = workflows_needing_schema?;
 
         Ok(HygieneReport {
             undescribed,

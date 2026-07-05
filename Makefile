@@ -131,7 +131,7 @@ test: ## Run the full test suite with cargo-nextest (fast local)
 test-changed: ## Run nextest for ONLY crates changed vs BASE (default origin/main); ARGS=--list to just list. Fast inner loop, NOT a CI substitute
 	@bash scripts/test-changed.sh $(ARGS)
 
-test-integration: ## Run env-gated integration tests against disposable Redis+Postgres (needs Docker)
+test-integration: ## Run env-gated integration tests against disposable Redis+Postgres+NATS (needs Docker)
 	@command -v docker >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ docker missing\033[0m — required to provision the disposable datastores\n'; exit 1; }
 	@bash scripts/test-integration.sh

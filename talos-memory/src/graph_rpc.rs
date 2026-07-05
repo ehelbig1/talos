@@ -58,6 +58,14 @@ pub struct GraphSearchRequest {
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: Vec<u8>,
+    /// RFC 0010 P2 inc.3 — signer identity (empty under HMAC, worker id under
+    /// Ed25519). See `MemoryRpcRequest::worker_id`.
+    #[serde(default)]
+    pub worker_id: String,
+    /// Unsigned scheme hint: 0 = HMAC, 1 = Ed25519. See
+    /// `MemoryRpcRequest::crypto_scheme`.
+    #[serde(default)]
+    pub crypto_scheme: u8,
 }
 
 /// Variant tag byte. Single-byte discriminant for the only operation
@@ -127,7 +135,8 @@ impl GraphSearchRequest {
         let timestamp_ms = rpc_auth::now_ms();
         let nonce = rpc_auth::random_nonce();
         let body_bytes = sign_body_bytes(&query, max_depth, limit, timestamp_ms);
-        let signature = rpc_auth::sign(SUBJECT_NAME, actor_id, &nonce, &body_bytes)?;
+        let (signature, worker_id, crypto_scheme) =
+            rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body_bytes)?;
         Some(Self {
             actor_id,
             query,
@@ -136,6 +145,8 @@ impl GraphSearchRequest {
             timestamp_ms,
             nonce,
             signature,
+            worker_id,
+            crypto_scheme,
         })
     }
 
@@ -152,12 +163,14 @@ impl GraphSearchRequest {
         }
         let body_bytes =
             sign_body_bytes(&self.query, self.max_depth, self.limit, self.timestamp_ms);
-        rpc_auth::verify(
+        rpc_auth::verify_rpc(
             SUBJECT_NAME,
             self.actor_id,
             &self.nonce,
             &body_bytes,
+            &self.worker_id,
             &self.signature,
+            self.crypto_scheme,
         )
     }
 }

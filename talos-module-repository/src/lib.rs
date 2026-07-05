@@ -111,6 +111,24 @@ pub struct ModuleListItem {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Full module detail row for the GraphQL `wasm_modules` / `my_modules`
+/// resolvers. Nullable storage columns are COALESCEd in the query so the
+/// non-null fields deserialize for catalog-only rows (Phase 5 unified
+/// `modules` table).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ModuleDetailsRow {
+    pub id: Uuid,
+    pub name: String,
+    pub size_bytes: i32,
+    pub content_hash: String,
+    pub compiled_at: chrono::DateTime<chrono::Utc>,
+    pub config: Option<serde_json::Value>,
+    pub source_code: Option<String>,
+    pub capability_world: Option<String>,
+    pub imported_interfaces: Option<Vec<String>>,
+    pub language: Option<String>,
+}
+
 /// Discriminator for `get_module_capability_world` — wasm_modules vs node_templates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleSource {
@@ -211,22 +229,22 @@ pub struct TemplateAlternativeRow {
     pub same_category: Option<bool>,
 }
 
-fn template_alternative_row_from_pg(row: sqlx::postgres::PgRow) -> TemplateAlternativeRow {
-    TemplateAlternativeRow {
-        id: row.try_get("id").unwrap_or_default(),
-        name: row.try_get("name").unwrap_or_default(),
-        category: row.try_get("category").unwrap_or_default(),
-        description: row
-            .try_get::<Option<String>, _>("description")
-            .unwrap_or(None),
-        allowed_secrets: row.try_get("allowed_secrets").unwrap_or_default(),
+fn template_alternative_row_from_pg(row: sqlx::postgres::PgRow) -> Result<TemplateAlternativeRow> {
+    Ok(TemplateAlternativeRow {
+        id: row.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+        name: row.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+        category: row.try_get::<Option<_>, _>("category")?.unwrap_or_default(),
+        description: row.try_get::<Option<String>, _>("description")?,
+        allowed_secrets: row
+            .try_get::<Option<_>, _>("allowed_secrets")?
+            .unwrap_or_default(),
         config_schema: row
-            .try_get("config_schema")
+            .try_get::<Option<serde_json::Value>, _>("config_schema")?
             .unwrap_or(serde_json::Value::Null),
         // similarity() returns PostgreSQL real (f32); cast to f64. Missing column → None.
         score: row.try_get::<f32, _>("score").ok().map(|s| s as f64),
         same_category: row.try_get("same_category").ok(),
-    }
+    })
 }
 
 /// Snapshot used by `hot_update_module` to resolve a module's current state
@@ -528,21 +546,20 @@ impl ModuleRepository {
         .await?;
 
         if let Some(row) = row_opt {
-            let wm_id: Uuid = row.try_get("id").unwrap_or(module_id);
-            let name: String = row.try_get("name").unwrap_or_default();
-            let source: Option<String> = row.try_get("source_code").unwrap_or(None);
+            let wm_id: Uuid = row.try_get::<Option<_>, _>("id")?.unwrap_or(module_id);
+            let name: String = row.try_get::<Option<_>, _>("name")?.unwrap_or_default();
+            let source: Option<String> = row.try_get::<Option<String>, _>("source_code")?;
             let config: serde_json::Value = row
                 .try_get::<Option<serde_json::Value>, _>("config")
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| serde_json::json!({}));
-            let old_hash: Option<String> = row.try_get("content_hash").unwrap_or(None);
+            let old_hash: Option<String> = row.try_get::<Option<String>, _>("content_hash")?;
             let world: String = row
-                .try_get::<Option<String>, _>("capability_world")
-                .unwrap_or(None)
+                .try_get::<Option<String>, _>("capability_world")?
                 .map(normalise_capability_world)
                 .unwrap_or_else(|| "automation-node".to_string());
-            let wasm_bytes: Option<Vec<u8>> = row.try_get("wasm_bytes").unwrap_or(None);
+            let wasm_bytes: Option<Vec<u8>> = row.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?;
             let is_sandbox_only = wasm_bytes.as_ref().map(|b| b.is_empty()).unwrap_or(true);
             // max_fuel is NOT NULL on the modules table, but use try_get → Option
             // to stay defensive against schema drift / older mirrored rows.
@@ -667,17 +684,18 @@ impl ModuleRepository {
         .bind(pattern)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.try_get("id").unwrap_or_default(),
-                    r.try_get("name").unwrap_or_default(),
-                    r.try_get("compiled_at")
-                        .unwrap_or_else(|_| chrono::Utc::now()),
-                )
-            })
-            .collect())
+        rows.iter()
+            .map(
+                |r| -> Result<(Uuid, String, chrono::DateTime<chrono::Utc>)> {
+                    Ok((
+                        r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                        r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                        r.try_get::<Option<_>, _>("compiled_at")?
+                            .unwrap_or_else(chrono::Utc::now),
+                    ))
+                },
+            )
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Phase 3.2: queries the unified modules table directly. The
@@ -714,6 +732,106 @@ impl ModuleRepository {
                 updated_at: r.get("updated_at"),
             })
             .collect())
+    }
+
+    /// Batch-fetch full module details by id, scoped to modules the user
+    /// owns directly or through org membership. Backs the GraphQL
+    /// `wasm_modules` resolver (bare-pool read — the `modules` table is
+    /// not RLS-scoped through this path; scoping is the explicit
+    /// `(user_id, org_ids)` predicate).
+    pub async fn get_modules_by_ids_scoped(
+        &self,
+        ids: &[Uuid],
+        user_id: Uuid,
+        org_ids: &[Uuid],
+    ) -> Result<Vec<ModuleDetailsRow>> {
+        let rows = sqlx::query_as::<_, ModuleDetailsRow>(
+            "SELECT id, name,
+                    COALESCE(size_bytes, 0) AS size_bytes,
+                    COALESCE(content_hash, '') AS content_hash,
+                    COALESCE(compiled_at, created_at) AS compiled_at,
+                    config, source_code, capability_world, imported_interfaces, language
+             FROM modules
+             WHERE id = ANY($1)
+               AND (user_id = $2 OR org_id = ANY($3))",
+        )
+        .bind(ids)
+        .bind(user_id)
+        .bind(org_ids)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Unscoped batch fetch of full module details by id. Backs the GraphQL
+    /// `ModuleLoader` DataLoader, which is only invoked via ComplexObject
+    /// resolvers (e.g. WebhookTrigger.module) where the parent entity has
+    /// already been scoped to the authenticated user; modules may also be
+    /// referenced across users via `workflow_module_refs`, so deliberately
+    /// NO user_id filter here. Do not call from a surface that hasn't
+    /// pre-scoped the ids.
+    pub async fn get_modules_by_ids(&self, ids: &[Uuid]) -> Result<Vec<ModuleDetailsRow>> {
+        let rows = sqlx::query_as::<_, ModuleDetailsRow>(
+            "SELECT id, name,
+                    COALESCE(size_bytes, 0) AS size_bytes,
+                    COALESCE(content_hash, '') AS content_hash,
+                    COALESCE(compiled_at, created_at) AS compiled_at,
+                    config, source_code, capability_world, imported_interfaces, language
+             FROM modules
+             WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated full-detail listing of the modules a user owns directly
+    /// or through org membership. Backs the GraphQL `my_modules` resolver.
+    /// Catalog rows (NULL user_id, NULL org_id) are excluded by the scope
+    /// predicate. Unique `id DESC` tiebreaker keeps OFFSET pages stable.
+    pub async fn list_modules_for_user_paginated(
+        &self,
+        user_id: Uuid,
+        org_ids: &[Uuid],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ModuleDetailsRow>> {
+        let rows = sqlx::query_as::<_, ModuleDetailsRow>(
+            "SELECT id, name,
+                    COALESCE(size_bytes, 0) AS size_bytes,
+                    COALESCE(content_hash, '') AS content_hash,
+                    COALESCE(compiled_at, created_at) AS compiled_at,
+                    config, source_code, capability_world, imported_interfaces, language
+             FROM modules
+             WHERE (user_id = $1 OR org_id = ANY($4))
+             ORDER BY COALESCE(compiled_at, created_at) DESC, id DESC
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .bind(org_ids)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Overwrite a module's `config` JSON by canonical id (Phase 5.1:
+    /// unified `modules` table). Caller is responsible for authorization —
+    /// used by the GraphQL `create_module_from_template` auto-setup path to
+    /// persist created watch-channel ids onto a module it just created.
+    pub async fn update_module_config(
+        &self,
+        module_id: Uuid,
+        config: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query("UPDATE modules SET config = $1 WHERE id = $2")
+            .bind(config)
+            .bind(module_id)
+            .execute(&self.db_pool)
+            .await?;
+        Ok(())
     }
 
     // ── MCP-handler support: listing + info + scanning ─────────────────────
@@ -808,20 +926,34 @@ impl ModuleRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| WasmModuleInfo {
-            wm_id: r.try_get("id").unwrap_or(module_or_template_id),
-            name: r.try_get("name").unwrap_or_default(),
-            capability_world: r
-                .try_get("capability_world")
-                .unwrap_or_else(|_| "unknown".to_string()),
-            compiled_at: r.try_get("compiled_at").unwrap_or(None),
-            template_id: Some(r.try_get("id").unwrap_or(module_or_template_id)),
-            allowed_hosts: r.try_get("allowed_hosts").unwrap_or_default(),
-            allowed_secrets: r.try_get("allowed_secrets").unwrap_or_default(),
-            size_bytes: r.try_get("size_bytes").unwrap_or(0),
-            has_source_code: r.try_get("has_source_code").unwrap_or(false),
-            rate_limit_per_minute: r.try_get("rate_limit_per_minute").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<WasmModuleInfo> {
+            Ok(WasmModuleInfo {
+                wm_id: r
+                    .try_get::<Option<_>, _>("id")?
+                    .unwrap_or(module_or_template_id),
+                name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                capability_world: r
+                    .try_get::<Option<_>, _>("capability_world")?
+                    .unwrap_or_else(|| "unknown".to_string()),
+                compiled_at: r.try_get::<Option<_>, _>("compiled_at")?,
+                template_id: Some(
+                    r.try_get::<Option<_>, _>("id")?
+                        .unwrap_or(module_or_template_id),
+                ),
+                allowed_hosts: r
+                    .try_get::<Option<_>, _>("allowed_hosts")?
+                    .unwrap_or_default(),
+                allowed_secrets: r
+                    .try_get::<Option<_>, _>("allowed_secrets")?
+                    .unwrap_or_default(),
+                size_bytes: r.try_get::<Option<_>, _>("size_bytes")?.unwrap_or(0),
+                has_source_code: r
+                    .try_get::<Option<_>, _>("has_source_code")?
+                    .unwrap_or(false),
+                rate_limit_per_minute: r.try_get::<Option<_>, _>("rate_limit_per_minute")?,
+            })
+        })
+        .transpose()
     }
 
     // Removed: the unscoped `get_node_template_info(template_id)` — it had
@@ -874,21 +1006,32 @@ impl ModuleRepository {
     fn row_to_template_info(
         row: Option<sqlx::postgres::PgRow>,
     ) -> Result<Option<NodeTemplateInfo>> {
-        Ok(row.map(|r| NodeTemplateInfo {
-            name: r.try_get("name").unwrap_or_default(),
-            // Map kind → category for back-compat with the old
-            // get_node_template_info contract. `kind=catalog` was
-            // historically `category=<the actual category column>`,
-            // but most consumers just want a label, and kind is the
-            // post-Phase-3.2 source-of-truth.
-            category: r.try_get("kind").unwrap_or_else(|_| "template".to_string()),
-            capability_world: r.try_get("capability_world").unwrap_or(None),
-            size_bytes: r.try_get("size_bytes").unwrap_or(0),
-            has_source_code: r.try_get("has_source_code").unwrap_or(false),
-            allowed_hosts: r.try_get("allowed_hosts").unwrap_or_default(),
-            allowed_secrets: r.try_get("allowed_secrets").unwrap_or_default(),
-            created_at: r.try_get("created_at").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<NodeTemplateInfo> {
+            Ok(NodeTemplateInfo {
+                name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                // Map kind → category for back-compat with the old
+                // get_node_template_info contract. `kind=catalog` was
+                // historically `category=<the actual category column>`,
+                // but most consumers just want a label, and kind is the
+                // post-Phase-3.2 source-of-truth.
+                category: r
+                    .try_get::<Option<_>, _>("kind")?
+                    .unwrap_or_else(|| "template".to_string()),
+                capability_world: r.try_get::<Option<_>, _>("capability_world")?,
+                size_bytes: r.try_get::<Option<_>, _>("size_bytes")?.unwrap_or(0),
+                has_source_code: r
+                    .try_get::<Option<_>, _>("has_source_code")?
+                    .unwrap_or(false),
+                allowed_hosts: r
+                    .try_get::<Option<_>, _>("allowed_hosts")?
+                    .unwrap_or_default(),
+                allowed_secrets: r
+                    .try_get::<Option<_>, _>("allowed_secrets")?
+                    .unwrap_or_default(),
+                created_at: r.try_get::<Option<_>, _>("created_at")?,
+            })
+        })
+        .transpose()
     }
 
     /// Find non-archived workflows that reference a module id by substring
@@ -912,13 +1055,14 @@ impl ModuleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowRef {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<WorkflowRef> {
+                Ok(WorkflowRef {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Find sub-workflows: workflows that reference one of the given
@@ -943,13 +1087,14 @@ impl ModuleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowRef {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<WorkflowRef> {
+                Ok(WorkflowRef {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Batch sibling to [`find_workflows_referencing_workflow`]. Single
@@ -994,16 +1139,16 @@ impl ModuleRepository {
         .bind(limit_per_target)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.try_get::<Uuid, _>("target_id").unwrap_or_default(),
-                    r.try_get::<Uuid, _>("id").unwrap_or_default(),
-                    r.try_get::<String, _>("name").unwrap_or_default(),
-                )
+        rows.iter()
+            .map(|r| -> Result<(Uuid, Uuid, String)> {
+                Ok((
+                    r.try_get::<Option<Uuid>, _>("target_id")?
+                        .unwrap_or_default(),
+                    r.try_get::<Option<Uuid>, _>("id")?.unwrap_or_default(),
+                    r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+                ))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Find user-owned modules that haven't been referenced by any
@@ -1030,14 +1175,17 @@ impl ModuleRepository {
         .bind(days)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| UnreferencedModule {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
-                compiled_at: r.try_get("compiled_at").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<UnreferencedModule> {
+                Ok(UnreferencedModule {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    compiled_at: r
+                        .try_get::<Option<_>, _>("compiled_at")?
+                        .unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// List the update history rows for a module.
@@ -1056,16 +1204,17 @@ impl ModuleRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ModuleHistoryRow {
-                id: r.try_get("id").unwrap_or_default(),
-                previous_hash: r.try_get("previous_hash").unwrap_or(None),
-                new_hash: r.try_get("new_hash").unwrap_or_default(),
-                size_bytes: r.try_get("size_bytes").unwrap_or(0),
-                created_at: r.try_get("created_at").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<ModuleHistoryRow> {
+                Ok(ModuleHistoryRow {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    previous_hash: r.try_get::<Option<String>, _>("previous_hash")?,
+                    new_hash: r.try_get::<Option<_>, _>("new_hash")?.unwrap_or_default(),
+                    size_bytes: r.try_get::<Option<_>, _>("size_bytes")?.unwrap_or(0),
+                    created_at: r.try_get::<Option<_>, _>("created_at")?.unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Lookup just the capability_world of a module. Phase 5.1: reads from
@@ -1089,15 +1238,20 @@ impl ModuleRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| {
-            let kind: String = r.try_get("kind").unwrap_or_default();
+        row.map(|r| -> Result<(String, ModuleSource)> {
+            let kind: String = r.try_get::<Option<_>, _>("kind")?.unwrap_or_default();
             let source = if kind == "catalog" {
                 ModuleSource::Template
             } else {
                 ModuleSource::Compiled
             };
-            (r.try_get("capability_world").unwrap_or_default(), source)
-        }))
+            Ok((
+                r.try_get::<Option<_>, _>("capability_world")?
+                    .unwrap_or_default(),
+                source,
+            ))
+        })
+        .transpose()
     }
 
     // ── Batch-delete + rate-limit + org helpers ────────────────────────────
@@ -1146,15 +1300,22 @@ impl ModuleRepository {
         .bind(module_ids)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let id: Uuid = r.try_get("id").ok()?;
-                let source: String = r.try_get("source").ok()?;
-                let owner: Option<Uuid> = r.try_get("user_id").unwrap_or(None);
-                Some((id, source, owner))
-            })
-            .collect())
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            // id/source are NOT NULL projections; skip a malformed row rather
+            // than abort the batch (preserves the prior filter_map behaviour).
+            let Some(id) = r.try_get::<Uuid, _>("id").ok() else {
+                continue;
+            };
+            let Some(source) = r.try_get::<String, _>("source").ok() else {
+                continue;
+            };
+            // user_id is nullable (catalog rows) — Option decode maps NULL → None,
+            // but a missing column fails loud instead of silently defaulting.
+            let owner: Option<Uuid> = r.try_get::<Option<_>, _>("user_id")?;
+            out.push((id, source, owner));
+        }
+        Ok(out)
     }
 
     /// Find webhook_triggers rows that reference any of the given module ids
@@ -1246,7 +1407,10 @@ impl ModuleRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.and_then(|r| r.try_get("rate_limit_per_minute").unwrap_or(None)))
+        Ok(row
+            .map(|r| r.try_get::<Option<i32>, _>("rate_limit_per_minute"))
+            .transpose()?
+            .flatten())
     }
 
     /// Org-membership check.
@@ -1273,16 +1437,19 @@ impl ModuleRepository {
         .bind(org_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| OrgModuleRow {
-                id: r.get("id"),
-                name: r.try_get("name").unwrap_or_else(|_| "unknown".to_string()),
-                capability_world: r
-                    .try_get("capability_world")
-                    .unwrap_or_else(|_| "unknown".to_string()),
+        rows.iter()
+            .map(|r| -> Result<OrgModuleRow> {
+                Ok(OrgModuleRow {
+                    id: r.get("id"),
+                    name: r
+                        .try_get::<Option<_>, _>("name")?
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    capability_world: r
+                        .try_get::<Option<_>, _>("capability_world")?
+                        .unwrap_or_else(|| "unknown".to_string()),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // ── install_module_from_catalog support ────────────────────────────────
@@ -1341,13 +1508,16 @@ impl ModuleRepository {
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(rows
-            .iter()
-            .map(|r| PinnedModuleStatus {
-                module_name: r.try_get("module_name").unwrap_or_default(),
-                has_wasm: r.try_get("has_wasm").unwrap_or(false),
+        rows.iter()
+            .map(|r| -> Result<PinnedModuleStatus> {
+                Ok(PinnedModuleStatus {
+                    module_name: r
+                        .try_get::<Option<_>, _>("module_name")?
+                        .unwrap_or_default(),
+                    has_wasm: r.try_get::<Option<_>, _>("has_wasm")?.unwrap_or(false),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Phase 5: update a module's precompiled wasm bytes by name (modules
@@ -1389,7 +1559,7 @@ impl ModuleRepository {
         .bind(name)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(template_alternative_row_from_pg))
+        row.map(template_alternative_row_from_pg).transpose()
     }
 
     /// pg_trgm-based search for similar templates. Returns score + same_category
@@ -1424,10 +1594,9 @@ impl ModuleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(template_alternative_row_from_pg)
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fallback for `find_template_alternatives_trgm` when pg_trgm is unavailable —
@@ -1452,10 +1621,9 @@ impl ModuleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(template_alternative_row_from_pg)
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// pg_trgm + ILIKE hybrid search by capability keyword.
@@ -1487,10 +1655,9 @@ impl ModuleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(template_alternative_row_from_pg)
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// ILIKE-only fallback for capability search when pg_trgm is unavailable.
@@ -1512,10 +1679,9 @@ impl ModuleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(template_alternative_row_from_pg)
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // ── workflows.rs MCP-handler support ───────────────────────────────────

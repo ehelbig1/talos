@@ -52,6 +52,7 @@ Four-digit, zero-padded, allocated in order. Never reused.
 | [0006](0006-org-scoped-write-isolation-pins-org-not-user.md) | Org-scoped write isolation pins `org_id`, not `user_id` | In progress | Decided (enterprise): `secrets` gets a per-user owner pin (Option B, implemented); `workflows`/`actors` stay org-pinned only. Latent until RLS enforcement is on + secret writes wired to `begin_org_scoped` |
 | [0007](0007-native-github-integration.md) | Native GitHub integration | Phase A complete | Server-side event-type filtering shipped: `event_filter` on `webhook_triggers` (create+validate+read-back across GraphQL & MCP) + `__webhook__` event metadata to the trigger input. Phase B → RFC 0008 |
 | [0008](0008-github-app-authentication.md) | GitHub App authentication | Draft | Phase B of native GitHub. Replace long-lived PATs with a GitHub App: 1-hour auto-rotating installation tokens minted from an RS256 App JWT (NOT the OAuth refresh path → needs its own renewal arm), App-level webhook delivery, click-to-connect, PAT fallback during migration |
+| [0010](0010-asymmetric-worker-trust-boundary.md) | Asymmetric worker-trust boundary | In progress | The genuine fix for the single fleet-wide `WORKER_SHARED_KEY` (review finding #1, where per-worker HMAC proved to be theater). **P1 landed (opt-in):** Ed25519 controller→worker dispatch + dual-verify + `crypto_scheme` rollout. Remaining: per-worker keypairs for worker→controller (P2), envelope sealing (P3), enforcement flip (P4) |
 
 ## Template for new RFCs
 

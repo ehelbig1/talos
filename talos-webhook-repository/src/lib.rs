@@ -275,16 +275,20 @@ impl WebhookRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| WebhookSecurityStat {
-                trigger_id: r.get("trigger_id"),
-                trigger_name: r.try_get("trigger_name").ok().flatten(),
-                auth_failures: r.try_get("auth_failures").unwrap_or(0),
-                rate_limit_hits: r.try_get("rate_limit_hits").unwrap_or(0),
-                successes: r.try_get("successes").unwrap_or(0),
+        rows.iter()
+            .map(|r| -> Result<WebhookSecurityStat> {
+                Ok(WebhookSecurityStat {
+                    trigger_id: r.get("trigger_id"),
+                    trigger_name: r.try_get("trigger_name").ok().flatten(),
+                    // RFC check-52: fail loud on schema drift (read as Option so a
+                    // genuinely-NULL count still yields 0, but a renamed/retyped
+                    // column errors instead of silently reporting 0).
+                    auth_failures: r.try_get::<Option<_>, _>("auth_failures")?.unwrap_or(0),
+                    rate_limit_hits: r.try_get::<Option<_>, _>("rate_limit_hits")?.unwrap_or(0),
+                    successes: r.try_get::<Option<_>, _>("successes")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 }
 

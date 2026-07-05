@@ -1774,6 +1774,41 @@ impl ParallelWorkflowEngine {
         .await
     }
 
+    /// RFC 0010 P3 (D3b): `&self` sibling of [`build_encrypted_secrets`] that
+    /// returns [`DispatchSecrets`] — inline WSK envelope OR the plaintext map for
+    /// claim-based sealing, per `TALOS_ENVELOPE_SEALING`. Used by the loop-node
+    /// path so loop bodies seal exactly like single-node dispatches (and thus
+    /// don't fail the worker downgrade guard under `required`). Resolve once and
+    /// clone per iteration (`DispatchSecrets: Clone`).
+    pub(crate) async fn build_dispatch_secrets(
+        &self,
+        node_id: Uuid,
+        execution_id: Uuid,
+        worker_shared_key: &Option<talos_workflow_engine_core::WorkerSharedKey>,
+    ) -> crate::secrets_pipeline::DispatchSecrets {
+        let (Some(resolver), Some(key)) = (self.secrets_resolver.as_ref(), worker_shared_key)
+        else {
+            return crate::secrets_pipeline::DispatchSecrets::default();
+        };
+        let vault_paths = self
+            .node_configs
+            .get(&node_id)
+            .map(|cfg| extract_vault_paths(cfg))
+            .unwrap_or_default();
+        crate::secrets_pipeline::build_dispatch_secrets_for(
+            resolver.as_ref(),
+            self.secret_envelope.as_ref(),
+            node_id,
+            self.user_id,
+            &vault_paths,
+            &[],
+            key.as_bytes(),
+            self.max_llm_tier,
+            execution_id.as_bytes(),
+        )
+        .await
+    }
+
     /// Collect all statically-known sub-workflow IDs from `node_meta` and batch-fetch
     /// their `graph_json` in a single query. Populates `self.sub_workflow_cache`.
     ///

@@ -188,20 +188,23 @@ impl WorkflowRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| {
+        rows.into_iter()
+            .map(|r| -> Result<NodeTemplateRow> {
                 let id: Uuid = r.get("id");
-                NodeTemplateRow {
+                Ok(NodeTemplateRow {
                     id,
                     name: r.get("name"),
-                    config_schema: r.try_get("config_schema").unwrap_or(serde_json::json!({})),
+                    config_schema: r
+                        .try_get::<Option<_>, _>("config_schema")?
+                        .unwrap_or(serde_json::json!({})),
                     allowed_secrets: decode_allowed_secrets_row(&r, Some(id)),
-                    allowed_hosts: r.try_get("allowed_hosts").unwrap_or_default(),
-                    max_retries: r.try_get("max_retries").unwrap_or(0),
-                }
+                    allowed_hosts: r
+                        .try_get::<Option<_>, _>("allowed_hosts")?
+                        .unwrap_or_default(),
+                    max_retries: r.try_get::<Option<_>, _>("max_retries")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Find a module by display name (case-insensitive) — for swap_node_module.
@@ -230,18 +233,21 @@ impl WorkflowRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| {
+        row.map(|r| -> Result<NodeTemplateRow> {
             let id: Uuid = r.get("id");
-            NodeTemplateRow {
+            Ok(NodeTemplateRow {
                 id,
                 name: r.get("name"),
-                config_schema: r.try_get("config_schema").unwrap_or(serde_json::json!({})),
+                config_schema: r
+                    .try_get::<Option<_>, _>("config_schema")?
+                    .unwrap_or(serde_json::json!({})),
                 allowed_secrets: decode_allowed_secrets_row(&r, Some(id)),
                 // Not selected on this path (swap_node_module doesn't need egress hosts).
                 allowed_hosts: Vec::new(),
-                max_retries: r.try_get("max_retries").unwrap_or(0),
-            }
-        }))
+                max_retries: r.try_get::<Option<_>, _>("max_retries")?.unwrap_or(0),
+            })
+        })
+        .transpose()
     }
 
     /// Find a node template by name for a specific user (used by inline compilation).
@@ -287,12 +293,21 @@ impl WorkflowRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| ModulePermissions {
-            allowed_hosts: r.try_get("allowed_hosts").unwrap_or_default(),
-            allowed_secrets: decode_allowed_secrets_row(&r, Some(module_id)),
-            allowed_methods: r.try_get("allowed_methods").unwrap_or_default(),
-            capability_world: r.try_get("capability_world").unwrap_or_default(),
-        }))
+        row.map(|r| -> Result<ModulePermissions> {
+            Ok(ModulePermissions {
+                allowed_hosts: r
+                    .try_get::<Option<_>, _>("allowed_hosts")?
+                    .unwrap_or_default(),
+                allowed_secrets: decode_allowed_secrets_row(&r, Some(module_id)),
+                allowed_methods: r
+                    .try_get::<Option<_>, _>("allowed_methods")?
+                    .unwrap_or_default(),
+                capability_world: r
+                    .try_get::<Option<_>, _>("capability_world")?
+                    .unwrap_or_default(),
+            })
+        })
+        .transpose()
     }
 
     /// Update an existing module's WASM + metadata (inline compilation retry path).
@@ -508,7 +523,7 @@ impl WorkflowRepository {
         let mut out: Vec<ModuleExportInfo> = Vec::new();
         for r in &rows {
             let id: Uuid = r.get("input_id");
-            let is_compiled: bool = r.try_get("is_compiled").unwrap_or(false);
+            let is_compiled: bool = r.try_get::<Option<_>, _>("is_compiled")?.unwrap_or(false);
             let name: String = r.get("name");
             let capability_world: Option<String> = r.try_get("capability_world").ok();
             let category_persisted: Option<String> = r.try_get("category").ok();
@@ -642,14 +657,16 @@ impl WorkflowRepository {
 
         let result = rows
             .iter()
-            .map(|r| ScaffoldingTemplateRow {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
-                category: r.try_get("category").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or(None),
-                is_compiled: r.try_get("is_compiled").unwrap_or(false),
+            .map(|r| -> Result<ScaffoldingTemplateRow> {
+                Ok(ScaffoldingTemplateRow {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    category: r.try_get::<Option<_>, _>("category")?.unwrap_or_default(),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    is_compiled: r.try_get::<Option<_>, _>("is_compiled")?.unwrap_or(false),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(result)
     }
 

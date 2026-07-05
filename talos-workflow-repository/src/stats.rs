@@ -40,11 +40,11 @@ impl WorkflowRepository {
         .await?;
 
         Ok(WorkflowExecStats {
-            total: row.try_get("total").unwrap_or(0),
-            succeeded: row.try_get("succeeded").unwrap_or(0),
-            failed: row.try_get("failed").unwrap_or(0),
-            running: row.try_get("running").unwrap_or(0),
-            avg_duration_secs: row.try_get("avg_duration_secs").unwrap_or(None),
+            total: row.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+            succeeded: row.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
+            failed: row.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
+            running: row.try_get::<Option<_>, _>("running")?.unwrap_or(0),
+            avg_duration_secs: row.try_get::<Option<_>, _>("avg_duration_secs")?,
         })
     }
 
@@ -88,20 +88,21 @@ impl WorkflowRepository {
         .bind(days)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let id: Uuid = row.try_get("workflow_id").unwrap_or_default();
+        rows.into_iter()
+            .map(|row| -> Result<(Uuid, WorkflowExecStats)> {
+                let id: Uuid = row
+                    .try_get::<Option<_>, _>("workflow_id")?
+                    .unwrap_or_default();
                 let stats = WorkflowExecStats {
-                    total: row.try_get("total").unwrap_or(0),
-                    succeeded: row.try_get("succeeded").unwrap_or(0),
-                    failed: row.try_get("failed").unwrap_or(0),
-                    running: row.try_get("running").unwrap_or(0),
-                    avg_duration_secs: row.try_get("avg_duration_secs").unwrap_or(None),
+                    total: row.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+                    succeeded: row.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
+                    failed: row.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
+                    running: row.try_get::<Option<_>, _>("running")?.unwrap_or(0),
+                    avg_duration_secs: row.try_get::<Option<_>, _>("avg_duration_secs")?,
                 };
-                (id, stats)
+                Ok((id, stats))
             })
-            .collect())
+            .collect()
     }
 
     /// Count active schedules for a workflow.
@@ -177,11 +178,11 @@ impl WorkflowRepository {
         .fetch_one(&self.db_pool)
         .await?;
         Ok(WorkflowHealthStats {
-            total: row.try_get("total").unwrap_or(0),
-            succeeded: row.try_get("succeeded").unwrap_or(0),
-            failed: row.try_get("failed").unwrap_or(0),
-            last_success_at: row.try_get("last_success_at").unwrap_or(None),
-            last_failure_at: row.try_get("last_failure_at").unwrap_or(None),
+            total: row.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+            succeeded: row.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
+            failed: row.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
+            last_success_at: row.try_get::<Option<_>, _>("last_success_at")?,
+            last_failure_at: row.try_get::<Option<_>, _>("last_failure_at")?,
         })
     }
 
@@ -219,11 +220,11 @@ impl WorkflowRepository {
         .fetch_one(&self.db_pool)
         .await?;
         Ok(WorkflowHealthStats {
-            total: row.try_get("total").unwrap_or(0),
-            succeeded: row.try_get("succeeded").unwrap_or(0),
-            failed: row.try_get("failed").unwrap_or(0),
-            last_success_at: row.try_get("last_success_at").unwrap_or(None),
-            last_failure_at: row.try_get("last_failure_at").unwrap_or(None),
+            total: row.try_get::<Option<_>, _>("total")?.unwrap_or(0),
+            succeeded: row.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
+            failed: row.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
+            last_success_at: row.try_get::<Option<_>, _>("last_success_at")?,
+            last_failure_at: row.try_get::<Option<_>, _>("last_failure_at")?,
         })
     }
 
@@ -298,8 +299,8 @@ impl WorkflowRepository {
             failed: row.get("failed"),
             cancelled: row.get("cancelled"),
             total: row.get("total"),
-            first_started: row.try_get("first_started").unwrap_or(None),
-            last_completed: row.try_get("last_completed").unwrap_or(None),
+            first_started: row.try_get::<Option<_>, _>("first_started")?,
+            last_completed: row.try_get::<Option<_>, _>("last_completed")?,
         })
     }
 }

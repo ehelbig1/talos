@@ -1114,6 +1114,44 @@ impl ModuleExecutionService {
         Ok(records)
     }
 
+    /// Batched per-execution log fetch for the GraphQL
+    /// `ModuleExecutionLogLoader` DataLoader, capping rows PER execution_id
+    /// via a ROW_NUMBER() window (MCP-1191 — an uncapped `= ANY($1)` fan-out
+    /// let one request pull ~1M rows).
+    ///
+    /// SECURITY: deliberately NOT user-scoped — the DataLoader is only
+    /// invoked from ComplexObject resolvers whose parent `ModuleExecution`
+    /// rows were already fetched through user-scoped queries. Do not call
+    /// from a surface that hasn't pre-scoped the execution ids.
+    pub async fn get_execution_logs_batched(
+        &self,
+        execution_ids: &[Uuid],
+        per_execution_cap: i32,
+    ) -> Result<Vec<ModuleExecutionLog>> {
+        let records = sqlx::query_as::<_, ModuleExecutionLog>(
+            r#"
+            SELECT id, execution_id, level, message, metadata, created_at
+            FROM (
+                SELECT id, execution_id, level, message, metadata, created_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY execution_id ORDER BY created_at ASC
+                       ) AS rn
+                FROM module_execution_logs
+                WHERE execution_id = ANY($1)
+            ) numbered
+            WHERE rn <= $2
+            ORDER BY execution_id, created_at ASC
+            "#,
+        )
+        .bind(execution_ids)
+        .bind(per_execution_cap)
+        .fetch_all(&self.db_pool)
+        .await
+        .context("Failed to batch-fetch execution logs")?;
+
+        Ok(records)
+    }
+
     // ==================== Best-Effort Helper Methods ====================
     // These methods log errors instead of propagating them, useful for
     // non-critical operations that shouldn't block execution

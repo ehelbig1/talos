@@ -18,7 +18,31 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// RFC 0010 P3 (D3b) — per-execution ephemeral secret-envelope sealing.
+pub mod envelope_seal;
+pub use envelope_seal::{
+    seal_secrets, ClaimResponse, SealOutput, SealedSecrets, SecretClaim, WorkerEphemeral,
+};
+
 type HmacSha256 = Hmac<Sha256>;
+
+/// RFC 0010 P3 secret-delivery scheme carried by `JobRequest` /
+/// `PipelineJobRequest`. `0` = legacy inline WSK envelope (today, default);
+/// `1` = claim-based ECIES sealing (D3b). Security-relevant (an attacker must
+/// not downgrade `1`→`0` to force a WSK envelope), so it is bound into the
+/// dispatch signing payload — but ONLY when non-zero, so a scheme-`0` message's
+/// signed bytes stay byte-identical to the pre-P3 wire format.
+pub const SEALING_INLINE_WSK: u8 = 0;
+/// See [`SEALING_INLINE_WSK`]. Claim-based ephemeral ECIES sealing.
+pub const SEALING_CLAIM_ECIES: u8 = 1;
+
+/// `skip_serializing_if` predicate: omit `sealing` from the wire JSON when it is
+/// the legacy default, so a scheme-0 (inline-WSK) message serializes
+/// byte-identically to the pre-P3 format. Signature is fixed by serde (`&T`).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn sealing_is_default(v: &u8) -> bool {
+    *v == SEALING_INLINE_WSK
+}
 
 /// HKDF-SHA256 `info` label for the secret-envelope AES-256-GCM subkey.
 ///
@@ -394,6 +418,399 @@ mod worker_id_validation_tests {
 // rule") is preserved exactly — `verify_core` is the ONLY path that inserts
 // into `JOB_NONCE_CACHE`; `verify_no_replay_core` never touches it.
 
+// ============================================================================
+// RFC 0010 P1 — Ed25519 controller→worker dispatch signature scheme
+// ============================================================================
+//
+// The `WORKER_SHARED_KEY` HMAC path (crypto scheme 0) is symmetric: a worker
+// that can verify a `JobRequest` can also forge one. Because the worker runs
+// untrusted WASM, a sandbox escape recovers the shared key and can mint
+// dispatches for any actor/tenant. Ed25519 (scheme 1) breaks that symmetry: the
+// controller signs with its private key and the worker holds only the *public*
+// key, so a compromised worker can verify dispatches but cannot forge them.
+//
+// Rollout safety (see RFC 0010 P1):
+// - `crypto_scheme` is an unsigned dispatch hint. It is NOT bound into the HMAC
+//   payload, so the scheme-0 `signing_payload()` bytes stay byte-identical to
+//   the pre-P1 wire format — no coordinated restart is needed for the HMAC path.
+// - Downgrade is still prevented: the two schemes sign DIFFERENT bytes (Ed25519
+//   signs `ed25519_signing_input`, which appends a domain tag), and the verifier
+//   dispatches on `crypto_scheme`. Flipping the hint routes the message to the
+//   wrong verify method, where the signature (which the attacker cannot forge
+//   for the other scheme) fails. Turning HMAC acceptance off entirely (P4) is
+//   the flag on the worker's dispatch call, not a payload change.
+
+/// Signature scheme tag carried by `JobRequest` / `PipelineJobRequest`.
+/// Scheme 0 = legacy `WORKER_SHARED_KEY` HMAC-SHA256; scheme 1 = Ed25519.
+pub const CRYPTO_SCHEME_HMAC: u8 = 0;
+/// See [`CRYPTO_SCHEME_HMAC`].
+pub const CRYPTO_SCHEME_ED25519: u8 = 1;
+
+/// Domain-separation suffix appended to the canonical payload before Ed25519
+/// signing/verification. Keeps an Ed25519 dispatch signature from ever being
+/// confused with an HMAC over "the same" message, and versions the scheme so a
+/// future format can bump the tag for a clean re-key.
+const ED25519_DISPATCH_DOMAIN_TAG: &[u8] = b":talos-dispatch-ed25519-v1";
+
+/// Re-exported so the controller (sign) and worker (verify) name the dispatch
+/// key types without pinning the `ed25519-dalek` version in their own manifests.
+pub use ed25519_dalek::{SigningKey as DispatchSigningKey, VerifyingKey as DispatchVerifyingKey};
+
+/// Parse a 32-byte Ed25519 **public** (verifying) key from lowercase/uppercase
+/// hex. Used by the worker to load `TALOS_CONTROLLER_PUBLIC_KEY`. Fails closed on
+/// wrong length or non-canonical encoding.
+pub fn parse_ed25519_verifying_key_hex(hex_str: &str) -> Result<DispatchVerifyingKey, String> {
+    let bytes = hex::decode(hex_str.trim())
+        .map_err(|_| "controller public key: invalid hex".to_string())?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "controller public key: must be 32 bytes".to_string())?;
+    DispatchVerifyingKey::from_bytes(&arr)
+        .map_err(|_| "controller public key: not a valid Ed25519 point".to_string())
+}
+
+/// Parse a 32-byte Ed25519 **public** (verifying) key from raw bytes. Used by the
+/// controller's RFC 0010 P2 inc.4 refresh task to turn a `worker_identities`
+/// `bytea` column into a verifying key before merging it into the dynamic
+/// overlay. Fails closed on a non-canonical point — a bad row is skipped rather
+/// than poisoning the snapshot. Keeps callers off a direct `ed25519-dalek` dep.
+pub fn parse_ed25519_verifying_key_bytes(bytes: &[u8; 32]) -> Result<DispatchVerifyingKey, String> {
+    DispatchVerifyingKey::from_bytes(bytes)
+        .map_err(|_| "worker public key: not a valid Ed25519 point".to_string())
+}
+
+/// Domain-separation prefix for the worker-registration proof-of-possession
+/// message (RFC 0010 P2 inc.4). A version bump invalidates every older proof.
+const WORKER_REGISTRATION_POP_DOMAIN: &[u8] = b"talos/worker-key-registration/v1";
+
+/// Build the canonical proof-of-possession message a worker signs to prove it
+/// holds the private key for `public_key` when self-registering over the network.
+/// Length-prefixed, domain-separated, fixed-little-endian so two distinct field
+/// tuples can never collide onto the same bytes. Pure and deterministic.
+#[must_use]
+pub fn worker_registration_pop_message(
+    worker_id: &str,
+    public_key: &[u8; 32],
+    supports_sealing: bool,
+    issued_at_ms: u64,
+    nonce: &str,
+) -> Vec<u8> {
+    let wid = worker_id.as_bytes();
+    let non = nonce.as_bytes();
+    let mut msg = Vec::with_capacity(
+        WORKER_REGISTRATION_POP_DOMAIN.len() + 8 + wid.len() + 32 + 1 + 8 + 8 + non.len(),
+    );
+    msg.extend_from_slice(WORKER_REGISTRATION_POP_DOMAIN);
+    msg.extend_from_slice(&(wid.len() as u64).to_le_bytes());
+    msg.extend_from_slice(wid);
+    msg.extend_from_slice(public_key);
+    msg.push(u8::from(supports_sealing));
+    msg.extend_from_slice(&issued_at_ms.to_le_bytes());
+    msg.extend_from_slice(&(non.len() as u64).to_le_bytes());
+    msg.extend_from_slice(non);
+    msg
+}
+
+/// Sign a worker-registration proof-of-possession with the worker's Ed25519
+/// signing key; returns the 64-byte signature. Used by the worker's boot-time
+/// self-registration client. The controller checks it with
+/// [`verify_worker_registration_proof`].
+#[must_use]
+pub fn sign_worker_registration_proof(
+    signing_key: &DispatchSigningKey,
+    worker_id: &str,
+    public_key: &[u8; 32],
+    supports_sealing: bool,
+    issued_at_ms: u64,
+    nonce: &str,
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let msg = worker_registration_pop_message(
+        worker_id,
+        public_key,
+        supports_sealing,
+        issued_at_ms,
+        nonce,
+    );
+    signing_key.sign(&msg).to_bytes().to_vec()
+}
+
+/// Verify a worker-registration proof-of-possession: `proof` MUST be a valid
+/// Ed25519 signature by `public_key` over the canonical message for these exact
+/// fields. Proves the registrant holds the private key for the key it registers,
+/// so it cannot register a public key it does not control, nor alter any signed
+/// field without invalidating the proof. Uses `verify_strict` (rejects
+/// small-order keys and signature malleability). Fails closed on a malformed
+/// signature or any field mismatch. Does NOT check freshness or caller
+/// authorization — the endpoint layers a bearer-token gate and a freshness
+/// window on top.
+pub fn verify_worker_registration_proof(
+    public_key: &[u8; 32],
+    worker_id: &str,
+    supports_sealing: bool,
+    issued_at_ms: u64,
+    nonce: &str,
+    proof: &[u8],
+) -> Result<(), String> {
+    let vk = DispatchVerifyingKey::from_bytes(public_key)
+        .map_err(|_| "registration proof: public_key is not a valid Ed25519 point".to_string())?;
+    let sig_bytes: [u8; 64] = proof
+        .try_into()
+        .map_err(|_| "registration proof: signature must be 64 bytes".to_string())?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let msg = worker_registration_pop_message(
+        worker_id,
+        public_key,
+        supports_sealing,
+        issued_at_ms,
+        nonce,
+    );
+    vk.verify_strict(&msg, &sig)
+        .map_err(|_| "registration proof: signature verification failed".to_string())
+}
+
+/// Parse a 32-byte Ed25519 **private** (signing) key seed from hex. Used by the
+/// controller to load its dispatch signing key. The seed is secret — callers
+/// must source it from a Secret / KMS, never a plaintext config committed to
+/// the repo. Fails closed on wrong length.
+pub fn parse_ed25519_signing_key_hex(hex_str: &str) -> Result<DispatchSigningKey, String> {
+    let bytes = hex::decode(hex_str.trim())
+        .map_err(|_| "controller signing key: invalid hex".to_string())?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "controller signing key: must be a 32-byte seed".to_string())?;
+    Ok(DispatchSigningKey::from_bytes(&arr))
+}
+
+/// Generate a fresh Ed25519 keypair for the RFC 0010 worker-trust boundary,
+/// returned as `(signing_seed_hex, verifying_key_hex)` — both 64-char lowercase
+/// hex, in the exact shape [`parse_ed25519_signing_key_hex`] /
+/// [`parse_ed25519_verifying_key_hex`] accept. The seed is SECRET (store it in a
+/// Secret / KMS and hand it to exactly one process); the verifying key is public
+/// and is what the peer configures. Backs the `controller
+/// generate-worker-trust-keypair` operator subcommand — the ONE supported way
+/// to mint keys for `TALOS_{CONTROLLER,WORKER}_SIGNING_KEY` +
+/// `TALOS_{CONTROLLER_PUBLIC_KEY,WORKER_PUBLIC_KEYS}`.
+#[must_use]
+pub fn generate_ed25519_keypair_hex() -> (String, String) {
+    let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+    let vk = sk.verifying_key();
+    (hex::encode(sk.to_bytes()), hex::encode(vk.to_bytes()))
+}
+
+/// The controller's dispatch-signing choice, constructed once at boot from
+/// config and used at every `JobRequest` / `PipelineJobRequest` sign site so the
+/// scheme lives in ONE place. `Hmac` keeps the legacy `WORKER_SHARED_KEY` path;
+/// `Ed25519` signs with the controller's private key (RFC 0010 P1).
+#[derive(Clone)]
+pub enum DispatchSigner {
+    /// Scheme 0 — symmetric HMAC-SHA256 under the pre-shared key.
+    Hmac(std::sync::Arc<Vec<u8>>),
+    /// Scheme 1 — Ed25519 under the controller's private key.
+    Ed25519(std::sync::Arc<DispatchSigningKey>),
+}
+
+// Redacted Debug (lint check 37): never render key material.
+impl std::fmt::Debug for DispatchSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hmac(_) => f.write_str("DispatchSigner::Hmac(<redacted>)"),
+            Self::Ed25519(_) => f.write_str("DispatchSigner::Ed25519(<redacted>)"),
+        }
+    }
+}
+
+impl DispatchSigner {
+    /// The wire `crypto_scheme` this signer stamps.
+    #[must_use]
+    pub fn scheme(&self) -> u8 {
+        match self {
+            Self::Hmac(_) => CRYPTO_SCHEME_HMAC,
+            Self::Ed25519(_) => CRYPTO_SCHEME_ED25519,
+        }
+    }
+
+    /// Sign a `JobRequest` under this signer's scheme (sets nonce + signature +
+    /// `crypto_scheme`).
+    pub fn sign_job(&self, req: &mut JobRequest) -> Result<(), String> {
+        match self {
+            Self::Hmac(k) => req.sign(k),
+            Self::Ed25519(sk) => req.sign_ed25519(sk),
+        }
+    }
+
+    /// Sign a `PipelineJobRequest` under this signer's scheme.
+    pub fn sign_pipeline(&self, req: &mut PipelineJobRequest) -> Result<(), String> {
+        match self {
+            Self::Hmac(k) => req.sign(k),
+            Self::Ed25519(sk) => req.sign_ed25519(sk),
+        }
+    }
+}
+
+/// The process-wide Ed25519 dispatch signer, resolved once from env, or `None`
+/// when Ed25519 dispatch is not configured (the default) — in which case every
+/// sign site keeps its legacy HMAC path. `Some` is returned only when
+/// `TALOS_DISPATCH_SCHEME=ed25519` AND a valid 32-byte-hex-seed
+/// `TALOS_CONTROLLER_SIGNING_KEY` is present. A requested-but-misconfigured
+/// setup logs an error and returns `None` (fall back to HMAC, which the
+/// dual-verify worker still accepts, so a bad key can't strand dispatch during
+/// rollout). Single source of truth for ALL controller sign sites (engine
+/// dispatcher, retry re-sign, module-push paths) so the scheme can't diverge
+/// between them.
+///
+/// Reads env like the sibling `load_worker_key_ring` / `load_worker_shared_key_previous`
+/// helpers; cached in a `OnceLock` so the key is parsed once.
+#[must_use]
+pub fn configured_dispatch_signer() -> Option<DispatchSigner> {
+    static CACHE: std::sync::OnceLock<Option<DispatchSigner>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let scheme = std::env::var("TALOS_DISPATCH_SCHEME").unwrap_or_default();
+            if !scheme.eq_ignore_ascii_case("ed25519") {
+                return None;
+            }
+            let Ok(hex_seed) = std::env::var("TALOS_CONTROLLER_SIGNING_KEY") else {
+                // NB: this crate has no `tracing` dep by design; the controller's
+                // `talos-engine` wrapper logs the same condition loudly at boot.
+                return None;
+            };
+            parse_ed25519_signing_key_hex(&hex_seed)
+                .ok()
+                .map(|sk| DispatchSigner::Ed25519(std::sync::Arc::new(sk)))
+        })
+        .clone()
+}
+
+/// Per-worker Ed25519 **result-verifying** key registry, parsed once from
+/// `TALOS_WORKER_PUBLIC_KEYS` (RFC 0010 P2). Format: comma-separated
+/// `worker_id=hex32` pairs; a `worker_id` MAY repeat to publish several keys
+/// (rotation / blue-green rollout), and every key registered for that id is
+/// tried at verify time. Malformed or empty entries are skipped (that entry
+/// fails closed) rather than poisoning the whole registry — one bad line can't
+/// strand the fleet. An unknown `worker_id` yields an empty slice, so
+/// `verify_dispatch` fails closed because no key matches.
+///
+/// The controller holds only worker *public* keys, so it can verify a
+/// worker-signed result but cannot forge one — the asymmetric half of the
+/// result-path trust boundary, mirroring the worker holding only the
+/// controller's public key on the dispatch path.
+type WorkerKeyMap = std::collections::HashMap<String, Vec<DispatchVerifyingKey>>;
+
+/// The env-parsed base registry (`TALOS_WORKER_PUBLIC_KEYS`), parsed exactly
+/// once. Immutable; the dynamic (DB-backed, RFC 0010 P2 inc.4) overlay is merged
+/// on top of a clone of this by [`set_dynamic_worker_public_keys`].
+fn env_worker_public_key_registry() -> &'static WorkerKeyMap {
+    static ENV: std::sync::OnceLock<WorkerKeyMap> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| {
+        std::env::var("TALOS_WORKER_PUBLIC_KEYS")
+            .map(|raw| parse_worker_public_keys(&raw))
+            .unwrap_or_default()
+    })
+}
+
+/// The live verifying-key snapshot readers hit on the hot `verify_dispatch` path.
+/// Seeded lazily from the env registry — so a worker (which never installs a
+/// dynamic overlay) keeps pure env-only behaviour — and atomically replaced by
+/// the controller's refresh task via [`set_dynamic_worker_public_keys`].
+///
+/// `ArcSwap` gives lock-free O(1) reads on the verify hot path and an atomic
+/// pointer swap on refresh (no reader ever blocks on a writer), the same shape
+/// `rpc_auth` uses for its rotating nonce cache.
+fn worker_public_key_snapshot() -> &'static arc_swap::ArcSwap<WorkerKeyMap> {
+    static SNAP: std::sync::OnceLock<arc_swap::ArcSwap<WorkerKeyMap>> = std::sync::OnceLock::new();
+    SNAP.get_or_init(|| arc_swap::ArcSwap::from_pointee(env_worker_public_key_registry().clone()))
+}
+
+/// **Controller-only.** Replace the dynamic worker-key overlay with `dynamic`,
+/// rebuilding the live snapshot as `union(env static registry, dynamic)` and
+/// atomically swapping it in. Full-replacement (NOT additive): each call rebuilds
+/// from the immutable env base, so a key that was deactivated in the DB and hence
+/// dropped from `dynamic` disappears from the snapshot on the next refresh — the
+/// controller's refresh task passes the complete active DB set every interval.
+///
+/// Env-registered keys always survive (they are the operator-pinned base);
+/// dynamic keys byte-identical to an env key are de-duplicated so a worker whose
+/// key is in both places is not verified against twice. The worker never calls
+/// this, so its behaviour is unchanged. Idempotent and safe to call repeatedly.
+pub fn set_dynamic_worker_public_keys(
+    dynamic: impl IntoIterator<Item = (String, DispatchVerifyingKey)>,
+) {
+    let mut merged = env_worker_public_key_registry().clone();
+    for (worker_id, vk) in dynamic {
+        let slot = merged.entry(worker_id).or_default();
+        if !slot
+            .iter()
+            .any(|existing| existing.to_bytes() == vk.to_bytes())
+        {
+            slot.push(vk);
+        }
+    }
+    worker_public_key_snapshot().store(std::sync::Arc::new(merged));
+}
+
+/// Pure parser for the `TALOS_WORKER_PUBLIC_KEYS` value — extracted from
+/// [`worker_public_key_registry`] so the skip-malformed / repeat-id-for-rotation
+/// behaviour is unit-testable without mutating process env. See that function
+/// for the format and fail-closed semantics.
+fn parse_worker_public_keys(
+    raw: &str,
+) -> std::collections::HashMap<String, Vec<DispatchVerifyingKey>> {
+    let mut map: std::collections::HashMap<String, Vec<DispatchVerifyingKey>> =
+        std::collections::HashMap::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((wid, hexk)) = entry.split_once('=') else {
+            continue;
+        };
+        let wid = wid.trim();
+        if wid.is_empty() {
+            continue;
+        }
+        let Ok(vk) = parse_ed25519_verifying_key_hex(hexk) else {
+            continue;
+        };
+        map.entry(wid.to_string()).or_default().push(vk);
+    }
+    map
+}
+
+/// Ed25519 result-verifying key(s) registered for `worker_id` (possibly several,
+/// for rotation). Reads the live snapshot = `union(env registry, dynamic DB
+/// overlay)`. Empty when the worker is unknown or no key is registered anywhere —
+/// `JobResult::verify_dispatch` then fails closed on an Ed25519-scheme result.
+/// Lock-free; see [`worker_public_key_snapshot`] / [`set_dynamic_worker_public_keys`].
+#[must_use]
+pub fn worker_public_keys(worker_id: &str) -> Vec<DispatchVerifyingKey> {
+    worker_public_key_snapshot()
+        .load()
+        .get(worker_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether the controller still accepts legacy-HMAC-signed job/pipeline results.
+/// Default `true` (accept — the rollout posture while workers migrate to
+/// per-worker Ed25519). `TALOS_RESULT_REQUIRE_ED25519` ∈ {`1`,`true`,`yes`,`on`}
+/// flips it to `false`: the RFC 0010 P4 enforcement flip that refuses HMAC
+/// results once every worker signs Ed25519. Cached; single source of truth for
+/// the `accept_legacy_hmac` argument at every controller result-verify site.
+#[must_use]
+pub fn result_accept_legacy_hmac() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            std::env::var("TALOS_RESULT_REQUIRE_ED25519")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
+}
+
 /// Crate-private core shared by every signed NATS message type.
 ///
 /// Implementors provide the canonical signing payload plus nonce/signature
@@ -442,17 +859,17 @@ trait SignedMessage {
         Ok(())
     }
 
-    /// Shared verify-without-replay-recording core: nonce parse +
-    /// freshness window + constant-time HMAC. **Never touches the replay
-    /// cache** — this is the observer half of the verify-once split.
+    /// Nonce parse + freshness window (past `max_age_secs`, future
+    /// `MAX_FUTURE_SKEW_SECS`). Signature-scheme-independent, so BOTH the HMAC
+    /// and the Ed25519 verify paths build on it — the replay/freshness discipline
+    /// is identical across schemes; only the signature primitive differs.
     /// Returns the parsed nonce timestamp on success.
     ///
     /// Check order is timestamp-parse before hex-validation. (Pre-refactor
     /// `PipelineJobResult` alone checked hex first — accidental drift; the
     /// orders are otherwise equivalent, differing only in WHICH error
     /// string is returned for a nonce malformed in both ways at once.)
-    fn verify_no_replay_core(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
-        // 1. Parse + freshness window check.
+    fn check_freshness_window(&self, max_age_secs: u64) -> Result<u64, String> {
         let parts: Vec<&str> = self.nonce().splitn(2, ':').collect();
         if parts.len() != 2 {
             return Err(format!("malformed {}", Self::NONCE_LABEL));
@@ -483,8 +900,17 @@ trait SignedMessage {
                 MAX_FUTURE_SKEW_SECS
             ));
         }
+        Ok(ts)
+    }
 
-        // 2. Constant-time HMAC verification.
+    /// Shared verify-without-replay-recording core: freshness window +
+    /// constant-time HMAC. **Never touches the replay cache** — this is the
+    /// observer half of the verify-once split. Returns the parsed nonce
+    /// timestamp on success.
+    fn verify_no_replay_core(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
+        let ts = self.check_freshness_window(max_age_secs)?;
+
+        // Constant-time HMAC verification.
         let mut mac =
             <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
         mac.update(&self.payload_bytes());
@@ -492,6 +918,71 @@ trait SignedMessage {
             .map_err(|_| "HMAC signature verification failed".to_string())?;
 
         Ok(ts)
+    }
+
+    /// Canonical bytes signed / verified under the Ed25519 dispatch scheme: the
+    /// type's HMAC `payload_bytes()` plus [`ED25519_DISPATCH_DOMAIN_TAG`]. The
+    /// domain tag means an Ed25519 signature and an HMAC over "the same" message
+    /// commit to different bytes — no cross-scheme confusion — and binds the
+    /// scheme/version.
+    fn ed25519_signing_input(&self) -> Vec<u8> {
+        let mut v = self.payload_bytes();
+        v.extend_from_slice(ED25519_DISPATCH_DOMAIN_TAG);
+        v
+    }
+
+    /// Ed25519 signing core: fresh nonce + Ed25519 signature over
+    /// [`Self::ed25519_signing_input`] with the controller's private key. Sets
+    /// both the nonce and the (64-byte) signature field. The nonce is set FIRST
+    /// so it is covered by the signature (it is part of `payload_bytes`).
+    fn sign_core_ed25519(&mut self, signing_key: &DispatchSigningKey) -> Result<(), String> {
+        use ed25519_dalek::Signer;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("system time error: {e}"))?
+            .as_secs();
+        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
+        self.set_nonce(format!("{}:{}", ts, hex::encode(rand_bytes)));
+        let sig = signing_key.sign(&self.ed25519_signing_input());
+        self.set_signature(sig.to_bytes().to_vec());
+        Ok(())
+    }
+
+    /// Ed25519 verify-without-replay: freshness window + Ed25519 signature check
+    /// against each provided controller public key (first match wins, so a
+    /// rotated controller key with an overlap window verifies). Uses
+    /// `verify_strict` (rejects non-canonical `R`/small-order points). Touches
+    /// no replay cache. Returns the parsed nonce timestamp on success.
+    fn verify_no_replay_ed25519_core(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        let ts = self.check_freshness_window(max_age_secs)?;
+        if keys.is_empty() {
+            return Err("no controller Ed25519 verifying key configured".to_string());
+        }
+        let sig = ed25519_dalek::Signature::from_slice(self.signature())
+            .map_err(|_| "malformed Ed25519 signature".to_string())?;
+        let input = self.ed25519_signing_input();
+        for k in keys {
+            if k.verify_strict(&input, &sig).is_ok() {
+                return Ok(ts);
+            }
+        }
+        Err("Ed25519 signature verification failed".to_string())
+    }
+
+    /// Ed25519 primary-verifier core: [`Self::verify_no_replay_ed25519_core`]
+    /// plus replay-cache recording (verify-once). Records the nonce exactly once,
+    /// only after a key matches.
+    fn verify_ed25519_core(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        let ts = self.verify_no_replay_ed25519_core(keys, max_age_secs)?;
+        self.record_nonce_or_replay_err(ts, max_age_secs)
     }
 
     /// Record the (already HMAC+freshness-verified) nonce in the
@@ -1871,6 +2362,44 @@ pub struct JobRequest {
     /// wire-format stability rule).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_topic: Option<String>,
+
+    /// RFC 0010 P1: signature scheme this request was signed under.
+    /// [`CRYPTO_SCHEME_HMAC`] (0, default) = legacy `WORKER_SHARED_KEY`
+    /// HMAC-SHA256; [`CRYPTO_SCHEME_ED25519`] (1) = Ed25519 with the controller's
+    /// private key. An unsigned dispatch hint: the verifier routes on it, and a
+    /// flip only sends the message to the wrong verify method (where the
+    /// scheme-specific signature the attacker can't forge fails). NOT part of the
+    /// HMAC `signing_payload()`, so scheme-0 bytes stay identical to pre-P1.
+    #[serde(default)]
+    pub crypto_scheme: u8,
+
+    /// RFC 0010 P3 (D3b): secret-delivery scheme. [`SEALING_INLINE_WSK`] (0,
+    /// default) = the inline WSK envelope in `encrypted_secrets` (today);
+    /// [`SEALING_CLAIM_ECIES`] (1) = claim-based ephemeral sealing — the worker
+    /// claims the job with an ephemeral key and the controller seals to it.
+    /// Bound into `signing_payload()` ONLY when non-zero (so scheme-0 bytes are
+    /// unchanged), which makes a `1`→`0` downgrade invalidate the signature.
+    /// Omitted from the wire JSON when 0 so a legacy message is byte-identical.
+    #[serde(default, skip_serializing_if = "sealing_is_default")]
+    pub sealing: u8,
+
+    /// RFC 0010 P3: the vault paths this job is permitted to resolve, sent in
+    /// the clear (paths are not secrets; values are). Populated ONLY when
+    /// `sealing == SEALING_CLAIM_ECIES`; the controller resolves + seals the
+    /// *values* on claim, reusing the existing per-module allowlist so the claim
+    /// cannot widen scope. When `sealing == 1`, `encrypted_secrets` is empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_paths: Vec<String>,
+
+    /// RFC 0010 P3 (D3b): the NATS subject the worker sends its `SecretClaim` to.
+    /// Set by the dispatcher (to the dispatching replica's per-process claim
+    /// responder inbox) ONLY when `sealing == SEALING_CLAIM_ECIES`. Bound into
+    /// `signing_payload()` when sealing is non-zero — same reasoning as
+    /// `reply_topic`: an on-wire attacker must not redirect the claim (which
+    /// carries the worker's ephemeral public key) to a subject they control and
+    /// have the controller seal the secrets straight to them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_inbox: Option<String>,
 }
 
 impl JobRequest {
@@ -2010,7 +2539,7 @@ impl JobRequest {
         let capability_world_str = self.capability_world.as_deref().unwrap_or("-");
         let cancellation_token_str = self.cancellation_token.as_deref().unwrap_or("-");
 
-        format!(
+        let mut payload = format!(
             "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
@@ -2054,8 +2583,32 @@ impl JobRequest {
             self.deadline_unix_secs,
             // H-7 (2026-05-23): cancellation_token appended AT THE END.
             lp(cancellation_token_str),
-        )
-        .into_bytes()
+        );
+
+        // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
+        // non-legacy sealing scheme is in effect. For `sealing == 0` (today's
+        // inline WSK envelope) nothing is appended, so the signed bytes are
+        // byte-identical to the pre-P3 wire format — no coordinated restart for
+        // the legacy path. When `sealing == 1`, appending the marker + sorted
+        // paths makes a `1`→`0` downgrade (or a widened `secret_paths`) fail
+        // verification, because the two produce different signed bytes.
+        if self.sealing != 0 {
+            use std::fmt::Write as _;
+            let mut paths = self.secret_paths.clone();
+            paths.sort_unstable();
+            // claim_inbox bound with a `-` sentinel for None so its absence is
+            // tamper-evident (an attacker can't strip it to redirect the claim).
+            let claim_inbox = self.claim_inbox.as_deref().unwrap_or("-");
+            let _ = write!(
+                payload,
+                ":{}:{}:{}",
+                self.sealing,
+                lp(&paths.join(",")),
+                lp(claim_inbox)
+            );
+        }
+
+        payload.into_bytes()
     }
 
     /// Diagnostic snapshot of the per-field hashes that
@@ -2152,6 +2705,70 @@ impl JobRequest {
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
     }
+
+    // ── RFC 0010 P1: Ed25519 dispatch scheme ──────────────────────────────
+
+    /// Sign under the Ed25519 dispatch scheme with the controller's private key.
+    /// Sets `crypto_scheme = CRYPTO_SCHEME_ED25519`, a fresh `job_nonce`, and the
+    /// 64-byte signature. Call after all other fields are populated.
+    pub fn sign_ed25519(&mut self, signing_key: &DispatchSigningKey) -> Result<(), String> {
+        self.crypto_scheme = CRYPTO_SCHEME_ED25519;
+        self.sign_core_ed25519(signing_key)
+    }
+
+    /// **Primary** Ed25519 verify: freshness + signature against the controller
+    /// public key(s), then record the nonce (verify-once). `keys` may carry a
+    /// rotated-out previous controller key for an overlap window.
+    pub fn verify_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        self.verify_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Observer Ed25519 verify: freshness + signature only, no replay-cache
+    /// write. Returns the parsed nonce timestamp.
+    pub fn verify_no_replay_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        self.verify_no_replay_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Scheme-dispatching **primary** verify for the worker. Routes on
+    /// `self.crypto_scheme`:
+    /// - [`CRYPTO_SCHEME_ED25519`] → verify against `ed_keys`.
+    /// - [`CRYPTO_SCHEME_HMAC`] → verify against the `hmac_ring`, but ONLY if
+    ///   `accept_legacy_hmac` is true. Setting it false is the RFC 0010 P4
+    ///   enforcement flip: the worker refuses legacy-HMAC dispatches once the
+    ///   fleet is fully on Ed25519.
+    /// - any other value → reject (unknown scheme).
+    ///
+    /// Records the nonce exactly once on success (verify-once rule preserved
+    /// across both schemes).
+    pub fn verify_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), String> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(
+                        "legacy HMAC dispatch refused (Ed25519-only enforcement enabled)"
+                            .to_string(),
+                    );
+                }
+                self.verify_with_ring(hmac_ring, max_age_secs)
+            }
+            other => Err(format!("unknown dispatch crypto_scheme: {other}")),
+        }
+    }
 }
 
 impl SignedMessage for JobRequest {
@@ -2211,6 +2828,16 @@ pub struct JobResult {
     /// [`JobResult::sign_with_worker_id`].
     #[serde(default)]
     pub worker_id: String,
+
+    /// RFC 0010 P2: signature scheme this result was signed under.
+    /// [`CRYPTO_SCHEME_HMAC`] (0, default) = legacy `WORKER_SHARED_KEY` HMAC;
+    /// [`CRYPTO_SCHEME_ED25519`] (1) = the worker's own Ed25519 private key
+    /// (verified by the controller against the worker's registered public key,
+    /// keyed by `worker_id`). Unsigned dispatch hint — a flip routes to the wrong
+    /// verify method where the scheme-specific signature fails. NOT part of the
+    /// HMAC `signing_payload()`, so scheme-0 bytes stay identical to pre-P2.
+    #[serde(default)]
+    pub crypto_scheme: u8,
 }
 
 impl JobResult {
@@ -2380,6 +3007,105 @@ impl JobResult {
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
     }
+
+    // ── RFC 0010 P2: per-worker Ed25519 result signing ────────────────────
+
+    /// Sign under the worker's Ed25519 key (scheme 1) and bind `worker_id`.
+    /// The controller verifies against the public key registered for that
+    /// `worker_id`, so a compromised worker holding only its own private key can
+    /// sign results only as itself. `worker_id` is validated (charset) and MUST
+    /// be non-empty under Ed25519 — an empty id has no registered key to verify
+    /// against.
+    pub fn sign_ed25519_with_worker_id(
+        &mut self,
+        signing_key: &DispatchSigningKey,
+        worker_id: &str,
+    ) -> Result<(), String> {
+        validate_worker_id(worker_id)?;
+        if worker_id.is_empty() {
+            return Err("Ed25519 result signing requires a non-empty worker_id".to_string());
+        }
+        self.worker_id = worker_id.to_string();
+        self.crypto_scheme = CRYPTO_SCHEME_ED25519;
+        self.sign_core_ed25519(signing_key)
+    }
+
+    /// **Primary** Ed25519 result verify (controller): freshness + signature
+    /// against the worker's public key(s), then record the nonce (verify-once).
+    pub fn verify_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        self.verify_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Observer Ed25519 result verify: freshness + signature only, no replay
+    /// write. For passive audit subscribers (see the verify-once rule).
+    pub fn verify_no_replay_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        self.verify_no_replay_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Scheme-dispatching **primary** verify for the controller. Routes on
+    /// `self.crypto_scheme`: Ed25519 against `worker_ed_keys` (the keys
+    /// registered for `self.worker_id`), or legacy HMAC against `hmac_ring` when
+    /// `accept_legacy_hmac` (the P4 flip refuses HMAC once the fleet is on
+    /// Ed25519). Records the nonce exactly once. Use [`Verifier`] semantics via
+    /// [`Self::verify_as`] for the HMAC path when you need Observer.
+    pub fn verify_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        worker_ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), String> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(worker_ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(
+                        "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
+                    );
+                }
+                self.verify_with_ring(hmac_ring, max_age_secs)
+            }
+            other => Err(format!("unknown result crypto_scheme: {other}")),
+        }
+    }
+
+    /// Scheme-dispatching **Observer** verify (passive audit subscribers on
+    /// `talos.results.*`): freshness + signature only, NEVER touching the
+    /// process-local replay cache. Routes on `self.crypto_scheme` exactly like
+    /// [`Self::verify_dispatch`] but uses the no-replay primitive on both arms,
+    /// honouring the verify-once rule (the request-reply dispatcher is the sole
+    /// Primary verifier). Use this at any site whose only side effect is an
+    /// idempotent DB write.
+    pub fn verify_no_replay_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        worker_ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), String> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self
+                .verify_no_replay_ed25519(worker_ed_keys, max_age_secs)
+                .map(|_| ()),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(
+                        "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
+                    );
+                }
+                self.verify_as_with_ring(hmac_ring, max_age_secs, Verifier::Observer)
+            }
+            other => Err(format!("unknown result crypto_scheme: {other}")),
+        }
+    }
 }
 
 impl SignedMessage for JobResult {
@@ -2519,6 +3245,32 @@ pub struct PipelineJobRequest {
     /// payload (wire-format stability rule).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_topic: Option<String>,
+
+    /// RFC 0010 P1: signature scheme (see [`JobRequest::crypto_scheme`]).
+    /// [`CRYPTO_SCHEME_HMAC`] (0, default) or [`CRYPTO_SCHEME_ED25519`] (1).
+    #[serde(default)]
+    pub crypto_scheme: u8,
+
+    /// RFC 0010 P3 (D3b): secret-delivery scheme (see [`JobRequest::sealing`]).
+    /// Bound into `signing_payload()` only when non-zero; omitted from wire JSON
+    /// when 0 so a legacy pipeline message is byte-identical.
+    #[serde(default, skip_serializing_if = "sealing_is_default")]
+    pub sealing: u8,
+
+    /// RFC 0010 P3: vault paths this pipeline is permitted to resolve when
+    /// `sealing == SEALING_CLAIM_ECIES`. See [`JobRequest::secret_paths`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_paths: Vec<String>,
+
+    /// RFC 0010 P3 (D3b): the subject the worker sends its `SecretClaim` to
+    /// (the controller replica's claim-responder inbox) when
+    /// `sealing == SEALING_CLAIM_ECIES`. The claim delivers ONE sealed payload —
+    /// a per-step `Vec<HashMap<String,String>>` aligned to `steps` — so the whole
+    /// pipeline is a single claim round-trip. Bound into `signing_payload()` when
+    /// sealing is non-zero (same reasoning as [`JobRequest::claim_inbox`]); omitted
+    /// from wire JSON when `None` so a legacy pipeline message is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_inbox: Option<String>,
 }
 
 impl PipelineJobRequest {
@@ -2679,7 +3431,7 @@ impl PipelineJobRequest {
             .collect();
         let step_policies_str = step_policies.join(";;");
 
-        format!(
+        let mut payload = format!(
             "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
@@ -2707,8 +3459,30 @@ impl PipelineJobRequest {
             // cancellation_token) appended AT THE END per the
             // wire-format stability rule.
             lp(&step_policies_str),
-        )
-        .into_bytes()
+        );
+
+        // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
+        // non-legacy sealing scheme is in effect, so `sealing == 0` bytes stay
+        // byte-identical to the pre-P3 wire format. See
+        // `JobRequest::signing_payload` for the downgrade-resistance reasoning.
+        if self.sealing != 0 {
+            use std::fmt::Write as _;
+            let mut paths = self.secret_paths.clone();
+            paths.sort_unstable();
+            // Bind claim_inbox too (the worker sends its ephemeral-key-bearing
+            // claim here — a tamperer must not redirect it). Appended after
+            // sealing/secret_paths, still inside the `sealing != 0` guard so
+            // legacy bytes are unchanged.
+            let _ = write!(
+                payload,
+                ":{}:{}:{}",
+                self.sealing,
+                lp(&paths.join(",")),
+                lp(self.claim_inbox.as_deref().unwrap_or("-")),
+            );
+        }
+
+        payload.into_bytes()
     }
 
     /// Sign the pipeline request using the pre-shared `key`.
@@ -2752,6 +3526,55 @@ impl PipelineJobRequest {
     /// to avoid dual-cache-insert deadlocks.
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
+    }
+
+    // ── RFC 0010 P1: Ed25519 dispatch scheme (mirror of JobRequest) ────────
+
+    /// Sign under the Ed25519 dispatch scheme. See [`JobRequest::sign_ed25519`].
+    pub fn sign_ed25519(&mut self, signing_key: &DispatchSigningKey) -> Result<(), String> {
+        self.crypto_scheme = CRYPTO_SCHEME_ED25519;
+        self.sign_core_ed25519(signing_key)
+    }
+
+    /// Primary Ed25519 verify. See [`JobRequest::verify_ed25519`].
+    pub fn verify_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        self.verify_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Observer Ed25519 verify. See [`JobRequest::verify_no_replay_ed25519`].
+    pub fn verify_no_replay_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        self.verify_no_replay_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Scheme-dispatching primary verify. See [`JobRequest::verify_dispatch`].
+    pub fn verify_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), String> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(
+                        "legacy HMAC dispatch refused (Ed25519-only enforcement enabled)"
+                            .to_string(),
+                    );
+                }
+                self.verify_with_ring(hmac_ring, max_age_secs)
+            }
+            other => Err(format!("unknown dispatch crypto_scheme: {other}")),
+        }
     }
 }
 
@@ -2826,6 +3649,10 @@ pub struct PipelineJobResult {
     /// for the security rationale — same model for both result types.
     #[serde(default)]
     pub worker_id: String,
+
+    /// RFC 0010 P2: signature scheme (see [`JobResult::crypto_scheme`]).
+    #[serde(default)]
+    pub crypto_scheme: u8,
 }
 
 impl PipelineJobResult {
@@ -2986,6 +3813,64 @@ impl PipelineJobResult {
     /// ways at once differs — every accept/reject outcome is identical.)
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
+    }
+
+    // ── RFC 0010 P2: per-worker Ed25519 result signing (mirror of JobResult) ──
+
+    /// Sign under the worker's Ed25519 key + bind `worker_id`. See
+    /// [`JobResult::sign_ed25519_with_worker_id`].
+    pub fn sign_ed25519_with_worker_id(
+        &mut self,
+        signing_key: &DispatchSigningKey,
+        worker_id: &str,
+    ) -> Result<(), String> {
+        validate_worker_id(worker_id)?;
+        if worker_id.is_empty() {
+            return Err("Ed25519 result signing requires a non-empty worker_id".to_string());
+        }
+        self.worker_id = worker_id.to_string();
+        self.crypto_scheme = CRYPTO_SCHEME_ED25519;
+        self.sign_core_ed25519(signing_key)
+    }
+
+    /// Primary Ed25519 result verify. See [`JobResult::verify_ed25519`].
+    pub fn verify_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<(), String> {
+        self.verify_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Observer Ed25519 result verify. See [`JobResult::verify_no_replay_ed25519`].
+    pub fn verify_no_replay_ed25519(
+        &self,
+        keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+    ) -> Result<u64, String> {
+        self.verify_no_replay_ed25519_core(keys, max_age_secs)
+    }
+
+    /// Scheme-dispatching primary verify. See [`JobResult::verify_dispatch`].
+    pub fn verify_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        worker_ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), String> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(worker_ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(
+                        "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
+                    );
+                }
+                self.verify_with_ring(hmac_ring, max_age_secs)
+            }
+            other => Err(format!("unknown result crypto_scheme: {other}")),
+        }
     }
 }
 
@@ -3492,6 +4377,10 @@ mod tests {
         // verify as a replay even though HMAC + freshness still pass.
         let key = test_key();
         let mut req = JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -3540,6 +4429,10 @@ mod tests {
     fn test_sign_and_verify() {
         let key = test_key();
         let mut req = JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -3580,6 +4473,10 @@ mod tests {
     fn test_tampered_signature_fails() {
         let key = test_key();
         let mut req = JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -3617,6 +4514,7 @@ mod tests {
     fn test_job_result_sign_and_verify() {
         let key = test_key();
         let mut result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"answer": 42}),
@@ -3638,6 +4536,7 @@ mod tests {
     fn test_job_result_tampered_fails() {
         let key = test_key();
         let mut result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"answer": 42}),
@@ -3663,6 +4562,7 @@ mod tests {
     fn verifier_primary_records_replay_observer_does_not() {
         let key = test_key();
         let mut a = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({}),
@@ -3700,6 +4600,7 @@ mod tests {
     fn verifier_observer_then_primary_both_succeed() {
         let key = test_key();
         let mut a = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({}),
@@ -3719,6 +4620,7 @@ mod tests {
     fn verifier_rejects_tampered_signature_in_both_roles() {
         let key = test_key();
         let mut a = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"answer": 42}),
@@ -3738,6 +4640,10 @@ mod tests {
     fn test_tampered_allowed_methods_fails() {
         let key = test_key();
         let mut req = JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -3778,6 +4684,10 @@ mod tests {
     fn test_allowed_methods_order_independent() {
         let key = test_key();
         let mut req = JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
@@ -3816,6 +4726,7 @@ mod tests {
     fn test_job_result_unsigned_fails() {
         let key = test_key();
         let result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({}),
@@ -3833,6 +4744,10 @@ mod tests {
     /// `.sign()` themselves before tampering / re-verifying.
     fn make_test_request(actor_id: Option<Uuid>) -> JobRequest {
         JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://m/v1".to_string(),
@@ -3860,6 +4775,547 @@ mod tests {
             dry_run: false,
             reply_topic: None,
         }
+    }
+
+    // ── RFC 0010 P1: Ed25519 dispatch scheme tests ────────────────────────
+
+    fn ed_keypair() -> DispatchSigningKey {
+        DispatchSigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    fn hmac_ring(key: &[u8]) -> talos_workflow_engine_core::WorkerKeyRing {
+        talos_workflow_engine_core::WorkerKeyRing::single(
+            talos_workflow_engine_core::WorkerSharedKey::new(key.to_vec()),
+        )
+    }
+
+    fn make_test_result() -> JobResult {
+        JobResult {
+            crypto_scheme: 0,
+            job_id: Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"ok": true}),
+            logs: vec![],
+            execution_time_ms: 12,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        }
+    }
+
+    // ── RFC 0010 P2: per-worker Ed25519 RESULT signing tests ──────────────
+
+    #[test]
+    fn result_ed25519_sign_verify_roundtrip() {
+        let worker_sk = ed_keypair();
+        let worker_pk = worker_sk.verifying_key();
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&worker_sk, "talos-worker-7")
+            .unwrap();
+        assert_eq!(r.crypto_scheme, CRYPTO_SCHEME_ED25519);
+        assert_eq!(r.worker_id, "talos-worker-7");
+        r.verify_no_replay_ed25519(&[worker_pk], 300)
+            .expect("controller verifies against the worker's public key");
+    }
+
+    #[test]
+    fn result_ed25519_requires_worker_id() {
+        let worker_sk = ed_keypair();
+        let mut r = make_test_result();
+        assert!(
+            r.sign_ed25519_with_worker_id(&worker_sk, "").is_err(),
+            "empty worker_id has no registered key to verify against"
+        );
+    }
+
+    #[test]
+    fn result_ed25519_wrong_worker_key_fails() {
+        // A result signed by worker-A's key does not verify against worker-B's
+        // key — a compromised worker can only sign results as itself.
+        let a = ed_keypair();
+        let b_pk = ed_keypair().verifying_key();
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&a, "worker-a").unwrap();
+        assert!(r.verify_no_replay_ed25519(&[b_pk], 300).is_err());
+    }
+
+    #[test]
+    fn result_ed25519_tampered_output_fails() {
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
+        r.output_payload = serde_json::json!({"ok": false});
+        assert!(r.verify_no_replay_ed25519(&[pk], 300).is_err());
+    }
+
+    #[test]
+    fn result_verify_dispatch_routes_and_enforces_p4() {
+        let key = test_key();
+        let ring = hmac_ring(&key);
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+
+        // HMAC result: accepted during rollout, refused under enforcement.
+        let mut hmac_r = make_test_result();
+        hmac_r.sign_with_worker_id(&key, "worker-a").unwrap();
+        hmac_r
+            .verify_dispatch(&ring, &[pk], 300, true)
+            .expect("HMAC result accepted during rollout");
+        let mut hmac_r2 = make_test_result();
+        hmac_r2.sign_with_worker_id(&key, "worker-a").unwrap();
+        assert!(
+            hmac_r2.verify_dispatch(&ring, &[pk], 300, false).is_err(),
+            "P4: HMAC result refused under Ed25519-only enforcement"
+        );
+
+        // Ed25519 result: accepted regardless of the legacy flag.
+        let mut ed_r = make_test_result();
+        ed_r.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
+        ed_r.verify_dispatch(&ring, &[pk], 300, false)
+            .expect("Ed25519 result accepted under enforcement");
+    }
+
+    #[test]
+    fn result_downgrade_flip_rejected() {
+        let key = test_key();
+        let ring = hmac_ring(&key);
+        let sk = ed_keypair();
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
+        r.crypto_scheme = CRYPTO_SCHEME_HMAC; // tamper the hint
+        assert!(r
+            .verify_dispatch(&ring, &[sk.verifying_key()], 300, true)
+            .is_err());
+    }
+
+    #[test]
+    fn worker_public_key_registry_parses_and_verifies() {
+        // Two workers, plus a rotated-in second key for worker-a — the exact
+        // shape the controller loads from TALOS_WORKER_PUBLIC_KEYS.
+        let a_old = ed_keypair();
+        let a_new = ed_keypair();
+        let b = ed_keypair();
+        let raw = format!(
+            "worker-a={},worker-b={},worker-a={}",
+            hex::encode(a_old.verifying_key().to_bytes()),
+            hex::encode(b.verifying_key().to_bytes()),
+            hex::encode(a_new.verifying_key().to_bytes()),
+        );
+        let reg = parse_worker_public_keys(&raw);
+
+        // worker-a carries BOTH keys (rotation overlap); worker-b carries one.
+        assert_eq!(reg.get("worker-a").map(Vec::len), Some(2));
+        assert_eq!(reg.get("worker-b").map(Vec::len), Some(1));
+        assert!(reg.get("worker-c").is_none());
+
+        // A result signed under either of worker-a's keys verifies against the
+        // registered set (first match wins).
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&a_new, "worker-a").unwrap();
+        r.verify_no_replay_ed25519(reg.get("worker-a").unwrap(), 300)
+            .expect("rotated-in worker key must verify");
+    }
+
+    #[test]
+    fn worker_public_key_registry_skips_malformed_entries() {
+        let good = ed_keypair();
+        // Garbage, a keyless bareword, an empty worker_id, and trailing commas
+        // are all skipped without poisoning the one valid pair.
+        let raw = format!(
+            "  , notanentry , =deadbeef , worker-x=zzzz , worker-ok={} ,,",
+            hex::encode(good.verifying_key().to_bytes()),
+        );
+        let reg = parse_worker_public_keys(&raw);
+        assert_eq!(reg.len(), 1, "only the one well-formed pair survives");
+        assert_eq!(reg.get("worker-ok").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn worker_public_keys_empty_input_is_empty() {
+        assert!(parse_worker_public_keys("").is_empty());
+        assert!(parse_worker_public_keys("   ,  , ").is_empty());
+    }
+
+    // RFC 0010 P2 inc.4: the DB-backed dynamic overlay. Uses a worker_id no other
+    // test references and no TALOS_WORKER_PUBLIC_KEYS env (unset in the test proc),
+    // so the env base is empty and this test owns its slice of the global snapshot.
+    #[test]
+    fn dynamic_worker_public_keys_overlay_union_dedup_and_replace() {
+        let a = ed_keypair();
+        let b = ed_keypair();
+        let wid = "inc4-dynamic-worker";
+
+        // Install two keys for the worker (rotation overlap): both resolve.
+        set_dynamic_worker_public_keys([
+            (wid.to_string(), a.verifying_key()),
+            (wid.to_string(), b.verifying_key()),
+        ]);
+        let keys = worker_public_keys(wid);
+        assert_eq!(keys.len(), 2, "both dynamic keys present");
+
+        // Dedup: re-installing with a byte-identical repeat does not double it.
+        set_dynamic_worker_public_keys([
+            (wid.to_string(), a.verifying_key()),
+            (wid.to_string(), a.verifying_key()),
+        ]);
+        assert_eq!(
+            worker_public_keys(wid).len(),
+            1,
+            "byte-identical keys dedup"
+        );
+        assert_eq!(
+            worker_public_keys(wid)[0].to_bytes(),
+            a.verifying_key().to_bytes()
+        );
+
+        // Full-replacement: an empty overlay drops the worker entirely (models a
+        // worker whose every key was deactivated in the DB).
+        set_dynamic_worker_public_keys(std::iter::empty());
+        assert!(
+            worker_public_keys(wid).is_empty(),
+            "empty refresh clears the dynamic overlay for this worker"
+        );
+
+        // A result signed by the worker verifies only while its key is installed.
+        set_dynamic_worker_public_keys([(wid.to_string(), a.verifying_key())]);
+        let mut r = make_test_result();
+        r.sign_ed25519_with_worker_id(&a, wid).unwrap();
+        r.verify_no_replay_ed25519(&worker_public_keys(wid), 300)
+            .expect("installed dynamic key verifies the worker's result");
+        // Reset the global so we don't leak state into other tests.
+        set_dynamic_worker_public_keys(std::iter::empty());
+    }
+
+    #[test]
+    fn ed25519_sign_verify_roundtrip() {
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+        let mut req = make_test_request(Some(Uuid::new_v4()));
+        req.sign_ed25519(&sk).unwrap();
+        assert_eq!(req.crypto_scheme, CRYPTO_SCHEME_ED25519);
+        assert_eq!(req.signature.len(), 64, "Ed25519 signatures are 64 bytes");
+        req.verify_no_replay_ed25519(&[pk], 300)
+            .expect("valid Ed25519 signature must verify");
+    }
+
+    #[test]
+    fn ed25519_tampered_payload_fails() {
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+        let mut req = make_test_request(Some(Uuid::new_v4()));
+        req.sign_ed25519(&sk).unwrap();
+        // Tamper a signed field.
+        req.max_llm_tier = LlmTier::Tier1;
+        assert!(
+            req.verify_no_replay_ed25519(&[pk], 300).is_err(),
+            "tampered payload must fail Ed25519 verification"
+        );
+    }
+
+    #[test]
+    fn ed25519_wrong_key_fails() {
+        let sk = ed_keypair();
+        let other_pk = ed_keypair().verifying_key();
+        let mut req = make_test_request(None);
+        req.sign_ed25519(&sk).unwrap();
+        assert!(
+            req.verify_no_replay_ed25519(&[other_pk], 300).is_err(),
+            "a different controller key must not verify"
+        );
+    }
+
+    #[test]
+    fn ed25519_empty_keyset_rejects() {
+        let sk = ed_keypair();
+        let mut req = make_test_request(None);
+        req.sign_ed25519(&sk).unwrap();
+        assert!(
+            req.verify_no_replay_ed25519(&[], 300).is_err(),
+            "no configured key must fail closed, not pass"
+        );
+    }
+
+    #[test]
+    fn ed25519_key_rotation_overlap() {
+        // Signed under the CURRENT key; a verifier carrying [rotated_in, old]
+        // still validates (first match wins), so a controller-key rotation with
+        // an overlap window doesn't drop in-flight dispatches.
+        let old = ed_keypair();
+        let new = ed_keypair();
+        let mut req = make_test_request(None);
+        req.sign_ed25519(&old).unwrap();
+        req.verify_no_replay_ed25519(&[new.verifying_key(), old.verifying_key()], 300)
+            .expect("previous-key overlap must verify");
+    }
+
+    #[test]
+    fn schemes_do_not_cross_validate() {
+        let key = test_key();
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+
+        // HMAC-signed request must not verify as Ed25519.
+        let mut hmac_req = make_test_request(None);
+        hmac_req.sign(&key).unwrap();
+        assert!(hmac_req.verify_no_replay_ed25519(&[pk], 300).is_err());
+
+        // Ed25519-signed request must not verify as HMAC (domain-separated
+        // input + a 64-byte non-HMAC signature).
+        let mut ed_req = make_test_request(None);
+        ed_req.sign_ed25519(&sk).unwrap();
+        assert!(ed_req.verify_no_replay(&key, 300).is_err());
+    }
+
+    #[test]
+    fn verify_dispatch_routes_by_scheme_and_enforces_p4() {
+        let key = test_key();
+        let ring = hmac_ring(&key);
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+
+        // HMAC request: admitted while legacy HMAC is accepted (rollout window).
+        let mut hmac_req = make_test_request(None);
+        hmac_req.sign(&key).unwrap();
+        hmac_req
+            .verify_dispatch(&ring, &[pk], 300, true)
+            .expect("HMAC dispatch accepted during rollout");
+
+        // Same HMAC request REFUSED once Ed25519-only enforcement is on (P4).
+        let mut hmac_req2 = make_test_request(None);
+        hmac_req2.sign(&key).unwrap();
+        assert!(
+            hmac_req2.verify_dispatch(&ring, &[pk], 300, false).is_err(),
+            "P4: legacy HMAC dispatch must be refused when enforcement is on"
+        );
+
+        // Ed25519 request: admitted regardless of the legacy flag.
+        let mut ed_req = make_test_request(None);
+        ed_req.sign_ed25519(&sk).unwrap();
+        ed_req
+            .verify_dispatch(&ring, &[pk], 300, false)
+            .expect("Ed25519 dispatch accepted under enforcement");
+    }
+
+    #[test]
+    fn downgrade_flip_is_rejected() {
+        // An on-wire attacker flips a valid Ed25519 request's scheme hint to 0
+        // to force the HMAC path. Without the HMAC key they cannot produce a
+        // valid HMAC, so verify_dispatch fails.
+        let key = test_key();
+        let ring = hmac_ring(&key);
+        let sk = ed_keypair();
+        let mut req = make_test_request(None);
+        req.sign_ed25519(&sk).unwrap();
+        req.crypto_scheme = CRYPTO_SCHEME_HMAC; // tamper the hint
+        assert!(
+            req.verify_dispatch(&ring, &[sk.verifying_key()], 300, true)
+                .is_err(),
+            "scheme downgrade must fail (no valid HMAC for the payload)"
+        );
+    }
+
+    #[test]
+    fn unknown_scheme_is_rejected() {
+        let key = test_key();
+        let ring = hmac_ring(&key);
+        let sk = ed_keypair();
+        let mut req = make_test_request(None);
+        req.sign_ed25519(&sk).unwrap();
+        req.crypto_scheme = 200; // unknown
+        assert!(req
+            .verify_dispatch(&ring, &[sk.verifying_key()], 300, true)
+            .is_err());
+    }
+
+    #[test]
+    fn ed25519_primary_verify_records_replay() {
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+        let mut req = make_test_request(None);
+        req.sign_ed25519(&sk).unwrap();
+        // Primary verify records the nonce…
+        req.verify_ed25519(&[pk], 300).expect("first verify ok");
+        // …so a second primary verify of the same nonce is a replay.
+        assert!(
+            req.verify_ed25519(&[pk], 300).is_err(),
+            "replayed Ed25519 dispatch must be rejected"
+        );
+    }
+
+    #[test]
+    fn ed25519_key_hex_parse_roundtrip() {
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+        let pk_hex = hex::encode(pk.to_bytes());
+        let parsed = parse_ed25519_verifying_key_hex(&pk_hex).expect("parse pubkey");
+        assert_eq!(parsed.to_bytes(), pk.to_bytes());
+        let sk_hex = hex::encode(sk.to_bytes());
+        let parsed_sk = parse_ed25519_signing_key_hex(&sk_hex).expect("parse signkey");
+        assert_eq!(parsed_sk.to_bytes(), sk.to_bytes());
+        // Wrong lengths fail closed.
+        assert!(parse_ed25519_verifying_key_hex("deadbeef").is_err());
+        assert!(parse_ed25519_signing_key_hex("").is_err());
+    }
+
+    #[test]
+    fn worker_registration_proof_roundtrip_and_field_binding() {
+        let sk = ed_keypair();
+        let pk = sk.verifying_key().to_bytes();
+        let (wid, sealing, ts, nonce) = ("worker-9", true, 1_700_000_000_000u64, "nonce-abc");
+
+        let proof = sign_worker_registration_proof(&sk, wid, &pk, sealing, ts, nonce);
+        assert_eq!(proof.len(), 64, "Ed25519 signature is 64 bytes");
+        verify_worker_registration_proof(&pk, wid, sealing, ts, nonce, &proof)
+            .expect("a faithfully-signed proof verifies");
+
+        // EVERY signed field is bound — flipping any one breaks verification.
+        assert!(
+            verify_worker_registration_proof(&pk, "worker-8", sealing, ts, nonce, &proof).is_err()
+        );
+        assert!(verify_worker_registration_proof(&pk, wid, !sealing, ts, nonce, &proof).is_err());
+        assert!(
+            verify_worker_registration_proof(&pk, wid, sealing, ts + 1, nonce, &proof).is_err()
+        );
+        assert!(
+            verify_worker_registration_proof(&pk, wid, sealing, ts, "nonce-xyz", &proof).is_err()
+        );
+
+        // A proof for a DIFFERENT key does not verify against this key — the
+        // registrant can only prove possession of a key it actually holds, so it
+        // cannot register another party's (or another worker's) public key.
+        let other_pk = ed_keypair().verifying_key().to_bytes();
+        assert!(
+            verify_worker_registration_proof(&other_pk, wid, sealing, ts, nonce, &proof).is_err()
+        );
+
+        // Tampered / malformed signatures fail closed.
+        let mut bad = proof.clone();
+        bad[0] ^= 0x01;
+        assert!(verify_worker_registration_proof(&pk, wid, sealing, ts, nonce, &bad).is_err());
+        assert!(
+            verify_worker_registration_proof(&pk, wid, sealing, ts, nonce, &proof[..63]).is_err()
+        );
+        // A non-point public_key is rejected before any verify.
+        assert!(
+            verify_worker_registration_proof(&[2u8; 32], wid, sealing, ts, nonce, &proof).is_err()
+        );
+    }
+
+    #[test]
+    fn worker_registration_pop_message_is_unambiguous() {
+        // Length-prefixing prevents a field-boundary collision: moving a byte
+        // from the end of worker_id to the start of nonce must change the bytes.
+        let pk = [7u8; 32];
+        let a = worker_registration_pop_message("ab", &pk, false, 1, "cd");
+        let b = worker_registration_pop_message("abc", &pk, false, 1, "d");
+        assert_ne!(a, b, "ambiguous concatenation would make these equal");
+    }
+
+    #[test]
+    fn verifying_key_from_bytes_roundtrips_and_rejects_noncanonical() {
+        // The bytes path (used by the inc.4 DB-overlay refresh) agrees with the
+        // hex path and with the key's own encoding.
+        let pk = ed_keypair().verifying_key();
+        let bytes = pk.to_bytes();
+        let parsed = parse_ed25519_verifying_key_bytes(&bytes).expect("canonical point parses");
+        assert_eq!(parsed.to_bytes(), bytes);
+        // A value that is not a valid curve point fails closed rather than
+        // yielding a key that would silently never verify. (`[2u8; 32]` does not
+        // decompress to an Edwards point.)
+        assert!(parse_ed25519_verifying_key_bytes(&[2u8; 32]).is_err());
+    }
+
+    #[test]
+    fn generated_keypair_hex_roundtrips_and_matches() {
+        let (seed_hex, pub_hex) = generate_ed25519_keypair_hex();
+        assert_eq!(seed_hex.len(), 64, "seed is 32 bytes = 64 hex chars");
+        assert_eq!(pub_hex.len(), 64, "public key is 32 bytes = 64 hex chars");
+        // Both parse in the exact shape the env loaders accept.
+        let sk = parse_ed25519_signing_key_hex(&seed_hex).expect("seed parses");
+        let pk = parse_ed25519_verifying_key_hex(&pub_hex).expect("pubkey parses");
+        // The emitted public key is the one derived from the emitted seed —
+        // an operator pasting the two halves into peer processes gets a
+        // matching pair, and a signature made with the seed verifies under it.
+        assert_eq!(sk.verifying_key().to_bytes(), pk.to_bytes());
+        let mut req = make_test_request(None);
+        req.sign_ed25519(&sk).unwrap();
+        req.verify_no_replay_ed25519(&[pk], 300)
+            .expect("seed-signed request verifies under the emitted public key");
+        // Two calls yield distinct keys (not a constant).
+        let (seed2, _) = generate_ed25519_keypair_hex();
+        assert_ne!(seed_hex, seed2, "keygen must be random per call");
+    }
+
+    /// RFC 0010 end-to-end: the exact hex strings the
+    /// `generate-worker-trust-keypair` subcommand prints, fed through the SAME
+    /// pure loaders the controller and worker read env with, must compose across
+    /// BOTH trust directions — controller→worker dispatch (P1) and
+    /// worker→controller results (P2) — using ONE per-worker keypair (the same
+    /// key the RPC path uses). This is the "did we ship something an operator can
+    /// actually turn on" check: it fails if the keygen output format drifts from
+    /// what `parse_ed25519_*` / `parse_worker_public_keys` accept, or if the two
+    /// verify paths diverge.
+    #[test]
+    fn operator_keygen_config_composes_both_directions() {
+        // --- what the operator generates + pastes into env ---
+        // `--role controller`: seed on controller, pub on every worker.
+        let (ctrl_seed_hex, ctrl_pub_hex) = generate_ed25519_keypair_hex();
+        // `--role worker --worker-id worker-1`: seed on the worker, the
+        // `worker_id=pub` pair appended to the controller's registry string.
+        let (w1_seed_hex, w1_pub_hex) = generate_ed25519_keypair_hex();
+        let worker_public_keys_env = format!("worker-1={w1_pub_hex}");
+
+        // === P1 dispatch: controller signs, worker verifies ===
+        // Controller side — build the signer exactly as configured_dispatch_signer.
+        let ctrl_signer = DispatchSigner::Ed25519(std::sync::Arc::new(
+            parse_ed25519_signing_key_hex(&ctrl_seed_hex).expect("controller seed parses"),
+        ));
+        let mut req = make_test_request(Some(Uuid::new_v4()));
+        ctrl_signer
+            .sign_job(&mut req)
+            .expect("controller signs dispatch");
+        assert_eq!(req.crypto_scheme, CRYPTO_SCHEME_ED25519);
+        // Worker side — parse TALOS_CONTROLLER_PUBLIC_KEY and verify. The ring
+        // holds only an unrelated dummy key: the Ed25519 path never touches the
+        // symmetric ring, and accept_legacy_hmac=false proves it holds under P4
+        // enforcement (a signature forged under the dummy HMAC key is refused).
+        let ctrl_pub = parse_ed25519_verifying_key_hex(&ctrl_pub_hex).expect("ctrl pub parses");
+        let unrelated_ring = hmac_ring(b"unrelated-hmac-key-never-touched-on-ed25519-path");
+        req.verify_dispatch(&unrelated_ring, &[ctrl_pub], 300, false)
+            .expect("worker verifies the controller-signed dispatch");
+
+        // === P2 result: worker signs, controller verifies via the registry ===
+        let w1_sk = parse_ed25519_signing_key_hex(&w1_seed_hex).expect("worker seed parses");
+        let mut result = make_test_result();
+        result
+            .sign_ed25519_with_worker_id(&w1_sk, "worker-1")
+            .expect("worker signs its result");
+        // Controller side — resolve the verifying key(s) for worker-1 out of the
+        // parsed TALOS_WORKER_PUBLIC_KEYS registry, then verify.
+        let registry = parse_worker_public_keys(&worker_public_keys_env);
+        let w1_keys = registry.get("worker-1").expect("worker-1 is registered");
+        result
+            .verify_dispatch(&unrelated_ring, w1_keys, 300, false)
+            .expect("controller verifies the worker-signed result");
+
+        // === Core security property, driven through the config path ===
+        // A result claiming to be worker-1 but signed by a DIFFERENT key (a
+        // compromised/rogue worker impersonating worker-1) fails against the
+        // registered key. The asymmetric boundary means holding a valid worker
+        // key never lets you forge as another worker_id.
+        let (rogue_seed_hex, _) = generate_ed25519_keypair_hex();
+        let rogue_sk = parse_ed25519_signing_key_hex(&rogue_seed_hex).unwrap();
+        let mut forged = make_test_result();
+        forged
+            .sign_ed25519_with_worker_id(&rogue_sk, "worker-1")
+            .unwrap();
+        assert!(
+            forged
+                .verify_dispatch(&unrelated_ring, w1_keys, 300, false)
+                .is_err(),
+            "a rogue key claiming worker-1 must not verify against worker-1's registered key"
+        );
     }
 
     /// M-4: tampering with `actor_id` MUST invalidate the signature.
@@ -4006,6 +5462,7 @@ mod tests {
     fn tampered_job_result_logs_fails_verification() {
         let key = test_key();
         let mut result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({"answer": 42}),
@@ -4083,6 +5540,10 @@ mod tests {
     fn tampered_pipeline_reply_topic_fails_verification() {
         let key = test_key();
         let mut req = PipelineJobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             steps: vec![],
@@ -4107,6 +5568,7 @@ mod tests {
     fn job_result_with_empty_logs_round_trips() {
         let key = test_key();
         let mut result = JobResult {
+            crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
             output_payload: serde_json::json!({}),
@@ -4289,6 +5751,10 @@ mod tests {
 
     fn make_test_pipeline(steps: Vec<PipelineStep>) -> PipelineJobRequest {
         PipelineJobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             steps,

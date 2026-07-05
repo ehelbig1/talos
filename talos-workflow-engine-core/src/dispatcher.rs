@@ -179,6 +179,22 @@ pub struct DispatchJob {
     /// AES-GCM nonce paired with `encrypted_secrets_ciphertext`.
     pub encrypted_secrets_nonce: Vec<u8>,
 
+    // ── RFC 0010 P3 (D3b): claim-based sealing ───────────────────────
+    /// When `Some`, this dispatch uses claim-based ephemeral sealing
+    /// (`TALOS_ENVELOPE_SEALING` on): the engine resolved the PLAINTEXT
+    /// secrets here instead of sealing them into
+    /// `encrypted_secrets_ciphertext` (which stays empty). This value is
+    /// **controller-process-internal only** — the dispatcher registers it
+    /// in `InFlightSeals` keyed on the wire `job_id` and it NEVER reaches
+    /// the wire (`JobRequest` carries no plaintext; the worker obtains the
+    /// values via a signed claim + on-claim ephemeral seal). `None` = the
+    /// legacy inline WSK envelope path (today's default).
+    pub plaintext_secrets: Option<std::collections::HashMap<String, String>>,
+    /// The vault paths this job is permitted to resolve, sent in the clear
+    /// on the `JobRequest` when claim-based sealing is active (paths are
+    /// not secrets; values are). Empty for the legacy path.
+    pub secret_paths: Vec<String>,
+
     // ── Dispatch policy ──────────────────────────────────────────────
     /// Priority hint (higher dequeues first). Default 100.
     pub priority: u8,
@@ -271,6 +287,8 @@ impl Default for DispatchJob {
             allow_tier2_exposure: false,
             encrypted_secrets_ciphertext: Vec::new(),
             encrypted_secrets_nonce: Vec::new(),
+            plaintext_secrets: None,
+            secret_paths: Vec::new(),
             priority: 100,
             dry_run: false,
             // SECURITY: default to Tier1 (local-only LLM egress). This
@@ -612,6 +630,14 @@ impl fmt::Debug for DispatchJob {
                 "encrypted_secrets_nonce",
                 &format!("<{} bytes>", self.encrypted_secrets_nonce.len()),
             )
+            .field(
+                "plaintext_secrets",
+                &self
+                    .plaintext_secrets
+                    .as_ref()
+                    .map(|m| format!("<{} redacted secrets>", m.len())),
+            )
+            .field("secret_paths", &self.secret_paths)
             .field("priority", &self.priority)
             .field("dry_run", &self.dry_run)
             .field("max_llm_tier", &self.max_llm_tier)

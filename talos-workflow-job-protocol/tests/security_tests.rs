@@ -15,6 +15,10 @@ fn test_key() -> Vec<u8> {
 
 fn make_job_request() -> JobRequest {
     JobRequest {
+        crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
+        claim_inbox: None,
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         module_uri: "file://tmp/module.wasm".to_string(),
@@ -289,6 +293,10 @@ fn tampered_wasm_bytes_fails_verification() {
 fn pipeline_tampered_step_count_fails() {
     let key = test_key();
     let mut req = PipelineJobRequest {
+        crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
+        claim_inbox: None,
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![make_pipeline_step()],
@@ -316,6 +324,10 @@ fn pipeline_tampered_step_count_fails() {
 fn pipeline_tampered_share_sandbox_fails() {
     let key = test_key();
     let mut req = PipelineJobRequest {
+        crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
+        claim_inbox: None,
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![make_pipeline_step()],
@@ -375,6 +387,7 @@ fn unsigned_request_fails_verification() {
 fn tampered_job_result_status_fails() {
     let key = test_key();
     let mut result = JobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Failed,
         output_payload: json!({"error": "something went wrong"}),
@@ -399,6 +412,7 @@ fn tampered_job_result_status_fails() {
 fn tampered_job_result_execution_time_fails() {
     let key = test_key();
     let mut result = JobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
         output_payload: json!({}),
@@ -500,6 +514,10 @@ fn tampered_job_request_integration_name_unset_to_set_fails() {
 fn tampered_pipeline_step_integration_name_fails() {
     let key = test_key();
     let mut req = PipelineJobRequest {
+        crypto_scheme: 0,
+        sealing: 0,
+        secret_paths: Vec::new(),
+        claim_inbox: None,
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         steps: vec![{
@@ -535,6 +553,7 @@ fn tampered_pipeline_step_integration_name_fails() {
 
 fn signed_job_result(key: &[u8]) -> JobResult {
     let mut result = JobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
         output_payload: json!({"ok": true}),
@@ -665,6 +684,7 @@ fn verify_no_replay_does_not_pollute_cache_for_subsequent_verify() {
 
 fn signed_pipeline_result(key: &[u8]) -> talos_workflow_job_protocol::PipelineJobResult {
     let mut result = talos_workflow_job_protocol::PipelineJobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         overall_status: JobStatus::Success,
         step_results: vec![],
@@ -780,6 +800,7 @@ fn pipeline_verify_no_replay_does_not_pollute_cache() {
 fn tampered_job_result_worker_id_fails() {
     let key = test_key();
     let mut result = JobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
         output_payload: json!({"ok": true}),
@@ -806,6 +827,7 @@ fn tampered_job_result_worker_id_fails() {
 fn tampered_pipeline_result_worker_id_fails() {
     let key = test_key();
     let mut result = talos_workflow_job_protocol::PipelineJobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         step_results: vec![],
         final_output: json!({"step": "ok"}),
@@ -831,6 +853,7 @@ fn worker_id_invalid_chars_rejected_at_sign_time() {
     // worker_id fails closed without producing an artifact at all.
     let key = test_key();
     let mut result = JobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
         output_payload: json!({"ok": true}),
@@ -862,6 +885,7 @@ fn worker_id_empty_passes_for_backcompat() {
     // fixtures; empty must still verify cleanly.
     let key = test_key();
     let mut result = JobResult {
+        crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
         output_payload: json!({"ok": true}),

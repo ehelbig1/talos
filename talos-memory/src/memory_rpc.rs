@@ -100,6 +100,17 @@ pub struct MemoryRpcRequest {
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: Vec<u8>,
+    /// RFC 0010 P2 inc.3: self-reported signer identity. Empty under the legacy
+    /// HMAC scheme; the worker's id under Ed25519 (the controller resolves the
+    /// verifying key by it). `#[serde(default)]` keeps scheme-0 wire bytes
+    /// byte-identical (absent field ⇒ empty string).
+    #[serde(default)]
+    pub worker_id: String,
+    /// Unsigned dispatch hint: 0 = legacy HMAC, 1 = per-worker Ed25519. Never
+    /// part of the signed input, so a flip on the wire just routes to a verify
+    /// path whose signature can't be satisfied without the right key.
+    #[serde(default)]
+    pub crypto_scheme: u8,
 }
 
 impl MemoryRpcRequest {
@@ -134,13 +145,16 @@ impl MemoryRpcRequest {
             // canonical_json_bytes returned empty (depth exceeded).
             return None;
         }
-        let signature = rpc_auth::sign(SUBJECT_NAME, actor_id, &nonce, &body)?;
+        let (signature, worker_id, crypto_scheme) =
+            rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body)?;
         Some(Self {
             actor_id,
             op,
             timestamp_ms,
             nonce,
             signature,
+            worker_id,
+            crypto_scheme,
         })
     }
 
@@ -164,12 +178,14 @@ impl MemoryRpcRequest {
         if body.is_empty() {
             return false;
         }
-        rpc_auth::verify(
+        rpc_auth::verify_rpc(
             SUBJECT_NAME,
             self.actor_id,
             &self.nonce,
             &body,
+            &self.worker_id,
             &self.signature,
+            self.crypto_scheme,
         )
     }
 }

@@ -13,6 +13,10 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+# RFC 0010 P2 inc.4: lock-free swap of the worker-verifying-key snapshot so the
+# controller can merge the DB-backed dynamic registry over the env base without
+# blocking the verify hot path.
+arc-swap = "1.7"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -25,6 +29,15 @@ hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
+# RFC 0010 P1: Ed25519 for the controller→worker dispatch signature scheme
+# (asymmetric worker-trust boundary — the worker holds only the public key).
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# RFC 0010 P3 (D3b): ephemeral-ephemeral X25519 ECDH for per-execution secret
+# envelope sealing (forward secrecy). Same dalek family as ed25519-dalek above.
+# `zeroize` (already transitively present) clears the ephemeral secret + derived
+# key material after each open.
+x25519-dalek = "2"
+zeroize = "1"
 
 [features]
 default = []

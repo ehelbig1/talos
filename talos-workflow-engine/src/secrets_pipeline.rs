@@ -63,6 +63,201 @@ pub(crate) async fn build_encrypted_secrets_for(
     // unseals with the same AAD from `JobRequest.workflow_execution_id`.
     aad: &[u8],
 ) -> talos_workflow_job_protocol::EncryptedSecrets {
+    // Steps 1-5 (resolve the plaintext secrets map) live in the shared
+    // `resolve_secrets_map_for` so the RFC 0010 P3 claim-based sealing path
+    // can reuse the exact same resolution + tier-1 filtering without duplicating
+    // it. This function then performs step 6 (the WSK seal) — the legacy inline
+    // envelope. The P3 path skips step 6 entirely and instead registers the
+    // plaintext in `InFlightSeals` for on-claim ephemeral sealing.
+    let secrets_map = resolve_secrets_map_for(
+        resolver,
+        node_id,
+        user_id,
+        vault_paths,
+        extra_paths,
+        max_llm_tier,
+    )
+    .await;
+
+    // 6. Seal via the pluggable envelope. Empty-map short-circuit
+    // matches the reference impl's sentinel; callers read an empty
+    // ciphertext as "no secrets to forward."
+    if secrets_map.is_empty() {
+        return talos_workflow_job_protocol::EncryptedSecrets::empty();
+    }
+    // L-1: route through the AAD-binding seal so the per-job AEAD
+    // context is part of the AES-GCM tag. The default trait impl
+    // falls back to plain `seal` (no AAD) so custom envelopes that
+    // haven't migrated still compile and produce decryptable bytes
+    // when paired with a worker on the legacy decrypt path.
+    match envelope
+        .seal_with_aad(&secrets_map, worker_shared_key, aad)
+        .await
+    {
+        Ok((ciphertext, nonce)) => {
+            // Validate the seal output structurally — a misconfigured
+            // envelope that returns a short nonce or a mismatched
+            // empty/non-empty pair would send corrupted bytes on the
+            // wire. Fail closed (empty ciphertext → node dispatches
+            // with no secrets → node fails cleanly) rather than
+            // forwarding the bad output.
+            if let Err(e) = talos_workflow_engine_core::validate_seal_output(&ciphertext, &nonce) {
+                tracing::error!(
+                    %node_id,
+                    error = %e,
+                    "SecretEnvelope::seal output failed structural validation — dispatching with empty ciphertext"
+                );
+                return talos_workflow_job_protocol::EncryptedSecrets::empty();
+            }
+            // Separate check: the envelope accepted the structural
+            // contract (returned the empty-empty sentinel) but did so
+            // on a non-empty input. We forwarded no secrets; the node
+            // is about to fail with a secrets-unavailable error, so
+            // surface the root cause in the logs.
+            if ciphertext.is_empty() && nonce.is_empty() {
+                tracing::error!(
+                    %node_id,
+                    secret_count = secrets_map.len(),
+                    "SecretEnvelope::seal returned the empty sentinel for a non-empty secrets map — node will dispatch without secrets"
+                );
+            }
+            talos_workflow_job_protocol::EncryptedSecrets { ciphertext, nonce }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                %node_id,
+                "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
+            );
+            talos_workflow_job_protocol::EncryptedSecrets::empty()
+        }
+    }
+}
+
+/// RFC 0010 P3 (D3b): is claim-based ephemeral sealing enabled process-wide?
+/// True when `TALOS_ENVELOPE_SEALING` is `audit` or `required`. Cached — the flag
+/// is fixed for the process lifetime (a change needs a restart, like the dispatch
+/// scheme flags). Kept as a local env read so the engine doesn't take a dependency
+/// on `talos-envelope-seal` (and thus on `async-nats`) just to branch.
+pub(crate) fn claim_based_sealing_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| parse_claim_based_enabled(std::env::var("TALOS_ENVELOPE_SEALING").ok()))
+}
+
+/// Pure parser for [`claim_based_sealing_enabled`] — `audit`/`required` (case-
+/// insensitive) enable claim-based sealing; anything else (incl. `off`/unset)
+/// does not. Extracted so the mode decision is deterministically testable.
+fn parse_claim_based_enabled(raw: Option<String>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("audit" | "required")
+    )
+}
+
+/// The secret payload for one node dispatch, in whichever form the active sealing
+/// mode requires: the legacy inline WSK `encrypted` envelope, OR (when claim-based
+/// sealing is on) the resolved `plaintext` map for the dispatcher to register in
+/// `InFlightSeals`. Exactly one of `encrypted` (non-empty) / `plaintext` (`Some`)
+/// is populated. `Clone` so the loop-node path can resolve once and reuse per
+/// iteration.
+#[derive(Clone)]
+pub(crate) struct DispatchSecrets {
+    pub encrypted: talos_workflow_job_protocol::EncryptedSecrets,
+    pub plaintext: Option<std::collections::HashMap<String, String>>,
+    pub secret_paths: Vec<String>,
+}
+
+impl Default for DispatchSecrets {
+    /// The "no secrets" dispatch — empty inline envelope, no claim. Uses the
+    /// deliberate `EncryptedSecrets::empty()` (the type is intentionally
+    /// non-`Default`; see lint check 17).
+    fn default() -> Self {
+        Self {
+            encrypted: talos_workflow_job_protocol::EncryptedSecrets::empty(),
+            plaintext: None,
+            secret_paths: Vec::new(),
+        }
+    }
+}
+
+/// Single decision point for "seal inline (WSK) vs. resolve plaintext for
+/// claim-based sealing", shared by EVERY single-node dispatch builder
+/// (`engine_dispatch_single`, the loop-body path) so `TALOS_ENVELOPE_SEALING`
+/// applies uniformly — the drift that let loop bodies stay inline (and thus fail
+/// the worker downgrade guard under `required`) can't recur. When claim-based
+/// sealing is on, resolves the plaintext via [`resolve_secrets_map_for`] and
+/// leaves `encrypted` empty (no plaintext ever reaches the wire — the dispatcher
+/// registers it in `InFlightSeals` and the worker claims it). Otherwise seals the
+/// inline WSK envelope exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_dispatch_secrets_for(
+    resolver: &dyn SecretsResolver,
+    envelope: &dyn SecretEnvelope,
+    node_id: Uuid,
+    user_id: Option<Uuid>,
+    vault_paths: &[String],
+    extra_paths: &[String],
+    worker_shared_key: &[u8],
+    max_llm_tier: talos_workflow_engine_core::LlmTier,
+    aad: &[u8],
+) -> DispatchSecrets {
+    if claim_based_sealing_enabled() {
+        let map = resolve_secrets_map_for(
+            resolver,
+            node_id,
+            user_id,
+            vault_paths,
+            extra_paths,
+            max_llm_tier,
+        )
+        .await;
+        // secret_paths = resolved secret NAMES (not values) — clear-text
+        // metadata bound into the dispatch signature (tamper-evident).
+        let mut names: Vec<String> = map.keys().cloned().collect();
+        names.sort_unstable();
+        DispatchSecrets {
+            encrypted: talos_workflow_job_protocol::EncryptedSecrets::empty(),
+            plaintext: if map.is_empty() { None } else { Some(map) },
+            secret_paths: names,
+        }
+    } else {
+        let encrypted = build_encrypted_secrets_for(
+            resolver,
+            envelope,
+            node_id,
+            user_id,
+            vault_paths,
+            extra_paths,
+            worker_shared_key,
+            max_llm_tier,
+            aad,
+        )
+        .await;
+        DispatchSecrets {
+            encrypted,
+            plaintext: None,
+            secret_paths: Vec::new(),
+        }
+    }
+}
+
+/// Resolve the plaintext secrets map for a node dispatch (steps 1-5 of the
+/// secret pipeline: module grants, declared extra paths, OAuth refresh + dynamic
+/// vault paths, the resolved-set tier-1 backstop, and the LLM-provider prefetch).
+///
+/// Extracted from [`build_encrypted_secrets_for`] so the RFC 0010 P3 (D3b)
+/// claim-based sealing path can obtain the SAME plaintext map — with identical
+/// tier-1 filtering — to register in `InFlightSeals` for on-claim ephemeral
+/// sealing, instead of the legacy inline WSK seal (step 6). Behaviour for the
+/// legacy path is unchanged: `build_encrypted_secrets_for` calls this then seals.
+pub(crate) async fn resolve_secrets_map_for(
+    resolver: &dyn SecretsResolver,
+    node_id: Uuid,
+    user_id: Option<Uuid>,
+    vault_paths: &[String],
+    extra_paths: &[String],
+    max_llm_tier: talos_workflow_engine_core::LlmTier,
+) -> std::collections::HashMap<String, String> {
     // 1. Module-grant secrets.
     let mut secrets_map = resolver
         .resolve_module_secrets(node_id)
@@ -149,59 +344,7 @@ pub(crate) async fn build_encrypted_secrets_for(
         );
     }
 
-    // 6. Seal via the pluggable envelope. Empty-map short-circuit
-    // matches the reference impl's sentinel; callers read an empty
-    // ciphertext as "no secrets to forward."
-    if secrets_map.is_empty() {
-        return talos_workflow_job_protocol::EncryptedSecrets::empty();
-    }
-    // L-1: route through the AAD-binding seal so the per-job AEAD
-    // context is part of the AES-GCM tag. The default trait impl
-    // falls back to plain `seal` (no AAD) so custom envelopes that
-    // haven't migrated still compile and produce decryptable bytes
-    // when paired with a worker on the legacy decrypt path.
-    match envelope
-        .seal_with_aad(&secrets_map, worker_shared_key, aad)
-        .await
-    {
-        Ok((ciphertext, nonce)) => {
-            // Validate the seal output structurally — a misconfigured
-            // envelope that returns a short nonce or a mismatched
-            // empty/non-empty pair would send corrupted bytes on the
-            // wire. Fail closed (empty ciphertext → node dispatches
-            // with no secrets → node fails cleanly) rather than
-            // forwarding the bad output.
-            if let Err(e) = talos_workflow_engine_core::validate_seal_output(&ciphertext, &nonce) {
-                tracing::error!(
-                    %node_id,
-                    error = %e,
-                    "SecretEnvelope::seal output failed structural validation — dispatching with empty ciphertext"
-                );
-                return talos_workflow_job_protocol::EncryptedSecrets::empty();
-            }
-            // Separate check: the envelope accepted the structural
-            // contract (returned the empty-empty sentinel) but did so
-            // on a non-empty input. We forwarded no secrets; the node
-            // is about to fail with a secrets-unavailable error, so
-            // surface the root cause in the logs.
-            if ciphertext.is_empty() && nonce.is_empty() {
-                tracing::error!(
-                    %node_id,
-                    secret_count = secrets_map.len(),
-                    "SecretEnvelope::seal returned the empty sentinel for a non-empty secrets map — node will dispatch without secrets"
-                );
-            }
-            talos_workflow_job_protocol::EncryptedSecrets { ciphertext, nonce }
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                %node_id,
-                "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
-            );
-            talos_workflow_job_protocol::EncryptedSecrets::empty()
-        }
-    }
+    secrets_map
 }
 
 /// Tier-1 LLM-provider path filter (single source of truth for the
@@ -282,9 +425,24 @@ pub(crate) fn extract_vault_paths(config: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_tier1_paths, retain_wire_safe_secrets};
+    use super::{filter_tier1_paths, parse_claim_based_enabled, retain_wire_safe_secrets};
     use std::collections::HashMap;
     use talos_workflow_engine_core::LlmTier;
+
+    #[test]
+    fn claim_based_sealing_mode_parsing() {
+        // off / unset / garbage → claim-based sealing NOT enabled.
+        for v in [None, Some("off"), Some("nonsense"), Some("")] {
+            let raw = v.map(std::string::ToString::to_string);
+            assert!(!parse_claim_based_enabled(raw), "{v:?} must not enable");
+        }
+        // audit AND required both enable the claim-based resolve path (the engine
+        // resolves plaintext for both; enforcement of `required` is worker-side).
+        // Case-insensitive + whitespace-tolerant.
+        for v in ["audit", "AUDIT", "required", "REQUIRED", "  Required  "] {
+            assert!(parse_claim_based_enabled(Some(v.into())), "{v} enables");
+        }
+    }
 
     fn paths() -> Vec<String> {
         vec![

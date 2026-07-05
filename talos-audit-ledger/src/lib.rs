@@ -432,6 +432,39 @@ impl OTLPCache {
     }
 }
 
+/// Non-secret `user_audit_settings` row for the GraphQL `auditSettings`
+/// query. Deliberately EXCLUDES the encrypted OTLP auth-header columns —
+/// this shape is for display surfaces; the exporter path
+/// ([`OTLPCache::get_tracer`]) reads + decrypts them itself.
+#[derive(Debug, sqlx::FromRow)]
+pub struct UserAuditSettingsRow {
+    pub streaming_enabled: bool,
+    pub otlp_endpoint: Option<String>,
+    pub otlp_protocol: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fetch a user's audit settings (non-secret columns). Pool-taking so the
+/// GraphQL resolver runs it on its context pool; the table is user-keyed,
+/// not org-pinned RLS, so a bare pool is the correct executor.
+pub async fn get_user_audit_settings(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> anyhow::Result<Option<UserAuditSettingsRow>> {
+    let row = sqlx::query_as::<_, UserAuditSettingsRow>(
+        r#"
+        SELECT streaming_enabled, otlp_endpoint, otlp_protocol, created_at, updated_at
+        FROM user_audit_settings
+        WHERE user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Build the optional S3 client for the WORM audit bucket from env.
 ///
 /// Endpoint resolution: `AWS_ENDPOINT_URL`, then `MINIO_ENDPOINT` (empty

@@ -482,13 +482,7 @@ impl AuthMutations {
         // Revoke all pre-2FA sessions — they were created with is_2fa_verified=false at
         // initial login and are now superseded by the fully-verified session we just created.
         // Non-fatal: if this fails the user is still logged in; stale sessions expire in 7 days.
-        let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
-        if let Err(e) =
-            sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND is_2fa_verified = false")
-                .bind(*user_id)
-                .execute(db_pool)
-                .await
-        {
+        if let Err(e) = auth_service.revoke_pre_2fa_sessions(*user_id).await {
             tracing::warn!(
                 user_id = %user_id,
                 "Failed to revoke pre-2FA sessions after 2FA completion (non-fatal): {}",

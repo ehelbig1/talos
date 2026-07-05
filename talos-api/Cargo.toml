@@ -52,6 +52,7 @@ talos-integrations = { path = "../talos-integrations" }
 talos-llm = { path = "../talos-llm" }
 talos-mcp-tool-schema = { path = "../talos-mcp-tool-schema" }
 talos-module-executions = { path = "../talos-module-executions" }
+talos-module-repository = { path = "../talos-module-repository" }
 talos-oauth = { path = "../talos-oauth" }
 talos-organizations = { path = "../talos-organizations" }
 talos-rate-limit = { path = "../talos-rate-limit" }

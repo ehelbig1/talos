@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 anyhow = "1"
 arc-swap = "1.7"
 dashmap = "6.1"
+# RFC 0010 P2 inc.3: per-worker Ed25519 RPC signing. Same major as
+# talos-workflow-job-protocol so the re-exported key types unify.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 chrono = { version = "0.4", features = ["serde"] }
 hmac = "0.12"
 pgvector = { version = "0.4", features = ["sqlx"] }
@@ -22,6 +25,11 @@ subtle = "2"
 talos-http-body = { path = "../talos-http-body" }
 # MCP-1050: canonical truncate_at_char_boundary for embedding input.
 talos-text-util = { path = "../talos-text-util" }
+# RFC 0010 P2 inc.3: reuse the SINGLE per-worker identity-key surface —
+# Ed25519 key parsing + the TALOS_WORKER_SIGNING_KEY / TALOS_WORKER_PUBLIC_KEYS
+# registry — so RPC signing shares the same keypair the worker uses for result
+# signing. No cycle: job-protocol does not depend on talos-memory.
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }

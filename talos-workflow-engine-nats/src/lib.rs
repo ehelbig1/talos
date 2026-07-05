@@ -61,6 +61,6 @@ mod dispatcher;
 mod run;
 mod transport;
 
-pub use dispatcher::NatsNodeDispatcher;
+pub use dispatcher::{EnvelopeSealingHandle, NatsNodeDispatcher};
 pub use run::{run_with_nats, run_with_seed_via_nats};
 pub use transport::NatsTransport;

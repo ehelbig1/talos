@@ -1671,11 +1671,16 @@ impl ActorRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| SourceActorCloneRow {
-            max_capability_world: r.get("max_capability_world"),
-            description: r.try_get("description").unwrap_or(None),
-            secret_grants: r.try_get("secret_grants").unwrap_or_default(),
-        }))
+        row.map(|r| -> Result<SourceActorCloneRow> {
+            Ok(SourceActorCloneRow {
+                max_capability_world: r.get("max_capability_world"),
+                description: r.try_get::<Option<_>, _>("description")?,
+                secret_grants: r
+                    .try_get::<Option<_>, _>("secret_grants")?
+                    .unwrap_or_default(),
+            })
+        })
+        .transpose()
     }
 
     /// Insert a cloned actor with explicit secret grants.
@@ -2118,15 +2123,18 @@ impl ActorRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ActorBasicSummary {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or(None),
-                max_capability_world: r.try_get("max_capability_world").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<ActorBasicSummary> {
+                Ok(ActorBasicSummary {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    max_capability_world: r
+                        .try_get::<Option<_>, _>("max_capability_world")?
+                        .unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Find actors whose semantic memories most resemble a task embedding.
@@ -2160,17 +2168,22 @@ impl ActorRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ActorMemorySimilarityRow {
-                actor_id: r.try_get("actor_id").unwrap_or(Uuid::nil()),
-                name: r.try_get("name").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or(None),
-                max_capability_world: r.try_get("max_capability_world").unwrap_or_default(),
-                best_score: r.try_get("best_score").unwrap_or(0.0),
-                memory_count: r.try_get("memory_count").unwrap_or(0),
+        rows.iter()
+            .map(|r| -> Result<ActorMemorySimilarityRow> {
+                Ok(ActorMemorySimilarityRow {
+                    actor_id: r
+                        .try_get::<Option<_>, _>("actor_id")?
+                        .unwrap_or(Uuid::nil()),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    max_capability_world: r
+                        .try_get::<Option<_>, _>("max_capability_world")?
+                        .unwrap_or_default(),
+                    best_score: r.try_get::<Option<_>, _>("best_score")?.unwrap_or(0.0),
+                    memory_count: r.try_get::<Option<_>, _>("memory_count")?.unwrap_or(0),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Find few-shot example memories for an actor by embedding similarity.
@@ -2221,9 +2234,11 @@ impl ActorRepository {
                 .await
                 .unwrap_or(serde_json::Value::Null);
             out.push(MemoryExample {
-                key: r.try_get("key").unwrap_or_default(),
+                key: r.try_get::<Option<_>, _>("key")?.unwrap_or_default(),
                 value,
-                memory_type: r.try_get("memory_type").unwrap_or_default(),
+                memory_type: r
+                    .try_get::<Option<_>, _>("memory_type")?
+                    .unwrap_or_default(),
                 score: r.try_get("score").ok(),
             });
         }
@@ -2270,9 +2285,11 @@ impl ActorRepository {
                 .await
                 .unwrap_or(serde_json::Value::Null);
             out.push(MemoryExample {
-                key: r.try_get("key").unwrap_or_default(),
+                key: r.try_get::<Option<_>, _>("key")?.unwrap_or_default(),
                 value,
-                memory_type: r.try_get("memory_type").unwrap_or_default(),
+                memory_type: r
+                    .try_get::<Option<_>, _>("memory_type")?
+                    .unwrap_or_default(),
                 score: None,
             });
         }
@@ -2293,14 +2310,19 @@ impl ActorRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| ActorCardInfo {
-            name: r.try_get("name").unwrap_or_default(),
-            description: r
-                .try_get::<Option<String>, _>("description")
-                .unwrap_or(None),
-            status: r.try_get("status").unwrap_or_default(),
-            max_capability_world: r.try_get("max_capability_world").unwrap_or_default(),
-        }))
+        row.map(|r| -> Result<ActorCardInfo> {
+            Ok(ActorCardInfo {
+                name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                description: r
+                    .try_get::<Option<String>, _>("description")
+                    .unwrap_or(None),
+                status: r.try_get::<Option<_>, _>("status")?.unwrap_or_default(),
+                max_capability_world: r
+                    .try_get::<Option<_>, _>("max_capability_world")?
+                    .unwrap_or_default(),
+            })
+        })
+        .transpose()
     }
 
     /// Lookup the actor's "default" workflow for `dispatch_to_actor` — return
@@ -2350,15 +2372,14 @@ impl ActorRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.try_get::<Uuid, _>("id").unwrap_or_default(),
-                    r.try_get::<String, _>("name").unwrap_or_default(),
-                )
+        rows.iter()
+            .map(|r| -> Result<(Uuid, String)> {
+                Ok((
+                    r.try_get::<Option<Uuid>, _>("id")?.unwrap_or_default(),
+                    r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+                ))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// List published workflows owned by an actor — projection for the A2A agent card.
@@ -2377,15 +2398,18 @@ impl ActorRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| PublishedWorkflowRow {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or(None),
-                capabilities: r.try_get("capabilities").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<PublishedWorkflowRow> {
+                Ok(PublishedWorkflowRow {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    capabilities: r
+                        .try_get::<Option<_>, _>("capabilities")?
+                        .unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Insert an admin event log entry. Used by `spawn_log_admin_event` for

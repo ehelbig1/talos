@@ -279,6 +279,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(sub) = args.get(1) {
         match sub.as_str() {
             "publish-templates" => return run_publish_templates_cli(&args[2..]).await,
+            "generate-worker-trust-keypair" => {
+                return run_generate_worker_trust_keypair_cli(&args[2..]);
+            }
+            "register-worker-identity"
+            | "list-worker-identities"
+            | "deactivate-worker-identity" => {
+                return run_worker_identity_cli(sub, &args[2..]).await;
+            }
             "--help" | "-h" => {
                 println!("Usage:");
                 println!("  controller                            Run the HTTP server (default)");
@@ -290,6 +298,34 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("                                        for `oras push`. See");
                 println!("                                        .github/workflows/template-publish.yml");
+                println!("  controller generate-worker-trust-keypair --role <controller|worker>");
+                println!(
+                    "                                        [--worker-id <id>]  Mint an Ed25519"
+                );
+                println!(
+                    "                                        keypair for the RFC 0010 worker-trust"
+                );
+                println!(
+                    "                                        boundary and print the env block."
+                );
+                println!(
+                    "  controller register-worker-identity --worker-id <id> --public-key <hex>"
+                );
+                println!(
+                    "                                        [--supports-sealing]  Operator-register"
+                );
+                println!(
+                    "                                        a worker's Ed25519 key in the DB registry."
+                );
+                println!(
+                    "  controller list-worker-identities     List the DB worker-identity registry."
+                );
+                println!(
+                    "  controller deactivate-worker-identity --worker-id <id> --public-key <hex>"
+                );
+                println!(
+                    "                                        Soft-retire one registered key (rotation)."
+                );
                 return Ok(());
             }
             // Anything else: fall through to server mode (preserves existing
@@ -1793,6 +1829,79 @@ fn spawn_maintenance_sweeps(
             }
         }
     });
+
+    // ---------- RFC 0010 P2 inc.4: dynamic worker-identity key refresh ---------
+    //
+    // Merges the DB-backed `worker_identities` registry into job_protocol's
+    // dynamic verifying-key overlay (union with the static
+    // `TALOS_WORKER_PUBLIC_KEYS` env base) so an autoscaling fleet can register
+    // keys without an operator editing a ConfigMap. Verify-path reads are
+    // lock-free (ArcSwap); this task just re-publishes the active set on an
+    // interval, so max staleness for a rotation/revocation = one interval.
+    //
+    // Initial load is SYNCHRONOUS so DB-registered keys can verify the very first
+    // job result after boot; a transient DB error there is non-fatal (env
+    // registry stays live, the loop retries). `TALOS_WORKER_KEY_REFRESH_SECS=0`
+    // disables the loop for deploys that use the env registry only.
+    let worker_key_refresh_secs: u64 = std::env::var("TALOS_WORKER_KEY_REFRESH_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    if worker_key_refresh_secs == 0 {
+        tracing::info!(
+            "Dynamic worker-identity key refresh disabled (TALOS_WORKER_KEY_REFRESH_SECS=0); \
+             TALOS_WORKER_PUBLIC_KEYS env registry only"
+        );
+    } else {
+        let refresh_secs = worker_key_refresh_secs.clamp(10, 3600);
+        let worker_id_repo =
+            talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool.clone());
+        let refresh_shutdown = bg_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut shutdown = refresh_shutdown;
+            // Immediate load so DB-registered keys go live shortly after boot; a
+            // transient error here is non-fatal (env registry stays active, the
+            // loop retries on the interval).
+            match refresh_worker_key_overlay(&worker_id_repo).await {
+                Ok(n) => tracing::info!(
+                    target: "talos_engine",
+                    event_kind = "worker_key_overlay_refresh",
+                    installed = n,
+                    "loaded dynamic worker-identity keys at boot"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "talos_engine",
+                    error = %e,
+                    "initial worker-identity key load failed; env registry still active, \
+                     will retry on interval"
+                ),
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+            // Burn the immediate first tick — we just loaded above.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if let Err(e) = refresh_worker_key_overlay(&worker_id_repo).await {
+                            tracing::warn!(
+                                target: "talos_engine",
+                                error = %e,
+                                "worker-identity key refresh failed; keeping last snapshot"
+                            );
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            tracing::info!(
+                                "worker-identity key refresh loop received shutdown signal"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // ---------- Audit-chain verification sweep (finding #2, Layer 2) ----------
     //
@@ -3978,10 +4087,22 @@ fn spawn_nats_log_subscribers(
                             // accidentally convert this site to a primary
                             // verifier and reintroduce the r300 regression.
                             if let Some(ref ring) = worker_key_ring_for_results {
-                                if let Err(e) = result.verify_as_with_ring(
+                                // RFC 0010 P2: scheme-routing Observer verify —
+                                // Ed25519 against the keys registered for this
+                                // worker_id, or legacy HMAC against the ring
+                                // while `result_accept_legacy_hmac()`. NEVER
+                                // records the replay cache (Observer role): the
+                                // request-reply dispatcher is the sole Primary
+                                // verifier, per the verify-once rule.
+                                let worker_ed_keys =
+                                    talos_workflow_job_protocol::worker_public_keys(
+                                        &result.worker_id,
+                                    );
+                                if let Err(e) = result.verify_no_replay_dispatch(
                                     ring,
+                                    &worker_ed_keys,
                                     300,
-                                    talos_workflow_job_protocol::Verifier::Observer,
+                                    talos_workflow_job_protocol::result_accept_legacy_hmac(),
                                 ) {
                                     tracing::warn!(
                                     "Rejected job result {}: signature verification failed — {}",
@@ -4369,7 +4490,7 @@ fn build_schema_and_services(
             tokio::spawn,
         ))
         .data(async_graphql::dataloader::DataLoader::new(
-            crate::api::schema::ModuleExecutionLogLoader(db_pool.clone()),
+            crate::api::schema::ModuleExecutionLogLoader(module_execution_service.clone()),
             tokio::spawn,
         ))
         .data(nats_client.clone())
@@ -5228,6 +5349,34 @@ fn build_router(
         .layer(Extension(redis_client.clone()))
         .layer(Extension(nats_client.clone()));
 
+    // RFC 0010 P2 inc.4c: in-cluster worker self-registration. Mounted ONLY when
+    // TALOS_WORKER_REGISTRATION_TOKEN is configured (fail-closed: no token ⇒ no
+    // route ⇒ 404). Merged after the rate-limit layers like probe_routes, so it
+    // carries its own Extensions (db_pool + the token) and a small body cap.
+    // Access is further restricted to worker pods by the chart NetworkPolicy;
+    // it is never exposed via nginx (`no-nginx-route`).
+    let worker_reg_token = std::env::var("TALOS_WORKER_REGISTRATION_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let internal_routes = if let Some(token) = worker_reg_token {
+        tracing::info!("Worker self-registration endpoint enabled at POST /internal/worker-key");
+        Router::new()
+            .route(
+                "/internal/worker-key",
+                axum::routing::post(register_worker_key_handler),
+            ) // no-nginx-route: RFC0010 in-cluster worker self-registration
+            .layer(axum::extract::DefaultBodyLimit::max(4096))
+            .layer(Extension(db_pool.clone()))
+            .layer(Extension(WorkerRegToken(std::sync::Arc::new(token))))
+    } else {
+        tracing::info!(
+            "Worker self-registration endpoint disabled (TALOS_WORKER_REGISTRATION_TOKEN unset); \
+             use the register-worker-identity CLI or TALOS_WORKER_PUBLIC_KEYS env"
+        );
+        Router::new()
+    };
+
     let app = Router::new()
         // Authenticated user-facing metrics dashboard. Stays inside the
         // rate-limited router; the unauthenticated Prometheus scrape lives
@@ -5354,6 +5503,9 @@ fn build_router(
         .merge(mcp_router)
         // Same for probe + scrape routes — see `probe_routes` definition.
         .merge(probe_routes)
+        // RFC 0010 P2 inc.4c worker self-registration (empty router when the
+        // token is unset, so this merge is a no-op in that mode).
+        .merge(internal_routes)
         // Request ID for tracing and audit logging (generates/propagates X-Request-ID)
         .layer(from_fn(request_id::request_id_middleware))
         // Security headers (apply to all responses)
@@ -5778,6 +5930,438 @@ use rpc_subscribers::{
     spawn_database_rpc_subscriber, spawn_graph_rpc_subscriber, spawn_integration_state_subscriber,
     spawn_integration_state_sweeper, spawn_memory_rpc_subscriber, spawn_state_write_subscriber,
 };
+
+/// RFC 0010 P2 inc.4: load the active `worker_identities` registry and install it
+/// as job_protocol's dynamic verifying-key overlay (union with the env base).
+/// Returns the number of keys installed. A stored key that is not a canonical
+/// Ed25519 point is skipped with a warning rather than poisoning the snapshot —
+/// one bad row can't strand the fleet (same fail-open-per-entry posture as the
+/// env-registry parser). Shared by the boot load, the periodic refresh task, and
+/// (inc.4c) the eager refresh after a registration write.
+async fn refresh_worker_key_overlay(
+    repo: &talos_worker_identity_repository::WorkerIdentityRepository,
+) -> anyhow::Result<usize> {
+    let entries = repo.load_active_registry().await?;
+    let mut mapped = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match talos_workflow_job_protocol::parse_ed25519_verifying_key_bytes(&entry.public_key) {
+            Ok(vk) => mapped.push((entry.worker_id, vk)),
+            Err(err) => tracing::warn!(
+                target: "talos_engine",
+                worker_id = %entry.worker_id,
+                error = %err,
+                "skipping malformed worker_identities public key"
+            ),
+        }
+    }
+    let installed = mapped.len();
+    talos_workflow_job_protocol::set_dynamic_worker_public_keys(mapped);
+    Ok(installed)
+}
+
+// ===== RFC 0010 P2 inc.4c: in-cluster worker self-registration endpoint =====
+//
+// `POST /internal/worker-key` — an autoscaling worker registers its Ed25519
+// public key at boot without an operator touching a ConfigMap. Because workers
+// run untrusted WASM and are credential-free, this endpoint is defended in depth:
+//   1. NetworkPolicy (chart) restricts ingress to worker pods, in-cluster only —
+//      the route is never exposed via nginx/Traefik (`no-nginx-route`).
+//   2. A constant-time shared bearer token (TALOS_WORKER_REGISTRATION_TOKEN)
+//      gates callers; when it is unset the route is not even mounted.
+//   3. An Ed25519 proof-of-possession over the request proves the caller holds
+//      the private key for the key it is registering (job_protocol PoP helpers).
+//   4. A freshness window bounds replay of a captured request; registration is
+//      idempotent so replay is otherwise benign.
+//   5. The inc.4a per-worker active-key cap bounds table inflation.
+//
+// Residual (documented in the RFC): the SHARED token authenticates "a legit
+// worker pod", not a specific worker_id, so an already-compromised worker holding
+// the token could register its own key under a DIFFERENT worker_id. That is still
+// strictly smaller than today's WSK model (any compromised worker forges as ANY
+// worker/tenant). The hardening path is per-worker provisioning tokens or an
+// mTLS client-cert whose SAN binds worker_id — tracked as a follow-up.
+
+/// The configured registration bearer token, injected as an axum `Extension` on
+/// the internal sub-router. Present only when the route is mounted (i.e. the env
+/// var is set and non-empty), so the handler always has a real token to compare.
+#[derive(Clone)]
+struct WorkerRegToken(std::sync::Arc<String>);
+
+#[derive(serde::Deserialize)]
+struct WorkerKeyRegistrationRequest {
+    worker_id: String,
+    /// Hex Ed25519 verifying key (32 bytes) being registered.
+    public_key: String,
+    #[serde(default)]
+    supports_sealing: bool,
+    /// Unix-millis when the worker built the request (freshness).
+    issued_at_ms: u64,
+    /// Anti-grinding nonce, bound into the proof.
+    nonce: String,
+    /// Hex Ed25519 signature (64 bytes) over the canonical PoP message.
+    proof: String,
+}
+
+/// Freshness tolerances for a registration request. Asymmetric like `rpc_auth`:
+/// generous on the past (clock skew + in-flight latency), tight on the future.
+const WORKER_REG_PAST_MS: u64 = 300_000;
+const WORKER_REG_FUTURE_MS: u64 = 60_000;
+
+/// Pure authorization decision for a registration request: constant-time bearer
+/// compare + freshness window. Extracted so it is unit-testable without a live
+/// server. `expected_token` is always non-empty (the route is unmounted
+/// otherwise). Returns the client-facing `(status, message)` on rejection — none
+/// of these leak internal state.
+fn authorize_worker_registration(
+    provided_token: Option<&str>,
+    expected_token: &str,
+    issued_at_ms: u64,
+    now_ms: u64,
+) -> Result<(), (axum::http::StatusCode, &'static str)> {
+    use axum::http::StatusCode;
+    use subtle::ConstantTimeEq;
+
+    let provided = provided_token.ok_or((StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+    // Length check first (ct_eq requires equal length); the compare itself is
+    // constant-time so a wrong token can't be recovered by timing.
+    let ok: bool = provided.len() == expected_token.len()
+        && provided.as_bytes().ct_eq(expected_token.as_bytes()).into();
+    if !ok {
+        return Err((StatusCode::UNAUTHORIZED, "invalid registration token"));
+    }
+    // Freshness: reject stale (past the window) or future-dated requests.
+    if issued_at_ms.saturating_add(WORKER_REG_PAST_MS) < now_ms {
+        return Err((StatusCode::BAD_REQUEST, "registration request expired"));
+    }
+    if issued_at_ms > now_ms.saturating_add(WORKER_REG_FUTURE_MS) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "registration issued_at is in the future",
+        ));
+    }
+    Ok(())
+}
+
+/// Extract a `Bearer <token>` value from the Authorization header.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn worker_reg_error(
+    status: axum::http::StatusCode,
+    message: &str,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (status, axum::Json(serde_json::json!({ "error": message })))
+}
+
+async fn register_worker_key_handler(
+    Extension(db_pool): Extension<sqlx::PgPool>,
+    Extension(reg_token): Extension<WorkerRegToken>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<WorkerKeyRegistrationRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // 1) Bearer + freshness.
+    if let Err((status, msg)) = authorize_worker_registration(
+        bearer_token(&headers),
+        &reg_token.0,
+        req.issued_at_ms,
+        now_ms,
+    ) {
+        return worker_reg_error(status, msg);
+    }
+
+    // 2) Shape validation — worker_id charset + 32-byte canonical Ed25519 point.
+    if let Err(e) = talos_workflow_job_protocol::validate_worker_id(&req.worker_id) {
+        return worker_reg_error(StatusCode::BAD_REQUEST, leak_safe_validation(&e));
+    }
+    let public_key = match hex::decode(req.public_key.trim())
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+    {
+        Some(pk) => pk,
+        None => {
+            return worker_reg_error(
+                StatusCode::BAD_REQUEST,
+                "public_key must be 64-char hex (32-byte Ed25519 key)",
+            )
+        }
+    };
+    let proof = match hex::decode(req.proof.trim()) {
+        Ok(p) => p,
+        Err(_) => return worker_reg_error(StatusCode::BAD_REQUEST, "proof must be hex"),
+    };
+
+    // 3) Proof-of-possession: the request is signed by the private key for the
+    //    key being registered, binding every field.
+    if talos_workflow_job_protocol::verify_worker_registration_proof(
+        &public_key,
+        &req.worker_id,
+        req.supports_sealing,
+        req.issued_at_ms,
+        &req.nonce,
+        &proof,
+    )
+    .is_err()
+    {
+        // Deliberately generic — do not distinguish "bad key" from "bad sig".
+        return worker_reg_error(StatusCode::UNAUTHORIZED, "proof-of-possession failed");
+    }
+
+    // 4) Persist (idempotent upsert + per-worker cap), then eagerly refresh the
+    //    verify overlay so the worker's very first result verifies immediately.
+    let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool);
+    match repo
+        .register(&req.worker_id, &public_key, req.supports_sealing)
+        .await
+    {
+        Ok(talos_worker_identity_repository::RegisterOutcome::Registered) => {
+            if let Err(e) = refresh_worker_key_overlay(&repo).await {
+                // Non-fatal: the periodic task will pick it up within its interval.
+                tracing::warn!(
+                    target: "talos_engine",
+                    error = %e,
+                    "eager worker-key overlay refresh after registration failed"
+                );
+            }
+            tracing::info!(
+                target: "talos_engine",
+                event_kind = "worker_key_registered",
+                worker_id = %req.worker_id,
+                supports_sealing = req.supports_sealing,
+                "worker self-registered an Ed25519 identity key"
+            );
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "status": "registered" })),
+            )
+        }
+        Ok(talos_worker_identity_repository::RegisterOutcome::CapReached) => worker_reg_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "worker already holds the maximum active keys; deactivate one first",
+        ),
+        Err(e) => {
+            // Log full error server-side; return a generic message (no schema leak).
+            tracing::error!(
+                target: "talos_engine",
+                worker_id = %req.worker_id,
+                error = %e,
+                "worker-key registration DB write failed"
+            );
+            worker_reg_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "registration failed (see server logs)",
+            )
+        }
+    }
+}
+
+/// Collapse the job_protocol validation error to one of a small set of fixed,
+/// leak-safe messages (the raw error only ever describes the charset rule, but
+/// this keeps the response surface stable and audited).
+fn leak_safe_validation(_e: &str) -> &'static str {
+    "invalid worker_id (allowed: A-Z a-z 0-9 . - _, non-empty, bounded length)"
+}
+
+// ---------- worker-identity registry subcommands (RFC 0010 P2 inc.4) --------
+//
+// Operator-facing management of the `worker_identities` DB registry. Workers are
+// credential-free (no Postgres), so THEY self-register over the HTTP endpoint;
+// these subcommands are the OPERATOR path — pre-registering keys, auditing the
+// registry, and retiring rotated-out keys — run from a context that already
+// holds DB credentials (the controller image as a one-shot Job). Direct DB
+// access is its own authorization, so no proof-of-possession is required here
+// (that gate exists on the network self-registration endpoint).
+async fn run_worker_identity_cli(sub: &str, args: &[String]) -> anyhow::Result<()> {
+    use talos_worker_identity_repository::{RegisterOutcome, WorkerIdentityRepository};
+
+    let mut worker_id: Option<String> = None;
+    let mut public_key_hex: Option<String> = None;
+    let mut supports_sealing = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--worker-id" => {
+                worker_id = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--worker-id requires a value"))?
+                        .clone(),
+                );
+            }
+            "--public-key" => {
+                public_key_hex = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--public-key requires a value"))?
+                        .clone(),
+                );
+            }
+            "--supports-sealing" => supports_sealing = true,
+            other => anyhow::bail!("unknown {sub} flag: {other}"),
+        }
+    }
+
+    let pool = crate::db::init_pool().await?;
+    let repo = WorkerIdentityRepository::new(pool);
+
+    // Shared parse+validate for the two subcommands that take a key.
+    let resolve_key =
+        |worker_id: &Option<String>, hex: &Option<String>| -> anyhow::Result<(String, [u8; 32])> {
+            let wid = worker_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--worker-id is required"))?;
+            talos_workflow_job_protocol::validate_worker_id(&wid)
+                .map_err(|e| anyhow::anyhow!("invalid --worker-id: {e}"))?;
+            let hex = hex.clone().ok_or_else(|| {
+                anyhow::anyhow!("--public-key is required (64-char hex Ed25519 key)")
+            })?;
+            // Parse through the canonical loader so a non-point is rejected here, not
+            // at verify time — the stored key is guaranteed a valid Ed25519 point.
+            let vk = talos_workflow_job_protocol::parse_ed25519_verifying_key_hex(&hex)
+                .map_err(|e| anyhow::anyhow!("invalid --public-key: {e}"))?;
+            Ok((wid, vk.to_bytes()))
+        };
+
+    match sub {
+        "register-worker-identity" => {
+            let (wid, pk) = resolve_key(&worker_id, &public_key_hex)?;
+            match repo.register(&wid, &pk, supports_sealing).await? {
+                RegisterOutcome::Registered => {
+                    println!("registered worker '{wid}' (supports_sealing={supports_sealing})");
+                }
+                RegisterOutcome::CapReached => anyhow::bail!(
+                    "worker '{wid}' already holds the maximum active keys \
+                     ({}); deactivate one before adding another",
+                    talos_worker_identity_repository::MAX_ACTIVE_KEYS_PER_WORKER
+                ),
+            }
+        }
+        "deactivate-worker-identity" => {
+            let (wid, pk) = resolve_key(&worker_id, &public_key_hex)?;
+            if repo.deactivate(&wid, &pk).await? {
+                println!("deactivated one key for worker '{wid}'");
+            } else {
+                println!("no active key matched for worker '{wid}' (already retired or absent)");
+            }
+        }
+        "list-worker-identities" => {
+            let rows = repo.list().await?;
+            if rows.is_empty() {
+                println!("(worker-identity registry is empty)");
+            }
+            for r in rows {
+                println!(
+                    "{wid}\t{key}\tsealing={sealing}\tactive={active}\tlast_seen={seen}",
+                    wid = r.worker_id,
+                    key = hex::encode(r.public_key),
+                    sealing = r.supports_sealing,
+                    active = r.active,
+                    seen = r.last_seen_at.to_rfc3339(),
+                );
+            }
+        }
+        _ => unreachable!("dispatch guarded by the match in main()"),
+    }
+    Ok(())
+}
+
+// ---------- `controller generate-worker-trust-keypair` subcommand ----------
+//
+// RFC 0010 (asymmetric worker-trust boundary). Mints an Ed25519 keypair in the
+// exact hex shape the env loaders accept and prints a copy-pasteable env block
+// telling the operator which half goes on which process. This is the ONE
+// supported way to generate keys for the boundary — hand-rolling with openssl
+// produces the wrong encoding (the loaders want a raw 32-byte seed / point in
+// hex, not a PKCS#8/PEM wrapper).
+//
+// Two roles, because the boundary has two independent keypairs:
+//   --role controller            controller SIGNS dispatches, workers VERIFY.
+//                                seed → TALOS_CONTROLLER_SIGNING_KEY (controller)
+//                                pub  → TALOS_CONTROLLER_PUBLIC_KEY  (workers)
+//   --role worker --worker-id ID this worker SIGNS results + RPC, controller VERIFIES.
+//                                seed → TALOS_WORKER_SIGNING_KEY (this worker)
+//                                pub  → TALOS_WORKER_PUBLIC_KEYS entry (controller)
+//
+// The seed is a PRIVATE key: it prints to stdout (the standard keygen pattern,
+// like `wg genkey`) so the operator can capture it into a Secret, and a loud
+// stderr banner reminds them never to commit it. Nothing is logged via
+// `tracing` — the value never touches the structured log surface.
+fn run_generate_worker_trust_keypair_cli(args: &[String]) -> anyhow::Result<()> {
+    let mut role: Option<String> = None;
+    let mut worker_id: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--role" => {
+                role = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--role requires a value"))?
+                        .clone(),
+                );
+            }
+            "--worker-id" => {
+                worker_id = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--worker-id requires a value"))?
+                        .clone(),
+                );
+            }
+            other => anyhow::bail!("unknown generate-worker-trust-keypair flag: {other}"),
+        }
+    }
+    let role = role.ok_or_else(|| anyhow::anyhow!("--role is required (controller|worker)"))?;
+
+    let (seed_hex, pub_hex) = talos_workflow_job_protocol::generate_ed25519_keypair_hex();
+
+    // Secret-handling banner on stderr so it's visible even when stdout is
+    // piped into a file/secret.
+    eprintln!("# ─────────────────────────────────────────────────────────────────────");
+    eprintln!("# RFC 0010 worker-trust keypair ({role}). The SIGNING key below is");
+    eprintln!("# SECRET — store it in a Kubernetes Secret / KMS, hand it to exactly");
+    eprintln!("# one process, and NEVER commit it. The PUBLIC key is safe to share.");
+    eprintln!("# ─────────────────────────────────────────────────────────────────────");
+
+    match role.as_str() {
+        "controller" => {
+            println!("# ── on the CONTROLLER (signs dispatches) ──");
+            println!("TALOS_DISPATCH_SCHEME=ed25519");
+            println!("TALOS_CONTROLLER_SIGNING_KEY={seed_hex}");
+            println!();
+            println!("# ── on EVERY WORKER (verifies dispatches) ──");
+            println!("TALOS_CONTROLLER_PUBLIC_KEY={pub_hex}");
+            println!("# During a controller-key rotation, keep the previous public key for an");
+            println!("# overlap window: TALOS_CONTROLLER_PUBLIC_KEY_PREVIOUS=<old_pub>[,<older>]");
+        }
+        "worker" => {
+            let wid = worker_id
+                .ok_or_else(|| anyhow::anyhow!("--worker-id is required for --role worker"))?;
+            // The id is bound into every Ed25519 result/RPC signature and used
+            // as the controller's lookup key, so it must satisfy the same
+            // validator the worker applies at sign time.
+            talos_workflow_job_protocol::validate_worker_id(&wid)
+                .map_err(|e| anyhow::anyhow!("invalid --worker-id: {e}"))?;
+            println!("# ── on WORKER '{wid}' (signs job results + RPC) ──");
+            println!("TALOS_WORKER_SIGNING_KEY={seed_hex}");
+            println!();
+            println!("# ── on the CONTROLLER (verifies this worker) ──");
+            println!("# Append to TALOS_WORKER_PUBLIC_KEYS (comma-separated worker_id=hex pairs;");
+            println!("# repeat the same id with a new key for a rotation overlap window):");
+            println!("TALOS_WORKER_PUBLIC_KEYS={wid}={pub_hex}");
+        }
+        other => anyhow::bail!("unknown --role '{other}' (expected controller|worker)"),
+    }
+    Ok(())
+}
 
 // ---------- `controller publish-templates` subcommand ----------
 //
@@ -7635,6 +8219,76 @@ async fn oauth_callback_handler(
 
 mod secrets_rotation;
 mod tenancy;
+
+#[cfg(test)]
+mod worker_registration_auth_tests {
+    use super::{authorize_worker_registration, WORKER_REG_FUTURE_MS, WORKER_REG_PAST_MS};
+    use axum::http::StatusCode;
+
+    const NOW: u64 = 1_700_000_000_000;
+    const TOKEN: &str = "s3cret-registration-token";
+
+    #[test]
+    fn accepts_valid_token_and_fresh_timestamp() {
+        assert!(authorize_worker_registration(Some(TOKEN), TOKEN, NOW, NOW).is_ok());
+        // Within the past window and the future window.
+        assert!(authorize_worker_registration(
+            Some(TOKEN),
+            TOKEN,
+            NOW - WORKER_REG_PAST_MS + 1,
+            NOW
+        )
+        .is_ok());
+        assert!(
+            authorize_worker_registration(Some(TOKEN), TOKEN, NOW + WORKER_REG_FUTURE_MS, NOW)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_missing_wrong_and_mislength_token() {
+        assert_eq!(
+            authorize_worker_registration(None, TOKEN, NOW, NOW)
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        // Same length, different content.
+        let wrong = "S3cret-registration-token";
+        assert_eq!(wrong.len(), TOKEN.len());
+        assert_eq!(
+            authorize_worker_registration(Some(wrong), TOKEN, NOW, NOW)
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        // Different length (the length guard before ct_eq).
+        assert_eq!(
+            authorize_worker_registration(Some("short"), TOKEN, NOW, NOW)
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn rejects_stale_and_future_dated() {
+        // One ms past the past window.
+        assert_eq!(
+            authorize_worker_registration(Some(TOKEN), TOKEN, NOW - WORKER_REG_PAST_MS - 1, NOW)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        // One ms past the future window.
+        assert_eq!(
+            authorize_worker_registration(Some(TOKEN), TOKEN, NOW + WORKER_REG_FUTURE_MS + 1, NOW)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
 
 #[cfg(test)]
 mod scrub_wasm_log_for_broadcast_tests {

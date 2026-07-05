@@ -16,7 +16,7 @@ use talos_workflow_engine_core::{DispatchJob, ExecutionStartedContext};
 use uuid::Uuid;
 
 use crate::engine::{ensure_rate_limit_eviction_task, ParallelWorkflowEngine, MODULE_RATE_LIMITS};
-use crate::secrets_pipeline::{build_encrypted_secrets_for, extract_vault_paths};
+use crate::secrets_pipeline::extract_vault_paths;
 
 impl ParallelWorkflowEngine {
     /// Build and await the full pipeline-chain dispatch future.
@@ -42,6 +42,11 @@ impl ParallelWorkflowEngine {
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> (NodeIndex, Result<JsonValue, String>) {
         let chain_tail = chain[chain.len() - 1];
+
+        // RFC 0010 P3 (D3b): pipelines now support claim-based sealing — each
+        // step's plaintext is resolved below (`build_dispatch_secrets_for`) and
+        // the dispatcher collects them into ONE sealed claim for the pipeline. No
+        // fail-closed guard here anymore; the flag flows through per step.
         let chain_node_ids: Vec<Uuid> = chain.iter().map(|&n| self.graph[n]).collect();
         // Pre-resolve graph node UUIDs → module UUIDs. Graph node IDs
         // are SHA256-derived from the node label string and don't
@@ -190,14 +195,17 @@ impl ParallelWorkflowEngine {
                 .unwrap_or(module_default_fuel)
                 .min(self.max_fuel_per_node);
 
-            // L-1: AAD = execution_id binds each step's AES-GCM tag to
-            // this dispatch. All steps in a pipeline share the same AAD
-            // because they share an execution_id — that's deliberate;
-            // step-level granularity is enforced by the wider JobRequest
-            // HMAC over the step list.
-            let encrypted_secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
+            // RFC 0010 P3 (D3b): resolve each step's secrets in whichever form the
+            // sealing mode needs — inline WSK envelope, OR plaintext for
+            // claim-based sealing (the dispatcher collects the per-step plaintext
+            // into one sealed claim payload). Same `build_dispatch_secrets_for`
+            // helper as the single-node + loop paths, so the flag applies
+            // uniformly. L-1: AAD = execution_id binds each step's legacy AES-GCM
+            // tag to this dispatch (steps share the execution_id AAD deliberately;
+            // step-level granularity is enforced by the wider JobRequest HMAC).
+            let step_secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
                 (Some(resolver), Some(key)) => {
-                    build_encrypted_secrets_for(
+                    crate::secrets_pipeline::build_dispatch_secrets_for(
                         resolver.as_ref(),
                         self.secret_envelope.as_ref(),
                         step_node_id,
@@ -210,7 +218,7 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 }
-                _ => talos_workflow_job_protocol::EncryptedSecrets::empty(),
+                _ => crate::secrets_pipeline::DispatchSecrets::default(),
             };
             step_jobs.push(DispatchJob {
                 execution_id,
@@ -277,8 +285,13 @@ impl ParallelWorkflowEngine {
                     .unwrap_or_default(),
                 allowed_sql_operations: vec![],
                 allow_tier2_exposure: false,
-                encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
-                encrypted_secrets_nonce: encrypted_secrets.nonce,
+                encrypted_secrets_ciphertext: step_secrets.encrypted.ciphertext,
+                encrypted_secrets_nonce: step_secrets.encrypted.nonce,
+                // RFC 0010 P3 (D3b): per-step plaintext under claim-based sealing
+                // (None/empty otherwise). The dispatcher (`dispatch_chain`)
+                // collects these into ONE sealed claim payload for the pipeline.
+                plaintext_secrets: step_secrets.plaintext,
+                secret_paths: step_secrets.secret_paths,
                 priority: 100,
                 dry_run: self.dry_run,
                 // Inherit the engine's tier ceiling (stamped from

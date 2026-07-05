@@ -317,29 +317,26 @@ impl ModulesMutations {
                     // (security event), None = ProbeFailed (DB error already
                     // logged inline). Both falsy paths skip the watch-channel
                     // setup but only the NotOwned arm fires the SECURITY warn.
-                    let ownership: Option<bool> = match sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM google_calendar_integrations
-                            WHERE id = $1 AND user_id = $2 AND is_active = true
-                        )",
-                    )
-                    .bind(integration_id)
-                    .bind(user_id)
-                    .fetch_one(db_pool)
-                    .await
-                    {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            tracing::error!(
-                                target: "talos_audit",
-                                %user_id,
-                                %integration_id,
-                                error = %e,
-                                "create_module_from_template: failed to verify integration ownership — skipping watch-channel auto-setup (the module IS still created)"
-                            );
-                            None
-                        }
-                    };
+                    let ownership: Option<bool> =
+                        match talos_google_calendar::user_owns_active_integration(
+                            db_pool,
+                            integration_id,
+                            user_id,
+                        )
+                        .await
+                        {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "talos_audit",
+                                    %user_id,
+                                    %integration_id,
+                                    error = %e,
+                                    "create_module_from_template: failed to verify integration ownership — skipping watch-channel auto-setup (the module IS still created)"
+                                );
+                                None
+                            }
+                        };
 
                     if ownership == Some(false) {
                         tracing::warn!(
@@ -421,14 +418,13 @@ impl ModulesMutations {
                                     // If this fails, we have orphaned watch channels in Google Calendar
                                     //
                                     // Phase 5.1: write to unified `modules` table by canonical id.
-                                    match sqlx::query(
-                                        "UPDATE modules SET config = $1 \
-                                         WHERE id = $2",
-                                    )
-                                    .bind(&updated_config)
-                                    .bind(module_id)
-                                    .execute(db_pool)
-                                    .await
+                                    let module_repo =
+                                        talos_module_repository::ModuleRepository::new(
+                                            db_pool.clone(),
+                                        );
+                                    match module_repo
+                                        .update_module_config(module_id, &updated_config)
+                                        .await
                                     {
                                         Ok(_) => {
                                             tracing::info!(

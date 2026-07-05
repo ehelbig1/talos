@@ -147,6 +147,14 @@ pub struct IntegrationStateRequest {
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: Vec<u8>,
+    /// RFC 0010 P2 inc.3 — signer identity (empty under HMAC, worker id under
+    /// Ed25519). See `MemoryRpcRequest::worker_id`.
+    #[serde(default)]
+    pub worker_id: String,
+    /// Unsigned scheme hint: 0 = HMAC, 1 = Ed25519. See
+    /// `MemoryRpcRequest::crypto_scheme`.
+    #[serde(default)]
+    pub crypto_scheme: u8,
 }
 
 impl IntegrationStateRequest {
@@ -166,7 +174,8 @@ impl IntegrationStateRequest {
         if body.is_empty() {
             return None;
         }
-        let signature = rpc_auth::sign(SUBJECT_NAME, actor_id, &nonce, &body)?;
+        let (signature, worker_id, crypto_scheme) =
+            rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body)?;
         Some(Self {
             integration_name,
             actor_id,
@@ -175,6 +184,8 @@ impl IntegrationStateRequest {
             timestamp_ms,
             nonce,
             signature,
+            worker_id,
+            crypto_scheme,
         })
     }
 
@@ -197,12 +208,14 @@ impl IntegrationStateRequest {
         if body.is_empty() {
             return false;
         }
-        rpc_auth::verify(
+        rpc_auth::verify_rpc(
             SUBJECT_NAME,
             self.actor_id,
             &self.nonce,
             &body,
+            &self.worker_id,
             &self.signature,
+            self.crypto_scheme,
         )
     }
 }

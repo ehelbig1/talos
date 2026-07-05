@@ -86,6 +86,7 @@ talos-workflow-manifest = { path = "../talos-workflow-manifest" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
 talos-webhook-repository = { path = "../talos-webhook-repository" }
+talos-worker-identity-repository = { path = "../talos-worker-identity-repository" }
 talos-totp-2fa = { path = "../talos-totp-2fa" }
 talos-oauth = { path = "../talos-oauth" }
 talos-integrations = { path = "../talos-integrations" }

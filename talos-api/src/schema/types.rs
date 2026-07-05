@@ -451,47 +451,25 @@ pub struct ModuleLoader(pub sqlx::Pool<sqlx::Postgres>);
 
 impl async_graphql::dataloader::Loader<Uuid> for ModuleLoader {
     type Value = WasmModule;
-    type Error = std::sync::Arc<sqlx::Error>;
+    type Error = std::sync::Arc<anyhow::Error>;
 
     /// NOTE: This DataLoader is only invoked via ComplexObject resolvers (e.g.,
     /// WebhookTrigger.module) where the parent entity has already been scoped to
     /// the authenticated user. The module IDs passed here are therefore
     /// pre-validated through user-scoped parent queries. Additionally, modules
     /// may be referenced across users via the workflow_module_refs junction table,
-    /// so we intentionally do not add a user_id filter here.
+    /// so the repository method intentionally has no user_id filter.
     async fn load(
         &self,
         keys: &[Uuid],
     ) -> std::result::Result<std::collections::HashMap<Uuid, Self::Value>, Self::Error> {
-        #[derive(sqlx::FromRow)]
-        struct ModuleRow {
-            id: Uuid,
-            name: String,
-            size_bytes: i32,
-            content_hash: String,
-            compiled_at: chrono::DateTime<chrono::Utc>,
-            config: Option<serde_json::Value>,
-            source_code: Option<String>,
-            capability_world: Option<String>,
-            imported_interfaces: Option<Vec<String>>,
-            language: Option<String>,
-        }
-
-        // Phase 5.1: unified `modules` table. COALESCE nullable columns so
-        // the non-null `ModuleRow` shape still deserialises; canonical id.
-        let modules = sqlx::query_as::<_, ModuleRow>(
-            "SELECT id, name,
-                    COALESCE(size_bytes, 0) AS size_bytes,
-                    COALESCE(content_hash, '') AS content_hash,
-                    COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, source_code, capability_world, imported_interfaces, language
-             FROM modules
-             WHERE id = ANY($1)",
-        )
-        .bind(keys)
-        .fetch_all(&self.0)
-        .await
-        .map_err(std::sync::Arc::new)?;
+        // Phase 5.1: unified `modules` table; bare-pool read preserved
+        // (the loader's own pool backs the per-call repository).
+        let repo = talos_module_repository::ModuleRepository::new(self.0.clone());
+        let modules = repo
+            .get_modules_by_ids(keys)
+            .await
+            .map_err(std::sync::Arc::new)?;
 
         let mut map = std::collections::HashMap::new();
         for m in modules {
@@ -517,25 +495,28 @@ impl async_graphql::dataloader::Loader<Uuid> for ModuleLoader {
     }
 }
 
-pub struct ModuleExecutionLogLoader(pub sqlx::Pool<sqlx::Postgres>);
+pub struct ModuleExecutionLogLoader(
+    pub std::sync::Arc<talos_module_executions::ModuleExecutionService>,
+);
 
 impl async_graphql::dataloader::Loader<Uuid> for ModuleExecutionLogLoader {
     type Value = Vec<ModuleExecutionLog>;
-    type Error = std::sync::Arc<sqlx::Error>;
+    type Error = std::sync::Arc<anyhow::Error>;
 
     async fn load(
         &self,
         keys: &[Uuid],
     ) -> std::result::Result<std::collections::HashMap<Uuid, Self::Value>, Self::Error> {
         // MCP-1191 (2026-05-17): cap rows returned PER execution_id at
-        // 200 via a ROW_NUMBER() window. Pre-fix the DataLoader did
-        // `WHERE execution_id = ANY($1)` with NO per-group cap — a
-        // GraphQL caller writing `{ moduleExecutions(limit: 1000)
-        // { logs { ... } } }` would trigger a single batched query for
-        // up to N executions × MAX_LOGS_PER_EXECUTION (1000 enforced
-        // by the `module_execution_logs` insert trigger) = 1 000 000
-        // rows × ~500 bytes per row = ~500 MiB heap on a single
-        // request.
+        // 200 via a ROW_NUMBER() window (in
+        // `ModuleExecutionService::get_execution_logs_batched`). Pre-fix
+        // the DataLoader did `WHERE execution_id = ANY($1)` with NO
+        // per-group cap — a GraphQL caller writing
+        // `{ moduleExecutions(limit: 1000) { logs { ... } } }` would
+        // trigger a single batched query for up to N executions ×
+        // MAX_LOGS_PER_EXECUTION (1000 enforced by the
+        // `module_execution_logs` insert trigger) = 1 000 000 rows ×
+        // ~500 bytes per row = ~500 MiB heap on a single request.
         //
         // The DB trigger caps insert rate at 1000 logs per execution,
         // but that's a per-execution cap, not a per-DataLoader-call
@@ -552,26 +533,11 @@ impl async_graphql::dataloader::Loader<Uuid> for ModuleExecutionLogLoader {
         // `module_execution_logs(executionId)` query (bounded by the
         // DB trigger at 1000) rather than the fan-out DataLoader.
         const MAX_LOGS_PER_EXECUTION: i32 = 200;
-        let logs = sqlx::query_as::<_, module_executions::ModuleExecutionLog>(
-            r#"
-            SELECT id, execution_id, level, message, metadata, created_at
-            FROM (
-                SELECT id, execution_id, level, message, metadata, created_at,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY execution_id ORDER BY created_at ASC
-                       ) AS rn
-                FROM module_execution_logs
-                WHERE execution_id = ANY($1)
-            ) numbered
-            WHERE rn <= $2
-            ORDER BY execution_id, created_at ASC
-            "#,
-        )
-        .bind(keys)
-        .bind(MAX_LOGS_PER_EXECUTION)
-        .fetch_all(&self.0)
-        .await
-        .map_err(std::sync::Arc::new)?;
+        let logs = self
+            .0
+            .get_execution_logs_batched(keys, MAX_LOGS_PER_EXECUTION)
+            .await
+            .map_err(std::sync::Arc::new)?;
 
         let mut map: std::collections::HashMap<Uuid, Vec<ModuleExecutionLog>> =
             std::collections::HashMap::new();
