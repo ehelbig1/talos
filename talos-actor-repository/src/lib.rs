@@ -2372,15 +2372,14 @@ impl ActorRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.try_get::<Uuid, _>("id").unwrap_or_default(),
-                    r.try_get::<String, _>("name").unwrap_or_default(),
-                )
+        rows.iter()
+            .map(|r| -> Result<(Uuid, String)> {
+                Ok((
+                    r.try_get::<Option<Uuid>, _>("id")?.unwrap_or_default(),
+                    r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+                ))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// List published workflows owned by an actor — projection for the A2A agent card.

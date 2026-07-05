@@ -1848,16 +1848,16 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                (
-                    r.try_get::<String, _>("error_message").unwrap_or_default(),
-                    r.try_get::<DateTime<Utc>, _>("started_at")
-                        .unwrap_or_else(|_| Utc::now()),
-                )
+        rows.into_iter()
+            .map(|r| -> Result<(String, DateTime<Utc>)> {
+                Ok((
+                    r.try_get::<Option<String>, _>("error_message")?
+                        .unwrap_or_default(),
+                    r.try_get::<Option<DateTime<Utc>>, _>("started_at")?
+                        .unwrap_or_else(Utc::now),
+                ))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_node_failure_counts(

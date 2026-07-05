@@ -3471,23 +3471,23 @@ echo
 # `.try_get::<Option<_>, _>("col")?.unwrap_or(default)` (or a typed
 # `FromRow`/`query_as!` mapping), NOT by re-adding a baseline.
 #
-# Coverage note: the regex matches `.try_get(...)` immediately followed by
-# `.unwrap_or` — it does NOT catch the turbofish form
-# `.try_get::<Option<T>, _>("col").unwrap_or(None)` (a handful remain), nor does
-# it false-positive on the fixed `?.unwrap_or` form. Broadening to catch
-# turbofish silent reads without flagging the `?`-threaded form is a tracked
-# follow-up.
+# Regex catches BOTH plain `.try_get("col").unwrap_or` AND the turbofish
+# `.try_get::<Option<T>, _>("col").unwrap_or` form (the `(::<[^(]*>)?` group), but
+# NOT the fixed `?.unwrap_or` form — the `\)\.unwrap_or` requires `)` immediately
+# followed by `.unwrap_or`, so a `)?.unwrap_or` (error propagated) never matches.
+# (A silent read split across lines — `.try_get(...)` and `.unwrap_or` on separate
+# lines — still slips past this line-based grep; those are rare and caught in review.)
 bold "▶ check 52: silent try_get().unwrap_or reads in repository crates (must be 0)"
 # `|| true`: now that the count is 0, `grep -c` finds no matches and exits 1,
 # which under this script's `set -euo pipefail` would abort here — the very
 # success case (fully burned down) must not fail the script. awk still prints 0.
-REPO_SILENT_READ_COUNT="$( { grep -rEc '\.try_get\([^)]*\)\.unwrap_or' \
+REPO_SILENT_READ_COUNT="$( { grep -rEc '\.try_get(::<[^(]*>)?\([^)]*\)\.unwrap_or' \
         --include='*.rs' \
         talos-*-repository 2>/dev/null || true; } \
     | awk -F: '{s+=$2} END {print s+0}')"
 if [ "$REPO_SILENT_READ_COUNT" -ne 0 ]; then
     red "✗ ${REPO_SILENT_READ_COUNT} silent try_get().unwrap_or read(s) in repository crates (must be 0):"
-    grep -rEn '\.try_get\([^)]*\)\.unwrap_or' --include='*.rs' talos-*-repository 2>/dev/null | sed 's/^/    /'
+    grep -rEn '\.try_get(::<[^(]*>)?\([^)]*\)\.unwrap_or' --include='*.rs' talos-*-repository 2>/dev/null | sed 's/^/    /'
     yellow "  → a renamed/dropped column would read as a silent default, not an error."
     yellow "    Read as Option and propagate: .try_get::<Option<_>, _>(\"col\")?.unwrap_or(default)"
     yellow "    or use a typed FromRow / query_as! mapping."
