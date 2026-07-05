@@ -13,10 +13,21 @@
 //! client error other than 429 is not retried (a bad token or proof won't fix
 //! itself). Registration is idempotent, so a retry — or a later reboot — is safe.
 //!
+//! The endpoint is trust-on-first-use per worker_id: the first registered key
+//! becomes this worker's identity, and later boots may only refresh that SAME
+//! key. A 409 means the worker_id is already bound to a different key — a
+//! signing-key rotation must be registered by an operator
+//! (`controller register-worker-identity`) before the rebooted worker's
+//! self-registration will refresh it.
+//!
 //! Config (all must be present to enable self-registration):
 //!   * `TALOS_CONTROLLER_URL`            — controller base URL (in-cluster).
-//!   * `TALOS_WORKER_REGISTRATION_TOKEN` — shared bearer token (matches the
-//!                                         controller's env).
+//!   * `TALOS_WORKER_REGISTRATION_TOKEN` — bearer credential: either the
+//!                                         fleet-shared token (matches the
+//!                                         controller's env) or a single-use
+//!                                         provisioning token minted for THIS
+//!                                         worker_id via
+//!                                         `controller mint-worker-provisioning-token`.
 //!   * `TALOS_WORKER_SIGNING_KEY`        — already required for result signing;
 //!                                         the caller passes the resolved key in.
 //! Optional:
