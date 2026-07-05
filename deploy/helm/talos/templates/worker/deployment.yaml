@@ -166,6 +166,25 @@ spec:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: METRICS_AUTH_TOKENS
                   optional: true
+            # RFC 0010 P2: boot-time Ed25519 self-registration client
+            # (worker::self_register → POST controller /internal/worker-key).
+            # In-cluster controller URL is always safe to set — the client
+            # no-ops unless TALOS_WORKER_REGISTRATION_TOKEN is also present.
+            # The bearer renders as an OPTIONAL secretKeyRef: absent from the
+            # bootstrap Secret means self-registration stays disabled. Under
+            # controller.workerRegistration.requireBoundToken, override the
+            # token per worker with a minted bound token via worker.extraEnv /
+            # a per-worker Secret instead of the fleet-shared bootstrap key.
+            # (TALOS_WORKER_SIGNING_KEY itself stays operator-provisioned —
+            # see `controller generate-worker-trust-keypair --role worker`.)
+            - name: TALOS_CONTROLLER_URL
+              value: "http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }}"
+            - name: TALOS_WORKER_REGISTRATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: TALOS_WORKER_REGISTRATION_TOKEN
+                  optional: true
             {{- with .Values.worker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -309,6 +309,28 @@ controller:
     # are flagged UNVERIFIED.
     chainSweepIntervalSecs: 3600
 
+  # RFC 0010 P2: dynamic worker Ed25519 self-registration
+  # (POST /internal/worker-key). Three pieces cooperate:
+  #   1. bootstrapSecret.data.TALOS_WORKER_REGISTRATION_TOKEN — the
+  #      fleet-shared bearer. The chart always renders it into the controller
+  #      AND worker pods as an OPTIONAL secretKeyRef, so adding the key to the
+  #      bootstrap Secret (plus toggle 3 below) is all a shared-token rollout
+  #      needs. Absent key = env unset = endpoint not mounted (fail-closed).
+  #   2. `requireBoundToken` below — the hardened end-state. When true the
+  #      controller sets TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1: ONLY
+  #      single-use, worker_id-bound provisioning tokens (minted via
+  #      `controller mint-worker-provisioning-token`) may register; the
+  #      fleet-shared token and wildcard tokens are refused. The endpoint
+  #      mounts even without the shared token in this mode. Each worker then
+  #      carries its own minted token via worker.extraEnv (or a per-worker
+  #      Secret) instead of the bootstrap-secret bearer.
+  #   3. networkPolicy.workerRegistrationIngress.enabled — network-layer
+  #      opt-in so worker pods can reach the controller port at all.
+  # Registration is trust-on-first-use per worker_id; key rotation goes
+  # through the register-worker-identity CLI or a bound provisioning token.
+  workerRegistration:
+    requireBoundToken: false
+
   # Extra arbitrary env vars rendered as name/value pairs into the Deployment.
   # Use this for non-sensitive per-deploy overrides.
   extraEnv: []
@@ -960,8 +982,10 @@ networkPolicy:
   # POST /internal/worker-key (dynamic Ed25519 self-registration). OFF by
   # default — enabling it opens controller:8000 to workers at the network
   # layer (the endpoint's bearer-token + proof-of-possession auth is the real
-  # gate). Turn on only alongside TALOS_WORKER_REGISTRATION_TOKEN when using
-  # dynamic registration; leave off for the static TALOS_WORKER_PUBLIC_KEYS or
+  # gate). Turn on only alongside a registration credential — the
+  # bootstrap-Secret TALOS_WORKER_REGISTRATION_TOKEN and/or
+  # controller.workerRegistration.requireBoundToken (see that block for the
+  # full rollout story); leave off for the static TALOS_WORKER_PUBLIC_KEYS or
   # register-worker-identity CLI path.
   workerRegistrationIngress:
     enabled: false
@@ -1098,6 +1122,16 @@ bootstrapSecret:
     # (per CLAUDE.md OCI auth model section).
     OCI_REGISTRY_USERNAME: ""
     OCI_REGISTRY_PASSWORD: ""
+    # RFC 0010 P2: fleet-shared bearer for dynamic worker Ed25519
+    # self-registration (POST /internal/worker-key). OPTIONAL — empty/absent
+    # is treated as unset by BOTH consumers (controller: endpoint not
+    # mounted, fail-closed; worker: self-registration client no-ops), so
+    # this documented default changes nothing. To enable: generate with
+    # `openssl rand -hex 32`, set it here, and enable
+    # networkPolicy.workerRegistrationIngress. See
+    # controller.workerRegistration for the bound-token hardened mode that
+    # replaces this shared bearer with single-use per-worker tokens.
+    TALOS_WORKER_REGISTRATION_TOKEN: ""
     # Worker AOT cache HMAC (MCP-858). HMAC-SHA256 signature over every
     # compiled-WASM blob the worker caches to disk — stops a tampered
     # AOT artifact from being executed on the next pod restart. REQUIRED
