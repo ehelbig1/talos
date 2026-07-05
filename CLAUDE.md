@@ -315,11 +315,15 @@ shape: typed input + outcome structs, `thiserror` enum with stable
 internal errors to a generic message (security: never leak
 schema/query details), Arc-wrapped dep injection, single instance
 shared across MCP and GraphQL ctx. Remaining structural work below:
-- `search.rs` → **next up.** Semantic search uses an embedding
-  fallback chain (Anthropic / Ollama / OpenAI / etc.) that wants to
-  live in a `SearchService` so the chain runs from one place. Same
-  pattern as r303/r304; smaller LoC than either but completes the
-  named-priority list.
+- `search.rs` → **DONE.** The embedding pipeline + fallback chain live
+  in the `talos-search-service` crate; `SearchService`
+  (`new(workflow_repo)` + `search_semantic`) is Arc-injected on
+  `McpState.search_service` and `handle_search_workflows_semantic` is a
+  thin wrapper (parse/validate → `search_semantic(SemanticSearchInput)`
+  → format), with typed `jsonrpc_code()` / `user_facing_message()`
+  errors. `search.rs` is raw-sqlx-free. Cross-protocol-ready (no
+  GraphQL consumer yet, but the Arc pattern supports one). This
+  completes the named-priority extraction list.
 - `secrets.rs` → extend `SecretsManager`. Already raw-sqlx-free;
   extraction here is about reconciling the name+namespace vs.
   key_path semantic mismatch in `handle_*`, not pulling SQL. More
