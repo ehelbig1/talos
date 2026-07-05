@@ -335,20 +335,23 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowLogRow {
-                id: r.try_get("id").unwrap_or_default(),
-                execution_id: r.try_get("execution_id").unwrap_or(execution_id),
-                node_id: r.try_get("node_id").unwrap_or(None),
-                level: r.try_get("level").unwrap_or_default(),
-                message: r.try_get("message").unwrap_or_default(),
-                metadata: r.try_get("metadata").unwrap_or(None),
-                created_at: r
-                    .try_get("created_at")
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+        rows.iter()
+            .map(|r| -> Result<WorkflowLogRow> {
+                Ok(WorkflowLogRow {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    execution_id: r
+                        .try_get::<Option<_>, _>("execution_id")?
+                        .unwrap_or(execution_id),
+                    node_id: r.try_get::<Option<_>, _>("node_id")?,
+                    level: r.try_get::<Option<_>, _>("level")?.unwrap_or_default(),
+                    message: r.try_get::<Option<_>, _>("message")?.unwrap_or_default(),
+                    metadata: r.try_get::<Option<_>, _>("metadata")?,
+                    created_at: r
+                        .try_get("created_at")
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Create with SecretsManager for output encryption at rest.
@@ -530,9 +533,12 @@ impl ExecutionRepository {
     /// decrypt path can dispatch on `output_data_format` and supply the
     /// correct AAD bytes. Callers MUST SELECT `id` + `output_data_format`
     /// in their query — without them, decryption falls back to v0.
-    async fn read_output_from_row(&self, row: &sqlx::postgres::PgRow) -> Option<serde_json::Value> {
-        let enc_bytes: Option<Vec<u8>> = row.try_get("output_data_enc").unwrap_or(None);
-        let enc_key_id: Option<Uuid> = row.try_get("output_enc_key_id").unwrap_or(None);
+    async fn read_output_from_row(
+        &self,
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<Option<serde_json::Value>> {
+        let enc_bytes: Option<Vec<u8>> = row.try_get::<Option<_>, _>("output_data_enc")?;
+        let enc_key_id: Option<Uuid> = row.try_get::<Option<_>, _>("output_enc_key_id")?;
 
         if let (Some(bytes), Some(key_id)) = (enc_bytes, enc_key_id) {
             // Encrypted row — the AAD format version and row `id` are
@@ -550,7 +556,7 @@ impl ExecutionRepository {
                         "output_data_format unreadable for an encrypted row — cannot dispatch AEAD; \
                          returning None (caller must SELECT output_data_format)"
                     );
-                    return None;
+                    return Ok(None);
                 }
             };
             let exec_id: Uuid = match row.try_get("id") {
@@ -560,7 +566,7 @@ impl ExecutionRepository {
                         err = ?e,
                         "row id unreadable for an encrypted row — cannot supply AEAD AAD; returning None"
                     );
-                    return None;
+                    return Ok(None);
                 }
             };
             // Decrypt or fail. Do NOT fall back to plaintext.
@@ -568,19 +574,20 @@ impl ExecutionRepository {
                 .decrypt_output(exec_id, key_id, &bytes, format_version)
                 .await
             {
-                Ok(val) => return Some(val),
+                Ok(val) => return Ok(Some(val)),
                 Err(e) => {
                     tracing::error!(
                         err = ?e,
                         "Failed to decrypt execution output — returning None (will not fall back to plaintext)"
                     );
-                    return None;
+                    return Ok(None);
                 }
             }
         }
 
         // Legacy row (no encrypted data) — read plaintext column
-        row.try_get("output_data").unwrap_or(None)
+        row.try_get::<Option<_>, _>("output_data")
+            .map_err(Into::into)
     }
 
     /// MCP-1211: find workflows whose recent executions terminated a loop
@@ -652,7 +659,7 @@ impl ExecutionRepository {
         let mut agg: HashMap<Uuid, (String, i64, Option<chrono::DateTime<chrono::Utc>>)> =
             HashMap::new();
         for r in rows {
-            let Some(output) = self.read_output_from_row(&r).await else {
+            let Some(output) = self.read_output_from_row(&r).await? else {
                 continue;
             };
             let Some(obj) = output.as_object() else {
@@ -668,9 +675,9 @@ impl ExecutionRepository {
                 continue;
             }
             let workflow_id: Uuid = r.get("workflow_id");
-            let workflow_name: String = r.try_get("name").unwrap_or_default();
+            let workflow_name: String = r.try_get::<Option<String>, _>("name")?.unwrap_or_default();
             let completed_at: Option<chrono::DateTime<chrono::Utc>> =
-                r.try_get("completed_at").unwrap_or(None);
+                r.try_get::<Option<_>, _>("completed_at")?;
             let entry = agg
                 .entry(workflow_id)
                 .or_insert_with(|| (workflow_name.clone(), 0, None));
@@ -767,25 +774,27 @@ impl ExecutionRepository {
 
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let output_data = self.read_output_from_row(&r).await;
+            let output_data = self.read_output_from_row(&r).await?;
             out.push(ExecutionRow {
                 id: r.get("id"),
                 workflow_id: r.get("workflow_id"),
                 status: r.get("status"),
-                started_at: r.try_get("started_at").unwrap_or(None),
-                completed_at: r.try_get("completed_at").unwrap_or(None),
+                started_at: r.try_get::<Option<_>, _>("started_at")?,
+                completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                 output_data,
-                error_message: r.try_get("error_message").unwrap_or(None),
-                is_pinned: r.try_get("is_pinned").unwrap_or(false),
-                pin_note: r.try_get("pin_note").unwrap_or(None),
-                replayed_from_id: r.try_get("replayed_from_id").unwrap_or(None),
-                actor_id: r.try_get("actor_id").unwrap_or(None),
-                workflow_version_id: r.try_get("workflow_version_id").unwrap_or(None),
-                priority: r.try_get("priority").unwrap_or(None),
-                is_test_execution: r.try_get("is_test_execution").unwrap_or(false),
-                provenance: r.try_get("provenance").unwrap_or(None),
-                acknowledged_at: r.try_get("acknowledged_at").unwrap_or(None),
-                acknowledgement_reason: r.try_get("acknowledgement_reason").unwrap_or(None),
+                error_message: r.try_get::<Option<_>, _>("error_message")?,
+                is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+                pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+                replayed_from_id: r.try_get::<Option<_>, _>("replayed_from_id")?,
+                actor_id: r.try_get::<Option<_>, _>("actor_id")?,
+                workflow_version_id: r.try_get::<Option<_>, _>("workflow_version_id")?,
+                priority: r.try_get::<Option<_>, _>("priority")?,
+                is_test_execution: r
+                    .try_get::<Option<_>, _>("is_test_execution")?
+                    .unwrap_or(false),
+                provenance: r.try_get::<Option<_>, _>("provenance")?,
+                acknowledged_at: r.try_get::<Option<_>, _>("acknowledged_at")?,
+                acknowledgement_reason: r.try_get::<Option<_>, _>("acknowledgement_reason")?,
             });
         }
         Ok(out)
@@ -819,25 +828,27 @@ impl ExecutionRepository {
         tx.commit().await?;
 
         let Some(r) = row else { return Ok(None) };
-        let output_data = self.read_output_from_row(&r).await;
+        let output_data = self.read_output_from_row(&r).await?;
         Ok(Some(ExecutionRow {
             id: r.get("id"),
             workflow_id: r.get("workflow_id"),
             status: r.get("status"),
-            started_at: r.try_get("started_at").unwrap_or(None),
-            completed_at: r.try_get("completed_at").unwrap_or(None),
+            started_at: r.try_get::<Option<_>, _>("started_at")?,
+            completed_at: r.try_get::<Option<_>, _>("completed_at")?,
             output_data,
-            error_message: r.try_get("error_message").unwrap_or(None),
-            is_pinned: r.try_get("is_pinned").unwrap_or(false),
-            pin_note: r.try_get("pin_note").unwrap_or(None),
-            replayed_from_id: r.try_get("replayed_from_id").unwrap_or(None),
-            actor_id: r.try_get("actor_id").unwrap_or(None),
-            workflow_version_id: r.try_get("workflow_version_id").unwrap_or(None),
-            priority: r.try_get("priority").unwrap_or(None),
-            is_test_execution: r.try_get("is_test_execution").unwrap_or(false),
-            provenance: r.try_get("provenance").unwrap_or(None),
-            acknowledged_at: r.try_get("acknowledged_at").unwrap_or(None),
-            acknowledgement_reason: r.try_get("acknowledgement_reason").unwrap_or(None),
+            error_message: r.try_get::<Option<_>, _>("error_message")?,
+            is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+            pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+            replayed_from_id: r.try_get::<Option<_>, _>("replayed_from_id")?,
+            actor_id: r.try_get::<Option<_>, _>("actor_id")?,
+            workflow_version_id: r.try_get::<Option<_>, _>("workflow_version_id")?,
+            priority: r.try_get::<Option<_>, _>("priority")?,
+            is_test_execution: r
+                .try_get::<Option<_>, _>("is_test_execution")?
+                .unwrap_or(false),
+            provenance: r.try_get::<Option<_>, _>("provenance")?,
+            acknowledged_at: r.try_get::<Option<_>, _>("acknowledged_at")?,
+            acknowledgement_reason: r.try_get::<Option<_>, _>("acknowledgement_reason")?,
         }))
     }
 
@@ -888,21 +899,22 @@ impl ExecutionRepository {
         .await?;
         tx.commit().await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ExecutionSummary {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.try_get("workflow_name").unwrap_or(None),
-                status: r.get("status"),
-                started_at: r.try_get("started_at").unwrap_or(None),
-                completed_at: r.try_get("completed_at").unwrap_or(None),
-                error_message: r.try_get("error_message").unwrap_or(None),
-                is_pinned: r.try_get("is_pinned").unwrap_or(false),
-                priority: r.try_get("priority").unwrap_or(None),
-                pin_note: r.try_get("pin_note").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<ExecutionSummary> {
+                Ok(ExecutionSummary {
+                    id: r.get("id"),
+                    workflow_id: r.get("workflow_id"),
+                    workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
+                    status: r.get("status"),
+                    started_at: r.try_get::<Option<_>, _>("started_at")?,
+                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+                    error_message: r.try_get::<Option<_>, _>("error_message")?,
+                    is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+                    priority: r.try_get::<Option<_>, _>("priority")?,
+                    pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Most recent execution for a workflow (for watch_execution workflow_id lookup).
@@ -927,23 +939,25 @@ impl ExecutionRepository {
         .await?;
 
         let Some(r) = row else { return Ok(None) };
-        let output_data = self.read_output_from_row(&r).await;
+        let output_data = self.read_output_from_row(&r).await?;
         Ok(Some(ExecutionRow {
             id: r.get("id"),
             workflow_id: r.get("workflow_id"),
             status: r.get("status"),
-            started_at: r.try_get("started_at").unwrap_or(None),
-            completed_at: r.try_get("completed_at").unwrap_or(None),
+            started_at: r.try_get::<Option<_>, _>("started_at")?,
+            completed_at: r.try_get::<Option<_>, _>("completed_at")?,
             output_data,
-            error_message: r.try_get("error_message").unwrap_or(None),
-            is_pinned: r.try_get("is_pinned").unwrap_or(false),
-            pin_note: r.try_get("pin_note").unwrap_or(None),
-            replayed_from_id: r.try_get("replayed_from_id").unwrap_or(None),
-            actor_id: r.try_get("actor_id").unwrap_or(None),
-            workflow_version_id: r.try_get("workflow_version_id").unwrap_or(None),
-            priority: r.try_get("priority").unwrap_or(None),
-            is_test_execution: r.try_get("is_test_execution").unwrap_or(false),
-            provenance: r.try_get("provenance").unwrap_or(None),
+            error_message: r.try_get::<Option<_>, _>("error_message")?,
+            is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+            pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+            replayed_from_id: r.try_get::<Option<_>, _>("replayed_from_id")?,
+            actor_id: r.try_get::<Option<_>, _>("actor_id")?,
+            workflow_version_id: r.try_get::<Option<_>, _>("workflow_version_id")?,
+            priority: r.try_get::<Option<_>, _>("priority")?,
+            is_test_execution: r
+                .try_get::<Option<_>, _>("is_test_execution")?
+                .unwrap_or(false),
+            provenance: r.try_get::<Option<_>, _>("provenance")?,
             acknowledged_at: None,
             acknowledgement_reason: None,
         }))
@@ -971,21 +985,22 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ExecutionSummary {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.try_get("workflow_name").unwrap_or(None),
-                status: r.get("status"),
-                started_at: r.try_get("started_at").unwrap_or(None),
-                completed_at: r.try_get("completed_at").unwrap_or(None),
-                error_message: r.try_get("error_message").unwrap_or(None),
-                is_pinned: r.try_get("is_pinned").unwrap_or(false),
-                priority: r.try_get("priority").unwrap_or(None),
-                pin_note: r.try_get("pin_note").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<ExecutionSummary> {
+                Ok(ExecutionSummary {
+                    id: r.get("id"),
+                    workflow_id: r.get("workflow_id"),
+                    workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
+                    status: r.get("status"),
+                    started_at: r.try_get::<Option<_>, _>("started_at")?,
+                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+                    error_message: r.try_get::<Option<_>, _>("error_message")?,
+                    is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+                    priority: r.try_get::<Option<_>, _>("priority")?,
+                    pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// All pinned executions for a user.
@@ -1003,21 +1018,22 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ExecutionSummary {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.try_get("workflow_name").unwrap_or(None),
-                status: r.get("status"),
-                started_at: r.try_get("started_at").unwrap_or(None),
-                completed_at: r.try_get("completed_at").unwrap_or(None),
-                error_message: r.try_get("error_message").unwrap_or(None),
-                is_pinned: r.try_get("is_pinned").unwrap_or(false),
-                priority: r.try_get("priority").unwrap_or(None),
-                pin_note: r.try_get("pin_note").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<ExecutionSummary> {
+                Ok(ExecutionSummary {
+                    id: r.get("id"),
+                    workflow_id: r.get("workflow_id"),
+                    workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
+                    status: r.get("status"),
+                    started_at: r.try_get::<Option<_>, _>("started_at")?,
+                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+                    error_message: r.try_get::<Option<_>, _>("error_message")?,
+                    is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+                    priority: r.try_get::<Option<_>, _>("priority")?,
+                    pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Walk the replayed_from_id chain up to max_depth. Returns ordered list oldest→newest.
@@ -1076,26 +1092,30 @@ impl ExecutionRepository {
 
         let mut chain: Vec<ExecutionRow> = rows
             .into_iter()
-            .map(|r| ExecutionRow {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                status: r.get("status"),
-                started_at: r.try_get("started_at").unwrap_or(None),
-                completed_at: r.try_get("completed_at").unwrap_or(None),
-                output_data: r.try_get("output_data").unwrap_or(None),
-                error_message: r.try_get("error_message").unwrap_or(None),
-                is_pinned: r.try_get("is_pinned").unwrap_or(false),
-                pin_note: r.try_get("pin_note").unwrap_or(None),
-                replayed_from_id: r.try_get("replayed_from_id").unwrap_or(None),
-                actor_id: r.try_get("actor_id").unwrap_or(None),
-                workflow_version_id: r.try_get("workflow_version_id").unwrap_or(None),
-                priority: r.try_get("priority").unwrap_or(None),
-                is_test_execution: r.try_get("is_test_execution").unwrap_or(false),
-                provenance: r.try_get("provenance").unwrap_or(None),
-                acknowledged_at: None,
-                acknowledgement_reason: None,
+            .map(|r| -> Result<ExecutionRow> {
+                Ok(ExecutionRow {
+                    id: r.get("id"),
+                    workflow_id: r.get("workflow_id"),
+                    status: r.get("status"),
+                    started_at: r.try_get::<Option<_>, _>("started_at")?,
+                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+                    output_data: r.try_get::<Option<_>, _>("output_data")?,
+                    error_message: r.try_get::<Option<_>, _>("error_message")?,
+                    is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+                    pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+                    replayed_from_id: r.try_get::<Option<_>, _>("replayed_from_id")?,
+                    actor_id: r.try_get::<Option<_>, _>("actor_id")?,
+                    workflow_version_id: r.try_get::<Option<_>, _>("workflow_version_id")?,
+                    priority: r.try_get::<Option<_>, _>("priority")?,
+                    is_test_execution: r
+                        .try_get::<Option<_>, _>("is_test_execution")?
+                        .unwrap_or(false),
+                    provenance: r.try_get::<Option<_>, _>("provenance")?,
+                    acknowledged_at: None,
+                    acknowledgement_reason: None,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         chain.reverse(); // oldest → newest
         Ok(chain)
@@ -1113,19 +1133,20 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ExecutionEvent {
-                event_type: r.get("event_type"),
-                node_id: r.try_get("node_id").unwrap_or(None),
-                status: r.try_get("status").unwrap_or(None),
-                log_message: r.try_get("log_message").unwrap_or(None),
-                created_at: r.get("created_at"),
-                iteration_index: r.try_get("iteration_index").unwrap_or(None),
-                duration_ms: r.try_get("duration_ms").unwrap_or(None),
-                error_class: r.try_get("error_class").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<ExecutionEvent> {
+                Ok(ExecutionEvent {
+                    event_type: r.get("event_type"),
+                    node_id: r.try_get::<Option<_>, _>("node_id")?,
+                    status: r.try_get::<Option<_>, _>("status")?,
+                    log_message: r.try_get::<Option<_>, _>("log_message")?,
+                    created_at: r.get("created_at"),
+                    iteration_index: r.try_get::<Option<_>, _>("iteration_index")?,
+                    duration_ms: r.try_get::<Option<_>, _>("duration_ms")?,
+                    error_class: r.try_get::<Option<_>, _>("error_class")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Events for a specific node in an execution.
@@ -1145,19 +1166,20 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ExecutionEvent {
-                event_type: r.get("event_type"),
-                node_id: r.try_get("node_id").unwrap_or(None),
-                status: r.try_get("status").unwrap_or(None),
-                log_message: r.try_get("log_message").unwrap_or(None),
-                created_at: r.get("created_at"),
-                iteration_index: r.try_get("iteration_index").unwrap_or(None),
-                duration_ms: r.try_get("duration_ms").unwrap_or(None),
-                error_class: r.try_get("error_class").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<ExecutionEvent> {
+                Ok(ExecutionEvent {
+                    event_type: r.get("event_type"),
+                    node_id: r.try_get::<Option<_>, _>("node_id")?,
+                    status: r.try_get::<Option<_>, _>("status")?,
+                    log_message: r.try_get::<Option<_>, _>("log_message")?,
+                    created_at: r.get("created_at"),
+                    iteration_index: r.try_get::<Option<_>, _>("iteration_index")?,
+                    duration_ms: r.try_get::<Option<_>, _>("duration_ms")?,
+                    error_class: r.try_get::<Option<_>, _>("error_class")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // ── Workflow reads (used by execution handlers) ────────────────────────
@@ -2023,19 +2045,20 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ExecutionEvent {
-                event_type: r.get("event_type"),
-                node_id: r.try_get("node_id").unwrap_or(None),
-                status: r.try_get("status").unwrap_or(None),
-                log_message: r.try_get("log_message").unwrap_or(None),
-                created_at: r.get("created_at"),
-                iteration_index: r.try_get("iteration_index").unwrap_or(None),
-                duration_ms: r.try_get("duration_ms").unwrap_or(None),
-                error_class: r.try_get("error_class").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<ExecutionEvent> {
+                Ok(ExecutionEvent {
+                    event_type: r.get("event_type"),
+                    node_id: r.try_get::<Option<_>, _>("node_id")?,
+                    status: r.try_get::<Option<_>, _>("status")?,
+                    log_message: r.try_get::<Option<_>, _>("log_message")?,
+                    created_at: r.get("created_at"),
+                    iteration_index: r.try_get::<Option<_>, _>("iteration_index")?,
+                    duration_ms: r.try_get::<Option<_>, _>("duration_ms")?,
+                    error_class: r.try_get::<Option<_>, _>("error_class")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Direct child executions replayed from a given execution (for replay chain forward walk).
@@ -2078,17 +2101,18 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| NodeHistoryEvent {
-                execution_id: r.get("execution_id"),
-                event_type: r.get("event_type"),
-                status: r.try_get("status").unwrap_or(None),
-                log_message: r.try_get("log_message").unwrap_or(None),
-                created_at: r.get("created_at"),
-                execution_started_at: r.try_get("execution_started_at").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<NodeHistoryEvent> {
+                Ok(NodeHistoryEvent {
+                    execution_id: r.get("execution_id"),
+                    event_type: r.get("event_type"),
+                    status: r.try_get::<Option<_>, _>("status")?,
+                    log_message: r.try_get::<Option<_>, _>("log_message")?,
+                    created_at: r.get("created_at"),
+                    execution_started_at: r.try_get::<Option<_>, _>("execution_started_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Recent executions for a workflow with full output_data — used by get_execution_delta.
@@ -2118,23 +2142,25 @@ impl ExecutionRepository {
 
         let mut result = Vec::with_capacity(rows.len());
         for r in &rows {
-            let output_data = self.read_output_from_row(r).await;
+            let output_data = self.read_output_from_row(r).await?;
             result.push(ExecutionRow {
                 id: r.get("id"),
                 workflow_id: r.get("workflow_id"),
                 status: r.get("status"),
-                started_at: r.try_get("started_at").unwrap_or(None),
-                completed_at: r.try_get("completed_at").unwrap_or(None),
+                started_at: r.try_get::<Option<_>, _>("started_at")?,
+                completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                 output_data,
-                error_message: r.try_get("error_message").unwrap_or(None),
-                is_pinned: r.try_get("is_pinned").unwrap_or(false),
-                pin_note: r.try_get("pin_note").unwrap_or(None),
-                replayed_from_id: r.try_get("replayed_from_id").unwrap_or(None),
-                actor_id: r.try_get("actor_id").unwrap_or(None),
-                workflow_version_id: r.try_get("workflow_version_id").unwrap_or(None),
-                priority: r.try_get("priority").unwrap_or(None),
-                is_test_execution: r.try_get("is_test_execution").unwrap_or(false),
-                provenance: r.try_get("provenance").unwrap_or(None),
+                error_message: r.try_get::<Option<_>, _>("error_message")?,
+                is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+                pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+                replayed_from_id: r.try_get::<Option<_>, _>("replayed_from_id")?,
+                actor_id: r.try_get::<Option<_>, _>("actor_id")?,
+                workflow_version_id: r.try_get::<Option<_>, _>("workflow_version_id")?,
+                priority: r.try_get::<Option<_>, _>("priority")?,
+                is_test_execution: r
+                    .try_get::<Option<_>, _>("is_test_execution")?
+                    .unwrap_or(false),
+                provenance: r.try_get::<Option<_>, _>("provenance")?,
                 acknowledged_at: None,
                 acknowledgement_reason: None,
             });
@@ -2308,18 +2334,19 @@ impl ExecutionRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ChildExecutionRow {
-                execution_id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.try_get("workflow_name").ok(),
-                status: r.try_get("status").unwrap_or_default(),
-                started_at: r.try_get("started_at").ok(),
-                completed_at: r.try_get("completed_at").ok(),
-                error_message: r.try_get("error_message").ok(),
+        rows.iter()
+            .map(|r| -> Result<ChildExecutionRow> {
+                Ok(ChildExecutionRow {
+                    execution_id: r.get("id"),
+                    workflow_id: r.get("workflow_id"),
+                    workflow_name: r.try_get("workflow_name").ok(),
+                    status: r.try_get::<Option<_>, _>("status")?.unwrap_or_default(),
+                    started_at: r.try_get("started_at").ok(),
+                    completed_at: r.try_get("completed_at").ok(),
+                    error_message: r.try_get("error_message").ok(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fetch all executions in a lineage tree rooted at `root_id`.
@@ -2374,15 +2401,16 @@ impl ExecutionRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ModuleExecutionResourceRow {
-                id: r.get("id"),
-                module_id: r.get("module_id"),
-                status: r.get("status"),
-                error_message: r.try_get("error_message").unwrap_or(None),
+        rows.iter()
+            .map(|r| -> Result<ModuleExecutionResourceRow> {
+                Ok(ModuleExecutionResourceRow {
+                    id: r.get("id"),
+                    module_id: r.get("module_id"),
+                    status: r.get("status"),
+                    error_message: r.try_get::<Option<_>, _>("error_message")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Verify that a module_execution exists and is owned by the given user.
