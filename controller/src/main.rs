@@ -4490,7 +4490,7 @@ fn build_schema_and_services(
             tokio::spawn,
         ))
         .data(async_graphql::dataloader::DataLoader::new(
-            crate::api::schema::ModuleExecutionLogLoader(db_pool.clone()),
+            crate::api::schema::ModuleExecutionLogLoader(module_execution_service.clone()),
             tokio::spawn,
         ))
         .data(nats_client.clone())
