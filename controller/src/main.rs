@@ -287,6 +287,11 @@ async fn main() -> anyhow::Result<()> {
             | "deactivate-worker-identity" => {
                 return run_worker_identity_cli(sub, &args[2..]).await;
             }
+            "mint-worker-provisioning-token"
+            | "list-worker-provisioning-tokens"
+            | "revoke-worker-provisioning-token" => {
+                return run_worker_provisioning_token_cli(sub, &args[2..]).await;
+            }
             "--help" | "-h" => {
                 println!("Usage:");
                 println!("  controller                            Run the HTTP server (default)");
@@ -326,6 +331,24 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     "                                        Soft-retire one registered key (rotation)."
                 );
+                println!(
+                    "  controller mint-worker-provisioning-token --worker-id <id> | --wildcard"
+                );
+                println!(
+                    "                                        [--ttl-hours <n>] [--note <text>]"
+                );
+                println!(
+                    "                                        Mint a single-use registration token"
+                );
+                println!(
+                    "                                        (RFC 0010 P2; bound tokens authorize"
+                );
+                println!("                                        exactly one worker_id).");
+                println!(
+                    "  controller list-worker-provisioning-tokens   List minted tokens (no secrets)."
+                );
+                println!("  controller revoke-worker-provisioning-token --id <uuid>");
+                println!("                                        Revoke an un-redeemed token.");
                 return Ok(());
             }
             // Anything else: fall through to server mode (preserves existing
@@ -6424,6 +6447,192 @@ async fn run_worker_identity_cli(sub: &str, args: &[String]) -> anyhow::Result<(
                     sealing = r.supports_sealing,
                     active = r.active,
                     seen = r.last_seen_at.to_rfc3339(),
+                );
+            }
+        }
+        _ => unreachable!("dispatch guarded by the match in main()"),
+    }
+    Ok(())
+}
+
+// ------- worker provisioning-token subcommands (RFC 0010 P2 inc.2/3) --------
+//
+// Operator mint/list/revoke for `worker_provisioning_tokens` — the single-use,
+// worker_id-bound credentials the registration endpoint redeems. Same trust
+// model as the worker-identity subcommands above: DB credentials ARE the
+// authorization. The raw token is printed ONCE to stdout (like
+// generate-worker-trust-keypair) and only its SHA-256 is stored; mints and
+// revokes append to `admin_event_log` (user_id NULL — no platform user exists
+// on this path) so the token lifecycle is auditable end-to-end.
+async fn run_worker_provisioning_token_cli(sub: &str, args: &[String]) -> anyhow::Result<()> {
+    use talos_worker_identity_repository::WorkerIdentityRepository;
+
+    let mut worker_id: Option<String> = None;
+    let mut wildcard = false;
+    let mut ttl_hours: i64 = 24;
+    let mut note: Option<String> = None;
+    let mut id: Option<uuid::Uuid> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--worker-id" => {
+                worker_id = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--worker-id requires a value"))?
+                        .clone(),
+                );
+            }
+            "--wildcard" => wildcard = true,
+            "--ttl-hours" => {
+                ttl_hours = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--ttl-hours requires a value"))?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--ttl-hours must be an integer"))?;
+            }
+            "--note" => {
+                note = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--note requires a value"))?
+                        .clone(),
+                );
+            }
+            "--id" => {
+                id = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--id requires a value"))?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--id must be a UUID"))?,
+                );
+            }
+            other => anyhow::bail!("unknown {sub} flag: {other}"),
+        }
+    }
+
+    let pool = crate::db::init_pool().await?;
+    let repo = WorkerIdentityRepository::new(pool);
+
+    match sub {
+        "mint-worker-provisioning-token" => {
+            // Binding is an explicit choice: wildcard must be SPELLED OUT, so
+            // an operator can't mint an any-worker token by forgetting a flag.
+            let binding = match (&worker_id, wildcard) {
+                (Some(_), true) => {
+                    anyhow::bail!("--worker-id and --wildcard are mutually exclusive")
+                }
+                (None, false) => anyhow::bail!(
+                    "specify --worker-id <id> (bound, recommended) or --wildcard (migration \
+                     compat; refused when TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1)"
+                ),
+                (Some(wid), false) => {
+                    talos_workflow_job_protocol::validate_worker_id(wid)
+                        .map_err(|e| anyhow::anyhow!("invalid --worker-id: {e}"))?;
+                    Some(wid.clone())
+                }
+                (None, true) => None,
+            };
+            if !(1..=24 * 30).contains(&ttl_hours) {
+                anyhow::bail!("--ttl-hours must be between 1 and 720 (30 days)");
+            }
+            // Bound the note so the audit/list surfaces stay sane.
+            if note.as_ref().is_some_and(|n| n.len() > 500) {
+                anyhow::bail!("--note must be at most 500 bytes");
+            }
+
+            // 32 bytes of OS entropy, hex-encoded, prefixed for greppability.
+            // Only the SHA-256 of this string is persisted.
+            let raw_token = {
+                use rand::RngCore;
+                let mut buf = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut buf);
+                format!("wpt_{}", hex::encode(buf))
+            };
+            let expires_at = chrono::Utc::now() + chrono::Duration::hours(ttl_hours);
+            let token_id = repo
+                .create_provisioning_token(
+                    &provisioning_token_hash(&raw_token),
+                    binding.as_deref(),
+                    expires_at,
+                    note.as_deref(),
+                )
+                .await?;
+            repo.insert_provisioning_token_audit(
+                "worker_provisioning_token_minted",
+                token_id,
+                &format!(
+                    "minted worker provisioning token for {} (ttl {ttl_hours}h)",
+                    binding.as_deref().unwrap_or("WILDCARD")
+                ),
+                Some(&serde_json::json!({
+                    "worker_id": binding,
+                    "expires_at": expires_at.to_rfc3339(),
+                    "note": note,
+                })),
+            )
+            .await?;
+
+            eprintln!("# ─────────────────────────────────────────────────────────────────────");
+            eprintln!("# Worker provisioning token — shown ONCE, only its SHA-256 is stored.");
+            eprintln!("# Hand it to exactly ONE worker pod as its registration bearer, then");
+            eprintln!("# discard it. Single-use; expires {expires_at}.");
+            eprintln!("# ─────────────────────────────────────────────────────────────────────");
+            match &binding {
+                Some(wid) => println!("# ── on WORKER '{wid}' (bound: registers only this id) ──"),
+                None => println!("# ── WILDCARD token (any worker_id, TOFU rule applies) ──"),
+            }
+            println!("TALOS_WORKER_REGISTRATION_TOKEN={raw_token}");
+            println!("# token id: {token_id}  (revoke-worker-provisioning-token --id {token_id})");
+        }
+        "list-worker-provisioning-tokens" => {
+            let rows = repo.list_provisioning_tokens().await?;
+            if rows.is_empty() {
+                println!("(no worker provisioning tokens minted)");
+            }
+            let now = chrono::Utc::now();
+            for r in rows {
+                // One derived status keeps the listing scannable; precedence
+                // mirrors the redeem SQL (used beats revoked beats expired).
+                let status = if let Some(used) = r.used_at {
+                    format!(
+                        "USED by '{}' at {}",
+                        r.used_by_worker_id.as_deref().unwrap_or("?"),
+                        used.to_rfc3339()
+                    )
+                } else if let Some(revoked) = r.revoked_at {
+                    format!("REVOKED at {}", revoked.to_rfc3339())
+                } else if r.expires_at <= now {
+                    "EXPIRED".to_string()
+                } else {
+                    "live".to_string()
+                };
+                println!(
+                    "{id}\t{binding}\texpires={expires}\t{status}\t{note}",
+                    id = r.id,
+                    binding = r
+                        .worker_id
+                        .as_deref()
+                        .map(|w| format!("worker={w}"))
+                        .unwrap_or_else(|| "WILDCARD".to_string()),
+                    expires = r.expires_at.to_rfc3339(),
+                    note = r.note.as_deref().unwrap_or(""),
+                );
+            }
+        }
+        "revoke-worker-provisioning-token" => {
+            let id = id.ok_or_else(|| anyhow::anyhow!("--id <uuid> is required"))?;
+            if repo.revoke_provisioning_token(id).await? {
+                repo.insert_provisioning_token_audit(
+                    "worker_provisioning_token_revoked",
+                    id,
+                    "revoked worker provisioning token",
+                    None,
+                )
+                .await?;
+                println!("revoked provisioning token {id}");
+            } else {
+                println!(
+                    "token {id} was not live (already used, already revoked, or unknown) — \
+                     nothing changed"
                 );
             }
         }

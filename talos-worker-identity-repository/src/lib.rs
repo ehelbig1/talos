@@ -421,6 +421,36 @@ impl WorkerIdentityRepository {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Append a provisioning-token lifecycle event to `admin_event_log` — the
+    /// same audit trail the platform's operator mutations write, keyed on
+    /// `resource_type = 'worker_provisioning_token'` / the token row id.
+    /// `user_id` is NULL: mints/revokes happen from the DB-credentialed
+    /// operator CLI, where holding DB credentials IS the authorization and no
+    /// platform user exists. Callers must never place token material in
+    /// `summary`/`details` — mint-site discipline, the raw token is shown once
+    /// on the mint stdout and exists nowhere else.
+    pub async fn insert_provisioning_token_audit(
+        &self,
+        event_type: &str,
+        token_id: uuid::Uuid,
+        summary: &str,
+        details: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO admin_event_log
+             (user_id, event_type, resource_type, resource_id, summary, details)
+             VALUES (NULL, $1, 'worker_provisioning_token', $2, $3, $4)",
+        )
+        .bind(event_type)
+        .bind(token_id)
+        .bind(summary)
+        .bind(details)
+        .execute(&self.db_pool)
+        .await
+        .context("insert provisioning-token audit event")?;
+        Ok(())
+    }
+
     /// All provisioning-token rows for the operator listing surface, newest
     /// first. Exposes metadata only — never `token_hash` (an offline-crackable
     /// digest has no business in ops output).
