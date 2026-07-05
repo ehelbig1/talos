@@ -5973,13 +5973,22 @@ async fn refresh_worker_key_overlay(
 //   4. A freshness window bounds replay of a captured request; registration is
 //      idempotent so replay is otherwise benign.
 //   5. The inc.4a per-worker active-key cap bounds table inflation.
+//   6. TRUST-ON-FIRST-USE (P2 hardening): the shared token proves "a legit
+//      worker pod", not a specific worker_id, so this path binds each worker_id
+//      to its FIRST registered key. After that, only an idempotent refresh of
+//      that exact active key is accepted — a different key, a revoked key, or a
+//      claim on a retired worker_id is a 409 (`register_tofu`). Without this, a
+//      compromised token-holder could register its own key under another
+//      worker's id and impersonate it for result signing / P3 secret claims.
+//      Rotation and revocation reversal are operator actions (the
+//      `register-worker-identity` CLI, DB-credentialed) — workers never
+//      generate keys in-pod, so a legitimate new key always accompanies an
+//      operator anyway.
 //
-// Residual (documented in the RFC): the SHARED token authenticates "a legit
-// worker pod", not a specific worker_id, so an already-compromised worker holding
-// the token could register its own key under a DIFFERENT worker_id. That is still
-// strictly smaller than today's WSK model (any compromised worker forges as ANY
-// worker/tenant). The hardening path is per-worker provisioning tokens or an
-// mTLS client-cert whose SAN binds worker_id — tracked as a follow-up.
+// Residual (documented in the RFC): TOFU still lets a token-holder claim a
+// NEVER-BEFORE-SEEN worker_id first. The remaining hardening path is per-worker
+// provisioning tokens (single-use, worker_id-bound, hashed at rest) or an mTLS
+// client-cert whose SAN binds worker_id — tracked as a follow-up.
 
 /// The configured registration bearer token, injected as an axum `Extension` on
 /// the internal sub-router. Present only when the route is mounted (i.e. the env
@@ -6119,14 +6128,15 @@ async fn register_worker_key_handler(
         return worker_reg_error(StatusCode::UNAUTHORIZED, "proof-of-possession failed");
     }
 
-    // 4) Persist (idempotent upsert + per-worker cap), then eagerly refresh the
-    //    verify overlay so the worker's very first result verifies immediately.
+    // 4) Persist under the TOFU rule (first key wins; only that key may
+    //    refresh itself here), then eagerly refresh the verify overlay so the
+    //    worker's very first result verifies immediately.
     let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool);
     match repo
-        .register(&req.worker_id, &public_key, req.supports_sealing)
+        .register_tofu(&req.worker_id, &public_key, req.supports_sealing)
         .await
     {
-        Ok(talos_worker_identity_repository::RegisterOutcome::Registered) => {
+        Ok(talos_worker_identity_repository::TofuOutcome::Registered) => {
             if let Err(e) = refresh_worker_key_overlay(&repo).await {
                 // Non-fatal: the periodic task will pick it up within its interval.
                 tracing::warn!(
@@ -6147,10 +6157,26 @@ async fn register_worker_key_handler(
                 axum::Json(serde_json::json!({ "status": "registered" })),
             )
         }
-        Ok(talos_worker_identity_repository::RegisterOutcome::CapReached) => worker_reg_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "worker already holds the maximum active keys; deactivate one first",
-        ),
+        Ok(talos_worker_identity_repository::TofuOutcome::IdentityConflict) => {
+            // The single loudest signal this endpoint can emit: a token-holder
+            // tried to bind a key that is NOT this worker_id's trusted key —
+            // either in-fleet impersonation or an unmanaged rotation. Public
+            // key material only (never the bearer token).
+            tracing::warn!(
+                target: "talos_security",
+                event_kind = "worker_key_tofu_conflict",
+                worker_id = %req.worker_id,
+                submitted_public_key = %hex::encode(public_key),
+                "worker-key registration REFUSED: worker_id already has a bound \
+                 identity and the submitted key does not match its active key. \
+                 Possible in-fleet impersonation attempt; legitimate rotation \
+                 goes through the register-worker-identity operator CLI."
+            );
+            worker_reg_error(
+                StatusCode::CONFLICT,
+                "worker_id already has a registered identity; rotation requires operator action",
+            )
+        }
         Err(e) => {
             // Log full error server-side; return a generic message (no schema leak).
             tracing::error!(

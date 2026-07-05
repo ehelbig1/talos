@@ -50,6 +50,26 @@ pub enum RegisterOutcome {
     CapReached,
 }
 
+/// Outcome of a [`WorkerIdentityRepository::register_tofu`] call — the
+/// trust-on-first-use rule the shared-token network registration path enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TofuOutcome {
+    /// The key is active: either this `worker_id` had no history at all (first
+    /// use — the key is now its trusted identity) or the submitted key IS the
+    /// worker's existing ACTIVE key (idempotent boot-time refresh; bumps
+    /// `last_seen_at` and the `supports_sealing` bit).
+    Registered,
+    /// Refused: `worker_id` already has registration history and the submitted
+    /// key is not one of its ACTIVE keys. Covers all three impersonation /
+    /// revocation-bypass shapes: a DIFFERENT key while active keys exist, a
+    /// re-activation attempt on a deliberately deactivated key, and a claim on
+    /// a decommissioned `worker_id` (rows exist, all inactive). Rotation,
+    /// revocation reversal, and identity re-issue are operator actions
+    /// (`register-worker-identity` CLI / a worker_id-bound provisioning token),
+    /// never a shared-bearer-token network call.
+    IdentityConflict,
+}
+
 pub struct WorkerIdentityRepository {
     db_pool: PgPool,
 }
@@ -119,6 +139,97 @@ impl WorkerIdentityRepository {
         } else {
             RegisterOutcome::CapReached
         })
+    }
+
+    /// Trust-on-first-use registration — the rule for the NETWORK
+    /// self-registration path, where the caller is authenticated only as "some
+    /// pod holding the shared registration token", not as a specific worker.
+    ///
+    /// A `worker_id`'s FIRST registered key becomes its trusted identity; from
+    /// then on this path only accepts an idempotent refresh of that exact
+    /// ACTIVE key. Anything else — a different key, a deactivated key, a new
+    /// key for a fully-retired `worker_id` — is [`TofuOutcome::IdentityConflict`]:
+    /// without this rule, any shared-token holder could register its own key
+    /// under another worker's id and impersonate it for result signing and
+    /// (P3) secret claims. Legitimate key rotation always accompanies an
+    /// operator (worker signing keys are provisioned via Secret, never
+    /// generated in-pod), so the operator paths — [`Self::register`] via the
+    /// CLI — carry the rotation semantics instead.
+    ///
+    /// Same advisory-lock serialisation as [`Self::register`], so a concurrent
+    /// first-use race on one `worker_id` admits exactly one key.
+    pub async fn register_tofu(
+        &self,
+        worker_id: &str,
+        public_key: &[u8; 32],
+        supports_sealing: bool,
+    ) -> Result<TofuOutcome> {
+        let mut tx = self.db_pool.begin().await.context("begin tofu tx")?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(worker_id)
+            .execute(&mut *tx)
+            .await
+            .context("advisory lock")?;
+
+        // Exact-row lookup: does this (worker_id, key) pair already exist, and
+        // is it live? Typed query_scalar — no silent-default reads (check 52).
+        let exact: Option<bool> = sqlx::query_scalar(
+            "SELECT active FROM worker_identities WHERE worker_id = $1 AND public_key = $2",
+        )
+        .bind(worker_id)
+        .bind(&public_key[..])
+        .fetch_optional(&mut *tx)
+        .await
+        .context("tofu exact-row lookup")?;
+
+        let outcome = match exact {
+            // Idempotent refresh of the worker's own ACTIVE key.
+            Some(true) => {
+                sqlx::query(
+                    "UPDATE worker_identities
+                     SET supports_sealing = $3, last_seen_at = now()
+                     WHERE worker_id = $1 AND public_key = $2",
+                )
+                .bind(worker_id)
+                .bind(&public_key[..])
+                .bind(supports_sealing)
+                .execute(&mut *tx)
+                .await
+                .context("tofu refresh")?;
+                TofuOutcome::Registered
+            }
+            // The key exists but was deliberately deactivated — re-activating
+            // it here would let a shared-token holder undo a revocation.
+            Some(false) => TofuOutcome::IdentityConflict,
+            None => {
+                let history: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM worker_identities WHERE worker_id = $1",
+                )
+                .bind(worker_id)
+                .fetch_one(&mut *tx)
+                .await
+                .context("tofu history count")?;
+                if history == 0 {
+                    sqlx::query(
+                        "INSERT INTO worker_identities (worker_id, public_key, supports_sealing)
+                         VALUES ($1, $2, $3)",
+                    )
+                    .bind(worker_id)
+                    .bind(&public_key[..])
+                    .bind(supports_sealing)
+                    .execute(&mut *tx)
+                    .await
+                    .context("tofu first-use insert")?;
+                    TofuOutcome::Registered
+                } else {
+                    TofuOutcome::IdentityConflict
+                }
+            }
+        };
+
+        tx.commit().await.context("commit tofu tx")?;
+        Ok(outcome)
     }
 
     /// Every ACTIVE `(worker_id, public_key)` pair. The controller's refresh task
@@ -279,6 +390,84 @@ mod tests {
         assert_eq!(mine[0].public_key, key(1));
         // The re-register updated the capability bit.
         assert!(repo.worker_supports_sealing(wid).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tofu_first_use_then_idempotent_then_conflicts() {
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-tofu-worker";
+        clean(&repo.db_pool, wid).await;
+
+        // First use: no history → key(1) becomes the trusted identity.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false).await.unwrap(),
+            TofuOutcome::Registered
+        );
+        // Idempotent same-key refresh, updating the capability bit.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), true).await.unwrap(),
+            TofuOutcome::Registered
+        );
+        assert!(repo.worker_supports_sealing(wid).await.unwrap());
+
+        // A DIFFERENT key for the same worker_id is refused (the gap this
+        // closes: shared-token impersonation).
+        assert_eq!(
+            repo.register_tofu(wid, &key(2), false).await.unwrap(),
+            TofuOutcome::IdentityConflict
+        );
+        // ...and the refusal wrote nothing.
+        let active: Vec<_> = repo
+            .load_active_registry()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.worker_id == wid)
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].public_key, key(1));
+    }
+
+    #[tokio::test]
+    async fn tofu_refuses_revoked_key_reactivation_and_retired_id_claims() {
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-tofu-revoked-worker";
+        clean(&repo.db_pool, wid).await;
+
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false).await.unwrap(),
+            TofuOutcome::Registered
+        );
+        // Operator revokes the key (compromise / decommission).
+        assert!(repo.deactivate(wid, &key(1)).await.unwrap());
+
+        // The revoked key cannot re-activate itself over the network path.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false).await.unwrap(),
+            TofuOutcome::IdentityConflict
+        );
+        // Nor can a NEW key claim the retired worker_id (history exists).
+        assert_eq!(
+            repo.register_tofu(wid, &key(2), false).await.unwrap(),
+            TofuOutcome::IdentityConflict
+        );
+
+        // The OPERATOR path still rotates freely: register a new key, and the
+        // worker's subsequent boot-time TOFU refresh of that key succeeds.
+        assert_eq!(
+            repo.register(wid, &key(2), false).await.unwrap(),
+            RegisterOutcome::Registered
+        );
+        assert_eq!(
+            repo.register_tofu(wid, &key(2), true).await.unwrap(),
+            TofuOutcome::Registered
+        );
     }
 
     #[tokio::test]
