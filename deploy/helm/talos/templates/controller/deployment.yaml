@@ -239,6 +239,24 @@ spec:
             # See values.yaml controller.audit.chainSweepIntervalSecs.
             - name: AUDIT_CHAIN_SWEEP_INTERVAL_SECS
               value: {{ .Values.controller.audit.chainSweepIntervalSecs | quote }}
+            # RFC 0010 P2: worker self-registration (POST /internal/worker-key).
+            # The shared bearer is optional — absent from the bootstrap Secret
+            # means the env stays unset and the endpoint is not mounted
+            # (fail-closed), so this render is inert until an operator adds the
+            # key. See values.yaml § controller.workerRegistration.
+            - name: TALOS_WORKER_REGISTRATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: TALOS_WORKER_REGISTRATION_TOKEN
+                  optional: true
+            {{- if .Values.controller.workerRegistration.requireBoundToken }}
+            # Hardened end-state: only single-use worker_id-bound provisioning
+            # tokens register; shared/wildcard bearers are refused. Also mounts
+            # the endpoint when the shared token is absent entirely.
+            - name: TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN
+              value: "1"
+            {{- end }}
             {{- with .Values.controller.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
