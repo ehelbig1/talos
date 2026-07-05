@@ -186,39 +186,18 @@ impl ModulesQueries {
             .data_opt::<Uuid>()
             .ok_or_else(|| async_graphql::Error::new("Authentication required"))?;
 
-        #[derive(sqlx::FromRow)]
-        struct ModuleRow {
-            id: Uuid,
-            name: String,
-            size_bytes: i32,
-            content_hash: String,
-            compiled_at: chrono::DateTime<chrono::Utc>,
-            config: Option<serde_json::Value>,
-            source_code: Option<String>,
-            capability_world: Option<String>,
-            imported_interfaces: Option<Vec<String>>,
-            language: Option<String>,
-        }
-
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
-        // Phase 5.1: unified `modules` table. COALESCE nullable columns so
-        // the non-null `ModuleRow` shape still deserialises; canonical id.
-        let modules = sqlx::query_as::<_, ModuleRow>(
-            "SELECT id, name,
-                    COALESCE(size_bytes, 0) AS size_bytes,
-                    COALESCE(content_hash, '') AS content_hash,
-                    COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, source_code, capability_world, imported_interfaces, language
-             FROM modules
-             WHERE id = ANY($1)
-               AND (user_id = $2 OR org_id = ANY($3))",
-        )
-        .bind(&ids)
-        .bind(user_id)
-        .bind(&org_ids)
-        .fetch_all(db_pool)
-        .await?;
+        // Phase 5.1: unified `modules` table; bare-pool read preserved —
+        // scoping is the explicit (user_id, org_ids) predicate in the repo.
+        let repo = talos_module_repository::ModuleRepository::new(db_pool.clone());
+        let modules = repo
+            .get_modules_by_ids_scoped(&ids, *user_id, &org_ids)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to fetch modules: {}", e);
+                async_graphql::Error::new("Failed to fetch modules").extend_safe()
+            })?;
 
         Ok(modules
             .into_iter()
@@ -267,43 +246,19 @@ impl ModulesQueries {
             .unwrap_or(0)
             .max(0) as i64;
 
-        #[derive(sqlx::FromRow)]
-        struct ModuleRow {
-            id: Uuid,
-            name: String,
-            size_bytes: i32,
-            content_hash: String,
-            compiled_at: chrono::DateTime<chrono::Utc>,
-            config: Option<serde_json::Value>,
-            source_code: Option<String>,
-            capability_world: Option<String>,
-            imported_interfaces: Option<Vec<String>>,
-            language: Option<String>,
-        }
-
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
-        // Phase 5: unified `modules` table. COALESCE nullable columns so
-        // the non-null `ModuleRow` shape deserialises for catalog-only
-        // rows. Scope stays on (user_id, org_id) — catalog rows have NULL
+        // Phase 5: unified `modules` table; bare-pool read preserved.
+        // Scope stays on (user_id, org_id) — catalog rows have NULL
         // user_id and are excluded from "my modules".
-        let modules = sqlx::query_as::<_, ModuleRow>(
-            "SELECT id, name,
-                    COALESCE(size_bytes, 0) AS size_bytes,
-                    COALESCE(content_hash, '') AS content_hash,
-                    COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, source_code, capability_world, imported_interfaces, language
-             FROM modules
-             WHERE (user_id = $1 OR org_id = ANY($4))
-             ORDER BY COALESCE(compiled_at, created_at) DESC, id DESC
-             LIMIT $2 OFFSET $3",
-        )
-        .bind(user_id)
-        .bind(limit_val)
-        .bind(offset_val)
-        .bind(&org_ids)
-        .fetch_all(db_pool)
-        .await?;
+        let repo = talos_module_repository::ModuleRepository::new(db_pool.clone());
+        let modules = repo
+            .list_modules_for_user_paginated(*user_id, &org_ids, limit_val, offset_val)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to fetch modules: {}", e);
+                async_graphql::Error::new("Failed to fetch modules").extend_safe()
+            })?;
 
         Ok(modules
             .into_iter()

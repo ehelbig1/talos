@@ -111,6 +111,24 @@ pub struct ModuleListItem {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Full module detail row for the GraphQL `wasm_modules` / `my_modules`
+/// resolvers. Nullable storage columns are COALESCEd in the query so the
+/// non-null fields deserialize for catalog-only rows (Phase 5 unified
+/// `modules` table).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ModuleDetailsRow {
+    pub id: Uuid,
+    pub name: String,
+    pub size_bytes: i32,
+    pub content_hash: String,
+    pub compiled_at: chrono::DateTime<chrono::Utc>,
+    pub config: Option<serde_json::Value>,
+    pub source_code: Option<String>,
+    pub capability_world: Option<String>,
+    pub imported_interfaces: Option<Vec<String>>,
+    pub language: Option<String>,
+}
+
 /// Discriminator for `get_module_capability_world` — wasm_modules vs node_templates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleSource {
@@ -714,6 +732,66 @@ impl ModuleRepository {
                 updated_at: r.get("updated_at"),
             })
             .collect())
+    }
+
+    /// Batch-fetch full module details by id, scoped to modules the user
+    /// owns directly or through org membership. Backs the GraphQL
+    /// `wasm_modules` resolver (bare-pool read — the `modules` table is
+    /// not RLS-scoped through this path; scoping is the explicit
+    /// `(user_id, org_ids)` predicate).
+    pub async fn get_modules_by_ids_scoped(
+        &self,
+        ids: &[Uuid],
+        user_id: Uuid,
+        org_ids: &[Uuid],
+    ) -> Result<Vec<ModuleDetailsRow>> {
+        let rows = sqlx::query_as::<_, ModuleDetailsRow>(
+            "SELECT id, name,
+                    COALESCE(size_bytes, 0) AS size_bytes,
+                    COALESCE(content_hash, '') AS content_hash,
+                    COALESCE(compiled_at, created_at) AS compiled_at,
+                    config, source_code, capability_world, imported_interfaces, language
+             FROM modules
+             WHERE id = ANY($1)
+               AND (user_id = $2 OR org_id = ANY($3))",
+        )
+        .bind(ids)
+        .bind(user_id)
+        .bind(org_ids)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated full-detail listing of the modules a user owns directly
+    /// or through org membership. Backs the GraphQL `my_modules` resolver.
+    /// Catalog rows (NULL user_id, NULL org_id) are excluded by the scope
+    /// predicate. Unique `id DESC` tiebreaker keeps OFFSET pages stable.
+    pub async fn list_modules_for_user_paginated(
+        &self,
+        user_id: Uuid,
+        org_ids: &[Uuid],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ModuleDetailsRow>> {
+        let rows = sqlx::query_as::<_, ModuleDetailsRow>(
+            "SELECT id, name,
+                    COALESCE(size_bytes, 0) AS size_bytes,
+                    COALESCE(content_hash, '') AS content_hash,
+                    COALESCE(compiled_at, created_at) AS compiled_at,
+                    config, source_code, capability_world, imported_interfaces, language
+             FROM modules
+             WHERE (user_id = $1 OR org_id = ANY($4))
+             ORDER BY COALESCE(compiled_at, created_at) DESC, id DESC
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .bind(org_ids)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
     }
 
     // ── MCP-handler support: listing + info + scanning ─────────────────────
