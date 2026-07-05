@@ -34,6 +34,33 @@ pub struct GoogleCalendarIntegration {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Ownership probe: does `user_id` own an ACTIVE integration `integration_id`?
+///
+/// Takes the caller's pool explicitly so callers that only have a pool (not a
+/// constructed `GoogleCalendarService`) can run the check — e.g. the GraphQL
+/// `create_module_from_template` auto-setup path, which must verify ownership
+/// BEFORE creating watch channels with the integration's credentials, and must
+/// distinguish "not owned" (security event) from a DB probe failure (the
+/// caller maps `Err` separately — see MCP-840).
+pub async fn user_owns_active_integration(
+    pool: &Pool<Postgres>,
+    integration_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool> {
+    let owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM google_calendar_integrations
+            WHERE id = $1 AND user_id = $2 AND is_active = true
+        )",
+    )
+    .bind(integration_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to probe google_calendar_integrations ownership")?;
+    Ok(owned)
+}
+
 /// Watch channel for a calendar
 #[derive(Clone, Serialize, Deserialize)]
 pub struct WatchChannel {

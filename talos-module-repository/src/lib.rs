@@ -794,6 +794,23 @@ impl ModuleRepository {
         Ok(rows)
     }
 
+    /// Overwrite a module's `config` JSON by canonical id (Phase 5.1:
+    /// unified `modules` table). Caller is responsible for authorization —
+    /// used by the GraphQL `create_module_from_template` auto-setup path to
+    /// persist created watch-channel ids onto a module it just created.
+    pub async fn update_module_config(
+        &self,
+        module_id: Uuid,
+        config: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query("UPDATE modules SET config = $1 WHERE id = $2")
+            .bind(config)
+            .bind(module_id)
+            .execute(&self.db_pool)
+            .await?;
+        Ok(())
+    }
+
     // ── MCP-handler support: listing + info + scanning ─────────────────────
 
     /// List a user's modules from the unified `user_modules` view (unions

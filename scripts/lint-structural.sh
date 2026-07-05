@@ -3375,8 +3375,10 @@ echo
 bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count must not grow)"
 # 117 at introduction (2026-07-01); 108 after the trigger_workflow
 # migration onto ExecutionOrchestrationService removed 9 inline sites;
-# 106 after modules/queries.rs moved onto ModuleRepository (2026-07-05).
-TALOS_API_SQLX_BASELINE=106
+# 106 after modules/queries.rs moved onto ModuleRepository (2026-07-05);
+# 104 after modules/mutations.rs (gcal ownership probe → talos-google-calendar,
+# module-config write → ModuleRepository).
+TALOS_API_SQLX_BASELINE=104
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \
