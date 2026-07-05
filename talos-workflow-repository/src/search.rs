@@ -261,13 +261,18 @@ impl WorkflowRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| WorkflowSearchTextSource {
-            name: r.get("name"),
-            description: r.try_get("description").unwrap_or(None),
-            intent: r.try_get("intent").unwrap_or(None),
-            capabilities: r.try_get("capabilities").unwrap_or_default(),
-            graph_json: r.try_get("graph_json").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<WorkflowSearchTextSource> {
+            Ok(WorkflowSearchTextSource {
+                name: r.get("name"),
+                description: r.try_get::<Option<_>, _>("description")?,
+                intent: r.try_get::<Option<_>, _>("intent")?,
+                capabilities: r
+                    .try_get::<Option<_>, _>("capabilities")?
+                    .unwrap_or_default(),
+                graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+            })
+        })
+        .transpose()
     }
 
     /// Update the `search_text` column on a workflow (best-effort).
@@ -304,17 +309,20 @@ impl WorkflowRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| CapabilityDispatchPreviewRow {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
-                capabilities: r.try_get("capabilities").unwrap_or_default(),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                status: r.try_get("status").unwrap_or_default(),
-                updated_at: r.try_get("updated_at").unwrap_or(None),
+        rows.iter()
+            .map(|r| -> Result<CapabilityDispatchPreviewRow> {
+                Ok(CapabilityDispatchPreviewRow {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    capabilities: r
+                        .try_get::<Option<_>, _>("capabilities")?
+                        .unwrap_or_default(),
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    status: r.try_get::<Option<_>, _>("status")?.unwrap_or_default(),
+                    updated_at: r.try_get::<Option<_>, _>("updated_at")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Top N workflows by readiness_score (NULLS LAST). Used by
@@ -335,16 +343,19 @@ impl WorkflowRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| SessionContextWorkflowRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                capabilities: r.try_get("capabilities").unwrap_or_default(),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                graph_json: r.try_get("graph_json").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<SessionContextWorkflowRow> {
+                Ok(SessionContextWorkflowRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    capabilities: r
+                        .try_get::<Option<_>, _>("capabilities")?
+                        .unwrap_or_default(),
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    graph_json: r.try_get::<Option<_>, _>("graph_json")?.unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Most-recently-used workflows for a user via `workflow_reuse_events`.
@@ -365,14 +376,17 @@ impl WorkflowRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| RecentlyUsedWorkflowRow {
-                workflow_id: r.get("workflow_id"),
-                name: r.try_get("name").unwrap_or_default(),
-                capabilities: r.try_get("capabilities").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<RecentlyUsedWorkflowRow> {
+                Ok(RecentlyUsedWorkflowRow {
+                    workflow_id: r.get("workflow_id"),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    capabilities: r
+                        .try_get::<Option<_>, _>("capabilities")?
+                        .unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Keyword-match workflows by ILIKE on name/description/capabilities. Used
@@ -394,14 +408,17 @@ impl WorkflowRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| RecentlyUsedWorkflowRow {
-                workflow_id: r.get("id"),
-                name: r.try_get("name").unwrap_or_default(),
-                capabilities: r.try_get("capabilities").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<RecentlyUsedWorkflowRow> {
+                Ok(RecentlyUsedWorkflowRow {
+                    workflow_id: r.get("id"),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    capabilities: r
+                        .try_get::<Option<_>, _>("capabilities")?
+                        .unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     // ── search.rs MCP-handler support ──────────────────────────────────────
@@ -422,12 +439,17 @@ impl WorkflowRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| WorkflowEmbeddingSource {
-            name: r.try_get("name").unwrap_or_default(),
-            description: r.try_get("description").unwrap_or(None),
-            capabilities: r.try_get("capabilities").unwrap_or_default(),
-            intent: r.try_get("intent").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<WorkflowEmbeddingSource> {
+            Ok(WorkflowEmbeddingSource {
+                name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                description: r.try_get::<Option<_>, _>("description")?,
+                capabilities: r
+                    .try_get::<Option<_>, _>("capabilities")?
+                    .unwrap_or_default(),
+                intent: r.try_get::<Option<_>, _>("intent")?,
+            })
+        })
+        .transpose()
     }
 
     /// Set the embedding column from a pre-formatted pgvector literal string
@@ -528,18 +550,19 @@ impl WorkflowRepository {
             .fetch_all(&self.db_pool)
             .await?
         };
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowSearchRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.try_get("description").unwrap_or(None),
-                tags: r.try_get("tags").unwrap_or_default(),
-                status: r.try_get("status").unwrap_or(None),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
+        rows.iter()
+            .map(|r| -> Result<WorkflowSearchRow> {
+                Ok(WorkflowSearchRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    tags: r.try_get::<Option<_>, _>("tags")?.unwrap_or_default(),
+                    status: r.try_get::<Option<_>, _>("status")?,
+                    created_at: r.get("created_at"),
+                    updated_at: r.get("updated_at"),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Fetch the source-workflow graph_json string for `find_similar_workflows`.
@@ -636,17 +659,18 @@ impl WorkflowRepository {
             .fetch_all(&self.db_pool)
             .await?
         };
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowSemanticVectorRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.get("description"),
-                capabilities: r.get("capabilities"),
-                readiness_score: r.get("readiness_score"),
-                match_score: r.try_get("match_score").unwrap_or(0.0),
+        rows.iter()
+            .map(|r| -> Result<WorkflowSemanticVectorRow, sqlx::Error> {
+                Ok(WorkflowSemanticVectorRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    description: r.get("description"),
+                    capabilities: r.get("capabilities"),
+                    readiness_score: r.get("readiness_score"),
+                    match_score: r.try_get::<Option<_>, _>("match_score")?.unwrap_or(0.0),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// pg_trgm fuzzy keyword search with ILIKE fallback OR. Returns
@@ -712,22 +736,25 @@ impl WorkflowRepository {
             .fetch_all(&self.db_pool)
             .await?
         };
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowSemanticTrgmRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.try_get("description").unwrap_or(None),
-                capabilities: r.try_get("capabilities").unwrap_or_default(),
-                intent: r.try_get("intent").unwrap_or(None),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                match_score: r
-                    .try_get::<Option<f32>, _>("match_score")
-                    .ok()
-                    .flatten()
-                    .map(|f| f as f64),
+        rows.iter()
+            .map(|r| -> Result<WorkflowSemanticTrgmRow, sqlx::Error> {
+                Ok(WorkflowSemanticTrgmRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    capabilities: r
+                        .try_get::<Option<_>, _>("capabilities")?
+                        .unwrap_or_default(),
+                    intent: r.try_get::<Option<_>, _>("intent")?,
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    match_score: r
+                        .try_get::<Option<f32>, _>("match_score")
+                        .ok()
+                        .flatten()
+                        .map(|f| f as f64),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// ILIKE-only fallback for `search_workflows_trgm` when pg_trgm is
@@ -777,18 +804,21 @@ impl WorkflowRepository {
             .fetch_all(&self.db_pool)
             .await?
         };
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowSemanticTrgmRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.try_get("description").unwrap_or(None),
-                capabilities: r.try_get("capabilities").unwrap_or_default(),
-                intent: r.try_get("intent").unwrap_or(None),
-                readiness_score: r.try_get("readiness_score").unwrap_or(None),
-                match_score: None,
+        rows.iter()
+            .map(|r| -> Result<WorkflowSemanticTrgmRow, sqlx::Error> {
+                Ok(WorkflowSemanticTrgmRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    capabilities: r
+                        .try_get::<Option<_>, _>("capabilities")?
+                        .unwrap_or_default(),
+                    intent: r.try_get::<Option<_>, _>("intent")?,
+                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                    match_score: None,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Workflows that need embedding regeneration. When `force_refresh` is
@@ -820,16 +850,19 @@ impl WorkflowRepository {
             .fetch_all(&self.db_pool)
             .await?
         };
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowEmbeddingCandidate {
-                id: r.try_get("id").unwrap_or_default(),
-                name: r.try_get("name").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or(None),
-                capabilities: r.try_get("capabilities").unwrap_or_default(),
-                intent: r.try_get("intent").unwrap_or(None),
+        rows.iter()
+            .map(|r| -> Result<WorkflowEmbeddingCandidate> {
+                Ok(WorkflowEmbeddingCandidate {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    description: r.try_get::<Option<_>, _>("description")?,
+                    capabilities: r
+                        .try_get::<Option<_>, _>("capabilities")?
+                        .unwrap_or_default(),
+                    intent: r.try_get::<Option<_>, _>("intent")?,
+                })
             })
-            .collect())
+            .collect()
     }
 }
 

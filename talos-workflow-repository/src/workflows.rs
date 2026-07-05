@@ -272,23 +272,29 @@ impl WorkflowRepository {
         .await?;
         tx.commit().await?;
 
-        Ok(row.map(|r| WorkflowRecord {
-            id: r.get("id"),
-            name: r.get("name"),
-            graph_json: r.get("graph_json"),
-            tags: r.try_get("tags").unwrap_or_default(),
-            description: r.try_get("description").unwrap_or(None),
-            max_concurrent_executions: r.try_get("max_concurrent_executions").unwrap_or(None),
-            is_enabled: r.try_get("is_enabled").unwrap_or(true),
-            capabilities: r.try_get("capabilities").unwrap_or_default(),
-            intent: r.try_get("intent").unwrap_or(None),
-            readiness_score: r.try_get("readiness_score").unwrap_or(None),
-            actor_id: r.try_get("actor_id").unwrap_or(None),
-            status: r.try_get("status").unwrap_or(None),
-            workflow_type: r.try_get("workflow_type").unwrap_or(None),
-            timeout_seconds: r.try_get("timeout_seconds").unwrap_or(None),
-            input_schema: r.try_get("input_schema").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<WorkflowRecord> {
+            Ok(WorkflowRecord {
+                id: r.get("id"),
+                name: r.get("name"),
+                graph_json: r.get("graph_json"),
+                tags: r.try_get::<Option<_>, _>("tags")?.unwrap_or_default(),
+                description: r.try_get::<Option<_>, _>("description")?,
+                max_concurrent_executions: r
+                    .try_get::<Option<_>, _>("max_concurrent_executions")?,
+                is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(true),
+                capabilities: r
+                    .try_get::<Option<_>, _>("capabilities")?
+                    .unwrap_or_default(),
+                intent: r.try_get::<Option<_>, _>("intent")?,
+                readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                actor_id: r.try_get::<Option<_>, _>("actor_id")?,
+                status: r.try_get::<Option<_>, _>("status")?,
+                workflow_type: r.try_get::<Option<_>, _>("workflow_type")?,
+                timeout_seconds: r.try_get::<Option<_>, _>("timeout_seconds")?,
+                input_schema: r.try_get::<Option<_>, _>("input_schema")?,
+            })
+        })
+        .transpose()
     }
 
     /// Fetch `graph_json` for `workflow_id` scoped to `user_id`. Returns
@@ -927,9 +933,9 @@ impl WorkflowRepository {
         .await?;
 
         Ok(WorkflowVersionInfo {
-            total_versions: row.try_get("total_versions").unwrap_or(0),
-            latest_version: row.try_get("latest_version").unwrap_or(None),
-            last_published: row.try_get("last_published").unwrap_or(None),
+            total_versions: row.try_get::<Option<_>, _>("total_versions")?.unwrap_or(0),
+            latest_version: row.try_get::<Option<_>, _>("latest_version")?,
+            last_published: row.try_get::<Option<_>, _>("last_published")?,
         })
     }
 
@@ -1217,11 +1223,16 @@ impl WorkflowRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| WorkflowDuplicateSource {
-            name: r.try_get("name").unwrap_or_default(),
-            graph_json: r.try_get("graph_json").unwrap_or_else(|_| "{}".to_string()),
-            tags: r.try_get("tags").unwrap_or_default(),
-        }))
+        row.map(|r| -> Result<WorkflowDuplicateSource> {
+            Ok(WorkflowDuplicateSource {
+                name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                graph_json: r
+                    .try_get::<Option<_>, _>("graph_json")?
+                    .unwrap_or_else(|| "{}".to_string()),
+                tags: r.try_get::<Option<_>, _>("tags")?.unwrap_or_default(),
+            })
+        })
+        .transpose()
     }
 
     /// Insert a duplicated workflow row. Returns the DB error so callers
@@ -1354,16 +1365,21 @@ impl WorkflowRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| WorkflowIdentityRow {
-            name: r.get("name"),
-            description: r.try_get("description").unwrap_or(None),
-            capabilities: r.try_get("capabilities").unwrap_or_default(),
-            intent: r.try_get("intent").unwrap_or(None),
-            readiness_score: r.try_get("readiness_score").unwrap_or(None),
-            readiness_computed_at: r.try_get("readiness_computed_at").unwrap_or(None),
-            graph_json: r.try_get("graph_json").unwrap_or_default(),
-            input_schema: r.try_get("input_schema").unwrap_or(None),
-        }))
+        row.map(|r| -> Result<WorkflowIdentityRow> {
+            Ok(WorkflowIdentityRow {
+                name: r.get("name"),
+                description: r.try_get::<Option<_>, _>("description")?,
+                capabilities: r
+                    .try_get::<Option<_>, _>("capabilities")?
+                    .unwrap_or_default(),
+                intent: r.try_get::<Option<_>, _>("intent")?,
+                readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                readiness_computed_at: r.try_get::<Option<_>, _>("readiness_computed_at")?,
+                graph_json: r.try_get::<Option<_>, _>("graph_json")?.unwrap_or_default(),
+                input_schema: r.try_get::<Option<_>, _>("input_schema")?,
+            })
+        })
+        .transpose()
     }
 
     // ── platform.rs MCP-handler support ────────────────────────────────────
@@ -1444,21 +1460,24 @@ impl WorkflowRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowExportRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                graph_json: r.get("graph_json"),
-                is_enabled: r.try_get("is_enabled").unwrap_or(true),
-                cron_expression: r.try_get("cron_expression").unwrap_or(None),
-                timezone: r
-                    .try_get::<Option<String>, _>("timezone")
-                    .unwrap_or(None)
-                    .unwrap_or_else(|| "UTC".to_string()),
-                schedule_enabled: r.try_get("schedule_enabled").unwrap_or(true),
+        rows.iter()
+            .map(|r| -> Result<WorkflowExportRow> {
+                Ok(WorkflowExportRow {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    graph_json: r.get("graph_json"),
+                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(true),
+                    cron_expression: r.try_get::<Option<_>, _>("cron_expression")?,
+                    timezone: r
+                        .try_get::<Option<String>, _>("timezone")
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| "UTC".to_string()),
+                    schedule_enabled: r
+                        .try_get::<Option<_>, _>("schedule_enabled")?
+                        .unwrap_or(true),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Find a workflow by exact name match (regardless of status). Used by

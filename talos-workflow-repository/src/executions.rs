@@ -1235,15 +1235,18 @@ impl WorkflowRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| ActorRow {
-            id: r.get("id"),
-            name: r.get("name"),
-            status: r.get("status"),
-            max_workflow_count: r.try_get("max_workflow_count").unwrap_or(None),
-            max_executions_per_hour: r.try_get("max_executions_per_hour").unwrap_or(None),
-            max_executions_total: r.try_get("max_executions_total").unwrap_or(None),
-            is_default: r.try_get("is_default").unwrap_or(false),
-        }))
+        row.map(|r| -> Result<ActorRow> {
+            Ok(ActorRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                status: r.get("status"),
+                max_workflow_count: r.try_get::<Option<_>, _>("max_workflow_count")?,
+                max_executions_per_hour: r.try_get::<Option<_>, _>("max_executions_per_hour")?,
+                max_executions_total: r.try_get::<Option<_>, _>("max_executions_total")?,
+                is_default: r.try_get::<Option<_>, _>("is_default")?.unwrap_or(false),
+            })
+        })
+        .transpose()
     }
 
     /// Count non-archived workflows owned by an actor.
