@@ -154,8 +154,10 @@ for ctest in "${CTRL_TESTS[@]}"; do
     [ "$ctest" = "env_vars" ] && threadflag=(--test-threads=1)
     echo
     echo "▶ controller :: ${ctest}  [migrated:talos_ctl template → per-test isolated DB]"
+    # ${arr[@]+…} guard: bash 3.2 (macOS default) treats an EMPTY array
+    # expansion as unbound under `set -u` and aborts the whole script here.
     if ! DATABASE_URL="$CTL_URL" TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
-        cargo test -p controller --test "$ctest" -- "${threadflag[@]}"; then
+        cargo test -p controller --test "$ctest" -- ${threadflag[@]+"${threadflag[@]}"}; then
         rc=1
     fi
 done

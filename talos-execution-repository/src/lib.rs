@@ -2640,6 +2640,39 @@ impl ExecutionRepository {
         Ok(result.rows_affected())
     }
 
+    /// Decide an `execution_approvals` row BY APPROVAL ID (contrast the
+    /// sibling `update_execution_approval_decision`, keyed on execution_id)
+    /// with an ownership JOIN on the owning workflow. Takes the caller's
+    /// transaction rather than the repo pool: the GraphQL approve/deny
+    /// mutations run this on a `begin_user_scoped` tx so the workflows RLS
+    /// policy backstops the `w.user_id = $1` gate (RFC 0005 S3 —
+    /// execution_approvals has no policy itself). Do NOT route this through
+    /// `self.db_pool`; that would silently drop the RLS backstop.
+    /// Returns rows affected (0 = not found or not owned).
+    pub async fn decide_execution_approval_scoped(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        approval_id: Uuid,
+        user_id: Uuid,
+        decision_status: &str,
+        reason: Option<&str>,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE execution_approvals \
+             SET status = $1, decided_at = NOW(), decided_by = $2, reason = $3 \
+             FROM workflows w \
+             WHERE execution_approvals.id = $4 \
+               AND w.id = execution_approvals.workflow_id AND w.user_id = $2",
+        )
+        .bind(decision_status)
+        .bind(user_id)
+        .bind(reason)
+        .bind(approval_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Latest `node_input` event for a (execution_id, node_id) pair.
     /// Returns the raw `log_message` text, which the handler parses as JSON
     /// or surfaces as a plain string.

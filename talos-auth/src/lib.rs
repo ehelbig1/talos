@@ -1334,6 +1334,21 @@ impl AuthService {
         Ok(result.rows_affected())
     }
 
+    /// Revoke a user's pre-2FA sessions only (`is_2fa_verified = false`).
+    /// Fired after a successful TOTP verification: the sessions created at
+    /// initial password login are superseded by the fully-verified session
+    /// just issued, so leaving them alive would keep a lower-privilege
+    /// bearer credential valid for the rest of its TTL.
+    pub async fn revoke_pre_2fa_sessions(&self, user_id: Uuid) -> Result<u64> {
+        let result =
+            sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND is_2fa_verified = false")
+                .bind(user_id)
+                .execute(&self.db_pool)
+                .await
+                .context("Failed to revoke pre-2FA sessions")?;
+        Ok(result.rows_affected())
+    }
+
     /// Clean up expired sessions and stale rotated_session_audit rows.
     /// Both tables share the same 7-day refresh-token TTL, so they expire
     /// together. Tracking the audit table beyond its meaningful window

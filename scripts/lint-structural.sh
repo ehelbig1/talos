@@ -3379,8 +3379,12 @@ bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count m
 # 104 after modules/mutations.rs (gcal ownership probe → talos-google-calendar,
 # module-config write → ModuleRepository); 102 after types.rs DataLoaders
 # (ModuleRepository::get_modules_by_ids +
-# ModuleExecutionService::get_execution_logs_batched).
-TALOS_API_SQLX_BASELINE=102
+# ModuleExecutionService::get_execution_logs_batched); 98 after
+# executions/mutations.rs (scoped-tx approve/deny →
+# ExecutionRepository::decide_execution_approval_scoped, tx passed through),
+# auth/mutations.rs (AuthService::revoke_pre_2fa_sessions), and
+# security/queries.rs (talos_audit_ledger::get_user_audit_settings).
+TALOS_API_SQLX_BASELINE=98
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \

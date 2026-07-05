@@ -42,26 +42,14 @@ impl SecurityQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        #[derive(sqlx::FromRow)]
-        struct SettingsRow {
-            streaming_enabled: bool,
-            otlp_endpoint: Option<String>,
-            otlp_protocol: Option<String>,
-            created_at: chrono::DateTime<chrono::Utc>,
-            updated_at: chrono::DateTime<chrono::Utc>,
-        }
-
-        let row = sqlx::query_as::<_, SettingsRow>(
-            r#"
-            SELECT streaming_enabled, otlp_endpoint, otlp_protocol, created_at, updated_at
-            FROM user_audit_settings
-            WHERE user_id = $1
-            "#,
-        )
-        .bind(user_id)
-        .fetch_optional(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        // user_audit_settings is user-keyed (not org-pinned RLS); bare-pool
+        // read preserved through the pool-taking helper.
+        let row = talos_audit_ledger::get_user_audit_settings(db_pool, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to fetch audit settings: {}", e);
+                async_graphql::Error::new("Failed to fetch audit settings").extend_safe()
+            })?;
 
         Ok(row.map(|r| UserAuditSettings {
             streaming_enabled: r.streaming_enabled,
