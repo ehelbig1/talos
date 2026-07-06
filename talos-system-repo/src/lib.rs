@@ -106,6 +106,56 @@ impl SystemRepository {
             .unwrap_or(0)
     }
 
+    /// Resolve an `agent_roles` row id by exact name.
+    pub async fn find_role_id_by_name(&self, role_name: &str) -> Result<Option<Uuid>> {
+        let role_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM agent_roles WHERE name = $1")
+                .bind(role_name)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(role_id)
+    }
+
+    /// Persist a freshly registered MCP agent. Token hashes arrive
+    /// pre-computed (bcrypt storage hash + SHA-256 lookup hash) — this
+    /// method only inserts. Returns the raw `sqlx::Error` so callers can
+    /// distinguish the `mcp_agents_name_key` unique violation (duplicate
+    /// agent name) from other failures via the error message.
+    pub async fn register_agent(
+        &self,
+        agent_id: Uuid,
+        name: &str,
+        role_id: Uuid,
+        token_hash: &str,
+        token_lookup_hash: &str,
+        user_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO mcp_agents (id, name, role_id, token_hash, token_lookup_hash, user_id) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(agent_id)
+        .bind(name)
+        .bind(role_id)
+        .bind(token_hash)
+        .bind(token_lookup_hash)
+        .bind(user_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete an MCP agent scoped to its owner. Returns rows affected
+    /// (0 = not found / not owned).
+    pub async fn delete_agent_for_user(&self, agent_id: Uuid, user_id: Uuid) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM mcp_agents WHERE id = $1 AND user_id = $2")
+            .bind(agent_id)
+            .bind(user_id)
+            .execute(&self.db_pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// A user's MCP agents, newest first, capped at `limit`. Backs the
     /// GraphQL `mcpAgents` query (MCP-1190 gave it the 1..=1000 clamp;
     /// the caller owns the clamp, this method just binds it).

@@ -590,6 +590,31 @@ impl WorkflowRepository {
         Ok(rows)
     }
 
+    /// Archive every non-archived workflow attached to an actor, returning
+    /// the number of rows moved. Takes the caller's connection: the
+    /// GraphQL `terminateActor` cleanup path runs this on a
+    /// `begin_user_scoped` tx so the workflows RLS policy
+    /// (USING-as-WITH-CHECK) restricts the sweep to the caller's own
+    /// workflows (RFC 0005 S3). Do NOT route through `self.db_pool`;
+    /// that would silently drop the RLS backstop.
+    pub async fn archive_workflows_for_actor_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+    ) -> Result<Option<i64>> {
+        let n = sqlx::query_scalar::<_, i64>(
+            "WITH updated AS (
+                UPDATE workflows SET status = 'archived', updated_at = now()
+                WHERE actor_id = $1 AND (status IS NULL OR status != 'archived')
+                RETURNING 1
+             ) SELECT COUNT(*) FROM updated",
+        )
+        .bind(actor_id)
+        .fetch_optional(conn)
+        .await?;
+        Ok(n)
+    }
+
     /// Set (or clear, with `None`) a workflow's max_concurrent_executions,
     /// ownership-gated on `user_id`. Takes the caller's transaction: the
     /// GraphQL `setConcurrencyLimit` mutation runs this on a
