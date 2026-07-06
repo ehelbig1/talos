@@ -7,7 +7,7 @@
   "capability_world": "http-node",
   "allowed_hosts": ["gmail.googleapis.com"],
   "allowed_methods": ["GET"],
-  "requires_secrets": ["vault://oauth/gmail/*/access_token"],
+  "requires_secrets": ["oauth/gmail/*"],
   "requires_approval_for": [],
   "config_schema": {
     "type": "object",

@@ -7,7 +7,7 @@
   "capability_world": "http-node",
   "allowed_hosts": ["www.googleapis.com"],
   "allowed_methods": ["GET"],
-  "requires_secrets": ["vault://oauth/google_calendar/*/access_token"],
+  "requires_secrets": ["oauth/google_calendar/*"],
   "requires_approval_for": [],
   "dependencies": {
     "chrono": "0.4"

@@ -1728,6 +1728,85 @@ mod validate_allowed_hosts_tests {
     }
 }
 
+/// Every shipped module template must pass the controller's seed-time
+/// validation. The seeding loop (controller main.rs) SKIPS a template —
+/// with only a boot-log WARN — when its `requires_secrets` or
+/// `allowed_hosts` fail validation, so a drifted talos.json silently
+/// vanishes from every fresh deploy's catalog. That happened to three
+/// OAuth templates (Jira/Gmail/Calendar, fixed 2026-07-06): they carried
+/// `vault://oauth/<provider>/*/access_token` grants — a convention the
+/// canonical `job_protocol::vault_path_permitted` matcher NEVER
+/// understood (no scheme prefix, no mid-path `*`), so they were both
+/// unseedable AND would have been dead grants at runtime. This test
+/// makes that drift a CI failure instead of a silent catalog gap.
+#[cfg(test)]
+mod shipped_template_manifests_pass_seed_validation {
+    use super::*;
+
+    fn str_array(manifest: &serde_json::Value, key: &str) -> Vec<String> {
+        manifest
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn every_template_talos_json_validates() {
+        // CARGO_MANIFEST_DIR-relative; fail LOUDLY if the layout moves
+        // (cargo_manifest_dir_relocation_class, PR #190) rather than
+        // silently validating zero files.
+        let templates_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
+        let entries: Vec<_> = std::fs::read_dir(&templates_dir)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "module-templates dir not found at {} ({e}) — if the layout moved, update this test",
+                    templates_dir.display()
+                )
+            })
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().join("talos.json").is_file())
+            .collect();
+        assert!(
+            entries.len() > 10,
+            "expected a full template catalog, found {} — wrong directory?",
+            entries.len()
+        );
+
+        let mut failures = Vec::new();
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let manifest_path = entry.path().join("talos.json");
+            let manifest: serde_json::Value = match serde_json::from_str(
+                &std::fs::read_to_string(&manifest_path).expect("readable talos.json"),
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    failures.push(format!("{name}: talos.json is not valid JSON: {e}"));
+                    continue;
+                }
+            };
+            if let Err(msg) = validate_allowed_secrets(&str_array(&manifest, "requires_secrets")) {
+                failures.push(format!("{name}: requires_secrets: {msg}"));
+            }
+            if let Err(msg) = validate_allowed_hosts(&str_array(&manifest, "allowed_hosts")) {
+                failures.push(format!("{name}: allowed_hosts: {msg}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} template(s) would be SILENTLY SKIPPED at controller seed time:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
+}
+
 #[cfg(test)]
 mod validate_allowed_secrets_tests {
     use super::*;
