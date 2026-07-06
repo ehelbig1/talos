@@ -1592,6 +1592,28 @@ impl ActorRepository {
         Ok(world)
     }
 
+    /// Fetch a user's email by id (e.g. to display who granted a
+    /// capability ceiling). No `is_active` filter — deactivated granters
+    /// still resolve for audit display.
+    pub async fn get_user_email(&self, user_id: Uuid) -> Result<Option<String>> {
+        let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.db_pool)
+            .await?;
+        Ok(email)
+    }
+
+    /// True if a user row exists for this id (any state — no `is_active`
+    /// filter). Used as the target-exists gate before writing a
+    /// capability grant.
+    pub async fn user_exists(&self, user_id: Uuid) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+            .bind(user_id)
+            .fetch_one(&self.db_pool)
+            .await?;
+        Ok(exists)
+    }
+
     /// Upsert a capability ceiling grant for a target user.
     pub async fn upsert_capability_grant(
         &self,

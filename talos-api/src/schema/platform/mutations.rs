@@ -41,31 +41,29 @@ impl PlatformMutations {
 
         // RFC 0005 S3: per-user scoped tx so the workflows RLS policy
         // backstops this UPDATE (USING-as-WITH-CHECK; the row stays owned
-        // by the caller — only max_concurrent_executions changes).
+        // by the caller — only max_concurrent_executions changes). The repo
+        // method executes on the tx we pass (see `set_max_concurrent_scoped`'s
+        // doc warning); the resolver keeps owning begin + commit.
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let result = sqlx::query(
-            "UPDATE workflows SET max_concurrent_executions = $1 WHERE id = $2 AND user_id = $3",
-        )
-        .bind(max_concurrent)
-        .bind(workflow_id)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to set concurrency limit: {}", e);
-            async_graphql::Error::new("Failed to set concurrency limit").extend_safe()
-        })?;
+        let rows_affected = workflow_repo
+            .set_max_concurrent_scoped(&mut tx, workflow_id, user_id, max_concurrent)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to set concurrency limit: {}", e);
+                async_graphql::Error::new("Failed to set concurrency limit").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             return Err(
                 async_graphql::Error::new("Workflow not found or access denied").extend_safe(),
             );
@@ -94,23 +92,17 @@ impl PlatformMutations {
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
         // Find the organization owned by the user
-        let org = sqlx::query!(
-            "SELECT id FROM organizations WHERE owner_id = $1 LIMIT 1",
-            user_id
-        )
-        .fetch_optional(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
-
-        let org_id = match org {
-            Some(o) => o.id,
-            None => {
-                return Err(
+        let org_id =
+            talos_organizations::OrganizationService::first_org_id_owned_by(db_pool, user_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "graphql: owned-org lookup failed");
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                })?
+                .ok_or_else(|| {
                     async_graphql::Error::new("No organization found to update quotas for")
-                        .extend_safe(),
-                )
-            }
-        };
+                        .extend_safe()
+                })?;
 
         let metrics = [
             ("cpu_cores", input.cpu_cores),
@@ -121,28 +113,25 @@ impl PlatformMutations {
 
         for (metric, limit) in metrics {
             if let Some(val) = limit {
-                sqlx::query!(
-                    "INSERT INTO resource_quotas (org_id, metric, max_limit) \
-                     VALUES ($1, $2, $3) \
-                     ON CONFLICT (org_id, metric) DO UPDATE SET max_limit = EXCLUDED.max_limit",
-                    org_id,
-                    metric,
-                    val
+                talos_organizations::OrganizationService::upsert_org_quota_limit(
+                    db_pool, org_id, metric, val,
                 )
-                .execute(db_pool)
                 .await
-                .map_err(|e| e.extend_safe())?;
+                .map_err(|e| {
+                    tracing::error!(error = %e, metric, "graphql: quota upsert failed");
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                })?;
             }
         }
 
         // Fetch updated quotas
-        let quotas = sqlx::query!(
-            "SELECT metric, max_limit FROM resource_quotas WHERE org_id = $1",
-            org_id
-        )
-        .fetch_all(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let quotas =
+            talos_organizations::OrganizationService::get_org_quota_limits(db_pool, org_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "graphql: quota limits read failed");
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                })?;
 
         let mut result = ResourceQuota {
             cpu_cores: 1,
@@ -241,14 +230,15 @@ impl PlatformMutations {
         }
 
         // Check granter's own ceiling
-        let granter_ceiling: String = sqlx::query_scalar(
-            "SELECT max_capability_world FROM user_capability_grants WHERE user_id = $1",
-        )
-        .bind(granter_id)
-        .fetch_optional(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?
-        .unwrap_or_else(|| "http-node".to_string());
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let granter_ceiling: String = actor_repo
+            .get_user_max_capability_world(granter_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: granter ceiling read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?
+            .unwrap_or_else(|| "http-node".to_string());
 
         // Lattice gate — NOT a linear rank comparison. You may only grant a
         // ceiling that is a SUBSET of your own. The previous local `rank`
@@ -269,37 +259,28 @@ impl PlatformMutations {
         }
 
         // Verify target user exists
-        let user_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
-                .bind(input.user_id)
-                .fetch_one(db_pool)
-                .await
-                .map_err(|e| e.extend_safe())?;
+        let user_exists = actor_repo.user_exists(input.user_id).await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: target user existence check failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         if !user_exists {
             return Err(async_graphql::Error::new("Target user not found").extend_safe());
         }
 
         // UPSERT the grant
-        sqlx::query(
-            "INSERT INTO user_capability_grants (user_id, max_capability_world, granted_by, notes) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (user_id) DO UPDATE \
-             SET max_capability_world = EXCLUDED.max_capability_world, \
-                 granted_by = EXCLUDED.granted_by, \
-                 granted_at = now(), \
-                 notes = EXCLUDED.notes",
-        )
-        .bind(input.user_id)
-        .bind(&input.max_capability_world)
-        .bind(granter_id)
-        .bind(input.notes.as_deref())
-        .execute(db_pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("grant_capability_ceiling failed: {}", e);
-            async_graphql::Error::new("Failed to grant capability ceiling").extend_safe()
-        })?;
+        actor_repo
+            .upsert_capability_grant(
+                input.user_id,
+                &input.max_capability_world,
+                granter_id,
+                input.notes.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("grant_capability_ceiling failed: {}", e);
+                async_graphql::Error::new("Failed to grant capability ceiling").extend_safe()
+            })?;
 
         tracing::info!(
             granter = %granter_id,
@@ -349,16 +330,16 @@ impl PlatformMutations {
             }
         }
 
-        let result = sqlx::query("DELETE FROM user_capability_grants WHERE user_id = $1")
-            .bind(user_id)
-            .execute(db_pool)
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let rows_deleted = actor_repo
+            .delete_capability_grant(user_id)
             .await
             .map_err(|e| {
                 tracing::error!("revoke_capability_ceiling failed: {}", e);
                 async_graphql::Error::new("Failed to revoke capability ceiling").extend_safe()
             })?;
 
-        if result.rows_affected() == 0 {
+        if rows_deleted == 0 {
             return Err(async_graphql::Error::new(
                 "No grant found — user is already at the default ceiling",
             )
@@ -402,28 +383,18 @@ impl PlatformMutations {
                 async_graphql::Error::new("Unknown integration service").extend_safe()
             })?;
 
-        // NOTE: Table name comes from the static PROVIDERS registry (compile-time constant,
-        // not user input). Only id and user_id are user-supplied, bound as $1 and $2.
-        let sql = if provider.disconnect_is_soft_delete {
-            format!(
-                "UPDATE {} SET is_active = false, updated_at = now() WHERE id = $1 AND user_id = $2",
-                provider.db_table
-            )
-        } else {
-            format!(
-                "DELETE FROM {} WHERE id = $1 AND user_id = $2",
-                provider.db_table
-            )
-        };
+        // Soft-delete vs hard-delete + the registry-driven table name live
+        // in `talos_integrations::store::disconnect_user_integration`
+        // (compile-time constants; only id and user_id are bound).
+        let rows_affected =
+            talos_integrations::store::disconnect_user_integration(db_pool, provider, id, *user_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "graphql: integration disconnect failed");
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                })?;
 
-        let result = sqlx::query(&sql)
-            .bind(id)
-            .bind(user_id)
-            .execute(db_pool)
-            .await
-            .map_err(|e| e.extend_safe())?;
-
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             return Err(
                 async_graphql::Error::new("Integration not found or access denied").extend_safe(),
             );

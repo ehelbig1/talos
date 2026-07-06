@@ -3391,8 +3391,23 @@ bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count m
 # list_user_writable_org_ids, ExecutionRepository::
 # list_recent_execution_events, WorkflowRepository::replace_module_refs);
 # 84 after security/mutations.rs (SecretsManager::count_encryption_keys +
-# talos_audit_ledger::upsert_user_audit_settings/get_user_audit_settings).
-TALOS_API_SQLX_BASELINE=84
+# talos_audit_ledger::upsert_user_audit_settings/get_user_audit_settings);
+# 78 after webhooks/mutations.rs (ModuleRepository::module_owned_by_user,
+# WebhookRepository::insert_trigger/get_dlq_entry_for_replay/
+# mark_dlq_entry_replayed, tx-taking
+# ExecutionRepository::get_dlq_replay_target_scoped +
+# mark_dlq_entry_replayed); 70 after platform/queries.rs
+# (ActorRepository::get_user_max_capability_world/get_user_capability_grant/
+# list_capability_grants/get_user_email,
+# ExecutionRepository::get_workflow_id_any_user,
+# OrganizationService::list_user_org_ids/get_org_quota_limits,
+# talos_integrations::store::list_user_service_integrations); 61 after
+# platform/mutations.rs (tx-taking WorkflowRepository::set_max_concurrent_scoped,
+# OrganizationService::first_org_id_owned_by/upsert_org_quota_limit/
+# get_org_quota_limits, ActorRepository::get_user_max_capability_world/
+# user_exists/upsert_capability_grant/delete_capability_grant,
+# talos_integrations::store::disconnect_user_integration).
+TALOS_API_SQLX_BASELINE=61
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \

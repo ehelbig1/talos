@@ -34,19 +34,16 @@ impl WebhooksMutations {
 
         // Verify the user owns the module.
         // Phase 5.1: unified `modules` table by canonical id.
-        let module_exists: Option<bool> = sqlx::query_scalar(
-            "SELECT EXISTS( \
-                 SELECT 1 FROM modules \
-                 WHERE id = $1 \
-                   AND user_id = $2 \
-             )",
-        )
-        .bind(input.module_id)
-        .bind(user_id)
-        .fetch_one(db_pool)
-        .await?;
+        let module_repo = talos_module_repository::ModuleRepository::new(db_pool.clone());
+        let module_exists = module_repo
+            .module_owned_by_user(input.module_id, *user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: module ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
-        if !module_exists.unwrap_or(false) {
+        if !module_exists {
             // MCP-918: .extend_safe()
             return Err(
                 async_graphql::Error::new("Module not found or access denied").extend_safe(),
@@ -275,31 +272,27 @@ impl WebhooksMutations {
                 )
             };
 
-        let listener_id = sqlx::query_scalar::<_, Uuid>(
-            r#"
-            INSERT INTO webhook_triggers (
-                id, name, module_id, verification_token,
-                signing_secret_enc, signing_key_id, signing_secret_format,
-                max_requests_per_minute, enabled, allowed_ips, user_id, event_filter
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            RETURNING id
-            "#,
-        )
-        .bind(trigger_id)
-        .bind(&name)
-        .bind(input.module_id)
-        .bind(&verification_token)
-        .bind(signing_secret_enc.as_deref())
-        .bind(signing_key_id)
-        .bind(signing_secret_format)
-        .bind(rpm_resolved)
-        .bind(enabled)
-        .bind(allowed_ips)
-        .bind(user_id)
-        .bind(input.event_filter.as_ref())
-        .fetch_one(db_pool)
-        .await?;
+        let webhook_repo = talos_webhook_repository::WebhookRepository::new(db_pool.clone());
+        let listener_id = webhook_repo
+            .insert_trigger(talos_webhook_repository::NewWebhookTrigger {
+                id: trigger_id,
+                name: &name,
+                module_id: input.module_id,
+                verification_token: &verification_token,
+                signing_secret_enc: signing_secret_enc.as_deref(),
+                signing_key_id,
+                signing_secret_format,
+                max_requests_per_minute: rpm_resolved,
+                enabled,
+                allowed_ips,
+                user_id: *user_id,
+                event_filter: input.event_filter.as_ref(),
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: webhook trigger insert failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         Ok(WebhookTrigger {
             id: listener_id,
@@ -343,26 +336,15 @@ impl WebhooksMutations {
         // operator (with admin tooling) cleans it up. UX cost is
         // accepted — losing trigger ownership shouldn't promote a row
         // to cross-tenant readable.
-        #[derive(sqlx::FromRow)]
-        struct DlqRow {
-            trigger_id: Option<Uuid>,
-            payload: Option<serde_json::Value>,
-            replayed_at: Option<chrono::DateTime<chrono::Utc>>,
-        }
-        let row = sqlx::query_as::<_, DlqRow>(
-            r#"
-            SELECT d.trigger_id, d.payload, d.replayed_at
-            FROM webhook_dlq d
-            INNER JOIN webhook_triggers t ON t.id = d.trigger_id
-            WHERE d.id = $1 AND t.user_id = $2
-            "#,
-        )
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?
-        .ok_or_else(|| async_graphql::Error::new("DLQ entry not found").extend_safe())?;
+        let webhook_repo = talos_webhook_repository::WebhookRepository::new(db_pool.clone());
+        let row = webhook_repo
+            .get_dlq_entry_for_replay(id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, dlq_id = %id, "graphql: webhook DLQ fetch failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?
+            .ok_or_else(|| async_graphql::Error::new("DLQ entry not found").extend_safe())?;
 
         if row.replayed_at.is_some() {
             return Err(async_graphql::Error::new("Entry has already been replayed").extend_safe());
@@ -394,12 +376,13 @@ impl WebhooksMutations {
             })?;
 
         // Mark replayed
-        sqlx::query("UPDATE webhook_dlq SET replayed_at = now(), replayed_by = $1 WHERE id = $2")
-            .bind(user_id)
-            .bind(id)
-            .execute(db_pool)
+        webhook_repo
+            .mark_dlq_entry_replayed(id, user_id)
             .await
-            .map_err(|e| e.extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, dlq_id = %id, "graphql: webhook DLQ mark-replayed failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         Ok(true)
     }
@@ -440,33 +423,26 @@ impl WebhooksMutations {
         // DLQ row replayed only AFTER the engine accepts the replay,
         // so a dispatcher failure surfaces as Err to the caller
         // instead of phantom-marking the row.
-        #[derive(sqlx::FromRow)]
-        struct DlqRow {
-            execution_id: Uuid,
-            replayed_at: Option<chrono::DateTime<chrono::Utc>>,
-        }
         // RFC 0005 S3: per-user scoped tx so the workflows RLS policy
-        // backstops the ownership JOIN (the gate is `w.user_id = $2`).
+        // backstops the ownership JOIN (the repo method executes on the
+        // tx we pass — see `get_dlq_replay_target_scoped`'s doc warning).
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let row: DlqRow = sqlx::query_as::<_, DlqRow>(
-            "SELECT d.execution_id, d.replayed_at \
-             FROM dead_letter_queue d \
-             JOIN workflows w ON w.id = d.workflow_id \
-             WHERE d.id = $1 AND w.user_id = $2",
-        )
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| e.extend_safe())?
-        .ok_or_else(|| {
-            async_graphql::Error::new("DLQ entry not found or access denied").extend_safe()
-        })?;
+        let row = exec_repo
+            .get_dlq_replay_target_scoped(&mut tx, id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, dlq_id = %id, "graphql: DLQ replay-target fetch failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?
+            .ok_or_else(|| {
+                async_graphql::Error::new("DLQ entry not found or access denied").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -509,16 +485,13 @@ impl WebhooksMutations {
         // Only mark replayed AFTER the engine accepted the dispatch.
         // Operator semantics: replayed_at = "we successfully kicked
         // off a new execution," NOT "we wrote a timestamp."
-        sqlx::query(
-            "UPDATE dead_letter_queue \
-             SET replayed_at = NOW(), replayed_by = $1 \
-             WHERE id = $2",
-        )
-        .bind(user_id)
-        .bind(id)
-        .execute(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        exec_repo
+            .mark_dlq_entry_replayed(id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, dlq_id = %id, "graphql: DLQ mark-replayed failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         info!(
             user_id = %user_id,

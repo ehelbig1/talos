@@ -492,6 +492,24 @@ impl ModuleRepository {
         Ok(total)
     }
 
+    /// True if the module exists AND is owned by `user_id`. Used as the
+    /// ownership gate before attaching user-scoped resources (e.g. webhook
+    /// triggers) to a module.
+    pub async fn module_owned_by_user(&self, module_id: Uuid, user_id: Uuid) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+               SELECT 1 FROM modules \
+               WHERE id = $1 \
+                 AND user_id = $2 \
+             )",
+        )
+        .bind(module_id)
+        .bind(user_id)
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(exists)
+    }
+
     /// Check whether a module exists but belongs to a different user or is a catalog entry.
     /// Used to distinguish "not found" from "access denied" in error messages.
     /// Phase 3.2: queries the unified modules table.

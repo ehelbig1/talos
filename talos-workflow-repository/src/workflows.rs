@@ -557,6 +557,31 @@ impl WorkflowRepository {
 
     /// Update workflow metadata fields selectively. Returns true if a row was affected.
     #[allow(clippy::too_many_arguments)]
+    /// Set (or clear, with `None`) a workflow's max_concurrent_executions,
+    /// ownership-gated on `user_id`. Takes the caller's transaction: the
+    /// GraphQL `setConcurrencyLimit` mutation runs this on a
+    /// `begin_user_scoped` tx so the workflows RLS policy backstops the
+    /// UPDATE (RFC 0005 S3, USING-as-WITH-CHECK). Do NOT route this
+    /// through `self.db_pool`; that would silently drop the RLS backstop.
+    /// Returns rows affected (0 = not found / not owned).
+    pub async fn set_max_concurrent_scoped(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        max_concurrent: Option<i32>,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE workflows SET max_concurrent_executions = $1 WHERE id = $2 AND user_id = $3",
+        )
+        .bind(max_concurrent)
+        .bind(workflow_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn update_workflow_metadata(
         &self,
         workflow_id: Uuid,
