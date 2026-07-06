@@ -37,8 +37,15 @@ COPY . .
 
 # Final build: cache mounts persist registry + target across builds, so
 # only crates with changed source recompile.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/talos/target \
+# sharing=locked: the controller/migrate/worker images build in PARALLEL
+# (compose bake) and share these cache mounts; the default `shared` mode
+# lets concurrent cargo processes race the registry unpack ("failed to
+# open .cargo-ok … File exists"), and a build killed mid-unpack leaves
+# the cache corrupted so every retry fails. Locking serializes the build
+# steps — near-free, since cargo's target-dir flock serialized the
+# actual compilation anyway.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/talos/target,sharing=locked \
     cargo build --profile docker --bin worker 2>&1 && \
     cp target/docker/worker /app/worker-bin
 
