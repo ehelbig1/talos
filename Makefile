@@ -23,7 +23,7 @@ SERVICE            ?= controller
 export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
-.PHONY: help setup up down rebuild restart logs ps shell doctor \
+.PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
         check build lint lint-frontend hooks test test-changed test-integration coverage-html audit check-catalog ci \
         drill clean nuke smoke rls-preflight _wait-healthy
 
@@ -39,6 +39,9 @@ help: ## Print this help message
 
 setup: ## First-time setup — generate .env with secrets, then build + start
 	@bash scripts/setup-dev.sh
+
+quickstart: ## Zero to a running workflow — golden path, printed step by step (after `make setup`)
+	@bash scripts/quickstart.sh
 
 up: ## Build + start the full dev stack, wait for health
 	@test -f .env || { \
