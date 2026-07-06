@@ -2292,6 +2292,23 @@ impl ExecutionRepository {
         .map_err(Into::into)
     }
 
+    /// Resolve an execution's owning workflow id with NO user scoping —
+    /// deliberately cross-tenant, for platform-admin forensic reads only
+    /// (the GraphQL `verifyAuditChain` query gates on `is_platform_admin`
+    /// upstream; an admin investigating an alert must resolve ANY
+    /// execution's workflow_id, so a tenant-scoped read would wrongly
+    /// restrict it to the admin's own org). Single-column, non-sensitive
+    /// (a UUID), no payload. Do NOT call this from user-facing paths —
+    /// use `get_execution_base` (user-scoped) instead.
+    pub async fn get_workflow_id_any_user(&self, execution_id: Uuid) -> Result<Option<Uuid>> {
+        let workflow_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT workflow_id FROM workflow_executions WHERE id = $1")
+                .bind(execution_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(workflow_id)
+    }
+
     /// Fetch `(root_execution_id, parent_execution_id)` for an execution —
     /// used to resolve the lineage tree root. Returns `Err` if the lineage
     /// columns don't exist yet (pre-migration); caller treats that as "use exec_id as root".

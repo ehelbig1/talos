@@ -60,13 +60,14 @@ impl PlatformQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        let ceiling: Option<String> = sqlx::query_scalar(
-            "SELECT max_capability_world FROM user_capability_grants WHERE user_id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let ceiling = actor_repo
+            .get_user_max_capability_world(user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: capability ceiling read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         Ok(ceiling.unwrap_or_else(|| "http-node".to_string()))
     }
@@ -84,31 +85,22 @@ impl PlatformQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        #[derive(sqlx::FromRow)]
-        struct GrantRow {
-            max_capability_world: String,
-            granted_by: Option<Uuid>,
-            granted_at: chrono::DateTime<chrono::Utc>,
-            notes: Option<String>,
-        }
-
-        let grant = sqlx::query_as::<_, GrantRow>(
-            "SELECT max_capability_world, granted_by, granted_at, notes \
-             FROM user_capability_grants WHERE user_id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let grant = actor_repo
+            .get_user_capability_grant(user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: capability grant read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         match grant {
             Some(g) => {
                 let granter_email: Option<String> = match g.granted_by {
-                    Some(gid) => sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
-                        .bind(gid)
-                        .fetch_optional(db_pool)
-                        .await
-                        .unwrap_or(None),
+                    // Display-only enrichment — a failed email lookup degrades
+                    // to None rather than failing the query (pre-extraction
+                    // behavior).
+                    Some(gid) => actor_repo.get_user_email(gid).await.unwrap_or(None),
                     None => None,
                 };
 
@@ -186,33 +178,18 @@ impl PlatformQueries {
             .extend_safe());
         }
 
-        #[derive(sqlx::FromRow)]
-        struct GrantRow {
-            user_id: Uuid,
-            email: String,
-            max_capability_world: String,
-            granted_by: Option<Uuid>,
-            granted_at: chrono::DateTime<chrono::Utc>,
-            notes: Option<String>,
-        }
-
-        let rows = sqlx::query_as::<_, GrantRow>(
-            "SELECT g.user_id, u.email, g.max_capability_world, g.granted_by, \
-                    g.granted_at, g.notes \
-             FROM user_capability_grants g \
-             JOIN users u ON u.id = g.user_id \
-             ORDER BY g.granted_at DESC \
-             LIMIT 200",
-        )
-        .fetch_all(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let rows = actor_repo.list_capability_grants().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: capability grants list failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
 
         Ok(rows
             .into_iter()
             .map(|r| CapabilityGrant {
                 user_id: r.user_id,
-                email: r.email,
+                // INNER JOIN on users guarantees a row; email is NOT NULL,
+                // so the Option only exists for the repo row's flexibility.
+                email: r.email.unwrap_or_default(),
                 max_capability_world: r.max_capability_world,
                 granted_by: r.granted_by,
                 granted_at: r.granted_at.to_rfc3339(),
@@ -253,19 +230,17 @@ impl PlatformQueries {
         }
 
         // The chain genesis is bound to (workflow_id, execution_id), so we
-        // need the owning workflow id. Look it up from the execution.
-        let workflow_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT workflow_id FROM workflow_executions WHERE id = $1")
-                // allow-bare-pool-rls: platform-admin-only forensic read (authz
-                // established upstream via is_platform_admin). The audit ledger
-                // is intentionally cross-tenant — an admin investigating an
-                // alert must resolve ANY execution's workflow_id, so a
-                // tenant-scoped tx would wrongly restrict it to the admin's own
-                // org. Single-column, non-sensitive (a UUID), no payload.
-                .bind(execution_id)
-                .fetch_optional(db_pool)
-                .await
-                .map_err(|e| e.extend_safe())?;
+        // need the owning workflow id. Deliberately cross-tenant: authz was
+        // established upstream via is_platform_admin, and the repo method's
+        // doc carries the full rationale (`get_workflow_id_any_user`).
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
+        let workflow_id = exec_repo
+            .get_workflow_id_any_user(execution_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: audit-chain workflow lookup failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         let workflow_id = workflow_id
             .ok_or_else(|| async_graphql::Error::new("Execution not found").extend_safe())?;
 
@@ -303,16 +278,15 @@ impl PlatformQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        let org = sqlx::query!(
-            "SELECT org_id FROM organization_members WHERE user_id = $1 LIMIT 1",
-            user_id
-        )
-        .fetch_optional(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let org_ids = talos_organizations::OrganizationService::list_user_org_ids(db_pool, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: org membership lookup failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
-        let org_id = match org {
-            Some(o) => o.org_id,
+        let org_id = match org_ids.first() {
+            Some(o) => *o,
             None => {
                 return Ok(ResourceQuota {
                     cpu_cores: 1,
@@ -327,13 +301,13 @@ impl PlatformQueries {
             }
         };
 
-        let quotas = sqlx::query!(
-            "SELECT metric, max_limit FROM resource_quotas WHERE org_id = $1",
-            org_id
-        )
-        .fetch_all(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let quotas =
+            talos_organizations::OrganizationService::get_org_quota_limits(db_pool, org_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "graphql: quota limits read failed");
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                })?;
 
         let mut result = ResourceQuota {
             cpu_cores: 1,
@@ -388,63 +362,15 @@ impl PlatformQueries {
             }
         }
 
-        // 2026-05-28 audit Perf#2: pre-fix this issued one SELECT per
-        // registered provider (4 today: GCal, Gmail, Slack, Jira;
-        // grows with each new integration). Dashboard load incurred
-        // N round-trips serially. Collapse to a single UNION ALL so
-        // every provider's rows return in one round-trip — the static
-        // PROVIDERS registry's table names and column names are
-        // compile-time constants, not user input, so the dynamic SQL
-        // builder is the same security shape as the per-provider
-        // version. Only `user_id` is bound as $1.
-        //
-        // NOTE: the UNION ALL preserves the per-provider service
-        // labeling via a literal `graphql_enum` column written into
-        // each branch — `resolve_service` runs in Rust on the unified
-        // result. The branch ordering matches PROVIDERS so the
-        // resulting Vec retains the same ordering as the pre-fix
-        // sequential loop.
-        let providers = talos_integrations::provider_config::PROVIDERS;
-        let union_branches: Vec<String> = providers
-            .iter()
-            .map(|provider| {
-                let table_alias = if provider.account_identifier_join.is_some() {
-                    "g"
-                } else {
-                    "t"
-                };
-                let join_clause = provider.account_identifier_join.unwrap_or("");
-                format!(
-                    "SELECT {alias}.id, {ident} as identifier, {alias}.created_at, '{enum_tag}' as service_tag \
-                     FROM {table} {alias} {join} \
-                     WHERE {alias}.user_id = $1 {extra}",
-                    alias = table_alias,
-                    ident = provider.account_identifier_column,
-                    table = provider.db_table,
-                    join = join_clause,
-                    extra = provider.extra_where,
-                    // PROVIDERS is a compile-time constant; the
-                    // graphql_enum strings are static literals (no
-                    // SQL injection surface).
-                    enum_tag = provider.graphql_enum,
-                )
-            })
-            .collect();
-
-        #[derive(sqlx::FromRow)]
-        struct UnionRow {
-            id: Uuid,
-            identifier: String,
-            created_at: chrono::DateTime<chrono::Utc>,
-            service_tag: String,
-        }
-
-        let sql = union_branches.join(" UNION ALL ");
-        let rows = sqlx::query_as::<_, UnionRow>(&sql)
-            .bind(user_id)
-            .fetch_all(db_pool)
+        // Single UNION-ALL round-trip across all registered providers
+        // (2026-05-28 audit Perf#2); SQL builder + rationale live in
+        // `talos_integrations::store::list_user_service_integrations`.
+        let rows = talos_integrations::store::list_user_service_integrations(db_pool, *user_id)
             .await
-            .map_err(|e| e.extend_safe())?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: service integrations list failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         let integrations = rows
             .into_iter()

@@ -37,6 +37,14 @@ pub struct OrgMember {
 /// existing `crate::organizations::OrgRole` import path continues to work.
 pub use talos_auth_types::OrgRole;
 
+/// One `resource_quotas` row (metric name + limit) returned by
+/// `get_org_quota_limits`. `max_limit` is BIGINT NOT NULL (0 = unlimited).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OrgQuotaLimit {
+    pub metric: String,
+    pub max_limit: i64,
+}
+
 /// Service for organization CRUD and membership management.
 pub struct OrganizationService;
 
@@ -239,6 +247,57 @@ impl OrganizationService {
             .fetch_all(db)
             .await
             .context("Failed to list user org memberships")
+    }
+
+    /// First organization OWNED by the user (arbitrary pick when they own
+    /// several — matches the legacy `LIMIT 1` resolver behavior). Distinct
+    /// from membership lookups: this keys on `organizations.owner_id`.
+    pub async fn first_org_id_owned_by(
+        db: &Pool<Postgres>,
+        owner_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 LIMIT 1")
+            .bind(owner_id)
+            .fetch_optional(db)
+            .await
+            .context("Failed to look up owned organization")
+    }
+
+    /// Per-metric quota limits for an org (`resource_quotas` table).
+    /// Metrics are free-form names ("cpu_cores", "memory_gb", …); callers
+    /// map them onto their own defaults.
+    pub async fn get_org_quota_limits(
+        db: &Pool<Postgres>,
+        org_id: Uuid,
+    ) -> Result<Vec<OrgQuotaLimit>> {
+        sqlx::query_as::<_, OrgQuotaLimit>(
+            "SELECT metric, max_limit FROM resource_quotas WHERE org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_all(db)
+        .await
+        .context("Failed to fetch org quota limits")
+    }
+
+    /// Upsert a single per-metric quota limit for an org.
+    pub async fn upsert_org_quota_limit(
+        db: &Pool<Postgres>,
+        org_id: Uuid,
+        metric: &str,
+        max_limit: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO resource_quotas (org_id, metric, max_limit) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (org_id, metric) DO UPDATE SET max_limit = EXCLUDED.max_limit",
+        )
+        .bind(org_id)
+        .bind(metric)
+        .bind(max_limit)
+        .execute(db)
+        .await
+        .context("Failed to upsert org quota limit")?;
+        Ok(())
     }
 
     /// Ids of the orgs where the user holds **at least Member role**

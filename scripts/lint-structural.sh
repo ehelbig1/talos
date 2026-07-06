@@ -3396,8 +3396,13 @@ bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count m
 # WebhookRepository::insert_trigger/get_dlq_entry_for_replay/
 # mark_dlq_entry_replayed, tx-taking
 # ExecutionRepository::get_dlq_replay_target_scoped +
-# mark_dlq_entry_replayed).
-TALOS_API_SQLX_BASELINE=78
+# mark_dlq_entry_replayed); 70 after platform/queries.rs
+# (ActorRepository::get_user_max_capability_world/get_user_capability_grant/
+# list_capability_grants/get_user_email,
+# ExecutionRepository::get_workflow_id_any_user,
+# OrganizationService::list_user_org_ids/get_org_quota_limits,
+# talos_integrations::store::list_user_service_integrations).
+TALOS_API_SQLX_BASELINE=70
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \
