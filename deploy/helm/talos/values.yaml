@@ -241,6 +241,30 @@ controller:
     # `jwt_legacy_aud_less_verify` telemetry event hit zero, then re-set
     # to "true". Rollback is instant: set "false" and restart.
     JWT_REQUIRE_AUD: "true"
+    # ── RFC 0010 worker-trust (P1 Ed25519 + P3 envelope sealing) ─────
+    # Enablement runbook (canaried on the dev stack 2026-07-06, incl. a
+    # sealed-secret round-trip proven end-to-end under "required"):
+    #   1. Keys: `controller generate-worker-trust-keypair --role
+    #      controller` and `--role worker --worker-id <id>`. Put
+    #      TALOS_CONTROLLER_SIGNING_KEY + TALOS_WORKER_SIGNING_KEY in
+    #      the bootstrap Secret (both render as optional secretKeyRefs);
+    #      the two PUBLIC halves go in these env maps (below + worker.env).
+    #   2. Uncomment TALOS_DISPATCH_SCHEME + the public-key entries and
+    #      `helm upgrade`. Verify jobs run (controller logs "dispatch
+    #      signing scheme = Ed25519").
+    #   3. Set TALOS_ENVELOPE_SEALING: "audit" on BOTH env maps; verify a
+    #      secret-carrying workflow (e.g. a vault:// header module) runs.
+    #      Controller logs "claim responder started".
+    #   4. Flip both to "required" — workers now refuse an inline-WSK
+    #      downgrade (no-secret nodes still run). Rollback at any step:
+    #      revert the values and upgrade; "off" is byte-identical legacy.
+    # TALOS_DISPATCH_SCHEME: "ed25519"
+    # Static registry of worker Ed25519 public keys (worker_id=hex pairs,
+    # comma-separated). Alternative: dynamic self-registration via
+    # controller.workerRegistration + networkPolicy.workerRegistrationIngress.
+    # TALOS_WORKER_PUBLIC_KEYS: "fleet=<64-hex from keygen --role worker>"
+    # off | audit | required — RFC 0010 P3 per-execution secret sealing.
+    # TALOS_ENVELOPE_SEALING: "audit"
     # Bootstrap-time first-admin pin (MCP-859). STRONGLY RECOMMENDED
     # for any deployment exposed to the public internet BEFORE the
     # operator's own signup completes. When set, ONLY a user
@@ -444,6 +468,20 @@ worker:
     # WORKER_ALLOW_PRIVATE_HOST_TARGETS gates module HTTP calls to
     # RFC1918 hostnames. Leave `false` on multi-tenant deployments.
     WORKER_ALLOW_PRIVATE_HOST_TARGETS: "false"
+    # ── RFC 0010 worker-trust (P1 Ed25519 + P3 envelope sealing) ─────
+    # Worker half of the enablement runbook documented at
+    # controller.env TALOS_ENVELOPE_SEALING. Uncomment together with
+    # the controller half; TALOS_WORKER_SIGNING_KEY comes from the
+    # bootstrap Secret (optional secretKeyRef in the deployment).
+    # Public half of the controller's dispatch-signing keypair
+    # (safe to put in values — it is not a secret):
+    # TALOS_CONTROLLER_PUBLIC_KEY: "<64-hex from keygen --role controller>"
+    # Fleet identity the controller looks this worker's public key up
+    # under (single-key fleet; per-worker identities go via extraEnv):
+    # TALOS_WORKER_ID: "fleet"
+    # Keep in lockstep with controller.env TALOS_ENVELOPE_SEALING; the
+    # worker enforces the inline-WSK downgrade guard under "required".
+    # TALOS_ENVELOPE_SEALING: "required"
 
   # Sigstore enforcement for OCI template signatures. The publish workflow
   # (.github/workflows/template-publish.yml) signs every artifact via
