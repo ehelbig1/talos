@@ -631,6 +631,64 @@ pub async fn init_read_replica_pool() -> Option<Pool<Postgres>> {
     }
 }
 
+/// Try to take a SESSION-level Postgres advisory lock on the given
+/// connection. Session locks persist until explicitly unlocked or the
+/// Postgres session ends — callers MUST release via
+/// `release_advisory_lock` on the SAME connection (see its doc for the
+/// pool-reuse leak this pairing prevents).
+pub async fn try_advisory_lock(
+    conn: &mut sqlx::PgConnection,
+    lock_id: i64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+        .bind(lock_id)
+        .fetch_one(conn)
+        .await
+}
+
+/// Release a session-level advisory lock taken via `try_advisory_lock`.
+///
+/// MCP-702: takes the `PoolConnection` BY VALUE so it can `detach()` on
+/// unlock failure. sqlx pool connections are NOT closed on drop — they
+/// return to the pool with the Postgres session (and any session-level
+/// advisory locks) intact, so a failed `pg_advisory_unlock` would leak
+/// the lock to the next pool consumer and stall future
+/// `pg_advisory_xact_lock(same_key)` attempts indefinitely. Detaching
+/// converts the connection into a raw `PgConnection` that closes on
+/// Drop, ending the session and freeing the lock server-side.
+///
+/// **Remaining caller-side hazard**: a task panic between the lock
+/// acquisition and this call drops the PoolConnection without unlocking
+/// (the lock leaks until pool idle-reaping). Wrap critical sections in
+/// an inner `async {}` block and call this in the outer scope
+/// regardless of the inner Result (MCP-701 IIFE pattern) where
+/// practical.
+pub async fn release_advisory_lock(
+    mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    lock_id: i64,
+) {
+    match sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(lock_id)
+        .execute(&mut *conn)
+        .await
+    {
+        Ok(_) => {
+            // Happy path — lock released, conn returns to pool on drop.
+        }
+        Err(e) => {
+            tracing::warn!(
+                lock_id,
+                error = %e,
+                "Failed to release pg advisory lock — detaching connection from pool \
+                 so the lock doesn't leak to the next consumer"
+            );
+            // Force-close the underlying connection so the session ends
+            // and Postgres releases all advisory locks held by it.
+            let _detached = conn.detach();
+        }
+    }
+}
+
 /// Returns `true` when `db_url` pins an sslmode that GUARANTEES a TLS
 /// connection: `require`, `verify-ca`, or `verify-full`. Returns `false` for an
 /// absent sslmode or the non-guaranteeing modes (`disable`, `allow`, `prefer` —

@@ -212,47 +212,28 @@ impl WorkflowsMutations {
             .ok()
             .cloned();
         // 1. Verify user owns the execution and it is currently 'waiting'.
-        // MCP-652: also pull `actor_id` so the budget/status gate below
-        // can run. Pre-fix this tuple was {workflow_id, status} only —
-        // resume bypassed the actor-budget enforcement that
-        // continuation-trigger (MCP-564) and retry (MCP-557/MCP-651)
-        // both honour. The sibling MCP path `resume_workflow_by_correlation_id`
-        // gates via `trigger_continuation_workflow` → `check_execution_allowed`;
-        // GraphQL's `resume_workflow(execution_id)` is unique to this
-        // surface so the gap had no MCP mirror to compare against.
-        #[derive(sqlx::FromRow)]
-        struct ExecInfo {
-            workflow_id: Uuid,
-            status: String,
-            actor_id: Option<Uuid>,
-        }
-
+        // MCP-652: the gate also pulls `actor_id` so the budget/status
+        // gate below can run (see `get_execution_resume_gate`'s doc — the
+        // read is deliberately bare-pool; its own predicate IS the
+        // authorization check).
         // Include org-owned executions via the parent workflow's org_id.
         // Resume is a write — use role-filtered helper so a Viewer can't
         // resume someone else's suspended execution.
         let org_ids = crate::schema::user_writable_org_ids(ctx).await?;
-        let exec_info = sqlx::query_as::<_, ExecInfo>(
-            // allow-bare-pool-rls: this IS the resume ownership gate — its own `we.user_id = $2 OR w.org_id = ANY($3)` predicate is the authorization check; revisit on RLS SET-ROLE rollout
-            r#"SELECT we.workflow_id, we.status, we.actor_id FROM workflow_executions we
-               LEFT JOIN workflows w ON w.id = we.workflow_id
-               WHERE we.id = $1 AND (we.user_id = $2 OR w.org_id = ANY($3))"#,
-        )
-        .bind(execution_id)
-        .bind(user_id)
-        .bind(&org_ids)
-        .fetch_optional(&db_pool)
-        .await
-        .map_err(|e: sqlx::Error| {
-            // Added type annotation
-            tracing::error!("Failed to check execution: {}", e);
-            // MCP-964: extend_safe so "Execution not found or access
-            // denied" survives the scrubber (lowercase 'n' misses
-            // case-sensitive whitelist).
-            async_graphql::Error::new("Failed to check execution").extend_safe()
-        })?
-        .ok_or_else(|| {
-            async_graphql::Error::new("Execution not found or access denied").extend_safe()
-        })?;
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
+        let exec_info = exec_repo
+            .get_execution_resume_gate(execution_id, *user_id, &org_ids)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to check execution: {}", e);
+                // MCP-964: extend_safe so "Execution not found or access
+                // denied" survives the scrubber (lowercase 'n' misses
+                // case-sensitive whitelist).
+                async_graphql::Error::new("Failed to check execution").extend_safe()
+            })?
+            .ok_or_else(|| {
+                async_graphql::Error::new("Execution not found or access denied").extend_safe()
+            })?;
 
         if exec_info.status != "waiting" {
             // MCP-916 cont.: .extend_safe() so the resume-status mismatch
@@ -391,17 +372,14 @@ impl WorkflowsMutations {
         //    (a completion landing, another resume) would be RESURRECTED from a
         //    terminal state. `rows_affected() == 0` ⇒ no longer resumable; bail
         //    before spawning.
-        let resume_flip =
-            sqlx::query("UPDATE workflow_executions SET status = 'pending' WHERE id = $1 AND status = 'waiting'")
-                // allow-bare-pool-rls: execution_id authorized by the resume ownership gate above (line ~794, we.user_id=$2 OR w.org_id=ANY) + authorize_workflow_trigger; revisit on RLS SET-ROLE rollout
-                .bind(execution_id)
-                .execute(&db_pool)
-                .await
-                .map_err(|e: sqlx::Error| {
-                    tracing::error!("Failed to update execution status: {}", e);
-                    async_graphql::Error::new("Failed to resume execution").extend_safe()
-                })?;
-        if resume_flip.rows_affected() == 0 {
+        let resume_flip_rows = exec_repo
+            .flip_waiting_to_pending(execution_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to update execution status: {}", e);
+                async_graphql::Error::new("Failed to resume execution").extend_safe()
+            })?;
+        if resume_flip_rows == 0 {
             return Err(async_graphql::Error::new(
                 "Execution is no longer resumable (its status changed since it was checked)",
             )
@@ -421,18 +399,13 @@ impl WorkflowsMutations {
                 }
             };
             let lock_id = (execution_id.as_u128() % (i64::MAX as u128)) as i64;
-            let locked: bool =
-                match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-                    .bind(lock_id)
-                    .fetch_one(&mut *conn)
-                    .await
-                {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::error!("Failed to acquire advisory lock: {}", e);
-                        false
-                    }
-                };
+            let locked: bool = match talos_db::try_advisory_lock(&mut conn, lock_id).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to acquire advisory lock: {}", e);
+                    false
+                }
+            };
             if !locked {
                 tracing::warn!(execution_id = %execution_id, "Execution already in progress, skipping duplicate resume");
                 return;
@@ -465,6 +438,11 @@ impl WorkflowsMutations {
             // theme of PR 3.
             let resume_resolved_registry = registry
                 .unwrap_or_else(|| Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client)));
+
+            // Repo handle for the background task's execution reads/writes
+            // (event persistence, pinned-version read, fail-marking).
+            let exec_repo_bg =
+                talos_execution_repository::ExecutionRepository::new(db_pool.clone());
 
             macro_rules! store_and_send {
                 ($event:expr) => {{
@@ -510,18 +488,18 @@ impl WorkflowsMutations {
                         };
                         talos_dlp_provider::redact_str(truncated)
                     });
-                    if let Err(db_err) = sqlx::query(
-                        "INSERT INTO execution_events (execution_id, event_type, node_id, status, log_message, iteration_index, iteration_total) VALUES ($1, $2, $3, $4, $5, $6, $7)"
-                    )
-                    .bind(event.execution_id)
-                    .bind(event_type)
-                    .bind(event.node_id)
-                    .bind(format!("{:?}", event.status))
-                    .bind(&redacted_log_message)
-                    .bind(event.iteration_index.map(saturating_u32_to_i32))
-                    .bind(event.iteration_total.map(saturating_u32_to_i32))
-                    .execute(&db_pool)
-                    .await {
+                    if let Err(db_err) = exec_repo_bg
+                        .insert_execution_event(
+                            event.execution_id,
+                            event_type,
+                            event.node_id,
+                            &format!("{:?}", event.status),
+                            redacted_log_message.as_deref(),
+                            event.iteration_index.map(saturating_u32_to_i32),
+                            event.iteration_total.map(saturating_u32_to_i32),
+                        )
+                        .await
+                    {
                         tracing::error!("Failed to persist execution event: {}", db_err);
                     }
                 }};
@@ -539,11 +517,12 @@ impl WorkflowsMutations {
             .await;
 
             // Load workflow definition: use the version pinned to this execution,
-            // or fall back to active version, then draft
-            #[derive(sqlx::FromRow)]
-            struct WorkflowGraph {
-                graph_json: String,
-            }
+            // or fall back to active version, then draft. The draft fallback
+            // reads via `get_workflow_graph_unchecked` (no ownership predicate
+            // — the resume ownership gate authorized this workflow_id before
+            // the task spawned; revisit on RLS SET-ROLE rollout).
+            let workflow_repo_bg =
+                talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
 
             // First try to load the version pinned to this execution record.
             //
@@ -564,14 +543,7 @@ impl WorkflowsMutations {
             // row already exists at this point (verified above), so
             // sqlx::Error::RowNotFound cannot fire here; this match
             // only handles real connection-level failures.
-            let pinned_version_id = match sqlx::query_scalar::<_, Option<Uuid>>(
-                // allow-bare-pool-rls: execution_id authorized by the resume ownership gate (line ~794, we.user_id=$2 OR w.org_id=ANY) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                "SELECT workflow_version_id FROM workflow_executions WHERE id = $1",
-            )
-            .bind(execution_id)
-            .fetch_one(&db_pool)
-            .await
-            {
+            let pinned_version_id = match exec_repo_bg.get_pinned_version_id(execution_id).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(
@@ -579,14 +551,13 @@ impl WorkflowsMutations {
                         error = %e,
                         "resume_workflow: failed to load pinned workflow_version_id — refusing to fall back to draft graph (would drift execution topology)"
                     );
-                    if let Err(db_err) = sqlx::query(
-                        // allow-bare-pool-rls: execution_id authorized by the resume ownership gate (line ~794, we.user_id=$2 OR w.org_id=ANY) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                        "UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
-                    )
-                    .bind(execution_id)
-                    .bind("Workflow execution failed")
-                    .execute(&db_pool)
-                    .await
+                    if let Err(db_err) = exec_repo_bg
+                        .fail_execution_unless_terminal(
+                            execution_id,
+                            "Workflow execution failed",
+                            false,
+                        )
+                        .await
                     {
                         tracing::error!(
                             execution_id = %execution_id,
@@ -594,68 +565,52 @@ impl WorkflowsMutations {
                             "Failed to mark execution as failed; execution will appear stuck"
                         );
                     }
-                    release_advisory_lock(conn, lock_id).await;
+                    talos_db::release_advisory_lock(conn, lock_id).await;
                     return;
                 }
             };
 
-            let graph_json_str = if let Some(vid) = pinned_version_id {
-                match WorkflowVersionService::get_version(&db_pool, vid).await {
-                    Ok(Some(v)) => v.graph_json.to_string(),
-                    _ => {
-                        match sqlx::query_as::<_, WorkflowGraph>(
-                            // allow-bare-pool-rls: workflow_id comes from exec_info authorized by the resume ownership gate (line ~794) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                            "SELECT graph_json FROM workflows WHERE id = $1",
-                        )
-                        .bind(workflow_id)
-                        .fetch_one(&db_pool)
+            let graph_json_str = {
+                let versioned = if let Some(vid) = pinned_version_id {
+                    WorkflowVersionService::get_version(&db_pool, vid)
                         .await
+                        .ok()
+                        .flatten()
+                        .map(|v| v.graph_json.to_string())
+                } else {
+                    WorkflowVersionService::get_active_version(&db_pool, workflow_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|v| v.graph_json.to_string())
+                };
+                match versioned {
+                    Some(g) => g,
+                    None => {
+                        // Draft fallback (unchanged fallback order:
+                        // pinned/active version first, then draft).
+                        match workflow_repo_bg
+                            .get_workflow_graph_unchecked(workflow_id)
+                            .await
                         {
-                            Ok(w) => w.graph_json,
-                            Err(e) => {
-                                tracing::error!(execution_id = %execution_id, "Failed to load workflow: {}", e);
-                                if let Err(db_err) = sqlx::query(
-                                    // allow-bare-pool-rls: execution_id authorized by the resume ownership gate (line ~794, we.user_id=$2 OR w.org_id=ANY) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                                    "UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')")
-                                    .bind(execution_id).bind("Workflow execution failed").execute(&db_pool).await {
+                            Ok(Some(g)) => g,
+                            Ok(None) | Err(_) => {
+                                tracing::error!(execution_id = %execution_id, "Failed to load workflow graph for resume");
+                                if let Err(db_err) = exec_repo_bg
+                                    .fail_execution_unless_terminal(
+                                        execution_id,
+                                        "Workflow execution failed",
+                                        false,
+                                    )
+                                    .await
+                                {
                                     tracing::error!(
                                         execution_id = %execution_id,
                                         error = %db_err,
                                         "Failed to mark execution as failed; execution will appear stuck"
                                     );
                                 }
-                                release_advisory_lock(conn, lock_id).await;
-                                return;
-                            }
-                        }
-                    }
-                }
-            } else {
-                match WorkflowVersionService::get_active_version(&db_pool, workflow_id).await {
-                    Ok(Some(version)) => version.graph_json.to_string(),
-                    _ => {
-                        match sqlx::query_as::<_, WorkflowGraph>(
-                            // allow-bare-pool-rls: workflow_id comes from exec_info authorized by the resume ownership gate (line ~794) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                            "SELECT graph_json FROM workflows WHERE id = $1",
-                        )
-                        .bind(workflow_id)
-                        .fetch_one(&db_pool)
-                        .await
-                        {
-                            Ok(w) => w.graph_json,
-                            Err(e) => {
-                                tracing::error!(execution_id = %execution_id, "Failed to load workflow: {}", e);
-                                if let Err(db_err) = sqlx::query(
-                                    // allow-bare-pool-rls: execution_id authorized by the resume ownership gate (line ~794, we.user_id=$2 OR w.org_id=ANY) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                                    "UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')")
-                                    .bind(execution_id).bind("Workflow execution failed").execute(&db_pool).await {
-                                    tracing::error!(
-                                        execution_id = %execution_id,
-                                        error = %db_err,
-                                        "Failed to mark execution as failed; execution will appear stuck"
-                                    );
-                                }
-                                release_advisory_lock(conn, lock_id).await;
+                                talos_db::release_advisory_lock(conn, lock_id).await;
                                 return;
                             }
                         }
@@ -686,17 +641,21 @@ impl WorkflowsMutations {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!(execution_id = %execution_id, "Failed to build engine for resume: {}", e);
-                    if let Err(db_err) = sqlx::query(
-                        // allow-bare-pool-rls: execution_id authorized by the resume ownership gate (line ~794, we.user_id=$2 OR w.org_id=ANY) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                        "UPDATE workflow_executions SET status = 'failed', error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')")
-                        .bind(execution_id).bind("Workflow execution failed").execute(&db_pool).await {
+                    if let Err(db_err) = exec_repo_bg
+                        .fail_execution_unless_terminal(
+                            execution_id,
+                            "Workflow execution failed",
+                            false,
+                        )
+                        .await
+                    {
                         tracing::error!(
                             execution_id = %execution_id,
                             error = %db_err,
                             "Failed to mark execution as failed (engine-build path); execution will appear stuck"
                         );
                     }
-                    release_advisory_lock(conn, lock_id).await;
+                    talos_db::release_advisory_lock(conn, lock_id).await;
                     return;
                 }
             };
@@ -806,10 +765,10 @@ impl WorkflowsMutations {
                     // bind path on the resume side.
                     let redacted_e = talos_dlp_provider::redact_str(&e.to_string());
                     let error_msg = format!("Resumed workflow failed: {}", redacted_e);
-                    if let Err(db_err) = sqlx::query(
-                        // allow-bare-pool-rls: execution_id authorized by the resume ownership gate (line ~794, we.user_id=$2 OR w.org_id=ANY) before this spawned task ran; revisit on RLS SET-ROLE rollout
-                        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')")
-                        .bind(execution_id).bind(&error_msg).execute(&db_pool).await {
+                    if let Err(db_err) = exec_repo_bg
+                        .fail_execution_unless_terminal(execution_id, &error_msg, true)
+                        .await
+                    {
                         tracing::error!(
                             execution_id = %execution_id,
                             error = %db_err,
@@ -832,7 +791,7 @@ impl WorkflowsMutations {
             }
 
             // Release the advisory lock on the SAME connection where it was acquired.
-            release_advisory_lock(conn, lock_id).await;
+            talos_db::release_advisory_lock(conn, lock_id).await;
         });
 
         Ok(true)
@@ -924,6 +883,7 @@ impl WorkflowsMutations {
         // `begin_org_scoped` also sets `app.current_user_id`, which the
         // org-pinned workflows policy simply ignores. Latent while
         // `TALOS_RLS_SET_ROLE` is off (sets the GUCs, no role switch).
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let mut tx =
             talos_db::begin_org_scoped(db_pool, &talos_tenancy::OrgScope::new(org_id, *user_id))
                 .await
@@ -931,21 +891,21 @@ impl WorkflowsMutations {
                     tracing::error!(error = %e, "graphql: tenant scope error");
                     async_graphql::Error::new("Request scope error").extend_safe()
                 })?;
-        let workflow_id = sqlx::query_scalar::<_, Uuid>(
-            r#"
-            INSERT INTO workflows (name, module_uri, graph_json, user_id, max_concurrent_executions, intent, org_id)
-            VALUES ($1, '', $2, $3, $4, $5, $6)
-            RETURNING id
-            "#,
-        )
-        .bind(&input.name)
-        .bind(&input.graph_json)
-        .bind(user_id)
-        .bind(input.max_concurrent_executions)
-        .bind(&input.intent)
-        .bind(org_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let workflow_id = workflow_repo
+            .insert_workflow_scoped(
+                &mut tx,
+                &input.name,
+                &input.graph_json,
+                *user_id,
+                input.max_concurrent_executions,
+                input.intent.as_ref(),
+                org_id,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: workflow insert failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -1082,27 +1042,28 @@ impl WorkflowsMutations {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let result = sqlx::query(
-            r#"
-            UPDATE workflows
-            SET name = $1, graph_json = $2, max_concurrent_executions = $3, intent = $4, updated_at = NOW()
-            WHERE id = $5 AND (user_id = $6 OR org_id = ANY($7))
-            "#,
-        )
-        .bind(&input.name)
-        .bind(&input.graph_json)
-        .bind(input.max_concurrent_executions)
-        .bind(&input.intent)
-        .bind(id)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .execute(&mut *tx)
-        .await?;
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+        let rows_affected = workflow_repo
+            .update_workflow_scoped(
+                &mut tx,
+                id,
+                *user_id,
+                &scope.accessible_org_ids,
+                &input.name,
+                &input.graph_json,
+                input.max_concurrent_executions,
+                input.intent.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: workflow update failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             // MCP-918: .extend_safe()
             return Err(async_graphql::Error::new(
                 "Workflow not found or you don't have permission to update it",
@@ -1168,26 +1129,19 @@ impl WorkflowsMutations {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let result = sqlx::query(
-            "DELETE FROM workflows \
-             WHERE id = $1 \
-               AND (user_id = $2 OR org_id = ANY($3)) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM workflow_executions \
-                   WHERE workflow_id = workflows.id \
-                     AND status IN ('running', 'queued', 'pending', 'resuming') \
-               )",
-        )
-        .bind(id)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .execute(&mut *tx)
-        .await?;
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+        let rows_affected = workflow_repo
+            .delete_workflow_guarded_scoped(&mut tx, id, *user_id, &scope.accessible_org_ids)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: workflow delete failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             // Distinguish "not found / access denied" from "blocked by
             // in-flight executions" so the operator gets actionable
             // feedback. Run a second SELECT to determine which case
@@ -1211,27 +1165,18 @@ impl WorkflowsMutations {
             // Err arm below — which already means "delete state
             // undetermined", the correct outcome when the scope can't even
             // be established.
-            let blocked: Result<Option<bool>, sqlx::Error> = async {
+            let blocked: anyhow::Result<Option<bool>> = async {
                 let mut dtx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
                     .await
-                    .map_err(|e| sqlx::Error::Protocol(format!("tenant scope: {e}")))?;
-                let b = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM workflows w \
-                         WHERE w.id = $1 \
-                           AND (w.user_id = $2 OR w.org_id = ANY($3)) \
-                           AND EXISTS ( \
-                               SELECT 1 FROM workflow_executions \
-                               WHERE workflow_id = w.id \
-                                 AND status IN ('running', 'queued', 'pending', 'resuming') \
-                           ) \
-                     )",
-                )
-                .bind(id)
-                .bind(user_id)
-                .bind(&scope.accessible_org_ids)
-                .fetch_optional(&mut *dtx)
-                .await?;
+                    .map_err(|e| anyhow::anyhow!("tenant scope: {e}"))?;
+                let b = workflow_repo
+                    .workflow_delete_blocked_scoped(
+                        &mut dtx,
+                        id,
+                        *user_id,
+                        &scope.accessible_org_ids,
+                    )
+                    .await?;
                 dtx.commit().await?;
                 Ok(b)
             }
@@ -1476,28 +1421,19 @@ impl WorkflowsMutations {
         }
 
         // Upsert: insert or update on conflict (workflow_id is UNIQUE)
-        let row = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
-            r#"
-            INSERT INTO workflow_schedules (workflow_id, user_id, cron_expression, timezone, next_trigger_at)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (workflow_id) DO UPDATE SET
-                cron_expression = EXCLUDED.cron_expression,
-                timezone = EXCLUDED.timezone,
-                next_trigger_at = EXCLUDED.next_trigger_at,
-                is_enabled = true,
-                updated_at = NOW()
-            RETURNING id, workflow_id, user_id, cron_expression, timezone, is_enabled,
-                      last_triggered_at, next_trigger_at, created_at, updated_at
-            "#,
+        let row = talos_scheduler::upsert_schedule_on_conn(
+            uow.conn(),
+            workflow_id,
+            user_id,
+            &cron_expression,
+            &tz,
+            next_trigger,
         )
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(&cron_expression)
-        .bind(&tz)
-        .bind(next_trigger)
-        .fetch_one(uow.conn())
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "graphql: schedule upsert failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -1567,24 +1503,18 @@ impl WorkflowsMutations {
 
         // Fetch existing schedule, locking the row (`FOR UPDATE OF ws`) so
         // the merge-then-update below is serialized against concurrent
-        // updaters. `OF ws` locks only the schedule row, not the joined
-        // workflows row.
-        let existing = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
-            r#"
-            SELECT ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
-                   ws.last_triggered_at, ws.next_trigger_at, ws.created_at, ws.updated_at
-            FROM workflow_schedules ws
-            LEFT JOIN workflows w ON w.id = ws.workflow_id
-            WHERE ws.workflow_id = $1 AND (ws.user_id = $2 OR w.org_id = ANY($3))
-            FOR UPDATE OF ws
-            "#,
+        // updaters.
+        let existing = talos_scheduler::get_schedule_for_update_on_conn(
+            uow.conn(),
+            workflow_id,
+            user_id,
+            &scope.accessible_org_ids,
         )
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .fetch_optional(uow.conn())
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?
+        .map_err(|e| {
+            tracing::error!(error = %e, "graphql: schedule locked read failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?
         .ok_or_else(|| async_graphql::Error::new("Schedule not found").extend_safe())?;
 
         let new_cron = cron_expression.unwrap_or(existing.cron_expression);
@@ -1642,32 +1572,21 @@ impl WorkflowsMutations {
             None
         };
 
-        let row = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
-            r#"
-            UPDATE workflow_schedules ws
-            SET cron_expression = $3,
-                timezone = $4,
-                is_enabled = $5,
-                next_trigger_at = $6,
-                updated_at = NOW()
-            FROM workflows w
-            WHERE ws.workflow_id = $1
-              AND w.id = ws.workflow_id
-              AND (ws.user_id = $2 OR w.org_id = ANY($7))
-            RETURNING ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
-                      ws.last_triggered_at, ws.next_trigger_at, ws.created_at, ws.updated_at
-            "#,
+        let row = talos_scheduler::update_schedule_on_conn(
+            uow.conn(),
+            workflow_id,
+            user_id,
+            &scope.accessible_org_ids,
+            &new_cron,
+            &new_tz,
+            new_enabled,
+            next_trigger,
         )
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(&new_cron)
-        .bind(&new_tz)
-        .bind(new_enabled)
-        .bind(next_trigger)
-        .bind(&scope.accessible_org_ids)
-        .fetch_one(uow.conn())
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "graphql: schedule update failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -1726,27 +1645,23 @@ impl WorkflowsMutations {
             );
         }
 
-        let result = sqlx::query(
-            r#"
-            DELETE FROM workflow_schedules ws
-            USING workflows w
-            WHERE ws.workflow_id = $1
-              AND w.id = ws.workflow_id
-              AND (ws.user_id = $2 OR w.org_id = ANY($3))
-            "#,
+        let rows_affected = talos_scheduler::delete_schedule_on_conn(
+            uow.conn(),
+            workflow_id,
+            user_id,
+            &scope.accessible_org_ids,
         )
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .execute(uow.conn())
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "graphql: schedule delete failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(rows_affected > 0)
     }
 
     // ── Workflow Testing ────────────────────────────────────────────────
@@ -1827,22 +1742,15 @@ impl WorkflowsMutations {
         // MCP-565 (webhook), MCP-652 (resume). test_workflow was the
         // last GraphQL execution-creating surface without the gate.
         // See `memory/dispatch_path_authorization_sweep.md`.
-        #[derive(sqlx::FromRow)]
-        struct WorkflowForTest {
-            graph_json: String,
-            actor_id: Option<Uuid>,
-        }
-        let wf_for_test = sqlx::query_as::<_, WorkflowForTest>(
-            // allow-bare-pool-rls: workflow_accessible_for_user (line ~2346, user_id OR org_id=ANY) gates this workflow_id immediately above; revisit on RLS SET-ROLE rollout
-            "SELECT graph_json, actor_id FROM workflows WHERE id = $1",
-        )
-        .bind(workflow_id)
-        .fetch_one(&db_pool)
-        .await
-        .map_err(|e: sqlx::Error| {
-            tracing::error!("Failed to load workflow for test: {}", e);
-            async_graphql::Error::new("Internal database error").extend_safe()
-        })?;
+        let test_workflow_repo =
+            talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+        let wf_for_test = test_workflow_repo
+            .get_graph_and_actor_unchecked(workflow_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to load workflow for test: {}", e);
+                async_graphql::Error::new("Internal database error").extend_safe()
+            })?;
         let graph_json = wf_for_test.graph_json;
 
         // MCP-672 + MCP-730 (2026-05-13): actor budget + capability-
@@ -1937,20 +1845,13 @@ impl WorkflowsMutations {
             .ok();
 
         // Create a test execution record (marked as test)
-        sqlx::query(
-            // allow-bare-pool-rls: row is stamped with the authenticated user_id ($3) for a workflow_id already gated by workflow_accessible_for_user (line ~2346) + authorize_workflow_trigger; revisit on RLS SET-ROLE rollout
-            "INSERT INTO workflow_executions (id, workflow_id, user_id, status, is_test_execution, actor_id) VALUES ($1, $2, $3, 'running', true, $4)"
-        )
-        .bind(execution_id)
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(test_effective_actor)
-        .execute(&db_pool)
-        .await
-        .map_err(|e: sqlx::Error| {
-            tracing::error!("Failed to create test execution: {}", e);
-            async_graphql::Error::new("Failed to create test execution").extend_safe()
-        })?;
+        talos_execution_repository::ExecutionRepository::new(db_pool.clone())
+            .insert_test_execution_row(execution_id, workflow_id, user_id, test_effective_actor)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create test execution: {}", e);
+                async_graphql::Error::new("Failed to create test execution").extend_safe()
+            })?;
 
         // Parse mock_inputs → trigger_input BEFORE spawning so a malformed
         // payload returns a proper synchronous GraphQL error rather than a
@@ -2259,21 +2160,19 @@ async fn persist_and_broadcast_test_event(
         };
         talos_dlp_provider::redact_str(truncated)
     });
-    if let Err(db_err) = sqlx::query(
-        // allow-bare-pool-rls: execution_id owned by the authenticated user via
-        // the test row test_workflow INSERTed before this detached task ran.
-        r#"
-        INSERT INTO execution_events (execution_id, event_type, node_id, status, log_message)
-        VALUES ($1, $2, $3, $4, $5)
-        "#,
-    )
-    .bind(event.execution_id)
-    .bind(event_type)
-    .bind(event.node_id)
-    .bind(format!("{:?}", event.status))
-    .bind(&redacted_log_message)
-    .execute(db_pool)
-    .await
+    // Bare pool by design: execution_id is owned by the authenticated user
+    // via the test row test_workflow INSERTed before this detached task ran.
+    if let Err(db_err) = talos_execution_repository::ExecutionRepository::new(db_pool.clone())
+        .insert_execution_event(
+            event.execution_id,
+            event_type,
+            event.node_id,
+            &format!("{:?}", event.status),
+            redacted_log_message.as_deref(),
+            None,
+            None,
+        )
+        .await
     {
         tracing::error!(
             execution_id = %event.execution_id,
@@ -2294,18 +2193,13 @@ async fn mark_test_execution_failed(
     execution_id: Uuid,
     message: &str,
 ) {
-    if let Err(db_err) = sqlx::query(
-        // allow-bare-pool-rls: execution_id was INSERTed under the authenticated
-        // user_id by test_workflow before this detached task ran, for a workflow
-        // gated by workflow_accessible_for_user; revisit on RLS SET-ROLE rollout.
-        // Status guard prevents clobbering a terminal / resuming row.
-        "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 \
-         WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
-    )
-    .bind(execution_id)
-    .bind(message)
-    .execute(db_pool)
-    .await
+    // Bare pool by design: execution_id was INSERTed under the authenticated
+    // user_id by test_workflow before this detached task ran, for a workflow
+    // gated by workflow_accessible_for_user; revisit on RLS SET-ROLE rollout.
+    // The repo method carries the terminal-status guard (check 39).
+    if let Err(db_err) = talos_execution_repository::ExecutionRepository::new(db_pool.clone())
+        .fail_execution_unless_terminal(execution_id, message, true)
+        .await
     {
         tracing::error!(
             execution_id = %execution_id,
@@ -2332,58 +2226,9 @@ async fn mark_test_execution_failed(
     .await;
 }
 
-async fn release_advisory_lock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, lock_id: i64) {
-    // MCP-702 (2026-05-13): the pre-fix design took `&mut conn` and
-    // commented "Advisory locks auto-release on connection close, so a
-    // failure here is recoverable." That assumption is wrong for sqlx
-    // pool connections — they are NOT closed when `PoolConnection` is
-    // dropped, they're returned to the pool and the Postgres TCP
-    // session persists. A session-level `pg_advisory_lock` therefore
-    // LEAKS to whatever pool consumer reuses that connection next,
-    // stalling future `pg_advisory_xact_lock(same_key)` attempts
-    // indefinitely. Same class as MCP-701 (rotate_master_key).
-    //
-    // Take `conn` by value so we can `detach()` it on unlock failure:
-    // detach converts the PoolConnection into a raw `PgConnection`
-    // that closes on Drop instead of returning to the pool, ending
-    // the Postgres session and freeing the lock. Without the detach,
-    // a transient unlock failure (network glitch, query timeout) would
-    // permanently retain the lock until sqlx's idle-timeout
-    // maintenance reaps the connection — which can take hours on a
-    // busy pool.
-    //
-    // **Remaining caller-side hazard**: tokio::spawn panics. If the
-    // spawned task panics between `pg_try_advisory_lock` and this
-    // function call, the PoolConnection drops without unlocking; the
-    // lock leaks. Refactoring the spawned-task bodies to use the
-    // MCP-701 IIFE pattern (wrap critical section in
-    // `async {}.await`, run unlock in the outer scope regardless of
-    // inner Result) would close this. Not yet applied because the
-    // spawned-task bodies are ~600 LoC each.
-    match sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_id)
-        .execute(&mut *conn)
-        .await
-    {
-        Ok(_) => {
-            // Happy path — lock released, conn returns to pool on drop.
-        }
-        Err(e) => {
-            tracing::warn!(
-                lock_id,
-                error = %e,
-                "Failed to release pg advisory lock — detaching connection from pool \
-                 so the lock doesn't leak to the next consumer"
-            );
-            // Force-close the underlying connection so the session
-            // ends and the lock releases server-side. The detached
-            // connection drops at end of this expression.
-            let _detached = conn.detach();
-            // _detached is a PgConnection; Drop closes the TCP session
-            // and Postgres releases all advisory locks held by it.
-        }
-    }
-}
+// `release_advisory_lock` moved to `talos_db::release_advisory_lock`
+// (check-50 extraction) — the MCP-702 detach-on-unlock-failure rationale
+// lives on the canonical helper.
 
 /// Project the typed `CreateFromDescriptionOutcome` from the workflow
 /// creation service into the GraphQL response shape. The MCP handler
