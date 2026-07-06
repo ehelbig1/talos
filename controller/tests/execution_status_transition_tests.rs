@@ -92,3 +92,59 @@ async fn queued_execution_requires_running_promotion_before_completion() {
         .expect("mark completed");
     assert_eq!(status(&ctx.db_pool, exec_id).await, "completed");
 }
+
+/// `workflow_executions.priority` is `TEXT` ('normal'/'high'/... — migration
+/// 20260314001300), NOT the `INT` of the unrelated `modules.priority` column.
+/// `ExecutionRow.priority` was mistyped `Option<i32>`, so `get_execution` (and
+/// every path reading the full row — retry/replay) hard-failed at decode:
+///
+///   error decoding column "priority": Rust type Option<i32> (INT4) is not
+///   compatible with SQL type TEXT
+///
+/// That made retryExecution / replayExecution 100% non-functional in
+/// production while returning only a generic "Internal error" to the client.
+/// This test decodes a real row through the actual repository query so the
+/// column-type contract can't silently drift again (pure-unit tests can't —
+/// the mismatch only surfaces against Postgres).
+#[tokio::test]
+async fn get_execution_decodes_text_priority_column() {
+    use talos_execution_repository::ExecutionRepository;
+
+    let ctx = common::setup_test_context().await;
+    let user_id = common::create_test_user(&ctx.auth_service, "exec-priority@example.com").await;
+    let workflow_id =
+        common::create_test_workflow(&ctx.db_pool, user_id, "exec-priority-test").await;
+
+    // actor_id is NOT NULL post-universalization — bind the user's default.
+    let actor_id = talos_actor_repository::ActorRepository::new(ctx.db_pool.clone())
+        .get_or_create_default_actor(user_id)
+        .await
+        .expect("default actor");
+
+    let repo = WorkflowRepository::new(ctx.db_pool.clone());
+    let exec_id = Uuid::new_v4();
+    repo.create_execution_under_concurrency_limit(
+        exec_id,
+        workflow_id,
+        user_id,
+        Some(actor_id),
+        Some("high"), // priority: TEXT enum, not an integer
+        None,
+        None,
+        None,
+        None,
+        InitialExecutionStatus::Queued,
+    )
+    .await
+    .expect("create execution with a text priority");
+
+    // The decode that used to blow up. Reading the row back at all is the
+    // assertion; the priority value round-trips as the stored string.
+    let exec_repo = ExecutionRepository::new(ctx.db_pool.clone());
+    let row = exec_repo
+        .get_execution(exec_id, user_id)
+        .await
+        .expect("get_execution must decode the TEXT priority column")
+        .expect("row exists");
+    assert_eq!(row.priority.as_deref(), Some("high"));
+}
