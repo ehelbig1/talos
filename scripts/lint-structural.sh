@@ -3401,8 +3401,13 @@ bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count m
 # list_capability_grants/get_user_email,
 # ExecutionRepository::get_workflow_id_any_user,
 # OrganizationService::list_user_org_ids/get_org_quota_limits,
-# talos_integrations::store::list_user_service_integrations).
-TALOS_API_SQLX_BASELINE=70
+# talos_integrations::store::list_user_service_integrations); 61 after
+# platform/mutations.rs (tx-taking WorkflowRepository::set_max_concurrent_scoped,
+# OrganizationService::first_org_id_owned_by/upsert_org_quota_limit/
+# get_org_quota_limits, ActorRepository::get_user_max_capability_world/
+# user_exists/upsert_capability_grant/delete_capability_grant,
+# talos_integrations::store::disconnect_user_integration).
+TALOS_API_SQLX_BASELINE=61
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \
