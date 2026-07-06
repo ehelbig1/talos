@@ -230,6 +230,170 @@ pub fn validate_resource_name(name: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Module config ↔ config_schema validation
+// ─────────────────────────────────────────────────────────────────────
+
+/// The JSON type name a `config_schema` property declares, as a
+/// value the caller actually supplied maps to. Used to produce the
+/// human-facing "expected X, got Y" diagnostic.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "integer"
+            } else {
+                "number"
+            }
+        }
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Does `value` satisfy the JSON-Schema `type` keyword `expected`?
+///
+/// `number` accepts both integers and floats (JSON Schema semantics);
+/// `integer` accepts only whole numbers. Unknown/absent `expected`
+/// strings are treated as "no constraint" (return true) so a schema
+/// using a type keyword this validator doesn't model never produces a
+/// false rejection.
+fn json_type_matches(value: &serde_json::Value, expected: &str) -> bool {
+    match expected {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+/// Validate a module's `config` JSON against its template's
+/// `config_schema`, catching the shape mistakes that otherwise fail deep
+/// inside the WASM guest at run time (e.g. an array-typed field supplied
+/// as an object — the `HEADERS` papercut). Checks, per top-level
+/// property: JSON `type`, `enum` membership, and top-level `required`
+/// presence. Shallow — nested object properties are not recursed; array
+/// `items` get a one-level element-type check.
+///
+/// Deliberately LENIENT in two ways so it never blocks a legitimate
+/// install:
+/// - **Unknown keys pass.** Modules may read config keys the schema
+///   doesn't enumerate; rejecting them would break dynamic-config
+///   modules. (Typo-catching is a possible future opt-in, not a
+///   default.)
+/// - **An absent/empty/non-object schema passes.** Older templates ship
+///   without a `config_schema`; there is nothing to validate against.
+///
+/// Reports EVERY problem it finds in one message (joined with `; `) so a
+/// caller fixing config sees the full list, not one error per round-trip.
+/// Returns the canonical [`ValidationError`]; the calling surface maps it
+/// (`.extend_safe()` for GraphQL, `mcp_error` for MCP).
+pub fn validate_config_against_schema(
+    config: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Result<(), ValidationError> {
+    // No schema, or a schema with no properties, means nothing to check.
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return Ok(());
+    };
+
+    // A property-bearing object schema expects an object config. Anything
+    // else (someone passed a bare array/string as the whole config) is
+    // the clearest possible mismatch.
+    let Some(config_obj) = config.as_object() else {
+        return Err(ValidationError::new(format!(
+            "Config must be a JSON object, got {}",
+            json_type_name(config)
+        )));
+    };
+
+    let mut problems: Vec<String> = Vec::new();
+
+    // Required keys must be present.
+    if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+        for key in required.iter().filter_map(|k| k.as_str()) {
+            if !config_obj.contains_key(key) {
+                problems.push(format!("missing required config key '{key}'"));
+            }
+        }
+    }
+
+    // Per-supplied-key type + enum checks (unknown keys are skipped).
+    for (key, value) in config_obj {
+        let Some(prop) = props.get(key).and_then(|p| p.as_object()) else {
+            continue; // unknown key — lenient by design
+        };
+
+        // type
+        if let Some(expected) = prop.get("type").and_then(|t| t.as_str()) {
+            if !json_type_matches(value, expected) {
+                problems.push(format!(
+                    "config key '{key}' must be {expected}, got {}",
+                    json_type_name(value)
+                ));
+                // Type is wrong — enum/items checks below would be noise.
+                continue;
+            }
+        }
+
+        // enum
+        if let Some(allowed) = prop.get("enum").and_then(|e| e.as_array()) {
+            if !allowed.iter().any(|a| a == value) {
+                let rendered: Vec<String> = allowed
+                    .iter()
+                    .map(|a| match a {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                let got = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                problems.push(format!(
+                    "config key '{key}' value '{got}' is not one of the allowed values [{}]",
+                    rendered.join(", ")
+                ));
+            }
+        }
+
+        // one-level array element type
+        if let (Some(arr), Some(item_type)) = (
+            value.as_array(),
+            prop.get("items")
+                .and_then(|i| i.get("type"))
+                .and_then(|t| t.as_str()),
+        ) {
+            if let Some((idx, bad)) = arr
+                .iter()
+                .enumerate()
+                .find(|(_, el)| !json_type_matches(el, item_type))
+            {
+                problems.push(format!(
+                    "config key '{key}'[{idx}] must be {item_type}, got {}",
+                    json_type_name(bad)
+                ));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationError::new(format!(
+            "Invalid module config: {}",
+            problems.join("; ")
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +549,109 @@ mod tests {
     fn resource_name_forbidden_char_message_is_stable() {
         let e = validate_resource_name("a/b").unwrap_err();
         assert_eq!(e.message, "Name contains forbidden character: '/'");
+    }
+
+    // ---- validate_config_against_schema ----------------------------
+
+    use serde_json::json;
+
+    fn http_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "required": ["URL"],
+            "properties": {
+                "METHOD": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"] },
+                "URL": { "type": "string" },
+                "HEADERS": { "type": "array", "items": { "type": "object" } },
+                "TIMEOUT_MS": { "type": "number" }
+            }
+        })
+    }
+
+    #[test]
+    fn valid_config_passes() {
+        let cfg = json!({
+            "METHOD": "GET",
+            "URL": "https://example.com",
+            "HEADERS": [{ "key": "X", "value": "y" }],
+            "TIMEOUT_MS": 5000
+        });
+        assert!(validate_config_against_schema(&cfg, &http_schema()).is_ok());
+    }
+
+    #[test]
+    fn the_headers_papercut_is_caught_at_create_time() {
+        // The exact mistake that used to fail deep in the WASM guest with
+        // "invalid type: map, expected a sequence": HEADERS as an object
+        // instead of an array.
+        let cfg = json!({
+            "URL": "https://example.com",
+            "HEADERS": { "X-Smoke-Auth": "vault://smoke/token" }
+        });
+        let e = validate_config_against_schema(&cfg, &http_schema()).unwrap_err();
+        assert!(
+            e.message.contains("'HEADERS' must be array, got object"),
+            "got: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn enum_violation_lists_allowed_values() {
+        let cfg = json!({ "URL": "https://x", "METHOD": "FETCH" });
+        let e = validate_config_against_schema(&cfg, &http_schema()).unwrap_err();
+        assert!(e.message.contains("'METHOD' value 'FETCH' is not one of"));
+        assert!(e.message.contains("GET, POST, PUT, DELETE, PATCH"));
+    }
+
+    #[test]
+    fn missing_required_key_is_reported() {
+        let cfg = json!({ "METHOD": "GET" });
+        let e = validate_config_against_schema(&cfg, &http_schema()).unwrap_err();
+        assert!(e.message.contains("missing required config key 'URL'"));
+    }
+
+    #[test]
+    fn all_problems_reported_in_one_message() {
+        let cfg = json!({ "METHOD": "FETCH", "HEADERS": {} });
+        let e = validate_config_against_schema(&cfg, &http_schema()).unwrap_err();
+        // required URL missing + METHOD enum + HEADERS type — all three.
+        assert!(
+            e.message.contains("missing required config key 'URL'"),
+            "{}",
+            e.message
+        );
+        assert!(e.message.contains("'METHOD'"), "{}", e.message);
+        assert!(e.message.contains("'HEADERS'"), "{}", e.message);
+    }
+
+    #[test]
+    fn unknown_keys_are_lenient() {
+        let cfg = json!({ "URL": "https://x", "SOME_DYNAMIC_KEY": 42 });
+        assert!(validate_config_against_schema(&cfg, &http_schema()).is_ok());
+    }
+
+    #[test]
+    fn absent_or_empty_schema_passes() {
+        let cfg = json!({ "anything": [1, 2, 3] });
+        assert!(validate_config_against_schema(&cfg, &json!({})).is_ok());
+        assert!(validate_config_against_schema(&cfg, &json!({ "type": "object" })).is_ok());
+    }
+
+    #[test]
+    fn number_accepts_integer_and_float() {
+        let schema = json!({ "properties": { "N": { "type": "number" } } });
+        assert!(validate_config_against_schema(&json!({ "N": 5 }), &schema).is_ok());
+        assert!(validate_config_against_schema(&json!({ "N": 5.5 }), &schema).is_ok());
+        let e = validate_config_against_schema(&json!({ "N": "5" }), &schema).unwrap_err();
+        assert!(e.message.contains("'N' must be number, got string"));
+    }
+
+    #[test]
+    fn non_object_config_is_rejected() {
+        let e = validate_config_against_schema(&json!([1, 2]), &http_schema()).unwrap_err();
+        assert!(e
+            .message
+            .contains("Config must be a JSON object, got array"));
     }
 }

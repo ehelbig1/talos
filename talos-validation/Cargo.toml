@@ -16,4 +16,5 @@ publish.workspace = true
 # now live in ONE place, so a fix can't land on one surface and miss
 # the other.
 [dependencies]
+serde_json.workspace = true
 thiserror.workspace = true

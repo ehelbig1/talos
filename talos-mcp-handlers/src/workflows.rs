@@ -2274,12 +2274,18 @@ async fn handle_add_node_to_workflow(
                 if let Some(template) = templates.first() {
                     template_max_retries = Some(template.max_retries);
 
-                    // Config type validation — only when config has keys to check.
-                    if let Err(msg) = talos_workflow_creation_helpers::validate_config_field_types(
+                    // Config shape validation (type / enum / required /
+                    // array-items) against the node template's config_schema.
+                    // Shared with the GraphQL createModuleFromTemplate path via
+                    // talos-validation, so a node added with a wrong-typed,
+                    // out-of-enum, or missing-required config key is rejected
+                    // here at add-time instead of failing opaquely inside the
+                    // WASM guest at run-time.
+                    if let Err(e) = talos_validation::validate_config_against_schema(
                         &config,
                         &template.config_schema,
                     ) {
-                        return mcp_error(req_id, -32602, &msg);
+                        return mcp_error(req_id, -32602, &e.message);
                     }
 
                     // Pattern validation: validate config string values against

@@ -107,6 +107,20 @@ impl ModulesMutations {
             async_graphql::Error::new("Invalid JSON config").extend_safe()
         })?;
 
+        // 2b. Validate config SHAPE against the template's config_schema
+        // BEFORE compiling. Pre-fix a shape mistake (e.g. HEADERS supplied
+        // as a `{key: value}` object instead of the schema's
+        // `[{key, value}]` array) sailed through create + compile and only
+        // failed deep inside the WASM guest at RUN time as
+        // "Invalid JSON input: invalid type: map, expected a sequence" —
+        // an opaque error a caller can't map back to their config. The
+        // validator (type / enum / required, shared with MCP via
+        // talos-validation) turns that into an actionable create-time
+        // message naming the offending key. Message is caller-input, safe
+        // to surface via extend_safe.
+        talos_validation::validate_config_against_schema(&config, &template.config_schema)
+            .map_err(|e| async_graphql::Error::new(e.message).extend_safe())?;
+
         // 3. Extract secret references and validate they exist.
         // MCP-662 (2026-05-13): bulk-validate via
         // `existing_secret_key_paths(paths, user_id)` instead of
