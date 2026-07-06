@@ -477,6 +477,12 @@ services:
       # queries because the worker has no Postgres credentials.
 
       METRICS_AUTH_TOKENS: ${METRICS_AUTH_TOKENS:-dev-token}
+      # Tamper-evident audit-event signing (HMAC). The WORKER is the
+      # producer — without the key here, audit events ship to the WORM
+      # bucket UNSIGNED even when the operator sets it in .env (the
+      # controller-side copy below only covers chain VERIFICATION).
+      # Generate with: openssl rand -hex 32
+      TALOS_AUDIT_SIGNING_KEY: ${TALOS_AUDIT_SIGNING_KEY:-}
       # HMAC key shared between controller and worker for signing NATS job requests.
       # Generate with: openssl rand -hex 32
       #
