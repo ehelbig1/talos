@@ -235,14 +235,25 @@ services:
         # Confirm the key is reachable.
         vault read transit/keys/talos-kek
 
-        # Create a stable-id child token so downstream services can use a
-        # predictable VAULT_TOKEN=dev-root across restarts. -force revokes
-        # any stale token with the same id before recreating. No-TTL +
-        # orphan so it doesn't expire or chain back to the root session.
-        vault token revoke dev-root 2>/dev/null || true
-        # Periodic orphan token: auto-renews every 768h, never expires as
-        # long as it's being used. Safe choice for a dev-only credential.
-        vault token create -id=dev-root -orphan -policy=root -period=768h -display-name=dev-root >/dev/null
+        # Ensure the stable-id child token exists so downstream services can
+        # use a predictable VAULT_TOKEN=dev-root across restarts.
+        #
+        # LOOKUP-FIRST (2026-07-06): the previous revoke-then-recreate shape
+        # forced a storage WRITE pair on every boot. Under disk pressure the
+        # revoke's write failed (its stderr was swallowed by 2>/dev/null) and
+        # the create then died on "cannot create a token with a duplicate
+        # ID" — killing init and, transitively, the controller, during an
+        # otherwise-unrelated `make rebuild`. A usable existing token IS the
+        # goal state, so probe for it and only revoke+recreate when the
+        # lookup fails (stale/expired/broken token).
+        if vault token lookup dev-root >/dev/null 2>&1; then
+          echo "vault-init: dev-root token already present"
+        else
+          vault token revoke dev-root 2>/dev/null || true
+          # Periodic orphan token: auto-renews every 768h, never expires as
+          # long as it's being used. Safe choice for a dev-only credential.
+          vault token create -id=dev-root -orphan -policy=root -period=768h -display-name=dev-root >/dev/null
+        fi
         echo "vault-init: dev-root token ready"
 
   # Controller Service (GraphQL API)
