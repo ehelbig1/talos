@@ -95,8 +95,10 @@ COPY . .
 # (i.e. /app/talos/controller/.sqlx) — already present via `COPY . .`.
 ENV SQLX_OFFLINE=1
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/talos/target \
+# sharing=locked: see worker/Dockerfile — the parallel image builds race
+# the shared registry cache mount without it (cargo unpack "File exists").
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/talos/target,sharing=locked \
     cargo build --profile docker --bin controller && \
     cp /app/talos/target/docker/controller /app/controller-bin
 

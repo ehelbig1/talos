@@ -242,12 +242,15 @@ introduced per-org v4 per table).
 - ALWAYS complete and verify data model changes (struct fields, migrations, protocol types) BEFORE launching parallel agents that construct those types. Otherwise agents use stale field names requiring manual reconciliation.
 
 ## Docker Build Notes
-- BuildKit uses persistent exec cache mounts for `/usr/local/cargo/registry` and `/app/target`
-  (see `controller/Dockerfile` lines 58-60 and 79-82).
-- These survive `docker compose build --no-cache`. If builds produce stale artifacts, run:
-  `make docker-clean-rebuild` to prune cache mounts and rebuild from scratch.
-- `make rebuild` clears Docker layer cache but NOT BuildKit exec cache mounts.
-- `make recover` fixes corrupted BuildKit metadata but not stale exec caches.
+- BuildKit uses persistent exec cache mounts for `/usr/local/cargo/registry` and `/app/talos/target`
+  (the `cargo build` RUN steps in `controller/Dockerfile` and `worker/Dockerfile`).
+- Both mounts are `sharing=locked` (2026-07-06): the controller/migrate/worker images build in
+  PARALLEL under compose bake, and the default `shared` mode let concurrent cargo processes race
+  the registry unpack (`failed to open .cargo-ok … File exists (os error 17)`); a build killed
+  mid-unpack leaves the cache corrupted so every retry fails.
+- These mounts survive `docker compose build --no-cache` AND `make clean` (its prune keeps 8 GB).
+  If builds produce stale artifacts or the `.cargo-ok` corruption above, purge them explicitly:
+  `docker builder prune -f --filter type=exec.cachemount`, then rebuild.
 - **cargo-audit + RustSec advisory database are baked into both the
   controller and builder images** at image-build time at the stable path
   `/opt/talos-advisory-db`. The compilation service passes
