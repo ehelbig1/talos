@@ -265,6 +265,20 @@ controller:
     # TALOS_WORKER_PUBLIC_KEYS: "fleet=<64-hex from keygen --role worker>"
     # off | audit | required — RFC 0010 P3 per-execution secret sealing.
     # TALOS_ENVELOPE_SEALING: "audit"
+    # Redis-backed distributed replay-nonce guard (codebase-review finding
+    # #2). Per-process nonce caches already stop within-replica replay; this
+    # makes signed-message single-use hold ACROSS controller replicas — a
+    # captured RPC replayed to a different replica inside the 60 s freshness
+    # window is rejected via a shared `SET NX PX` in Redis. Default ON
+    # (2026-07-06): Redis is already a required, prod-TLS-gated dependency,
+    # and at one replica the guard is inert-but-proven, so scaling out can't
+    # silently forget it. On Redis outage the guard fails OPEN by default
+    # (HMAC + freshness + per-replica caches still enforce; only the
+    # cross-replica single-use add-on degrades) — flip the second knob to
+    # refuse RPC entirely when Redis is unreachable, if your posture
+    # prefers unavailability over the 60 s replay window.
+    TALOS_DISTRIBUTED_REPLAY: "true"
+    # TALOS_REPLAY_FAIL_CLOSED: "true"
     # Bootstrap-time first-admin pin (MCP-859). STRONGLY RECOMMENDED
     # for any deployment exposed to the public internet BEFORE the
     # operator's own signup completes. When set, ONLY a user

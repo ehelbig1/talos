@@ -430,6 +430,15 @@ services:
       # the claim protocol; required additionally makes workers refuse an
       # inline-WSK downgrade. Set the same value on the worker service.
       TALOS_ENVELOPE_SEALING: ${TALOS_ENVELOPE_SEALING:-off}
+      # Redis-backed distributed replay-nonce guard (codebase-review
+      # finding #2): makes signed-message single-use hold ACROSS controller
+      # replicas, not just within one process. Default ON — Redis is always
+      # present in this stack; single-replica dev gains nothing but proves
+      # the wiring. Fail policy on Redis outage is fail-OPEN by default
+      # (HMAC + freshness + the per-replica cache still hold); set
+      # TALOS_REPLAY_FAIL_CLOSED=true to refuse RPC when Redis is down.
+      TALOS_DISTRIBUTED_REPLAY: ${TALOS_DISTRIBUTED_REPLAY:-true}
+      TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-false}
     ports:
       - "8000:8000"
     volumes:
