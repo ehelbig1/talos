@@ -28,7 +28,7 @@ pub struct ExecutionRow {
     pub replayed_from_id: Option<Uuid>,
     pub actor_id: Option<Uuid>,
     pub workflow_version_id: Option<Uuid>,
-    pub priority: Option<i32>,
+    pub priority: Option<String>,
     pub is_test_execution: bool,
     pub provenance: Option<serde_json::Value>,
     pub acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -45,7 +45,7 @@ pub struct ExecutionSummary {
     pub completed_at: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
     pub is_pinned: bool,
-    pub priority: Option<i32>,
+    pub priority: Option<String>,
     pub pin_note: Option<String>,
 }
 
