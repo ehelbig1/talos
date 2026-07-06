@@ -337,6 +337,7 @@ impl InlineCompileService {
         match self
             .compiler
             .lint_code(
+                Some(input.user_id),
                 "add_node_lint",
                 &wrapped_code,
                 &world_full,

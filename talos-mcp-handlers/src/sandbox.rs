@@ -1522,7 +1522,13 @@ async fn handle_run_sandbox(
     };
     if let Ok(lint_errors) = state
         .compiler
-        .lint_code("run_sandbox_lint", &rust_code, &lint_world, None)
+        .lint_code(
+            agent.user_id,
+            "run_sandbox_lint",
+            &rust_code,
+            &lint_world,
+            None,
+        )
         .await
     {
         if !lint_errors.is_empty() {
@@ -2143,7 +2149,7 @@ async fn handle_lint_sandbox(
 
     match state
         .compiler
-        .lint_code("lint-check", code, &world_full, None)
+        .lint_code(None, "lint-check", code, &world_full, None)
         .await
     {
         Ok(errors) => {
