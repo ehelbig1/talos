@@ -2673,6 +2673,34 @@ impl ExecutionRepository {
         Ok(result.rows_affected())
     }
 
+    /// Workflow dead-letter-queue entries for a user, newest first. Takes
+    /// the caller's transaction: the GraphQL `dead_letter_queue` query runs
+    /// this on a `begin_user_scoped` tx so the workflows RLS policy
+    /// backstops the ownership JOIN (RFC 0005 S3 — dead_letter_queue has no
+    /// policy of its own). Do NOT route this through `self.db_pool`; that
+    /// would silently drop the RLS backstop.
+    pub async fn list_dead_letter_queue_scoped(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<DeadLetterQueueRow>> {
+        let rows = sqlx::query_as::<_, DeadLetterQueueRow>(
+            "SELECT d.id, d.workflow_id, d.execution_id, d.node_id, d.error_message, \
+                    d.payload::text AS payload, d.created_at, d.replayed_at, d.replayed_by \
+             FROM dead_letter_queue d \
+             JOIN workflows w ON w.id = d.workflow_id \
+             WHERE w.user_id = $1 \
+             ORDER BY d.created_at DESC \
+             LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(rows)
+    }
+
     /// Latest `node_input` event for a (execution_id, node_id) pair.
     /// Returns the raw `log_message` text, which the handler parses as JSON
     /// or surfaces as a plain string.
@@ -2692,6 +2720,21 @@ impl ExecutionRepository {
         .await?;
         Ok(msg.flatten())
     }
+}
+
+/// Workflow DLQ row returned by `list_dead_letter_queue_scoped`.
+/// `payload` arrives pre-cast to text (JSONB column).
+#[derive(Debug, sqlx::FromRow)]
+pub struct DeadLetterQueueRow {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    pub execution_id: Uuid,
+    pub node_id: Uuid,
+    pub error_message: String,
+    pub payload: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub replayed_at: Option<DateTime<Utc>>,
+    pub replayed_by: Option<Uuid>,
 }
 
 /// Row returned by `list_recent_module_executions_for_user`.

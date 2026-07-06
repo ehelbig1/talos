@@ -43,27 +43,16 @@ impl WebhooksQueries {
         let limit = pagination.get_limit();
         let offset = pagination.get_offset();
 
-        let listeners = sqlx::query!(
-            r#"
-            SELECT id, name, module_id,
-                   enabled as "enabled!",
-                   max_requests_per_minute as "max_requests_per_minute!",
-                   trigger_count as "trigger_count!",
-                   success_count as "success_count!",
-                   error_count as "error_count!",
-                   last_triggered_at,
-                   event_filter
-            FROM webhook_triggers
-            WHERE user_id = $1
-            ORDER BY created_at DESC, id DESC
-            LIMIT $2 OFFSET $3
-            "#,
-            user_id,
-            limit,
-            offset
-        )
-        .fetch_all(db_pool)
-        .await?;
+        // Bare-pool read preserved — webhook_triggers is user-scoped by
+        // predicate, not org-pinned RLS.
+        let repo = talos_webhook_repository::WebhookRepository::new(db_pool.clone());
+        let listeners = repo
+            .list_for_user_with_stats(*user_id, limit, offset)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to list webhook triggers: {}", e);
+                async_graphql::Error::new("Failed to list webhook triggers").extend_safe()
+            })?;
 
         Ok(listeners
             .into_iter()
@@ -101,40 +90,26 @@ impl WebhooksQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        use sqlx::Row;
-        let rows = sqlx::query(
-            r#"
-            SELECT d.id, d.trigger_id, d.source_ip::text, d.drop_reason,
-                   d.headers::text, d.payload::text, d.created_at,
-                   d.replayed_at, d.replayed_by
-            FROM webhook_dlq d
-            JOIN webhook_triggers t ON t.id = d.trigger_id
-            WHERE t.user_id = $1
-            ORDER BY d.created_at DESC
-            LIMIT 200
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        // Bare-pool read preserved — ownership is the JOIN on
+        // webhook_triggers.user_id, not org-pinned RLS.
+        let repo = talos_webhook_repository::WebhookRepository::new(db_pool.clone());
+        let rows = repo.list_dlq_for_user(user_id, 200).await.map_err(|e| {
+            tracing::error!("Failed to list webhook DLQ: {}", e);
+            async_graphql::Error::new("Failed to list webhook DLQ").extend_safe()
+        })?;
 
         Ok(rows
             .into_iter()
             .map(|row| WebhookDlqEntry {
-                id: row.get("id"),
-                trigger_id: row.get("trigger_id"),
-                source_ip: row.get("source_ip"),
-                drop_reason: row.get("drop_reason"),
-                headers: row.get("headers"),
-                payload: row.get("payload"),
-                created_at: row
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339(),
-                replayed_at: row
-                    .get::<Option<chrono::DateTime<chrono::Utc>>, _>("replayed_at")
-                    .map(|t| t.to_rfc3339()),
-                replayed_by: row.get("replayed_by"),
+                id: row.id,
+                trigger_id: row.trigger_id,
+                source_ip: row.source_ip,
+                drop_reason: row.drop_reason,
+                headers: row.headers,
+                payload: row.payload,
+                created_at: row.created_at.to_rfc3339(),
+                replayed_at: row.replayed_at.map(|t| t.to_rfc3339()),
+                replayed_by: row.replayed_by,
             })
             .collect())
     }
@@ -155,31 +130,24 @@ impl WebhooksQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        use sqlx::Row;
         // RFC 0005 S3: per-user scoped tx so the workflows RLS policy
         // backstops the ownership JOIN (dead_letter_queue has no policy of
         // its own; the gate is `w.user_id = $1` on the joined workflow).
+        // The repo method takes the tx — executor preserved.
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let rows = sqlx::query(
-            r#"
-            SELECT d.id, d.workflow_id, d.execution_id, d.node_id, d.error_message, d.payload::text,
-                   d.created_at, d.replayed_at, d.replayed_by
-            FROM dead_letter_queue d
-            JOIN workflows w ON w.id = d.workflow_id
-            WHERE w.user_id = $1
-            ORDER BY d.created_at DESC
-            LIMIT 200
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
+        let rows = exec_repo
+            .list_dead_letter_queue_scoped(&mut tx, user_id, 200)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to list dead letter queue: {}", e);
+                async_graphql::Error::new("Failed to list dead letter queue").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -188,19 +156,15 @@ impl WebhooksQueries {
         Ok(rows
             .into_iter()
             .map(|row| DeadLetterEntry {
-                id: row.get("id"),
-                workflow_id: row.get("workflow_id"),
-                execution_id: row.get("execution_id"),
-                node_id: row.get("node_id"),
-                error_message: row.get("error_message"),
-                payload: row.get("payload"),
-                created_at: row
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339(),
-                replayed_at: row
-                    .get::<Option<chrono::DateTime<chrono::Utc>>, _>("replayed_at")
-                    .map(|t| t.to_rfc3339()),
-                replayed_by: row.get("replayed_by"),
+                id: row.id,
+                workflow_id: row.workflow_id,
+                execution_id: row.execution_id,
+                node_id: row.node_id,
+                error_message: row.error_message,
+                payload: row.payload,
+                created_at: row.created_at.to_rfc3339(),
+                replayed_at: row.replayed_at.map(|t| t.to_rfc3339()),
+                replayed_by: row.replayed_by,
             })
             .collect())
     }

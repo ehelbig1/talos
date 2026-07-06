@@ -66,6 +66,7 @@ talos-totp-2fa = { path = "../talos-totp-2fa" }
 # multiline description, control-char rejection). Shared with
 # talos-mcp-handlers so a rule fix can't drift between surfaces.
 talos-validation = { path = "../talos-validation" }
+talos-webhook-repository = { path = "../talos-webhook-repository" }
 talos-webhooks = { path = "../talos-webhooks" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-creation = { path = "../talos-workflow-creation" }

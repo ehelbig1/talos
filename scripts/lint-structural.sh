@@ -3383,8 +3383,11 @@ bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count m
 # executions/mutations.rs (scoped-tx approve/deny →
 # ExecutionRepository::decide_execution_approval_scoped, tx passed through),
 # auth/mutations.rs (AuthService::revoke_pre_2fa_sessions), and
-# security/queries.rs (talos_audit_ledger::get_user_audit_settings).
-TALOS_API_SQLX_BASELINE=98
+# security/queries.rs (talos_audit_ledger::get_user_audit_settings); 95
+# after webhooks/queries.rs (WebhookRepository::list_for_user_with_stats /
+# list_dlq_for_user + tx-taking
+# ExecutionRepository::list_dead_letter_queue_scoped).
+TALOS_API_SQLX_BASELINE=95
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \
