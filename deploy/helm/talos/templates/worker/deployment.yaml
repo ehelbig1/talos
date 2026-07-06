@@ -185,6 +185,20 @@ spec:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: TALOS_WORKER_REGISTRATION_TOKEN
                   optional: true
+            # RFC 0010 P1/P3: this worker's Ed25519 signing seed (signs
+            # JobResults, RPC, and P3 secret claims). Optional — absent means
+            # results sign on the legacy fleet-HMAC path. This bootstrap-Secret
+            # ref suits a single-key fleet (all replicas share one identity —
+            # pair with TALOS_WORKER_ID via worker.env); for per-worker keys,
+            # inject via worker.extraEnv / a per-worker Secret instead.
+            # Generate with
+            # `controller generate-worker-trust-keypair --role worker --worker-id <id>`.
+            - name: TALOS_WORKER_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: TALOS_WORKER_SIGNING_KEY
+                  optional: true
             {{- with .Values.worker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

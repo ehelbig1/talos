@@ -257,6 +257,19 @@ spec:
             - name: TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN
               value: "1"
             {{- end }}
+            # RFC 0010 P1/P3: Ed25519 dispatch-signing seed (also signs the P3
+            # SealedSecrets envelopes). Optional — absent from the bootstrap
+            # Secret means the env stays unset and dispatch signing stays on
+            # the legacy fleet-HMAC path. Generate with
+            # `controller generate-worker-trust-keypair --role controller`;
+            # activate via controller.env TALOS_DISPATCH_SCHEME=ed25519 (see
+            # the values.yaml enablement runbook next to TALOS_ENVELOPE_SEALING).
+            - name: TALOS_CONTROLLER_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: TALOS_CONTROLLER_SIGNING_KEY
+                  optional: true
             {{- with .Values.controller.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -412,6 +412,24 @@ services:
       # `aud=talos`. Default ON — the issuer has stamped `aud` since 2026-05;
       # a stale pre-aud session cookie just prompts a fresh login.
       JWT_REQUIRE_AUD: ${JWT_REQUIRE_AUD:-true}
+      # RFC 0010 worker-trust boundary (P1 Ed25519 dispatch signing + P3
+      # per-execution envelope sealing). Generate the keypairs with:
+      #   docker compose exec controller /app/controller \
+      #     generate-worker-trust-keypair --role controller
+      #   docker compose exec controller /app/controller \
+      #     generate-worker-trust-keypair --role worker --worker-id <id>
+      # and paste the printed env lines into .env. All empty = the legacy
+      # fleet-HMAC (WORKER_SHARED_KEY) path, byte-identical to pre-RFC-0010.
+      TALOS_DISPATCH_SCHEME: ${TALOS_DISPATCH_SCHEME:-}
+      TALOS_CONTROLLER_SIGNING_KEY: ${TALOS_CONTROLLER_SIGNING_KEY:-}
+      # Comma-separated worker_id=pubkey_hex pairs (the static alternative to
+      # boot-time self-registration; fine for a fixed-size dev fleet).
+      TALOS_WORKER_PUBLIC_KEYS: ${TALOS_WORKER_PUBLIC_KEYS:-}
+      # off | audit | required — RFC 0010 P3 secret-envelope sealing mode.
+      # audit/required seal per-execution to the worker's ephemeral key via
+      # the claim protocol; required additionally makes workers refuse an
+      # inline-WSK downgrade. Set the same value on the worker service.
+      TALOS_ENVELOPE_SEALING: ${TALOS_ENVELOPE_SEALING:-off}
     ports:
       - "8000:8000"
     volumes:
@@ -520,6 +538,18 @@ services:
       # protection. Default off — leave unset (or set to "false") on
       # multi-tenant deployments where module authors are not trusted.
       WORKER_ALLOW_PRIVATE_HOST_TARGETS: ${WORKER_ALLOW_PRIVATE_HOST_TARGETS:-false}
+      # RFC 0010 worker-trust boundary (see the controller service for keygen).
+      # Public key verifies Ed25519-signed dispatches; the signing key signs
+      # JobResults + secret claims. TALOS_WORKER_ID pins the identity the
+      # controller looks the public key up under (dev replicas share one
+      # fleet identity; per-worker keys + self-registration are the
+      # production shape). All empty = legacy fleet-HMAC path.
+      TALOS_CONTROLLER_PUBLIC_KEY: ${TALOS_CONTROLLER_PUBLIC_KEY:-}
+      TALOS_WORKER_SIGNING_KEY: ${TALOS_WORKER_SIGNING_KEY:-}
+      TALOS_WORKER_ID: ${TALOS_WORKER_ID:-}
+      # Keep in lockstep with the controller's TALOS_ENVELOPE_SEALING; the
+      # worker enforces the downgrade guard only under "required".
+      TALOS_ENVELOPE_SEALING: ${TALOS_ENVELOPE_SEALING:-off}
     depends_on:
       nats:
         condition: service_healthy
