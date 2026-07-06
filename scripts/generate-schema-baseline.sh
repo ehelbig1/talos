@@ -91,6 +91,25 @@ bold "▶ emitting _sqlx_migrations seed → $BASELINE_DIR/seed_sqlx_migrations.
     for f in $(printf '%s\n' "${FILES[@]}" | sort); do
         v="$(migration_version "$f")"
         [ "$v" -le "$CUTPOINT" ] || continue
+        # Cluster-level objects (CREATE ROLE, role memberships, and the
+        # GRANTs that reference them) are INVISIBLE to `pg_dump
+        # --schema-only --no-privileges` — seeding a role-creating
+        # migration as "applied" strands the baseline path with no
+        # talos_app/talos_guest (found the hard way when phase 2 flipped
+        # the test-template build: every RLS test failed with `role
+        # "talos_app" does not exist`, and the verifier couldn't catch it
+        # because roles are cluster-scoped and its two DBs share one
+        # cluster). These migrations are pg_roles-guarded idempotent, so
+        # leave them UNSEEDED: `sqlx migrate run` re-runs them against the
+        # snapshot, where `GRANT ... ON ALL TABLES` lands on the
+        # fully-loaded schema and the membership grant resolves
+        # CURRENT_USER per-environment (a dumped grant would hardcode the
+        # generator's user).
+        if grep -q "CREATE ROLE" "$f"; then
+            # stderr — stdout inside this block IS the seed SQL file.
+            bold "  ↷ leaving role-creating migration $v unseeded (re-runs on the baseline path)" >&2
+            continue
+        fi
         desc="$(migration_desc "$f" | sed "s/'/''/g")"
         sum="$(sha384_hex "$f")"
         sep=","; [ "$first" -eq 1 ] && sep="" && first=0

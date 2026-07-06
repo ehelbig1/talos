@@ -265,8 +265,10 @@ jobs:
           shared-key: quality-integration
 
       - name: Install sqlx-cli
-        # `make test-integration` runs `sqlx migrate run` against the disposable
-        # Postgres it provisions.
+        # `make test-integration` provisions its migrated DBs from the RFC 0009
+        # schema baseline + tail by default (phase 2), with `sqlx migrate run`
+        # applying the post-cutpoint migrations. The `schema-baseline` job below
+        # is the drift gate that keeps that fast path trustworthy.
         uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: sqlx-cli

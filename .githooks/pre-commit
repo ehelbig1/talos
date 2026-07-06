@@ -39,8 +39,11 @@ if [ -n "$STAGED_RS" ]; then
     fi
 fi
 
-# 3. Check for modified migration files that were already applied
-STAGED_MIGRATIONS=$(git diff --cached --name-only --diff-filter=M -- 'migrations/*.sql')
+# 3. Check for modified migration files that were already applied.
+# migrations/.baseline/ is EXCLUDED: those are regenerable RFC 0009
+# artifacts (schema snapshot + seed), not sqlx-checksummed migrations —
+# `make schema-baseline` rewrites them wholesale by design.
+STAGED_MIGRATIONS=$(git diff --cached --name-only --diff-filter=M -- 'migrations/*.sql' ':(exclude)migrations/.baseline/*')
 if [ -n "$STAGED_MIGRATIONS" ]; then
     echo "ERROR: Modifying existing migration files breaks sqlx checksums."
     echo "Create a new migration file instead."

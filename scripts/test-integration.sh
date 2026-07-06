@@ -60,13 +60,35 @@ SELFCONTAINED_URL="${PG_BASE}/talos_sc"
 # isolated from the shared 'talos' migrated tests.
 CTL_URL="${PG_BASE}/talos_ctl"
 
-echo "▶ applying migrations to 'talos'…"
-DATABASE_URL="$MIGRATED_URL" sqlx migrate run --source migrations >/dev/null
+# Build a migrated DB. RFC 0009 phase 2: by default, load the baseline
+# snapshot (`migrations/.baseline/schema.sql` + the `_sqlx_migrations`
+# seed) and let `sqlx migrate run` apply only the post-cutpoint tail —
+# collapsing the 265-migration replay into one psql load. Safe because
+# quality.yml's "Migration baseline verifier" job proves baseline+seed+tail
+# is byte-identical to the full chain on every PR. Set
+# TALOS_USE_SCHEMA_BASELINE=0 to force the full-chain replay (e.g. when
+# debugging a suspected baseline drift the verifier hasn't caught yet).
+# psql runs inside the pg container (`docker exec -i`) so the host needs
+# no postgres client.
+migrate_db() { # $1 = db name, $2 = database url
+    if [ "${TALOS_USE_SCHEMA_BASELINE:-1}" != "0" ] && [ -f migrations/.baseline/schema.sql ]; then
+        echo "▶ building '$1' from schema baseline + tail (TALOS_USE_SCHEMA_BASELINE=0 for full chain)…"
+        docker exec -i "$PG_NAME" psql -q -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$1" \
+            < migrations/.baseline/schema.sql >/dev/null
+        docker exec -i "$PG_NAME" psql -q -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$1" \
+            < migrations/.baseline/seed_sqlx_migrations.sql >/dev/null
+    else
+        echo "▶ applying full migration chain to '$1'…"
+    fi
+    DATABASE_URL="$2" sqlx migrate run --source migrations >/dev/null
+}
+
+migrate_db talos "$MIGRATED_URL"
 echo "▶ creating empty 'talos_sc' for self-contained tests…"
 docker exec "$PG_NAME" psql -U "$PG_USER" -d talos -c "CREATE DATABASE talos_sc" >/dev/null
-echo "▶ creating + migrating 'talos_ctl' for the controller DB-harness binaries…"
+echo "▶ creating 'talos_ctl' for the controller DB-harness binaries…"
 docker exec "$PG_NAME" psql -U "$PG_USER" -d talos -c "CREATE DATABASE talos_ctl" >/dev/null
-DATABASE_URL="$CTL_URL" sqlx migrate run --source migrations >/dev/null
+migrate_db talos_ctl "$CTL_URL"
 
 export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 export TALOS_TEST_NATS_URL="nats://127.0.0.1:${NATS_PORT}"

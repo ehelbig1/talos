@@ -1678,6 +1678,41 @@ CREATE TABLE public.webhook_triggers (
 
 
 --
+-- Name: worker_identities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.worker_identities (
+    worker_id text NOT NULL,
+    public_key bytea NOT NULL,
+    key_algo text DEFAULT 'ed25519'::text NOT NULL,
+    supports_sealing boolean DEFAULT false NOT NULL,
+    active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT worker_identities_key_algo CHECK ((key_algo = 'ed25519'::text)),
+    CONSTRAINT worker_identities_public_key_len CHECK ((octet_length(public_key) = 32))
+);
+
+
+--
+-- Name: worker_provisioning_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.worker_provisioning_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    token_hash text NOT NULL,
+    worker_id text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    used_at timestamp with time zone,
+    used_by_worker_id text,
+    revoked_at timestamp with time zone,
+    note text,
+    CONSTRAINT worker_provisioning_tokens_hash_len CHECK ((char_length(token_hash) = 64))
+);
+
+
+--
 -- Name: workflow_alerts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2737,6 +2772,30 @@ ALTER TABLE ONLY public.webhook_processed_events
 
 ALTER TABLE ONLY public.webhook_request_log
     ADD CONSTRAINT webhook_request_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: worker_identities worker_identities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.worker_identities
+    ADD CONSTRAINT worker_identities_pkey PRIMARY KEY (worker_id, public_key);
+
+
+--
+-- Name: worker_provisioning_tokens worker_provisioning_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.worker_provisioning_tokens
+    ADD CONSTRAINT worker_provisioning_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: worker_provisioning_tokens worker_provisioning_tokens_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.worker_provisioning_tokens
+    ADD CONSTRAINT worker_provisioning_tokens_token_hash_key UNIQUE (token_hash);
 
 
 --
@@ -4498,6 +4557,13 @@ CREATE INDEX idx_wf_executions_actor_id ON public.workflow_executions USING btre
 --
 
 CREATE INDEX idx_wmr_module_id ON public.workflow_module_refs USING btree (module_id);
+
+
+--
+-- Name: idx_worker_identities_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_worker_identities_active ON public.worker_identities USING btree (worker_id) WHERE active;
 
 
 --
