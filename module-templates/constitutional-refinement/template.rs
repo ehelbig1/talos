@@ -1,6 +1,6 @@
 use talos_sdk_macros::talos_module;
 
-#[talos_module(world = "llm-node")]
+#[talos_module(world = "secrets-node")]
 fn run(input: String) -> Result<String, String> {
     let input_json: serde_json::Value =
         serde_json::from_str(&input).unwrap_or(serde_json::json!({}));

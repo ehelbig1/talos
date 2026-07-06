@@ -1797,10 +1797,37 @@ mod shipped_template_manifests_pass_seed_validation {
             if let Err(msg) = validate_allowed_hosts(&str_array(&manifest, "allowed_hosts")) {
                 failures.push(format!("{name}: allowed_hosts: {msg}"));
             }
+            // capability_world must be a REAL compile target, i.e. one the
+            // dispatcher's `CapabilityWorld` parser recognises. `llm-node` is
+            // the trap: it exists as a WIT world AND as an actor-ceiling rank
+            // label, but the wit-inspector classifies every LLM import as the
+            // `secrets` tier ("LLM API keys are host-managed"), so a module
+            // declaring `world = "llm-node"` while importing llm bindings
+            // fails compilation with a world-mismatch — uninstallable via
+            // createModuleFromTemplate (llm-inference + constitutional-
+            // refinement shipped this way, 2026-07-06; the fix is
+            // `secrets-node`, matching anthropic-claude). from_str maps
+            // llm-node → Unknown, which is exactly the signal. Check 48
+            // verifies talos.json ↔ macro consistency but not that either is
+            // a compilable world, so it passed both-wrong.
+            if let Some(world) = manifest.get("capability_world").and_then(|v| v.as_str()) {
+                use std::str::FromStr;
+                // `from_str` is TOTAL — unrecognised strings map to
+                // `Unknown` (Ok), never Err — so check the variant.
+                if talos_capability_world::CapabilityWorld::from_str(world)
+                    == Ok(talos_capability_world::CapabilityWorld::Unknown)
+                {
+                    failures.push(format!(
+                        "{name}: capability_world '{world}' is not a compilable WIT world \
+                         (llm-node is an actor-ceiling rank only — LLM modules must declare \
+                         'secrets-node')"
+                    ));
+                }
+            }
         }
         assert!(
             failures.is_empty(),
-            "{} template(s) would be SILENTLY SKIPPED at controller seed time:\n  {}",
+            "{} template(s) would be SKIPPED at seed time or fail to install:\n  {}",
             failures.len(),
             failures.join("\n  ")
         );

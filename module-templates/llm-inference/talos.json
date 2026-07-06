@@ -4,7 +4,7 @@
   "display_name": "LLM Inference",
   "description": "Generate AI text completions via the host's managed LLM client. The provider's API key is fetched and held by the controller — never enters guest WASM memory. Supports Anthropic, OpenAI, Gemini, and local Ollama.",
   "category": "AI",
-  "capability_world": "llm-node",
+  "capability_world": "secrets-node",
   "allowed_hosts": [],
   "allowed_secrets": [],
   "recommended_fuel": {
