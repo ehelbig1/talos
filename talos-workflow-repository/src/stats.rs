@@ -5,6 +5,42 @@ use crate::*;
 impl WorkflowRepository {
     // ── Execution statistics ───────────────────────────────────────────────
 
+    /// Per-workflow execution stats for ALL of a user's workflows over the
+    /// past `days` days (workflows with ≥1 execution in the window, worst
+    /// failures first, capped at 50). Takes the caller's connection: the
+    /// GraphQL `getAllWorkflowStats` query runs this on a
+    /// `begin_user_scoped` tx so the workflows + workflow_executions RLS
+    /// policies backstop the user-only read (RFC 0005 S3). Do NOT route
+    /// through `self.db_pool`; that would silently drop the RLS backstop.
+    pub async fn get_all_workflow_stats_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        user_id: Uuid,
+        days: i32,
+    ) -> Result<Vec<AllWorkflowStatsRow>> {
+        let rows = sqlx::query_as::<_, AllWorkflowStatsRow>(
+            r#"
+            SELECT w.id, w.name,
+                COUNT(*)::bigint AS total,
+                COUNT(*) FILTER (WHERE we.status = 'completed')::bigint AS succeeded,
+                COUNT(*) FILTER (WHERE we.status = 'failed')::bigint AS failed,
+                (AVG(EXTRACT(EPOCH FROM (we.completed_at - we.started_at))) FILTER (WHERE we.completed_at IS NOT NULL))::float8 AS avg_duration_secs
+            FROM workflows w
+            LEFT JOIN workflow_executions we ON we.workflow_id = w.id AND we.started_at > NOW() - make_interval(days => $2::int)
+            WHERE w.user_id = $1
+            GROUP BY w.id, w.name
+            HAVING COUNT(we.id) > 0
+            ORDER BY COUNT(*) FILTER (WHERE we.status = 'failed') DESC, COUNT(*) DESC
+            LIMIT 50
+            "#,
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows)
+    }
+
     /// Fetch aggregated execution stats for a workflow over the past N days.
     pub async fn get_workflow_execution_stats(
         &self,
@@ -308,6 +344,17 @@ impl WorkflowRepository {
 // ─────────────────────────────────────────────────────────────────────────────
 // Additional Row DTOs
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-workflow stats row returned by `get_all_workflow_stats_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct AllWorkflowStatsRow {
+    pub id: Uuid,
+    pub name: String,
+    pub total: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub avg_duration_secs: Option<f64>,
+}
 
 #[derive(Debug)]
 pub struct WorkflowExecStats {

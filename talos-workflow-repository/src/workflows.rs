@@ -590,6 +590,80 @@ impl WorkflowRepository {
         Ok(rows)
     }
 
+    /// Single workflow gated on ownership OR org access. Takes the
+    /// caller's connection: the GraphQL `workflow` query runs this on a
+    /// `begin_tenant_read_scoped` tx so the workflows RLS policy
+    /// backstops the app-layer `user_id = $2 OR org_id = ANY($3)` filter
+    /// (RFC 0004 M4). Do NOT route through `self.db_pool`; that would
+    /// silently drop the RLS backstop.
+    pub async fn get_workflow_for_accessor_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        accessible_org_ids: &[Uuid],
+    ) -> Result<Option<WorkflowAccessRow>> {
+        let row = sqlx::query_as::<_, WorkflowAccessRow>(
+            r#"
+            SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id
+            FROM workflows
+            WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(accessible_org_ids)
+        .fetch_optional(conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// Paginated workflow listing across ownership OR org access, newest
+    /// first with a unique `id DESC` tiebreaker. Same scoped-executor
+    /// contract as `get_workflow_for_accessor_scoped`.
+    pub async fn list_workflows_for_accessor_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        user_id: Uuid,
+        accessible_org_ids: &[Uuid],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowAccessRow>> {
+        let rows = sqlx::query_as::<_, WorkflowAccessRow>(
+            "SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id \
+             FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) \
+             ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .bind(accessible_org_ids)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows)
+    }
+
+    /// A workflow's draft `graph_json`, gated on ownership OR org access
+    /// (the read doubles as the access check for version-diff flows).
+    /// Same scoped-executor contract as `get_workflow_for_accessor_scoped`.
+    pub async fn get_graph_json_for_accessor_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        accessible_org_ids: &[Uuid],
+    ) -> Result<Option<String>> {
+        let graph_json: Option<String> = sqlx::query_scalar(
+            "SELECT graph_json FROM workflows WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(accessible_org_ids)
+        .fetch_optional(conn)
+        .await?;
+        Ok(graph_json)
+    }
+
     /// Archive every non-archived workflow attached to an actor, returning
     /// the number of rows moved. Takes the caller's connection: the
     /// GraphQL `terminateActor` cleanup path runs this on a
@@ -1721,6 +1795,18 @@ impl WorkflowRepository {
         }
         Ok(())
     }
+}
+
+/// Workflow row (accessor-gated projection) returned by
+/// `get_workflow_for_accessor_scoped` / `list_workflows_for_accessor_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct WorkflowAccessRow {
+    pub id: Uuid,
+    pub name: String,
+    pub graph_json: String,
+    pub max_concurrent_executions: Option<i32>,
+    pub intent: Option<serde_json::Value>,
+    pub actor_id: Option<Uuid>,
 }
 
 /// Row returned by `list_workflows_for_actor_scoped`.
