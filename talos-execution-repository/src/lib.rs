@@ -2701,6 +2701,48 @@ impl ExecutionRepository {
         Ok(rows)
     }
 
+    /// Replay target for a workflow-DLQ entry (execution id + replay
+    /// marker), ownership-gated through the `workflows` JOIN. Takes the
+    /// caller's transaction: the GraphQL `replayDeadLetterEntry` mutation
+    /// runs this on a `begin_user_scoped` tx so the workflows RLS policy
+    /// backstops the ownership JOIN (RFC 0005 S3 — dead_letter_queue has
+    /// no policy of its own). Do NOT route this through `self.db_pool`;
+    /// that would silently drop the RLS backstop.
+    pub async fn get_dlq_replay_target_scoped(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        dlq_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<DlqReplayTargetRow>> {
+        let row = sqlx::query_as::<_, DlqReplayTargetRow>(
+            "SELECT d.execution_id, d.replayed_at \
+             FROM dead_letter_queue d \
+             JOIN workflows w ON w.id = d.workflow_id \
+             WHERE d.id = $1 AND w.user_id = $2",
+        )
+        .bind(dlq_id)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(row)
+    }
+
+    /// Stamp a workflow-DLQ entry as replayed. Ownership was established
+    /// by the preceding `get_dlq_replay_target_scoped` read; this write
+    /// keys on id alone (matching the pre-extraction resolver SQL).
+    pub async fn mark_dlq_entry_replayed(&self, dlq_id: Uuid, replayed_by: Uuid) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE dead_letter_queue \
+             SET replayed_at = NOW(), replayed_by = $1 \
+             WHERE id = $2",
+        )
+        .bind(replayed_by)
+        .bind(dlq_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Most-recent `execution_events` rows for subscription replay,
     /// NEWEST-first, capped at `limit` (MCP-954 — an uncapped replay pulled
     /// every event of a long-running execution into memory per subscriber).
@@ -2772,6 +2814,13 @@ pub struct DeadLetterQueueRow {
     pub created_at: DateTime<Utc>,
     pub replayed_at: Option<DateTime<Utc>>,
     pub replayed_by: Option<Uuid>,
+}
+
+/// Replay target returned by `get_dlq_replay_target_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct DlqReplayTargetRow {
+    pub execution_id: Uuid,
+    pub replayed_at: Option<DateTime<Utc>>,
 }
 
 /// Row returned by `list_recent_module_executions_for_user`.

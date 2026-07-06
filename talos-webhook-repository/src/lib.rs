@@ -58,6 +58,36 @@ pub struct WebhookDlqRow {
     pub replayed_by: Option<Uuid>,
 }
 
+/// Webhook-DLQ replay target (trigger id + raw JSONB payload + replay
+/// marker) returned by `get_dlq_entry_for_replay`. Ownership is enforced
+/// by the INNER JOIN on the trigger's `user_id` — orphaned entries
+/// (trigger deleted, FK SET NULL) are deliberately inaccessible (MCP-675).
+#[derive(Debug, sqlx::FromRow)]
+pub struct WebhookDlqReplayRow {
+    pub trigger_id: Option<Uuid>,
+    pub payload: Option<serde_json::Value>,
+    pub replayed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Insert params for the GraphQL `createWebhookTrigger` mutation. The
+/// signing secret arrives PRE-encrypted — the resolver owns the AAD
+/// binding to the pre-generated trigger `id` (MCP-S2 swap-resistance);
+/// this repository method only persists the ciphertext + key id.
+pub struct NewWebhookTrigger<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub module_id: Uuid,
+    pub verification_token: &'a str,
+    pub signing_secret_enc: Option<&'a [u8]>,
+    pub signing_key_id: Option<Uuid>,
+    pub signing_secret_format: i16,
+    pub max_requests_per_minute: i32,
+    pub enabled: bool,
+    pub allowed_ips: Option<&'a [String]>,
+    pub user_id: Uuid,
+    pub event_filter: Option<&'a serde_json::Value>,
+}
+
 /// 24-hour security stats per webhook trigger. Used by
 /// `get_webhook_security_stats`.
 #[derive(Debug)]
@@ -214,6 +244,75 @@ impl WebhookRepository {
             .context("Failed to commit webhook create transaction")?;
 
         Ok(Some(current))
+    }
+
+    /// Persist a webhook trigger for the GraphQL `createWebhookTrigger`
+    /// mutation (no per-user cap gate — that flow belongs to
+    /// `try_create_under_cap`, the MCP path). Returns the inserted row id.
+    pub async fn insert_trigger(&self, t: NewWebhookTrigger<'_>) -> Result<Uuid> {
+        let id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO webhook_triggers (
+                id, name, module_id, verification_token,
+                signing_secret_enc, signing_key_id, signing_secret_format,
+                max_requests_per_minute, enabled, allowed_ips, user_id, event_filter
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING id
+            "#,
+        )
+        .bind(t.id)
+        .bind(t.name)
+        .bind(t.module_id)
+        .bind(t.verification_token)
+        .bind(t.signing_secret_enc)
+        .bind(t.signing_key_id)
+        .bind(t.signing_secret_format)
+        .bind(t.max_requests_per_minute)
+        .bind(t.enabled)
+        .bind(t.allowed_ips)
+        .bind(t.user_id)
+        .bind(t.event_filter)
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Fetch a webhook-DLQ entry for replay, ownership-gated via the
+    /// INNER JOIN on the trigger's `user_id`. Orphaned entries (trigger
+    /// deleted → FK SET NULL) don't match the JOIN and are inaccessible
+    /// until operator cleanup — losing trigger ownership must not promote
+    /// a row to cross-tenant readable (MCP-675).
+    pub async fn get_dlq_entry_for_replay(
+        &self,
+        dlq_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<WebhookDlqReplayRow>> {
+        let row = sqlx::query_as::<_, WebhookDlqReplayRow>(
+            "SELECT d.trigger_id, d.payload, d.replayed_at \
+             FROM webhook_dlq d \
+             INNER JOIN webhook_triggers t ON t.id = d.trigger_id \
+             WHERE d.id = $1 AND t.user_id = $2",
+        )
+        .bind(dlq_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Stamp a webhook-DLQ entry as replayed. Ownership was established by
+    /// the preceding `get_dlq_entry_for_replay` read; this write keys on id
+    /// alone (matching the pre-extraction resolver SQL).
+    pub async fn mark_dlq_entry_replayed(&self, dlq_id: Uuid, replayed_by: Uuid) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE webhook_dlq SET replayed_at = now(), replayed_by = $1 WHERE id = $2",
+        )
+        .bind(replayed_by)
+        .bind(dlq_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// List a user's webhooks (most recent first, capped at `limit`).
