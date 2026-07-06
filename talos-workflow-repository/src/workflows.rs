@@ -590,6 +590,163 @@ impl WorkflowRepository {
         Ok(rows)
     }
 
+    /// Insert a workflow row for the GraphQL `createWorkflow` mutation.
+    /// Takes the caller's connection: workflows are ORG-pinned (RFC 0006
+    /// — the RLS WITH CHECK keys on `org_id = app.current_org_id`), so
+    /// the resolver runs this on a `begin_org_scoped` tx opened for the
+    /// resolved owning org (explicit writable org or the caller's
+    /// personal org); the bound `org_id` and the scope's active org match
+    /// by construction. Do NOT route through `self.db_pool`; a bare-pool
+    /// create only passes the org pin via its rollout-safe `unset →
+    /// permit` clause (check 42). Distinct from `create_workflow` (the
+    /// MCP shape, which resolves the personal org itself via
+    /// `begin_personal_org_write`).
+    pub async fn insert_workflow_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        name: &str,
+        graph_json: &str,
+        user_id: Uuid,
+        max_concurrent_executions: Option<i32>,
+        intent: Option<&serde_json::Value>,
+        org_id: Uuid,
+    ) -> Result<Uuid> {
+        let workflow_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO workflows (name, module_uri, graph_json, user_id, max_concurrent_executions, intent, org_id)
+            VALUES ($1, '', $2, $3, $4, $5, $6)
+            RETURNING id
+            "#,
+        )
+        .bind(name)
+        .bind(graph_json)
+        .bind(user_id)
+        .bind(max_concurrent_executions)
+        .bind(intent)
+        .bind(org_id)
+        .fetch_one(conn)
+        .await?;
+        Ok(workflow_id)
+    }
+
+    /// Full-field workflow update gated on ownership OR writable-org
+    /// access. Takes the caller's connection (tenant-scoped tx built from
+    /// the WRITABLE org set — a Viewer must not update an org-shared
+    /// workflow; RFC 0004 M4). Returns rows affected. Do NOT route
+    /// through `self.db_pool`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_workflow_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        writable_org_ids: &[Uuid],
+        name: &str,
+        graph_json: &str,
+        max_concurrent_executions: Option<i32>,
+        intent: Option<&serde_json::Value>,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE workflows
+            SET name = $1, graph_json = $2, max_concurrent_executions = $3, intent = $4, updated_at = NOW()
+            WHERE id = $5 AND (user_id = $6 OR org_id = ANY($7))
+            "#,
+        )
+        .bind(name)
+        .bind(graph_json)
+        .bind(max_concurrent_executions)
+        .bind(intent)
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(writable_org_ids)
+        .execute(conn)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete a workflow gated on ownership OR writable-org access,
+    /// REFUSING when in-flight executions exist (the NOT EXISTS guard —
+    /// a plain DELETE would CASCADE running executions away mid-flight,
+    /// MCP-650). Takes the caller's connection (tenant-scoped tx from the
+    /// WRITABLE org set). Returns rows affected; 0 = not found / not
+    /// permitted / blocked — disambiguate with
+    /// `workflow_delete_blocked_scoped`.
+    pub async fn delete_workflow_guarded_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        writable_org_ids: &[Uuid],
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM workflows \
+             WHERE id = $1 \
+               AND (user_id = $2 OR org_id = ANY($3)) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM workflow_executions \
+                   WHERE workflow_id = workflows.id \
+                     AND status IN ('running', 'queued', 'pending', 'resuming') \
+               )",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(writable_org_ids)
+        .execute(conn)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Refusal-path diagnostic for `delete_workflow_guarded_scoped`: true
+    /// when the workflow exists (and is accessible) but has in-flight
+    /// executions blocking the delete. Takes the caller's connection —
+    /// run on a fresh tenant-scoped tx (the delete's tx has committed).
+    pub async fn workflow_delete_blocked_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        writable_org_ids: &[Uuid],
+    ) -> Result<Option<bool>> {
+        let b: Option<bool> = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM workflows w \
+                 WHERE w.id = $1 \
+                   AND (w.user_id = $2 OR w.org_id = ANY($3)) \
+                   AND EXISTS ( \
+                       SELECT 1 FROM workflow_executions \
+                       WHERE workflow_id = w.id \
+                         AND status IN ('running', 'queued', 'pending', 'resuming') \
+                   ) \
+             )",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(writable_org_ids)
+        .fetch_optional(conn)
+        .await?;
+        Ok(b)
+    }
+
+    /// A workflow's `graph_json` + bound actor with NO ownership
+    /// predicate, on the bare pool — callers MUST have already gated the
+    /// workflow_id (the GraphQL `testWorkflow` mutation gates via
+    /// `workflow_accessible_for_user` + `authorize_workflow_trigger`
+    /// immediately before calling; revisit on RLS SET-ROLE rollout).
+    /// Errors when the row is missing (`fetch_one`).
+    pub async fn get_graph_and_actor_unchecked(
+        &self,
+        workflow_id: Uuid,
+    ) -> Result<GraphAndActorRow> {
+        let row = sqlx::query_as::<_, GraphAndActorRow>(
+            "SELECT graph_json, actor_id FROM workflows WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Single workflow gated on ownership OR org access. Takes the
     /// caller's connection: the GraphQL `workflow` query runs this on a
     /// `begin_tenant_read_scoped` tx so the workflows RLS policy
@@ -1795,6 +1952,13 @@ impl WorkflowRepository {
         }
         Ok(())
     }
+}
+
+/// Graph + actor projection returned by `get_graph_and_actor_unchecked`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct GraphAndActorRow {
+    pub graph_json: String,
+    pub actor_id: Option<Uuid>,
 }
 
 /// Workflow row (accessor-gated projection) returned by

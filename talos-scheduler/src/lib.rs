@@ -82,6 +82,141 @@ pub async fn list_schedules_for_user(
     Ok(rows)
 }
 
+/// Upsert a workflow's schedule (INSERT or re-enable + rewrite on the
+/// `workflow_id` UNIQUE conflict), returning the stored row. Takes the
+/// caller's connection: the GraphQL `createSchedule` mutation runs the
+/// workflow-access check and this upsert in ONE request-scoped
+/// UnitOfWork (RFC 0005 S3). Do NOT add a bare-pool variant for that
+/// path.
+pub async fn upsert_schedule_on_conn(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+    user_id: Uuid,
+    cron_expression: &str,
+    timezone: &str,
+    next_trigger_at: DateTime<Utc>,
+) -> anyhow::Result<WorkflowSchedule> {
+    let row = sqlx::query_as::<_, WorkflowSchedule>(
+        r#"
+        INSERT INTO workflow_schedules (workflow_id, user_id, cron_expression, timezone, next_trigger_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (workflow_id) DO UPDATE SET
+            cron_expression = EXCLUDED.cron_expression,
+            timezone = EXCLUDED.timezone,
+            next_trigger_at = EXCLUDED.next_trigger_at,
+            is_enabled = true,
+            updated_at = NOW()
+        RETURNING id, workflow_id, user_id, cron_expression, timezone, is_enabled,
+                  last_triggered_at, next_trigger_at, created_at, updated_at
+        "#,
+    )
+    .bind(workflow_id)
+    .bind(user_id)
+    .bind(cron_expression)
+    .bind(timezone)
+    .bind(next_trigger_at)
+    .fetch_one(conn)
+    .await?;
+    Ok(row)
+}
+
+/// Accessor-gated schedule read with a `FOR UPDATE OF ws` row lock so
+/// the caller's read→merge→update is serialized against concurrent
+/// updaters (lost-update window). Takes the caller's connection — the
+/// lock only means anything inside the caller's transaction.
+pub async fn get_schedule_for_update_on_conn(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+    user_id: Uuid,
+    accessible_org_ids: &[Uuid],
+) -> anyhow::Result<Option<WorkflowSchedule>> {
+    let row = sqlx::query_as::<_, WorkflowSchedule>(
+        r#"
+        SELECT ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
+               ws.last_triggered_at, ws.next_trigger_at, ws.created_at, ws.updated_at
+        FROM workflow_schedules ws
+        LEFT JOIN workflows w ON w.id = ws.workflow_id
+        WHERE ws.workflow_id = $1 AND (ws.user_id = $2 OR w.org_id = ANY($3))
+        FOR UPDATE OF ws
+        "#,
+    )
+    .bind(workflow_id)
+    .bind(user_id)
+    .bind(accessible_org_ids)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row)
+}
+
+/// Accessor-gated schedule rewrite (merged fields pre-computed by the
+/// caller under the `get_schedule_for_update_on_conn` row lock),
+/// returning the stored row. Takes the caller's connection — same
+/// UnitOfWork as the locked read.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_schedule_on_conn(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+    user_id: Uuid,
+    accessible_org_ids: &[Uuid],
+    cron_expression: &str,
+    timezone: &str,
+    is_enabled: bool,
+    next_trigger_at: Option<DateTime<Utc>>,
+) -> anyhow::Result<WorkflowSchedule> {
+    let row = sqlx::query_as::<_, WorkflowSchedule>(
+        r#"
+        UPDATE workflow_schedules ws
+        SET cron_expression = $3,
+            timezone = $4,
+            is_enabled = $5,
+            next_trigger_at = $6,
+            updated_at = NOW()
+        FROM workflows w
+        WHERE ws.workflow_id = $1
+          AND w.id = ws.workflow_id
+          AND (ws.user_id = $2 OR w.org_id = ANY($7))
+        RETURNING ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
+                  ws.last_triggered_at, ws.next_trigger_at, ws.created_at, ws.updated_at
+        "#,
+    )
+    .bind(workflow_id)
+    .bind(user_id)
+    .bind(cron_expression)
+    .bind(timezone)
+    .bind(is_enabled)
+    .bind(next_trigger_at)
+    .bind(accessible_org_ids)
+    .fetch_one(conn)
+    .await?;
+    Ok(row)
+}
+
+/// Accessor-gated schedule delete. Takes the caller's connection (the
+/// GraphQL `deleteSchedule` mutation shares one UnitOfWork with its
+/// workflow-access check). Returns rows affected.
+pub async fn delete_schedule_on_conn(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+    user_id: Uuid,
+    accessible_org_ids: &[Uuid],
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM workflow_schedules ws
+        USING workflows w
+        WHERE ws.workflow_id = $1
+          AND w.id = ws.workflow_id
+          AND (ws.user_id = $2 OR w.org_id = ANY($3))
+        "#,
+    )
+    .bind(workflow_id)
+    .bind(user_id)
+    .bind(accessible_org_ids)
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Calculate the next trigger time for a cron expression in the given timezone.
 ///
 /// Returns `None` if the cron expression is invalid or no future occurrence can

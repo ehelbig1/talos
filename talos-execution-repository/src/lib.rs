@@ -2760,6 +2760,148 @@ impl ExecutionRepository {
         Ok(result.rows_affected())
     }
 
+    /// Ownership/status/actor gate for the GraphQL `resumeWorkflow`
+    /// mutation. Deliberately a BARE-POOL read: its own
+    /// `we.user_id = $2 OR w.org_id = ANY($3)` predicate IS the
+    /// authorization check (the caller passes the WRITABLE org set so a
+    /// Viewer can't resume an org-shared execution) — revisit on RLS
+    /// SET-ROLE rollout.
+    pub async fn get_execution_resume_gate(
+        &self,
+        execution_id: Uuid,
+        user_id: Uuid,
+        writable_org_ids: &[Uuid],
+    ) -> Result<Option<ResumeGateRow>> {
+        let row = sqlx::query_as::<_, ResumeGateRow>(
+            r#"SELECT we.workflow_id, we.status, we.actor_id FROM workflow_executions we
+               LEFT JOIN workflows w ON w.id = we.workflow_id
+               WHERE we.id = $1 AND (we.user_id = $2 OR w.org_id = ANY($3))"#,
+        )
+        .bind(execution_id)
+        .bind(user_id)
+        .bind(writable_org_ids)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Atomically flip a 'waiting' execution to 'pending' (the
+    /// authoritative resume gate — the caller's earlier status read is
+    /// advisory only). Returns rows affected; 0 = no longer resumable.
+    /// The `AND status = 'waiting'` predicate is the status guard: it
+    /// can't clobber a row another writer owns and can't resurrect a
+    /// terminal row.
+    pub async fn flip_waiting_to_pending(&self, execution_id: Uuid) -> Result<u64> {
+        let result = sqlx::query(
+            // allow-bare-status-write: single-status precondition (waiting →
+            // pending) is strictly narrower than the NOT IN terminal guard.
+            "UPDATE workflow_executions SET status = 'pending' WHERE id = $1 AND status = 'waiting'",
+        )
+        .bind(execution_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// The workflow_version_id pinned to an execution at trigger time
+    /// (NULL = unpinned). Errors propagate — the resume path fails
+    /// CLOSED on a DB error rather than falling back to the draft graph
+    /// (graph-topology drift, MCP-839).
+    pub async fn get_pinned_version_id(&self, execution_id: Uuid) -> Result<Option<Uuid>> {
+        let v: Option<Uuid> =
+            sqlx::query_scalar("SELECT workflow_version_id FROM workflow_executions WHERE id = $1")
+                .bind(execution_id)
+                .fetch_one(&self.db_pool)
+                .await?;
+        Ok(v)
+    }
+
+    /// Append one `execution_events` row. `log_message` MUST already be
+    /// truncated + DLP-redacted by the caller (the GraphQL event writers
+    /// apply the 8 KiB truncate-then-redact discipline before calling —
+    /// MCP-965/MCP-1194).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_execution_event(
+        &self,
+        execution_id: Uuid,
+        event_type: &str,
+        node_id: Option<Uuid>,
+        status: &str,
+        log_message: Option<&str>,
+        iteration_index: Option<i32>,
+        iteration_total: Option<i32>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO execution_events (execution_id, event_type, node_id, status, log_message, iteration_index, iteration_total) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(execution_id)
+        .bind(event_type)
+        .bind(node_id)
+        .bind(status)
+        .bind(log_message)
+        .bind(iteration_index)
+        .bind(iteration_total)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark an execution failed unless it already reached a terminal /
+    /// resuming state (`status NOT IN ('completed','failed','cancelled',
+    /// 'resuming')` — check-39 guard). Used by the GraphQL resume / test
+    /// failure paths, which pre-redact `error_message` and choose whether
+    /// the failure stamps `completed_at` (engine-run failures do; setup
+    /// failures before the run started don't). Distinct from
+    /// `mark_execution_failed`, which is the engine-finalizer variant
+    /// (running/resuming-only guard + truncation + encryption).
+    pub async fn fail_execution_unless_terminal(
+        &self,
+        execution_id: Uuid,
+        error_message: &str,
+        set_completed_at: bool,
+    ) -> Result<u64> {
+        let sql = if set_completed_at {
+            "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 \
+             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
+        } else {
+            "UPDATE workflow_executions SET status = 'failed', error_message = $2 \
+             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
+        };
+        let result = sqlx::query(sql)
+            .bind(execution_id)
+            .bind(error_message)
+            .execute(&self.db_pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Insert the GraphQL `testWorkflow` execution row: status 'running',
+    /// `is_test_execution = true`, attributed to the resolved effective
+    /// actor. Distinct from `create_test_execution` (the MCP shape, which
+    /// stamps started_at/version/priority and fires the execution-event
+    /// broadcast — the GraphQL path emits its own events). Bare pool by
+    /// design: the row is stamped with the authenticated user_id for a
+    /// workflow already gated by workflow_accessible_for_user +
+    /// authorize_workflow_trigger.
+    pub async fn insert_test_execution_row(
+        &self,
+        execution_id: Uuid,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        actor_id: Option<Uuid>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO workflow_executions (id, workflow_id, user_id, status, is_test_execution, actor_id) VALUES ($1, $2, $3, 'running', true, $4)",
+        )
+        .bind(execution_id)
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(actor_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(())
+    }
+
     /// Latest execution per workflow (DISTINCT ON) for a batch of
     /// workflow ids, gated on ownership OR org access. Takes the caller's
     /// connection: the GraphQL `latestWorkflowExecutions` query runs this
@@ -2930,6 +3072,14 @@ pub struct DeadLetterQueueRow {
     pub created_at: DateTime<Utc>,
     pub replayed_at: Option<DateTime<Utc>>,
     pub replayed_by: Option<Uuid>,
+}
+
+/// Resume-gate row returned by `get_execution_resume_gate`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ResumeGateRow {
+    pub workflow_id: Uuid,
+    pub status: String,
+    pub actor_id: Option<Uuid>,
 }
 
 /// Latest-execution row returned by

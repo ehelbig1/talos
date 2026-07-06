@@ -3362,17 +3362,18 @@ else
 fi
 echo
 
-# ── 50. Raw sqlx in talos-api/src/schema — RATCHET ────────────────────
+# ── 50. Raw sqlx in talos-api/src/schema — HARD RULE (graduated) ──────
 # talos-mcp-handlers went 371 → 0 raw-sqlx sites under check 6; the
-# GraphQL schema tree never got the same treatment and sat at 117 sites
-# (2026-07-01 review) — on the surface where RLS/tenancy stakes are
-# highest. Full check-6-style prohibition would block every PR touching
-# the debt, so this is a RATCHET: the count may only go DOWN. New inline
-# SQL in talos-api/src/schema fails the lint; burning down existing debt
-# lowers the baseline (update TALOS_API_SQLX_BASELINE when you do).
-# Same playbook as check 6: push the SQL into the relevant repository
-# crate and call it from the resolver.
-bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count must not grow)"
+# GraphQL schema tree sat at 117 sites (2026-07-01 review) — on the
+# surface where RLS/tenancy stakes are highest. Introduced as a RATCHET
+# (count may only go down); the debt was fully burned down 117 → 0
+# across PRs #386/#389/#390/#391/#392 + the workflows finale, and the
+# check GRADUATED to a hard rule 2026-07-06 (same arc as check 6).
+# Every resolver SQL statement lives in a repository/service crate;
+# scoped-tx sites use conn-taking methods (&mut PgConnection) with the
+# resolver owning begin/commit so the RLS backstop is preserved
+# (checks 25/42 are the guardrails). Do NOT re-add a baseline.
+bold "▶ check 50: raw sqlx::query in talos-api/src/schema (must be 0)"
 # 117 at introduction (2026-07-01); 108 after the trigger_workflow
 # migration onto ExecutionOrchestrationService removed 9 inline sites;
 # 106 after modules/queries.rs moved onto ModuleRepository (2026-07-05);
@@ -3427,25 +3428,30 @@ bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count m
 # get_graph_json_for_accessor_scoped/get_all_workflow_stats_scoped,
 # WorkflowVersionService::get_version_for_accessor_on_conn/
 # get_active_graph_json_on_conn, talos_scheduler::
-# get_schedule_for_accessor_on_conn/list_schedules_for_user).
-# Only workflows/mutations.rs (25) remains.
-TALOS_API_SQLX_BASELINE=25
-API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
+# get_schedule_for_accessor_on_conn/list_schedules_for_user); 0 after
+# workflows/mutations.rs (ExecutionRepository::get_execution_resume_gate/
+# flip_waiting_to_pending/get_pinned_version_id/insert_execution_event/
+# fail_execution_unless_terminal/insert_test_execution_row, conn-taking
+# WorkflowRepository::insert_workflow_scoped (org-pinned create)/
+# update_workflow_scoped/delete_workflow_guarded_scoped/
+# workflow_delete_blocked_scoped + get_graph_and_actor_unchecked,
+# talos_scheduler::upsert/get_for_update/update/delete_schedule_on_conn,
+# talos_db::try_advisory_lock/release_advisory_lock). GRADUATED.
+TALOS_API_SQLX_BASELINE=0
+# `|| true`: grep exits 1 on zero matches — the expected steady state now
+# that the tree is raw-sqlx-free — and pipefail would kill the script.
+API_SQLX_COUNT="$({ grep -rEc 'sqlx::query' \
         --include='*.rs' \
-        talos-api/src/schema 2>/dev/null \
+        talos-api/src/schema 2>/dev/null || true; } \
     | awk -F: '{s+=$2} END {print s+0}')"
 if [ "$API_SQLX_COUNT" -gt "$TALOS_API_SQLX_BASELINE" ]; then
-    red "✗ raw sqlx::query sites in talos-api/src/schema grew: ${API_SQLX_COUNT} > baseline ${TALOS_API_SQLX_BASELINE}"
-    yellow "  → new resolver SQL goes in a repository crate (same rule as talos-mcp-handlers, check 6)."
-    yellow "  → if you MOVED existing SQL (site count unchanged overall), re-run to confirm;"
-    yellow "    the ratchet counts sites, not diffs."
+    red "✗ ${API_SQLX_COUNT} raw sqlx::query site(s) in talos-api/src/schema (must be 0 — graduated hard rule)"
+    yellow "  → resolver SQL goes in a repository crate (same rule as talos-mcp-handlers, check 6)."
+    yellow "  → scoped-tx sites: conn-taking repo method (&mut PgConnection), resolver keeps begin/commit."
+    grep -rEln 'sqlx::query' --include='*.rs' talos-api/src/schema 2>/dev/null | sed 's/^/    /'
     EXIT_CODE=1
-elif [ "$API_SQLX_COUNT" -lt "$TALOS_API_SQLX_BASELINE" ]; then
-    yellow "⚠ talos-api sqlx debt burned down: ${API_SQLX_COUNT} < baseline ${TALOS_API_SQLX_BASELINE}"
-    yellow "  → lower TALOS_API_SQLX_BASELINE in scripts/lint-structural.sh (check 50) to lock in the progress."
-    green "✓ talos-api/src/schema raw-sqlx ratchet holds (${API_SQLX_COUNT}/${TALOS_API_SQLX_BASELINE})"
 else
-    green "✓ talos-api/src/schema raw-sqlx ratchet holds (${API_SQLX_COUNT}/${TALOS_API_SQLX_BASELINE})"
+    green "✓ talos-api/src/schema is raw-sqlx-free (hard rule, graduated from the 117-site ratchet)"
 fi
 echo
 
