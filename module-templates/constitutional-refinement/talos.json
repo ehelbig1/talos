@@ -4,7 +4,7 @@
   "display_name": "Constitutional Refinement",
   "description": "Iteratively critiques and refines LLM output against a constitution of principles. Applies each principle as a critique pass and revises until all principles are satisfied or max rounds are reached.",
   "category": "AI",
-  "capability_world": "llm-node",
+  "capability_world": "secrets-node",
   "allowed_hosts": ["api.openai.com", "api.anthropic.com"],
   "allowed_secrets": ["*"],
   "config_schema": {
