@@ -29,6 +29,22 @@ pub struct NodeTemplate {
     pub config_schema: String, // Serialized JSON
     pub icon: Option<String>,
     pub allowed_hosts: Vec<String>,
+    /// The WIT capability world this template compiles to (e.g.
+    /// `"secrets-node"`, `"http-node"`, `"minimal-node"`). Surfaced so a
+    /// caller can see, BEFORE installing, the minimum actor capability
+    /// ceiling required to run a module built from this template — instead
+    /// of discovering it via a ceiling-denial at trigger time. Pair with
+    /// the `capabilityWorldHierarchy` query for the rank + description.
+    pub capability_world: String,
+    /// Vault secret paths (or prefix globs) this template needs granted,
+    /// e.g. `["oauth/gmail/*"]`. Surfaced so a caller knows what to set up
+    /// before running rather than hitting a resolution failure.
+    pub requires_secrets: Vec<String>,
+    /// Operation categories that make a module built from this template
+    /// pause for human approval at run time (e.g. `["network_scan"]`).
+    /// Empty for templates that never suspend. Surfaced so a suspension
+    /// isn't a surprise.
+    pub requires_approval_for: Vec<String>,
 }
 
 #[derive(SimpleObject, Clone)]

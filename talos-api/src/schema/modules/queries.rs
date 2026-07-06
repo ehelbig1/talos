@@ -138,6 +138,9 @@ impl ModulesQueries {
                     .unwrap_or_else(|_| "{}".to_string()),
                 icon: t.icon,
                 allowed_hosts: t.allowed_hosts,
+                capability_world: t.capability_world,
+                requires_secrets: t.allowed_secrets,
+                requires_approval_for: t.requires_approval_for,
             })
             .collect())
     }
@@ -173,6 +176,9 @@ impl ModulesQueries {
                 .unwrap_or_else(|_| "{}".to_string()),
             icon: t.icon,
             allowed_hosts: t.allowed_hosts,
+            capability_world: t.capability_world,
+            requires_secrets: t.allowed_secrets,
+            requires_approval_for: t.requires_approval_for,
         })
     }
 
