@@ -465,6 +465,58 @@ pub async fn get_user_audit_settings(
     Ok(row)
 }
 
+/// Parameters for [`upsert_user_audit_settings`]. The auth-header fields are
+/// the pre-encrypted envelope triple from [`encrypt_otlp_auth_headers`] —
+/// this function never sees plaintext headers.
+#[derive(Debug)]
+pub struct UserAuditSettingsUpsert {
+    pub user_id: Uuid,
+    pub streaming_enabled: bool,
+    pub otlp_endpoint: Option<String>,
+    pub otlp_protocol: Option<String>,
+    pub auth_headers_encrypted: Option<Vec<u8>>,
+    pub auth_headers_enc_key_id: Option<Uuid>,
+    pub auth_headers_format: i16,
+}
+
+/// Upsert a user's audit settings (keyed on user_id). Pool-taking; the table
+/// is user-keyed, not org-pinned RLS, so a bare pool is the correct executor.
+/// Caller is responsible for endpoint validation (SSRF gate) and header
+/// encryption BEFORE calling.
+pub async fn upsert_user_audit_settings(
+    pool: &PgPool,
+    s: UserAuditSettingsUpsert,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO user_audit_settings (
+            user_id, streaming_enabled, otlp_endpoint, otlp_protocol,
+            auth_headers_encrypted,
+            auth_headers_enc_key_id, auth_headers_format, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET
+            streaming_enabled = EXCLUDED.streaming_enabled,
+            otlp_endpoint = EXCLUDED.otlp_endpoint,
+            otlp_protocol = EXCLUDED.otlp_protocol,
+            auth_headers_encrypted = EXCLUDED.auth_headers_encrypted,
+            auth_headers_enc_key_id = EXCLUDED.auth_headers_enc_key_id,
+            auth_headers_format = EXCLUDED.auth_headers_format,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(s.user_id)
+    .bind(s.streaming_enabled)
+    .bind(s.otlp_endpoint)
+    .bind(s.otlp_protocol)
+    .bind(s.auth_headers_encrypted)
+    .bind(s.auth_headers_enc_key_id)
+    .bind(s.auth_headers_format)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Build the optional S3 client for the WORM audit bucket from env.
 ///
 /// Endpoint resolution: `AWS_ENDPOINT_URL`, then `MINIO_ENDPOINT` (empty

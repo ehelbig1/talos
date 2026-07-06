@@ -4224,6 +4224,18 @@ impl SecretsManager {
         Ok(new_dek_id)
     }
 
+    /// Total `encryption_keys` rows (all DEK generations, global + per-org,
+    /// active or not). Monotonically increasing as long as old DEKs aren't
+    /// pruned — the GraphQL rotateEncryptionKey mutation surfaces it as the
+    /// operator-facing "key version" counter.
+    pub async fn count_encryption_keys(&self) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM encryption_keys")
+            .fetch_one(&self.db_pool)
+            .await
+            .context("Failed to count encryption keys")?;
+        Ok(count)
+    }
+
     /// Rotate the active root DEK for ONE organization. Per-org sibling of
     /// [`Self::rotate_dek`]: deactivates that org's current active DEK and
     /// inserts a fresh one, leaving every other org and the global DEK
