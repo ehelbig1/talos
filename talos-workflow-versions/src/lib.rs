@@ -341,6 +341,50 @@ impl WorkflowVersionService {
         Ok(version)
     }
 
+    /// Active published version's `graph_json` as text, against a
+    /// caller-supplied connection (RFC 0005 S3 executor threading — the
+    /// GraphQL version-diff resolver runs this inside its request-scoped
+    /// UnitOfWork so the draft + published reads share one snapshot).
+    pub async fn get_active_graph_json_on_conn(
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+    ) -> Result<Option<String>> {
+        let graph_json: Option<String> = sqlx::query_scalar(
+            "SELECT graph_json::text FROM workflow_versions WHERE workflow_id = $1 AND is_active = true",
+        )
+        .bind(workflow_id)
+        .fetch_optional(conn)
+        .await
+        .context("Failed to fetch active version graph_json")?;
+        Ok(graph_json)
+    }
+
+    /// Get a version by id, gated on the PARENT workflow's ownership OR
+    /// org access (workflow_versions has no RLS policy of its own — the
+    /// JOIN through `workflows` is the only tenant protection a version
+    /// read gets, plus the workflows RLS backstop when run on the
+    /// caller's tenant-scoped tx). Takes the caller's connection; do NOT
+    /// add a bare-pool variant for the GraphQL path.
+    pub async fn get_version_for_accessor_on_conn(
+        conn: &mut sqlx::PgConnection,
+        version_id: Uuid,
+        user_id: Uuid,
+        accessible_org_ids: &[Uuid],
+    ) -> Result<Option<WorkflowVersion>> {
+        let version = sqlx::query_as::<_, WorkflowVersion>(
+            "SELECT wv.* FROM workflow_versions wv \
+             JOIN workflows w ON wv.workflow_id = w.id \
+             WHERE wv.id = $1 AND (w.user_id = $2 OR w.org_id = ANY($3))",
+        )
+        .bind(version_id)
+        .bind(user_id)
+        .bind(accessible_org_ids)
+        .fetch_optional(conn)
+        .await
+        .context("Failed to fetch workflow version")?;
+        Ok(version)
+    }
+
     /// Get a specific version by its ID.
     pub async fn get_version(
         db_pool: &PgPool,

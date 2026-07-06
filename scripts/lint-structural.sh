@@ -3419,8 +3419,17 @@ bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count m
 # update_actor_status_scoped/terminate_actor_scoped/update_actor_fields_scoped/
 # actor_owned_active_scoped/get_actor_clone_source_scoped, conn-taking
 # WorkflowRepository::archive_workflows_for_actor_scoped,
-# SystemRepository::find_role_id_by_name/register_agent/delete_agent_for_user).
-TALOS_API_SQLX_BASELINE=36
+# SystemRepository::find_role_id_by_name/register_agent/delete_agent_for_user);
+# 25 after workflows/queries.rs (conn-taking ExecutionRepository::
+# list_latest_executions_for_workflows_scoped/list_execution_history_scoped/
+# list_pending_approvals_scoped, conn-taking WorkflowRepository::
+# get_workflow_for_accessor_scoped/list_workflows_for_accessor_scoped/
+# get_graph_json_for_accessor_scoped/get_all_workflow_stats_scoped,
+# WorkflowVersionService::get_version_for_accessor_on_conn/
+# get_active_graph_json_on_conn, talos_scheduler::
+# get_schedule_for_accessor_on_conn/list_schedules_for_user).
+# Only workflows/mutations.rs (25) remains.
+TALOS_API_SQLX_BASELINE=25
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \

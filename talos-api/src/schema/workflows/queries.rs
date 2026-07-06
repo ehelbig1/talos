@@ -38,17 +38,6 @@ impl WorkflowsQueries {
             );
         }
 
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            workflow_id: Uuid,
-            status: String,
-            started_at: chrono::DateTime<chrono::Utc>,
-            completed_at: Option<chrono::DateTime<chrono::Utc>>,
-            error_message: Option<String>,
-            created_at: chrono::DateTime<chrono::Utc>,
-        }
-
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
         // RFC 0004/0005 S2: run on a tenant-scoped tx so the
@@ -57,7 +46,9 @@ impl WorkflowsQueries {
         // accessible orgs) the WHERE clause uses; the policy mirrors the
         // `we.user_id = $2 OR w.org_id = ANY(...)` predicate (EXISTS on
         // the parent workflow's org — see the migration for why we.org_id
-        // is not the tenant key here).
+        // is not the tenant key here). The repo method executes on the tx
+        // we pass.
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
@@ -65,22 +56,18 @@ impl WorkflowsQueries {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let rows = sqlx::query_as::<_, Row>(
-            r#"
-            SELECT DISTINCT ON (we.workflow_id)
-                we.id, we.workflow_id, we.status, we.started_at, we.completed_at, we.error_message, we.created_at
-            FROM workflow_executions we
-            LEFT JOIN workflows w ON w.id = we.workflow_id
-            WHERE we.workflow_id = ANY($1) AND (we.user_id = $2 OR w.org_id = ANY($3))
-            ORDER BY we.workflow_id, we.started_at DESC
-            "#,
-        )
-        .bind(&workflow_ids)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let rows = exec_repo
+            .list_latest_executions_for_workflows_scoped(
+                &mut tx,
+                &workflow_ids,
+                user_id,
+                &scope.accessible_org_ids,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: latest executions read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -133,41 +120,19 @@ impl WorkflowsQueries {
             .unwrap_or(0)
             .max(0) as i64;
 
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            workflow_id: Uuid,
-            status: String,
-            started_at: chrono::DateTime<chrono::Utc>,
-            completed_at: Option<chrono::DateTime<chrono::Utc>>,
-            error_message: Option<String>,
-            created_at: chrono::DateTime<chrono::Utc>,
-            output_data: Option<serde_json::Value>,
-            trigger_type: Option<String>,
-            actor_id: Option<Uuid>,
-        }
-
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
         // N T6-N2 note: `latest_workflow_executions` above uses
         // `DISTINCT ON (we.workflow_id)` because it semantically wants
-        // "one row per workflow." This `workflow_execution_history`
-        // query intentionally omits DISTINCT — every execution row IS a
-        // distinct event in the audit timeline, and (we.id) is the
-        // primary key so duplicates are impossible by construction.
-        // The asymmetry is correct, not a footgun.
-        // `workflow_executions` has no top-level `trigger_type` column —
-        // see `WorkflowRepository::get_scheduled_24h_execution_stats`
-        // doc for the backstory. Pre-fix the GraphQL `workflow_execution_history`
-        // query selected `we.trigger_type` against `workflow_executions`
-        // and Postgres errored at every call. The `extend_safe()` mapper
-        // then surfaced a generic 500-class error to the GraphQL caller —
-        // the field was effectively broken since the column was renamed
-        // away. Project from `provenance->>'trigger_type'` and alias
-        // back to `trigger_type` so the `Row` FromRow derive is unchanged.
+        // "one row per workflow"; the history read intentionally omits
+        // DISTINCT (every execution IS a distinct audit event). The
+        // trigger_type projection backstory lives on the repo method
+        // (`list_execution_history_scoped`).
         // RFC 0004/0005 S2: tenant-scoped tx → workflow_executions RLS
         // backstops the app-layer ownership/org filter (see sibling
-        // resolver above + the migration).
+        // resolver above + the migration). The repo method executes on
+        // the tx we pass.
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
@@ -175,26 +140,20 @@ impl WorkflowsQueries {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let rows = sqlx::query_as::<_, Row>(
-            r#"
-            SELECT we.id, we.workflow_id, we.status, we.started_at, we.completed_at,
-                   we.error_message, we.created_at, we.output_data,
-                   we.provenance->>'trigger_type' AS trigger_type, we.actor_id
-            FROM workflow_executions we
-            LEFT JOIN workflows w ON w.id = we.workflow_id
-            WHERE we.workflow_id = $1 AND (we.user_id = $2 OR w.org_id = ANY($5))
-            ORDER BY we.created_at DESC, we.id DESC
-            LIMIT $3 OFFSET $4
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(limit_val)
-        .bind(offset_val)
-        .bind(&scope.accessible_org_ids)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let rows = exec_repo
+            .list_execution_history_scoped(
+                &mut tx,
+                workflow_id,
+                user_id,
+                &scope.accessible_org_ids,
+                limit_val,
+                offset_val,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: execution history read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -253,24 +212,11 @@ impl WorkflowsQueries {
 
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
-        // Query workflow with ownership OR org membership check
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            name: String,
-            graph_json: String,
-            #[allow(dead_code)]
-            user_id: Uuid,
-            #[allow(dead_code)]
-            org_id: Option<Uuid>,
-            max_concurrent_executions: Option<i32>,
-            intent: Option<serde_json::Value>,
-            actor_id: Option<Uuid>,
-        }
-
         // RFC 0004 M4: run on a tenant-scoped tx so the workflows RLS
         // policy backstops the app-layer ownership/org filter. The scope
         // carries the same (user, accessible orgs) the WHERE clause uses.
+        // The repo method executes on the tx we pass.
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let scope = talos_tenancy::TenantReadScope::new(*user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
@@ -278,19 +224,13 @@ impl WorkflowsQueries {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let found = sqlx::query_as::<_, Row>(
-            r#"
-            SELECT id, name, graph_json, user_id, org_id, max_concurrent_executions, intent, actor_id
-            FROM workflows
-            WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))
-            "#,
-        )
-        .bind(id)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let found = workflow_repo
+            .get_workflow_for_accessor_scoped(&mut tx, id, *user_id, &scope.accessible_org_ids)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: workflow read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -335,20 +275,11 @@ impl WorkflowsQueries {
             .unwrap_or(0)
             .max(0) as i64;
 
-        #[derive(sqlx::FromRow)]
-        struct WorkflowRow {
-            id: Uuid,
-            name: String,
-            graph_json: String,
-            max_concurrent_executions: Option<i32>,
-            intent: Option<serde_json::Value>,
-            actor_id: Option<Uuid>,
-        }
-
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
 
         // RFC 0004 M4: scoped tx so the workflows RLS policy backstops the
-        // app-layer union filter.
+        // app-layer union filter. The repo method executes on the tx we pass.
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let scope = talos_tenancy::TenantReadScope::new(*user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
             .await
@@ -356,15 +287,19 @@ impl WorkflowsQueries {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let workflows = sqlx::query_as::<_, WorkflowRow>(
-            "SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
-        )
-        .bind(user_id)
-        .bind(limit_val)
-        .bind(offset_val)
-        .bind(&scope.accessible_org_ids)
-        .fetch_all(&mut *tx)
-        .await?;
+        let workflows = workflow_repo
+            .list_workflows_for_accessor_scoped(
+                &mut tx,
+                *user_id,
+                &scope.accessible_org_ids,
+                limit_val,
+                offset_val,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: workflows list failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -572,17 +507,17 @@ impl WorkflowsQueries {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let version = sqlx::query_as::<_, talos_workflow_versions::WorkflowVersion>(
-            "SELECT wv.* FROM workflow_versions wv \
-             JOIN workflows w ON wv.workflow_id = w.id \
-             WHERE wv.id = $1 AND (w.user_id = $2 OR w.org_id = ANY($3))",
+        let version = WorkflowVersionService::get_version_for_accessor_on_conn(
+            &mut tx,
+            id,
+            user_id,
+            &scope.accessible_org_ids,
         )
-        .bind(id)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "graphql: workflow version read failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -670,21 +605,17 @@ impl WorkflowsQueries {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let row = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
-            r#"
-            SELECT ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
-                   ws.last_triggered_at, ws.next_trigger_at, ws.created_at, ws.updated_at
-            FROM workflow_schedules ws
-            LEFT JOIN workflows w ON w.id = ws.workflow_id
-            WHERE ws.workflow_id = $1 AND (ws.user_id = $2 OR w.org_id = ANY($3))
-            "#,
+        let row = talos_scheduler::get_schedule_for_accessor_on_conn(
+            &mut tx,
+            workflow_id,
+            user_id,
+            &scope.accessible_org_ids,
         )
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "graphql: workflow schedule read failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -719,22 +650,13 @@ impl WorkflowsQueries {
         let limit_val = limit.unwrap_or(100).clamp(1, 1000) as i64;
         let offset_val = offset.unwrap_or(0).max(0) as i64;
 
-        let rows = sqlx::query_as::<_, talos_scheduler::WorkflowSchedule>(
-            r#"
-            SELECT id, workflow_id, user_id, cron_expression, timezone, is_enabled,
-                   last_triggered_at, next_trigger_at, created_at, updated_at
-            FROM workflow_schedules
-            WHERE user_id = $1
-            ORDER BY created_at DESC, id DESC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(user_id)
-        .bind(limit_val)
-        .bind(offset_val)
-        .fetch_all(db_pool)
-        .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let rows =
+            talos_scheduler::list_schedules_for_user(db_pool, user_id, limit_val, offset_val)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "graphql: schedules list failed");
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                })?;
 
         Ok(rows
             .into_iter()
@@ -769,49 +691,24 @@ impl WorkflowsQueries {
 
         let days_val = days.unwrap_or(7).clamp(1, 90);
 
-        #[derive(sqlx::FromRow)]
-        struct StatsRow {
-            id: Uuid,
-            name: String,
-            total: i64,
-            succeeded: i64,
-            failed: i64,
-            avg_duration_secs: Option<f64>,
-        }
-
         // RFC 0005 S3: per-user tenant-scoped tx so the workflows +
         // workflow_executions RLS policies backstop this user-only stats
         // read (both tables are RLS-enabled; the query filters w.user_id).
+        // The repo method executes on the tx we pass.
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let rows = sqlx::query_as::<_, StatsRow>(
-            r#"
-            SELECT w.id, w.name,
-                COUNT(*)::bigint AS total,
-                COUNT(*) FILTER (WHERE we.status = 'completed')::bigint AS succeeded,
-                COUNT(*) FILTER (WHERE we.status = 'failed')::bigint AS failed,
-                (AVG(EXTRACT(EPOCH FROM (we.completed_at - we.started_at))) FILTER (WHERE we.completed_at IS NOT NULL))::float8 AS avg_duration_secs
-            FROM workflows w
-            LEFT JOIN workflow_executions we ON we.workflow_id = w.id AND we.started_at > NOW() - make_interval(days => $2::int)
-            WHERE w.user_id = $1
-            GROUP BY w.id, w.name
-            HAVING COUNT(we.id) > 0
-            ORDER BY COUNT(*) FILTER (WHERE we.status = 'failed') DESC, COUNT(*) DESC
-            LIMIT 50
-            "#,
-        )
-        .bind(user_id)
-        .bind(days_val)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e: sqlx::Error| {
-            tracing::error!("Failed to fetch workflow stats: {}", e);
-            async_graphql::Error::new("Failed to fetch workflow stats").extend_safe()
-        })?;
+        let rows = workflow_repo
+            .get_all_workflow_stats_scoped(&mut tx, user_id, days_val)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to fetch workflow stats: {}", e);
+                async_graphql::Error::new("Failed to fetch workflow stats").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -856,28 +753,32 @@ impl WorkflowsQueries {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
 
-        let draft_json: Option<String> = sqlx::query_scalar(
-            "SELECT graph_json FROM workflows WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))",
-        )
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(&scope.accessible_org_ids)
-        .fetch_optional(uow.conn())
-        .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+        let draft_json = workflow_repo
+            .get_graph_json_for_accessor_scoped(
+                uow.conn(),
+                workflow_id,
+                user_id,
+                &scope.accessible_org_ids,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: workflow graph read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         let draft_json = draft_json.ok_or_else(|| {
             async_graphql::Error::new("Workflow not found or access denied").extend_safe()
         })?;
 
         // Get active published version
-        let published_json: Option<String> = sqlx::query_scalar(
-            "SELECT graph_json::text FROM workflow_versions WHERE workflow_id = $1 AND is_active = true",
-        )
-        .bind(workflow_id)
-        .fetch_optional(uow.conn())
-        .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let published_json =
+            WorkflowVersionService::get_active_graph_json_on_conn(uow.conn(), workflow_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "graphql: active version read failed");
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -1082,33 +983,24 @@ impl WorkflowsQueries {
         // MCP-1190: clamp 1..=100 matching MCP canonical, default 20.
         let limit_val: i64 = i64::from(limit.unwrap_or(20).clamp(1, 100));
 
-        use sqlx::Row;
         // RFC 0005 S3: per-user tenant-scoped tx so the workflows RLS
         // policy backstops the ownership JOIN (execution_approvals has no
         // policy of its own; the gate is `w.user_id = $1` on the joined
-        // workflow).
+        // workflow). The repo method executes on the tx we pass.
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let rows = sqlx::query(
-            r#"
-            SELECT a.id, a.workflow_id, a.execution_id, a.node_id, a.required_for, a.status,
-                   a.requested_at, a.decided_at, a.decided_by, a.reason
-            FROM execution_approvals a
-            JOIN workflows w ON w.id = a.workflow_id
-            WHERE w.user_id = $1 AND a.status = 'pending'
-            ORDER BY a.requested_at DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(user_id)
-        .bind(limit_val)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let rows = exec_repo
+            .list_pending_approvals_scoped(&mut tx, user_id, limit_val)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: pending approvals read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -1117,20 +1009,16 @@ impl WorkflowsQueries {
         Ok(rows
             .into_iter()
             .map(|row| ExecutionApproval {
-                id: row.get("id"),
-                workflow_id: row.get("workflow_id"),
-                execution_id: row.get("execution_id"),
-                node_id: row.get("node_id"),
-                required_for: row.get("required_for"),
-                status: row.get("status"),
-                requested_at: row
-                    .get::<chrono::DateTime<chrono::Utc>, _>("requested_at")
-                    .to_rfc3339(),
-                decided_at: row
-                    .get::<Option<chrono::DateTime<chrono::Utc>>, _>("decided_at")
-                    .map(|t| t.to_rfc3339()),
-                decided_by: row.get("decided_by"),
-                reason: row.get("reason"),
+                id: row.id,
+                workflow_id: row.workflow_id,
+                execution_id: row.execution_id,
+                node_id: row.node_id,
+                required_for: row.required_for,
+                status: row.status,
+                requested_at: row.requested_at.to_rfc3339(),
+                decided_at: row.decided_at.map(|t| t.to_rfc3339()),
+                decided_by: row.decided_by,
+                reason: row.reason,
             })
             .collect())
     }

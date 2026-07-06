@@ -2760,6 +2760,105 @@ impl ExecutionRepository {
         Ok(result.rows_affected())
     }
 
+    /// Latest execution per workflow (DISTINCT ON) for a batch of
+    /// workflow ids, gated on ownership OR org access. Takes the caller's
+    /// connection: the GraphQL `latestWorkflowExecutions` query runs this
+    /// on a `begin_tenant_read_scoped` tx so the workflow_executions RLS
+    /// policy backstops the app-layer `we.user_id = $2 OR w.org_id =
+    /// ANY($3)` predicate (RFC 0004/0005 S2). Do NOT route through
+    /// `self.db_pool`; that would silently drop the RLS backstop.
+    pub async fn list_latest_executions_for_workflows_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_ids: &[Uuid],
+        user_id: Uuid,
+        accessible_org_ids: &[Uuid],
+    ) -> Result<Vec<LatestExecutionRow>> {
+        let rows = sqlx::query_as::<_, LatestExecutionRow>(
+            r#"
+            SELECT DISTINCT ON (we.workflow_id)
+                we.id, we.workflow_id, we.status, we.started_at, we.completed_at, we.error_message, we.created_at
+            FROM workflow_executions we
+            LEFT JOIN workflows w ON w.id = we.workflow_id
+            WHERE we.workflow_id = ANY($1) AND (we.user_id = $2 OR w.org_id = ANY($3))
+            ORDER BY we.workflow_id, we.started_at DESC
+            "#,
+        )
+        .bind(workflow_ids)
+        .bind(user_id)
+        .bind(accessible_org_ids)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated execution history for one workflow, gated on ownership
+    /// OR org access, newest first with a unique `we.id DESC` tiebreaker.
+    /// `trigger_type` is projected from `provenance->>'trigger_type'`
+    /// (there is no top-level column — see
+    /// `get_scheduled_24h_execution_stats`). Same scoped-executor
+    /// contract as `list_latest_executions_for_workflows_scoped`.
+    pub async fn list_execution_history_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        accessible_org_ids: &[Uuid],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ExecutionHistoryRow>> {
+        let rows = sqlx::query_as::<_, ExecutionHistoryRow>(
+            r#"
+            SELECT we.id, we.workflow_id, we.status, we.started_at, we.completed_at,
+                   we.error_message, we.created_at, we.output_data,
+                   we.provenance->>'trigger_type' AS trigger_type, we.actor_id
+            FROM workflow_executions we
+            LEFT JOIN workflows w ON w.id = we.workflow_id
+            WHERE we.workflow_id = $1 AND (we.user_id = $2 OR w.org_id = ANY($5))
+            ORDER BY we.created_at DESC, we.id DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .bind(accessible_org_ids)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Pending execution approvals for a user's workflows, newest first,
+    /// capped at `limit`. Takes the caller's connection: the GraphQL
+    /// `pendingApprovals` query runs this on a `begin_user_scoped` tx so
+    /// the workflows RLS policy backstops the ownership JOIN
+    /// (execution_approvals has no policy of its own — RFC 0005 S3). Do
+    /// NOT route through `self.db_pool`.
+    pub async fn list_pending_approvals_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ExecutionApprovalRow>> {
+        let rows = sqlx::query_as::<_, ExecutionApprovalRow>(
+            r#"
+            SELECT a.id, a.workflow_id, a.execution_id, a.node_id, a.required_for, a.status,
+                   a.requested_at, a.decided_at, a.decided_by, a.reason
+            FROM execution_approvals a
+            JOIN workflows w ON w.id = a.workflow_id
+            WHERE w.user_id = $1 AND a.status = 'pending'
+            ORDER BY a.requested_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows)
+    }
+
     /// Most-recent `execution_events` rows for subscription replay,
     /// NEWEST-first, capped at `limit` (MCP-954 — an uncapped replay pulled
     /// every event of a long-running execution into memory per subscriber).
@@ -2831,6 +2930,51 @@ pub struct DeadLetterQueueRow {
     pub created_at: DateTime<Utc>,
     pub replayed_at: Option<DateTime<Utc>>,
     pub replayed_by: Option<Uuid>,
+}
+
+/// Latest-execution row returned by
+/// `list_latest_executions_for_workflows_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct LatestExecutionRow {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Execution-history row returned by `list_execution_history_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExecutionHistoryRow {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub output_data: Option<serde_json::Value>,
+    pub trigger_type: Option<String>,
+    pub actor_id: Option<Uuid>,
+}
+
+/// Full execution_approvals row returned by
+/// `list_pending_approvals_scoped` (the GraphQL `pendingApprovals`
+/// shape — distinct from `PendingApprovalRow`, the MCP listing shape).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExecutionApprovalRow {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    pub execution_id: Uuid,
+    pub node_id: Uuid,
+    pub required_for: Vec<String>,
+    pub status: String,
+    pub requested_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_by: Option<Uuid>,
+    pub reason: Option<String>,
 }
 
 /// Replay target returned by `get_dlq_replay_target_scoped`.

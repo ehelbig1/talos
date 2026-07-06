@@ -26,6 +26,62 @@ pub struct WorkflowSchedule {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A workflow's schedule, gated on schedule ownership OR the parent
+/// workflow's org access. Takes the caller's connection: the GraphQL
+/// `workflowSchedule` query runs this on a `begin_tenant_read_scoped` tx
+/// so the workflows RLS policy backstops the JOIN (workflow_schedules
+/// has no policy of its own — RFC 0005 S3). Do NOT add a bare-pool
+/// variant for that path.
+pub async fn get_schedule_for_accessor_on_conn(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+    user_id: Uuid,
+    accessible_org_ids: &[Uuid],
+) -> anyhow::Result<Option<WorkflowSchedule>> {
+    let row = sqlx::query_as::<_, WorkflowSchedule>(
+        r#"
+        SELECT ws.id, ws.workflow_id, ws.user_id, ws.cron_expression, ws.timezone, ws.is_enabled,
+               ws.last_triggered_at, ws.next_trigger_at, ws.created_at, ws.updated_at
+        FROM workflow_schedules ws
+        LEFT JOIN workflows w ON w.id = ws.workflow_id
+        WHERE ws.workflow_id = $1 AND (ws.user_id = $2 OR w.org_id = ANY($3))
+        "#,
+    )
+    .bind(workflow_id)
+    .bind(user_id)
+    .bind(accessible_org_ids)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row)
+}
+
+/// A user's own schedules, newest first with a unique `id DESC`
+/// tiebreaker, paginated. Bare-pool read (strictly `user_id`-filtered;
+/// backs the GraphQL `mySchedules` query).
+pub async fn list_schedules_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<WorkflowSchedule>> {
+    let rows = sqlx::query_as::<_, WorkflowSchedule>(
+        r#"
+        SELECT id, workflow_id, user_id, cron_expression, timezone, is_enabled,
+               last_triggered_at, next_trigger_at, created_at, updated_at
+        FROM workflow_schedules
+        WHERE user_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Calculate the next trigger time for a cron expression in the given timezone.
 ///
 /// Returns `None` if the cron expression is invalid or no future occurrence can
