@@ -7699,6 +7699,15 @@ async fn graphql_handler(
     req = req.data(cookies);
 
     // Try API key authentication first (X-API-Key header)
+    // MERELY presenting the header commits the request to the API-key lane:
+    // a present-but-invalid key fails CLOSED (below), it is NOT downgraded to
+    // the ambient session cookie. This is the security pairing for the CSRF
+    // exemption in `talos-csrf::is_api_key_request` — CSRF is skipped for
+    // X-API-Key requests, so if a bogus key could silently fall back to the
+    // victim's cookie, an attacker's cross-origin page could send a junk
+    // X-API-Key to bypass CSRF and ride the session. Failing closed removes
+    // that path.
+    let api_key_header_present = headers.contains_key("X-API-Key");
     let mut authenticated = false;
     if let Some(api_key) = headers.get("X-API-Key").and_then(|h| h.to_str().ok()) {
         // Get API key service from schema data
@@ -7714,12 +7723,17 @@ async fn graphql_handler(
                 req = req.data(crate::api::schema::IsTwoFactorVerified(true));
                 authenticated = true;
                 tracing::debug!("Authenticated via API key for user {}", user_id);
+            } else {
+                tracing::debug!(
+                    "X-API-Key present but invalid — failing closed (no cookie fallback)"
+                );
             }
         }
     }
 
-    // Fall back to JWT token authentication if no API key was used
-    if !authenticated {
+    // Fall back to JWT token authentication ONLY when no API key was
+    // presented. See the api_key_header_present rationale above.
+    if !authenticated && !api_key_header_present {
         if let Some(token_str) = token {
             // Get auth service from schema data
             if let Some(auth_service) = schema.0.data::<std::sync::Arc<AuthService>>() {

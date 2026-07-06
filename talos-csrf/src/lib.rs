@@ -13,7 +13,31 @@ use std::time::{Duration, Instant};
 const CSRF_TOKEN_LENGTH: usize = 32;
 const CSRF_COOKIE_NAME: &str = "talos_csrf_token";
 const CSRF_HEADER_NAME: &str = "X-CSRF-Token";
+/// Presence of this header marks a request as authenticating via a
+/// long-lived API key rather than the ambient session cookie — see
+/// [`is_api_key_request`].
+const API_KEY_HEADER_NAME: &str = "X-API-Key";
 const GRACE_PERIOD_SECONDS: u64 = 15;
+
+/// CSRF exists to stop a cross-origin page from riding a victim's
+/// AMBIENT session cookie (the browser attaches it automatically). A
+/// request that carries an `X-API-Key` header is not using ambient
+/// cookie auth: an attacker's page cannot set a custom header on a
+/// cross-origin request without a CORS preflight, and does not possess
+/// the key regardless — so CSRF is moot for these requests, and forcing
+/// the seed-cookie + `X-CSRF-Token` dance only breaks legitimate
+/// scriptability.
+///
+/// SECURITY PAIRING (do not break): this exemption is only safe because
+/// the controller's GraphQL auth path treats a PRESENT `X-API-Key` as
+/// authoritative — a present-but-INVALID key fails closed (401) and is
+/// NEVER downgraded to the session cookie. If that fallback were
+/// reintroduced, an attacker could send a bogus `X-API-Key` to skip CSRF
+/// AND ride the victim's cookie. See `controller/src/main.rs`
+/// (`api_key_header_present` gate on the JWT fallback).
+fn is_api_key_request(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(API_KEY_HEADER_NAME)
+}
 
 /// Maximum GraphQL request body size (bytes). SINGLE SOURCE OF TRUTH for both
 /// the `/graphql` route's `DefaultBodyLimit::max(..)` AND the dev-only body
@@ -193,6 +217,12 @@ pub async fn csrf_protection(
         return Ok(response);
     }
 
+    // Skip CSRF for API-key-authenticated requests (see is_api_key_request).
+    if is_api_key_request(request.headers()) {
+        let response = next.run(request).await;
+        return Ok(response);
+    }
+
     // For mutations (POST, PUT, DELETE, PATCH), validate CSRF token
     let cookie_token = cookies.get(CSRF_COOKIE_NAME).map(|c| c.value().to_string());
 
@@ -281,6 +311,14 @@ pub async fn csrf_protection_graphql(
             cookies.add(build_csrf_cookie(generate_csrf_token()));
         }
 
+        let response = next.run(request).await;
+        return Ok(response);
+    }
+
+    // Skip CSRF for API-key-authenticated requests (see is_api_key_request).
+    // Checked before body buffering so scripted API-key mutations avoid the
+    // seed-cookie + X-CSRF-Token dance entirely.
+    if is_api_key_request(request.headers()) {
         let response = next.run(request).await;
         return Ok(response);
     }
@@ -527,6 +565,27 @@ mod tests {
             "CSRF cookie Secure flag must follow is_production()"
         );
         assert_eq!(cookie.name(), CSRF_COOKIE_NAME);
+    }
+
+    #[test]
+    fn is_api_key_request_detects_the_header() {
+        use axum::http::HeaderMap;
+        let mut with_key = HeaderMap::new();
+        with_key.insert("X-API-Key", "talos_anything".parse().unwrap());
+        assert!(is_api_key_request(&with_key));
+
+        // Case-insensitive header lookup (HeaderMap normalises names).
+        let mut lower = HeaderMap::new();
+        lower.insert("x-api-key", "k".parse().unwrap());
+        assert!(is_api_key_request(&lower));
+
+        // No header → not an API-key request (CSRF still enforced).
+        assert!(!is_api_key_request(&HeaderMap::new()));
+
+        // A CSRF header alone must NOT count as an API-key request.
+        let mut csrf_only = HeaderMap::new();
+        csrf_only.insert(CSRF_HEADER_NAME, "tok".parse().unwrap());
+        assert!(!is_api_key_request(&csrf_only));
     }
 
     #[test]
