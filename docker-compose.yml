@@ -405,8 +405,13 @@ services:
       # Disable pooling here too — same reason as the worker service above.
       TALOS_DISABLE_POOLING: "true"
       # RFC 0005 S3 tenant-isolation RLS enforcement (SET LOCAL ROLE talos_app).
-      # Default off; flip via TALOS_RLS_SET_ROLE=true in .env to validate.
-      TALOS_RLS_SET_ROLE: ${TALOS_RLS_SET_ROLE:-false}
+      # Default ON (2026-07-06) so dev matches the production posture; set
+      # TALOS_RLS_SET_ROLE=false in .env only to bisect an RLS-related failure.
+      TALOS_RLS_SET_ROLE: ${TALOS_RLS_SET_ROLE:-true}
+      # JWT audience-claim enforcement (MCP-857): reject tokens missing
+      # `aud=talos`. Default ON — the issuer has stamped `aud` since 2026-05;
+      # a stale pre-aud session cookie just prompts a fresh login.
+      JWT_REQUIRE_AUD: ${JWT_REQUIRE_AUD:-true}
     ports:
       - "8000:8000"
     volumes:

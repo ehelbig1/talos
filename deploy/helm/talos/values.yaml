@@ -211,30 +211,36 @@ controller:
     # per-transaction SET LOCAL ROLE (auto-resets on commit/rollback), so
     # the RFC 0004 row-level-security policies ENFORCE even when the
     # controller's DB connection is a superuser — the in-cluster Postgres
-    # default, where RLS is otherwise silently bypassed. Default OFF: the
-    # policies are a no-op backstop until you opt in (the app-layer
-    # ownership checks remain primary either way).
+    # default, where RLS is otherwise silently bypassed. Default ON as of
+    # 2026-07-06: the full integration suite runs green under enforcement,
+    # and the app-layer ownership checks remain primary either way — the
+    # policies now back them fail-closed instead of sitting decorative.
     #
-    # PREREQUISITES before flipping to "true":
+    # PREREQUISITES (both hold on any chart-managed deploy):
     #   1. Migrations applied through
     #      20260529220000_talos_app_role.sql (creates `talos_app` + the
-    #      request-path grants). The controller boot guard logs an ERROR if
+    #      request-path grants) — the chart's migrations Job runs these
+    #      before the controller starts. The boot guard logs an ERROR if
     #      the role is missing or mis-attributed while this is on.
-    #   2. Validate in staging first: after enabling, confirm the
-    #      controller logs "RLS SET-ROLE mode active" (INFO) at boot and
-    #      run `make smoke`. Exercise a few read/write workflows.
-    # Rollback is instant and data-safe: set "false" (or remove) and
-    # restart — enforcement is per-transaction, no migration to undo.
-    # TALOS_RLS_SET_ROLE: "true"
-    # JWT audience-claim enforcement (MCP-857). Once every live token
-    # in your cluster carries `aud=talos`, set this to "true" to fail
-    # closed on tokens missing the claim (defense vs. cross-audience
-    # JWT replay — see talos-auth/src/lib.rs ~line 1239). During the
-    # back-compat retirement window, leave commented/unset and the
-    # verifier accepts aud-less tokens. Flip to "true" only after
-    # confirming no aud-less tokens remain (e.g. all sessions refreshed
-    # past the JWT TTL since the issuer started stamping `aud`).
-    # JWT_REQUIRE_AUD: "true"
+    #   2. The controller's connecting role is a MEMBER of `talos_app`
+    #      (the migration grants this to the role that runs it). If your
+    #      migrations run as a DIFFERENT DB user than the controller,
+    #      verify with `scripts/rls-preflight.sh` before upgrading.
+    # After upgrade, confirm the controller logs "RLS SET-ROLE mode
+    # active" (INFO) at boot and run `make smoke`.
+    # Rollback is instant and data-safe: set "false" and restart —
+    # enforcement is per-transaction, no migration to undo.
+    TALOS_RLS_SET_ROLE: "true"
+    # JWT audience-claim enforcement (MCP-857): fail closed on tokens
+    # missing `aud=talos` (defense vs. cross-audience JWT replay — see
+    # talos-auth/src/lib.rs `verify_token`). Default ON as of 2026-07-06:
+    # the issuer has stamped `aud` since 2026-05, so any aud-less token
+    # aged out of circulation one access-token TTL (15 min) after that
+    # deploy. If upgrading from a pre-2026-05 build, upgrade first with
+    # this set to "false", wait one TTL while watching the
+    # `jwt_legacy_aud_less_verify` telemetry event hit zero, then re-set
+    # to "true". Rollback is instant: set "false" and restart.
+    JWT_REQUIRE_AUD: "true"
     # Bootstrap-time first-admin pin (MCP-859). STRONGLY RECOMMENDED
     # for any deployment exposed to the public internet BEFORE the
     # operator's own signup completes. When set, ONLY a user
