@@ -2701,6 +2701,31 @@ impl ExecutionRepository {
         Ok(rows)
     }
 
+    /// Most-recent `execution_events` rows for subscription replay,
+    /// NEWEST-first, capped at `limit` (MCP-954 — an uncapped replay pulled
+    /// every event of a long-running execution into memory per subscriber).
+    /// Caller reverses to chronological order for stream consumers.
+    /// Authorization happens at the subscription layer
+    /// (`authorize_execution_subscription`) before this is called.
+    pub async fn list_recent_execution_events(
+        &self,
+        execution_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ExecutionEventReplayRow>> {
+        let rows = sqlx::query_as::<_, ExecutionEventReplayRow>(
+            "SELECT node_id, status, log_message, iteration_index, iteration_total, duration_ms \
+             FROM execution_events \
+             WHERE execution_id = $1 \
+             ORDER BY created_at DESC \
+             LIMIT $2",
+        )
+        .bind(execution_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Latest `node_input` event for a (execution_id, node_id) pair.
     /// Returns the raw `log_message` text, which the handler parses as JSON
     /// or surfaces as a plain string.
@@ -2720,6 +2745,18 @@ impl ExecutionRepository {
         .await?;
         Ok(msg.flatten())
     }
+}
+
+/// Execution-event row returned by `list_recent_execution_events` for
+/// subscription replay.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExecutionEventReplayRow {
+    pub node_id: Option<Uuid>,
+    pub status: String,
+    pub log_message: Option<String>,
+    pub iteration_index: Option<i32>,
+    pub iteration_total: Option<i32>,
+    pub duration_ms: Option<i64>,
 }
 
 /// Workflow DLQ row returned by `list_dead_letter_queue_scoped`.

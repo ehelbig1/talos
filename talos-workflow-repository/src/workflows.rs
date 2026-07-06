@@ -3,6 +3,7 @@
 //! [`talos_workflow_engine_core::WorkflowGraphStore`] impl.
 
 use crate::*;
+use anyhow::Context as _;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Row DTOs
@@ -707,6 +708,35 @@ impl WorkflowRepository {
             .bind(workflow_id)
             .execute(&self.db_pool)
             .await?;
+        Ok(())
+    }
+
+    /// Replace the `workflow_module_refs` junction rows for a workflow:
+    /// DELETE the existing set, then batch-INSERT `module_ids` (skipped when
+    /// empty). Backs the GraphQL `sync_workflow_module_refs` save hook —
+    /// best-effort at the caller (a failed sync warns, it doesn't fail the
+    /// save). A failed DELETE aborts before the INSERT so a partial sync
+    /// can't duplicate refs.
+    pub async fn replace_module_refs(&self, workflow_id: Uuid, module_ids: &[Uuid]) -> Result<()> {
+        sqlx::query("DELETE FROM workflow_module_refs WHERE workflow_id = $1")
+            .bind(workflow_id)
+            .execute(&self.db_pool)
+            .await
+            .context("workflow_module_refs delete failed")?;
+
+        if module_ids.is_empty() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            "INSERT INTO workflow_module_refs (workflow_id, module_id) \
+             SELECT $1, * FROM UNNEST($2::uuid[]) ON CONFLICT DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(module_ids)
+        .execute(&self.db_pool)
+        .await
+        .context("workflow_module_refs batch insert failed")?;
         Ok(())
     }
 

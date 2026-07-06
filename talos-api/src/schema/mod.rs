@@ -237,11 +237,9 @@ pub async fn user_accessible_org_ids(ctx: &Context<'_>) -> Result<Vec<Uuid>> {
     // sees no org-shared resources) but loses the regression signal.
     // Logging at error! level pairs the read+write paths so an
     // `organization_members` schema break surfaces uniformly.
-    let org_ids: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(
-        "SELECT org_id FROM organization_members WHERE user_id = $1",
+    let org_ids: Vec<Uuid> = match talos_organizations::OrganizationService::list_user_org_ids(
+        db_pool, *user_id,
     )
-    .bind(user_id)
-    .fetch_all(db_pool)
     .await
     {
         Ok(ids) => ids,
@@ -284,24 +282,22 @@ pub async fn user_writable_org_ids(ctx: &Context<'_>) -> Result<Vec<Uuid>> {
     // naming class) would make EVERY write to org-shared resources
     // silently 403 with no operator-facing signal. Logging at error!
     // level surfaces the actual cause so the regression is investigable.
-    let mut org_ids: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(
-        "SELECT org_id FROM organization_members \
-         WHERE user_id = $1 AND role IN ('member', 'admin', 'owner')",
-    )
-    .bind(user_id)
-    .fetch_all(db_pool)
-    .await
-    {
-        Ok(ids) => ids,
-        Err(e) => {
-            tracing::error!(
-                user_id = %user_id,
-                error = %e,
-                "user_writable_org_ids: DB query failed — falling back to empty (writer denied)"
-            );
-            Vec::new()
-        }
-    };
+    let mut org_ids: Vec<Uuid> =
+        match talos_organizations::OrganizationService::list_user_writable_org_ids(
+            db_pool, *user_id,
+        )
+        .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(
+                    user_id = %user_id,
+                    error = %e,
+                    "user_writable_org_ids: DB query failed — falling back to empty (writer denied)"
+                );
+                Vec::new()
+            }
+        };
 
     // If API key is org-scoped, intersect with that single org so the
     // key can't escape its scope by piggybacking on the user's other
@@ -384,33 +380,13 @@ pub async fn sync_workflow_module_refs(
 ) {
     let module_ids = ParallelWorkflowEngine::extract_module_ids(graph_json);
 
-    if let Err(e) = sqlx::query("DELETE FROM workflow_module_refs WHERE workflow_id = $1")
-        .bind(workflow_id)
-        .execute(db_pool)
-        .await
-    {
+    // Best-effort: a failed sync warns, it doesn't fail the workflow save.
+    // The repo method aborts before the INSERT if the DELETE fails, matching
+    // the previous inline two-statement semantics.
+    let repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+    if let Err(e) = repo.replace_module_refs(workflow_id, &module_ids).await {
         tracing::warn!(
-            "sync_workflow_module_refs: delete failed for {}: {}",
-            workflow_id,
-            e
-        );
-        return;
-    }
-
-    if module_ids.is_empty() {
-        return;
-    }
-
-    if let Err(e) = sqlx::query(
-        "INSERT INTO workflow_module_refs (workflow_id, module_id) SELECT $1, * FROM UNNEST($2::uuid[]) ON CONFLICT DO NOTHING",
-    )
-    .bind(workflow_id)
-    .bind(&module_ids as &[uuid::Uuid])
-    .execute(db_pool)
-    .await
-    {
-        tracing::warn!(
-            "sync_workflow_module_refs: batch insert failed for workflow {}: {}",
+            "sync_workflow_module_refs: sync failed for workflow {}: {}",
             workflow_id,
             e
         );
