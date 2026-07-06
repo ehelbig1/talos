@@ -106,6 +106,28 @@ impl SystemRepository {
             .unwrap_or(0)
     }
 
+    /// A user's MCP agents, newest first, capped at `limit`. Backs the
+    /// GraphQL `mcpAgents` query (MCP-1190 gave it the 1..=1000 clamp;
+    /// the caller owns the clamp, this method just binds it).
+    pub async fn list_agents_for_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<McpAgentListRow>> {
+        let rows = sqlx::query_as::<_, McpAgentListRow>(
+            "SELECT id, name, created_at, last_connected_at AS last_used_at \
+             FROM mcp_agents \
+             WHERE user_id = $1 \
+             ORDER BY created_at DESC \
+             LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
+    }
+
     // ── mcp/mod.rs local-dev helpers ───────────────────────────────────────
 
     /// Find the oldest user (by created_at). Used by the local MCP endpoint to
@@ -228,6 +250,15 @@ impl SystemRepository {
         .await?;
         Ok(())
     }
+}
+
+/// MCP-agent listing row returned by `list_agents_for_user`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct McpAgentListRow {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Agent lookup row returned by `find_active_agent_by_token_lookup_hash`.

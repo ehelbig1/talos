@@ -18,8 +18,6 @@ impl ActorsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        use sqlx::Row;
-
         // RFC 0004/0005 S2: run on a tenant-scoped tx so the actors RLS
         // policy backstops the app-layer `user_id` filter. Actors are
         // personal (the policy only ever matches the owner clause), but
@@ -27,7 +25,9 @@ impl ActorsQueries {
         // workflow_executions COUNT subqueries — both RLS-enabled — stay
         // permissive enough to count a teammate's executions on this
         // actor's org-shared workflows (preserving the pre-RLS counts; an
-        // empty org list would undercount them).
+        // empty org list would undercount them). The repo method executes
+        // on the tx we pass (`list_actor_summaries_scoped`).
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let org_ids: Vec<uuid::Uuid> = crate::schema::user_accessible_org_ids(ctx).await?;
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
@@ -36,22 +36,13 @@ impl ActorsQueries {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let rows = sqlx::query(
-            r#"SELECT
-                a.id, a.name, a.description, a.status, a.max_capability_world,
-                a.created_at, a.updated_at,
-                (SELECT COUNT(*) FROM workflows w WHERE w.actor_id = a.id) as workflow_count,
-                (SELECT COUNT(*) FROM workflow_executions we
-                 JOIN workflows w ON w.id = we.workflow_id
-                 WHERE w.actor_id = a.id) as execution_count
-             FROM actors a
-             WHERE a.user_id = $1
-             ORDER BY a.created_at DESC"#,
-        )
-        .bind(user_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let rows = actor_repo
+            .list_actor_summaries_scoped(&mut tx, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actors list failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
@@ -59,21 +50,17 @@ impl ActorsQueries {
         let actors = rows
             .into_iter()
             .map(|row| ActorSummary {
-                id: row.get("id"),
-                name: row.get("name"),
-                description: row.get("description"),
-                status: row.get("status"),
-                max_capability_world: row.get("max_capability_world"),
-                workflow_count: row.get("workflow_count"),
-                execution_count: row.get("execution_count"),
+                id: row.id,
+                name: row.name,
+                description: row.description,
+                status: row.status,
+                max_capability_world: row.max_capability_world,
+                workflow_count: row.workflow_count,
+                execution_count: row.execution_count,
                 total_budget_usd: None,
                 spent_budget_usd: 0.0,
-                created_at: row
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339(),
-                updated_at: row
-                    .get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
-                    .to_rfc3339(),
+                created_at: row.created_at.to_rfc3339(),
+                updated_at: row.updated_at.to_rfc3339(),
             })
             .collect();
 
@@ -91,11 +78,11 @@ impl ActorsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        use sqlx::Row;
-
         // RFC 0004/0005 S2: tenant-scoped tx → actors RLS backstops the
         // app-layer `user_id` filter; real org_ids keep the RLS-enabled
         // COUNT subqueries non-regressing (see sibling list resolver).
+        // Repo method executes on the tx we pass.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let org_ids: Vec<uuid::Uuid> = crate::schema::user_accessible_org_ids(ctx).await?;
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope)
@@ -104,58 +91,33 @@ impl ActorsQueries {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let row = sqlx::query(
-            r#"SELECT
-                a.id, a.name, a.description, a.status, a.max_capability_world, a.metadata,
-                a.created_at, a.updated_at,
-                (SELECT COUNT(*) FROM workflows w WHERE w.actor_id = a.id) as workflow_count,
-                (SELECT COUNT(*) FROM workflow_executions we
-                 WHERE we.actor_id = a.id) as execution_count,
-                (SELECT MAX(we.started_at) FROM workflow_executions we
-                 WHERE we.actor_id = a.id) as last_active_at
-             FROM actors a
-             WHERE a.id = $1 AND a.user_id = $2"#,
-        )
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e: sqlx::Error| e.extend_safe())?;
+        let row = actor_repo
+            .get_actor_details_scoped(&mut tx, id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor detail read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit()
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
 
-        Ok(row.map(|r| {
-            let metadata: Option<String> = r
-                .get::<'_, Option<serde_json::Value>, _>("metadata")
-                .map(|v| v.to_string());
-            let last_active_at: Option<String> = r
-                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_active_at")
-                .ok()
-                .flatten()
-                .map(|d| d.to_rfc3339());
-
-            ActorDetails {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.get("description"),
-                status: r.get("status"),
-                max_capability_world: r.get("max_capability_world"),
-                metadata,
-                workflow_count: r.get("workflow_count"),
-                execution_count: r.get("execution_count"),
-                total_budget_usd: None,
-                spent_budget_usd: 0.0,
-                mcp_token: None,
-                rate_limit: None,
-                last_active_at,
-                created_at: r
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339(),
-                updated_at: r
-                    .get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
-                    .to_rfc3339(),
-            }
+        Ok(row.map(|r| ActorDetails {
+            id: r.id,
+            name: r.name,
+            description: r.description,
+            status: r.status,
+            max_capability_world: r.max_capability_world,
+            metadata: r.metadata.map(|v| v.to_string()),
+            workflow_count: r.workflow_count,
+            execution_count: r.execution_count,
+            total_budget_usd: None,
+            spent_budget_usd: 0.0,
+            mcp_token: None,
+            rate_limit: None,
+            last_active_at: r.last_active_at.map(|d| d.to_rfc3339()),
+            created_at: r.created_at.to_rfc3339(),
+            updated_at: r.updated_at.to_rfc3339(),
         }))
     }
 
@@ -171,14 +133,14 @@ impl ActorsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        use sqlx::Row;
-
         // RFC 0005 S3: one request-scoped unit of work — the ownership
         // check and the stats aggregate share ONE tenant-scoped tx (role +
         // GUC set once), so they see a consistent snapshot and the
         // actors / workflow_executions RLS policies backstop both. Real
         // org ids keep the executions count non-regressing (a teammate's
         // executions on the actor's org-shared workflows still count).
+        // Repo methods execute on the UoW's connection.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
@@ -188,40 +150,35 @@ impl ActorsQueries {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
 
-        let actor_exists: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
-                .bind(actor_id)
-                .bind(user_id)
-                .fetch_optional(uow.conn())
-                .await
-                .map_err(|e| e.extend_safe())?;
+        let actor_exists = actor_repo
+            .actor_owned_by_user_scoped(uow.conn(), actor_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
-        if actor_exists.is_none() {
+        if !actor_exists {
             return Err(async_graphql::Error::new("Actor not found").extend_safe());
         }
 
-        let stats = sqlx::query(
-            "SELECT
-                COUNT(*) AS total,
-                COUNT(*) FILTER (WHERE status = 'completed') AS successful,
-                COUNT(*) FILTER (WHERE status = 'failed') AS failed,
-                COUNT(*) FILTER (WHERE status IN ('pending', 'running')) AS active
-             FROM workflow_executions WHERE actor_id = $1",
-        )
-        .bind(actor_id)
-        .fetch_one(uow.conn())
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let stats = actor_repo
+            .get_actor_execution_counts_scoped(uow.conn(), actor_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor execution stats failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
         Ok(ActorExecutionsSummary {
-            total_executions: stats.get("total"),
-            successful_executions: stats.get("successful"),
-            failed_executions: stats.get("failed"),
-            active_executions: stats.get("active"),
+            total_executions: stats.total,
+            successful_executions: stats.successful,
+            failed_executions: stats.failed,
+            active_executions: stats.active,
         })
     }
 
@@ -237,10 +194,9 @@ impl ActorsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        use sqlx::Row;
-
         // RFC 0005 S3: shared unit of work (see actor_executions_summary).
         // Ownership check + workflows aggregate in one tenant-scoped tx.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
         let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
         let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope)
@@ -250,36 +206,33 @@ impl ActorsQueries {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
 
-        let actor_exists: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
-                .bind(actor_id)
-                .bind(user_id)
-                .fetch_optional(uow.conn())
-                .await
-                .map_err(|e| e.extend_safe())?;
+        let actor_exists = actor_repo
+            .actor_owned_by_user_scoped(uow.conn(), actor_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
-        if actor_exists.is_none() {
+        if !actor_exists {
             return Err(async_graphql::Error::new("Actor not found").extend_safe());
         }
 
-        let stats = sqlx::query(
-            "SELECT
-                COUNT(*) AS total,
-                COUNT(*) FILTER (WHERE status != 'archived' OR status IS NULL) AS active
-             FROM workflows WHERE actor_id = $1",
-        )
-        .bind(actor_id)
-        .fetch_one(uow.conn())
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let stats = actor_repo
+            .get_actor_workflow_counts_scoped(uow.conn(), actor_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor workflow stats failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
         Ok(ActorWorkflowsSummary {
-            total_workflows: stats.get("total"),
-            active_workflows: stats.get("active"),
+            total_workflows: stats.total,
+            active_workflows: stats.active,
         })
     }
 
@@ -296,13 +249,12 @@ impl ActorsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        use sqlx::Row;
-
         let limit = limit.unwrap_or(50).clamp(1, 200);
 
         // RFC 0005 S3: ownership check + action-log read in ONE per-user
         // unit of work (actors are personal — the actor's log is the
         // user's), so the actors ownership read gets the RLS backstop.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
             .await
             .map_err(|e| {
@@ -310,30 +262,25 @@ impl ActorsQueries {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
 
-        let actor_exists: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
-                .bind(actor_id)
-                .bind(user_id)
-                .fetch_optional(uow.conn())
-                .await
-                .map_err(|e| e.extend_safe())?;
+        let actor_exists = actor_repo
+            .actor_owned_by_user_scoped(uow.conn(), actor_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
-        if actor_exists.is_none() {
+        if !actor_exists {
             return Err(async_graphql::Error::new("Actor not found").extend_safe());
         }
 
-        let rows = sqlx::query(
-            r#"SELECT id, action_type, summary, timestamp, workflow_id, execution_id
-               FROM actor_action_log
-               WHERE actor_id = $1
-               ORDER BY timestamp DESC
-               LIMIT $2"#,
-        )
-        .bind(actor_id)
-        .bind(limit)
-        .fetch_all(uow.conn())
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let rows = actor_repo
+            .list_action_log_scoped(uow.conn(), actor_id, limit)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: action log read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -342,14 +289,12 @@ impl ActorsQueries {
         Ok(rows
             .into_iter()
             .map(|row| ActorActionLogEntry {
-                id: row.get("id"),
-                action_type: row.get("action_type"),
-                summary: row.get("summary"),
-                timestamp: row
-                    .get::<chrono::DateTime<chrono::Utc>, _>("timestamp")
-                    .to_rfc3339(),
-                workflow_id: row.get("workflow_id"),
-                execution_id: row.get("execution_id"),
+                id: row.id,
+                action_type: row.action_type,
+                summary: row.summary,
+                timestamp: row.timestamp.to_rfc3339(),
+                workflow_id: row.workflow_id,
+                execution_id: row.execution_id,
             })
             .collect())
     }
@@ -379,8 +324,6 @@ impl ActorsQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        use sqlx::Row;
-
         // MCP-1189: cap at 1000 even if caller passes a larger value.
         // Negatives / zero clamp up to 1. Canonical `unwrap_or(N)
         // .clamp(1, MAX)` shape used throughout the workspace.
@@ -389,7 +332,9 @@ impl ActorsQueries {
         // RFC 0005 S3: ownership check + the actor's-workflows read in ONE
         // per-user unit of work — both `actors` and `workflows` (the read
         // is `w.user_id = $2`, strictly the user's own) get the RLS
-        // backstop.
+        // backstop. Repo methods execute on the UoW's connection.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
             .await
             .map_err(|e| {
@@ -397,36 +342,25 @@ impl ActorsQueries {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
 
-        let actor_exists: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM actors WHERE id = $1 AND user_id = $2")
-                .bind(actor_id)
-                .bind(user_id)
-                .fetch_optional(uow.conn())
-                .await
-                .map_err(|e| e.extend_safe())?;
+        let actor_exists = actor_repo
+            .actor_owned_by_user_scoped(uow.conn(), actor_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
-        if actor_exists.is_none() {
+        if !actor_exists {
             return Err(async_graphql::Error::new("Actor not found").extend_safe());
         }
 
-        let rows = sqlx::query(
-            r#"SELECT
-                w.id, w.name, w.status, w.graph_json, w.created_at, w.updated_at,
-                COALESCE(
-                    (SELECT COUNT(*) FROM workflow_nodes wn WHERE wn.workflow_id = w.id),
-                    0
-                ) AS node_count
-               FROM workflows w
-               WHERE w.actor_id = $1 AND w.user_id = $2
-               ORDER BY w.updated_at DESC
-               LIMIT $3"#,
-        )
-        .bind(actor_id)
-        .bind(user_id)
-        .bind(limit_val)
-        .fetch_all(uow.conn())
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let rows = workflow_repo
+            .list_workflows_for_actor_scoped(uow.conn(), actor_id, user_id, limit_val)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor workflows read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -435,17 +369,13 @@ impl ActorsQueries {
         Ok(rows
             .into_iter()
             .map(|row| ActorWorkflowItem {
-                id: row.get("id"),
-                name: row.get("name"),
-                status: row.get("status"),
-                node_count: row.get::<i64, _>("node_count"),
-                graph_json: row.get("graph_json"),
-                created_at: row
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339(),
-                updated_at: row
-                    .get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
-                    .to_rfc3339(),
+                id: row.id,
+                name: row.name,
+                status: row.status,
+                node_count: row.node_count,
+                graph_json: row.graph_json,
+                created_at: row.created_at.to_rfc3339(),
+                updated_at: row.updated_at.to_rfc3339(),
             })
             .collect())
     }
@@ -482,12 +412,11 @@ impl ActorsQueries {
         // concurrent dashboard loads. Negatives / zero clamp up to 1.
         let limit_val: i64 = i64::from(limit.unwrap_or(1000).clamp(1, 1000));
 
-        use sqlx::Row as _;
-
         // RFC 0005 S3: ownership check + memory read in ONE per-user unit
         // of work (actors are personal), so the actors ownership read gets
         // the RLS backstop. Commit before the (connection-free) per-row
         // decrypt loop below.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
             .await
             .map_err(|e| {
@@ -496,14 +425,13 @@ impl ActorsQueries {
             })?;
 
         // Verify ownership
-        let owned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2)",
-        )
-        .bind(actor_id)
-        .bind(user_id)
-        .fetch_one(uow.conn())
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let owned = actor_repo
+            .actor_owned_by_user_scoped(uow.conn(), actor_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         if !owned {
             return Err(
@@ -511,25 +439,22 @@ impl ActorsQueries {
             );
         }
 
-        // Phase B: every row carries ciphertext (value_enc + value_key_id);
-        // the legacy plaintext `value` column is dropped. decrypt_row_value
-        // reads value_enc + value_key_id and routes through the registered
-        // crypto hook.
-        let rows = sqlx::query(
-            "SELECT key, value_enc, value_key_id, memory_type, expires_at, updated_at \
-             FROM actor_memory \
-             WHERE actor_id = $1 \
-               AND ($2::text IS NULL OR memory_type = $2) \
-               AND (expires_at IS NULL OR expires_at > NOW()) \
-             ORDER BY memory_type, key ASC \
-             LIMIT $3",
+        // Phase B: every row carries ciphertext (value_enc + value_key_id).
+        // The canonical talos-memory listing projects the MCP-S2 columns
+        // (actor_id, value_format) that AAD-bound decryption requires —
+        // the pre-extraction inline SELECT omitted both, so decrypt failed
+        // loudly ("must project `actor_id`") for every populated actor.
+        let rows = talos_memory::list_memories_with_ciphertext_scoped(
+            uow.conn(),
+            actor_id,
+            memory_type.as_deref(),
+            limit_val,
         )
-        .bind(actor_id)
-        .bind(memory_type.as_deref())
-        .bind(limit_val)
-        .fetch_all(uow.conn())
         .await
-        .map_err(|e| e.extend_safe())?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "graphql: actor memories read failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -537,31 +462,27 @@ impl ActorsQueries {
 
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            let value = talos_memory::decrypt_row_value(r).await.map_err(|e| {
-                // Log the underlying decrypt error server-side. The
-                // chain may include KEK provider URLs, transit-key
-                // names, DEK UUIDs, and aead::Error from AES-GCM
-                // — all server internals that should not cross the
-                // GraphQL boundary. Return a generic safe message.
-                tracing::error!(
-                    actor_id = %actor_id,
-                    "actor_memories: row decrypt failed: {:#}",
-                    e
-                );
-                async_graphql::Error::new("Failed to decrypt actor memory").extend_safe()
-            })?;
+            let value = talos_memory::decrypt_memory_list_row(r)
+                .await
+                .map_err(|e| {
+                    // Log the underlying decrypt error server-side. The
+                    // chain may include KEK provider URLs, transit-key
+                    // names, DEK UUIDs, and aead::Error from AES-GCM
+                    // — all server internals that should not cross the
+                    // GraphQL boundary. Return a generic safe message.
+                    tracing::error!(
+                        actor_id = %actor_id,
+                        "actor_memories: row decrypt failed: {:#}",
+                        e
+                    );
+                    async_graphql::Error::new("Failed to decrypt actor memory").extend_safe()
+                })?;
             out.push(ActorMemoryEntry {
-                key: r.get("key"),
+                key: r.key.clone(),
                 value: value.to_string(),
-                memory_type: r.get("memory_type"),
-                expires_at: r
-                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("expires_at")
-                    .ok()
-                    .flatten()
-                    .map(|d| d.to_rfc3339()),
-                updated_at: r
-                    .get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
-                    .to_rfc3339(),
+                memory_type: r.memory_type.clone(),
+                expires_at: r.expires_at.map(|d| d.to_rfc3339()),
+                updated_at: r.updated_at.to_rfc3339(),
             });
         }
         Ok(out)
@@ -591,28 +512,14 @@ impl ActorsQueries {
         // small (~100 bytes) so 1000 rows = ~100 KiB, bounded.
         let limit_val: i64 = i64::from(limit.unwrap_or(100).clamp(1, 1000));
 
-        #[derive(sqlx::FromRow)]
-        struct McpAgentRow {
-            id: Uuid,
-            name: String,
-            created_at: chrono::DateTime<chrono::Utc>,
-            last_used_at: Option<chrono::DateTime<chrono::Utc>>,
-        }
-
-        let rows = sqlx::query_as::<_, McpAgentRow>(
-            r#"
-            SELECT id, name, created_at, last_connected_at AS last_used_at
-            FROM mcp_agents
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(user_id)
-        .bind(limit_val)
-        .fetch_all(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let system_repo = talos_system_repo::SystemRepository::new(db_pool.clone());
+        let rows = system_repo
+            .list_agents_for_user(*user_id, limit_val)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: mcp agents list failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
         Ok(rows
             .into_iter()

@@ -7252,6 +7252,7 @@ dependencies = [
  "talos-registry",
  "talos-scheduler",
  "talos-secrets-manager",
+ "talos-system-repo",
  "talos-tenancy",
  "talos-text-util",
  "talos-totp-2fa",
@@ -8700,6 +8701,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bcrypt",
+ "chrono",
  "serde_json",
  "sqlx",
  "tokio",
