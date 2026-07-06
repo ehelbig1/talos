@@ -146,9 +146,22 @@ pub fn require_2fa(ctx: &Context<'_>) -> Result<()> {
     // helper itself fail closed so that defect is impossible. Mutations
     // that should NOT require 2FA (none today, by policy) explicitly
     // skip calling `require_2fa` rather than relying on data absence.
+    // The two arms fail closed identically but deserve DIFFERENT messages
+    // (2026-07-06). `IsTwoFactorVerified` is injected only when
+    // authentication SUCCEEDS (API key or valid JWT — see the /graphql
+    // handler in controller main.rs), so the missing-data arm fires for
+    // every unauthenticated request — most commonly an EXPIRED session
+    // driven from curl/scripts, which don't run the frontend's token
+    // refresh. Pre-fix both arms said "Two-Factor Authentication
+    // required", sending expired-session users hunting for a 2FA problem
+    // that doesn't exist. The missing arm now names the real condition
+    // and signposts API keys (the intended lane for non-browser clients);
+    // the `!verified` arm keeps the genuine pre-2FA message.
     let verified = ctx.data::<IsTwoFactorVerified>().map_err(|_| {
         async_graphql::Error::new(
-            "Two-Factor Authentication required. Please verify your identity.",
+            "Authentication required — no valid session or API key on this request \
+             (your session may have expired). Log in again, or use an API key \
+             (X-API-Key header) for scripts and long-lived clients.",
         )
         .extend_safe()
     })?;
@@ -524,6 +537,64 @@ mod tests {
             require_scope(ctx, ApiKeyScope::Admin)?;
             Ok("admin_success".to_string())
         }
+
+        async fn two_fa_gated(&self, ctx: &Context<'_>) -> Result<String> {
+            require_2fa(ctx)?;
+            Ok("2fa_success".to_string())
+        }
+    }
+
+    /// Lock in the two distinct `require_2fa` failure messages (2026-07-06).
+    /// The missing-data arm fires for UNAUTHENTICATED requests (expired
+    /// session, no token) — pre-fix it reused the 2FA message, sending
+    /// expired-session script users hunting for a nonexistent 2FA problem.
+    /// It must name the real condition and signpost API keys; only the
+    /// authenticated-but-unverified arm may mention Two-Factor.
+    #[tokio::test]
+    async fn test_require_2fa_error_messages() {
+        let schema = Schema::build(TestQuery, EmptyMutation, EmptySubscription).finish();
+
+        // Arm 1: no auth data at all (expired session / anonymous request).
+        let res = schema
+            .execute(async_graphql::Request::new("{ twoFaGated }"))
+            .await;
+        assert_eq!(res.errors.len(), 1);
+        let msg = &res.errors[0].message;
+        assert!(
+            msg.contains("Authentication required") && msg.contains("API key"),
+            "missing-data arm must name the real condition and signpost API keys, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Two-Factor"),
+            "missing-data arm must NOT claim a 2FA problem, got: {msg}"
+        );
+
+        // Arm 2: authenticated but pre-2FA (TOTP user not yet verified).
+        let res = schema
+            .execute(
+                async_graphql::Request::new("{ twoFaGated }")
+                    .data(Uuid::new_v4())
+                    .data(IsTwoFactorVerified(false)),
+            )
+            .await;
+        assert_eq!(res.errors.len(), 1);
+        assert!(
+            res.errors[0]
+                .message
+                .contains("Two-Factor Authentication required"),
+            "pre-2FA arm keeps the genuine 2FA message, got: {}",
+            res.errors[0].message
+        );
+
+        // Happy path: verified session passes.
+        let res = schema
+            .execute(
+                async_graphql::Request::new("{ twoFaGated }")
+                    .data(Uuid::new_v4())
+                    .data(IsTwoFactorVerified(true)),
+            )
+            .await;
+        assert!(res.errors.is_empty(), "unexpected errors: {:?}", res.errors);
     }
 
     #[tokio::test]
