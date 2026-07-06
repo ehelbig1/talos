@@ -170,20 +170,32 @@ fn detect_runtime() -> Option<&'static str> {
 /// * `workspace` — The temporary compilation workspace directory (mounted read-write).
 /// * `cargo_registry_cache` — Host-side Cargo registry cache (mounted read-only for speed).
 /// * `wit_dir` — Directory containing the WIT files (mounted read-only).
+/// * `target_cache` — Optional persistent `CARGO_TARGET_DIR` (per-USER — see
+///   `target_cache` module for why it must never be fleet-shared). Mounted
+///   read-write at `/cache/target` with `CARGO_TARGET_DIR` pointed there, so
+///   dependency artifacts survive across compiles instead of rebuilding from
+///   scratch in the throwaway `{workspace}/target`. `None` = legacy behavior.
+///   Steps that don't build (lockfile gen, audit) pass `None`.
 ///
 /// # Fallback
 ///
 /// When `TALOS_COMPILATION_CONTAINER=false` (or neither podman nor docker is
 /// found in a non-production environment), returns a plain `Command::new("cargo")`
-/// that runs directly on the host.
+/// that runs directly on the host (with `CARGO_TARGET_DIR` set to the same
+/// per-user cache when provided, so the host path gets identical reuse).
 pub fn build_command(
     workspace: &Path,
     cargo_registry_cache: &Path,
     wit_dir: &Path,
+    target_cache: Option<&Path>,
 ) -> Result<Command> {
     if !container_enabled() {
         tracing::debug!("Container compilation disabled — using direct cargo");
-        return Ok(Command::new("cargo"));
+        let mut cmd = Command::new("cargo");
+        if let Some(cache) = target_cache {
+            cmd.env("CARGO_TARGET_DIR", cache);
+        }
+        return Ok(cmd);
     }
 
     let runtime = match detect_runtime() {
@@ -236,7 +248,11 @@ pub fn build_command(
                      falling back to direct cargo in non-production mode"
                 );
             }
-            return Ok(Command::new("cargo"));
+            let mut cmd = Command::new("cargo");
+            if let Some(cache) = target_cache {
+                cmd.env("CARGO_TARGET_DIR", cache);
+            }
+            return Ok(cmd);
         }
     };
 
@@ -284,6 +300,15 @@ pub fn build_command(
         registry_abs.display()
     );
     let wit_workspace_mount = format!("{}:/build/wit:ro", wit_abs.display());
+    // Persistent per-user target cache (see `target_cache` module). Mounted
+    // read-write because cargo writes build artifacts into it — the
+    // cross-tenant poisoning risk that rw implies is bounded by the
+    // per-user keying, NOT by anything in this function; callers must only
+    // ever pass a user-scoped path here.
+    let target_cache_mount = target_cache.map(|cache| {
+        let cache_abs = cache.canonicalize().unwrap_or_else(|_| cache.to_path_buf());
+        format!("{}:/cache/target:rw", cache_abs.display())
+    });
 
     let mut cmd = Command::new(runtime);
     cmd.args([
@@ -317,10 +342,14 @@ pub fn build_command(
         &registry_mount,
         "-v",
         &wit_workspace_mount,
+    ]);
+    if let Some(mount) = &target_cache_mount {
+        // Point cargo at the persistent cache instead of /build/target.
+        cmd.args(["-v", mount, "-e", "CARGO_TARGET_DIR=/cache/target"]);
+    }
+    cmd.args([
         // Working directory inside the container
-        "-w",
-        "/build",
-        // Image
+        "-w", "/build", // Image
         &image,
         // The caller will append cargo subcommand args (e.g. "cargo component build ...")
         // but we need "cargo" as the entrypoint command inside the container.
@@ -483,12 +512,44 @@ mod tests {
         let reg = PathBuf::from("/tmp/test-registry");
         let wit = PathBuf::from("/tmp/test-wit");
 
-        let cmd = build_command(&ws, &reg, &wit).unwrap();
+        let cmd = build_command(&ws, &reg, &wit, None).unwrap();
         // When container is disabled, the command should be plain "cargo"
         let program = format!("{:?}", cmd.as_std().get_program());
         assert!(program.contains("cargo"), "Expected cargo, got {}", program);
 
         // Clean up env
+        std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+    }
+
+    #[test]
+    fn direct_cargo_sets_target_dir_when_cache_provided() {
+        let _g = env_lock();
+        std::env::set_var("TALOS_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+
+        let ws = PathBuf::from("/tmp/test-workspace");
+        let reg = PathBuf::from("/tmp/test-registry");
+        let wit = PathBuf::from("/tmp/test-wit");
+        let cache = PathBuf::from("/tmp/test-target-cache/user-a");
+
+        let cmd = build_command(&ws, &reg, &wit, Some(&cache)).unwrap();
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            envs.iter().any(|(k, v)| *k == "CARGO_TARGET_DIR"
+                && v.map(|v| v == cache.as_os_str()).unwrap_or(false)),
+            "direct-cargo path must point CARGO_TARGET_DIR at the per-user cache, got {envs:?}"
+        );
+
+        // Without a cache the env must NOT be set — the legacy behavior
+        // (inherit process env or default to {workspace}/target) stands.
+        let cmd = build_command(&ws, &reg, &wit, None).unwrap();
+        assert!(
+            !cmd.as_std()
+                .get_envs()
+                .any(|(k, _)| k == "CARGO_TARGET_DIR"),
+            "no-cache path must not override CARGO_TARGET_DIR"
+        );
+
         std::env::remove_var("TALOS_COMPILATION_CONTAINER");
     }
 

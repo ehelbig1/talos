@@ -421,7 +421,7 @@ impl super::WorkflowCreationService {
         };
         if let Ok(lint_errors) = self
             .compiler
-            .lint_code(node_id, &wrapped, &lint_world, None)
+            .lint_code(Some(user_id), node_id, &wrapped, &lint_world, None)
             .await
         {
             if !lint_errors.is_empty() {

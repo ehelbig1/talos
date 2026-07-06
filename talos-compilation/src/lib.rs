@@ -14,6 +14,7 @@ pub mod container;
 pub mod dependency_allowlist;
 pub mod js_templates;
 pub mod scaffold;
+mod target_cache;
 
 // Re-export the allowlist gate at the crate root so callers (and the
 // `mcp::utils` re-export shim in controller) can keep importing
@@ -941,7 +942,10 @@ impl CompilationService {
             .wit_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let lockfile_cmd = container::build_command(workspace, &cargo_registry_cache, wit_dir);
+        // No target cache for lockfile generation — it only resolves the
+        // dependency graph, never builds artifacts.
+        let lockfile_cmd =
+            container::build_command(workspace, &cargo_registry_cache, wit_dir, None);
         let lockfile_result = match lockfile_cmd {
             Ok(mut cmd) => {
                 tokio::time::timeout(
@@ -1221,7 +1225,19 @@ impl CompilationService {
         );
         // `wit_dir` was hoisted up above (H-6) for the sandboxed
         // lockfile-gen step; reuse it here.
-        let build_cmd = container::build_command(workspace, &cargo_registry_cache, wit_dir);
+        //
+        // Persistent per-USER target cache (see `target_cache` module):
+        // dependency artifacts survive across this user's compiles, so
+        // repeat compiles only rebuild the user's lib.rs (~2-3 s) instead
+        // of the whole dep graph (~15-30 s). `None` (disabled / cache-dir
+        // failure) falls back to the throwaway `{workspace}/target`.
+        let user_target_cache = target_cache::resolve_for(user_id);
+        let build_cmd = container::build_command(
+            workspace,
+            &cargo_registry_cache,
+            wit_dir,
+            user_target_cache.as_deref(),
+        );
         let output = match build_cmd {
             Ok(mut cmd) => {
                 tokio::time::timeout(
@@ -1325,9 +1341,17 @@ impl CompilationService {
         // use whichever one is valid.  This is robust across cargo-component versions and
         // across CARGO_TARGET_DIR environments.
         let wasm_filename = format!("{}.wasm", package_name.replace("-", "_"));
-        let target_base = std::env::var("CARGO_TARGET_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| workspace.join("target"));
+        // Artifact location precedence mirrors where the build actually
+        // wrote: the per-user target cache when one was in play (in the
+        // container path the stdout line reports the CONTAINER-side
+        // /cache/target/... which doesn't exist host-side, so this base is
+        // what the probe below resolves against), else the legacy
+        // CARGO_TARGET_DIR env / throwaway workspace target.
+        let target_base = user_target_cache.clone().unwrap_or_else(|| {
+            std::env::var("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| workspace.join("target"))
+        });
 
         // Parse "Creating component /path/to/name.wasm" from cargo stdout.
         // The path may be absolute or relative to the compilation workspace.
@@ -1786,6 +1810,19 @@ impl CompilationService {
             }
         }
 
+        // Path to the internal proc-macro crate every generated module
+        // depends on. `/app/talos_sdk_macros` is where BOTH runtime images
+        // (controller + builder) bake it; `TALOS_SDK_MACROS_PATH` overrides
+        // for non-image environments (host-side integration tests, local
+        // `cargo run` of the controller) — mirroring `TALOS_WIT_PATH`. The
+        // value is operator-controlled env, but it lands inside a TOML
+        // string literal, so refuse shapes that would escape it rather
+        // than emit a malformed manifest.
+        let sdk_macros_path = std::env::var("TALOS_SDK_MACROS_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty() && !s.contains('"') && !s.contains('\n'))
+            .unwrap_or_else(|| "/app/talos_sdk_macros".to_string());
+
         // Write Cargo.toml configured for cargo-component
         // SECURITY: Component model provides better isolation than core WASM
         // PERFORMANCE: Optimized release builds with LTO
@@ -1799,7 +1836,7 @@ edition = "2021"
 wit-bindgen-rt = {{ version = "0.44.0", features = ["bitflags"] }}
 serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
-talos_sdk_macros = {{ path = "/app/talos_sdk_macros" }}
+talos_sdk_macros = {{ path = "{sdk_macros_path}" }}
 {}
 [lib]
 crate-type = ["cdylib"]
@@ -2461,6 +2498,7 @@ impl CompilationService {
     /// skips code-gen, linking and Wizer snapshotting. Typically 3-5x faster.
     pub async fn lint_code(
         &self,
+        user_id: Option<Uuid>,
         name: &str,
         source_code: &str,
         world: &str,
@@ -2555,7 +2593,16 @@ impl CompilationService {
             .wit_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let lint_cmd = container::build_command(&workspace, &cargo_registry_cache, wit_dir);
+        // Same per-user target cache as the full compile: `cargo component
+        // check` builds the dependency graph's rmeta, which dominates the
+        // 30 s lint budget when cold. Anonymous callers lint uncached.
+        let lint_target_cache = user_id.and_then(target_cache::resolve_for);
+        let lint_cmd = container::build_command(
+            &workspace,
+            &cargo_registry_cache,
+            wit_dir,
+            lint_target_cache.as_deref(),
+        );
         let output = match lint_cmd {
             Ok(mut cmd) => tokio::time::timeout(
                 std::time::Duration::from_secs(30),

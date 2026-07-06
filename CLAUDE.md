@@ -264,6 +264,19 @@ introduced per-org v4 per table).
   exited with an error". This was the 2026-04-27 prod regression —
   cargo-audit was missing from `controller/Dockerfile` AND the advisory DB
   was missing from `Dockerfile.builder`.
+- **Runtime compiles + lint pre-flights reuse a per-USER persistent
+  `CARGO_TARGET_DIR`** (`/tmp/cargo-target/per-user/{user_id}`; knobs
+  `TALOS_COMPILE_TARGET_CACHE` / `_DIR` / `_TTL_HOURS` — see
+  `talos-compilation/src/target_cache.rs`). Second-and-later compiles only
+  rebuild the user's `lib.rs` (measured 11× on the host path; prod's
+  container path previously rebuilt the whole dep graph every call). The
+  per-USER scoping is a SECURITY invariant, not an optimization detail: the
+  build sandbox mounts the cache read-write and cargo fingerprints are not
+  integrity checks, so a fleet-shared cache would let one tenant poison
+  `.rlib`s that another tenant's build links. Never consolidate it. Idle
+  user dirs sweep after 7 days (opportunistic, rate-limited).
+  `TALOS_SDK_MACROS_PATH` overrides the baked `/app/talos_sdk_macros` for
+  host-side runs (mirrors `TALOS_WIT_PATH`).
 
 ## WASM Module Development Rules (MUST follow)
 - NEVER use top-level `serde_json::Value` to parse upstream payloads. Use typed `#[derive(serde::Deserialize)]` structs — 3-10x cheaper in WASM fuel. The `Value` type allocates a `HashMap<String, Value>` per JSON object; typed structs skip unneeded fields entirely.
