@@ -627,11 +627,7 @@ impl SecurityMutations {
         // post-rotation count of `encryption_keys` rows — monotonically
         // increasing as long as old DEKs aren't pruned, which preserves
         // the operator's perception of "the number went up".
-        let db_pool = ctx.data::<sqlx::PgPool>()?;
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM encryption_keys")
-            .fetch_one(db_pool)
-            .await
-            .unwrap_or(1); // best-effort; the rotation itself already succeeded
+        let count: i64 = secrets_manager.count_encryption_keys().await.unwrap_or(1); // best-effort; the rotation itself already succeeded
 
         info!(
             new_dek_id = %new_dek_id,
@@ -772,50 +768,40 @@ impl SecurityMutations {
             }
         }
 
-        // Runtime query (not the `sqlx::query!` macro) so the
-        // auth_headers_enc_key_id / auth_headers_format columns don't require
-        // regenerating the offline `.sqlx` cache against a live migrated DB.
-        // Same bare-pool pattern as rotateEncryptionKey's count query above;
-        // user_audit_settings is keyed by user_id and is not an org-pinned RLS
-        // table, so no tenant-scoped tx is required.
-        sqlx::query(
-            r#"
-            INSERT INTO user_audit_settings (
-                user_id, streaming_enabled, otlp_endpoint, otlp_protocol,
-                auth_headers_encrypted,
-                auth_headers_enc_key_id, auth_headers_format, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-            ON CONFLICT (user_id) DO UPDATE SET
-                streaming_enabled = EXCLUDED.streaming_enabled,
-                otlp_endpoint = EXCLUDED.otlp_endpoint,
-                otlp_protocol = EXCLUDED.otlp_protocol,
-                auth_headers_encrypted = EXCLUDED.auth_headers_encrypted,
-                auth_headers_enc_key_id = EXCLUDED.auth_headers_enc_key_id,
-                auth_headers_format = EXCLUDED.auth_headers_format,
-                updated_at = NOW()
-            "#,
+        // Bare-pool write preserved through the pool-taking helper —
+        // user_audit_settings is keyed by user_id and is not an org-pinned
+        // RLS table, so no tenant-scoped tx is required. Validation (SSRF
+        // gate) and header encryption happened above; the helper only
+        // persists the pre-sealed envelope triple.
+        talos_audit_ledger::upsert_user_audit_settings(
+            db_pool,
+            talos_audit_ledger::UserAuditSettingsUpsert {
+                user_id: *user_id,
+                streaming_enabled,
+                otlp_endpoint,
+                otlp_protocol,
+                auth_headers_encrypted: encrypted_headers,
+                auth_headers_enc_key_id: headers_enc_key_id,
+                auth_headers_format: headers_format,
+            },
         )
-        .bind(*user_id)
-        .bind(streaming_enabled)
-        .bind(otlp_endpoint)
-        .bind(otlp_protocol)
-        .bind(encrypted_headers)
-        .bind(headers_enc_key_id)
-        .bind(headers_format)
-        .execute(db_pool)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to update audit settings: {}", e);
+            async_graphql::Error::new("Failed to update audit settings").extend_safe()
+        })?;
 
-        let row = sqlx::query!(
-            r#"
-            SELECT streaming_enabled, otlp_endpoint, otlp_protocol, created_at, updated_at
-            FROM user_audit_settings
-            WHERE user_id = $1
-            "#,
-            user_id
-        )
-        .fetch_one(db_pool)
-        .await?;
+        let row = talos_audit_ledger::get_user_audit_settings(db_pool, *user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to read back audit settings: {}", e);
+                async_graphql::Error::new("Failed to read back audit settings").extend_safe()
+            })?
+            .ok_or_else(|| {
+                // The upsert above just wrote this row; absence is exceptional.
+                tracing::error!(user_id = %user_id, "audit settings row missing after upsert");
+                async_graphql::Error::new("Failed to read back audit settings").extend_safe()
+            })?;
 
         Ok(UserAuditSettings {
             streaming_enabled: row.streaming_enabled,

@@ -25,6 +25,39 @@ pub struct WebhookListRow {
     pub event_filter: Option<serde_json::Value>,
 }
 
+/// Stats-bearing webhook row for the GraphQL `webhook_triggers` listing
+/// (fire counters + last-fired, no created_at). Counter columns are nullable
+/// in the schema (DEFAULT 0 from 001) — COALESCEd in the query.
+#[derive(Debug, sqlx::FromRow)]
+pub struct WebhookTriggerStatsRow {
+    pub id: Uuid,
+    pub name: String,
+    pub module_id: Option<Uuid>,
+    pub enabled: bool,
+    pub max_requests_per_minute: i32,
+    pub trigger_count: i32,
+    pub success_count: i32,
+    pub error_count: i32,
+    pub last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub event_filter: Option<serde_json::Value>,
+}
+
+/// Webhook DLQ entry, owner-scoped through the trigger JOIN. `source_ip` /
+/// `headers` / `payload` arrive pre-cast to text (INET/JSONB columns); the
+/// payload/headers were DLP-scrubbed before storage.
+#[derive(Debug, sqlx::FromRow)]
+pub struct WebhookDlqRow {
+    pub id: Uuid,
+    pub trigger_id: Option<Uuid>,
+    pub source_ip: Option<String>,
+    pub drop_reason: String,
+    pub headers: Option<String>,
+    pub payload: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub replayed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub replayed_by: Option<Uuid>,
+}
+
 /// 24-hour security stats per webhook trigger. Used by
 /// `get_webhook_security_stats`.
 #[derive(Debug)]
@@ -194,6 +227,53 @@ impl WebhookRepository {
         .fetch_all(&self.db_pool)
         .await?;
         Ok(rows.iter().map(row_to_webhook).collect())
+    }
+
+    /// Paginated stats listing for the GraphQL `webhook_triggers` query.
+    /// User-scoped by predicate; unique `id DESC` tiebreaker keeps OFFSET
+    /// pages stable.
+    pub async fn list_for_user_with_stats(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WebhookTriggerStatsRow>> {
+        let rows = sqlx::query_as::<_, WebhookTriggerStatsRow>(
+            "SELECT id, name, module_id, enabled, max_requests_per_minute, \
+                    COALESCE(trigger_count, 0) AS trigger_count, \
+                    COALESCE(success_count, 0) AS success_count, \
+                    COALESCE(error_count, 0) AS error_count, \
+                    last_triggered_at, event_filter \
+             FROM webhook_triggers WHERE user_id = $1 \
+             ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Webhook DLQ entries for a user's triggers, newest first. Ownership is
+    /// enforced by the JOIN on `webhook_triggers.user_id` (webhook_dlq has no
+    /// user column of its own).
+    pub async fn list_dlq_for_user(&self, user_id: Uuid, limit: i64) -> Result<Vec<WebhookDlqRow>> {
+        let rows = sqlx::query_as::<_, WebhookDlqRow>(
+            "SELECT d.id, d.trigger_id, d.source_ip::text AS source_ip, d.drop_reason, \
+                    d.headers::text AS headers, d.payload::text AS payload, d.created_at, \
+                    d.replayed_at, d.replayed_by \
+             FROM webhook_dlq d \
+             JOIN webhook_triggers t ON t.id = d.trigger_id \
+             WHERE t.user_id = $1 \
+             ORDER BY d.created_at DESC \
+             LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Delete a webhook scoped to user. Returns rows affected (0 = not

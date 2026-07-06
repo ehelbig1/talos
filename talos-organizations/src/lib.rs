@@ -230,6 +230,35 @@ impl OrganizationService {
         .context("Failed to list user organizations")
     }
 
+    /// Ids of every org the user is a member of (any role). Lightweight
+    /// id-only variant of `list_user_orgs` for permission filters and
+    /// read-path scoping predicates.
+    pub async fn list_user_org_ids(db: &Pool<Postgres>, user_id: Uuid) -> Result<Vec<Uuid>> {
+        sqlx::query_scalar("SELECT org_id FROM organization_members WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_all(db)
+            .await
+            .context("Failed to list user org memberships")
+    }
+
+    /// Ids of the orgs where the user holds **at least Member role**
+    /// (member/admin/owner — Viewer excluded). Use for WRITE-path scoping
+    /// predicates on org-shared resources; the role filter runs at the DB
+    /// layer so a Viewer's orgs never enter a write predicate.
+    pub async fn list_user_writable_org_ids(
+        db: &Pool<Postgres>,
+        user_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        sqlx::query_scalar(
+            "SELECT org_id FROM organization_members \
+             WHERE user_id = $1 AND role IN ('member', 'admin', 'owner')",
+        )
+        .bind(user_id)
+        .fetch_all(db)
+        .await
+        .context("Failed to list user writable org memberships")
+    }
+
     // ── Membership ─────────────────────────────────────────────────────
 
     /// Add a member to an organization. The inviter must have at least Admin role.

@@ -7256,6 +7256,7 @@ dependencies = [
  "talos-text-util",
  "talos-totp-2fa",
  "talos-validation",
+ "talos-webhook-repository",
  "talos-webhooks",
  "talos-workflow-authorization",
  "talos-workflow-creation",

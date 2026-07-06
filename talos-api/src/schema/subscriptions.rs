@@ -67,17 +67,8 @@ impl SubscriptionRoot {
         crate::access_check::authorize_execution_subscription(db_pool, execution_id, *user_id)
             .await?;
 
-        // Fetch historical events from database for replay
-        #[derive(sqlx::FromRow)]
-        struct EventRow {
-            node_id: Option<Uuid>,
-            status: String,
-            log_message: Option<String>,
-            iteration_index: Option<i32>,
-            iteration_total: Option<i32>,
-            duration_ms: Option<i64>,
-        }
-
+        // Fetch historical events from database for replay.
+        //
         // MCP-954 (2026-05-15): cap historical-event replay. Pre-fix
         // the SELECT had no LIMIT — for a long-running execution that
         // accumulates thousands of events (loops, iterations, batch-
@@ -95,33 +86,18 @@ impl SubscriptionRoot {
         // replay window. The cap is loose enough (1000) that normal
         // executions are unaffected.
         const EXECUTION_REPLAY_LIMIT: i64 = 1000;
-        let mut historical_events: Vec<EventRow> = sqlx::query_as(
-            r#"
-            SELECT
-                node_id,
-                status,
-                log_message,
-                iteration_index,
-                iteration_total,
-                duration_ms
-            FROM execution_events
-            WHERE execution_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(execution_id)
-        .bind(EXECUTION_REPLAY_LIMIT)
-        .fetch_all(db_pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to fetch events: {}", e);
-            // MCP-1048: .extend_safe() so the message survives the
-            // production scrubber whitelist (does not contain
-            // Authentication / Access denied / Not found / Invalid /
-            // Validation / Unauthorized substrings).
-            async_graphql::Error::new("Failed to fetch events").extend_safe()
-        })?;
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
+        let mut historical_events = exec_repo
+            .list_recent_execution_events(execution_id, EXECUTION_REPLAY_LIMIT)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to fetch events: {}", e);
+                // MCP-1048: .extend_safe() so the message survives the
+                // production scrubber whitelist (does not contain
+                // Authentication / Access denied / Not found / Invalid /
+                // Validation / Unauthorized substrings).
+                async_graphql::Error::new("Failed to fetch events").extend_safe()
+            })?;
         historical_events.reverse();
 
         // Convert database rows to ExecutionEvent structs
@@ -350,9 +326,7 @@ impl SubscriptionRoot {
             // Admins bypass the filter entirely; no need to load.
             Vec::new()
         } else {
-            sqlx::query_scalar("SELECT org_id FROM organization_members WHERE user_id = $1")
-                .bind(user_id)
-                .fetch_all(&db_pool)
+            talos_organizations::OrganizationService::list_user_org_ids(&db_pool, user_id)
                 .await
                 .map_err(|e| {
                     tracing::error!("dlq_updates org membership lookup failed: {}", e);
@@ -427,11 +401,9 @@ impl SubscriptionRoot {
                                     // a re-fetch.
                                     accessible_org_ids = Vec::new();
                                 } else {
-                                    match sqlx::query_scalar::<_, Uuid>(
-                                        "SELECT org_id FROM organization_members WHERE user_id = $1",
+                                    match talos_organizations::OrganizationService::list_user_org_ids(
+                                        &db_pool, user_id,
                                     )
-                                    .bind(user_id)
-                                    .fetch_all(&db_pool)
                                     .await
                                     {
                                         Ok(new_ids) => accessible_org_ids = new_ids,
