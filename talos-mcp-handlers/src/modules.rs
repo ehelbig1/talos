@@ -445,6 +445,17 @@ async fn handle_list_templates(
             serde_json::json!({
                 "id": t.id, "name": t.name, "category": t.category,
                 "description": t.description,
+                // Requirements surfaced so an agent picking a template sees,
+                // BEFORE installing, the minimum actor capability ceiling
+                // (`capability_world`), the vault secret paths to grant
+                // (`requires_secrets`), and whether a module built from it
+                // pauses for human approval (`requires_approval_for`) —
+                // instead of discovering these via a ceiling-denial /
+                // secret-resolution failure / unexpected suspension at run
+                // time. Mirrors the GraphQL NodeTemplate fields.
+                "capability_world": t.capability_world,
+                "requires_secrets": t.allowed_secrets,
+                "requires_approval_for": t.requires_approval_for,
             })
         })
         .collect();
