@@ -70,19 +70,18 @@ impl ActorsMutations {
         // connection timeout / query bug / FK violation is
         // distinguishable from a missing-row hit on the operator
         // side. User-facing message stays generic.
-        let role_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM agent_roles WHERE name = $1")
-                .bind(&role_name)
-                .fetch_optional(&db_pool)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        role_name = %role_name,
-                        error = %e,
-                        "register_mcp_agent: agent_roles lookup failed"
-                    );
-                    async_graphql::Error::new("Database error").extend_safe()
-                })?;
+        let system_repo = talos_system_repo::SystemRepository::new(db_pool.clone());
+        let role_id = system_repo
+            .find_role_id_by_name(&role_name)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    role_name = %role_name,
+                    error = %e,
+                    "register_mcp_agent: agent_roles lookup failed"
+                );
+                async_graphql::Error::new("Database error").extend_safe()
+            })?;
 
         let role_id = role_id.ok_or_else(|| {
             // MCP-1048: .extend_safe() + bounded_preview on role_name.
@@ -131,38 +130,36 @@ impl ActorsMutations {
         );
 
         let agent_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO mcp_agents (id, name, role_id, token_hash, token_lookup_hash, user_id) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(agent_id)
-        .bind(&name)
-        .bind(role_id)
-        .bind(&bcrypt_hash)
-        .bind(&lookup_hash)
-        .bind(*user_id)
-        .execute(&db_pool)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("mcp_agents_name_key") {
-                // MCP-1200 (2026-05-17): .extend_safe() added so the
-                // duplicate-name message survives the production
-                // scrubber. Pre-fix the Error::new on this line lacked
-                // .extend_safe() AND the sibling else-branch on the
-                // next call DID have it — the existing lint check 14
-                // saw the sibling's .extend_safe() in its 8-line
-                // lookahead and treated both as covered (blind spot).
-                // The message had no whitelist-substring match either
-                // ("already exists" not in the canonical list) so the
-                // scrubber replaced it with "Internal server error",
-                // leaving operators with no actionable signal.
-                async_graphql::Error::new(format!("Agent name '{}' already exists", name))
-                    .extend_safe()
-            } else {
-                tracing::error!("Failed to register MCP agent: {}", e);
-                async_graphql::Error::new("Failed to register agent").extend_safe()
-            }
-        })?;
+        system_repo
+            .register_agent(
+                agent_id,
+                &name,
+                role_id,
+                &bcrypt_hash,
+                &lookup_hash,
+                *user_id,
+            )
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("mcp_agents_name_key") {
+                    // MCP-1200 (2026-05-17): .extend_safe() added so the
+                    // duplicate-name message survives the production
+                    // scrubber. Pre-fix the Error::new on this line lacked
+                    // .extend_safe() AND the sibling else-branch on the
+                    // next call DID have it — the existing lint check 14
+                    // saw the sibling's .extend_safe() in its 8-line
+                    // lookahead and treated both as covered (blind spot).
+                    // The message had no whitelist-substring match either
+                    // ("already exists" not in the canonical list) so the
+                    // scrubber replaced it with "Internal server error",
+                    // leaving operators with no actionable signal.
+                    async_graphql::Error::new(format!("Agent name '{}' already exists", name))
+                        .extend_safe()
+                } else {
+                    tracing::error!("Failed to register MCP agent: {}", e);
+                    async_graphql::Error::new("Failed to register agent").extend_safe()
+                }
+            })?;
 
         tracing::info!(
             agent_id = %agent_id,
@@ -322,21 +319,21 @@ impl ActorsMutations {
                     tracing::error!(error = %e, "graphql: tenant scope error");
                     async_graphql::Error::new("Request scope error").extend_safe()
                 })?;
-        sqlx::query(
-            "INSERT INTO actors (id, user_id, name, description, max_capability_world, status) \
-             VALUES ($1, $2, $3, $4, $5, 'active')",
-        )
-        .bind(actor_id)
-        .bind(user_id)
-        .bind(&name)
-        .bind(&description)
-        .bind(&max_world)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to create actor: {}", e);
-            async_graphql::Error::new("Failed to create actor").extend_safe()
-        })?;
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        actor_repo
+            .insert_actor_scoped(
+                &mut tx,
+                actor_id,
+                user_id,
+                &name,
+                description.as_deref(),
+                &max_world,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create actor: {}", e);
+                async_graphql::Error::new("Failed to create actor").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -402,26 +399,20 @@ impl ActorsMutations {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let result = sqlx::query(
-            "UPDATE actors SET status = $1, updated_at = now() \
-             WHERE id = $2 AND user_id = $3 \
-             AND status NOT IN ('archived', 'terminated')",
-        )
-        .bind(&status)
-        .bind(id)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to update actor status: {}", e);
-            async_graphql::Error::new("Failed to update actor status").extend_safe()
-        })?;
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let rows_affected = actor_repo
+            .update_actor_status_scoped(&mut tx, id, user_id, &status)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to update actor status: {}", e);
+                async_graphql::Error::new("Failed to update actor status").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             // rows_affected = 0 collapses three cases into one
             // user-facing message:
             //   * actor doesn't exist
@@ -480,23 +471,20 @@ impl ActorsMutations {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let result = sqlx::query(
-            "UPDATE actors SET status = 'terminated', updated_at = now() WHERE id = $1 AND user_id = $2",
-        )
-        .bind(id)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to terminate actor: {}", e);
-            async_graphql::Error::new("Failed to terminate actor").extend_safe()
-        })?;
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let rows_affected = actor_repo
+            .terminate_actor_scoped(&mut tx, id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to terminate actor: {}", e);
+                async_graphql::Error::new("Failed to terminate actor").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             return Err(
                 async_graphql::Error::new("Actor not found or access denied").extend_safe(),
             );
@@ -522,20 +510,16 @@ impl ActorsMutations {
             // backstops it — only the caller's own workflows for this actor
             // are archived. begin/commit failures fold into the existing
             // cleanup_failed path (the actor is already terminated above).
-            let archive_res: Result<Option<i64>, sqlx::Error> = async {
+            // The repo method executes on the tx we pass
+            // (`archive_workflows_for_actor_scoped`).
+            let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+            let archive_res: anyhow::Result<Option<i64>> = async {
                 let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
                     .await
-                    .map_err(|e| sqlx::Error::Protocol(format!("tenant scope: {e}")))?;
-                let n = sqlx::query_scalar::<_, i64>(
-                    "WITH updated AS (
-                        UPDATE workflows SET status = 'archived', updated_at = now()
-                        WHERE actor_id = $1 AND (status IS NULL OR status != 'archived')
-                        RETURNING 1
-                     ) SELECT COUNT(*) FROM updated",
-                )
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
+                    .map_err(|e| anyhow::anyhow!("tenant scope: {e}"))?;
+                let n = workflow_repo
+                    .archive_workflows_for_actor_scoped(&mut tx, id)
+                    .await?;
                 tx.commit().await?;
                 Ok(n)
             }
@@ -678,49 +662,27 @@ impl ActorsMutations {
             }
         }
 
-        let mut set_parts: Vec<String> = vec!["updated_at = NOW()".to_string()];
-        let mut param_count = 0usize;
-        if name.is_some() {
-            param_count += 1;
-            set_parts.push(format!("name = ${}", param_count));
-        }
-        if description.is_some() {
-            param_count += 1;
-            set_parts.push(format!("description = ${}", param_count));
-        }
-        if max_capability_world.is_some() {
-            param_count += 1;
-            set_parts.push(format!("max_capability_world = ${}", param_count));
-        }
-        let sql = format!(
-            "UPDATE actors SET {} WHERE id = ${} AND user_id = ${}",
-            set_parts.join(", "),
-            param_count + 1,
-            param_count + 2,
-        );
-
         // RFC 0005 S3: per-user scoped tx → actors RLS backstops the
-        // UPDATE (see update_actor_status).
+        // UPDATE (see update_actor_status). The dynamic SET builder lives
+        // in `ActorRepository::update_actor_fields_scoped`; the repo
+        // method executes on the tx we pass and returns raw errors so the
+        // unique-name detection below still sees the Postgres message.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let mut q = sqlx::query(&sql);
-        if let Some(ref n) = name {
-            q = q.bind(n.trim());
-        }
-        if let Some(ref d) = description {
-            q = q.bind(d.as_str());
-        }
-        if let Some(ref w) = max_capability_world {
-            q = q.bind(w.as_str());
-        }
-        let result = q
-            .bind(id)
-            .bind(user_id)
-            .execute(&mut *tx)
+        let rows_affected = actor_repo
+            .update_actor_fields_scoped(
+                &mut tx,
+                id,
+                user_id,
+                name.as_deref(),
+                description.as_deref(),
+                max_capability_world.as_deref(),
+            )
             .await
             .map_err(|e| {
                 if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
@@ -739,7 +701,7 @@ impl ActorsMutations {
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             return Err(
                 async_graphql::Error::new("Actor not found or access denied").extend_safe(),
             );
@@ -790,21 +752,22 @@ impl ActorsMutations {
 
         // Validate actor ownership — RFC 0005 S3: on a per-user scoped tx
         // so the actors RLS policy backstops the check (the memory write
-        // itself goes through talos_memory).
+        // itself goes through talos_memory). Repo method executes on the
+        // tx we pass.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let owned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2 AND status != 'terminated')",
-        )
-        .bind(input.actor_id)
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let owned = actor_repo
+            .actor_owned_active_scoped(&mut tx, input.actor_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -932,21 +895,22 @@ impl ActorsMutations {
             .map_err(|msg| async_graphql::Error::new(msg).extend_safe())?;
 
         // Verify ownership before deleting — RFC 0005 S3: per-user scoped
-        // tx so the actors RLS policy backstops the check.
+        // tx so the actors RLS policy backstops the check. Repo method
+        // executes on the tx we pass.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let mut tx = talos_db::begin_user_scoped(db_pool, user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: tenant scope error");
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
-        let owned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2)",
-        )
-        .bind(actor_id)
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let owned = actor_repo
+            .actor_owned_by_user_scoped(&mut tx, actor_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -984,7 +948,6 @@ impl ActorsMutations {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
 
         let db_pool = ctx.data::<sqlx::PgPool>()?;
-        use sqlx::Row as _;
 
         // RFC 0006 / RFC 0005 S3: the source-actor ownership read + the
         // clone INSERT share one tx scoped to the owner's personal org.
@@ -1010,23 +973,23 @@ impl ActorsMutations {
                     async_graphql::Error::new("Request scope error").extend_safe()
                 })?;
 
-        // Fetch source actor (ownership check)
-        let src = sqlx::query(
-            "SELECT name, description, max_capability_world FROM actors \
-             WHERE id = $1 AND user_id = $2 AND status != 'terminated'",
-        )
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| e.extend_safe())?
-        .ok_or_else(|| {
-            async_graphql::Error::new("Actor not found or access denied").extend_safe()
-        })?;
+        // Fetch source actor (ownership check) — repo method executes on
+        // the org-scoped tx we pass.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let src = actor_repo
+            .get_actor_clone_source_scoped(&mut tx, id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: clone source read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?
+            .ok_or_else(|| {
+                async_graphql::Error::new("Actor not found or access denied").extend_safe()
+            })?;
 
-        let src_name: String = src.get("name");
-        let src_description: Option<String> = src.get("description");
-        let src_world: Option<String> = src.get("max_capability_world");
+        let src_name: String = src.name;
+        let src_description: Option<String> = src.description;
+        let src_world: Option<String> = src.max_capability_world;
 
         let clone_name = name
             .filter(|n| !n.trim().is_empty())
@@ -1038,21 +1001,20 @@ impl ActorsMutations {
         let new_id = uuid::Uuid::new_v4();
         let world = src_world.as_deref().unwrap_or("minimal-node");
 
-        sqlx::query(
-            "INSERT INTO actors (id, user_id, name, description, max_capability_world, status) \
-             VALUES ($1, $2, $3, $4, $5, 'active')",
-        )
-        .bind(new_id)
-        .bind(user_id)
-        .bind(&clone_name)
-        .bind(&src_description)
-        .bind(world)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("clone_actor insert failed: {}", e);
-            async_graphql::Error::new("Failed to clone actor").extend_safe()
-        })?;
+        actor_repo
+            .insert_actor_scoped(
+                &mut tx,
+                new_id,
+                user_id,
+                &clone_name,
+                src_description.as_deref(),
+                world,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("clone_actor insert failed: {}", e);
+                async_graphql::Error::new("Failed to clone actor").extend_safe()
+            })?;
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -1153,16 +1115,16 @@ impl ActorsMutations {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        let result = sqlx::query!(
-            "DELETE FROM mcp_agents WHERE id = $1 AND user_id = $2",
-            id,
-            user_id
-        )
-        .execute(db_pool)
-        .await
-        .map_err(|e| e.extend_safe())?;
+        let system_repo = talos_system_repo::SystemRepository::new(db_pool.clone());
+        let rows_affected = system_repo
+            .delete_agent_for_user(id, *user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: mcp agent delete failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             return Err(
                 async_graphql::Error::new("Agent not found or access denied").extend_safe(),
             );

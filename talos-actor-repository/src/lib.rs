@@ -123,6 +123,76 @@ pub struct ApprovalPolicyRow {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Actor listing row (with workflow/execution counts) returned by
+/// `list_actor_summaries_scoped`. Distinct from `ActorSummaryRow`
+/// (the MCP `list_actors` shape) — this is the GraphQL `actors` query
+/// projection with per-actor execution counts and `updated_at`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ActorSummaryWithCountsRow {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub max_capability_world: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub workflow_count: i64,
+    pub execution_count: i64,
+}
+
+/// Actor detail row returned by `get_actor_details_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ActorDetailsRow {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub max_capability_world: String,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub workflow_count: i64,
+    pub execution_count: i64,
+    pub last_active_at: Option<DateTime<Utc>>,
+}
+
+/// Per-actor execution status counts returned by
+/// `get_actor_execution_counts_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ActorExecutionCountsRow {
+    pub total: i64,
+    pub successful: i64,
+    pub failed: i64,
+    pub active: i64,
+}
+
+/// Per-actor workflow counts returned by `get_actor_workflow_counts_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ActorWorkflowCountsRow {
+    pub total: i64,
+    pub active: i64,
+}
+
+/// Clone-source row returned by `get_actor_clone_source_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ActorCloneSourceRow {
+    pub name: String,
+    pub description: Option<String>,
+    pub max_capability_world: Option<String>,
+}
+
+/// Action-log listing row (no `details` payload) returned by
+/// `list_action_log_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ActionLogSummaryRow {
+    pub id: Uuid,
+    pub action_type: String,
+    pub summary: String,
+    pub timestamp: DateTime<Utc>,
+    pub workflow_id: Option<Uuid>,
+    pub execution_id: Option<Uuid>,
+}
+
 /// Action log entry returned by `get_actor_action_log`.
 #[derive(Debug)]
 pub struct ActionLogEntry {
@@ -1238,6 +1308,324 @@ impl ActorRepository {
         .execute(&self.db_pool)
         .await?;
         Ok(())
+    }
+
+    // ── Scoped read surface (GraphQL actors resolvers) ────────────────────
+    //
+    // The methods below take the caller's `&mut PgConnection` instead of
+    // routing through `self.db_pool`: the GraphQL resolvers run them on a
+    // tenant-scoped tx / UnitOfWork (RFC 0004/0005) so the actors /
+    // workflows / workflow_executions RLS policies backstop the app-layer
+    // predicates. Do NOT add pool-routing variants for those paths — that
+    // would silently drop the RLS backstop.
+
+    /// Actor list for a user with workflow/execution counts, newest first.
+    /// Run on a tenant-read-scoped tx (real org ids keep the RLS-enabled
+    /// COUNT subqueries counting teammates' executions on org-shared
+    /// workflows).
+    pub async fn list_actor_summaries_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        user_id: Uuid,
+    ) -> Result<Vec<ActorSummaryWithCountsRow>> {
+        let rows = sqlx::query_as::<_, ActorSummaryWithCountsRow>(
+            r#"SELECT
+                a.id, a.name, a.description, a.status, a.max_capability_world,
+                a.created_at, a.updated_at,
+                (SELECT COUNT(*) FROM workflows w WHERE w.actor_id = a.id) as workflow_count,
+                (SELECT COUNT(*) FROM workflow_executions we
+                 JOIN workflows w ON w.id = we.workflow_id
+                 WHERE w.actor_id = a.id) as execution_count
+             FROM actors a
+             WHERE a.user_id = $1
+             ORDER BY a.created_at DESC"#,
+        )
+        .bind(user_id)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Single-actor detail (ownership-gated) with counts + last-active.
+    /// Same tenant-read-scoped executor contract as
+    /// `list_actor_summaries_scoped`.
+    pub async fn get_actor_details_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<ActorDetailsRow>> {
+        let row = sqlx::query_as::<_, ActorDetailsRow>(
+            r#"SELECT
+                a.id, a.name, a.description, a.status, a.max_capability_world, a.metadata,
+                a.created_at, a.updated_at,
+                (SELECT COUNT(*) FROM workflows w WHERE w.actor_id = a.id) as workflow_count,
+                (SELECT COUNT(*) FROM workflow_executions we
+                 WHERE we.actor_id = a.id) as execution_count,
+                (SELECT MAX(we.started_at) FROM workflow_executions we
+                 WHERE we.actor_id = a.id) as last_active_at
+             FROM actors a
+             WHERE a.id = $1 AND a.user_id = $2"#,
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .fetch_optional(conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// True if the actor exists and belongs to `user_id`. Runs on the
+    /// caller's scoped connection so the actors RLS policy backstops the
+    /// ownership predicate within the same snapshot as the read it gates.
+    pub async fn actor_owned_by_user_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2)",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .fetch_one(conn)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Execution status counts for an actor (`workflow_executions` RLS
+    /// backstops via the caller's scoped connection).
+    pub async fn get_actor_execution_counts_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+    ) -> Result<ActorExecutionCountsRow> {
+        let row = sqlx::query_as::<_, ActorExecutionCountsRow>(
+            "SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE status = 'completed') AS successful,
+                COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                COUNT(*) FILTER (WHERE status IN ('pending', 'running')) AS active
+             FROM workflow_executions WHERE actor_id = $1",
+        )
+        .bind(actor_id)
+        .fetch_one(conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// Workflow counts for an actor (`workflows` RLS backstops via the
+    /// caller's scoped connection).
+    pub async fn get_actor_workflow_counts_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+    ) -> Result<ActorWorkflowCountsRow> {
+        let row = sqlx::query_as::<_, ActorWorkflowCountsRow>(
+            "SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE status != 'archived' OR status IS NULL) AS active
+             FROM workflows WHERE actor_id = $1",
+        )
+        .bind(actor_id)
+        .fetch_one(conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// Newest-first action-log page (no `details` payload — the GraphQL
+    /// listing shape). Runs on the caller's scoped connection, sharing the
+    /// snapshot with the ownership check that gates it.
+    pub async fn list_action_log_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ActionLogSummaryRow>> {
+        let rows = sqlx::query_as::<_, ActionLogSummaryRow>(
+            r#"SELECT id, action_type, summary, timestamp, workflow_id, execution_id
+               FROM actor_action_log
+               WHERE actor_id = $1
+               ORDER BY timestamp DESC
+               LIMIT $2"#,
+        )
+        .bind(actor_id)
+        .bind(limit)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Insert a new actor row (status 'active'). Takes the caller's
+    /// connection: actors are ORG-pinned (RFC 0006 — the RLS WITH CHECK
+    /// keys on `org_id = app.current_org_id`), so the GraphQL create /
+    /// clone mutations run this on a `begin_org_scoped` tx opened for the
+    /// owner's personal org. Do NOT route through `self.db_pool`; a
+    /// bare-pool create only passes the org pin via its rollout-safe
+    /// `unset → permit` clause (i.e. silently un-enforced — check 42).
+    ///
+    /// Errors are returned WITHOUT added context so callers can inspect
+    /// the raw Postgres message (unique-violation detection).
+    pub async fn insert_actor_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+        name: &str,
+        description: Option<&str>,
+        max_capability_world: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO actors (id, user_id, name, description, max_capability_world, status) \
+             VALUES ($1, $2, $3, $4, $5, 'active')",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .bind(name)
+        .bind(description)
+        .bind(max_capability_world)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Set an actor's status (ownership-gated), refusing terminal-state
+    /// rows — the `status NOT IN ('archived','terminated')` guard makes
+    /// the IRREVERSIBLE contract on terminate/archive unconditional
+    /// (MCP-645/647). Takes the caller's connection (per-user scoped tx;
+    /// RFC 0005 S3 — USING doubles as WITH CHECK). Returns rows affected
+    /// (0 = missing / not owned / terminal).
+    pub async fn update_actor_status_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+        status: &str,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE actors SET status = $1, updated_at = now() \
+             WHERE id = $2 AND user_id = $3 \
+             AND status NOT IN ('archived', 'terminated')",
+        )
+        .bind(status)
+        .bind(actor_id)
+        .bind(user_id)
+        .execute(conn)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Mark an actor terminated (ownership-gated, no terminal guard —
+    /// terminating a terminated actor is a no-op rewrite of the same
+    /// state). Takes the caller's connection (per-user scoped tx).
+    /// Returns rows affected.
+    pub async fn terminate_actor_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE actors SET status = 'terminated', updated_at = now() \
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .execute(conn)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Partial-update an actor's name / description / capability world
+    /// (ownership-gated). At least one field must be Some — callers
+    /// validate that upstream. Takes the caller's connection (per-user
+    /// scoped tx). Returns rows affected.
+    ///
+    /// Errors are returned WITHOUT added context so callers can inspect
+    /// the raw Postgres message (unique/duplicate-name detection).
+    pub async fn update_actor_fields_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+        max_capability_world: Option<&str>,
+    ) -> Result<u64> {
+        // Dynamic SET clause; param_count tracks bound parameters
+        // separately from set_parts because "updated_at = NOW()" has no
+        // bind (same shape as WorkflowRepository::update_workflow_metadata).
+        let mut set_parts: Vec<String> = vec!["updated_at = NOW()".to_string()];
+        let mut param_count = 0usize;
+        if name.is_some() {
+            param_count += 1;
+            set_parts.push(format!("name = ${}", param_count));
+        }
+        if description.is_some() {
+            param_count += 1;
+            set_parts.push(format!("description = ${}", param_count));
+        }
+        if max_capability_world.is_some() {
+            param_count += 1;
+            set_parts.push(format!("max_capability_world = ${}", param_count));
+        }
+        let sql = format!(
+            "UPDATE actors SET {} WHERE id = ${} AND user_id = ${}",
+            set_parts.join(", "),
+            param_count + 1,
+            param_count + 2,
+        );
+        let mut q = sqlx::query(&sql);
+        if let Some(n) = name {
+            q = q.bind(n.trim());
+        }
+        if let Some(d) = description {
+            q = q.bind(d);
+        }
+        if let Some(w) = max_capability_world {
+            q = q.bind(w);
+        }
+        let result = q.bind(actor_id).bind(user_id).execute(conn).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// True if the actor exists, belongs to `user_id`, AND is not
+    /// terminated. Ownership gate for writes that must refuse terminated
+    /// actors (e.g. memory writes). Takes the caller's scoped connection.
+    pub async fn actor_owned_active_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND user_id = $2 AND status != 'terminated')",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .fetch_one(conn)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Clone-source fields for a non-terminated actor the user owns.
+    /// Takes the caller's connection — the GraphQL clone mutation runs
+    /// this ownership read and the clone INSERT in ONE org-scoped tx.
+    pub async fn get_actor_clone_source_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<ActorCloneSourceRow>> {
+        let row = sqlx::query_as::<_, ActorCloneSourceRow>(
+            "SELECT name, description, max_capability_world FROM actors \
+             WHERE id = $1 AND user_id = $2 AND status != 'terminated'",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .fetch_optional(conn)
+        .await?;
+        Ok(row)
     }
 
     /// Fetch actor action log entries with optional timestamp and action-type filters.

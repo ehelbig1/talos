@@ -1101,6 +1101,74 @@ pub async fn list_memories(
         .collect())
 }
 
+/// Ciphertext-bearing listing row returned by
+/// `list_memories_with_ciphertext_scoped`. Carries the MCP-S2 columns
+/// (`actor_id`, `key`, `value_format`) that AAD-bound decryption
+/// requires — decrypt with `decrypt_memory_list_row` AFTER the caller's
+/// transaction commits (the decrypt loop is connection-free, so don't
+/// hold the tx open across it).
+#[derive(Debug, sqlx::FromRow)]
+pub struct MemoryListRowEnc {
+    pub actor_id: Uuid,
+    pub key: String,
+    pub value_enc: Option<Vec<u8>>,
+    pub value_key_id: Option<Uuid>,
+    pub value_format: i16,
+    pub memory_type: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Non-expired memory rows WITH ciphertext for an actor, ordered
+/// `memory_type, key ASC`. Takes the caller's connection so a
+/// tenant-scoped tx / unit of work keeps its RLS backstop (the GraphQL
+/// `actorMemories` resolver runs the actors ownership check and this
+/// read in one per-user UoW). Do NOT add a pool variant for that path;
+/// it would split the snapshot.
+///
+/// The projection deliberately includes `actor_id` + `value_format` —
+/// the pre-extraction resolver SELECT omitted both, which the MCP-S2
+/// fail-loud contract in `decrypt_row_value` rejects, so every decrypt
+/// of a populated actor errored ("must project `actor_id`").
+pub async fn list_memories_with_ciphertext_scoped(
+    conn: &mut sqlx::PgConnection,
+    actor_id: Uuid,
+    memory_type_filter: Option<&str>,
+    limit: i64,
+) -> Result<Vec<MemoryListRowEnc>> {
+    sqlx::query_as::<_, MemoryListRowEnc>(
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, \
+                memory_type, expires_at, updated_at \
+         FROM actor_memory \
+         WHERE actor_id = $1 \
+           AND ($2::text IS NULL OR memory_type = $2) \
+           AND (expires_at IS NULL OR expires_at > NOW()) \
+         ORDER BY memory_type, key ASC \
+         LIMIT $3",
+    )
+    .bind(actor_id)
+    .bind(memory_type_filter)
+    .bind(limit)
+    .fetch_all(conn)
+    .await
+    .context("list_memories_with_ciphertext_scoped")
+}
+
+/// Decrypt one `MemoryListRowEnc` via the registered crypto hook, with
+/// the row's own `(actor_id, key)` AAD binding and per-row format
+/// dispatch. Connection-free — safe to run after the listing tx commits.
+pub async fn decrypt_memory_list_row(row: &MemoryListRowEnc) -> Result<serde_json::Value> {
+    let aad = build_memory_aad(row.actor_id, &row.key);
+    resolve_stored_value(
+        None,
+        row.value_enc.clone(),
+        row.value_key_id,
+        aad,
+        row.value_format,
+    )
+    .await
+}
+
 /// Hard upper bound on the row count `list_keys` will return regardless
 /// of caller-supplied limit. Mirrors the legacy hardcoded `LIMIT 1000`
 /// retained for back-compat. Subscriber callers should pass an explicit

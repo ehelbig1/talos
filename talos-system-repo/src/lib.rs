@@ -106,6 +106,78 @@ impl SystemRepository {
             .unwrap_or(0)
     }
 
+    /// Resolve an `agent_roles` row id by exact name.
+    pub async fn find_role_id_by_name(&self, role_name: &str) -> Result<Option<Uuid>> {
+        let role_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM agent_roles WHERE name = $1")
+                .bind(role_name)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(role_id)
+    }
+
+    /// Persist a freshly registered MCP agent. Token hashes arrive
+    /// pre-computed (bcrypt storage hash + SHA-256 lookup hash) — this
+    /// method only inserts. Returns the raw `sqlx::Error` so callers can
+    /// distinguish the `mcp_agents_name_key` unique violation (duplicate
+    /// agent name) from other failures via the error message.
+    pub async fn register_agent(
+        &self,
+        agent_id: Uuid,
+        name: &str,
+        role_id: Uuid,
+        token_hash: &str,
+        token_lookup_hash: &str,
+        user_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO mcp_agents (id, name, role_id, token_hash, token_lookup_hash, user_id) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(agent_id)
+        .bind(name)
+        .bind(role_id)
+        .bind(token_hash)
+        .bind(token_lookup_hash)
+        .bind(user_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete an MCP agent scoped to its owner. Returns rows affected
+    /// (0 = not found / not owned).
+    pub async fn delete_agent_for_user(&self, agent_id: Uuid, user_id: Uuid) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM mcp_agents WHERE id = $1 AND user_id = $2")
+            .bind(agent_id)
+            .bind(user_id)
+            .execute(&self.db_pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// A user's MCP agents, newest first, capped at `limit`. Backs the
+    /// GraphQL `mcpAgents` query (MCP-1190 gave it the 1..=1000 clamp;
+    /// the caller owns the clamp, this method just binds it).
+    pub async fn list_agents_for_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<McpAgentListRow>> {
+        let rows = sqlx::query_as::<_, McpAgentListRow>(
+            "SELECT id, name, created_at, last_connected_at AS last_used_at \
+             FROM mcp_agents \
+             WHERE user_id = $1 \
+             ORDER BY created_at DESC \
+             LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows)
+    }
+
     // ── mcp/mod.rs local-dev helpers ───────────────────────────────────────
 
     /// Find the oldest user (by created_at). Used by the local MCP endpoint to
@@ -228,6 +300,15 @@ impl SystemRepository {
         .await?;
         Ok(())
     }
+}
+
+/// MCP-agent listing row returned by `list_agents_for_user`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct McpAgentListRow {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Agent lookup row returned by `find_active_agent_by_token_lookup_hash`.

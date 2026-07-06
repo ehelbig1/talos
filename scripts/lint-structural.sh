@@ -3406,8 +3406,21 @@ bold "▶ check 50: raw sqlx::query in talos-api/src/schema (ratchet — count m
 # OrganizationService::first_org_id_owned_by/upsert_org_quota_limit/
 # get_org_quota_limits, ActorRepository::get_user_max_capability_world/
 # user_exists/upsert_capability_grant/delete_capability_grant,
-# talos_integrations::store::disconnect_user_integration).
-TALOS_API_SQLX_BASELINE=61
+# talos_integrations::store::disconnect_user_integration); 48 after
+# actors/queries.rs (conn-taking ActorRepository scoped reads:
+# list_actor_summaries_scoped/get_actor_details_scoped/
+# actor_owned_by_user_scoped/get_actor_execution_counts_scoped/
+# get_actor_workflow_counts_scoped/list_action_log_scoped, conn-taking
+# WorkflowRepository::list_workflows_for_actor_scoped,
+# talos_memory::list_memories_with_ciphertext_scoped (also fixes the
+# actorMemories MCP-S2 projection break), SystemRepository::list_agents_for_user);
+# 36 after actors/mutations.rs (conn-taking ActorRepository scoped writes:
+# insert_actor_scoped (org-pinned create, resolver keeps begin_org_scoped)/
+# update_actor_status_scoped/terminate_actor_scoped/update_actor_fields_scoped/
+# actor_owned_active_scoped/get_actor_clone_source_scoped, conn-taking
+# WorkflowRepository::archive_workflows_for_actor_scoped,
+# SystemRepository::find_role_id_by_name/register_agent/delete_agent_for_user).
+TALOS_API_SQLX_BASELINE=36
 API_SQLX_COUNT="$(grep -rEc 'sqlx::query' \
         --include='*.rs' \
         talos-api/src/schema 2>/dev/null \

@@ -59,6 +59,7 @@ talos-rate-limit = { path = "../talos-rate-limit" }
 talos-registry = { path = "../talos-registry" }
 talos-scheduler = { path = "../talos-scheduler" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-system-repo = { path = "../talos-system-repo" }
 # MCP-1036: bounded_preview for caller-supplied reflection in validate_uuid error.
 talos-text-util = { path = "../talos-text-util" }
 talos-totp-2fa = { path = "../talos-totp-2fa" }

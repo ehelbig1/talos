@@ -557,6 +557,64 @@ impl WorkflowRepository {
 
     /// Update workflow metadata fields selectively. Returns true if a row was affected.
     #[allow(clippy::too_many_arguments)]
+    /// Workflows attached to an actor (ownership-gated on `user_id`),
+    /// most recently updated first, with per-row node counts. Takes the
+    /// caller's connection: the GraphQL `actorWorkflows` resolver runs
+    /// this on a per-user UnitOfWork so the workflows RLS policy
+    /// backstops the `w.user_id` predicate (RFC 0005 S3). Do NOT route
+    /// through `self.db_pool`; that would silently drop the RLS backstop.
+    pub async fn list_workflows_for_actor_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ActorWorkflowRow>> {
+        let rows = sqlx::query_as::<_, ActorWorkflowRow>(
+            r#"SELECT
+                w.id, w.name, w.status, w.graph_json, w.created_at, w.updated_at,
+                COALESCE(
+                    (SELECT COUNT(*) FROM workflow_nodes wn WHERE wn.workflow_id = w.id),
+                    0
+                ) AS node_count
+               FROM workflows w
+               WHERE w.actor_id = $1 AND w.user_id = $2
+               ORDER BY w.updated_at DESC
+               LIMIT $3"#,
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Archive every non-archived workflow attached to an actor, returning
+    /// the number of rows moved. Takes the caller's connection: the
+    /// GraphQL `terminateActor` cleanup path runs this on a
+    /// `begin_user_scoped` tx so the workflows RLS policy
+    /// (USING-as-WITH-CHECK) restricts the sweep to the caller's own
+    /// workflows (RFC 0005 S3). Do NOT route through `self.db_pool`;
+    /// that would silently drop the RLS backstop.
+    pub async fn archive_workflows_for_actor_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+    ) -> Result<Option<i64>> {
+        let n = sqlx::query_scalar::<_, i64>(
+            "WITH updated AS (
+                UPDATE workflows SET status = 'archived', updated_at = now()
+                WHERE actor_id = $1 AND (status IS NULL OR status != 'archived')
+                RETURNING 1
+             ) SELECT COUNT(*) FROM updated",
+        )
+        .bind(actor_id)
+        .fetch_optional(conn)
+        .await?;
+        Ok(n)
+    }
+
     /// Set (or clear, with `None`) a workflow's max_concurrent_executions,
     /// ownership-gated on `user_id`. Takes the caller's transaction: the
     /// GraphQL `setConcurrencyLimit` mutation runs this on a
@@ -1663,6 +1721,18 @@ impl WorkflowRepository {
         }
         Ok(())
     }
+}
+
+/// Row returned by `list_workflows_for_actor_scoped`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ActorWorkflowRow {
+    pub id: Uuid,
+    pub name: String,
+    pub status: Option<String>,
+    pub graph_json: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub node_count: i64,
 }
 
 #[derive(Debug)]
