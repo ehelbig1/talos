@@ -9,7 +9,7 @@
     "api.atlassian.com"
   ],
   "requires_secrets": [
-    "vault://oauth/atlassian/*/access_token"
+    "oauth/atlassian/*"
   ],
   "config_schema": {
     "type": "object",
