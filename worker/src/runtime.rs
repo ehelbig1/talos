@@ -1803,7 +1803,27 @@ impl TalosRuntime {
         } else {
             wasmtime::WasmBacktraceDetails::Enable
         });
-        config.debug_info(!is_production);
+        // Guest-module DWARF debug info. DEFAULT OFF (2026-07-07) — it was
+        // `!is_production`, i.e. ON in dev/test, and that is the confirmed
+        // trigger for the aarch64 Cranelift `value_is_real` lowering panic
+        // on componentize-js / StarlingMonkey output (root-caused by a
+        // leave-one-out Config bisect: holding every other worker knob,
+        // ONLY toggling debug_info flips clean↔panic). wasmtime's DWARF
+        // emission for those very large functions trips the aarch64
+        // instruction-lowering assertion — an upstream bug, still present
+        // in wasmtime 46. debug_info was already OFF in production (the
+        // memory-cost gate), so this changes only the dev/test default and
+        // costs nothing real: guest-WASM DWARF needs a source-mapped
+        // debugger attached to the runtime, which is not a Talos workflow.
+        // Opt back in with TALOS_WASM_DEBUG_INFO=1 (the #414 codegen panic
+        // guard is the backstop if it re-triggers). Deliberately NOT in
+        // ENGINE_CONFIG_FINGERPRINT (per-deploy; no serialized-component
+        // compatibility impact), so this needs no AOT-cache invalidation.
+        let wasm_debug_info = matches!(
+            std::env::var("TALOS_WASM_DEBUG_INFO").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        );
+        config.debug_info(wasm_debug_info);
 
         // Limit backtrace depth in production to avoid unbounded diagnostic overhead
         // on deeply nested trap paths.  In dev we capture all frames.
