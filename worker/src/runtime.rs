@@ -195,6 +195,66 @@ pub const AOT_VERSION_HDR: &[u8] = b"TALOSV7";
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
 
+/// Run a component-compilation closure, converting a native-codegen PANIC
+/// into a clean `Err` instead of letting it abort the worker process.
+///
+/// wasmtime's Cranelift backend can *panic* (a debug assertion, not an
+/// `Err`) on certain guest instruction patterns — e.g. the aarch64
+/// `value_is_real` lowering assertion hit by StarlingMonkey/`jco` output
+/// (an upstream Cranelift bug, dev-arch-only: linux/amd64 codegen is
+/// clean, and wasmtime 45.0.3 already carries the fixes for every
+/// *advisory*-class aarch64 miscompile — CVE-2026-34971 et al). Because
+/// [`wasmtime::component::Component::new`] runs in the worker process, an
+/// unguarded panic unwinds through the whole worker and kills every
+/// in-flight job on it — a guest-influenceable availability DoS, and the
+/// class is open-ended (the *next* codegen bug on *any* arch behaves the
+/// same). Catching it bounds the blast radius to the one offending module.
+///
+/// Soundness of the `AssertUnwindSafe`: wasmtime compilation is a pure
+/// transformation. A panic mid-compile retains no partial artifact (the
+/// closure's `Component` is dropped while unwinding) and does not corrupt
+/// the shared `Engine` — its `Config` and type registry are immutable
+/// across the call, and the compile cache is written only on the success
+/// path *after* this returns. Subsequent compiles on the same engine are
+/// therefore unaffected (verified: unrelated modules compile fine after a
+/// caught panic). The worker binary unwinds (no `panic = "abort"`), so the
+/// guard is effective.
+fn guard_codegen_panic<T>(
+    phase: &'static str,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            // Full compiler-internal detail is logged SERVER-SIDE only; the
+            // returned (client-facing, via JobResult) message stays generic
+            // per the "never return internal error details" rule.
+            tracing::error!(
+                target: "talos_worker",
+                event_kind = "wasm_codegen_panic",
+                phase,
+                panic = %panic_payload_str(&payload),
+                "WASM native compilation PANICKED — module rejected, worker survived. \
+                 Likely a compiler-backend bug for this module's instruction patterns."
+            );
+            Err(anyhow::anyhow!(
+                "module failed native compilation (its instruction patterns are \
+                 unsupported by this platform's WASM compiler backend)"
+            ))
+        }
+    }
+}
+
+/// Best-effort extraction of a human-readable message from a caught panic
+/// payload (`&str` and `String` cover ~all `panic!`/`assert!` payloads).
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 /// Canonical encoding of every wasmtime `Config::` knob the worker sets
 /// in `TalosRuntime::with_resources`. Mixed into the AOT HMAC input so
 /// that any change to the engine configuration automatically
@@ -2725,11 +2785,7 @@ impl TalosRuntime {
                 span.add_event("compilation_started");
                 span.set_attribute_bool("cache_hit", false);
                 let compilation_start = std::time::Instant::now();
-                let component = if wasm_bytes.starts_with(AOT_VERSION_HDR) {
-                    self.load_precompiled(wasm_bytes, cap.clone())?
-                } else {
-                    Component::new(&self.engine, wasm_bytes)?
-                };
+                let component = self.compile_component_guarded(wasm_bytes, cap.clone())?;
                 let pre = linker.instantiate_pre(&component)?;
                 metrics.compilation_ms = compilation_start.elapsed().as_millis() as u64;
                 span.add_event("compilation_completed");
@@ -3151,11 +3207,7 @@ impl TalosRuntime {
             if let Some(entry) = cache.get(&cache_key) {
                 entry.clone()
             } else {
-                let component = if wasm_bytes.starts_with(AOT_VERSION_HDR) {
-                    self.load_precompiled(wasm_bytes, cap.clone())?
-                } else {
-                    Component::new(&self.engine, wasm_bytes)?
-                };
+                let component = self.compile_component_guarded(wasm_bytes, cap.clone())?;
                 let pre = linker.instantiate_pre(&component)?;
                 self.cache_insert_instance_pre(cache, cache_key, pre.clone());
                 pre
@@ -3341,11 +3393,8 @@ impl TalosRuntime {
                 if let Some(entry) = cache.get(&module_hash_bytes) {
                     entry.clone()
                 } else {
-                    let component = if step.wasm_bytes.starts_with(AOT_VERSION_HDR) {
-                        self.load_precompiled(&step.wasm_bytes, cap.clone())?
-                    } else {
-                        wasmtime::component::Component::new(&self.engine, &step.wasm_bytes)?
-                    };
+                    let component =
+                        self.compile_component_guarded(&step.wasm_bytes, cap.clone())?;
                     let pre = linker.instantiate_pre(&component)?;
                     self.cache_insert_instance_pre(cache, module_hash_bytes, pre.clone());
                     pre
@@ -3610,11 +3659,7 @@ impl TalosRuntime {
             };
 
             let component_result: anyhow::Result<Component> =
-                if wasm_bytes.starts_with(AOT_VERSION_HDR) {
-                    self.load_precompiled(&wasm_bytes, cap.clone())
-                } else {
-                    Component::new(&self.engine, &wasm_bytes).map_err(Into::into)
-                };
+                self.compile_component_guarded(&wasm_bytes, cap.clone());
 
             match component_result {
                 Ok(component) => match linker.instantiate_pre(&component) {
@@ -3774,6 +3819,41 @@ impl TalosRuntime {
     /// # Safety
     /// Pre-compiled modules MUST be compiled with the EXACT SAME version of Wasmtime
     /// and the EXACT SAME engine configuration. Always verify compatibility before loading.
+    ///
+    /// Turn raw module bytes into a `Component`, panic-guarded.
+    ///
+    /// The single chokepoint for both load paths: AOT blobs (integrity-
+    /// verified deserialize via [`Self::load_precompiled`]) and JIT
+    /// compilation ([`wasmtime::component::Component::new`], which runs
+    /// Cranelift codegen). Both run inside [`guard_codegen_panic`] so a
+    /// backend panic (see that function) becomes a clean per-job error
+    /// instead of crashing the worker. Every `Component::new` call site in
+    /// this file routes through here — do not call `Component::new`
+    /// directly (an unguarded site reopens the worker-DoS surface; the
+    /// structural lint `no_unguarded_component_new` enforces this).
+    fn compile_component_guarded(
+        &self,
+        wasm_bytes: &[u8],
+        cap: crate::wit_inspector::CapabilityWorld,
+    ) -> Result<Component> {
+        let is_aot = wasm_bytes.starts_with(AOT_VERSION_HDR);
+        let phase = if is_aot {
+            "aot_deserialize"
+        } else {
+            "jit_compile"
+        };
+        guard_codegen_panic(phase, || {
+            if is_aot {
+                self.load_precompiled(wasm_bytes, cap)
+            } else {
+                // THIS is the guarded chokepoint (wrapped by guard_codegen_panic
+                // above); all other sites route here. Trailing marker keeps it on
+                // the call line so the line-based lint (check 53) sees the opt-out.
+                Component::new(&self.engine, wasm_bytes).map_err(Into::into) // allow-unguarded-component-new
+            }
+        })
+    }
+
     pub fn load_precompiled(
         &self,
         precompiled_bytes: &[u8],
@@ -4522,5 +4602,60 @@ mod tests {
         // this collapsed key is never actually populated cross-tenant.
         let key_none = TalosRuntime::result_cache_key("modhash", &input, None);
         assert_ne!(key_none, key_a);
+    }
+
+    // ── Codegen panic guard ──────────────────────────────────────────────
+    // Deterministic, arch-independent coverage of the panic→error conversion.
+    // The REAL trigger (aarch64 Cranelift `value_is_real` on jco output)
+    // can't be reproduced on an amd64 CI runner, so these exercise the
+    // mechanism directly rather than a specific bad component.
+
+    #[test]
+    fn guard_passes_success_and_error_through_unchanged() {
+        let ok = guard_codegen_panic("t", || Ok::<u32, anyhow::Error>(7)).unwrap();
+        assert_eq!(ok, 7);
+        let err = guard_codegen_panic("t", || Err::<u32, _>(anyhow::anyhow!("real compile error")));
+        assert!(err.unwrap_err().to_string().contains("real compile error"));
+    }
+
+    #[test]
+    fn guard_converts_panic_to_error_without_unwinding_past() {
+        // A `&str` panic (assert!/panic!("...")) — the common Cranelift shape.
+        let r = guard_codegen_panic("jit_compile", || -> anyhow::Result<()> {
+            panic!("value_is_real assertion (simulated)")
+        });
+        let msg = r.unwrap_err().to_string();
+        // Client-facing message is generic (no compiler internals leaked).
+        assert!(msg.contains("failed native compilation"), "got: {msg}");
+        assert!(
+            !msg.contains("value_is_real"),
+            "internal detail must not reach the client message"
+        );
+    }
+
+    #[test]
+    fn guard_handles_string_and_nonstring_payloads() {
+        let s = guard_codegen_panic("t", || -> anyhow::Result<()> {
+            panic!("{}", String::from("owned-string panic"))
+        });
+        assert!(s.is_err());
+        // Non-string payload (e.g. a panic with a struct) still converts, not aborts.
+        let n = guard_codegen_panic("t", || -> anyhow::Result<()> {
+            std::panic::panic_any(42u8)
+        });
+        assert!(n.is_err());
+    }
+
+    #[test]
+    fn panic_payload_str_extracts_both_str_and_string() {
+        let boxed_str: Box<dyn std::any::Any + Send> = Box::new("a &str");
+        assert_eq!(panic_payload_str(boxed_str.as_ref()), "a &str");
+        let boxed_string: Box<dyn std::any::Any + Send> = Box::new(String::from("a String"));
+        assert_eq!(panic_payload_str(boxed_string.as_ref()), "a String");
+        let boxed_other: Box<dyn std::any::Any + Send> = Box::new(7u64);
+        assert_eq!(
+            panic_payload_str(boxed_other.as_ref()),
+            "non-string panic payload"
+        );
     }
 }
