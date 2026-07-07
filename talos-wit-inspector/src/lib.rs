@@ -352,9 +352,17 @@ fn classify_world(imports: &HashSet<String>, has_sockets: bool) -> CapabilityWor
         || has_agent_orchestration;
 
     if !any_trusted {
-        if has_sockets {
-            return CapabilityWorld::Network;
-        }
+        // NOTE: `has_sockets` deliberately does NOT escalate the world.
+        // Interpreter-based toolchains (componentize-py) structurally import
+        // wasi:sockets for their embedded runtime regardless of the talos
+        // world — escalating on the import alone classified every Python
+        // module as Network, GRANTING it raw sockets (the world drives
+        // `allow_wasi_network`). Classification follows the talos:core
+        // surface; the socket boundary is enforced at RUNTIME by the
+        // context flag derived from the module's stored world (all tier
+        // linkers satisfy the wasi:sockets import; non-socket worlds deny
+        // the calls — see worker runtime `select_tier`'s layer notes).
+        let _ = has_sockets;
         if NETWORK_TIER.iter().any(|iface| imports.contains(*iface)) {
             return CapabilityWorld::Http;
         }
@@ -492,9 +500,17 @@ mod tests {
     }
 
     #[test]
-    fn sockets_give_network_world() {
+    fn sockets_import_does_not_escalate_world() {
+        // A structural wasi:sockets import must NOT bump the classification:
+        // interpreter toolchains (componentize-py) import it for their
+        // embedded runtime regardless of the talos world, and the world is
+        // what GRANTS sockets at runtime (allow_wasi_network derives from the
+        // stored world; non-socket worlds deny the calls). Classification
+        // follows the talos:core surface only.
         let imports = make_imports(&["talos:core/logging", "talos:core/http"]);
-        assert_eq!(classify_world(&imports, true), CapabilityWorld::Network);
+        assert_eq!(classify_world(&imports, true), CapabilityWorld::Http);
+        let minimal = make_imports(&["talos:core/logging", "talos:core/json"]);
+        assert_eq!(classify_world(&minimal, true), CapabilityWorld::Minimal);
     }
 
     #[test]

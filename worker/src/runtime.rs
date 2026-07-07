@@ -1636,10 +1636,15 @@ impl TalosRuntime {
             //      bindings against the declared world; Http's WIT doesn't import
             //      `wasi:sockets`, so a legitimately-compiled Http module has no
             //      reference to the socket interface in its component imports.
-            //   2. **Post-compile inspector check.** `talos_wit_inspector` walks the
-            //      component's import list and rejects Http modules that declare a
-            //      `wasi:sockets` import (catches a hand-edited or attacker-crafted
-            //      component that bypassed step 1's cargo-component path).
+            //   2. **Post-compile inspector check.** `talos_wit_inspector` classifies
+            //      the component from its PARSED talos:core import surface and
+            //      validates it against the declared world. NOTE (JS/Py wiring,
+            //      2026-07): a structural `wasi:sockets` import no longer escalates
+            //      the classification — interpreter toolchains (componentize-py)
+            //      import it for their embedded runtime regardless of world, and
+            //      escalating GRANTED sockets to every Python module via this very
+            //      world→flag derivation. For sockets-importing components in
+            //      non-socket worlds, layer 3 is the enforcement.
             //   3. **Runtime context flag.** Even if both above are bypassed and the
             //      shared linker resolves the socket import at instantiation, the
             //      context's `allow_wasi_network=false` makes the socket calls themselves
