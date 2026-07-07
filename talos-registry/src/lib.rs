@@ -56,6 +56,28 @@ fn clamp_execution_fuel(db_max_fuel: i64) -> i64 {
     }
 }
 
+/// Inline-dispatch byte ceiling — modules larger than this are dispatched
+/// by `redis:wasm:{id}` URI rather than embedded in the `DispatchJob`, so
+/// their bytes MUST be resident in Redis before the worker fetches them.
+///
+/// Kept in lockstep with the engine's authoritative copy
+/// (`talos_workflow_engine::dispatch_bytes::inline_wasm_cap_bytes`) via the
+/// SAME env var + default — the registry can't depend on the engine crate
+/// (that would invert the layering), so the value is mirrored here and the
+/// two are aligned by reading identical config. If they ever diverge the
+/// failure is safe-but-suboptimal (a module between the two thresholds gets
+/// a synchronous pre-warm it didn't strictly need), never a miss.
+fn inline_wasm_cap_bytes() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TALOS_INLINE_WASM_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(4 * 1024 * 1024)
+    })
+}
+
 /// MCP-548: decode `allowed_secrets TEXT[]` from a Postgres row, logging
 /// loudly when the decode fails. The column is `NOT NULL DEFAULT '{}'` per
 /// the migration, so a decode error indicates a real anomaly: a schema-type
@@ -824,7 +846,15 @@ impl ModuleRegistry {
             .try_get("wasm_bytes")
             .context("modules.wasm_bytes: try_get failed (schema drift?)")?;
         if !wasm_bytes.is_empty() {
-            self.cache_wasm_bytes_under(module_id, &wasm_bytes);
+            // Oversized (redis-routed) modules must be resident BEFORE this
+            // fetch returns — the worker fetches by `redis:wasm:` URI and
+            // would race a fire-and-forget fill. Small (inlined) modules
+            // keep the async fill. See `ensure_wasm_bytes_cached`.
+            if wasm_bytes.len() > inline_wasm_cap_bytes() {
+                self.ensure_wasm_bytes_cached(module_id, &wasm_bytes).await;
+            } else {
+                self.cache_wasm_bytes_under(module_id, &wasm_bytes);
+            }
         }
 
         Ok(WasmModule {
@@ -1007,7 +1037,14 @@ impl ModuleRegistry {
                     language: "rust".to_string(),
                     integration_name: row.try_get("integration_name").unwrap_or(None),
                 };
-                self.cache_wasm_bytes_under(module_id, &m.wasm_bytes);
+                // Oversized (redis-routed) modules must be resident before
+                // returning — see the twin call in `get_module`.
+                if m.wasm_bytes.len() > inline_wasm_cap_bytes() {
+                    self.ensure_wasm_bytes_cached(module_id, &m.wasm_bytes)
+                        .await;
+                } else {
+                    self.cache_wasm_bytes_under(module_id, &m.wasm_bytes);
+                }
                 return Ok(m);
             }
         }
@@ -1039,29 +1076,61 @@ impl ModuleRegistry {
         let Some(ref redis_client) = self.redis_client else {
             return;
         };
-        // Clone Arc + bytes for the background task. Bytes can be large
-        // (~80 KB typical) but the clone is amortised against the dispatch
-        // savings; could be tightened by passing `Bytes` if it becomes hot.
+        // Clone Arc + bytes for the background task. Small modules
+        // (~80 KB typical Rust component) ride INLINE in the dispatch and
+        // never need this key on the worker's read path, so a lost race
+        // is harmless — the fire-and-forget keeps the dispatch hot path
+        // free of a Redis round-trip. Oversized components DON'T take this
+        // path (they go through `ensure_wasm_bytes_cached` — see the call
+        // sites), so the async fill is only ever used where a miss is
+        // recoverable.
         let client = redis_client.clone();
         let bytes = wasm_bytes.to_vec();
         tokio::spawn(async move {
-            let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
-                tracing::debug!(module_id = %module_id, "Redis connect failed during cache fill — read path will fall back");
-                return;
-            };
-            let key = format!("wasm:{}", module_id);
-            // SETEX (vs SET): bound stale exposure if a downstream rotation
-            // path forgets to DEL. 24h matches `get_module_bytes`.
-            if let Err(e) = redis::cmd("SETEX")
-                .arg(&key)
-                .arg(86400)
-                .arg(&bytes)
-                .query_async::<()>(&mut conn)
-                .await
-            {
-                tracing::debug!(module_id = %module_id, error = %e, "Redis SET failed during cache fill");
-            }
+            Self::set_wasm_key(&client, module_id, &bytes).await;
         });
+    }
+
+    /// **Synchronous** Redis pre-warm for `wasm:<module_id>` — awaits the
+    /// SETEX before returning so the key is guaranteed resident.
+    ///
+    /// Required for OVERSIZED components (interpreter toolchains:
+    /// componentize-py ~18 MB, jco ~13 MB). Those exceed the inline cap,
+    /// so the engine dispatches them by `redis:wasm:{id}` URI instead of
+    /// embedding the bytes (`dispatch_bytes::embeds_inline`). If the
+    /// pre-warm were fire-and-forget (as for small modules), the worker
+    /// could issue its `GET wasm:{id}` before the background SETEX landed
+    /// and fail the job with "wasm module not found" — a non-deterministic
+    /// race that gets WORSE with size (a 13 MB SETEX easily loses to a
+    /// fast local dispatch → NATS → worker GET). Awaiting closes it: the
+    /// key exists before `fetch` returns to the engine, so it exists
+    /// before the JobRequest is even built.
+    async fn ensure_wasm_bytes_cached(&self, module_id: Uuid, wasm_bytes: &[u8]) {
+        let Some(ref client) = self.redis_client else {
+            return;
+        };
+        Self::set_wasm_key(client, module_id, wasm_bytes).await;
+    }
+
+    /// Shared SETEX body for both the fire-and-forget (`cache_wasm_bytes_under`)
+    /// and awaited (`ensure_wasm_bytes_cached`) pre-warm paths.
+    async fn set_wasm_key(client: &redis::Client, module_id: Uuid, bytes: &[u8]) {
+        let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+            tracing::debug!(module_id = %module_id, "Redis connect failed during cache fill — read path will fall back");
+            return;
+        };
+        let key = format!("wasm:{}", module_id);
+        // SETEX (vs SET): bound stale exposure if a downstream rotation
+        // path forgets to DEL. 24h matches `get_module_bytes`.
+        if let Err(e) = redis::cmd("SETEX")
+            .arg(&key)
+            .arg(86400)
+            .arg(bytes)
+            .query_async::<()>(&mut conn)
+            .await
+        {
+            tracing::debug!(module_id = %module_id, error = %e, "Redis SET failed during cache fill");
+        }
     }
 
     pub async fn get_module_bytes(&self, module_id: Uuid, user_id: Uuid) -> Result<Vec<u8>> {

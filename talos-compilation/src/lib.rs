@@ -2360,22 +2360,38 @@ impl CompilationService {
 
         let mut cmd = container::tool_command("jco", workspace)
             .context("JS compilation sandbox setup failed")?;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            cmd.args([
-                "componentize",
-                "module.js",
-                "--wit",
-                "talos.wit",
-                "--world-name",
-                world,
-                "-o",
-                "module.wasm",
-            ])
-            .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("JS compilation timed out after 120s"))??;
+        cmd.args([
+            "componentize",
+            "module.js",
+            "--wit",
+            "talos.wit",
+            "--world-name",
+            world,
+            "-o",
+            "module.wasm",
+        ]);
+        // Align jco's WASI import surface with the linker tier that will run
+        // the module. StarlingMonkey imports `wasi:http/outgoing-handler`
+        // (its `fetch`) unconditionally, but the worker only grants that raw
+        // interface to the AUTOMATION (trusted) tier — every lower tier's
+        // linker provides `wasi:http/types` ONLY (see the worker's
+        // `add_wasi_http_types_only` vs `add_only_http_to_linker_async`). So
+        // for any world below automation, `--disable http` drops the
+        // outgoing-handler import (keeping the types, which the tier DOES
+        // provide) — without it a minimal-node JS module fails to link with
+        // "wasi:http/outgoing-handler not found in the linker". This mirrors
+        // the capability model rather than widening it: dropping the RAW
+        // handler removes StarlingMonkey's ungated global `fetch` only. An
+        // http-/network-node module still reaches the network through the
+        // Talos-gated `talos:core` http import (SSRF-checked, tier-aware),
+        // which comes from `talos.wit`, not wasi:http — so egress stays on
+        // the enforced path and a minimal-node module gets none at all.
+        if !world_grants_raw_wasi_http(world) {
+            cmd.args(["--disable", "http"]);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("JS compilation timed out after 120s"))??;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -2521,6 +2537,31 @@ mod jspy_world_detection_tests {
     use super::*;
 
     #[test]
+    fn only_automation_world_grants_raw_wasi_http() {
+        // The capability rule that decides jco's `--disable http`. ONLY the
+        // trusted/automation tier's linker provides wasi:http/outgoing-handler;
+        // every lower world (and unknown) must compile with it disabled.
+        assert!(world_grants_raw_wasi_http("automation-node"));
+        assert!(world_grants_raw_wasi_http("trusted"));
+        for w in [
+            "minimal-node",
+            "http-node",
+            "network-node",
+            "secrets-node",
+            "database-node",
+            "governance-node",
+            "agent-node",
+            "",
+            "not-a-world",
+        ] {
+            assert!(
+                !world_grants_raw_wasi_http(w),
+                "{w} must NOT grant raw wasi:http (fail closed)"
+            );
+        }
+    }
+
+    #[test]
     fn js_world_annotation_is_parsed() {
         assert_eq!(
             CompilationService::detect_js_world(
@@ -2560,6 +2601,25 @@ mod jspy_world_detection_tests {
         assert!(PY_WITWORLD_SHIM.contains("class WitWorld"));
         assert!(PY_WITWORLD_SHIM.contains("def run(self, input: str) -> str"));
     }
+}
+
+/// Whether a capability world's linker tier grants the RAW
+/// `wasi:http/outgoing-handler` interface (StarlingMonkey's `fetch`).
+///
+/// Only the automation (Trusted) tier does — the worker adds
+/// `add_only_http_to_linker_async` there and `add_wasi_http_types_only`
+/// (types, no handler) everywhere else. So JS for any lower world must be
+/// compiled with `jco --disable http` (see `compile_js_in_workspace`);
+/// keeping the handler import would fail to link with
+/// "wasi:http/outgoing-handler not found in the linker". An
+/// unknown/unparseable world is treated as NOT granting it — fail closed to
+/// the narrower import surface. Pure so the capability→toolchain mapping is
+/// unit-testable without invoking jco.
+fn world_grants_raw_wasi_http(world: &str) -> bool {
+    matches!(
+        world.parse::<CapabilityWorld>(),
+        Ok(CapabilityWorld::Trusted)
+    )
 }
 
 /// Auto-detect the source language from the source code content.
