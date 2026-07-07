@@ -3557,7 +3557,31 @@ else
 fi
 echo
 
-# ── 53. Lint self-consistency (meta-check) ────────────────────────────
+# ── 53. Unguarded wasmtime Component::new in the worker runtime ───────
+# wasmtime's Cranelift backend can PANIC (not Err) on certain guest
+# instruction patterns (e.g. the aarch64 `value_is_real` lowering bug on
+# jco/StarlingMonkey output). `Component::new` runs in the worker PROCESS,
+# so an unguarded panic unwinds through the whole worker and kills every
+# in-flight job — a guest-influenceable DoS. All component compilation
+# MUST route through `TalosRuntime::compile_component_guarded` (which wraps
+# it in `guard_codegen_panic`). The single legitimate site inside that
+# method is tagged `// allow-unguarded-component-new`.
+bold "▶ check 53: unguarded wasmtime Component::new in worker runtime (must route through the panic guard)"
+UNGUARDED_CN="$(grep -rEn 'Component::new\(' --include='*.rs' worker/src 2>/dev/null \
+    | grep -v 'allow-unguarded-component-new' \
+    | grep -vE '//.*Component::new' || true)"
+if [ -n "$UNGUARDED_CN" ]; then
+    red "✗ direct wasmtime Component::new outside the panic guard:"
+    echo "$UNGUARDED_CN" | sed 's/^/    /'
+    yellow "  → route it through TalosRuntime::compile_component_guarded so a Cranelift"
+    yellow "    codegen panic becomes a clean per-job error instead of crashing the worker."
+    EXIT_CODE=1
+else
+    green "✓ all worker Component::new sites route through the codegen panic guard"
+fi
+echo
+
+# ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
 # pre-push hook comment said 40 — three sources, three numbers. Assert
@@ -3565,7 +3589,7 @@ echo
 # a renumber went wrong or a check was deleted without renumbering), and
 # (b) CLAUDE.md's "N checks today" sentence matches the real count. The
 # pre-push hook no longer states a number (it points at --count).
-bold "▶ check 53: lint self-consistency (check numbering + documented count)"
+bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"
 META_FAIL=0
