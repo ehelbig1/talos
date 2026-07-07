@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO admin_event_log\n             (user_id, event_type, resource_type, resource_id, summary, details)\n             VALUES (NULL, $1, 'worker_provisioning_token', $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8269285d8fca6a40696d42b0f6bc87ffc1e837a36723ef72242533623b0916c6"
+}

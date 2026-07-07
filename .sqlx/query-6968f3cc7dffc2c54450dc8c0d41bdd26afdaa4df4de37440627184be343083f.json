@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO worker_provisioning_tokens (token_hash, worker_id, expires_at, note)\n             VALUES ($1, $2, $3, $4)\n             RETURNING id as \"id!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6968f3cc7dffc2c54450dc8c0d41bdd26afdaa4df4de37440627184be343083f"
+}

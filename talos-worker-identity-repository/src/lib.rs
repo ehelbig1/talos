@@ -13,9 +13,35 @@
 //! expiring, optionally worker_id-bound registration tokens, stored as SHA-256
 //! hashes. [`WorkerIdentityRepository::register_with_provisioning_token`]
 //! consumes + registers atomically in one transaction.
+//!
+//! # Compile-time-checked SQL (RFC 0009 follow-up / review weakness #5)
+//!
+//! This crate is the pilot for compile-checked `sqlx::query!` in the repository
+//! layer: every schema-touching statement is a macro, so a renamed / dropped /
+//! retyped column is a **build error** (validated against the committed
+//! `.sqlx/` offline metadata) rather than a runtime failure or — worse — a
+//! silent `try_get(...).unwrap_or(default)` read. Conventions established here
+//! for the rest of the burn-down:
+//! * **Aggregates / `EXISTS` need an explicit non-null override** (`count(*) as
+//!   "n!"`, `EXISTS(...) as "exists!"`, `RETURNING id as "id!"`): Postgres
+//!   reports these nullable, so the alias asserts the invariant and keeps the
+//!   binding non-`Option`.
+//! * **App-level type narrowing stays in Rust**: `public_key` is `bytea`
+//!   (`Vec<u8>`) at the DB layer but a domain `[u8; 32]`, so those reads use
+//!   `query!` + [`decode_pubkey_bytes`] (a deliberate fail-loud width check)
+//!   instead of `query_as!`. The macro still checks the columns exist.
+//! * **Pure-builtin calls stay `sqlx::query`**: the advisory-lock statement
+//!   ([`advisory_lock_worker`]) references no table columns — only
+//!   `pg_advisory_xact_lock`/`hashtext` — so it carries zero schema-drift risk
+//!   and gets no benefit from the macro (which would only add void-return
+//!   typing friction). `query!` is for statements that touch the schema.
+//!
+//! Regenerate the offline metadata after any query change with
+//! `make sqlx-prepare` (needs a migrated `DATABASE_URL`); CI's
+//! `sqlx-cache` job fails if the committed `.sqlx/` is stale.
 
 use anyhow::{anyhow, Context, Result};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 
 /// Ceiling on simultaneously-ACTIVE keys per `worker_id`. Comfortably covers
 /// blue/green + rotation overlap while bounding how far a compromised registrant
@@ -143,7 +169,7 @@ async fn register_in_tx(
     public_key: &[u8; 32],
     supports_sealing: bool,
 ) -> Result<RegisterOutcome> {
-    let res = sqlx::query(
+    let res = sqlx::query!(
         "INSERT INTO worker_identities (worker_id, public_key, supports_sealing)
          SELECT $1, $2, $3
          WHERE (SELECT count(*) FROM worker_identities
@@ -154,11 +180,11 @@ async fn register_in_tx(
             SET active = true,
                 supports_sealing = EXCLUDED.supports_sealing,
                 last_seen_at = now()",
+        worker_id,
+        &public_key[..],
+        supports_sealing,
+        MAX_ACTIVE_KEYS_PER_WORKER,
     )
-    .bind(worker_id)
-    .bind(&public_key[..])
-    .bind(supports_sealing)
-    .bind(MAX_ACTIVE_KEYS_PER_WORKER)
     .execute(&mut **tx)
     .await
     .context("gated upsert")?;
@@ -180,12 +206,14 @@ async fn register_tofu_in_tx(
     supports_sealing: bool,
 ) -> Result<TofuOutcome> {
     // Exact-row lookup: does this (worker_id, key) pair already exist, and is
-    // it live? Typed query_scalar — no silent-default reads (check 52).
-    let exact: Option<bool> = sqlx::query_scalar(
+    // it live? Compile-checked query! — `active` is a NOT NULL column so the
+    // scalar is `bool`; `fetch_optional` makes the row-absence the outer
+    // `Option` (no silent-default reads — check 52, now enforced at build time).
+    let exact: Option<bool> = sqlx::query_scalar!(
         "SELECT active FROM worker_identities WHERE worker_id = $1 AND public_key = $2",
+        worker_id,
+        &public_key[..],
     )
-    .bind(worker_id)
-    .bind(&public_key[..])
     .fetch_optional(&mut **tx)
     .await
     .context("tofu exact-row lookup")?;
@@ -193,14 +221,14 @@ async fn register_tofu_in_tx(
     match exact {
         // Idempotent refresh of the worker's own ACTIVE key.
         Some(true) => {
-            sqlx::query(
+            sqlx::query!(
                 "UPDATE worker_identities
                  SET supports_sealing = $3, last_seen_at = now()
                  WHERE worker_id = $1 AND public_key = $2",
+                worker_id,
+                &public_key[..],
+                supports_sealing,
             )
-            .bind(worker_id)
-            .bind(&public_key[..])
-            .bind(supports_sealing)
             .execute(&mut **tx)
             .await
             .context("tofu refresh")?;
@@ -210,20 +238,24 @@ async fn register_tofu_in_tx(
         // here would let a shared-token holder undo a revocation.
         Some(false) => Ok(TofuOutcome::IdentityConflict),
         None => {
-            let history: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM worker_identities WHERE worker_id = $1")
-                    .bind(worker_id)
-                    .fetch_one(&mut **tx)
-                    .await
-                    .context("tofu history count")?;
+            // `count(*)` is inferred NULLABLE by Postgres, so the `as "n!"`
+            // override asserts NOT NULL and keeps the binding an `i64` (not
+            // `Option<i64>`) — the canonical sqlx aggregate-nullability idiom.
+            let history: i64 = sqlx::query_scalar!(
+                "SELECT count(*) as \"n!\" FROM worker_identities WHERE worker_id = $1",
+                worker_id,
+            )
+            .fetch_one(&mut **tx)
+            .await
+            .context("tofu history count")?;
             if history == 0 {
-                sqlx::query(
+                sqlx::query!(
                     "INSERT INTO worker_identities (worker_id, public_key, supports_sealing)
                      VALUES ($1, $2, $3)",
+                    worker_id,
+                    &public_key[..],
+                    supports_sealing,
                 )
-                .bind(worker_id)
-                .bind(&public_key[..])
-                .bind(supports_sealing)
                 .execute(&mut **tx)
                 .await
                 .context("tofu first-use insert")?;
@@ -334,7 +366,9 @@ impl WorkerIdentityRepository {
         // WHERE so an ineligible call cannot consume: unused, unrevoked,
         // unexpired, binding matches the registering worker_id (NULL =
         // wildcard), and wildcard only while enforcement is off.
-        let consumed: Option<Option<String>> = sqlx::query_scalar(
+        // `RETURNING worker_id` (a NULLABLE column) → the INNER Option; row
+        // absence (ineligible token) → the OUTER Option from `fetch_optional`.
+        let consumed: Option<Option<String>> = sqlx::query_scalar!(
             "UPDATE worker_provisioning_tokens
              SET used_at = now(), used_by_worker_id = $2
              WHERE token_hash = $1
@@ -344,10 +378,10 @@ impl WorkerIdentityRepository {
                AND (worker_id IS NULL OR worker_id = $2)
                AND (worker_id IS NOT NULL OR NOT $3)
              RETURNING worker_id",
+            token_hash,
+            worker_id,
+            require_bound,
         )
-        .bind(token_hash)
-        .bind(worker_id)
-        .bind(require_bound)
         .fetch_optional(&mut *tx)
         .await
         .context("consume provisioning token")?;
@@ -391,15 +425,18 @@ impl WorkerIdentityRepository {
         expires_at: chrono::DateTime<chrono::Utc>,
         note: Option<&str>,
     ) -> Result<uuid::Uuid> {
-        let id: uuid::Uuid = sqlx::query_scalar(
+        // `RETURNING id` on a PK is inferred nullable by sqlx (it can't prove a
+        // RETURNING expression is NOT NULL), so `as "id!"` asserts the invariant
+        // the PRIMARY KEY guarantees and keeps the binding a plain `Uuid`.
+        let id: uuid::Uuid = sqlx::query_scalar!(
             "INSERT INTO worker_provisioning_tokens (token_hash, worker_id, expires_at, note)
              VALUES ($1, $2, $3, $4)
-             RETURNING id",
+             RETURNING id as \"id!\"",
+            token_hash,
+            worker_id,
+            expires_at,
+            note,
         )
-        .bind(token_hash)
-        .bind(worker_id)
-        .bind(expires_at)
-        .bind(note)
         .fetch_one(&self.db_pool)
         .await
         .context("insert provisioning token")?;
@@ -410,11 +447,11 @@ impl WorkerIdentityRepository {
     /// (unused, unrevoked) token was revoked, `false` otherwise — revoking a
     /// consumed token is a no-op so the redemption record stays truthful.
     pub async fn revoke_provisioning_token(&self, id: uuid::Uuid) -> Result<bool> {
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "UPDATE worker_provisioning_tokens SET revoked_at = now()
              WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL",
+            id,
         )
-        .bind(id)
         .execute(&self.db_pool)
         .await
         .context("revoke provisioning token")?;
@@ -436,15 +473,15 @@ impl WorkerIdentityRepository {
         summary: &str,
         details: Option<&serde_json::Value>,
     ) -> Result<()> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO admin_event_log
              (user_id, event_type, resource_type, resource_id, summary, details)
              VALUES (NULL, $1, 'worker_provisioning_token', $2, $3, $4)",
+            event_type,
+            token_id,
+            summary,
+            details as Option<&serde_json::Value>,
         )
-        .bind(event_type)
-        .bind(token_id)
-        .bind(summary)
-        .bind(details)
         .execute(&self.db_pool)
         .await
         .context("insert provisioning-token audit event")?;
@@ -455,30 +492,23 @@ impl WorkerIdentityRepository {
     /// first. Exposes metadata only — never `token_hash` (an offline-crackable
     /// digest has no business in ops output).
     pub async fn list_provisioning_tokens(&self) -> Result<Vec<ProvisioningTokenRow>> {
-        let rows = sqlx::query(
-            "SELECT id, worker_id, created_at, expires_at, used_at, used_by_worker_id,
-                    revoked_at, note
+        // `query_as!` maps straight into the struct AND compile-checks that every
+        // column's name, SQL type, and nullability matches the field — so a
+        // renamed column or a NOT NULL→NULL drift is a build error, not a
+        // runtime `try_get` failure. `id as "id!"` because sqlx infers PK
+        // columns nullable in projections; the rest match the schema's
+        // NOT NULL / nullable split exactly.
+        let rows = sqlx::query_as!(
+            ProvisioningTokenRow,
+            "SELECT id as \"id!\", worker_id, created_at, expires_at, used_at,
+                    used_by_worker_id, revoked_at, note
              FROM worker_provisioning_tokens
              ORDER BY created_at DESC, id",
         )
         .fetch_all(&self.db_pool)
         .await
         .context("list provisioning tokens")?;
-
-        rows.into_iter()
-            .map(|r| {
-                Ok(ProvisioningTokenRow {
-                    id: r.try_get("id")?,
-                    worker_id: r.try_get("worker_id")?,
-                    created_at: r.try_get("created_at")?,
-                    expires_at: r.try_get("expires_at")?,
-                    used_at: r.try_get("used_at")?,
-                    used_by_worker_id: r.try_get("used_by_worker_id")?,
-                    revoked_at: r.try_get("revoked_at")?,
-                    note: r.try_get("note")?,
-                })
-            })
-            .collect()
+        Ok(rows)
     }
 
     /// Every ACTIVE `(worker_id, public_key)` pair. The controller's refresh task
@@ -486,20 +516,24 @@ impl WorkerIdentityRepository {
     /// snapshot. One indexed scan (partial index `WHERE active`); the table is
     /// small (fleet-sized), so this is cheap.
     pub async fn load_active_registry(&self) -> Result<Vec<WorkerKeyEntry>> {
-        let rows = sqlx::query("SELECT worker_id, public_key FROM worker_identities WHERE active")
+        // `query!` (not `query_as!`) because `public_key` is `bytea` → `Vec<u8>`
+        // at the DB layer, but the domain type is a fixed `[u8; 32]`. The macro
+        // still compile-checks that both columns exist with the expected SQL
+        // types; the app-level width-narrowing (a deliberate fail-loud security
+        // check, below) stays in Rust where it belongs.
+        let rows = sqlx::query!("SELECT worker_id, public_key FROM worker_identities WHERE active")
             .fetch_all(&self.db_pool)
             .await
             .context("load active worker registry")?;
 
         rows.into_iter()
             .map(|r| {
-                // Fail-loud decode (lint check 52): a dropped/renamed column or a
-                // wrong-width key errors here rather than silently defaulting to
-                // an empty/garbage key that would then fail every verify opaquely.
-                let worker_id: String = r.try_get("worker_id")?;
-                let public_key = decode_pubkey(&r, &worker_id)?;
+                // Fail-loud decode (lint check 52): a wrong-width key errors here
+                // rather than silently defaulting to a garbage key that would
+                // then fail every verify opaquely.
+                let public_key = decode_pubkey_bytes(&r.public_key, &r.worker_id)?;
                 Ok(WorkerKeyEntry {
-                    worker_id,
+                    worker_id: r.worker_id,
                     public_key,
                 })
             })
@@ -509,12 +543,12 @@ impl WorkerIdentityRepository {
     /// Soft-retire one key (rotation). Returns `true` if a live key was
     /// deactivated, `false` if it was already inactive / absent. Idempotent.
     pub async fn deactivate(&self, worker_id: &str, public_key: &[u8; 32]) -> Result<bool> {
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "UPDATE worker_identities SET active = false
              WHERE worker_id = $1 AND public_key = $2 AND active",
+            worker_id,
+            &public_key[..],
         )
-        .bind(worker_id)
-        .bind(&public_key[..])
         .execute(&self.db_pool)
         .await
         .context("deactivate worker key")?;
@@ -525,11 +559,13 @@ impl WorkerIdentityRepository {
     /// claim-sealing capability. Lets the controller seal claim-based to capable
     /// workers and inline (legacy WSK) to the rest during a heterogeneous rollout.
     pub async fn worker_supports_sealing(&self, worker_id: &str) -> Result<bool> {
-        let supported: bool = sqlx::query_scalar(
+        // `EXISTS(...)` is inferred nullable by Postgres; `as "exists!"` asserts
+        // NOT NULL so the scalar binds as `bool` (never `Option<bool>`).
+        let supported: bool = sqlx::query_scalar!(
             "SELECT EXISTS(SELECT 1 FROM worker_identities
-             WHERE worker_id = $1 AND active AND supports_sealing)",
+             WHERE worker_id = $1 AND active AND supports_sealing) as \"exists!\"",
+            worker_id,
         )
-        .bind(worker_id)
         .fetch_one(&self.db_pool)
         .await
         .context("query worker sealing capability")?;
@@ -539,7 +575,10 @@ impl WorkerIdentityRepository {
     /// Full listing for operator/admin surfaces, newest-key-last within a worker.
     /// Deterministic order (no OFFSET pagination here; ordered for stable output).
     pub async fn list(&self) -> Result<Vec<WorkerIdentityRow>> {
-        let rows = sqlx::query(
+        // `query!` (not `query_as!`) for the same reason as `load_active_registry`:
+        // `public_key` bytea narrows to the domain `[u8; 32]` in Rust. All other
+        // columns are NOT NULL, so the macro binds them non-optionally.
+        let rows = sqlx::query!(
             "SELECT worker_id, public_key, supports_sealing, active, created_at, last_seen_at
              FROM worker_identities
              ORDER BY worker_id, created_at, public_key",
@@ -550,29 +589,29 @@ impl WorkerIdentityRepository {
 
         rows.into_iter()
             .map(|r| {
-                let worker_id: String = r.try_get("worker_id")?;
-                let public_key = decode_pubkey(&r, &worker_id)?;
+                let public_key = decode_pubkey_bytes(&r.public_key, &r.worker_id)?;
                 Ok(WorkerIdentityRow {
-                    worker_id,
+                    worker_id: r.worker_id,
                     public_key,
-                    supports_sealing: r.try_get("supports_sealing")?,
-                    active: r.try_get("active")?,
-                    created_at: r.try_get("created_at")?,
-                    last_seen_at: r.try_get("last_seen_at")?,
+                    supports_sealing: r.supports_sealing,
+                    active: r.active,
+                    created_at: r.created_at,
+                    last_seen_at: r.last_seen_at,
                 })
             })
             .collect()
     }
 }
 
-/// Decode the `public_key` bytea column into a fixed 32-byte array, erroring
-/// loudly (with the offending `worker_id`) on any width mismatch. The DB CHECK
-/// already guarantees 32 bytes on write, so this only trips on corruption or a
-/// schema change — exactly when a silent default would be dangerous.
-fn decode_pubkey(row: &sqlx::postgres::PgRow, worker_id: &str) -> Result<[u8; 32]> {
-    let bytes: Vec<u8> = row.try_get("public_key")?;
+/// Decode a `public_key` bytea value into a fixed 32-byte array, erroring loudly
+/// (with the offending `worker_id`) on any width mismatch. The DB CHECK already
+/// guarantees 32 bytes on write, so this only trips on corruption or a schema
+/// change — exactly when a silent default would be dangerous. Takes the decoded
+/// bytes directly (the `query!` macro already produced a `Vec<u8>`), keeping the
+/// width-narrowing security check independent of the row-access mechanism.
+fn decode_pubkey_bytes(bytes: &[u8], worker_id: &str) -> Result<[u8; 32]> {
     let len = bytes.len();
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
         anyhow!("worker_identities.public_key for {worker_id} is {len} bytes, expected 32")
     })
 }
@@ -598,11 +637,13 @@ mod tests {
     // Remove any rows a prior run left for this worker_id so each test starts
     // from a known-empty state (distinct worker_ids keep tests mutually isolated).
     async fn clean(pool: &PgPool, worker_id: &str) {
-        sqlx::query("DELETE FROM worker_identities WHERE worker_id = $1")
-            .bind(worker_id)
-            .execute(pool)
-            .await
-            .expect("test cleanup delete");
+        sqlx::query!(
+            "DELETE FROM worker_identities WHERE worker_id = $1",
+            worker_id
+        )
+        .execute(pool)
+        .await
+        .expect("test cleanup delete");
     }
 
     // A distinct worker_id per test so a shared DB stays isolated without a
@@ -726,11 +767,13 @@ mod tests {
     }
 
     async fn clean_token(pool: &PgPool, token_hash: &str) {
-        sqlx::query("DELETE FROM worker_provisioning_tokens WHERE token_hash = $1")
-            .bind(token_hash)
-            .execute(pool)
-            .await
-            .expect("test token cleanup delete");
+        sqlx::query!(
+            "DELETE FROM worker_provisioning_tokens WHERE token_hash = $1",
+            token_hash
+        )
+        .execute(pool)
+        .await
+        .expect("test token cleanup delete");
     }
 
     fn in_one_hour() -> chrono::DateTime<chrono::Utc> {

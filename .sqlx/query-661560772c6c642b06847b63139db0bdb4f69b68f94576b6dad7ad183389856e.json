@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker_provisioning_tokens SET revoked_at = now()\n             WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "661560772c6c642b06847b63139db0bdb4f69b68f94576b6dad7ad183389856e"
+}

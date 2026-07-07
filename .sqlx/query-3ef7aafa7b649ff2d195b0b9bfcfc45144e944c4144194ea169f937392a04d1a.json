@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker_identities\n                 SET supports_sealing = $3, last_seen_at = now()\n                 WHERE worker_id = $1 AND public_key = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3ef7aafa7b649ff2d195b0b9bfcfc45144e944c4144194ea169f937392a04d1a"
+}
