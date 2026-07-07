@@ -10,30 +10,37 @@ Talos modules are WebAssembly (WASM) components that execute within a sandboxed 
 
 ## WIT Interface
 
-All modules implement the `talos:core` package. The core entry point is:
+All modules implement a world from the `talos:core` package (source of truth:
+`wit/talos.wit`). Every world exports the same single entry point — `run`:
 
 ```wit
-world processor {
-    import talos:core/logging;
-    export process: func(input: string) -> string;
+world minimal-node {
+    // Utility interfaces: pure computation, no external side-effects
+    import logging;
+    import json;
+    import datetime;
+    import crypto;
+    import env;
+
+    export run: func(input: string) -> result<string, string>;
 }
 ```
 
-Modules receive a JSON string as input and return a JSON string as output.
+Modules receive a JSON string as input and return a JSON string as output
+(see [Module input contract](#module-input-contract) for exactly what the
+input string contains). Returning `Err(...)` marks the node execution as
+failed with that message.
 
 ### Available Capabilities
 
-Each world can import one or more capability interfaces:
-
-| World                    | Imports                                      | Use Case                           |
-|--------------------------|----------------------------------------------|------------------------------------|
-| `processor`              | `logging`                                    | Simple data transformation         |
-| `http-processor`         | `logging`, `http`                            | External API calls                 |
-| `secret-processor`       | `logging`, `secrets`                         | Access encrypted secrets           |
-| `stateful-processor`     | `logging`, `state`                           | Persistent key-value storage       |
-| `full-processor`         | `logging`, `http`, `secrets`, `state`        | All capabilities                   |
-| `database-query`         | `logging`, `database`                        | SQL query execution                |
-| `message-publisher`      | `logging`, `messaging`                       | Publish to NATS topics             |
+Each world layers capability interfaces on top of the minimal set —
+`http-node` adds `http`, `webhook`, `graphql`, `email`, `state`,
+`data-transform`, `templates`; `secrets-node` adds `secrets` + the `llm`
+family; `database-node` adds `database` + `agent-memory`; and so on. The
+authoritative world → capability → tier mapping is the
+[Security Tiers](#security-tiers) table at the bottom of this guide — it is
+kept in sync with `wit/talos.wit`, which is the WIT source of truth. Pick
+the LEAST privileged world that satisfies your module's needs.
 
 ### HTTP Interface
 
@@ -87,7 +94,33 @@ interface logging {
 
 ## Creating a Rust Module
 
-### 1. Project Setup
+### Preferred path: `compile_custom_sandbox`
+
+You don't need a cargo project. Provide just `use` statements and a
+synchronous `pub fn run(input: String) -> Result<String, String>` to the
+`compile_custom_sandbox` MCP tool (or `get_module_scaffold` first for a
+ready-to-fill scaffold) — the platform wraps it with the `#[talos_module]`
+macro, compiles it in a network-isolated sandbox against your chosen
+`capability_world`, and stores the module. `serde_json` is pre-bundled;
+extra crates go through the allowlisted `dependencies` parameter.
+
+```rust
+use serde_json::Value;
+
+pub fn run(input: String) -> Result<String, String> {
+    let data: Value = serde_json::from_str(&input)
+        .map_err(|e| format!("bad input: {e}"))?;
+    let n = data["config"]["n"].as_i64().unwrap_or(0);
+    Ok(serde_json::json!({ "doubled": n * 2 }).to_string())
+}
+```
+
+### Manual path: wit-bindgen + upload
+
+For out-of-band builds, generate bindings against `wit/talos.wit` directly.
+The world name must be a real capability world (`minimal-node`, `http-node`,
+`secrets-node`, … — see [Security Tiers](#security-tiers)) and the export is
+`run`, returning `result<string, string>`:
 
 ```bash
 cargo new --lib my-module
@@ -106,18 +139,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-### 2. Implement the Module
-
 ```rust
 wit_bindgen::generate!({
-    world: "http-processor",
+    world: "http-node",
     path: "../wit/talos.wit",
 });
 
 struct MyModule;
 
 impl Guest for MyModule {
-    fn process(input: String) -> String {
+    fn run(input: String) -> Result<String, String> {
         // Parse input
         let data: serde_json::Value = serde_json::from_str(&input)
             .unwrap_or(serde_json::json!({}));
@@ -128,7 +159,7 @@ impl Guest for MyModule {
             &format!("Processing: {}", data),
         );
 
-        // Make HTTP request
+        // Make HTTP request (subject to the module's allowed_hosts whitelist)
         let response = talos::core::http::fetch(&talos::core::http::Request {
             method: talos::core::http::Method::Get,
             url: "https://api.example.com/data".to_string(),
@@ -137,13 +168,13 @@ impl Guest for MyModule {
             timeout_ms: Some(5000),
         });
 
-        // Return result
+        // Return result — Err(...) marks the node execution as failed
         match response {
             Ok(resp) => {
                 let body = String::from_utf8_lossy(&resp.body);
-                serde_json::json!({ "status": resp.status, "body": body }).to_string()
+                Ok(serde_json::json!({ "status": resp.status, "body": body }).to_string())
             }
-            Err(e) => serde_json::json!({ "error": format!("{:?}", e) }).to_string(),
+            Err(e) => Err(format!("http fetch failed: {:?}", e)),
         }
     }
 }
@@ -151,15 +182,8 @@ impl Guest for MyModule {
 export!(MyModule);
 ```
 
-### 3. Compile to WASM
-
-```bash
-cargo build --target wasm32-wasip2 --release
-```
-
-### 4. Upload via GraphQL
-
-Use the `createCustomModule` mutation to upload the compiled `.wasm` file.
+Compile with `cargo build --target wasm32-wasip2 --release` and upload the
+`.wasm` via the `createCustomModule` GraphQL mutation.
 
 ## Creating a JavaScript/TypeScript Module
 
