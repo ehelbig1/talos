@@ -165,21 +165,69 @@ Use the `createCustomModule` mutation to upload the compiled `.wasm` file.
 
 ### 1. Write the Module
 
-```typescript
-// my-module.ts
-export function process(input: string): string {
-    const data = JSON.parse(input);
+The exported entry point MUST be named `run` (not `process`) and take the
+single JSON string argument — every world exports `run(input: string) ->
+result<string, string>` (see [Module input contract](#module-input-contract)
+for exactly what `input` contains).
+
+```javascript
+// my-module.js
+export function run(input) {
+    // `input` is a JSON-encoded envelope string — parse it, then read your
+    // node config from `.config` (NOT the top-level parse result).
+    const payload = JSON.parse(input);
+    const config = payload.config ?? {};
 
     // Use imported capabilities via global bindings
-    log("info", `Processing: ${JSON.stringify(data)}`);
+    log("info", `Processing n=${config.n}`);
 
-    return JSON.stringify({ result: "processed", input: data });
+    return JSON.stringify({ doubled: (config.n ?? 0) * 2 });
 }
 ```
 
-### 2. Upload via GraphQL
+### 2. Compile
 
-Use the `createCustomModule` mutation with `language: "typescript"`. The controller compiles TypeScript modules to WASM automatically using ComponentizeJS.
+Compile via the `compile_custom_sandbox` MCP tool with `language:
+"javascript"` (jco/componentize under the hood). `capability_world` is
+authoritative and `dependencies` must be omitted (modules are
+self-contained — no network at componentize time). Python is identical with
+`language: "python"` and a module-level `def run(input: str) -> str:`.
+
+## Module input contract
+
+Regardless of language, `run(input)` receives a **JSON-encoded string of the
+node payload**, not your raw value. This is the single most common
+JS/Python authoring trap — parsing `input` and using it directly yields the
+whole envelope, so a module silently computes on `undefined`/`None`.
+
+The parsed envelope has this shape (built identically by `test_module` and
+by the live engine in `engine_dispatch_single`):
+
+```jsonc
+{
+  "config": { /* your node config — test_module's `config` arg, or add_node_to_workflow's `config` field */ },
+  "input":  { /* upstream node's output (empty for the first node) */ },
+  /* ...plus config's and input's own keys spread at the root for convenience */
+}
+```
+
+So a doubler expecting `{ "n": 21 }` as its config reads:
+
+| Language | Read your config value |
+|----------|------------------------|
+| JavaScript | `JSON.parse(input).config.n` |
+| Python | `json.loads(input)["config"]["n"]` |
+| Rust (SDK) | `data["config"]["n"]` — the `#[talos_module]` macro parses the envelope for you |
+
+Rust authors rarely notice this because the SDK hands them `data`
+pre-parsed; JS/Python `run(input)` sees the raw envelope string and must
+parse + index `.config` themselves.
+
+### Upload via GraphQL
+
+The `createCustomModule` mutation also accepts pre-compiled `.wasm`; the
+`compile_custom_sandbox` MCP path above is preferred for source-in,
+module-out authoring.
 
 ## Module Configuration
 
