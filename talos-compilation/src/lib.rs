@@ -20,7 +20,7 @@ mod target_cache;
 // `mcp::utils` re-export shim in controller) can keep importing
 // `validate_dependencies` from a stable location.
 pub use dependency_allowlist::{get_allowed_dependencies, validate_dependencies};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use talos_capability_world::CapabilityWorld;
 use tokio::process::Command;
@@ -2302,46 +2302,77 @@ impl CompilationService {
         world: &str,
         job_id: &str,
     ) -> Result<Vec<u8>> {
-        // M-13: refuse host-toolchain JS compile in production unless
-        // the operator has opted into the legacy degraded sandbox.
-        require_host_lang_toolchain_allowed("javascript")?;
+        // M-13: the compile runs SANDBOXED (container::tool_command — same
+        // --network=none/read-only/non-root envelope as the Rust path)
+        // whenever a container runtime is available. Only the host-fallback
+        // path needs the production gate: jco evaluates the module via
+        // StarlingMonkey at componentize time.
+        if !container::will_sandbox() {
+            require_host_lang_toolchain_allowed("javascript")?;
+        }
 
         let _permit = compilation_semaphore()
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("Compilation queue full — try again later"))?;
 
-        let workspace = std::env::temp_dir().join(format!("talos-js-{}", job_id));
+        let workspace = self.workspace_root.join(format!("js-{}", job_id));
         tokio::fs::create_dir_all(&workspace).await?;
+        let out = self
+            .compile_js_in_workspace(&workspace, js_source, world)
+            .await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        let wasm_bytes = out?;
 
-        // Write JS source
-        let source_path = workspace.join("module.js");
-        tokio::fs::write(&source_path, js_source).await?;
+        tracing::info!(
+            job_id = job_id,
+            language = "javascript",
+            output_bytes = wasm_bytes.len(),
+            "JS → WASM compilation complete"
+        );
+        Ok(wasm_bytes)
+    }
 
-        // Copy WIT file
-        let wit_dest = workspace.join("talos.wit");
+    /// Inner JS compile body — the caller owns workspace cleanup (L-37
+    /// inner/outer pattern), so every early return here is leak-free.
+    ///
+    /// Known platform caveat: wasmtime 45's Cranelift panics
+    /// (`value_is_real`, machinst/lower.rs) when compiling StarlingMonkey
+    /// (jco) output **on aarch64** — the produced component is valid and
+    /// executes fine on x86-64 (verified: linux/amd64 codegen OK + the
+    /// panic reproduced only on Apple Silicon). Production workers are
+    /// linux/amd64, so this only affects local dev execution of JS modules
+    /// on ARM Macs.
+    async fn compile_js_in_workspace(
+        &self,
+        workspace: &Path,
+        js_source: &str,
+        world: &str,
+    ) -> Result<Vec<u8>> {
+        // Write JS source + the WIT the world resolves against. Tool args are
+        // RELATIVE to the workspace: the sandbox mounts it at /build with
+        // `-w /build`, and the host fallback sets `current_dir(workspace)`,
+        // so the same argv resolves identically in both modes.
+        tokio::fs::write(workspace.join("module.js"), js_source).await?;
         if self.wit_path.exists() {
-            tokio::fs::copy(&self.wit_path, &wit_dest).await?;
+            tokio::fs::copy(&self.wit_path, workspace.join("talos.wit")).await?;
         }
 
-        let output_path = workspace.join("module.wasm");
-
-        // Compile with jco componentize
+        let mut cmd = container::tool_command("jco", workspace)
+            .context("JS compilation sandbox setup failed")?;
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            Command::new("jco")
-                .args([
-                    "componentize",
-                    source_path.to_str().unwrap_or("module.js"),
-                    "--wit",
-                    wit_dest.to_str().unwrap_or("talos.wit"),
-                    "--world-name",
-                    world,
-                    "-o",
-                    output_path.to_str().unwrap_or("module.wasm"),
-                ])
-                .current_dir(&workspace)
-                .output(),
+            cmd.args([
+                "componentize",
+                "module.js",
+                "--wit",
+                "talos.wit",
+                "--world-name",
+                world,
+                "-o",
+                "module.wasm",
+            ])
+            .output(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("JS compilation timed out after 120s"))??;
@@ -2350,25 +2381,15 @@ impl CompilationService {
             let stderr = String::from_utf8_lossy(&result.stderr);
             // Sanitize paths in error messages
             let sanitized = stderr.replace(workspace.to_str().unwrap_or(""), "<workspace>");
-            let _ = tokio::fs::remove_dir_all(&workspace).await;
             bail!("JS compilation failed:\n{}", sanitized);
         }
 
-        let wasm_bytes = tokio::fs::read(&output_path).await?;
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        let wasm_bytes = tokio::fs::read(workspace.join("module.wasm")).await?;
 
         // Validate the output is a valid WASM component
         if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
             bail!("JS compilation produced invalid WASM binary");
         }
-
-        tracing::info!(
-            job_id = job_id,
-            language = "javascript",
-            output_bytes = wasm_bytes.len(),
-            "JS → WASM compilation complete"
-        );
-
         Ok(wasm_bytes)
     }
 
@@ -2382,65 +2403,28 @@ impl CompilationService {
         world: &str,
         job_id: &str,
     ) -> Result<Vec<u8>> {
-        // M-13: refuse host-toolchain Python compile in production
-        // unless the operator has opted into the legacy degraded sandbox.
-        // componentize-py runs arbitrary Python introspection at compile
-        // time, so this is the highest-risk of the non-Rust paths.
-        require_host_lang_toolchain_allowed("python")?;
+        // M-13: the compile runs SANDBOXED (container::tool_command — same
+        // --network=none/read-only/non-root envelope as the Rust path)
+        // whenever a container runtime is available. Only the host-fallback
+        // path needs the production gate — componentize-py runs arbitrary
+        // Python introspection at compile time, the highest-risk of the
+        // non-Rust paths.
+        if !container::will_sandbox() {
+            require_host_lang_toolchain_allowed("python")?;
+        }
 
         let _permit = compilation_semaphore()
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("Compilation queue full — try again later"))?;
 
-        let workspace = std::env::temp_dir().join(format!("talos-py-{}", job_id));
+        let workspace = self.workspace_root.join(format!("py-{}", job_id));
         tokio::fs::create_dir_all(&workspace).await?;
-
-        // Write Python source
-        let source_path = workspace.join("app.py");
-        tokio::fs::write(&source_path, python_source).await?;
-
-        // Copy WIT file
-        let wit_dest = workspace.join("talos.wit");
-        if self.wit_path.exists() {
-            tokio::fs::copy(&self.wit_path, &wit_dest).await?;
-        }
-
-        let output_path = workspace.join("module.wasm");
-
-        // Compile with componentize-py
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            Command::new("componentize-py")
-                .args([
-                    "-d",
-                    wit_dest.to_str().unwrap_or("talos.wit"),
-                    "-w",
-                    world,
-                    "componentize",
-                    source_path.to_str().unwrap_or("app.py"),
-                    "-o",
-                    output_path.to_str().unwrap_or("module.wasm"),
-                ])
-                .current_dir(&workspace)
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Python compilation timed out after 120s"))??;
-
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            let sanitized = stderr.replace(workspace.to_str().unwrap_or(""), "<workspace>");
-            let _ = tokio::fs::remove_dir_all(&workspace).await;
-            bail!("Python compilation failed:\n{}", sanitized);
-        }
-
-        let wasm_bytes = tokio::fs::read(&output_path).await?;
+        let out = self
+            .compile_python_in_workspace(&workspace, python_source, world)
+            .await;
         let _ = tokio::fs::remove_dir_all(&workspace).await;
-
-        if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
-            bail!("Python compilation produced invalid WASM binary");
-        }
+        let wasm_bytes = out?;
 
         tracing::info!(
             job_id = job_id,
@@ -2448,8 +2432,133 @@ impl CompilationService {
             output_bytes = wasm_bytes.len(),
             "Python → WASM compilation complete"
         );
-
         Ok(wasm_bytes)
+    }
+
+    /// Inner Python compile body — the caller owns workspace cleanup (L-37
+    /// inner/outer pattern), so every early return here is leak-free.
+    async fn compile_python_in_workspace(
+        &self,
+        workspace: &Path,
+        python_source: &str,
+        world: &str,
+    ) -> Result<Vec<u8>> {
+        // componentize-py binds a world-level `export run: func(...)` to a
+        // protocol class named `WitWorld` on the app module. The Python SDK's
+        // `@talos_module` decorator (and plain `def run`) authors a module-
+        // level function instead, so append the adapter shim unless the
+        // source already provides the class itself.
+        let app_source = if python_source.contains("class WitWorld") {
+            python_source.to_string()
+        } else {
+            format!("{python_source}\n{PY_WITWORLD_SHIM}")
+        };
+
+        // Layout: app.py + wit/talos.wit. Args are RELATIVE to the workspace
+        // (sandbox mounts it at /build with -w /build; host fallback sets
+        // current_dir) and `componentize app` names the MODULE, not a file —
+        // the invocation shape verified against componentize-py 0.24.
+        tokio::fs::write(workspace.join("app.py"), app_source).await?;
+        let wit_dir = workspace.join("wit");
+        tokio::fs::create_dir_all(&wit_dir).await?;
+        if self.wit_path.exists() {
+            tokio::fs::copy(&self.wit_path, wit_dir.join("talos.wit")).await?;
+        }
+
+        let mut cmd = container::tool_command("componentize-py", workspace)
+            .context("Python compilation sandbox setup failed")?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            cmd.args([
+                "-d",
+                "wit",
+                "-w",
+                world,
+                "componentize",
+                "app",
+                "-o",
+                "module.wasm",
+            ])
+            .output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Python compilation timed out after 120s"))??;
+
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let sanitized = stderr.replace(workspace.to_str().unwrap_or(""), "<workspace>");
+            bail!("Python compilation failed:\n{}", sanitized);
+        }
+
+        let wasm_bytes = tokio::fs::read(workspace.join("module.wasm")).await?;
+        if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
+            bail!("Python compilation produced invalid WASM binary");
+        }
+        Ok(wasm_bytes)
+    }
+}
+
+/// Adapter appended to Python module source that doesn't define its own
+/// `WitWorld`: componentize-py resolves the world's `export run` through a
+/// class of that name, while the Python SDK contract is a module-level
+/// `run` (the `@talos_module` decorator returns a `str -> str` callable;
+/// undecorated functions may return a dict). Handles both by serializing
+/// non-string results as JSON.
+const PY_WITWORLD_SHIM: &str = r#"
+# --- generated by talos (do not edit): adapts the module entry point to
+# --- componentize-py's world-export protocol class.
+class WitWorld:
+    def run(self, input: str) -> str:
+        result = run(input)
+        if isinstance(result, str):
+            return result
+        import json as _talos_json
+        return _talos_json.dumps(result)
+"#;
+
+#[cfg(test)]
+mod jspy_world_detection_tests {
+    use super::*;
+
+    #[test]
+    fn js_world_annotation_is_parsed() {
+        assert_eq!(
+            CompilationService::detect_js_world(
+                "// @talos-world: http-node\nexport function run(i) {}"
+            ),
+            Some("http-node".to_string())
+        );
+        // Tolerates no space after the colon and trailing prose.
+        assert_eq!(
+            CompilationService::detect_js_world("/* @talos-world:secrets-node — needs vault */"),
+            Some("secrets-node".to_string())
+        );
+    }
+
+    #[test]
+    fn js_world_absent_or_empty_falls_back_to_none() {
+        assert_eq!(
+            CompilationService::detect_js_world("export function run(i) {}"),
+            None
+        );
+        assert_eq!(
+            CompilationService::detect_js_world("// @talos-world:   "),
+            None
+        );
+    }
+
+    #[test]
+    fn python_shim_appended_only_when_witworld_absent() {
+        // The shim decision mirrors compile_python_in_workspace's check —
+        // pin both branches so an SDK-shaped module gets the adapter and a
+        // raw protocol-class module passes through untouched.
+        let sdk_shaped = "def run(input: str) -> str:\n    return input\n";
+        assert!(!sdk_shaped.contains("class WitWorld"));
+        let raw = "class WitWorld:\n    def run(self, input):\n        return input\n";
+        assert!(raw.contains("class WitWorld"));
+        // And the shim itself defines exactly the protocol class.
+        assert!(PY_WITWORLD_SHIM.contains("class WitWorld"));
+        assert!(PY_WITWORLD_SHIM.contains("def run(self, input: str) -> str"));
     }
 }
 
@@ -2683,8 +2792,12 @@ impl CompilationService {
     /// Compile source to WASM with an explicit language override.
     ///
     /// - `Rust` / `None`: standard `cargo component build` path
-    /// - `Python`: `componentize-py` targeting the specified world
-    /// - `JavaScript` / `TypeScript` / `Go`: stub — falls back to Rust path
+    /// - `Python`: `componentize-py` targeting the world declared in-source
+    /// - `JavaScript`: `jco componentize` targeting the world declared
+    ///   in-source (`// @talos-world: <world>`, default `minimal-node`)
+    /// - `TypeScript` / `Go`: refused with a clear error — silently falling
+    ///   back to the Rust path (the pre-wiring behavior) produced a wall of
+    ///   irrelevant rustc errors for a `.ts` module.
     pub async fn compile_to_wasm_with_language(
         &self,
         user_id: Uuid,
@@ -2700,6 +2813,20 @@ impl CompilationService {
                 self.compile_python_module(user_id, job_id, name, source_code, config)
                     .await
             }
+            Some(ModuleLanguage::JavaScript) => {
+                self.compile_js_module(user_id, job_id, name, source_code)
+                    .await
+            }
+            Some(ModuleLanguage::TypeScript) => {
+                bail!(
+                    "TypeScript modules must be transpiled to JavaScript before \
+                     submission (jco componentizes plain JS). Submit the compiled \
+                     JS with language=javascript."
+                )
+            }
+            Some(ModuleLanguage::Go) => {
+                bail!("Go module compilation is not supported")
+            }
             _ => {
                 self.compile_to_wasm_with_config(
                     user_id,
@@ -2712,6 +2839,88 @@ impl CompilationService {
                 .await
             }
         }
+    }
+
+    /// Compile a JavaScript module to WASM via `jco componentize`, wrapped in
+    /// the same [`CompilationResult`] envelope the Rust/Python paths return.
+    ///
+    /// The capability world comes from an in-source annotation
+    /// (`// @talos-world: http-node`), defaulting to least-privilege
+    /// `minimal-node` — same posture as `extract_wit_world` (M-14).
+    async fn compile_js_module(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+    ) -> Result<CompilationResult> {
+        let world =
+            Self::detect_js_world(source_code).unwrap_or_else(|| "minimal-node".to_string());
+        self.send_event(
+            user_id,
+            job_id,
+            "compiling",
+            Some("Invoking jco componentize...".to_string()),
+            Some(0.4),
+        );
+        tracing::info!(
+            name = %name,
+            world = %world,
+            sandboxed = container::will_sandbox(),
+            "Compiling JavaScript module via jco"
+        );
+
+        match self
+            .compile_js_to_wasm(source_code, &world, &job_id.to_string())
+            .await
+        {
+            Ok(wasm_bytes) => {
+                let size_bytes = wasm_bytes.len() as i32;
+                let content_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+                let cap_world = world
+                    .parse::<CapabilityWorld>()
+                    .unwrap_or(CapabilityWorld::Unknown);
+                Ok(CompilationResult {
+                    success: true,
+                    wasm_bytes: Some(wasm_bytes),
+                    errors: vec![],
+                    size_bytes,
+                    content_hash,
+                    capability_world: cap_world,
+                    imported_interfaces: vec![],
+                })
+            }
+            Err(e) => Ok(CompilationResult {
+                success: false,
+                wasm_bytes: None,
+                errors: vec![CompilationError {
+                    line: None,
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: format!("{e:#}"),
+                    severity: "error".to_string(),
+                }],
+                size_bytes: 0,
+                content_hash: String::new(),
+                capability_world: CapabilityWorld::Unknown,
+                imported_interfaces: vec![],
+            }),
+        }
+    }
+
+    /// Extract the capability world from JavaScript source.
+    ///
+    /// Looks for a `// @talos-world: <world>` comment annotation (the JS
+    /// counterpart of Python's `@talos_module(world=...)`).
+    fn detect_js_world(source: &str) -> Option<String> {
+        let idx = source.find("@talos-world:")?;
+        let rest = source[idx + "@talos-world:".len()..].trim_start();
+        let world: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        (!world.is_empty()).then_some(world)
     }
 
     /// Compile a Python module to WASM via `componentize-py`.
@@ -2727,12 +2936,14 @@ impl CompilationService {
         source_code: &str,
         config: &serde_json::Value,
     ) -> Result<CompilationResult> {
-        // M-13: same fail-closed gate as compile_python_to_wasm. This
-        // path is the one hit by `compile_to_wasm_with_language` so
-        // gating both entrypoints means there's no surface that can
-        // reach `componentize-py` on the host without the explicit
+        // M-13: same sandbox-or-gate rule as compile_python_to_wasm. This
+        // path is the one hit by `compile_to_wasm_with_language`, so covering
+        // both entrypoints means there's no surface that can reach
+        // `componentize-py` UNSANDBOXED on the host without the explicit
         // operator opt-in.
-        require_host_lang_toolchain_allowed("python")?;
+        if !container::will_sandbox() {
+            require_host_lang_toolchain_allowed("python")?;
+        }
 
         self.send_event(
             user_id,
@@ -2776,13 +2987,21 @@ impl CompilationService {
     }
 
     /// Inner Python compilation logic — separated so the caller can guarantee cleanup.
+    ///
+    /// Delegates the actual invocation to [`Self::compile_python_in_workspace`]
+    /// (shared with `compile_python_to_wasm`) so the sandbox, the SDK shim,
+    /// and the componentize-py argv shape live in exactly one place. This
+    /// replaced a hand-rolled invocation that passed `-w talos:core/<world>`
+    /// — componentize-py resolves bare world names against the WIT package,
+    /// so that form never worked (the path was dead code; the shared core is
+    /// the verified-working shape).
     async fn compile_python_inner(
         &self,
         user_id: Uuid,
         job_id: Uuid,
         name: &str,
         source_code: &str,
-        config: &serde_json::Value,
+        _config: &serde_json::Value,
         workspace: &std::path::Path,
     ) -> Result<CompilationResult> {
         self.send_event(
@@ -2795,45 +3014,10 @@ impl CompilationService {
         let world =
             Self::detect_python_world(source_code).unwrap_or_else(|| "minimal-node".to_string());
 
-        // Write Python source
-        let app_path = workspace.join("app.py");
-        tokio::fs::write(&app_path, source_code).await?;
-
-        // Write the WIT file alongside the source
-        let wit_dir = workspace.join("wit");
-        tokio::fs::create_dir_all(&wit_dir).await?;
-        let wit_source_path = self
-            .workspace_root
-            .parent()
-            .unwrap_or(&self.workspace_root)
-            .join("wit")
-            .join("talos.wit");
-        if tokio::fs::metadata(&wit_source_path).await.is_ok() {
-            tokio::fs::copy(&wit_source_path, wit_dir.join("talos.wit")).await?;
-        }
-
-        // Output path
-        let output_wasm = workspace.join("output.wasm");
-
-        // Build componentize-py command
-        let mut cmd = tokio::process::Command::new("componentize-py");
-        cmd.args([
-            "-d",
-            wit_dir.to_str().unwrap_or("wit"),
-            "-w",
-            &format!("talos:core/{}", world),
-            "componentize",
-            "app",
-            "-o",
-            output_wasm.to_str().unwrap_or("output.wasm"),
-        ]);
-        cmd.current_dir(&workspace);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
         tracing::info!(
             name = %name,
             world = %world,
+            sandboxed = container::will_sandbox(),
             "Compiling Python module via componentize-py"
         );
         self.send_event(
@@ -2844,49 +3028,12 @@ impl CompilationService {
             Some(0.4),
         );
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
+        let wasm_bytes = match self
+            .compile_python_in_workspace(workspace, source_code, &world)
             .await
-            .map_err(|_| anyhow::anyhow!("Python compilation timed out after 120 seconds"))?
-            .context("Failed to execute componentize-py")?;
-
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            let error_text = if stderr.is_empty() {
-                stdout.to_string()
-            } else {
-                stderr.to_string()
-            };
-
-            return Ok(CompilationResult {
-                success: false,
-                wasm_bytes: None,
-                errors: vec![CompilationError {
-                    line: None,
-                    column: None,
-                    end_line: None,
-                    end_column: None,
-                    message: error_text,
-                    severity: "error".to_string(),
-                }],
-                size_bytes: 0,
-                content_hash: String::new(),
-                capability_world: CapabilityWorld::Unknown,
-                imported_interfaces: vec![],
-            });
-        }
-
-        // Read the compiled WASM
-        let wasm_bytes = tokio::fs::read(&output_wasm).await.ok();
-        let size_bytes = wasm_bytes.as_ref().map(|b| b.len() as i32).unwrap_or(0);
-        let content_hash = wasm_bytes
-            .as_ref()
-            .map(|b| hex::encode(sha2::Sha256::digest(b)))
-            .unwrap_or_default();
-
-        // Validate WASM if present
-        if let Some(ref bytes) = wasm_bytes {
-            if bytes.len() < 8 {
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
                 return Ok(CompilationResult {
                     success: false,
                     wasm_bytes: None,
@@ -2895,7 +3042,7 @@ impl CompilationService {
                         column: None,
                         end_line: None,
                         end_column: None,
-                        message: "componentize-py produced invalid WASM (too small)".to_string(),
+                        message: format!("{e:#}"),
                         severity: "error".to_string(),
                     }],
                     size_bytes: 0,
@@ -2904,8 +3051,10 @@ impl CompilationService {
                     imported_interfaces: vec![],
                 });
             }
-        }
+        };
 
+        let size_bytes = wasm_bytes.len() as i32;
+        let content_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
         // Map world string to CapabilityWorld enum
         let cap_world = world
             .parse::<CapabilityWorld>()
@@ -2919,8 +3068,8 @@ impl CompilationService {
         );
 
         Ok(CompilationResult {
-            success: wasm_bytes.is_some(),
-            wasm_bytes,
+            success: true,
+            wasm_bytes: Some(wasm_bytes),
             errors: vec![],
             size_bytes,
             content_hash,

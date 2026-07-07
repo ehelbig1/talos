@@ -90,6 +90,29 @@ RUN mkdir -p /home/builder/.cargo/registry && \
 # so the unprivileged builder user can read it without owning the tree.
 COPY --from=builder-base /opt/talos-advisory-db /opt/talos-advisory-db
 
+# ---------- JS + Python componentize toolchains (M-13 wiring) ----------
+# `container::tool_command` runs `jco` / `componentize-py` in this image with
+# the same --network=none sandbox as cargo, so both need to be fully
+# self-contained here (no network at compile time — verified: neither tool
+# fetches once installed).
+#
+# Node: binary + global node_modules copied from the digest-pinned official
+# image (bookworm apt ships an EOL node; nodesource adds an apt-key supply
+# chain). jco is pinned to the exact version the compile path was verified
+# against (componentizes via an embedded StarlingMonkey engine).
+COPY --from=node:22.17.0-bookworm-slim@sha256:b04ce4ae4e95b522112c2e5c52f781471a5cbc3b594527bcddedee9bc48c03a0 /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:22.17.0-bookworm-slim@sha256:b04ce4ae4e95b522112c2e5c52f781471a5cbc3b594527bcddedee9bc48c03a0 /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    npm install -g @bytecodealliance/jco@1.25.1 && \
+    npm cache clean --force
+# Python: bookworm's python3.11 + componentize-py pinned to the verified
+# version (embeds its own CPython-for-WASI at componentize time — the
+# produced component is self-contained).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip3 install --no-cache-dir --break-system-packages componentize-py==0.24.0
+
 # Set cargo home so the registry cache mount works
 ENV CARGO_HOME=/home/builder/.cargo
 

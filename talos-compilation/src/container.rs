@@ -136,6 +136,16 @@ pub fn host_fallback_allowed() -> bool {
     )
 }
 
+/// Whether a compile invoked right now would actually run inside the
+/// sandbox container (container mode on AND a runtime binary present).
+///
+/// Callers use this to decide whether the M-13 host-toolchain gate applies:
+/// a sandboxed JS/Python compile needs no gate (that is the point of the
+/// sandbox); only the host-fallback path is production-gated.
+pub fn will_sandbox() -> bool {
+    container_enabled() && detect_runtime().is_some()
+}
+
 /// Detect which container runtime is available on the host.
 ///
 /// Prefers `podman` (rootless by default); falls back to `docker`.
@@ -465,6 +475,119 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Co
     Ok(cmd)
 }
 
+/// Build a [`Command`] that runs an arbitrary sandboxed TOOL (jco,
+/// componentize-py) against a compile workspace — the generic sibling of
+/// [`build_command`], which hardcodes `cargo` + the registry mount.
+///
+/// Sandboxed mode mounts ONLY the workspace (read-write, at `/build`) and
+/// runs the tool with the same security envelope as the Rust path:
+/// `--network=none`, read-only rootfs, tmpfs `/tmp`, memory/cpu limits,
+/// non-root, all capabilities dropped. Callers pass paths RELATIVE to the
+/// workspace in the tool args — the container working dir is `/build` and
+/// the host-fallback Command has `current_dir(workspace)` set, so the same
+/// relative args resolve in both modes.
+///
+/// Host fallback (container off / no runtime) returns a bare
+/// `Command::new(tool)` — the caller MUST gate that path through
+/// `require_host_lang_toolchain_allowed` (use [`will_sandbox`] to decide),
+/// because these tools execute user-supplied code at compile time
+/// (componentize-py runs Python introspection; jco evaluates module
+/// structure via StarlingMonkey).
+///
+/// `tool` must be a bare program name from this crate (no caller/user
+/// input) — asserted against a path-free charset as defense in depth.
+pub fn tool_command(tool: &str, workspace: &Path) -> Result<Command> {
+    // Defense in depth: refuse anything that isn't a simple program name.
+    // `tool` is always a crate-internal constant ("jco", "componentize-py");
+    // this assert keeps that true if a future caller plumbs user input here.
+    if tool.is_empty()
+        || !tool
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("invalid sandbox tool name: '{tool}'");
+    }
+
+    if !container_enabled() {
+        tracing::debug!(
+            tool,
+            "Container compilation disabled — using direct host tool"
+        );
+        let mut cmd = Command::new(tool);
+        cmd.current_dir(workspace);
+        return Ok(cmd);
+    }
+
+    let Some(runtime) = detect_runtime() else {
+        // Same fallback policy as build_command: the caller applies the
+        // production host-toolchain gate before running this Command.
+        tracing::warn!(
+            tool,
+            "Container compilation enabled but no runtime found — \
+             falling back to direct host tool"
+        );
+        let mut cmd = Command::new(tool);
+        cmd.current_dir(workspace);
+        return Ok(cmd);
+    };
+
+    let image = nonempty_env_or("TALOS_BUILDER_IMAGE", DEFAULT_IMAGE);
+    if !image
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b".:/_-".contains(&b))
+        || image.is_empty()
+    {
+        bail!(
+            "TALOS_BUILDER_IMAGE contains invalid characters: '{}'. \
+             Only alphanumeric, '.', ':', '/', '_', '-' are allowed.",
+            image
+        );
+    }
+    let memory = nonempty_env_or("TALOS_BUILDER_MEMORY", DEFAULT_MEMORY);
+    let cpus = nonempty_env_or("TALOS_BUILDER_CPUS", DEFAULT_CPUS);
+
+    let workspace_abs = workspace
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve workspace path: {}", workspace.display()))?;
+    let workspace_mount = format!("{}:/build:rw", workspace_abs.display());
+
+    let mut cmd = Command::new(runtime);
+    cmd.args([
+        "run",
+        "--rm",
+        // SECURITY: identical envelope to build_command — see its comments.
+        "--network=none",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,size=1g",
+        "--memory",
+        &memory,
+        "--cpus",
+        &cpus,
+        "--user",
+        "1000:1000",
+        "--cap-drop=ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        // Writable per-run scratch HOME: the rootfs is read-only, and jco's
+        // wizer step writes a wasmtime cache under the user's home — and it
+        // resolves that home via the passwd db (getpwuid), NOT $HOME, because
+        // componentize-js spawns wizer with a scrubbed env. A tmpfs at the
+        // image user's passwd home makes the cache writable regardless of how
+        // any tool resolves it, and dies with the container (nothing persists
+        // across runs — deliberate: a poisoned cache can't outlive its run).
+        "--tmpfs",
+        "/home/builder:rw,size=512m,uid=1000,gid=1000",
+        "-v",
+        &workspace_mount,
+        "-w",
+        "/build",
+        &image,
+        tool,
+    ]);
+    Ok(cmd)
+}
+
 #[cfg(test)]
 /// Crate-wide test serialization lock for env-var-touching tests.
 ///
@@ -697,5 +820,55 @@ mod tests {
         }
         std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
         std::env::remove_var("RUST_ENV");
+    }
+
+    #[test]
+    fn tool_command_disabled_mode_runs_host_tool_with_workspace_cwd() {
+        let _g = env_lock();
+        std::env::set_var("TALOS_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+
+        let ws = PathBuf::from("/tmp/test-tool-workspace");
+        let cmd = tool_command("componentize-py", &ws).unwrap();
+        let program = format!("{:?}", cmd.as_std().get_program());
+        assert!(
+            program.contains("componentize-py"),
+            "disabled mode must run the bare tool, got {program}"
+        );
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(ws.as_path()),
+            "host fallback must run from the workspace so relative args resolve"
+        );
+
+        std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+    }
+
+    #[test]
+    fn tool_command_rejects_non_program_names() {
+        let _g = env_lock();
+        std::env::set_var("TALOS_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+        // Paths, spaces, and shell-ish shapes must all be refused — the tool
+        // name is a crate-internal constant, and this pins that contract.
+        for bad in ["/usr/bin/evil", "jco componentize", "../jco", "", "a;b"] {
+            assert!(
+                tool_command(bad, &PathBuf::from("/tmp")).is_err(),
+                "{bad:?} must be rejected as a tool name"
+            );
+        }
+        std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+    }
+
+    #[test]
+    fn will_sandbox_false_when_container_disabled() {
+        let _g = env_lock();
+        std::env::set_var("TALOS_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+        assert!(
+            !will_sandbox(),
+            "container disabled must mean no sandbox — the M-13 host gate applies"
+        );
+        std::env::remove_var("TALOS_COMPILATION_CONTAINER");
     }
 }
