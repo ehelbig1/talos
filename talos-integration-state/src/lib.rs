@@ -481,7 +481,10 @@ async fn row_to_entry(
     // Encrypted rows carry the JSON string in `value_enc` (with `value` NULL);
     // legacy rows carry plaintext JSON in `value`. Decrypt when present, else
     // fall back to plaintext (the pre-encryption read path).
-    let value_enc: Option<Vec<u8>> = row.try_get("value_enc").unwrap_or(None);
+    let value_enc: Option<Vec<u8>> = row.try_get("value_enc").map_err(|e| {
+        tracing::error!(error = %e, "integration_state row.value_enc decode failed");
+        IntegrationStateError::Internal("row decode failed".into())
+    })?;
     let value = if let Some(ciphertext) = value_enc {
         let key_id: Uuid = row.try_get("value_key_id").map_err(|e| {
             tracing::error!(error = %e, "integration_state row.value_key_id decode failed");
@@ -515,12 +518,33 @@ async fn row_to_entry(
             IntegrationStateError::Internal("row encode failed".into())
         })?
     };
-    let updated_at_ms: i64 = row.try_get("updated_at_ms").unwrap_or(0);
-    let expires_at_ms: Option<i64> = row.try_get("expires_at_ms").unwrap_or(None);
-    let idx_str_1: Option<String> = row.try_get("idx_str_1").unwrap_or(None);
-    let idx_str_2: Option<String> = row.try_get("idx_str_2").unwrap_or(None);
-    let idx_ts_1_ms: Option<i64> = row.try_get("idx_ts_1_ms").unwrap_or(None);
-    let idx_int_1: Option<i64> = row.try_get("idx_int_1").unwrap_or(None);
+    let updated_at_ms: i64 = row
+        .try_get::<Option<i64>, _>("updated_at_ms")
+        .map_err(|e| {
+            tracing::error!(error = %e, "integration_state row.updated_at_ms decode failed");
+            IntegrationStateError::Internal("row decode failed".into())
+        })?
+        .unwrap_or(0);
+    let expires_at_ms: Option<i64> = row.try_get("expires_at_ms").map_err(|e| {
+        tracing::error!(error = %e, "integration_state row.expires_at_ms decode failed");
+        IntegrationStateError::Internal("row decode failed".into())
+    })?;
+    let idx_str_1: Option<String> = row.try_get("idx_str_1").map_err(|e| {
+        tracing::error!(error = %e, "integration_state row.idx_str_1 decode failed");
+        IntegrationStateError::Internal("row decode failed".into())
+    })?;
+    let idx_str_2: Option<String> = row.try_get("idx_str_2").map_err(|e| {
+        tracing::error!(error = %e, "integration_state row.idx_str_2 decode failed");
+        IntegrationStateError::Internal("row decode failed".into())
+    })?;
+    let idx_ts_1_ms: Option<i64> = row.try_get("idx_ts_1_ms").map_err(|e| {
+        tracing::error!(error = %e, "integration_state row.idx_ts_1_ms decode failed");
+        IntegrationStateError::Internal("row decode failed".into())
+    })?;
+    let idx_int_1: Option<i64> = row.try_get("idx_int_1").map_err(|e| {
+        tracing::error!(error = %e, "integration_state row.idx_int_1 decode failed");
+        IntegrationStateError::Internal("row decode failed".into())
+    })?;
     Ok(StoredEntry {
         key,
         value,

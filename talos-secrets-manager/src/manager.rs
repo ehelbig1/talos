@@ -322,19 +322,19 @@ impl ModuleSource {
 
 /// Free function so it can be used inside SecretsManager methods without
 /// requiring `&self`.
-fn row_to_summary(row: sqlx::postgres::PgRow) -> SecretSummary {
-    SecretSummary {
+fn row_to_summary(row: sqlx::postgres::PgRow) -> Result<SecretSummary> {
+    Ok(SecretSummary {
         id: row.get("id"),
         name: row.get("name"),
         key_path: row.get("key_path"),
-        description: row.try_get("description").ok().flatten(),
+        description: row.try_get("description")?,
         namespace: row
-            .try_get::<String, _>("namespace")
-            .unwrap_or_else(|_| "default".to_string()),
+            .try_get::<Option<String>, _>("namespace")?
+            .unwrap_or_else(|| "default".to_string()),
         created_at: row.get("created_at"),
-        expires_at: row.try_get("expires_at").unwrap_or(None),
-        rotation_reminder_days: row.try_get("rotation_reminder_days").unwrap_or(None),
-    }
+        expires_at: row.try_get("expires_at")?,
+        rotation_reminder_days: row.try_get("rotation_reminder_days")?,
+    })
 }
 
 pub trait SecretProvider: Send + Sync {
@@ -2928,17 +2928,16 @@ impl SecretsManager {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|r| {
+        rows.iter()
+            .map(|r| -> Result<(String, i64)> {
                 use sqlx::Row;
                 let ns: String = r
-                    .try_get("namespace")
-                    .unwrap_or_else(|_| "default".to_string());
-                let count: i64 = r.try_get("secret_count").unwrap_or(0);
-                (ns, count)
+                    .try_get::<Option<String>, _>("namespace")?
+                    .unwrap_or_else(|| "default".to_string());
+                let count: i64 = r.try_get::<Option<_>, _>("secret_count")?.unwrap_or(0);
+                Ok((ns, count))
             })
-            .collect())
+            .collect()
     }
 
     // ── MCP-handler support: lightweight listing + scanning ─────────────────
@@ -2980,7 +2979,7 @@ impl SecretsManager {
             .await?
         };
 
-        Ok(rows.into_iter().map(row_to_summary).collect())
+        rows.into_iter().map(row_to_summary).collect()
     }
 
     /// List secrets expiring within `within_days` from now (clamped 1..=365).
@@ -3001,7 +3000,7 @@ impl SecretsManager {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows.into_iter().map(row_to_summary).collect())
+        rows.into_iter().map(row_to_summary).collect()
     }
 
     // ─── r306: identifier reconciliation ──────────────────────────────────
@@ -3660,11 +3659,15 @@ impl SecretsManager {
 
         let mut out = Vec::new();
         for row in rows {
-            let allowed: Vec<String> = row.try_get("allowed_secrets").unwrap_or_default();
-            let kind: String = row.try_get("kind").unwrap_or_default();
+            let allowed: Vec<String> = row
+                .try_get::<Option<_>, _>("allowed_secrets")?
+                .unwrap_or_default();
+            let kind: String = row.try_get::<Option<_>, _>("kind")?.unwrap_or_default();
             out.push(ModuleSecretReference {
-                module_id: row.try_get("module_id").unwrap_or_default(),
-                module_name: row.try_get("name").unwrap_or_default(),
+                module_id: row
+                    .try_get::<Option<_>, _>("module_id")?
+                    .unwrap_or_default(),
+                module_name: row.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
                 source: ModuleSource::from_modules_kind(&kind),
                 wildcard: allowed.iter().any(|s| s == "*"),
             });
@@ -3691,14 +3694,13 @@ impl SecretsManager {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let id: Uuid = r.try_get("id").unwrap_or_default();
-                let name: String = r.try_get("name").unwrap_or_default();
-                (id, name)
+        rows.into_iter()
+            .map(|r| -> Result<(Uuid, String)> {
+                let id: Uuid = r.try_get::<Option<_>, _>("id")?.unwrap_or_default();
+                let name: String = r.try_get::<Option<_>, _>("name")?.unwrap_or_default();
+                Ok((id, name))
             })
-            .collect())
+            .collect()
     }
 
     /// Scan non-archived workflows for direct references to a secret in
@@ -3726,14 +3728,13 @@ impl SecretsManager {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let id: Uuid = r.try_get("id").unwrap_or_default();
-                let name: String = r.try_get("name").unwrap_or_default();
-                (id, name)
+        rows.into_iter()
+            .map(|r| -> Result<(Uuid, String)> {
+                let id: Uuid = r.try_get::<Option<_>, _>("id")?.unwrap_or_default();
+                let name: String = r.try_get::<Option<_>, _>("name")?.unwrap_or_default();
+                Ok((id, name))
             })
-            .collect())
+            .collect()
     }
 
     /// Aggregate set of secret names referenced by any of the user's modules
@@ -3818,17 +3819,18 @@ impl SecretsManager {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| SecretRefForExport {
-                name: r.try_get("name").unwrap_or_default(),
-                key_path: r.try_get("key_path").unwrap_or_default(),
-                namespace: r
-                    .try_get::<String, _>("namespace")
-                    .unwrap_or_else(|_| "default".to_string()),
-                description: r.try_get("description").unwrap_or(None),
+        rows.iter()
+            .map(|r| -> Result<SecretRefForExport> {
+                Ok(SecretRefForExport {
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    key_path: r.try_get::<Option<_>, _>("key_path")?.unwrap_or_default(),
+                    namespace: r
+                        .try_get::<Option<String>, _>("namespace")?
+                        .unwrap_or_else(|| "default".to_string()),
+                    description: r.try_get("description")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// True if a secret exists for the user at the given key_path. Used by
@@ -3910,20 +3912,19 @@ impl SecretsManager {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| SecretAuditEntry {
-                id: r.try_get("id").unwrap_or_default(),
-                secret_name: r
-                    .try_get::<Option<String>, _>("secret_name")
-                    .unwrap_or(None),
-                action: r.try_get("action").unwrap_or_default(),
-                actor_type: r.try_get("actor_type").unwrap_or_default(),
-                actor: r.try_get::<Option<String>, _>("actor").unwrap_or(None),
-                ip_address: r.try_get::<Option<String>, _>("ip_address").unwrap_or(None),
-                created_at: r.try_get("created_at").unwrap_or_default(),
+        rows.iter()
+            .map(|r| -> Result<SecretAuditEntry, sqlx::Error> {
+                Ok(SecretAuditEntry {
+                    id: r.try_get::<Option<_>, _>("id")?.unwrap_or_default(),
+                    secret_name: r.try_get::<Option<String>, _>("secret_name")?,
+                    action: r.try_get::<Option<_>, _>("action")?.unwrap_or_default(),
+                    actor_type: r.try_get::<Option<_>, _>("actor_type")?.unwrap_or_default(),
+                    actor: r.try_get::<Option<String>, _>("actor")?,
+                    ip_address: r.try_get::<Option<String>, _>("ip_address")?,
+                    created_at: r.try_get::<Option<_>, _>("created_at")?.unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Lightweight rows for the secret-health report (just creation + expiry).
@@ -3941,15 +3942,16 @@ impl SecretsManager {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SecretHealthRow {
-                name: r.try_get("name").unwrap_or_default(),
-                key_path: r.try_get("key_path").unwrap_or_default(),
-                created_at: r.try_get("created_at").unwrap_or_default(),
-                expires_at: r.try_get("expires_at").unwrap_or(None),
+        rows.into_iter()
+            .map(|r| -> Result<SecretHealthRow> {
+                Ok(SecretHealthRow {
+                    name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
+                    key_path: r.try_get::<Option<_>, _>("key_path")?.unwrap_or_default(),
+                    created_at: r.try_get::<Option<_>, _>("created_at")?.unwrap_or_default(),
+                    expires_at: r.try_get("expires_at")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Invalidate DEK cache (call after key rotation or security incident).

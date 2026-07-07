@@ -97,19 +97,20 @@ impl ScheduleRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ScheduleListRow {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.get("workflow_name"),
-                cron_expression: r.get("cron_expression"),
-                timezone: r.try_get("timezone").unwrap_or(None),
-                is_enabled: r.get("is_enabled"),
-                last_triggered_at: r.try_get("last_triggered_at").unwrap_or(None),
-                next_trigger_at: r.try_get("next_trigger_at").unwrap_or(None),
+        rows.iter()
+            .map(|r| -> Result<ScheduleListRow> {
+                Ok(ScheduleListRow {
+                    id: r.get("id"),
+                    workflow_id: r.get("workflow_id"),
+                    workflow_name: r.get("workflow_name"),
+                    cron_expression: r.get("cron_expression"),
+                    timezone: r.try_get::<Option<_>, _>("timezone")?,
+                    is_enabled: r.get("is_enabled"),
+                    last_triggered_at: r.try_get::<Option<_>, _>("last_triggered_at")?,
+                    next_trigger_at: r.try_get::<Option<_>, _>("next_trigger_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Toggle a schedule's `is_enabled` flag (handles both pause + resume).
@@ -159,17 +160,18 @@ impl ScheduleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ScheduleNextRunRow {
-                id: r.get("id"),
-                cron_expression: r.get("cron_expression"),
-                timezone: r.try_get("timezone").unwrap_or(None),
-                next_trigger_at: r.get("next_trigger_at"),
-                is_enabled: r.get("is_enabled"),
-                workflow_name: r.get("workflow_name"),
+        rows.iter()
+            .map(|r| -> Result<ScheduleNextRunRow> {
+                Ok(ScheduleNextRunRow {
+                    id: r.get("id"),
+                    cron_expression: r.get("cron_expression"),
+                    timezone: r.try_get::<Option<_>, _>("timezone")?,
+                    next_trigger_at: r.get("next_trigger_at"),
+                    is_enabled: r.get("is_enabled"),
+                    workflow_name: r.get("workflow_name"),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Health-check info: schedule fields + parent workflow id/name.
@@ -190,17 +192,20 @@ impl ScheduleRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|r| ScheduleHealthRow {
-            id: r.get("id"),
-            cron_expression: r.get("cron_expression"),
-            timezone: r
-                .try_get::<String, _>("timezone")
-                .unwrap_or_else(|_| "UTC".to_string()),
-            is_enabled: r.try_get("is_enabled").unwrap_or(false),
-            last_triggered_at: r.try_get("last_triggered_at").unwrap_or(None),
-            next_trigger_at: r.try_get("next_trigger_at").unwrap_or(None),
-            workflow_id: r.get("workflow_id"),
-            workflow_name: r.get("workflow_name"),
-        }))
+        row.map(|r| -> Result<ScheduleHealthRow> {
+            Ok(ScheduleHealthRow {
+                id: r.get("id"),
+                cron_expression: r.get("cron_expression"),
+                timezone: r
+                    .try_get::<Option<String>, _>("timezone")?
+                    .unwrap_or_else(|| "UTC".to_string()),
+                is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                last_triggered_at: r.try_get::<Option<_>, _>("last_triggered_at")?,
+                next_trigger_at: r.try_get::<Option<_>, _>("next_trigger_at")?,
+                workflow_id: r.get("workflow_id"),
+                workflow_name: r.get("workflow_name"),
+            })
+        })
+        .transpose()
     }
 }
