@@ -25,7 +25,7 @@ export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/n
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
         check build lint lint-frontend hooks test test-changed test-integration coverage-html audit check-catalog ci \
-        drill clean nuke smoke rls-preflight _wait-healthy
+        drill clean nuke smoke rls-preflight sqlx-prepare sqlx-check _wait-healthy
 
 ## ──── Dev ──────────────────────────────────────────────────────────
 
@@ -143,6 +143,25 @@ coverage-html: ## HTML coverage report via cargo-tarpaulin (slow; local only)
 	@command -v cargo-tarpaulin >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ cargo-tarpaulin missing\033[0m — install: cargo install cargo-tarpaulin --locked\n'; exit 1; }
 	@cargo tarpaulin --out Html
+
+sqlx-prepare: ## Regenerate the compile-checked .sqlx offline cache (needs a migrated DATABASE_URL)
+	@command -v sqlx >/dev/null 2>&1 \
+	    || { printf '\033[1;31m✗ sqlx-cli missing\033[0m — install: cargo install sqlx-cli --locked\n'; exit 1; }
+	@[ -n "$$DATABASE_URL" ] \
+	    || { printf '\033[1;31m✗ DATABASE_URL unset\033[0m — point it at a MIGRATED Postgres (e.g. the compose DB or a disposable pgvector).\n'; exit 1; }
+	@# --all-targets so queries in test/bin targets are collected too, else
+	@# `sqlx-check` (and CI) would flag them as missing from the cache.
+	@SQLX_OFFLINE=false cargo sqlx prepare --workspace -- --all-targets
+	@printf '\033[1;32m✓ .sqlx cache regenerated — commit the changes\033[0m\n'
+
+sqlx-check: ## Verify the committed .sqlx cache matches the queries (needs a migrated DATABASE_URL) — CI gate
+	@command -v sqlx >/dev/null 2>&1 \
+	    || { printf '\033[1;31m✗ sqlx-cli missing\033[0m — install: cargo install sqlx-cli --locked\n'; exit 1; }
+	@[ -n "$$DATABASE_URL" ] \
+	    || { printf '\033[1;31m✗ DATABASE_URL unset\033[0m — point it at a MIGRATED Postgres.\n'; exit 1; }
+	@SQLX_OFFLINE=false cargo sqlx prepare --workspace --check -- --all-targets \
+	    || { printf '\033[1;31m✗ .sqlx cache is STALE\033[0m — run `make sqlx-prepare` and commit the result.\n'; exit 1; }
+	@printf '\033[1;32m✓ .sqlx cache is up to date\033[0m\n'
 
 audit: ## Supply-chain gates — cargo-deny (advisories + licenses + bans + sources), secret scan, migration idempotency
 	@command -v cargo-deny  >/dev/null 2>&1 \

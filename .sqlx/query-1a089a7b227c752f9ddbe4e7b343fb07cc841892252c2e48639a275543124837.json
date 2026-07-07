@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker_provisioning_tokens\n             SET used_at = now(), used_by_worker_id = $2\n             WHERE token_hash = $1\n               AND used_at IS NULL\n               AND revoked_at IS NULL\n               AND expires_at > now()\n               AND (worker_id IS NULL OR worker_id = $2)\n               AND (worker_id IS NOT NULL OR NOT $3)\n             RETURNING worker_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "worker_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "1a089a7b227c752f9ddbe4e7b343fb07cc841892252c2e48639a275543124837"
+}

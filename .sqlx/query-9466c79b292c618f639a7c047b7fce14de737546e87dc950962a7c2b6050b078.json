@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT worker_id, public_key, supports_sealing, active, created_at, last_seen_at\n             FROM worker_identities\n             ORDER BY worker_id, created_at, public_key",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "worker_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "public_key",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "supports_sealing",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9466c79b292c618f639a7c047b7fce14de737546e87dc950962a7c2b6050b078"
+}

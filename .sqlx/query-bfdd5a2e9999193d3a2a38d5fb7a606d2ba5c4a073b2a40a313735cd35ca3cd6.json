@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO worker_identities (worker_id, public_key, supports_sealing)\n                     VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bfdd5a2e9999193d3a2a38d5fb7a606d2ba5c4a073b2a40a313735cd35ca3cd6"
+}

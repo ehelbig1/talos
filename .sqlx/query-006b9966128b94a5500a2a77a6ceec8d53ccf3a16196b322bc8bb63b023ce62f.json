@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker_identities SET active = false\n             WHERE worker_id = $1 AND public_key = $2 AND active",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "006b9966128b94a5500a2a77a6ceec8d53ccf3a16196b322bc8bb63b023ce62f"
+}
