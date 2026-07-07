@@ -25,12 +25,13 @@ pub fn record_fuel(
     module_id: Option<Uuid>,
     fuel_consumed: i64,
     wall_time_ms: i64,
+    max_fuel: Option<i64>,
 ) {
     tokio::spawn(async move {
         if let Err(e) = sqlx::query(
             "INSERT INTO execution_cost_rollup \
-             (actor_id, workflow_id, execution_id, node_id, module_id, fuel_consumed, wall_time_ms) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (actor_id, workflow_id, execution_id, node_id, module_id, fuel_consumed, wall_time_ms, max_fuel) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(actor_id)
         .bind(workflow_id)
@@ -39,6 +40,7 @@ pub fn record_fuel(
         .bind(module_id)
         .bind(fuel_consumed)
         .bind(wall_time_ms)
+        .bind(max_fuel)
         .execute(&pool)
         .await
         {

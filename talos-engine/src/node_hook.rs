@@ -263,6 +263,11 @@ impl NodeLifecycleHook for ControllerNodeHook {
                 .node_label
                 .map(str::to_string)
                 .unwrap_or_else(|| ctx.node_id.to_string());
+            // `__fuel_limit__` is the limit the WORKER actually enforced
+            // (config override > module default, engine-clamped) — stamped
+            // next to `__fuel_consumed__`. None for outputs from pre-stamp
+            // workers; readers COALESCE back to modules.max_fuel.
+            let max_fuel = output.get("__fuel_limit__").and_then(JsonValue::as_i64);
             talos_cost_attribution::record_fuel(
                 self.pool.clone(),
                 ctx.actor_id,
@@ -272,6 +277,7 @@ impl NodeLifecycleHook for ControllerNodeHook {
                 ctx.module_id,
                 fuel,
                 i64::try_from(ctx.wall_time_ms).unwrap_or(i64::MAX),
+                max_fuel,
             );
         }
 
