@@ -113,7 +113,12 @@ impl ControllerNodeHook {
     /// `with_effective_actor(arg, workflow_default)` resolves to None and
     /// the hook bails. We now emit one WARN per dropped envelope with the
     /// key + node id so the gap is greppable.
-    fn persist_memory_write_if_present(&self, actor_id: Option<Uuid>, output: &JsonValue) {
+    /// `pub` (2026-07-07): `test_module` reuses this exact path so a
+    /// module's `__memory_write__` behaves identically in the dev-test
+    /// surface and in live workflows — pre-fix, test_module accepted the
+    /// envelope and silently dropped it (the hook only fired on engine
+    /// executions), a confusing divergence found by the functional sweep.
+    pub fn persist_memory_write_if_present(&self, actor_id: Option<Uuid>, output: &JsonValue) {
         let Some(mw) = output
             .get("__memory_write__")
             .and_then(JsonValue::as_object)

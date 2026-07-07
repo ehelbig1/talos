@@ -1145,19 +1145,37 @@ async fn handle_compile_custom_sandbox(
             .unwrap_or("");
         if user_name.is_empty() {
             // No new name requested — return the existing template directly.
-            return mcp_text(
-                req_id,
-                &format!(
-                    "Compilation skipped — identical source already compiled.\n\
-                     \n\
-                     Template ID: {}\n\
-                     WASM size: {} bytes\n\
-                     \n\
-                     To use this module in a workflow, pass the Template ID as the `module_id` in create_workflow.",
-                    existing_template_id,
-                    existing_wasm.len(),
-                ),
-            );
+            // Human prose + machine-parsable JSON block (same shape as the
+            // fresh-compile success response below).
+            return JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: req_id,
+                result: Some(serde_json::json!({
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": format!(
+                                "Compilation skipped — identical source already compiled.\n\
+                                 \n\
+                                 Module ID: {}\n\
+                                 WASM size: {} bytes\n\
+                                 \n\
+                                 Pass it as `module_id` in create_workflow / add_node_to_workflow, or run it with test_module.",
+                                existing_template_id,
+                                existing_wasm.len(),
+                            )
+                        },
+                        {
+                            "type": "text",
+                            "text": serde_json::json!({
+                                "module_id": existing_template_id.to_string(),
+                                "cache_hit": true,
+                            }).to_string()
+                        }
+                    ]
+                })),
+                error: None,
+            };
         }
         // User wants a different name — fall through to normal compilation
         // so a new named template is created. The compilation itself is fast
@@ -1373,9 +1391,9 @@ async fn handle_compile_custom_sandbox(
             let success_text = format!(
                 "Compilation successful!\n\
                  \n\
-                 Template ID: {}\n\
+                 Module ID: {}\n\
                  \n\
-                 To use this module in a workflow, pass the Template ID as the `module_id` in create_workflow / add_node_to_workflow.\n\
+                 Pass it as `module_id` in create_workflow / add_node_to_workflow.\n\
                  To execute it directly, call test_module with module_id: {}.{}",
                 template_id_str, template_id_str, warning_text
             );
@@ -1388,6 +1406,21 @@ async fn handle_compile_custom_sandbox(
                         {
                             "type": "text",
                             "text": success_text
+                        },
+                        // Machine-parsable block (sweep DX finding,
+                        // 2026-07-07): agents were regexing the UUID out
+                        // of the prose. The prose stays for humans; this
+                        // block is stable structure for tooling. The key
+                        // is `module_id` — the name every consumer
+                        // (add_node_to_workflow, test_module) actually
+                        // uses — retiring the "Template ID" label
+                        // mismatch.
+                        {
+                            "type": "text",
+                            "text": serde_json::json!({
+                                "module_id": template_id_str,
+                                "language": language_str,
+                            }).to_string()
                         }
                     ]
                 })),
@@ -3180,8 +3213,18 @@ async fn handle_test_module(
             worker::runtime::RetryPolicy::default(),
             None,
             security_policy,
-            None,  // capability_world_hint
-            None,  // max_fuel_override
+            None, // capability_world_hint
+            // Fuel: enforce the MODULE's own budget so test results are
+            // PREDICTIVE of workflow behavior. Pre-fix this was None (the
+            // runtime's env default), which masked the interpreter-fuel bug
+            // for a day — a JS module "passed" test_module then died with
+            // fuel-exhausted on every workflow dispatch (the fuel-four-paths
+            // trap, functional sweep 2026-07-07). Workflow node-config
+            // overrides can still raise it at dispatch; the module row is
+            // the baseline both paths now share. Non-positive rows (never
+            // written by the registry, which clamps ≥1M) fall back to the
+            // runtime default rather than a zero-fuel insta-kill.
+            u64::try_from(module.max_fuel).ok().filter(|f| *f > 0),
             false, // dry_run
             Some(effective_actor_id),
             user_id,
@@ -3193,12 +3236,42 @@ async fn handle_test_module(
     match execution_result {
         Ok(val) => {
             let output = talos_workflow_engine::ParallelWorkflowEngine::unwrap_output(&val);
+            // `__memory_write__` parity with the engine (sweep DX finding,
+            // 2026-07-07): pre-fix test_module accepted the envelope and
+            // silently dropped it — the persistence hook only fired on
+            // engine executions, so "test says ok, workflow behaves
+            // differently" again. Now:
+            //   * caller passed actor_id (ownership already verified
+            //     above) → persist through the SAME
+            //     ControllerNodeHook::persist_memory_write_if_present the
+            //     engine uses, and say so;
+            //   * no actor_id → keep the no-write behavior but SAY SO
+            //     instead of silently dropping.
+            let memory_write_note = if output.get("__memory_write__").is_some() {
+                if actor_id_opt.is_some() {
+                    talos_engine::node_hook::ControllerNodeHook::new(state.db_pool.clone())
+                        .persist_memory_write_if_present(actor_id_opt, output);
+                    Some(
+                        "output contains __memory_write__ — persisted to the supplied actor's \
+                         memory (same path as workflow execution)",
+                    )
+                } else {
+                    Some(
+                        "output contains __memory_write__ but NO actor_id was supplied — the \
+                         write was NOT persisted. Pass actor_id to test_module (or run in an \
+                         actor-bound workflow) to exercise the memory write.",
+                    )
+                }
+            } else {
+                None
+            };
             Some(mcp_text(
                 req_id.clone(),
                 &serde_json::json!({
                     "success": true,
                     "output": output,
                     "duration_ms": duration_ms,
+                    "memory_write": memory_write_note,
                 })
                 .to_string(),
             ))

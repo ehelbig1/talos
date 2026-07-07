@@ -1192,8 +1192,33 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
+    // Unknown-argument detection (see utils::unknown_argument_warning):
+    // arguments the tool's advertised schema doesn't declare are silently
+    // ignored by handlers — a typo'd param name is an invisible no-op
+    // (sweep finding: `depends_on` vs `connect_from` produced a
+    // disconnected-but-"working" workflow). Warn, don't reject: a warning
+    // catches caller typos AND schema under-declaration without turning
+    // either into a hard failure. Names only in the log — never values.
+    let arg_warning = crate::utils::unknown_argument_warning(name, &args);
+    if let Some(w) = arg_warning.as_deref() {
+        tracing::warn!(
+            target: "talos_mcp",
+            event_kind = "unknown_tool_arguments",
+            tool = name,
+            warning = w,
+            "tools/call received argument names not in the tool's inputSchema"
+        );
+    }
+    // Decorator applied to whichever domain dispatch claims the tool.
+    let decorate = |mut r: JsonRpcResponse| -> JsonRpcResponse {
+        if let Some(w) = arg_warning.as_deref() {
+            crate::utils::append_warning_block(&mut r, w);
+        }
+        r
+    };
+
     if let Some(r) = sandbox::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = workflows::dispatch(
         name,
@@ -1204,60 +1229,60 @@ async fn handle_tools_call(
     )
     .await
     {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = executions::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await
     {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = secrets::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = schedules::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = versions::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = webhooks::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = graph::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = modules::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = analytics::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = search::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = alerts::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) =
         knowledge_graph::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await
     {
-        return r;
+        return decorate(r);
     }
     if let Some(r) =
         configuration::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await
     {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = platform::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = advanced::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = actor::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
     if let Some(r) = ollama::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
-        return r;
+        return decorate(r);
     }
 
     // Dynamic catalog template tools (e.g. "Redis_Cache-v1", "HTTP_Request-v1") are in the

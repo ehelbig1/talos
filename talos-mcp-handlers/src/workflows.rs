@@ -2659,20 +2659,28 @@ async fn handle_trigger_workflow(
             // Sync-wait timed out OR async dispatch — return the
             // pollable execution_id with the historical message text.
             if let Some(wait) = wait_ms.filter(|w| *w > 0) {
-                mcp_text(
+                crate::utils::mcp_text_with_json(
                     req_id,
                     &format!(
                         "Workflow triggered.\nExecution ID: {}\nStatus: still running after {}ms wait.\n\nThe workflow has not completed yet. Use get_execution_status(execution_id: \"{}\", detail: true) to check when it finishes with full node-by-node output.",
                         exec.execution_id, wait, exec.execution_id
                     ),
+                    serde_json::json!({
+                        "execution_id": exec.execution_id.to_string(),
+                        "status": "running",
+                    }),
                 )
             } else {
-                mcp_text(
+                crate::utils::mcp_text_with_json(
                     req_id,
                     &format!(
                         "Workflow triggered.\nExecution ID: {}\nStatus: running\n\nUse get_execution_status(execution_id: \"{}\") to check results.\nAfter several runs, use get_execution_delta(workflow_id: \"{}\") to see how outputs are changing across executions.",
                         exec.execution_id, exec.execution_id, workflow_id
                     ),
+                    serde_json::json!({
+                        "execution_id": exec.execution_id.to_string(),
+                        "status": "running",
+                    }),
                 )
             }
         }
