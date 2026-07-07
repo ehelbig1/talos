@@ -217,16 +217,16 @@ pub fn validate_capability_level(
 /// Security note: a false-positive Minimal classification is safe because the
 /// tiered linker enforces the real security boundary at execution time.
 fn detect_world_from_type_section(bytes: &[u8]) -> Option<CapabilityWorld> {
-    // Ordered most-specific first so "database-node" is preferred over "network-node"
-    // in case both substrings appear (unlikely but defensive).
-    //
     // NOTE: No `talos:core` pre-filter here. The WIT worlds export just `run`
     // (not `talos:core/...`), so when DCE removes all import calls the binary
     // contains no `talos:core` strings at all — but cargo-component still embeds
     // the world name string (e.g. `minimal-node`) in the component type section.
     // The world-name patterns are specific enough to avoid false positives against
     // arbitrary non-Talos WASM, and the tiered linker enforces real security.
-    const WORLD_PATTERNS: &[(&[u8], CapabilityWorld)] = &[
+    //
+    // Sentinel tier: the explicit `__talos_world_<name>__` marker our codegen
+    // embeds — one per module by construction, so first match wins.
+    const SENTINEL_PATTERNS: &[(&[u8], CapabilityWorld)] = &[
         (b"__talos_world_database-node__", CapabilityWorld::Database),
         (b"__talos_world_agent-node__", CapabilityWorld::Agent),
         (b"__talos_world_secrets-node__", CapabilityWorld::Secrets),
@@ -243,7 +243,24 @@ fn detect_world_from_type_section(bytes: &[u8]) -> Option<CapabilityWorld> {
         (b"__talos_world_network-node__", CapabilityWorld::Network),
         (b"__talos_world_http-node__", CapabilityWorld::Http),
         (b"__talos_world_minimal-node__", CapabilityWorld::Minimal),
-        // Legacy fallback
+    ];
+    for (pattern, world) in SENTINEL_PATTERNS {
+        if bytes_contain(bytes, pattern) {
+            return Some(world.clone());
+        }
+    }
+
+    // Legacy tier: bare world-name substrings, as embedded by cargo-component
+    // (which encodes exactly ONE — its own world). A bare-name match is only
+    // trustworthy when it is UNIQUE: componentize-py embeds the ENTIRE
+    // consumed WIT text — every world's name — so first-match-wins classified
+    // every Python module as `Database` (the first pattern), silently
+    // INFLATING its stored world and therefore what the tiered linker grants
+    // at runtime. Ambiguity (>1 distinct world name present) returns None so
+    // classification falls back to the component's PARSED import section —
+    // ground truth, and exhaustive for foreign toolchains, which bind every
+    // interface their world declares (no DCE).
+    const LEGACY_PATTERNS: &[(&[u8], CapabilityWorld)] = &[
         (b"database-node", CapabilityWorld::Database),
         (b"agent-node", CapabilityWorld::Agent),
         (b"secrets-node", CapabilityWorld::Secrets),
@@ -256,13 +273,18 @@ fn detect_world_from_type_section(bytes: &[u8]) -> Option<CapabilityWorld> {
         (b"minimal-node", CapabilityWorld::Minimal),
         (b"talos:plugin", CapabilityWorld::Minimal),
     ];
-
-    for (pattern, world) in WORLD_PATTERNS {
+    let mut found: Option<CapabilityWorld> = None;
+    for (pattern, world) in LEGACY_PATTERNS {
         if bytes_contain(bytes, pattern) {
-            return Some(world.clone());
+            if found.is_some() {
+                // Two distinct world names in one binary = an embedded WIT
+                // document, not a world tag. Refuse to guess.
+                return None;
+            }
+            found = Some(world.clone());
         }
     }
-    None
+    found
 }
 
 /// Scan the binary for known `talos:core/*` interface name strings.
@@ -798,6 +820,38 @@ mod tests {
                 w
             );
         }
+    }
+
+    #[test]
+    fn type_section_scan_single_world_name_is_trusted() {
+        // cargo-component shape: exactly one bare world name embedded.
+        let blob = b"...some component bytes...secrets-node...more bytes...";
+        assert_eq!(
+            detect_world_from_type_section(blob),
+            Some(CapabilityWorld::Secrets)
+        );
+    }
+
+    #[test]
+    fn type_section_scan_refuses_ambiguous_world_names() {
+        // componentize-py shape: the consumed WIT text (every world name) is
+        // embedded verbatim. First-match-wins classified these as Database —
+        // world inflation for a minimal module. Ambiguity must return None so
+        // the parsed import section decides.
+        let blob =
+            b"world minimal-node {} world http-node {} world database-node {} world agent-node {}";
+        assert_eq!(detect_world_from_type_section(&blob[..]), None);
+    }
+
+    #[test]
+    fn type_section_sentinel_still_wins_outright() {
+        // The explicit codegen sentinel is one-per-module by construction and
+        // must keep first-match semantics even alongside stray bare names.
+        let blob = b"__talos_world_http-node__ ... minimal-node ... database-node";
+        assert_eq!(
+            detect_world_from_type_section(&blob[..]),
+            Some(CapabilityWorld::Http)
+        );
     }
 
     #[test]
