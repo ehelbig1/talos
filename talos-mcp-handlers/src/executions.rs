@@ -2715,6 +2715,21 @@ async fn handle_enqueue_workflow(
                     let output_data = talos_dlp_provider::redact_json(
                         &serde_json::to_value(&ctx.results).unwrap_or(serde_json::json!({})),
                     );
+                    // PR #423 sibling: a wait/confidence-gate pause returns
+                    // `Ok(ctx)` with `ctx.waiting = true` — the execution is
+                    // NOT completed. Persist status='waiting' so the row
+                    // stays resumable for the later approval/resume signal.
+                    if ctx.waiting {
+                        if let Err(ue) = repo.mark_execution_waiting(exec_id, &output_data).await {
+                            tracing::warn!(
+                                target: "talos_audit",
+                                execution_id = %exec_id,
+                                workflow_id = %wf_id,
+                                error = %ue,
+                                "enqueue_workflow: mark_execution_waiting UPDATE failed — execution row may stay in 'running' state and the pending resume will have nothing to advance"
+                            );
+                        }
+                    }
                     // MCP-802 (2026-05-14): log mark_execution_completed
                     // failures. Pre-fix `let _ = ...await` discarded the
                     // Result, so a transient DB UPDATE failure (pool
@@ -2728,7 +2743,9 @@ async fn handle_enqueue_workflow(
                     // MCP-776 (scheduler failure-marking). WARN with
                     // `target: "talos_audit"` so dashboards can
                     // correlate "stuck running" reports to DB health.
-                    if let Err(ue) = repo.mark_execution_completed(exec_id, &output_data).await {
+                    else if let Err(ue) =
+                        repo.mark_execution_completed(exec_id, &output_data).await
+                    {
                         tracing::warn!(
                             target: "talos_audit",
                             execution_id = %exec_id,

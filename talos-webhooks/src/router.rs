@@ -1826,7 +1826,23 @@ impl WebhookRouter {
                     let wf_repo =
                         talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
                             .with_encryption(self.secrets_manager.clone());
-                    if let Err(e) = wf_repo
+                    // PR #423 sibling: a wait/confidence-gate pause is NOT
+                    // completed — persist status='waiting' so the row stays
+                    // resumable, and tell the webhook caller "waiting" so
+                    // they don't treat the paused run as terminal.
+                    let is_waiting = ctx.waiting;
+                    if is_waiting {
+                        if let Err(e) = wf_repo
+                            .mark_execution_waiting(execution_id, &scrubbed_for_storage)
+                            .await
+                        {
+                            tracing::error!(
+                                execution_id = %execution_id,
+                                error = %e,
+                                "Failed to mark webhook execution waiting"
+                            );
+                        }
+                    } else if let Err(e) = wf_repo
                         .mark_execution_completed(execution_id, &scrubbed_for_storage)
                         .await
                     {
@@ -1839,7 +1855,7 @@ impl WebhookRouter {
 
                     let body = serde_json::json!({
                         "execution_id": execution_id,
-                        "status": "completed",
+                        "status": if is_waiting { "waiting" } else { "completed" },
                         "output": output_value,
                     })
                     .to_string();
