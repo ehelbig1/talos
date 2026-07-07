@@ -402,6 +402,10 @@ jobs:
         image: pgvector/pgvector:pg17
         env:
           POSTGRES_PASSWORD: sqlxcheck
+          # DATABASE_URL below points at /talos; without this the image
+          # only creates the default `postgres` DB and migrate fails with
+          # `database "talos" does not exist`.
+          POSTGRES_DB: talos
         ports:
           - 5432:5432
         options: >-
