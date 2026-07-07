@@ -318,22 +318,24 @@ impl ParallelWorkflowEngine {
                 .oci_url
                 .clone()
                 .unwrap_or_else(|| format!("redis:wasm:{module_id_resolved}")),
-            // Embed bytes directly so the worker doesn't depend on
-            // Redis pre-warm — bypasses the `wasm:{uid}:{id}` vs
-            // `wasm:{id}` key mismatch and template-UUID issues.
-            wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
-                None
-            } else {
+            // Embed bytes directly (no Redis pre-warm dependency) when they
+            // fit under the NATS-payload-aware cap; oversized components
+            // (interpreter toolchains: componentize-py/jco, 12-18MB) route
+            // by the `redis:wasm:` URI — see `dispatch_bytes` for the
+            // transport + integrity story.
+            wasm_bytes: if crate::dispatch_bytes::embeds_inline(&wasm_module.wasm_bytes) {
                 Some(wasm_module.wasm_bytes.clone())
-            },
-            // OCI modules (empty wasm_bytes) commit the expected hash
-            // so the worker verifies fetched content matches what the
-            // engine compiled. Inline bytes don't need this — HMAC
-            // already covers sha256(inline_bytes).
-            expected_wasm_hash: if wasm_module.wasm_bytes.is_empty() {
-                Some(wasm_module.content_hash.clone())
             } else {
                 None
+            },
+            // URI-fetched bytes (OCI modules AND oversized components)
+            // commit the expected hash so the worker verifies fetched
+            // content matches what the engine compiled. Inline bytes don't
+            // need this — HMAC already covers sha256(inline_bytes).
+            expected_wasm_hash: if crate::dispatch_bytes::embeds_inline(&wasm_module.wasm_bytes) {
+                None
+            } else {
+                Some(wasm_module.content_hash.clone())
             },
             capability_world: Some(wasm_module.capability_world.clone()),
             integration_name: wasm_module.integration_name.clone(),

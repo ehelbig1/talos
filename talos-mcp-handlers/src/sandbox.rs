@@ -128,6 +128,11 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "type": "object",
                         "description": "A JSON object mapping crate names to version strings (e.g. {\"chrono\": \"0.4\", \"uuid\": \"1\"}). PRE-BUNDLED (always available without declaring): serde, serde_json. Declaring them is harmless — the injector skips duplicates — but unnecessary. Only add third-party crates your logic specifically needs. NOTE: reqwest is NOT allowed — it links against browser wasm-bindgen bindings incompatible with wasm32-wasip2. For HTTP, use the host-provided WIT interfaces (talos::core::http, fetch, webhook, graphql) instead."
                     },
+                    "language": {
+                        "type": "string",
+                        "enum": ["rust", "javascript", "python"],
+                        "description": "Source language of `rust_code` (default: rust). JavaScript compiles via jco componentize — provide `export function run(input) { ... }` returning a JSON string. Python compiles via componentize-py — provide a module-level `def run(input: str) -> str:` (or the SDK's @talos_module-decorated function; a dict return is auto-JSON-serialized). For both, `capability_world` is authoritative and `dependencies` must be omitted (modules are self-contained; the sandbox has no network at componentize time). Note: JS/Python components are 12-18MB (embedded runtime) vs ~100KB for Rust."
+                    },
                     "rust_code": {
                         "type": "string",
                         "description": "The exact Rust source code for the module's execution logic.\n\
@@ -919,6 +924,37 @@ async fn handle_compile_custom_sandbox(
         return mcp_error(req_id, -32602, &msg);
     }
 
+    // Source language (M-13 wiring): rust (default) | javascript | python.
+    // Strict-parsed like capability_world — a typo'd language must not
+    // silently compile the source as Rust (a wall of irrelevant rustc
+    // errors for a .py module). TypeScript/Go are refused in the router
+    // with a clear message.
+    let language: Option<talos_compilation::ModuleLanguage> = match args.get("language") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(l)) => match l.trim().to_ascii_lowercase().as_str() {
+            "" | "rust" => None,
+            "javascript" | "js" => Some(talos_compilation::ModuleLanguage::JavaScript),
+            "python" | "py" => Some(talos_compilation::ModuleLanguage::Python),
+            other => {
+                return mcp_error(
+                        req_id,
+                        -32602,
+                        &format!(
+                            "Unsupported language '{other}'. Supported: rust (default),                              javascript, python. (TypeScript must be transpiled to JS first.)"
+                        ),
+                    );
+            }
+        },
+        Some(v) => {
+            let kind = crate::utils::json_type_name(v);
+            return mcp_error(
+                req_id,
+                -32602,
+                &format!("language must be a string ('rust'|'javascript'|'python'), got {kind}"),
+            );
+        }
+    };
+
     // Parse integration_name at the very top so a malformed value fails
     // BEFORE the expensive compile step. Rejected values produce a 4xx-
     // shaped error with the specific reason (regex / length / type).
@@ -989,6 +1025,13 @@ async fn handle_compile_custom_sandbox(
     }
 
     let dependencies = args.get("dependencies");
+    if language.is_some() && dependencies.is_some_and(|d| !d.is_null()) {
+        return mcp_error(
+            req_id,
+            -32602,
+            "dependencies is Rust-only (cargo crates). JavaScript/Python modules              must be self-contained — the sandbox has no network at componentize time.",
+        );
+    }
 
     // SECURITY: Validate dependencies against the allowlist
     if let Err(dep_error) = validate_dependencies(dependencies) {
@@ -1040,10 +1083,17 @@ async fn handle_compile_custom_sandbox(
         return resp;
     }
 
-    let rust_code = talos_workflow_creation_helpers::wrap_rust_code_with_talos_module(
-        inner_rust_code,
-        capability_world,
-    );
+    // Rust source gets the #[talos_module] macro wrap; JS/Python compile
+    // as-is (their world comes from the authoritative capability_world arg,
+    // passed to the language router below).
+    let rust_code = if language.is_none() {
+        talos_workflow_creation_helpers::wrap_rust_code_with_talos_module(
+            inner_rust_code,
+            capability_world,
+        )
+    } else {
+        inner_rust_code.to_string()
+    };
 
     // ── Pre-compilation vault:// check ──────────────────────────────────────
     // Block compilation if code references vault:// but allowed_secrets is empty.
@@ -1118,13 +1168,17 @@ async fn handle_compile_custom_sandbox(
     let job_id = uuid::Uuid::new_v4();
     let compilation = state
         .compiler
-        .compile_to_wasm_with_config(
+        .compile_to_wasm_with_language_and_world(
             user_id,
             job_id,
             "custom_sandbox",
             &rust_code,
             &serde_json::json!({}),
             dependencies,
+            language,
+            // Authoritative for JS/Python: the world was ceiling-checked
+            // above, so an in-source annotation must not widen it.
+            Some(capability_world),
         )
         .await;
 

@@ -2808,13 +2808,52 @@ impl CompilationService {
         dependencies: Option<&serde_json::Value>,
         language: Option<ModuleLanguage>,
     ) -> Result<CompilationResult> {
+        self.compile_to_wasm_with_language_and_world(
+            user_id,
+            job_id,
+            name,
+            source_code,
+            config,
+            dependencies,
+            language,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::compile_to_wasm_with_language`] with an explicit capability
+    /// world for the JS/Python paths. `world_override` (when `Some`) is
+    /// AUTHORITATIVE over in-source annotations — protocol surfaces
+    /// (compile_custom_sandbox's `capability_world` arg) validate the world
+    /// against actor ceilings BEFORE compiling, so letting a source
+    /// annotation widen it afterwards would bypass that gate. Ignored for
+    /// the Rust path (cargo-component derives the world from the macro).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compile_to_wasm_with_language_and_world(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        dependencies: Option<&serde_json::Value>,
+        language: Option<ModuleLanguage>,
+        world_override: Option<&str>,
+    ) -> Result<CompilationResult> {
         match language {
             Some(ModuleLanguage::Python) => {
-                self.compile_python_module(user_id, job_id, name, source_code, config)
-                    .await
+                self.compile_python_module(
+                    user_id,
+                    job_id,
+                    name,
+                    source_code,
+                    config,
+                    world_override,
+                )
+                .await
             }
             Some(ModuleLanguage::JavaScript) => {
-                self.compile_js_module(user_id, job_id, name, source_code)
+                self.compile_js_module(user_id, job_id, name, source_code, world_override)
                     .await
             }
             Some(ModuleLanguage::TypeScript) => {
@@ -2853,9 +2892,11 @@ impl CompilationService {
         job_id: Uuid,
         name: &str,
         source_code: &str,
+        world_override: Option<&str>,
     ) -> Result<CompilationResult> {
-        let world =
-            Self::detect_js_world(source_code).unwrap_or_else(|| "minimal-node".to_string());
+        let world = world_override.map(str::to_string).unwrap_or_else(|| {
+            Self::detect_js_world(source_code).unwrap_or_else(|| "minimal-node".to_string())
+        });
         self.send_event(
             user_id,
             job_id,
@@ -2935,6 +2976,7 @@ impl CompilationService {
         name: &str,
         source_code: &str,
         config: &serde_json::Value,
+        world_override: Option<&str>,
     ) -> Result<CompilationResult> {
         // M-13: same sandbox-or-gate rule as compile_python_to_wasm. This
         // path is the one hit by `compile_to_wasm_with_language`, so covering
@@ -2977,7 +3019,15 @@ impl CompilationService {
 
         // Run the compilation in a closure so we can ensure cleanup on all exit paths.
         let result = self
-            .compile_python_inner(user_id, job_id, name, source_code, config, &workspace)
+            .compile_python_inner(
+                user_id,
+                job_id,
+                name,
+                source_code,
+                config,
+                &workspace,
+                world_override,
+            )
             .await;
 
         // Cleanup workspace on ALL paths (success, error, early return).
@@ -3003,6 +3053,7 @@ impl CompilationService {
         source_code: &str,
         _config: &serde_json::Value,
         workspace: &std::path::Path,
+        world_override: Option<&str>,
     ) -> Result<CompilationResult> {
         self.send_event(
             user_id,
@@ -3011,8 +3062,9 @@ impl CompilationService {
             Some("Detecting Python capability world...".to_string()),
             Some(0.1),
         );
-        let world =
-            Self::detect_python_world(source_code).unwrap_or_else(|| "minimal-node".to_string());
+        let world = world_override.map(str::to_string).unwrap_or_else(|| {
+            Self::detect_python_world(source_code).unwrap_or_else(|| "minimal-node".to_string())
+        });
 
         tracing::info!(
             name = %name,
