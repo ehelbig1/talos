@@ -3526,10 +3526,18 @@ echo
 # `Option<T>` and propagates schema drift with `?` (NULL still yields the
 # documented default; a renamed/dropped/retyped column errors instead of
 # silently defaulting). Now GRADUATED to a HARD RULE (like check 6 for
-# talos-mcp-handlers): the count must stay 0 — any NEW silent read in a
-# repository crate is an outright failure. Fix by reading as
+# talos-mcp-handlers): the count must stay 0 — any NEW silent read is an
+# outright failure. Fix by reading as
 # `.try_get::<Option<_>, _>("col")?.unwrap_or(default)` (or a typed
 # `FromRow`/`query_as!` mapping), NOT by re-adding a baseline.
+#
+# WIDENED TO WORKSPACE-WIDE 2026-07-07: the original `talos-*-repository`
+# glob was a NAMING scope, not a ROLE scope — 62 more sites of the identical
+# class lived in DB-reading crates that are repositories by role but not by
+# name (talos-secrets-manager 24, talos-module-executions 12, talos-registry
+# 11, talos-schedule-repo 7, talos-integration-state 7, talos-auth 1). All
+# burned down in the same pass that widened this check, so the whole
+# workspace is now at 0 and stays there.
 #
 # Regex catches BOTH plain `.try_get("col").unwrap_or` AND the turbofish
 # `.try_get::<Option<T>, _>("col").unwrap_or` form (the `(::<[^(]*>)?` group), but
@@ -3537,23 +3545,27 @@ echo
 # followed by `.unwrap_or`, so a `)?.unwrap_or` (error propagated) never matches.
 # (A silent read split across lines — `.try_get(...)` and `.unwrap_or` on separate
 # lines — still slips past this line-based grep; those are rare and caught in review.)
-bold "▶ check 52: silent try_get().unwrap_or reads in repository crates (must be 0)"
+bold "▶ check 52: silent try_get().unwrap_or reads (workspace-wide, must be 0)"
 # `|| true`: now that the count is 0, `grep -c` finds no matches and exits 1,
 # which under this script's `set -euo pipefail` would abort here — the very
 # success case (fully burned down) must not fail the script. awk still prints 0.
+# --exclude-dir: target (build artifacts), .git, .claude (session worktrees
+# checked out INSIDE the repo dir would otherwise re-surface stale copies),
+# node_modules (defensive; frontend has no .rs but the walk is cheaper skipped).
 REPO_SILENT_READ_COUNT="$( { grep -rEc '\.try_get(::<[^(]*>)?\([^)]*\)\.unwrap_or' \
         --include='*.rs' \
-        talos-*-repository 2>/dev/null || true; } \
+        --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude --exclude-dir=node_modules \
+        . 2>/dev/null || true; } \
     | awk -F: '{s+=$2} END {print s+0}')"
 if [ "$REPO_SILENT_READ_COUNT" -ne 0 ]; then
-    red "✗ ${REPO_SILENT_READ_COUNT} silent try_get().unwrap_or read(s) in repository crates (must be 0):"
-    grep -rEn '\.try_get(::<[^(]*>)?\([^)]*\)\.unwrap_or' --include='*.rs' talos-*-repository 2>/dev/null | sed 's/^/    /'
+    red "✗ ${REPO_SILENT_READ_COUNT} silent try_get().unwrap_or read(s) workspace-wide (must be 0):"
+    grep -rEn '\.try_get(::<[^(]*>)?\([^)]*\)\.unwrap_or' --include='*.rs' --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude --exclude-dir=node_modules . 2>/dev/null | sed 's/^/    /'
     yellow "  → a renamed/dropped column would read as a silent default, not an error."
     yellow "    Read as Option and propagate: .try_get::<Option<_>, _>(\"col\")?.unwrap_or(default)"
     yellow "    or use a typed FromRow / query_as! mapping."
     EXIT_CODE=1
 else
-    green "✓ no silent try_get().unwrap_or reads in repository crates"
+    green "✓ no silent try_get().unwrap_or reads workspace-wide"
 fi
 echo
 

@@ -836,7 +836,9 @@ impl AuthService {
             .await?;
 
             use sqlx::Row as _;
-            let new_attempts: i32 = row.try_get("failed_login_attempts").unwrap_or(1);
+            let new_attempts: i32 = row
+                .try_get::<Option<i32>, _>("failed_login_attempts")?
+                .unwrap_or(1);
 
             if new_attempts >= MAX_ATTEMPTS {
                 // Log account lockout server-side; return the same generic

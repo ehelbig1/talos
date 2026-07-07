@@ -1006,9 +1006,13 @@ impl ModuleRegistry {
             .flatten();
 
             if let Some(row) = successor {
-                let new_id: Uuid = row.try_get("id").unwrap_or(module_id);
-                let wasm_bytes: Vec<u8> = row.try_get("wasm_bytes").unwrap_or_default();
-                let cap_str: String = row.try_get("capability_world").unwrap_or_default();
+                let new_id: Uuid = row.try_get::<Option<_>, _>("id")?.unwrap_or(module_id);
+                let wasm_bytes: Vec<u8> = row
+                    .try_get::<Option<_>, _>("wasm_bytes")?
+                    .unwrap_or_default();
+                let cap_str: String = row
+                    .try_get::<Option<_>, _>("capability_world")?
+                    .unwrap_or_default();
                 tracing::info!(
                     old_module_id = %module_id,
                     new_module_id = %new_id,
@@ -1016,26 +1020,36 @@ impl ModuleRegistry {
                     "stale-name fallback: original module id was renamed/superseded; resolved a fresh module by name",
                 );
                 let m = WasmModule {
-                    name: row.try_get("name").unwrap_or(name),
-                    content_hash: row.try_get("content_hash").unwrap_or_default(),
+                    name: row.try_get::<Option<_>, _>("name")?.unwrap_or(name),
+                    content_hash: row
+                        .try_get::<Option<_>, _>("content_hash")?
+                        .unwrap_or_default(),
                     wasm_bytes,
                     source_code: None,
                     template_id: Some(new_id),
                     config: None,
-                    size_bytes: row.try_get("size_bytes").unwrap_or(0),
-                    max_fuel: clamp_execution_fuel(row.try_get("max_fuel").unwrap_or(0)),
+                    size_bytes: row.try_get::<Option<_>, _>("size_bytes")?.unwrap_or(0),
+                    max_fuel: clamp_execution_fuel(
+                        row.try_get::<Option<_>, _>("max_fuel")?.unwrap_or(0),
+                    ),
                     max_memory_mb: 128,
-                    allowed_hosts: row.try_get("allowed_hosts").unwrap_or_default(),
-                    allowed_methods: row.try_get("allowed_methods").unwrap_or_default(),
+                    allowed_hosts: row
+                        .try_get::<Option<_>, _>("allowed_hosts")?
+                        .unwrap_or_default(),
+                    allowed_methods: row
+                        .try_get::<Option<_>, _>("allowed_methods")?
+                        .unwrap_or_default(),
                     allowed_secrets: decode_allowed_secrets(&row, module_id),
-                    requires_approval_for: row.try_get("requires_approval_for").unwrap_or_default(),
+                    requires_approval_for: row
+                        .try_get::<Option<_>, _>("requires_approval_for")?
+                        .unwrap_or_default(),
                     user_id: None,
                     capability_world: parse_capability_world(&cap_str),
                     imported_interfaces: vec![],
                     dependencies: None,
                     oci_url: None,
                     language: "rust".to_string(),
-                    integration_name: row.try_get("integration_name").unwrap_or(None),
+                    integration_name: row.try_get::<Option<String>, _>("integration_name")?,
                 };
                 // Oversized (redis-routed) modules must be resident before
                 // returning — see the twin call in `get_module`.
