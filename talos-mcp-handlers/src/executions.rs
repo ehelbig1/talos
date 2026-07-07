@@ -22,7 +22,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_executions",
-            "description": "List recent executions for a workflow with status, time, and error info.",
+            "description": "List recent executions for ONE workflow (workflow_id required) with status, time, and error info. For a cross-workflow listing use list_recent_executions instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

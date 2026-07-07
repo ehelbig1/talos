@@ -1644,6 +1644,257 @@ pub fn spawn_workflow_post_create_tasks(
     }
 }
 
+// ── Unknown-argument detection (tools/call) ──────────────────────────────
+//
+// Functional-sweep finding (2026-07-07): passing `depends_on` to
+// `add_node_to_workflow` (real params: `connect_from`/`connect_to`) was
+// SILENTLY ignored — the node landed disconnected, the workflow "worked"
+// with the wrong semantics, and nothing hinted at the typo. Handlers read
+// args field-by-field, so any unrecognized key is an invisible no-op.
+//
+// The fix is a central check in `handle_tools_call`: compare the caller's
+// argument names against the tool's advertised `inputSchema.properties`
+// (the SAME schemas `tools/list` serves, so the check can never drift from
+// what clients are told). Unknown args produce a WARNING appended to the
+// response — deliberately not an error: with ~280 hand-written schemas, a
+// schema that under-declares a param its handler actually reads would turn
+// a working call into a hard failure. The warning surfaces both caller
+// typos AND schema drift without breaking either side.
+
+/// `tool name → declared argument names`, built once on first use from the
+/// same per-domain `tool_schemas()` sets the `tools/list` manifest serves.
+static TOOL_ARG_INDEX: std::sync::OnceLock<
+    std::collections::HashMap<String, std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn tool_arg_index(
+) -> &'static std::collections::HashMap<String, std::collections::HashSet<String>> {
+    TOOL_ARG_INDEX.get_or_init(|| {
+        let all: Vec<serde_json::Value> = [
+            crate::advanced::tool_schemas(),
+            crate::platform::tool_schemas(),
+            crate::search::tool_schemas(),
+            crate::workflows::tool_schemas(),
+            crate::modules::tool_schemas(),
+            crate::sandbox::tool_schemas(),
+            crate::executions::tool_schemas(),
+            crate::actor::tool_schemas(),
+            crate::analytics::tool_schemas(),
+            crate::secrets::tool_schemas(),
+            crate::schedules::tool_schemas(),
+            crate::versions::tool_schemas(),
+            crate::webhooks::tool_schemas(),
+            crate::graph::tool_schemas(),
+            crate::knowledge_graph::tool_schemas(),
+            crate::alerts::tool_schemas(),
+            crate::schemas::tool_schemas(),
+            crate::ollama::tool_schemas(),
+        ]
+        .concat();
+        all.iter()
+            .filter_map(|t| {
+                let name = t.get("name")?.as_str()?.to_string();
+                let props = t.get("inputSchema")?.get("properties")?.as_object()?;
+                Some((name, props.keys().cloned().collect()))
+            })
+            .collect()
+    })
+}
+
+/// Bounded Levenshtein distance for did-you-mean suggestions. Inputs are
+/// argument names (short); both sides are hard-capped so a pathological
+/// key can't burn CPU — anything longer than the cap simply never
+/// suggests (fine: suggestions are best-effort).
+fn arg_edit_distance(a: &str, b: &str) -> usize {
+    const CAP: usize = 64;
+    let a: Vec<char> = a.chars().take(CAP).collect();
+    let b: Vec<char> = b.chars().take(CAP).collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Best did-you-mean candidate for `unknown` among `declared`, or None
+/// when nothing is close enough to be a plausible typo.
+fn closest_declared_arg<'a>(
+    unknown: &str,
+    declared: &'a std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    declared
+        .iter()
+        .map(|d| (arg_edit_distance(unknown, d), d.as_str()))
+        // Threshold: ≤2 edits, or a prefix/substring relationship for
+        // longer names (catches `cron` → `cron_expression`).
+        .filter(|(dist, d)| {
+            *dist <= 2
+                || (unknown.len() >= 3 && (d.starts_with(unknown) || d.contains(unknown)))
+                || (d.len() >= 3 && unknown.contains(*d))
+        })
+        .min_by_key(|(dist, _)| *dist)
+        .map(|(_, d)| d)
+}
+
+/// Detect argument names the tool's advertised schema doesn't declare.
+/// Returns a human-readable warning, or `None` when everything matches,
+/// the tool isn't in the static index (dynamic `-v1` catalog tools), or
+/// the tool declares no properties at all.
+///
+/// SECURITY: only argument NAMES are inspected and echoed — never values
+/// (an unknown key's value could be a secret pasted under a typo'd name).
+pub(crate) fn unknown_argument_warning(tool: &str, args: &serde_json::Value) -> Option<String> {
+    let declared = tool_arg_index().get(tool)?;
+    let provided = args.as_object()?;
+    let mut notes: Vec<String> = provided
+        .keys()
+        // Underscore-prefixed keys are reserved for protocol metadata
+        // (e.g. `_meta`) — never warn on them.
+        .filter(|k| !k.starts_with('_') && !declared.contains(*k))
+        .map(|k| match closest_declared_arg(k, declared) {
+            Some(sugg) => format!("'{k}' (did you mean '{sugg}'?)"),
+            None => format!("'{k}'"),
+        })
+        .collect();
+    if notes.is_empty() {
+        return None;
+    }
+    notes.sort();
+    Some(format!(
+        "⚠ unknown argument{} ignored by '{tool}': {}. Unrecognized arguments have NO effect — \
+         check tools/list for the declared parameters.",
+        if notes.len() == 1 { "" } else { "s" },
+        notes.join(", ")
+    ))
+}
+
+/// Human prose + machine-parsable JSON as two content blocks.
+///
+/// Sweep DX finding (2026-07-07): id-bearing responses (`trigger_workflow`,
+/// `create_workflow`, `compile_custom_sandbox`) were prose-only, forcing
+/// agents to regex UUIDs out of sentences. The prose stays first for
+/// humans; the second block is a bare JSON object tooling can parse
+/// without touching the prose. Additive — existing content[0] consumers
+/// are unaffected.
+pub(crate) fn mcp_text_with_json(
+    id: Option<serde_json::Value>,
+    text: &str,
+    machine: serde_json::Value,
+) -> talos_mcp::JsonRpcResponse {
+    talos_mcp::JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: Some(serde_json::json!({
+            "content": [
+                { "type": "text", "text": text },
+                { "type": "text", "text": machine.to_string() },
+            ]
+        })),
+        error: None,
+    }
+}
+
+/// Append a warning text block to a tools/call response.
+///
+/// Applied to SUCCESS and TOOL-ERROR responses alike (live-proof finding:
+/// `create_schedule(cron: ...)` errors with "Missing 'cron_expression'" —
+/// the unknown-arg warning with its did-you-mean IS the diagnosis for that
+/// error, so suppressing it on isError responses hid the answer exactly
+/// when it mattered most). No-op on non-standard result shapes.
+pub(crate) fn append_warning_block(resp: &mut talos_mcp::JsonRpcResponse, warning: &str) {
+    if let Some(result) = resp.result.as_mut() {
+        if let Some(content) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
+            content.push(serde_json::json!({ "type": "text", "text": warning }));
+        }
+    }
+}
+
+#[cfg(test)]
+mod unknown_arg_tests {
+    use super::*;
+
+    #[test]
+    fn index_contains_core_tools_with_declared_args() {
+        let idx = tool_arg_index();
+        let add_node = idx
+            .get("add_node_to_workflow")
+            .expect("add_node_to_workflow in index");
+        assert!(add_node.contains("connect_from"));
+        assert!(add_node.contains("connect_to"));
+        assert!(!add_node.contains("depends_on"));
+        assert!(idx.contains_key("test_module"));
+        assert!(idx.contains_key("create_schedule"));
+    }
+
+    #[test]
+    fn sweep_regression_depends_on_warns_with_suggestion() {
+        // The exact mistake from the 2026-07-07 functional sweep.
+        let w = unknown_argument_warning(
+            "add_node_to_workflow",
+            &serde_json::json!({"workflow_id": "x", "node_id": "n", "depends_on": ["a"]}),
+        )
+        .expect("must warn");
+        assert!(w.contains("'depends_on'"), "warning: {w}");
+        // Value must never leak into the warning.
+        assert!(!w.contains("\"a\""), "arg value leaked: {w}");
+    }
+
+    #[test]
+    fn cron_suggests_cron_expression() {
+        let w = unknown_argument_warning(
+            "create_schedule",
+            &serde_json::json!({"workflow_id": "x", "cron": "* * * * *"}),
+        )
+        .expect("must warn");
+        assert!(w.contains("did you mean 'cron_expression'"), "warning: {w}");
+        assert!(!w.contains("* * * * *"), "arg value leaked: {w}");
+    }
+
+    #[test]
+    fn declared_args_and_meta_keys_do_not_warn() {
+        assert!(unknown_argument_warning(
+            "add_node_to_workflow",
+            &serde_json::json!({"workflow_id": "x", "node_id": "n", "connect_from": "a", "_meta": {}}),
+        )
+        .is_none());
+        // Unknown TOOL (dynamic -v1 catalog route) → no warning.
+        assert!(
+            unknown_argument_warning("Redis_Cache-v1", &serde_json::json!({"anything": 1}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn append_decorates_success_and_tool_errors() {
+        let mut ok = talos_mcp::mcp_text(None, "done");
+        append_warning_block(&mut ok, "⚠ w");
+        let content = ok.result.unwrap()["content"].clone();
+        assert_eq!(content.as_array().unwrap().len(), 2);
+        assert_eq!(content[1]["text"], "⚠ w");
+
+        // Tool errors ARE decorated: when the unknown arg caused the
+        // error (cron vs cron_expression), the warning is the diagnosis.
+        let mut err = talos_mcp::mcp_error(None, -32602, "bad");
+        append_warning_block(&mut err, "⚠ w");
+        let content = err.result.unwrap()["content"].clone();
+        assert_eq!(content.as_array().unwrap().len(), 2, "error decorated too");
+        assert_eq!(content[1]["text"], "⚠ w");
+    }
+
+    #[test]
+    fn edit_distance_bounded_on_pathological_input() {
+        let long = "x".repeat(100_000);
+        // Capped at 64 chars per side — must return quickly and not panic.
+        assert!(arg_edit_distance(&long, "connect_from") >= 1);
+    }
+}
+
 #[cfg(test)]
 mod bool_validation_tests {
     use super::validate_optional_bool;

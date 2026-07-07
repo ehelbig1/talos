@@ -212,6 +212,43 @@ impl WorkflowValidationService {
             });
         }
 
+        // ── Probable-intent hint: multiple parallel roots (sweep DX
+        // finding, 2026-07-07). Multiple nodes with no incoming edges are
+        // LEGAL — they all run in parallel from the trigger — but the most
+        // common way to arrive here is a typo'd/omitted edge parameter
+        // (`depends_on` instead of `connect_from`), which produced a
+        // "valid" workflow whose nodes silently ran in parallel instead of
+        // chained. Warning severity: never blocks, just asks the question
+        // validation is uniquely positioned to ask.
+        if node_ids.len() >= 2 {
+            let mut has_incoming: HashSet<&str> = HashSet::new();
+            for edge in &edges {
+                if let Some(tgt) = edge.get("target").and_then(|v| v.as_str()) {
+                    has_incoming.insert(tgt);
+                }
+            }
+            let roots: Vec<&str> = node_ids
+                .iter()
+                .filter(|id| !has_incoming.contains(**id))
+                .copied()
+                .collect();
+            if roots.len() >= 2 {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Warning,
+                    message: format!(
+                        "{} root nodes ({}) have no incoming edges and will ALL run in \
+                         parallel from the trigger. If you intended a sequence, connect \
+                         them (add_node_to_workflow's `connect_from`, or an edge in \
+                         graph_json). Ignore this if parallel fan-out is intentional.",
+                        roots.len(),
+                        roots.join(", "),
+                    ),
+                    node_id: None,
+                    category: "parallel_roots".into(),
+                });
+            }
+        }
+
         let node_id_set: HashSet<&str> = node_ids.iter().copied().collect();
         for edge in &edges {
             let src = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
