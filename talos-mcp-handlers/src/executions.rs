@@ -4729,13 +4729,17 @@ pub async fn build_execution_trace_json(
 
     // Per-node fuel + ceiling from `execution_cost_rollup`. The hook
     // records the node *label* (not the UUID) in `node_id`, so we key by
-    // label to match `node_traces` entries. NodeFuel.module_max_fuel is
-    // 0 for raw rust_code nodes that never landed in the modules table.
+    // label to match `node_traces` entries. `effective_max_fuel` is the
+    // limit the dispatch actually enforced — `COALESCE(rollup.max_fuel,
+    // modules.max_fuel)`: the worker-stamped `__fuel_limit__` when present
+    // (includes node-config overrides + engine clamp), the module default
+    // for pre-stamp rows. 0 for raw rust_code nodes that never landed in
+    // the modules table.
     struct NodeFuel {
         module_id: Option<Uuid>,
         fuel_consumed: i64,
         wall_time_ms: i64,
-        module_max_fuel: i64,
+        effective_max_fuel: i64,
     }
     let fuel_by_label: std::collections::HashMap<String, NodeFuel> = state
         .analytics_repo
@@ -4751,7 +4755,7 @@ pub async fn build_execution_trace_json(
                     module_id: mid,
                     fuel_consumed: fuel,
                     wall_time_ms: wall,
-                    module_max_fuel: ceiling.unwrap_or(0),
+                    effective_max_fuel: ceiling.unwrap_or(0),
                 },
             )
         })
@@ -4798,9 +4802,9 @@ pub async fn build_execution_trace_json(
                 // was a quoted string `"1.8"` — same wire-format
                 // inconsistency MCP-19 already swept across percentage
                 // fields.
-                let utilization_pct = if f.module_max_fuel > 0 {
+                let utilization_pct = if f.effective_max_fuel > 0 {
                     Some(talos_analytics_repository::format_percent(
-                        (f.fuel_consumed as f64 / f.module_max_fuel as f64) * 100.0,
+                        (f.fuel_consumed as f64 / f.effective_max_fuel as f64) * 100.0,
                     ))
                 } else {
                     None
@@ -4809,7 +4813,7 @@ pub async fn build_execution_trace_json(
                     "module_id": f.module_id.map(|m| m.to_string()),
                     "fuel_consumed": f.fuel_consumed,
                     "wall_time_ms": f.wall_time_ms,
-                    "current_max_fuel": if f.module_max_fuel > 0 { Some(f.module_max_fuel) } else { None },
+                    "current_max_fuel": if f.effective_max_fuel > 0 { Some(f.effective_max_fuel) } else { None },
                     "utilization_pct": utilization_pct,
                 })
             });

@@ -3090,10 +3090,21 @@ impl TalosRuntime {
         };
 
         // Inject fuel consumption metadata into the output JSON.
+        // `__fuel_limit__` records the limit THIS worker actually enforced
+        // (config override > module default, engine-clamped) so downstream
+        // fuel reports show the effective ceiling instead of re-deriving a
+        // possibly-different number from the modules table (pre-fix a node
+        // could report `fuel=2905011/1380000` — consumed over its own
+        // "limit" — because the display ceiling ignored the node-config
+        // override the dispatch honored).
         let mut out_json = out_json;
         if let Some(consumed) = fuel_consumed {
             if let Some(obj) = out_json.as_object_mut() {
                 obj.insert("__fuel_consumed__".to_string(), serde_json::json!(consumed));
+                obj.insert(
+                    "__fuel_limit__".to_string(),
+                    serde_json::json!(fuel_limit_for_calc),
+                );
             }
         }
 
@@ -3299,11 +3310,17 @@ impl TalosRuntime {
             Err(e) => return Err(anyhow::anyhow!("Component returned error: {}", e)),
         };
 
-        // Inject fuel consumption into string output if it's valid JSON
+        // Inject fuel consumption into string output if it's valid JSON.
+        // `__fuel_limit__`: see execute_module — the worker records the
+        // limit it actually enforced so reports show the effective ceiling.
         if let Some(consumed) = fuel_consumed {
             if let Ok(mut json_val) = serde_json::from_str::<JsonValue>(&output_str) {
                 if let Some(obj) = json_val.as_object_mut() {
                     obj.insert("__fuel_consumed__".to_string(), serde_json::json!(consumed));
+                    obj.insert(
+                        "__fuel_limit__".to_string(),
+                        serde_json::json!(fuel_limit_for_calc),
+                    );
                     if let Ok(s) = serde_json::to_string(&json_val) {
                         return Ok(s);
                     }
@@ -3567,9 +3584,14 @@ impl TalosRuntime {
             })?;
 
             // Inject fuel consumption metadata into the step output.
+            // Per-step limit (each pipeline step carries its own max_fuel).
             if let Some(consumed) = fuel_consumed {
                 if let Some(obj) = step_output.as_object_mut() {
                     obj.insert("__fuel_consumed__".to_string(), serde_json::json!(consumed));
+                    obj.insert(
+                        "__fuel_limit__".to_string(),
+                        serde_json::json!(step_max_fuel),
+                    );
                 }
             }
 

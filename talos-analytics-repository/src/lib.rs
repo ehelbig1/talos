@@ -4079,7 +4079,12 @@ impl AnalyticsRepository {
         user_id: Uuid,
     ) -> Result<Vec<(String, Option<Uuid>, i64, i64, Option<i64>)>> {
         let rows = sqlx::query_as::<_, (String, Option<Uuid>, i64, i64, Option<i64>)>(
-            "SELECT r.node_id, r.module_id, r.fuel_consumed, r.wall_time_ms, m.max_fuel \
+            "SELECT r.node_id, r.module_id, r.fuel_consumed, r.wall_time_ms, \
+                    /* Effective per-node limit: prefer the limit the worker \
+                       actually enforced (r.max_fuel, stamped from \
+                       __fuel_limit__); fall back to the module row for rows \
+                       written before the stamp existed. */ \
+                    COALESCE(r.max_fuel, m.max_fuel) \
              FROM execution_cost_rollup r \
              JOIN workflows w ON w.id = r.workflow_id \
              LEFT JOIN modules m ON m.id = r.module_id \
