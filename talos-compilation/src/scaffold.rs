@@ -77,6 +77,35 @@ pub fn compute_max_fuel(item_count: u64, bytes_per_item: u64, safety_multiplier:
     compute_max_fuel_with_llm_output(item_count, bytes_per_item, 0, safety_multiplier)
 }
 
+/// Structural fuel overhead of the module's language RUNTIME, independent
+/// of payload shape. Added ON TOP of the formula budget (and of an
+/// explicit `fuel_budget` declaration — the author's payload shape can't
+/// know about interpreter boot cost).
+///
+/// The payload formula above is calibrated for Rust components (~100 KB,
+/// near-zero startup). Interpreter-toolchain components embed their whole
+/// runtime and burn megafuel BEFORE the first line of user code runs:
+///
+/// - **JavaScript (jco/StarlingMonkey)**: measured ~2.84–2.91 M fuel for
+///   engine boot + source parse on a trivial doubler (functional sweep,
+///   2026-07-07). Budget 4 M for headroom on non-trivial sources.
+/// - **Python (componentize-py)**: measured ~0.21 M for embedded-CPython
+///   startup on the same doubler. Budget 1 M.
+/// - **Rust / unknown**: 0 — the formula's 50 K baseline already covers it.
+///
+/// Without this every JS module compiled with the default budget
+/// (~1.38 M) fails in workflows with `fuel exhausted` before user code
+/// executes — while confusingly SUCCEEDING under `test_module`, whose
+/// dispatch path applies a different limit (the fuel-four-paths trap).
+/// The sum is clamped to the dispatcher's 50 M cap by the caller.
+pub fn interpreter_fuel_baseline(language: &str) -> u64 {
+    match language.to_ascii_lowercase().as_str() {
+        "javascript" | "js" | "typescript" | "ts" => 4_000_000,
+        "python" | "py" => 1_000_000,
+        _ => 0,
+    }
+}
+
 /// Extended fuel computation that factors in LLM response size.
 ///
 /// LLM-backed modules typically have small input but 2-4 KB of generated
@@ -561,6 +590,31 @@ mod tests {
     fn fuel_formula_huge_payload_caps_at_50m() {
         // 1000 items × 100K bytes × 5x safety → saturates far above 50M.
         assert_eq!(compute_max_fuel(1000, 100_000, 5.0), 50_000_000);
+    }
+
+    #[test]
+    fn interpreter_baseline_covers_measured_boot_cost() {
+        // StarlingMonkey boot measured at ~2.91M on a trivial doubler —
+        // the JS baseline must clear it with headroom, and the default
+        // formula budget (~1.38M) + baseline must exceed it too.
+        assert!(interpreter_fuel_baseline("javascript") > 2_910_000);
+        assert!(interpreter_fuel_baseline("python") > 210_000);
+        // Case-insensitive + alias forms.
+        assert_eq!(
+            interpreter_fuel_baseline("JavaScript"),
+            interpreter_fuel_baseline("js")
+        );
+        assert_eq!(
+            interpreter_fuel_baseline("PYTHON"),
+            interpreter_fuel_baseline("py")
+        );
+        // Rust and unknown languages add nothing.
+        assert_eq!(interpreter_fuel_baseline("rust"), 0);
+        assert_eq!(interpreter_fuel_baseline(""), 0);
+        assert_eq!(interpreter_fuel_baseline("go"), 0);
+        // Default formula budget + JS baseline clears the measured boot.
+        let default_budget = compute_max_fuel(10, 2000, 2.0);
+        assert!(default_budget + interpreter_fuel_baseline("javascript") > 2_910_000);
     }
 
     #[test]

@@ -569,6 +569,8 @@ impl InlineCompileService {
                 &allowed_secrets,
                 input.integration_name.as_deref(),
                 input.dependencies,
+                // Inline add_node compiles are rust_code-only by definition.
+                "rust",
             )
             .await
             .map_err(|e| {

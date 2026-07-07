@@ -1256,9 +1256,27 @@ async fn handle_compile_custom_sandbox(
             // backfill the alias columns.
             use sha2::{Digest, Sha256};
             let content_hash = format!("{:x}", Sha256::digest(&wasm_bytes));
+            // Persist the ACTUAL source language ("rust" default). Routes
+            // future hot-update recompiles to the right toolchain; pre-fix
+            // the mirror hardcoded 'rust' for every sandbox compile.
+            let language_str = language
+                .as_ref()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "rust".to_string());
+            // Fuel = payload-shape budget (declared via fuel_budget, or the
+            // conservative formula default) + the language runtime's boot
+            // baseline. The baseline is added even to explicit fuel_budget
+            // declarations — the author's payload shape can't account for
+            // interpreter startup (StarlingMonkey boots at ~2.9M fuel; the
+            // bare formula default of ~1.38M made every default-budget JS
+            // module fail in workflows before user code ran). Clamped to
+            // the dispatcher's 50M cap.
             let computed_max_fuel: i64 = parse_fuel_budget_arg(args)
                 .unwrap_or_else(|| talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0))
-                as i64;
+                .saturating_add(talos_compilation::scaffold::interpreter_fuel_baseline(
+                    &language_str,
+                ))
+                .min(50_000_000) as i64;
             // DB CHECK constraint accepts short forms only ('minimal', 'http', 'trusted'…).
             let cw_short = if capability_world == "automation-node" {
                 "trusted"
@@ -1288,6 +1306,7 @@ async fn handle_compile_custom_sandbox(
                     &allowed_secrets,
                     integration_name.as_deref(),
                     dependencies,
+                    &language_str,
                 )
                 .await
             {

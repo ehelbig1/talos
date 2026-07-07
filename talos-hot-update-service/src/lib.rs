@@ -595,6 +595,12 @@ impl HotUpdateService {
                 &stored_secrets,
                 stored_integration_name.as_deref(),
                 stored_dependencies,
+                // Hot-update compiles through the RUST toolchain
+                // (wrap_source_with_module_macro); if the compile succeeded
+                // the stored artifact IS rust regardless of the module's
+                // previous language. JS/Python source fails the rust
+                // compile long before this write is reached.
+                "rust",
             )
             .await
             .map_err(|e| {
@@ -637,6 +643,8 @@ impl HotUpdateService {
                 &[],
                 None,
                 stored_dependencies,
+                // Rust toolchain — see the sandbox-path comment above.
+                "rust",
             )
             .await
             .map_err(|e| {
