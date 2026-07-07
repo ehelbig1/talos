@@ -98,6 +98,13 @@ pub struct ModuleMirrorWrite<'a> {
     pub dependencies: Option<&'a serde_json::Value>,
     pub config: Option<&'a serde_json::Value>,
     pub integration_name: Option<&'a str>,
+    /// Source language of the module ("rust" | "javascript" | "python" | …).
+    /// Persisted to `modules.language`, which routes hot-update recompiles
+    /// to the right toolchain (jco / componentize-py / cargo). Pre-fix this
+    /// was a hardcoded `'rust'` literal in the SQL, so every JS/Python
+    /// sandbox compile was stored as rust (functional-sweep finding,
+    /// 2026-07-07).
+    pub language: &'a str,
 }
 
 /// Module info for listing.
@@ -2267,6 +2274,7 @@ impl ModuleRepository {
         allowed_secrets: &[String],
         integration_name: Option<&str>,
         dependencies: Option<&serde_json::Value>,
+        language: &str,
     ) -> Result<()> {
         // Convenience overload: callers with no extra metadata
         // (max_memory_mb, imported_interfaces, config) get sensible
@@ -2293,6 +2301,7 @@ impl ModuleRepository {
             dependencies,
             config: None,
             integration_name,
+            language,
         })
         .await
     }
@@ -2334,6 +2343,7 @@ impl ModuleRepository {
         let dependencies = spec.dependencies;
         let config = spec.config;
         let integration_name = spec.integration_name;
+        let language = spec.language;
         // capability_world is stored in long form (`secrets-node`) on the
         // new modules table to match the worker's CapabilityWorld parser.
         // wasm_modules stores the short form (`secrets`); convert here.
@@ -2367,7 +2377,7 @@ impl ModuleRepository {
                 $5, $6, $7, \
                 $8, $9, $10, $11, $12, \
                 $15, $16, $17, $18, \
-                $13, 'rust', \
+                $13, $19, \
                 NOW(), NOW(), NOW() \
              ) \
              ON CONFLICT (id) DO UPDATE SET \
@@ -2378,6 +2388,11 @@ impl ModuleRepository {
                 content_hash = EXCLUDED.content_hash, \
                 size_bytes = EXCLUDED.size_bytes, \
                 max_fuel = EXCLUDED.max_fuel, \
+                /* language follows the recompile: a hot-update that switches \
+                   source language (rust rewrite of a js module, etc.) must \
+                   update the routing metadata or the NEXT hot-update would \
+                   re-route compilation to the wrong toolchain. */ \
+                language = EXCLUDED.language, \
                 /* max_memory_mb: preserve existing value (CASE WHEN guard) — \
                    default 128 from new INSERT shouldn't overwrite an operator- \
                    tuned ceiling on hot-update. Use COALESCE NULLIF since \
@@ -2427,6 +2442,7 @@ impl ModuleRepository {
         .bind(imported_interfaces)
         .bind(dependencies)
         .bind(config)
+        .bind(language)
         .execute(&self.db_pool)
         .await?;
         // rows_affected == 0 means the INSERT conflicted on `id` AND the
