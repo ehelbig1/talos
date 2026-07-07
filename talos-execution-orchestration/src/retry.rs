@@ -214,16 +214,15 @@ impl ExecutionOrchestrationService {
                         &wf_ctx,
                         &trigger_input_for_storage,
                     );
-                    if let Err(e) = repo_for_task
-                        .mark_execution_completed(execution_id, &output_json)
-                        .await
-                    {
-                        tracing::error!(
-                            execution_id = %execution_id,
-                            err = %e,
-                            "retry: failed to mark execution as completed"
-                        );
-                    }
+                    // Honor `wf_ctx.waiting` — see finalize.rs.
+                    crate::finalize::finalize_engine_success(
+                        repo_for_task.as_ref(),
+                        execution_id,
+                        wf_ctx.waiting,
+                        &output_json,
+                        "retry",
+                    )
+                    .await;
                 }
                 Err(e) => {
                     // MCP-447: DLP-redact the engine error before
