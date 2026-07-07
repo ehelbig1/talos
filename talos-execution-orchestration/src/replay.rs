@@ -287,16 +287,15 @@ impl ExecutionOrchestrationService {
                         &wf_ctx,
                         &trigger_input_for_storage,
                     );
-                    if let Err(e) = repo_for_task
-                        .mark_execution_completed(new_execution_id, &output_json)
-                        .await
-                    {
-                        tracing::error!(
-                            execution_id = %new_execution_id,
-                            err = %e,
-                            "replay: failed to mark execution as completed"
-                        );
-                    }
+                    // Honor `wf_ctx.waiting` — see finalize.rs.
+                    crate::finalize::finalize_engine_success(
+                        repo_for_task.as_ref(),
+                        new_execution_id,
+                        wf_ctx.waiting,
+                        &output_json,
+                        "replay",
+                    )
+                    .await;
                 }
                 Err(e) => {
                     // MCP-447: DLP-redact once at the source so both

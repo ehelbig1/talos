@@ -572,34 +572,55 @@ impl ExecutionOrchestrationService {
                         &wf_ctx,
                         &trigger_input_for_storage,
                     );
-                    if let Err(e) = workflow_repo_for_task
-                        .mark_execution_completed(execution_id, &output_json)
-                        .await
-                    {
-                        tracing::error!(
-                            execution_id = %execution_id,
-                            err = %e,
-                            "trigger: failed to mark execution as completed"
-                        );
-                    }
+                    // Honor `wf_ctx.waiting` (confidence-gate / wait-node
+                    // pause): the execution is NOT terminal — persist
+                    // status='waiting' so the pending approval has
+                    // something to resume. See finalize.rs for the
+                    // regression history (r295 extraction dropped this
+                    // branch; found live 2026-07-07).
+                    let kind = crate::finalize::finalize_engine_success(
+                        workflow_repo_for_task.as_ref(),
+                        execution_id,
+                        wf_ctx.waiting,
+                        &output_json,
+                        "trigger",
+                    )
+                    .await;
 
-                    // Live terminal event: broadcast to executionUpdates
+                    // Live event: broadcast to executionUpdates
                     // subscribers + persist to execution_events (see
                     // terminal_event.rs — semantics inherited from the
                     // pre-migration GraphQL store_and_send! macro).
+                    // Waiting is announced as Waiting, not Completed —
+                    // subscribers must not see a paused run as finished.
+                    let (event_status, event_msg) = match kind {
+                        crate::finalize::SuccessKind::Completed => (
+                            talos_engine::events::ExecutionStatus::Completed,
+                            "Workflow finished successfully".to_string(),
+                        ),
+                        crate::finalize::SuccessKind::Waiting => (
+                            talos_engine::events::ExecutionStatus::Waiting,
+                            "Workflow paused — awaiting approval/resume".to_string(),
+                        ),
+                    };
                     crate::terminal_event::emit_terminal_event(
                         &db_pool_for_events,
                         event_sender.as_ref(),
                         execution_id,
-                        talos_engine::events::ExecutionStatus::Completed,
-                        "Workflow finished successfully".to_string(),
+                        event_status,
+                        event_msg,
                         wf_ctx.trace_id.clone(),
                     )
                     .await;
 
                     // Phase 5.2: Reasoning-trace capture under the actor's
                     // scratchpad memory. Best-effort; failures land in
-                    // tracing, never propagate.
+                    // tracing, never propagate. Skipped for WAITING runs —
+                    // the outputs are partial; the resume path finalizes
+                    // the run and a partial trace keyed by execution_id
+                    // would masquerade as the full one.
+                    let trace_actor_id =
+                        trace_actor_id.filter(|_| kind == crate::finalize::SuccessKind::Completed);
                     if let Some(actor_id) = trace_actor_id {
                         let trace_value = serde_json::json!({
                             "execution_id": execution_id,
