@@ -47,6 +47,19 @@ RUN git clone --filter=tree:0 https://github.com/RustSec/advisory-db /opt/talos-
     git -C /opt/talos-advisory-db checkout --detach "${ADVISORY_DB_COMMIT}" && \
     chmod -R a+rX /opt/talos-advisory-db
 
+# JS + Python componentize toolchains for the HOST-fallback compile path —
+# the same reason cargo/cargo-component live in this image: dev compose runs
+# compiles host-direct inside the controller container. Pins mirror
+# Dockerfile.builder (the sandboxed production path); bump both together.
+COPY --from=node:22.17.0-bookworm-slim@sha256:b04ce4ae4e95b522112c2e5c52f781471a5cbc3b594527bcddedee9bc48c03a0 /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:22.17.0-bookworm-slim@sha256:b04ce4ae4e95b522112c2e5c52f781471a5cbc3b594527bcddedee9bc48c03a0 /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    npm install -g @bytecodealliance/jco@1.25.1 && \
+    npm cache clean --force && \
+    apt-get update && apt-get install -y --no-install-recommends python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip3 install --no-cache-dir --break-system-packages componentize-py==0.24.0
+
 # ════════════════════════════════════════════════════════════════════════════
 # Stage 2: Build the controller binary
 # ════════════════════════════════════════════════════════════════════════════

@@ -1713,8 +1713,9 @@ export function run(input) {{
         "**JavaScript scaffold for `{world}`:**\n\n```javascript\n{scaffold}\n```\n\n\
          **Next steps:**\n\
          1. Fill in your logic in the scaffold above\n\
-         2. Compile with `jco componentize` targeting the `{world}` world\n\
-         3. Use `compile_custom_sandbox` or `add_node_to_workflow` to deploy"
+         2. Submit it via `compile_custom_sandbox` with `language: \"javascript\"` and \
+         `capability_world: \"{world}\"` — the server compiles it sandboxed via jco \
+         (no local toolchain needed; `dependencies` must be omitted)"
     );
 
     mcp_text(req_id, &text)
@@ -1850,8 +1851,11 @@ def run(input: str) -> str:
         "**Python scaffold for `{world}`:**\n\n```python\n{scaffold}\n```\n\n\
          **Next steps:**\n\
          1. Fill in your logic in the scaffold above\n\
-         2. Compile with `componentize-py` targeting the `{world}` world\n\
-         3. Use `compile_custom_sandbox` or `add_node_to_workflow` to deploy"
+         2. Submit it via `compile_custom_sandbox` with `language: \"python\"` and \
+         `capability_world: \"{world}\"` — the server compiles it sandboxed via \
+         componentize-py (no local toolchain needed; a module-level \
+         `def run(input: str) -> str` is adapted automatically; `dependencies` \
+         must be omitted)"
     );
 
     mcp_text(req_id, &text)

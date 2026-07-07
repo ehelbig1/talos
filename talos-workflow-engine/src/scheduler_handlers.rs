@@ -1783,18 +1783,20 @@ impl ParallelWorkflowEngine {
                 // subtle serde/Tokio interaction can be isolated
                 // and reverted if needed without entangling other
                 // changes.
-                wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
-                    None
-                } else {
+                wasm_bytes: if crate::dispatch_bytes::embeds_inline(&wasm_module.wasm_bytes) {
                     Some(wasm_module.wasm_bytes.clone())
+                } else {
+                    None
                 },
                 // Hash is load-bearing only when the worker has to
-                // fetch bytes by URI; inline bytes are already covered
-                // by the job-envelope HMAC.
-                expected_wasm_hash: if wasm_module.wasm_bytes.is_empty() {
-                    Some(wasm_module.content_hash.clone())
-                } else {
+                // fetch bytes by URI (OCI modules and oversized
+                // interpreter-toolchain components — see `dispatch_bytes`);
+                // inline bytes are already covered by the job-envelope HMAC.
+                expected_wasm_hash: if crate::dispatch_bytes::embeds_inline(&wasm_module.wasm_bytes)
+                {
                     None
+                } else {
+                    Some(wasm_module.content_hash.clone())
                 },
                 capability_world: Some(wasm_module.capability_world.clone()),
                 integration_name: wasm_module.integration_name.clone(),

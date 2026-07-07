@@ -244,20 +244,21 @@ impl ParallelWorkflowEngine {
                 // `wasm:{id}`) and the prior-comment-claim-but-not-code
                 // inconsistency above.
                 wasm_bytes: artifact.as_ref().and_then(|a| {
-                    if a.wasm_bytes.is_empty() {
-                        None
-                    } else {
+                    if crate::dispatch_bytes::embeds_inline(&a.wasm_bytes) {
                         Some(a.wasm_bytes.clone())
+                    } else {
+                        None
                     }
                 }),
                 // Worker only consults the hash on a URI fetch; when
                 // bytes are inline, the envelope HMAC already covers
-                // them. Emit only for the fetch-by-URI path.
+                // them. Oversized components (interpreter toolchains)
+                // route by URI too — see `dispatch_bytes`.
                 expected_wasm_hash: artifact.as_ref().and_then(|a| {
-                    if a.wasm_bytes.is_empty() {
-                        Some(a.content_hash.clone())
-                    } else {
+                    if crate::dispatch_bytes::embeds_inline(&a.wasm_bytes) {
                         None
+                    } else {
+                        Some(a.content_hash.clone())
                     }
                 }),
                 // Pipeline dispatch uses a chain-level capability
