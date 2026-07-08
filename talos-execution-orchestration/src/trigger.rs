@@ -485,10 +485,13 @@ impl ExecutionOrchestrationService {
                         "trigger: failed to mark execution as failed after graph load error"
                     );
                 }
-                return Err(OrchestrationError::Internal(anyhow::anyhow!(
-                    "graph load failed: {}",
-                    user_msg
-                )));
+                // Surface the DLP-redacted, actionable message to the
+                // caller as a WORKFLOW-DEFINITION error (empty/malformed
+                // graph) — not `Internal`, which would swallow it into a
+                // generic "Internal server error" AND page as a server-side
+                // failure. `redacted_msg` (not `user_msg`) because a
+                // malformed-graph body could echo a secret.
+                return Err(OrchestrationError::GraphLoadFailed(redacted_msg));
             }
         };
 

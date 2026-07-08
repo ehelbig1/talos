@@ -360,6 +360,10 @@ pub fn orchestration_error_to_response(
         E::ConcurrencyLimitExceeded(reason) => reason.clone(),
         E::DispatchFailed(reason) => reason.clone(),
         E::InvalidArgument(reason) => reason.clone(),
+        // Workflow-definition error (empty/malformed graph) — surface the
+        // actionable message verbatim; NOT a server-side failure, so no
+        // ERROR log here (the message is already DLP-redacted upstream).
+        E::GraphLoadFailed(reason) => reason.clone(),
         E::Database(_) | E::Internal(_) => {
             // Don't surface raw DB / engine error text to clients —
             // log full detail server-side, return a generic message.
