@@ -939,3 +939,41 @@ async fn module_artifact_cache_is_per_engine_not_global() {
         "a separate engine instance must not reuse another run's artifact cache"
     );
 }
+
+/// Sub-workflow engines must NOT carry a persisting event sink.
+///
+/// `execute_subworkflow_graph` runs the inner engine under a synthetic
+/// execution id with no `workflow_executions` row, so the FK-bound
+/// `PostgresEventSink` would drop every event (regression round 5,
+/// 2026-07-08). The fix detaches the sink via `clear_event_sink`; this
+/// test locks in both halves: `adapter_set` PROPAGATES the parent sink
+/// (so a normal sub-engine build would inherit it), and `clear_event_sink`
+/// removes it.
+#[tokio::test]
+async fn sub_engine_event_sink_is_detachable() {
+    use std::sync::Arc;
+    use talos_workflow_engine_test_utils::capture::CaptureEventSink;
+
+    let mut parent = ParallelWorkflowEngine::new();
+    parent.set_event_sink(Arc::new(CaptureEventSink::new()));
+    assert!(
+        parent.event_sink.is_some(),
+        "parent engine should hold the sink we just set"
+    );
+
+    // adapter_set + into_engine mirrors the sub-workflow build path; the
+    // sink is inherited (this is exactly the pre-fix leak vector).
+    let mut sub = parent.adapter_set().into_engine();
+    assert!(
+        sub.event_sink.is_some(),
+        "sub-engine inherits the parent's event sink via adapter_set"
+    );
+
+    // The fix: execute_subworkflow_graph calls this before running.
+    sub.clear_event_sink();
+    assert!(
+        sub.event_sink.is_none(),
+        "clear_event_sink must detach the FK-doomed sink so inner events \
+         aren't persisted under a synthetic execution id"
+    );
+}
