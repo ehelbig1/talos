@@ -465,9 +465,29 @@ impl TalosContext {
         header_name: &str,
         value: &'a str,
     ) -> Result<std::borrow::Cow<'a, str>, String> {
-        let Some(vault_path) = value.strip_prefix("vault://") else {
+        // Resolve a `vault://<path>` reference embedded ANYWHERE in the header
+        // value, not only as an exact prefix. The canonical integration-module
+        // pattern carries a scheme prefix, e.g.
+        //   AUTH_HEADER = "Bearer vault://oauth/gmail/<uid>/<email>/access_token"
+        // A bare-prefix-only match (the old `strip_prefix`) left that literal
+        // string in the outbound header, so the provider returned 401. We keep
+        // any `prefix`/`suffix` around the ref (the caller-supplied auth scheme)
+        // and substitute the token IN PLACE. This must stay consistent with the
+        // controller-side prefetch extractor (talos_workflow_engine::
+        // vault_resolver::extract_vault_refs), which uses the identical split.
+        let Some(marker) = value.find("vault://") else {
             return Ok(std::borrow::Cow::Borrowed(value));
         };
+        let prefix = &value[..marker];
+        let after = &value[marker + "vault://".len()..];
+        let (vault_path, suffix) = match after.find(char::is_whitespace) {
+            Some(ws) => (&after[..ws], &after[ws..]),
+            None => (after, ""),
+        };
+        if vault_path.is_empty() {
+            // "vault://" with no path token — nothing to resolve; leave untouched.
+            return Ok(std::borrow::Cow::Borrowed(value));
+        }
 
         // Hash the vault path once up-front. Used both for audit
         // correlation (host log) and as the *only* identifier surfaced
@@ -565,7 +585,19 @@ impl TalosContext {
         // inventory while keeping the log line compact.
         match self.provider.resolve(vault_path, exec_id).await {
             Ok(handle) => {
-                let header_result = self.provider.into_auth_header(handle, header_name);
+                // Bare value ("vault://<path>") → preserve legacy behaviour
+                // EXACTLY: into_auth_header reconstructs the auth header (adds
+                // "Bearer " for an Authorization header when the token carries no
+                // scheme). Embedded value ("Bearer vault://<path>", etc.) → the
+                // caller already supplied the scheme + surrounding text, so we
+                // splice the resolved token in place. Passing header_name="" makes
+                // into_auth_header return the CR/LF-guarded RAW token WITHOUT
+                // prepending a scheme (its `needs_bearer` gate keys on the header
+                // name being "authorization"), so we never emit "Bearer Bearer …".
+                let embedded = !(prefix.is_empty() && suffix.is_empty());
+                let header_result = self
+                    .provider
+                    .into_auth_header(handle, if embedded { "" } else { header_name });
                 // Always release — both success and error paths must drop the slot
                 // so the Zeroizing<String> is freed and secret material is erased.
                 let _ = self.provider.release(handle).await;
@@ -575,8 +607,17 @@ impl TalosContext {
                     // its buffer when the binding goes out of scope; the
                     // String we hand to reqwest will be moved into
                     // HeaderValue's internal buffer and is the only
-                    // remaining plaintext copy after this scope exits.
-                    Ok(plaintext) => Ok(std::borrow::Cow::Owned((*plaintext).clone())),
+                    // remaining plaintext copy after this scope exits. For the
+                    // embedded case the same one-copy exit holds — the token is
+                    // spliced between the caller's prefix/suffix.
+                    Ok(plaintext) => {
+                        let out = if embedded {
+                            format!("{prefix}{}{suffix}", plaintext.as_str())
+                        } else {
+                            (*plaintext).clone()
+                        };
+                        Ok(std::borrow::Cow::Owned(out))
+                    }
                     Err(e) => {
                         tracing::error!(
                             vault_path,

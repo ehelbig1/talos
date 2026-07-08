@@ -93,4 +93,29 @@ mod tests {
         let err = anyhow::anyhow!("test error");
         assert!(!is_pg_unique_violation(&err));
     }
+
+    #[test]
+    fn test_is_pg_unique_violation_detects_create_secret_duplicate_message() {
+        // Regression: SecretsManager::create_secret translates the PG
+        // UNIQUE_VIOLATION (23505) into a top-line "Validation: a secret with
+        // this name or key path already exists" context. The upsert fallback
+        // MUST recognize it so an OAuth token refresh updates the existing
+        // secret instead of failing with "Failed to store refreshed
+        // credentials". Simulate the chain the fallback actually sees.
+        let root =
+            anyhow::anyhow!("Validation: a secret with this name or key path already exists");
+        let wrapped = root.context("Failed to upsert access token secret");
+        assert!(
+            is_pg_unique_violation(&wrapped),
+            "the duplicate-secret message must be detected so upsert falls back to UPDATE"
+        );
+    }
+
+    #[test]
+    fn test_is_pg_unique_violation_no_false_positive_on_unrelated_exists() {
+        // The message fallback is scoped to the exact duplicate phrase so it
+        // does not fire on unrelated errors that merely contain "exists".
+        let err = anyhow::anyhow!("the requested calendar already exists upstream");
+        assert!(!is_pg_unique_violation(&err));
+    }
 }
