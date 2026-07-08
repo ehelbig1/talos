@@ -5652,7 +5652,7 @@ async fn handle_submit_workflow_approval(
     if should_attempt_waiting_resume(nats_published, db_rows_updated) {
         match state
             .execution_orchestration_service
-            .resume_waiting_execution(exec_id, user_id)
+            .resume_waiting_execution(exec_id, user_id, &[])
             .await
         {
             Ok(talos_execution_orchestration::WaitingResumeOutcome::Resumed) => {

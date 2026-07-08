@@ -64,10 +64,16 @@ impl ExecutionOrchestrationService {
     /// was unblocked over NATS, or a module-approval retry flow), so
     /// callers can report `resume_triggered: false` without failing the
     /// approval write that already landed.
+    /// `writable_org_ids`: org-aware scoping for the GraphQL
+    /// `resumeWorkflow` path (org editors may resume org-owned
+    /// executions); pass `&[]` for strict user-only scoping (the MCP
+    /// approval path). Applied uniformly to the advisory read, the
+    /// authorization-gate graph fetch, and the atomic claim.
     pub async fn resume_waiting_execution(
         &self,
         execution_id: Uuid,
         user_id: Uuid,
+        writable_org_ids: &[Uuid],
     ) -> Result<WaitingResumeOutcome, OrchestrationError> {
         // Dispatch requires NATS — check before touching the row so a
         // NATS-less deployment can't strand the execution in 'resuming'.
@@ -83,7 +89,7 @@ impl ExecutionOrchestrationService {
         //    and to fetch the actor for the authorization gate.
         let exec = self
             .execution_repo
-            .get_execution(execution_id, user_id)
+            .get_execution_resume_gate(execution_id, user_id, writable_org_ids)
             .await
             .map_err(OrchestrationError::Internal)?
             .ok_or(OrchestrationError::ExecutionNotFound(execution_id))?;
@@ -104,7 +110,7 @@ impl ExecutionOrchestrationService {
         if exec.actor_id.is_some() {
             let graph_json = self
                 .execution_repo
-                .get_workflow_graph_for_user(exec.workflow_id, user_id)
+                .get_workflow_graph_for_user_or_orgs(exec.workflow_id, user_id, writable_org_ids)
                 .await
                 .map_err(OrchestrationError::Internal)?
                 .ok_or(OrchestrationError::WorkflowNotFound(exec.workflow_id))?;
@@ -125,7 +131,7 @@ impl ExecutionOrchestrationService {
         //    the double-resume guard — everything before it is advisory.
         let Some(row) = self
             .execution_repo
-            .claim_waiting_execution_for_resume(execution_id, user_id)
+            .claim_waiting_execution_for_resume(execution_id, user_id, writable_org_ids)
             .await
             .map_err(OrchestrationError::Internal)?
         else {

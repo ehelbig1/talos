@@ -1961,11 +1961,22 @@ impl ExecutionRepository {
         &self,
         execution_id: Uuid,
         user_id: Uuid,
+        writable_org_ids: &[Uuid],
     ) -> Result<Option<StuckExecutionForResume>> {
+        // Org-aware scoping mirrors `get_execution_resume_gate`: an org
+        // member with a WRITE role may resume org-owned executions (the
+        // GraphQL resumeWorkflow path); pass `&[]` for strict user-only
+        // scoping (the MCP submit_workflow_approval path). The resumed run
+        // itself executes as the EXECUTION's owner (RETURNING e.user_id) —
+        // the org editor authorizes the resume, they don't impersonate it.
         let row = sqlx::query_as::<_, StuckExecutionForResume>(
             "UPDATE workflow_executions e \
              SET status = 'resuming', updated_at = NOW(), epoch = e.epoch + 1 \
-             WHERE e.id = $1 AND e.user_id = $2 AND e.status = 'waiting' \
+             WHERE e.id = $1 \
+               AND (e.user_id = $2 OR EXISTS ( \
+                    SELECT 1 FROM workflows w \
+                    WHERE w.id = e.workflow_id AND w.org_id = ANY($3))) \
+               AND e.status = 'waiting' \
              RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, e.epoch, \
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
@@ -1974,9 +1985,32 @@ impl ExecutionRepository {
         )
         .bind(execution_id)
         .bind(user_id)
+        .bind(writable_org_ids)
         .fetch_optional(&self.db_pool)
         .await?;
         Ok(row)
+    }
+
+    /// Org-aware sibling of `get_workflow_graph_for_user` for the resume
+    /// authorization gate: org-owned workflows are readable by members whose
+    /// org ids are in `writable_org_ids`. Kept separate so the user-scoped
+    /// callers (retry / replay / failure-analysis) keep their strict predicate.
+    pub async fn get_workflow_graph_for_user_or_orgs(
+        &self,
+        wf_id: Uuid,
+        user_id: Uuid,
+        writable_org_ids: &[Uuid],
+    ) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT graph_json FROM workflows \
+             WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))",
+        )
+        .bind(wf_id)
+        .bind(user_id)
+        .bind(writable_org_ids)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row.map(|(gj,)| gj))
     }
 
     /// Terminal exit for a claimed (`resuming`) execution whose resume could
@@ -2835,18 +2869,6 @@ impl ExecutionRepository {
     /// The `AND status = 'waiting'` predicate is the status guard: it
     /// can't clobber a row another writer owns and can't resurrect a
     /// terminal row.
-    pub async fn flip_waiting_to_pending(&self, execution_id: Uuid) -> Result<u64> {
-        let result = sqlx::query(
-            // allow-bare-status-write: single-status precondition (waiting →
-            // pending) is strictly narrower than the NOT IN terminal guard.
-            "UPDATE workflow_executions SET status = 'pending' WHERE id = $1 AND status = 'waiting'",
-        )
-        .bind(execution_id)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
     /// The workflow_version_id pinned to an execution at trigger time
     /// (NULL = unpinned). Errors propagate — the resume path fails
     /// CLOSED on a DB error rather than falling back to the draft graph
