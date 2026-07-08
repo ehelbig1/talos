@@ -3605,12 +3605,13 @@ echo
 # sqlx row (repository crates + the check-52 widened family); sampled
 # 0 json-`.get` false positives in scope.
 #
-# RATCHET (introduced 2026-07-08 at 473 sites; baseline below reflects
-# burn-down progress — talos-webhook-repository already at 0): the count
-# must never EXCEED the baseline. When you burn sites down, LOWER the
-# baseline in the same PR. Do not raise it — convert the read instead.
-bold "▶ check 55: bare row.get() sqlx reads in DB-layer crates (ratchet)"
-BARE_ROW_GET_BASELINE=465
+# Introduced 2026-07-08 as a RATCHET at 473 sites (#428, webhook-repository
+# exemplar 8→0); FULLY BURNED DOWN same day (465→0 across all nine remaining
+# crates via the check-52 playbook) and GRADUATED to a HARD RULE: the count
+# must stay 0 — any new bare `.get` sqlx read in a DB-layer crate is an
+# outright failure. Convert with `try_get(...)?`; do NOT re-add a baseline.
+bold "▶ check 55: bare row.get() sqlx reads in DB-layer crates (must be 0)"
+BARE_ROW_GET_BASELINE=0
 BARE_ROW_GET_SCOPE="talos-actor-repository talos-advanced-repository talos-analytics-repository \
     talos-execution-repository talos-github-repository talos-module-repository \
     talos-webhook-repository talos-worker-identity-repository talos-workflow-repository \
@@ -3625,16 +3626,15 @@ BARE_ROW_GET_COUNT="$( { grep -rEc '(row|r)\.get(::<[^(]*>)?\("' \
 # when preceded by "try_" — the regex above does NOT match try_get, but keep the
 # guard cheap and explicit in case of drift)
 if [ "$BARE_ROW_GET_COUNT" -gt "$BARE_ROW_GET_BASELINE" ]; then
-    red "✗ bare row.get() count ${BARE_ROW_GET_COUNT} exceeds the ratchet baseline ${BARE_ROW_GET_BASELINE}"
+    red "✗ ${BARE_ROW_GET_COUNT} bare row.get() sqlx read(s) in DB-layer crates (must be 0):"
+    # shellcheck disable=SC2086
+    grep -rEn '(row|r)\.get(::<[^(]*>)?\("' --include='*.rs' $BARE_ROW_GET_SCOPE 2>/dev/null | sed 's/^/    /'
     yellow "  → a bare .get panics on NULL/type-drift and kills the request task (connection"
-    yellow "    reset). Use .try_get(\"col\")? — or, for new NULLABLE columns,"
-    yellow "    .try_get::<Option<_>, _>(\"col\")? with an explicit default."
-    yellow "  → if you burned sites down elsewhere in this change, lower the baseline instead."
+    yellow "    reset — the #427 list_webhooks incident). Use .try_get(\"col\")? — or, for"
+    yellow "    NULLABLE columns, .try_get::<Option<_>, _>(\"col\")? with an explicit default."
     EXIT_CODE=1
-elif [ "$BARE_ROW_GET_COUNT" -lt "$BARE_ROW_GET_BASELINE" ]; then
-    green "✓ bare row.get() count ${BARE_ROW_GET_COUNT} is BELOW baseline ${BARE_ROW_GET_BASELINE} — lower BARE_ROW_GET_BASELINE in scripts/lint-structural.sh to lock in the progress"
 else
-    green "✓ bare row.get() count ${BARE_ROW_GET_COUNT} == baseline (ratchet holding)"
+    green "✓ no bare row.get() sqlx reads in DB-layer crates (hard rule, graduated from the 473-site ratchet)"
 fi
 echo
 

@@ -886,7 +886,7 @@ pub async fn recall_exact(
     .context("recall_exact")?;
 
     let Some(r) = row else { return Ok(None) };
-    let row_key: String = r.get("key");
+    let row_key: String = r.try_get("key")?;
     let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
     let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
     // Fail LOUD on a missing `value_format`, matching decrypt_row_value /
@@ -905,9 +905,9 @@ pub async fn recall_exact(
     Ok(Some(MemoryRow {
         key: row_key,
         value,
-        memory_type: r.get("memory_type"),
-        expires_at: r.get("expires_at"),
-        updated_at: r.get("updated_at"),
+        memory_type: r.try_get("memory_type")?,
+        expires_at: r.try_get("expires_at")?,
+        updated_at: r.try_get("updated_at")?,
     }))
 }
 
@@ -982,8 +982,8 @@ pub async fn recall_recent_by_types(
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         use sqlx::Row as _;
-        let key: String = r.get("key");
-        let memory_type: String = r.get("memory_type");
+        let key: String = r.try_get("key")?;
+        let memory_type: String = r.try_get("memory_type")?;
         let value = decrypt_row_value(r).await?;
         out.push((key, value, memory_type));
     }
@@ -1032,8 +1032,8 @@ pub async fn recall_recent_excluding_types(
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         use sqlx::Row as _;
-        let key: String = r.get("key");
-        let memory_type: String = r.get("memory_type");
+        let key: String = r.try_get("key")?;
+        let memory_type: String = r.try_get("memory_type")?;
         let value = decrypt_row_value(r).await?;
         out.push((key, value, memory_type));
     }
@@ -1085,20 +1085,21 @@ pub async fn list_memories(
     .await
     .context("list_memories")?;
 
-    Ok(rows
-        .iter()
-        .map(|r| MemoryMeta {
-            key: r.get("key"),
-            memory_type: r.get("memory_type"),
-            expires_at: r.get("expires_at"),
-            updated_at: r.get("updated_at"),
-            value_bytes: r.get("value_bytes"),
-            metadata: r
-                .try_get::<Option<serde_json::Value>, _>("metadata")
-                .ok()
-                .flatten(),
+    rows.iter()
+        .map(|r| -> Result<MemoryMeta> {
+            Ok(MemoryMeta {
+                key: r.try_get("key")?,
+                memory_type: r.try_get("memory_type")?,
+                expires_at: r.try_get("expires_at")?,
+                updated_at: r.try_get("updated_at")?,
+                value_bytes: r.try_get("value_bytes")?,
+                metadata: r
+                    .try_get::<Option<serde_json::Value>, _>("metadata")
+                    .ok()
+                    .flatten(),
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Ciphertext-bearing listing row returned by
@@ -1338,7 +1339,7 @@ pub async fn recall_semantic_filtered(
             // per-row value_format using build_memory_aad(actor_id, key).
             let mut hits = Vec::with_capacity(rows.len());
             for r in rows {
-                let row_key: String = r.get("key");
+                let row_key: String = r.try_get("key")?;
                 let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
                 let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
                 // Fail LOUD on a missing `value_format` (see recall_exact /
@@ -1354,11 +1355,11 @@ pub async fn recall_semantic_filtered(
                 hits.push(MemoryHit {
                     key: row_key,
                     value,
-                    memory_type: r.get("memory_type"),
-                    expires_at: r.get("expires_at"),
-                    updated_at: r.get("updated_at"),
-                    score: r.get::<f64, _>("score"),
-                    metadata: r.get::<Option<serde_json::Value>, _>("metadata"),
+                    memory_type: r.try_get("memory_type")?,
+                    expires_at: r.try_get("expires_at")?,
+                    updated_at: r.try_get("updated_at")?,
+                    score: r.try_get::<f64, _>("score")?,
+                    metadata: r.try_get::<Option<serde_json::Value>, _>("metadata")?,
                 });
             }
             return Ok(SearchOutcome {
@@ -1605,7 +1606,7 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
         let actor_id: Uuid = r
             .try_get("actor_id")
             .context("rows_to_memory_hits: caller's SELECT must project `actor_id` (MCP-S2 AAD)")?;
-        let row_key: String = r.get("key");
+        let row_key: String = r.try_get("key")?;
         let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
         let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
         let value_format: i16 = r.try_get("value_format").context(
@@ -1616,11 +1617,11 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
         hits.push(MemoryHit {
             key: row_key,
             value,
-            memory_type: r.get("memory_type"),
-            expires_at: r.get("expires_at"),
-            updated_at: r.get("updated_at"),
+            memory_type: r.try_get("memory_type")?,
+            expires_at: r.try_get("expires_at")?,
+            updated_at: r.try_get("updated_at")?,
             score: (1.0 - (i as f64 * 0.02)).max(0.0),
-            metadata: r.get::<Option<serde_json::Value>, _>("metadata"),
+            metadata: r.try_get::<Option<serde_json::Value>, _>("metadata")?,
         });
     }
     Ok(hits)
@@ -1874,11 +1875,11 @@ pub async fn clone_memories(
             )
         })?;
         for r in v1_rows {
-            let key: String = r.get("key");
-            let value_enc: Vec<u8> = r.get("value_enc");
-            let value_key_id: Uuid = r.get("value_key_id");
-            let src_format: i16 = r.get("value_format");
-            let memory_type: String = r.get("memory_type");
+            let key: String = r.try_get("key")?;
+            let value_enc: Vec<u8> = r.try_get("value_enc")?;
+            let value_key_id: Uuid = r.try_get("value_key_id")?;
+            let src_format: i16 = r.try_get("value_format")?;
+            let memory_type: String = r.try_get("memory_type")?;
             let metadata: Option<serde_json::Value> = r.try_get("metadata").ok();
             // Decrypt under SOURCE AAD, using the row's OWN format (v1/v3/v4 all
             // decrypt via the versioned dispatch).
@@ -2072,12 +2073,12 @@ pub async fn re_encrypt_memories_to_org(pool: &Pool<Postgres>) -> Result<MemoryR
     let mut re_encrypted = 0u64;
     let mut failed = 0u64;
     for r in rows {
-        let actor_id: Uuid = r.get("actor_id");
-        let key: String = r.get("key");
-        let value_enc: Vec<u8> = r.get("value_enc");
-        let value_key_id: Uuid = r.get("value_key_id");
-        let src_format: i16 = r.get("value_format");
-        let org_id: Uuid = r.get("org_id");
+        let actor_id: Uuid = r.try_get("actor_id")?;
+        let key: String = r.try_get("key")?;
+        let value_enc: Vec<u8> = r.try_get("value_enc")?;
+        let value_key_id: Uuid = r.try_get("value_key_id")?;
+        let src_format: i16 = r.try_get("value_format")?;
+        let org_id: Uuid = r.try_get("org_id")?;
 
         let aad = build_memory_aad(actor_id, &key);
         let plaintext = match hook
@@ -2209,8 +2210,8 @@ async fn backfill_embeddings_filtered(
     let mut embedded = 0usize;
     for r in &raw_rows {
         use sqlx::Row as _;
-        let id: Uuid = r.get("id");
-        let key: String = r.get("key");
+        let id: Uuid = r.try_get("id")?;
+        let key: String = r.try_get("key")?;
         let value = match decrypt_row_value(r).await {
             Ok(v) => v,
             Err(e) => {
@@ -2222,7 +2223,7 @@ async fn backfill_embeddings_filtered(
         let serialized = serde_json::to_string(&value).unwrap_or_default();
         let truncated: String = serialized.chars().take(4000).collect();
         let text = format!("{}: {}", key, truncated);
-        let row_actor: Uuid = r.get("actor_id");
+        let row_actor: Uuid = r.try_get("actor_id")?;
         let local_only = embed_local_only(pool, row_actor).await;
         if let Some(emb) = embedding::generate_embedding(&text, local_only).await {
             // L-1: UPDATE failures (DB pool exhaustion, FK violation,

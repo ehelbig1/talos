@@ -263,7 +263,7 @@ impl WorkflowRepository {
         .await?;
         row.map(|r| -> Result<WorkflowSearchTextSource> {
             Ok(WorkflowSearchTextSource {
-                name: r.get("name"),
+                name: r.try_get("name")?,
                 description: r.try_get::<Option<_>, _>("description")?,
                 intent: r.try_get::<Option<_>, _>("intent")?,
                 capabilities: r
@@ -346,8 +346,8 @@ impl WorkflowRepository {
         rows.iter()
             .map(|r| -> Result<SessionContextWorkflowRow> {
                 Ok(SessionContextWorkflowRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     capabilities: r
                         .try_get::<Option<_>, _>("capabilities")?
                         .unwrap_or_default(),
@@ -379,7 +379,7 @@ impl WorkflowRepository {
         rows.iter()
             .map(|r| -> Result<RecentlyUsedWorkflowRow> {
                 Ok(RecentlyUsedWorkflowRow {
-                    workflow_id: r.get("workflow_id"),
+                    workflow_id: r.try_get("workflow_id")?,
                     name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
                     capabilities: r
                         .try_get::<Option<_>, _>("capabilities")?
@@ -411,7 +411,7 @@ impl WorkflowRepository {
         rows.iter()
             .map(|r| -> Result<RecentlyUsedWorkflowRow> {
                 Ok(RecentlyUsedWorkflowRow {
-                    workflow_id: r.get("id"),
+                    workflow_id: r.try_get("id")?,
                     name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
                     capabilities: r
                         .try_get::<Option<_>, _>("capabilities")?
@@ -553,13 +553,13 @@ impl WorkflowRepository {
         rows.iter()
             .map(|r| -> Result<WorkflowSearchRow> {
                 Ok(WorkflowSearchRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     description: r.try_get::<Option<_>, _>("description")?,
                     tags: r.try_get::<Option<_>, _>("tags")?.unwrap_or_default(),
                     status: r.try_get::<Option<_>, _>("status")?,
-                    created_at: r.get("created_at"),
-                    updated_at: r.get("updated_at"),
+                    created_at: r.try_get("created_at")?,
+                    updated_at: r.try_get("updated_at")?,
                 })
             })
             .collect()
@@ -598,14 +598,15 @@ impl WorkflowRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| WorkflowGraphRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                graph_json: r.get("graph_json"),
+        rows.iter()
+            .map(|r| -> Result<WorkflowGraphRow> {
+                Ok(WorkflowGraphRow {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    graph_json: r.try_get("graph_json")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Vector cosine search over the workflows.embedding column.
@@ -662,11 +663,11 @@ impl WorkflowRepository {
         rows.iter()
             .map(|r| -> Result<WorkflowSemanticVectorRow, sqlx::Error> {
                 Ok(WorkflowSemanticVectorRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
-                    description: r.get("description"),
-                    capabilities: r.get("capabilities"),
-                    readiness_score: r.get("readiness_score"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    description: r.try_get("description")?,
+                    capabilities: r.try_get("capabilities")?,
+                    readiness_score: r.try_get("readiness_score")?,
                     match_score: r.try_get::<Option<_>, _>("match_score")?.unwrap_or(0.0),
                 })
             })
@@ -739,8 +740,8 @@ impl WorkflowRepository {
         rows.iter()
             .map(|r| -> Result<WorkflowSemanticTrgmRow, sqlx::Error> {
                 Ok(WorkflowSemanticTrgmRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     description: r.try_get::<Option<_>, _>("description")?,
                     capabilities: r
                         .try_get::<Option<_>, _>("capabilities")?
@@ -807,8 +808,8 @@ impl WorkflowRepository {
         rows.iter()
             .map(|r| -> Result<WorkflowSemanticTrgmRow, sqlx::Error> {
                 Ok(WorkflowSemanticTrgmRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     description: r.try_get::<Option<_>, _>("description")?,
                     capabilities: r
                         .try_get::<Option<_>, _>("capabilities")?

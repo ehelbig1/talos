@@ -583,21 +583,21 @@ impl ActorRepository {
         .await?;
         tx.commit().await?;
 
-        let result = rows
-            .iter()
-            .map(|r| ActorSummaryRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                description: r.get("description"),
-                status: r.get("status"),
-                max_capability_world: r.get("max_capability_world"),
-                workflow_count: r.get("workflow_count"),
-                total_executions: r.get("total_executions"),
-                last_active: r.get("last_active"),
-                created_at: r.get("created_at"),
+        rows.iter()
+            .map(|r| -> Result<ActorSummaryRow> {
+                Ok(ActorSummaryRow {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    description: r.try_get("description")?,
+                    status: r.try_get("status")?,
+                    max_capability_world: r.try_get("max_capability_world")?,
+                    workflow_count: r.try_get("workflow_count")?,
+                    total_executions: r.try_get("total_executions")?,
+                    last_active: r.try_get("last_active")?,
+                    created_at: r.try_get("created_at")?,
+                })
             })
-            .collect();
-        Ok(result)
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fetch full actor detail (name, description, status, capability world, grants, metadata).
@@ -610,15 +610,18 @@ impl ActorRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| ActorDetail {
-            name: r.get("name"),
-            description: r.get("description"),
-            status: r.get("status"),
-            max_capability_world: r.get("max_capability_world"),
-            secret_grants: r.get("secret_grants"),
-            created_at: r.get("created_at"),
-            metadata: r.get("metadata"),
-        }))
+        row.map(|r| -> Result<ActorDetail> {
+            Ok(ActorDetail {
+                name: r.try_get("name")?,
+                description: r.try_get("description")?,
+                status: r.try_get("status")?,
+                max_capability_world: r.try_get("max_capability_world")?,
+                secret_grants: r.try_get("secret_grants")?,
+                created_at: r.try_get("created_at")?,
+                metadata: r.try_get("metadata")?,
+            })
+        })
+        .transpose()
     }
 
     /// Re-fetch the columns the GraphQL `ActorSummary` type needs after a
@@ -656,17 +659,22 @@ impl ActorRepository {
         .await?;
         tx.commit().await?;
 
-        Ok(row.map(|r| ActorPostMutationSummary {
-            id: r.get("id"),
-            name: r.get("name"),
-            description: r.get("description"),
-            status: r.get("status"),
-            max_capability_world: r.get("max_capability_world"),
-            workflow_count: r.get::<Option<i64>, _>("workflow_count").unwrap_or(0),
-            total_executions: r.get::<Option<i64>, _>("total_executions").unwrap_or(0),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        }))
+        row.map(|r| -> Result<ActorPostMutationSummary> {
+            Ok(ActorPostMutationSummary {
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                description: r.try_get("description")?,
+                status: r.try_get("status")?,
+                max_capability_world: r.try_get("max_capability_world")?,
+                workflow_count: r.try_get::<Option<i64>, _>("workflow_count")?.unwrap_or(0),
+                total_executions: r
+                    .try_get::<Option<i64>, _>("total_executions")?
+                    .unwrap_or(0),
+                created_at: r.try_get("created_at")?,
+                updated_at: r.try_get("updated_at")?,
+            })
+        })
+        .transpose()
     }
 
     /// Fetch a full summary of an actor in a single query using LATERAL joins.
@@ -709,25 +717,28 @@ impl ActorRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| ActorFullSummary {
-            name: r.get("name"),
-            description: r.get("description"),
-            status: r.get("status"),
-            max_capability_world: r.get("max_capability_world"),
-            secret_grants: r.get("secret_grants"),
-            created_at: r.get("created_at"),
-            metadata: r.get("metadata"),
-            exec_total: r.get("exec_total"),
-            exec_last_24h: r.get("exec_last_24h"),
-            exec_completed: r.get("exec_completed"),
-            exec_failed: r.get("exec_failed"),
-            workflow_count: r.get("workflow_count"),
-            memory_count: r.get("memory_count"),
-            approval_policy_count: r.get("approval_policy_count"),
-            budget_max_executions_per_hour: r.get("max_executions_per_hour"),
-            budget_max_workflow_count: r.get("max_workflow_count"),
-            budget_on_exceeded: r.get("on_budget_exceeded"),
-        }))
+        row.map(|r| -> Result<ActorFullSummary> {
+            Ok(ActorFullSummary {
+                name: r.try_get("name")?,
+                description: r.try_get("description")?,
+                status: r.try_get("status")?,
+                max_capability_world: r.try_get("max_capability_world")?,
+                secret_grants: r.try_get("secret_grants")?,
+                created_at: r.try_get("created_at")?,
+                metadata: r.try_get("metadata")?,
+                exec_total: r.try_get("exec_total")?,
+                exec_last_24h: r.try_get("exec_last_24h")?,
+                exec_completed: r.try_get("exec_completed")?,
+                exec_failed: r.try_get("exec_failed")?,
+                workflow_count: r.try_get("workflow_count")?,
+                memory_count: r.try_get("memory_count")?,
+                approval_policy_count: r.try_get("approval_policy_count")?,
+                budget_max_executions_per_hour: r.try_get("max_executions_per_hour")?,
+                budget_max_workflow_count: r.try_get("max_workflow_count")?,
+                budget_on_exceeded: r.try_get("on_budget_exceeded")?,
+            })
+        })
+        .transpose()
     }
 
     /// Fetch just the status column for a given actor (used for terminal-state checks).
@@ -1022,17 +1033,20 @@ impl ActorRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| ActorBudgetPolicy {
-            max_executions_per_hour: r.get("max_executions_per_hour"),
-            max_executions_total: r.get("max_executions_total"),
-            max_fuel_per_execution: r.get("max_fuel_per_execution"),
-            max_fuel_per_hour: r.get("max_fuel_per_hour"),
-            max_outbound_requests_per_hour: r.get("max_outbound_requests_per_hour"),
-            max_workflow_count: r.get("max_workflow_count"),
-            max_workflows_per_minute: r.get("max_workflows_per_minute"),
-            max_compilations_per_hour: r.get("max_compilations_per_hour"),
-            on_budget_exceeded: r.get("on_budget_exceeded"),
-        }))
+        row.map(|r| -> Result<ActorBudgetPolicy> {
+            Ok(ActorBudgetPolicy {
+                max_executions_per_hour: r.try_get("max_executions_per_hour")?,
+                max_executions_total: r.try_get("max_executions_total")?,
+                max_fuel_per_execution: r.try_get("max_fuel_per_execution")?,
+                max_fuel_per_hour: r.try_get("max_fuel_per_hour")?,
+                max_outbound_requests_per_hour: r.try_get("max_outbound_requests_per_hour")?,
+                max_workflow_count: r.try_get("max_workflow_count")?,
+                max_workflows_per_minute: r.try_get("max_workflows_per_minute")?,
+                max_compilations_per_hour: r.try_get("max_compilations_per_hour")?,
+                on_budget_exceeded: r.try_get("on_budget_exceeded")?,
+            })
+        })
+        .transpose()
     }
 
     /// Fetch the budget summary columns used by get_actor_summary
@@ -1049,11 +1063,14 @@ impl ActorRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| ActorBudgetSummary {
-            max_executions_per_hour: r.get("max_executions_per_hour"),
-            max_workflow_count: r.get("max_workflow_count"),
-            on_budget_exceeded: r.get("on_budget_exceeded"),
-        }))
+        row.map(|r| -> Result<ActorBudgetSummary> {
+            Ok(ActorBudgetSummary {
+                max_executions_per_hour: r.try_get("max_executions_per_hour")?,
+                max_workflow_count: r.try_get("max_workflow_count")?,
+                on_budget_exceeded: r.try_get("on_budget_exceeded")?,
+            })
+        })
+        .transpose()
     }
 
     /// Count executions for an actor in the rolling last hour.
@@ -1122,12 +1139,15 @@ impl ActorRepository {
         .await?;
 
         Ok(row
-            .map(|r| ActorExecStats {
-                total: r.get("total"),
-                last_24h: r.get("last_24h"),
-                completed: r.get("completed"),
-                failed: r.get("failed"),
+            .map(|r| -> Result<ActorExecStats> {
+                Ok(ActorExecStats {
+                    total: r.try_get("total")?,
+                    last_24h: r.try_get("last_24h")?,
+                    completed: r.try_get("completed")?,
+                    failed: r.try_get("failed")?,
+                })
             })
+            .transpose()?
             .unwrap_or(ActorExecStats {
                 total: 0,
                 last_24h: 0,
@@ -1188,17 +1208,17 @@ impl ActorRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        let result = rows
-            .iter()
-            .map(|r| ApprovalPolicyRow {
-                id: r.get("id"),
-                trigger_condition: r.get("trigger_condition"),
-                approval_mode: r.get("approval_mode"),
-                approvers: r.get("approvers"),
-                created_at: r.get("created_at"),
+        rows.iter()
+            .map(|r| -> Result<ApprovalPolicyRow> {
+                Ok(ApprovalPolicyRow {
+                    id: r.try_get("id")?,
+                    trigger_condition: r.try_get("trigger_condition")?,
+                    approval_mode: r.try_get("approval_mode")?,
+                    approvers: r.try_get("approvers")?,
+                    created_at: r.try_get("created_at")?,
+                })
             })
-            .collect();
-        Ok(result)
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Delete an approval policy, verifying ownership through the actor → user chain.
@@ -1652,19 +1672,19 @@ impl ActorRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        let result = rows
-            .iter()
-            .map(|r| ActionLogEntry {
-                id: r.get("id"),
-                timestamp: r.get("timestamp"),
-                action_type: r.get("action_type"),
-                workflow_id: r.get("workflow_id"),
-                execution_id: r.get("execution_id"),
-                summary: r.get("summary"),
-                details: r.get("details"),
+        rows.iter()
+            .map(|r| -> Result<ActionLogEntry> {
+                Ok(ActionLogEntry {
+                    id: r.try_get("id")?,
+                    timestamp: r.try_get("timestamp")?,
+                    action_type: r.try_get("action_type")?,
+                    workflow_id: r.try_get("workflow_id")?,
+                    execution_id: r.try_get("execution_id")?,
+                    summary: r.try_get("summary")?,
+                    details: r.try_get("details")?,
+                })
             })
-            .collect();
-        Ok(result)
+            .collect::<Result<Vec<_>>>()
     }
 
     // Actor memory read/write/forget/list helpers moved to
@@ -1881,12 +1901,15 @@ impl ActorRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| UserCapabilityGrant {
-            max_capability_world: r.get("max_capability_world"),
-            granted_by: r.get("granted_by"),
-            granted_at: r.get("granted_at"),
-            notes: r.get("notes"),
-        }))
+        row.map(|r| -> Result<UserCapabilityGrant> {
+            Ok(UserCapabilityGrant {
+                max_capability_world: r.try_get("max_capability_world")?,
+                granted_by: r.try_get("granted_by")?,
+                granted_at: r.try_get("granted_at")?,
+                notes: r.try_get("notes")?,
+            })
+        })
+        .transpose()
     }
 
     // ── LLM tier ceiling ──────────────────────────────────────────────────
@@ -2050,18 +2073,18 @@ impl ActorRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        let result = rows
-            .iter()
-            .map(|r| CapabilityGrantRow {
-                user_id: r.get("user_id"),
-                email: r.get("email"),
-                max_capability_world: r.get("max_capability_world"),
-                granted_by: r.get("granted_by"),
-                granted_at: r.get("granted_at"),
-                notes: r.get("notes"),
+        rows.iter()
+            .map(|r| -> Result<CapabilityGrantRow> {
+                Ok(CapabilityGrantRow {
+                    user_id: r.try_get("user_id")?,
+                    email: r.try_get("email")?,
+                    max_capability_world: r.try_get("max_capability_world")?,
+                    granted_by: r.try_get("granted_by")?,
+                    granted_at: r.try_get("granted_at")?,
+                    notes: r.try_get("notes")?,
+                })
             })
-            .collect();
-        Ok(result)
+            .collect::<Result<Vec<_>>>()
     }
 
     // ── clone_actor helpers ────────────────────────────────────────────────
@@ -2083,7 +2106,7 @@ impl ActorRepository {
 
         row.map(|r| -> Result<SourceActorCloneRow> {
             Ok(SourceActorCloneRow {
-                max_capability_world: r.get("max_capability_world"),
+                max_capability_world: r.try_get("max_capability_world")?,
                 description: r.try_get::<Option<_>, _>("description")?,
                 secret_grants: r
                     .try_get::<Option<_>, _>("secret_grants")?
@@ -2465,22 +2488,25 @@ impl ActorRepository {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| ActorBasicInfo {
-            id: r.get("id"),
-            name: r.get("name"),
-            description: r.try_get("description").ok().flatten(),
-            status: r
-                .try_get::<Option<String>, _>("status")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "active".to_string()),
-            max_capability_world: r
-                .try_get::<Option<String>, _>("max_capability_world")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "minimal-node".to_string()),
-            updated_at: r.try_get("updated_at").ok().flatten(),
-        }))
+        row.map(|r| -> Result<ActorBasicInfo> {
+            Ok(ActorBasicInfo {
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                description: r.try_get("description").ok().flatten(),
+                status: r
+                    .try_get::<Option<String>, _>("status")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "active".to_string()),
+                max_capability_world: r
+                    .try_get::<Option<String>, _>("max_capability_world")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "minimal-node".to_string()),
+                updated_at: r.try_get("updated_at").ok().flatten(),
+            })
+        })
+        .transpose()
     }
 
     /// Clone semantic + episodic memories from one actor to another.

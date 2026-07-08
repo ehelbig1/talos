@@ -329,12 +329,12 @@ impl WorkflowRepository {
         .fetch_one(&self.db_pool)
         .await?;
         Ok(WorkflowQueueStats {
-            queued: row.get("queued"),
-            running: row.get("running"),
-            completed: row.get("completed"),
-            failed: row.get("failed"),
-            cancelled: row.get("cancelled"),
-            total: row.get("total"),
+            queued: row.try_get("queued")?,
+            running: row.try_get("running")?,
+            completed: row.try_get("completed")?,
+            failed: row.try_get("failed")?,
+            cancelled: row.try_get("cancelled")?,
+            total: row.try_get("total")?,
             first_started: row.try_get::<Option<_>, _>("first_started")?,
             last_completed: row.try_get::<Option<_>, _>("last_completed")?,
         })

@@ -124,20 +124,22 @@ impl WorkflowRepository {
 
         let summaries = rows
             .into_iter()
-            .map(|row| WorkflowSummary {
-                id: row.get("id"),
-                name: row.get("name"),
-                description: row.try_get("description").ok().flatten(),
-                graph_json: row.get("graph_json"),
-                tags: row.try_get("tags").ok().unwrap_or_default(),
-                last_status: row.try_get("last_status").ok().flatten(),
-                last_exec_at: row.try_get("last_exec_at").ok().flatten(),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                status: row.try_get("status").ok().flatten(),
-                workflow_type: row.try_get("workflow_type").ok().flatten(),
+            .map(|row| -> Result<WorkflowSummary> {
+                Ok(WorkflowSummary {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    description: row.try_get("description").ok().flatten(),
+                    graph_json: row.try_get("graph_json")?,
+                    tags: row.try_get("tags").ok().unwrap_or_default(),
+                    last_status: row.try_get("last_status").ok().flatten(),
+                    last_exec_at: row.try_get("last_exec_at").ok().flatten(),
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                    status: row.try_get("status").ok().flatten(),
+                    workflow_type: row.try_get("workflow_type").ok().flatten(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(summaries)
     }
@@ -232,20 +234,22 @@ impl WorkflowRepository {
 
         let summaries = rows
             .into_iter()
-            .map(|row| WorkflowSummary {
-                id: row.get("id"),
-                name: row.get("name"),
-                description: row.try_get("description").ok().flatten(),
-                graph_json: row.get("graph_json"),
-                tags: row.try_get("tags").ok().unwrap_or_default(),
-                last_status: row.try_get("last_status").ok().flatten(),
-                last_exec_at: row.try_get("last_exec_at").ok().flatten(),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                status: row.try_get("status").ok().flatten(),
-                workflow_type: row.try_get("workflow_type").ok().flatten(),
+            .map(|row| -> Result<WorkflowSummary> {
+                Ok(WorkflowSummary {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    description: row.try_get("description").ok().flatten(),
+                    graph_json: row.try_get("graph_json")?,
+                    tags: row.try_get("tags").ok().unwrap_or_default(),
+                    last_status: row.try_get("last_status").ok().flatten(),
+                    last_exec_at: row.try_get("last_exec_at").ok().flatten(),
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                    status: row.try_get("status").ok().flatten(),
+                    workflow_type: row.try_get("workflow_type").ok().flatten(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok((summaries, total))
     }
@@ -275,9 +279,9 @@ impl WorkflowRepository {
 
         row.map(|r| -> Result<WorkflowRecord> {
             Ok(WorkflowRecord {
-                id: r.get("id"),
-                name: r.get("name"),
-                graph_json: r.get("graph_json"),
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                graph_json: r.try_get("graph_json")?,
                 tags: r.try_get::<Option<_>, _>("tags")?.unwrap_or_default(),
                 description: r.try_get::<Option<_>, _>("description")?,
                 max_concurrent_executions: r
@@ -1711,7 +1715,7 @@ impl WorkflowRepository {
         .await?;
         row.map(|r| -> Result<WorkflowIdentityRow> {
             Ok(WorkflowIdentityRow {
-                name: r.get("name"),
+                name: r.try_get("name")?,
                 description: r.try_get::<Option<_>, _>("description")?,
                 capabilities: r
                     .try_get::<Option<_>, _>("capabilities")?
@@ -1807,9 +1811,9 @@ impl WorkflowRepository {
         rows.iter()
             .map(|r| -> Result<WorkflowExportRow> {
                 Ok(WorkflowExportRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
-                    graph_json: r.get("graph_json"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    graph_json: r.try_get("graph_json")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(true),
                     cron_expression: r.try_get::<Option<_>, _>("cron_expression")?,
                     timezone: r

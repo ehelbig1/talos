@@ -324,14 +324,14 @@ impl ModuleSource {
 /// requiring `&self`.
 fn row_to_summary(row: sqlx::postgres::PgRow) -> Result<SecretSummary> {
     Ok(SecretSummary {
-        id: row.get("id"),
-        name: row.get("name"),
-        key_path: row.get("key_path"),
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        key_path: row.try_get("key_path")?,
         description: row.try_get("description")?,
         namespace: row
             .try_get::<Option<String>, _>("namespace")?
             .unwrap_or_else(|| "default".to_string()),
-        created_at: row.get("created_at"),
+        created_at: row.try_get("created_at")?,
         expires_at: row.try_get("expires_at")?,
         rotation_reminder_days: row.try_get("rotation_reminder_days")?,
     })
@@ -1334,16 +1334,16 @@ impl SecretsManager {
         };
 
         let record = SecretRecord {
-            id: row.get("id"),
-            encrypted_value: row.get("encrypted_value"),
-            encryption_key_id: row.get("encryption_key_id"),
-            encryption_format_version: row.get("encryption_format_version"),
+            id: row.try_get("id")?,
+            encrypted_value: row.try_get("encrypted_value")?,
+            encryption_key_id: row.try_get("encryption_key_id")?,
+            encryption_format_version: row.try_get("encryption_format_version")?,
             allowed_modules: row
-                .get::<Option<Vec<Uuid>>, _>("allowed_modules")
+                .try_get::<Option<Vec<Uuid>>, _>("allowed_modules")?
                 .unwrap_or_default(),
-            expires_at: row.get("expires_at"),
-            owner_user_id: row.get("owner_user_id"),
-            org_id: row.get("org_id"),
+            expires_at: row.try_get("expires_at")?,
+            owner_user_id: row.try_get("owner_user_id")?,
+            org_id: row.try_get("org_id")?,
         };
 
         // 2. Check expiration
@@ -2233,12 +2233,12 @@ impl SecretsManager {
         let mut accessed_ids = Vec::new();
 
         for row in rows {
-            let id: Uuid = row.get("id");
-            let key_path: String = row.get("key_path");
-            let encrypted_value: Vec<u8> = row.get("encrypted_value");
-            let encryption_key_id: Uuid = row.get("encryption_key_id");
-            let encryption_format_version: i16 = row.get("encryption_format_version");
-            let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.get("expires_at");
+            let id: Uuid = row.try_get("id")?;
+            let key_path: String = row.try_get("key_path")?;
+            let encrypted_value: Vec<u8> = row.try_get("encrypted_value")?;
+            let encryption_key_id: Uuid = row.try_get("encryption_key_id")?;
+            let encryption_format_version: i16 = row.try_get("encryption_format_version")?;
+            let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("expires_at")?;
 
             if let Some(expires_at) = expires_at {
                 if expires_at < now {
@@ -2511,22 +2511,22 @@ impl SecretsManager {
     }
 
     /// Convert a raw `sqlx::PgRow` into a `Secret` struct.
-    fn row_to_secret(row: sqlx::postgres::PgRow) -> Secret {
-        Secret {
-            id: row.get("id"),
-            name: row.get("name"),
-            key_path: row.get("key_path"),
-            description: row.get("description"),
-            created_by: row.get("created_by"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-            expires_at: row.get("expires_at"),
-            owner_user_id: row.get("owner_user_id"),
-            org_id: row.get("org_id"),
-            allowed_modules: row.get("allowed_modules"),
-            last_accessed_at: row.get("last_accessed_at"),
-            access_count: row.get("access_count"),
-        }
+    fn row_to_secret(row: sqlx::postgres::PgRow) -> Result<Secret> {
+        Ok(Secret {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            key_path: row.try_get("key_path")?,
+            description: row.try_get("description")?,
+            created_by: row.try_get("created_by")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            expires_at: row.try_get("expires_at")?,
+            owner_user_id: row.try_get("owner_user_id")?,
+            org_id: row.try_get("org_id")?,
+            allowed_modules: row.try_get("allowed_modules")?,
+            last_accessed_at: row.try_get("last_accessed_at")?,
+            access_count: row.try_get("access_count")?,
+        })
     }
 
     /// List secrets (without decrypted values)
@@ -2566,7 +2566,9 @@ impl SecretsManager {
             .await?
         };
 
-        Ok(rows.into_iter().map(Self::row_to_secret).collect())
+        rows.into_iter()
+            .map(Self::row_to_secret)
+            .collect::<Result<Vec<_>>>()
     }
 
     /// List secrets with pagination (without decrypted values)
@@ -2622,7 +2624,9 @@ impl SecretsManager {
             .await?
         };
 
-        Ok(rows.into_iter().map(Self::row_to_secret).collect())
+        rows.into_iter()
+            .map(Self::row_to_secret)
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Get secret metadata (without value), scoped to the requesting user.
@@ -2670,7 +2674,7 @@ impl SecretsManager {
         .context("Secret not found")?;
         tx.commit().await?;
 
-        Ok(Self::row_to_secret(row))
+        Self::row_to_secret(row)
     }
 
     /// Get secret metadata by ID, scoped to the requesting user.
@@ -2699,7 +2703,7 @@ impl SecretsManager {
         .await
         .context("Secret not found")?;
 
-        Ok(Self::row_to_secret(row))
+        Self::row_to_secret(row)
     }
 
     // MCP-1087 (2026-05-16): removed the deprecated `secret_exists`
@@ -3366,14 +3370,17 @@ impl SecretsManager {
         .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(row.map(|r| SecretLookup {
-            id: r.get("id"),
-            key_path: r.get("key_path"),
-            namespace: r
-                .try_get::<String, _>("namespace")
-                .unwrap_or_else(|_| "default".to_string()),
-            description: r.try_get("description").ok(),
-        }))
+        row.map(|r| -> Result<SecretLookup> {
+            Ok(SecretLookup {
+                id: r.try_get("id")?,
+                key_path: r.try_get("key_path")?,
+                namespace: r
+                    .try_get::<String, _>("namespace")
+                    .unwrap_or_else(|_| "default".to_string()),
+                description: r.try_get("description").ok(),
+            })
+        })
+        .transpose()
     }
 
     // ─── r306: by-id sibling methods for the resolver-then-mutate flow ──
@@ -4398,10 +4405,10 @@ impl SecretsManager {
         };
 
         for row in &stale_rows {
-            let secret_id: Uuid = row.get("id");
-            let encrypted_value: Vec<u8> = row.get("encrypted_value");
-            let encryption_key_id: Uuid = row.get("encryption_key_id");
-            let encryption_format_version: i16 = row.get("encryption_format_version");
+            let secret_id: Uuid = row.try_get("id")?;
+            let encrypted_value: Vec<u8> = row.try_get("encrypted_value")?;
+            let encryption_key_id: Uuid = row.try_get("encryption_key_id")?;
+            let encryption_format_version: i16 = row.try_get("encryption_format_version")?;
 
             if encrypted_value.len() < 12 {
                 tracing::warn!(secret_id = %secret_id, "Skipping secret with invalid ciphertext (too short)");
@@ -4570,11 +4577,11 @@ impl SecretsManager {
         .await?;
 
         for row in &stale_rows {
-            let secret_id: Uuid = row.get("id");
-            let org_id: Uuid = row.get("org_id");
-            let encrypted_value: Vec<u8> = row.get("encrypted_value");
-            let encryption_key_id: Uuid = row.get("encryption_key_id");
-            let encryption_format_version: i16 = row.get("encryption_format_version");
+            let secret_id: Uuid = row.try_get("id")?;
+            let org_id: Uuid = row.try_get("org_id")?;
+            let encrypted_value: Vec<u8> = row.try_get("encrypted_value")?;
+            let encryption_key_id: Uuid = row.try_get("encryption_key_id")?;
+            let encryption_format_version: i16 = row.try_get("encryption_format_version")?;
 
             if encrypted_value.len() < 12 {
                 tracing::warn!(secret_id = %secret_id, "per-org sweep: skipping secret with invalid ciphertext (too short)");
@@ -4714,14 +4721,15 @@ impl SecretsManager {
         .await
         .context("dek_migration_status: count query failed")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| DekTableMigrationStatus {
-                table: r.get::<String, _>("tbl"),
-                has_sweep: r.get::<bool, _>("has_sweep"),
-                pending: r.get::<i64, _>("pending"),
+        rows.into_iter()
+            .map(|r| -> Result<DekTableMigrationStatus> {
+                Ok(DekTableMigrationStatus {
+                    table: r.try_get::<String, _>("tbl")?,
+                    has_sweep: r.try_get::<bool, _>("has_sweep")?,
+                    pending: r.try_get::<i64, _>("pending")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Rotate the master key used for envelope encryption of DEKs.

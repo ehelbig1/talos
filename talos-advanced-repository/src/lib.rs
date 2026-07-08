@@ -389,9 +389,9 @@ impl AdvancedRepository {
         rows.into_iter()
             .map(|r| -> Result<ScratchSessionRow> {
                 Ok(ScratchSessionRow {
-                    name: r.get("name"),
-                    world: r.get("world"),
-                    updated_at: r.get("updated_at"),
+                    name: r.try_get("name")?,
+                    world: r.try_get("world")?,
+                    updated_at: r.try_get("updated_at")?,
                     has_error: r.try_get::<Option<bool>, _>("has_error")?.unwrap_or(false),
                 })
             })
@@ -528,17 +528,18 @@ impl AdvancedRepository {
         }
         .context("list_archived_executions")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ArchivedExecutionRow {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                status: r.get("status"),
-                started_at: r.get("started_at"),
-                completed_at: r.get("completed_at"),
-                error_message: r.get("error_message"),
+        rows.into_iter()
+            .map(|r| -> Result<ArchivedExecutionRow> {
+                Ok(ArchivedExecutionRow {
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
+                    status: r.try_get("status")?,
+                    started_at: r.try_get("started_at")?,
+                    completed_at: r.try_get("completed_at")?,
+                    error_message: r.try_get("error_message")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     // ── Marketplace ───────────────────────────────────────────────────────────
@@ -568,8 +569,8 @@ impl AdvancedRepository {
 
         row.map(|r| -> Result<WasmModuleRow> {
             Ok(WasmModuleRow {
-                name: r.get("name"),
-                capability_world: r.get("capability_world"),
+                name: r.try_get("name")?,
+                capability_world: r.try_get("capability_world")?,
                 source_code: r.try_get::<Option<String>, _>("source_code")?,
             })
         })
@@ -599,7 +600,7 @@ impl AdvancedRepository {
 
         row.map(|r| -> Result<SandboxModuleRow> {
             Ok(SandboxModuleRow {
-                name: r.get("name"),
+                name: r.try_get("name")?,
                 wasm_bytes: r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?,
             })
         })
@@ -636,7 +637,7 @@ impl AdvancedRepository {
         .await
         .context("publish_to_marketplace")?;
 
-        Ok(row.get("id"))
+        Ok(row.try_get("id")?)
     }
 
     /// Fetch a marketplace listing by ID (must be public).
@@ -653,12 +654,15 @@ impl AdvancedRepository {
         .await
         .context("get_marketplace_listing")?;
 
-        Ok(row.map(|r| MarketplaceListingRow {
-            module_id: r.get("module_id"),
-            name: r.get("name"),
-            capability_world: r.get("capability_world"),
-            version: r.get("version"),
-        }))
+        row.map(|r| -> Result<MarketplaceListingRow> {
+            Ok(MarketplaceListingRow {
+                module_id: r.try_get("module_id")?,
+                name: r.try_get("name")?,
+                capability_world: r.try_get("capability_world")?,
+                version: r.try_get("version")?,
+            })
+        })
+        .transpose()
     }
 
     /// Fetch the full installable artifact for a marketplace source module —
@@ -1230,11 +1234,12 @@ impl AdvancedRepository {
                 .await
                 .context("get_workflow_graph_and_name")?;
 
-        Ok(row.map(|r| {
-            let name: String = r.get("name");
-            let graph: String = r.get("graph_json");
-            (name, graph)
-        }))
+        row.map(|r| -> Result<(String, String)> {
+            let name: String = r.try_get("name")?;
+            let graph: String = r.try_get("graph_json")?;
+            Ok((name, graph))
+        })
+        .transpose()
     }
 
     /// Fetch id, name, config_schema, allowed_secrets for a batch of template IDs.
@@ -1259,8 +1264,8 @@ impl AdvancedRepository {
         rows.into_iter()
             .map(|r| -> Result<NodeTemplateConfigRow> {
                 Ok(NodeTemplateConfigRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     config_schema: r
                         .try_get::<Option<serde_json::Value>, _>("config_schema")?
                         .unwrap_or(serde_json::json!({})),
@@ -1325,7 +1330,9 @@ impl AdvancedRepository {
         .context("get_ids_without_embedding")?;
         tx.commit().await?;
 
-        Ok(rows.into_iter().map(|r| r.get("id")).collect())
+        rows.into_iter()
+            .map(|r| r.try_get("id").map_err(Into::into))
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fetch recent draft workflows with no executions (max 10).
@@ -1425,7 +1432,9 @@ impl AdvancedRepository {
         .context("get_ids_without_capabilities")?;
         tx.commit().await?;
 
-        Ok(rows.into_iter().map(|r| r.get("id")).collect())
+        rows.into_iter()
+            .map(|r| r.try_get("id").map_err(Into::into))
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fetch the next upcoming scheduled run for a user. Returns full schedule
@@ -2138,18 +2147,19 @@ impl AdvancedRepository {
         .context("list_sla_thresholds")?;
         tx.commit().await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| SlaThresholdRow {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.get("workflow_name"),
-                p95_latency_ms: r.get("p95_latency_ms"),
-                success_rate_pct: r.get("success_rate_pct"),
-                notification_webhook: r.get("notification_webhook"),
-                created_at: r.get("created_at"),
+        rows.into_iter()
+            .map(|r| -> Result<SlaThresholdRow> {
+                Ok(SlaThresholdRow {
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
+                    workflow_name: r.try_get("workflow_name")?,
+                    p95_latency_ms: r.try_get("p95_latency_ms")?,
+                    success_rate_pct: r.try_get("success_rate_pct")?,
+                    notification_webhook: r.try_get("notification_webhook")?,
+                    created_at: r.try_get("created_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fetch SLA threshold config for webhook testing.
@@ -2302,21 +2312,22 @@ impl AdvancedRepository {
         }
         .context("list_suspensions")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| SuspensionRow {
-                id: r.get("id"),
-                correlation_id: r.get("correlation_id"),
-                description: r.get("description"),
-                status: r.get("status"),
-                continuation_workflow_id: r.get("continuation_workflow_id"),
-                callback_url: r.get("callback_url"),
-                timeout_at: r.get("timeout_at"),
-                resumed_at: r.get("resumed_at"),
-                resumed_by: r.get("resumed_by"),
-                created_at: r.get("created_at"),
+        rows.into_iter()
+            .map(|r| -> Result<SuspensionRow> {
+                Ok(SuspensionRow {
+                    id: r.try_get("id")?,
+                    correlation_id: r.try_get("correlation_id")?,
+                    description: r.try_get("description")?,
+                    status: r.try_get("status")?,
+                    continuation_workflow_id: r.try_get("continuation_workflow_id")?,
+                    callback_url: r.try_get("callback_url")?,
+                    timeout_at: r.try_get("timeout_at")?,
+                    resumed_at: r.try_get("resumed_at")?,
+                    resumed_by: r.try_get("resumed_by")?,
+                    created_at: r.try_get("created_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Fetch a suspension by correlation_id (ownership-checked) for resumption.
@@ -2336,11 +2347,14 @@ impl AdvancedRepository {
         .await
         .context("get_suspension_by_correlation")?;
 
-        Ok(row.map(|r| SuspensionDetailRow {
-            id: r.get("id"),
-            status: r.get("status"),
-            continuation_workflow_id: r.get("continuation_workflow_id"),
-        }))
+        row.map(|r| -> Result<SuspensionDetailRow> {
+            Ok(SuspensionDetailRow {
+                id: r.try_get("id")?,
+                status: r.try_get("status")?,
+                continuation_workflow_id: r.try_get("continuation_workflow_id")?,
+            })
+        })
+        .transpose()
     }
 
     /// Mark a suspension as resumed with the given payload.
@@ -2394,7 +2408,10 @@ impl AdvancedRepository {
         .await
         .context("claim_suspension_for_mcp_resume")?;
 
-        Ok(row.map(|r| (r.get("id"), r.get("continuation_workflow_id"))))
+        row.map(|r| -> Result<(Uuid, Option<Uuid>)> {
+            Ok((r.try_get("id")?, r.try_get("continuation_workflow_id")?))
+        })
+        .transpose()
     }
 
     /// Cancel a waiting suspension by correlation_id. Returns rows affected.
@@ -2528,16 +2545,16 @@ impl AdvancedRepository {
         rows.iter()
             .map(|r| -> Result<MarketplaceSearchRow> {
                 Ok(MarketplaceSearchRow {
-                    id: r.get("id"),
-                    module_id: r.get("module_id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    module_id: r.try_get("module_id")?,
+                    name: r.try_get("name")?,
                     description: r
                         .try_get::<Option<String>, _>("description")?
                         .unwrap_or_default(),
-                    capability_world: r.get("capability_world"),
-                    version: r.get("version"),
-                    downloads: r.get("downloads"),
-                    tags: r.get("tags"),
+                    capability_world: r.try_get("capability_world")?,
+                    version: r.try_get("version")?,
+                    downloads: r.try_get("downloads")?,
+                    tags: r.try_get("tags")?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -2612,7 +2629,7 @@ impl AdvancedRepository {
         rows.iter()
             .map(|r| -> Result<PinnedModuleInstallStatus> {
                 Ok(PinnedModuleInstallStatus {
-                    module_name: r.get("module_name"),
+                    module_name: r.try_get("module_name")?,
                     has_wasm: r.try_get::<Option<bool>, _>("has_wasm")?.unwrap_or(false),
                 })
             })
@@ -2643,8 +2660,8 @@ impl AdvancedRepository {
         rows.iter()
             .map(|r| -> Result<ActiveActorWithMemoryRow> {
                 Ok(ActiveActorWithMemoryRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     description: r.try_get::<Option<String>, _>("description")?,
                     status: r
                         .try_get::<Option<String>, _>("status")
@@ -2717,12 +2734,12 @@ impl AdvancedRepository {
         rows.iter()
             .map(|r| -> Result<RecentExecutionRow> {
                 Ok(RecentExecutionRow {
-                    execution_id: r.get("execution_id"),
-                    workflow_id: r.get("workflow_id"),
+                    execution_id: r.try_get("execution_id")?,
+                    workflow_id: r.try_get("workflow_id")?,
                     workflow_name: r
                         .try_get::<Option<String>, _>("workflow_name")?
                         .unwrap_or_default(),
-                    status: r.get("status"),
+                    status: r.try_get("status")?,
                     started_at: r.try_get("started_at").ok(),
                     completed_at: r.try_get("completed_at").ok(),
                     duration_ms: r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
@@ -2758,8 +2775,8 @@ impl AdvancedRepository {
         rows.iter()
             .map(|r| -> Result<StuckExecutionRow> {
                 Ok(StuckExecutionRow {
-                    execution_id: r.get("id"),
-                    workflow_id: r.get("workflow_id"),
+                    execution_id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
                     hours_stuck: r.try_get::<Option<f64>, _>("hours_stuck")?.unwrap_or(0.0),
                 })
             })

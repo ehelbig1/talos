@@ -462,10 +462,10 @@ impl ExecutionRepository {
         let mut re_encrypted = 0u64;
         let mut failed = 0u64;
         for r in &rows {
-            let exec_id: Uuid = r.get("id");
-            let enc: Vec<u8> = r.get("output_data_enc");
-            let key_id: Uuid = r.get("output_enc_key_id");
-            let fmt: i16 = r.get("output_data_format");
+            let exec_id: Uuid = r.try_get("id")?;
+            let enc: Vec<u8> = r.try_get("output_data_enc")?;
+            let key_id: Uuid = r.try_get("output_enc_key_id")?;
+            let fmt: i16 = r.try_get("output_data_format")?;
 
             let value = match self.decrypt_output(exec_id, key_id, &enc, fmt).await {
                 Ok(v) => v,
@@ -674,7 +674,7 @@ impl ExecutionRepository {
             if !has_loop_cap {
                 continue;
             }
-            let workflow_id: Uuid = r.get("workflow_id");
+            let workflow_id: Uuid = r.try_get("workflow_id")?;
             let workflow_name: String = r.try_get::<Option<String>, _>("name")?.unwrap_or_default();
             let completed_at: Option<chrono::DateTime<chrono::Utc>> =
                 r.try_get::<Option<_>, _>("completed_at")?;
@@ -776,9 +776,9 @@ impl ExecutionRepository {
         for r in rows {
             let output_data = self.read_output_from_row(&r).await?;
             out.push(ExecutionRow {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                status: r.get("status"),
+                id: r.try_get("id")?,
+                workflow_id: r.try_get("workflow_id")?,
+                status: r.try_get("status")?,
                 started_at: r.try_get::<Option<_>, _>("started_at")?,
                 completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                 output_data,
@@ -830,9 +830,9 @@ impl ExecutionRepository {
         let Some(r) = row else { return Ok(None) };
         let output_data = self.read_output_from_row(&r).await?;
         Ok(Some(ExecutionRow {
-            id: r.get("id"),
-            workflow_id: r.get("workflow_id"),
-            status: r.get("status"),
+            id: r.try_get("id")?,
+            workflow_id: r.try_get("workflow_id")?,
+            status: r.try_get("status")?,
             started_at: r.try_get::<Option<_>, _>("started_at")?,
             completed_at: r.try_get::<Option<_>, _>("completed_at")?,
             output_data,
@@ -902,10 +902,10 @@ impl ExecutionRepository {
         rows.into_iter()
             .map(|r| -> Result<ExecutionSummary> {
                 Ok(ExecutionSummary {
-                    id: r.get("id"),
-                    workflow_id: r.get("workflow_id"),
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
                     workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
-                    status: r.get("status"),
+                    status: r.try_get("status")?,
                     started_at: r.try_get::<Option<_>, _>("started_at")?,
                     completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                     error_message: r.try_get::<Option<_>, _>("error_message")?,
@@ -941,9 +941,9 @@ impl ExecutionRepository {
         let Some(r) = row else { return Ok(None) };
         let output_data = self.read_output_from_row(&r).await?;
         Ok(Some(ExecutionRow {
-            id: r.get("id"),
-            workflow_id: r.get("workflow_id"),
-            status: r.get("status"),
+            id: r.try_get("id")?,
+            workflow_id: r.try_get("workflow_id")?,
+            status: r.try_get("status")?,
             started_at: r.try_get::<Option<_>, _>("started_at")?,
             completed_at: r.try_get::<Option<_>, _>("completed_at")?,
             output_data,
@@ -988,10 +988,10 @@ impl ExecutionRepository {
         rows.into_iter()
             .map(|r| -> Result<ExecutionSummary> {
                 Ok(ExecutionSummary {
-                    id: r.get("id"),
-                    workflow_id: r.get("workflow_id"),
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
                     workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
-                    status: r.get("status"),
+                    status: r.try_get("status")?,
                     started_at: r.try_get::<Option<_>, _>("started_at")?,
                     completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                     error_message: r.try_get::<Option<_>, _>("error_message")?,
@@ -1021,10 +1021,10 @@ impl ExecutionRepository {
         rows.into_iter()
             .map(|r| -> Result<ExecutionSummary> {
                 Ok(ExecutionSummary {
-                    id: r.get("id"),
-                    workflow_id: r.get("workflow_id"),
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
                     workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
-                    status: r.get("status"),
+                    status: r.try_get("status")?,
                     started_at: r.try_get::<Option<_>, _>("started_at")?,
                     completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                     error_message: r.try_get::<Option<_>, _>("error_message")?,
@@ -1094,9 +1094,9 @@ impl ExecutionRepository {
             .into_iter()
             .map(|r| -> Result<ExecutionRow> {
                 Ok(ExecutionRow {
-                    id: r.get("id"),
-                    workflow_id: r.get("workflow_id"),
-                    status: r.get("status"),
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
+                    status: r.try_get("status")?,
                     started_at: r.try_get::<Option<_>, _>("started_at")?,
                     completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                     output_data: r.try_get::<Option<_>, _>("output_data")?,
@@ -1136,11 +1136,11 @@ impl ExecutionRepository {
         rows.into_iter()
             .map(|r| -> Result<ExecutionEvent> {
                 Ok(ExecutionEvent {
-                    event_type: r.get("event_type"),
+                    event_type: r.try_get("event_type")?,
                     node_id: r.try_get::<Option<_>, _>("node_id")?,
                     status: r.try_get::<Option<_>, _>("status")?,
                     log_message: r.try_get::<Option<_>, _>("log_message")?,
-                    created_at: r.get("created_at"),
+                    created_at: r.try_get("created_at")?,
                     iteration_index: r.try_get::<Option<_>, _>("iteration_index")?,
                     duration_ms: r.try_get::<Option<_>, _>("duration_ms")?,
                     error_class: r.try_get::<Option<_>, _>("error_class")?,
@@ -1169,11 +1169,11 @@ impl ExecutionRepository {
         rows.into_iter()
             .map(|r| -> Result<ExecutionEvent> {
                 Ok(ExecutionEvent {
-                    event_type: r.get("event_type"),
+                    event_type: r.try_get("event_type")?,
                     node_id: r.try_get::<Option<_>, _>("node_id")?,
                     status: r.try_get::<Option<_>, _>("status")?,
                     log_message: r.try_get::<Option<_>, _>("log_message")?,
-                    created_at: r.get("created_at"),
+                    created_at: r.try_get("created_at")?,
                     iteration_index: r.try_get::<Option<_>, _>("iteration_index")?,
                     duration_ms: r.try_get::<Option<_>, _>("duration_ms")?,
                     error_class: r.try_get::<Option<_>, _>("error_class")?,
@@ -2126,11 +2126,11 @@ impl ExecutionRepository {
         rows.into_iter()
             .map(|r| -> Result<ExecutionEvent> {
                 Ok(ExecutionEvent {
-                    event_type: r.get("event_type"),
+                    event_type: r.try_get("event_type")?,
                     node_id: r.try_get::<Option<_>, _>("node_id")?,
                     status: r.try_get::<Option<_>, _>("status")?,
                     log_message: r.try_get::<Option<_>, _>("log_message")?,
-                    created_at: r.get("created_at"),
+                    created_at: r.try_get("created_at")?,
                     iteration_index: r.try_get::<Option<_>, _>("iteration_index")?,
                     duration_ms: r.try_get::<Option<_>, _>("duration_ms")?,
                     error_class: r.try_get::<Option<_>, _>("error_class")?,
@@ -2182,11 +2182,11 @@ impl ExecutionRepository {
         rows.into_iter()
             .map(|r| -> Result<NodeHistoryEvent> {
                 Ok(NodeHistoryEvent {
-                    execution_id: r.get("execution_id"),
-                    event_type: r.get("event_type"),
+                    execution_id: r.try_get("execution_id")?,
+                    event_type: r.try_get("event_type")?,
                     status: r.try_get::<Option<_>, _>("status")?,
                     log_message: r.try_get::<Option<_>, _>("log_message")?,
-                    created_at: r.get("created_at"),
+                    created_at: r.try_get("created_at")?,
                     execution_started_at: r.try_get::<Option<_>, _>("execution_started_at")?,
                 })
             })
@@ -2222,9 +2222,9 @@ impl ExecutionRepository {
         for r in &rows {
             let output_data = self.read_output_from_row(r).await?;
             result.push(ExecutionRow {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                status: r.get("status"),
+                id: r.try_get("id")?,
+                workflow_id: r.try_get("workflow_id")?,
+                status: r.try_get("status")?,
                 started_at: r.try_get::<Option<_>, _>("started_at")?,
                 completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                 output_data,
@@ -2432,8 +2432,8 @@ impl ExecutionRepository {
         rows.iter()
             .map(|r| -> Result<ChildExecutionRow> {
                 Ok(ChildExecutionRow {
-                    execution_id: r.get("id"),
-                    workflow_id: r.get("workflow_id"),
+                    execution_id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
                     workflow_name: r.try_get("workflow_name").ok(),
                     status: r.try_get::<Option<_>, _>("status")?.unwrap_or_default(),
                     started_at: r.try_get("started_at").ok(),
@@ -2499,9 +2499,9 @@ impl ExecutionRepository {
         rows.iter()
             .map(|r| -> Result<ModuleExecutionResourceRow> {
                 Ok(ModuleExecutionResourceRow {
-                    id: r.get("id"),
-                    module_id: r.get("module_id"),
-                    status: r.get("status"),
+                    id: r.try_get("id")?,
+                    module_id: r.try_get("module_id")?,
+                    status: r.try_get("status")?,
                     error_message: r.try_get::<Option<_>, _>("error_message")?,
                 })
             })
@@ -2540,14 +2540,15 @@ impl ExecutionRepository {
         .bind(execution_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ModuleExecutionLogRow {
-                level: r.get("level"),
-                message: r.get("message"),
-                created_at: r.get("created_at"),
+        rows.iter()
+            .map(|r| -> Result<ModuleExecutionLogRow> {
+                Ok(ModuleExecutionLogRow {
+                    level: r.try_get("level")?,
+                    message: r.try_get("message")?,
+                    created_at: r.try_get("created_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Single module_execution detail (id/module_id/status/error/output).
