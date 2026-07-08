@@ -1935,6 +1935,50 @@ impl ExecutionRepository {
         Ok(row)
     }
 
+    /// Atomically CLAIM a specific `waiting` execution for an
+    /// approval-driven resume (the `submit_workflow_approval` /
+    /// approval-decision path). Sibling of
+    /// [`claim_stuck_execution_for_resume`] with three differences:
+    ///
+    /// * keyed on `id` (the caller knows exactly which execution the
+    ///   approval decision belongs to), not "oldest stale";
+    /// * preconditioned on `status = 'waiting'` (a suspended
+    ///   confidence-gate / wait-node execution), not an orphaned
+    ///   `running` row;
+    /// * **tenant-scoped**: `AND user_id = $2` makes the ownership
+    ///   check part of the atomic claim itself, so a caller can never
+    ///   resume another user's execution even if an earlier advisory
+    ///   read raced.
+    ///
+    /// The single-status precondition is the double-resume guard: two
+    /// concurrent approval submissions (or an approval racing the
+    /// GraphQL `resumeWorkflow` mutation) can only win this transition
+    /// once — the loser sees `None` and must not dispatch. The
+    /// `epoch + 1` bump fences any controller still driving the row
+    /// (same F4 contract as the crash-recovery claim). Returns the
+    /// same row shape the crash-recovery resume kernel consumes.
+    pub async fn claim_waiting_execution_for_resume(
+        &self,
+        execution_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<StuckExecutionForResume>> {
+        let row = sqlx::query_as::<_, StuckExecutionForResume>(
+            "UPDATE workflow_executions e \
+             SET status = 'resuming', updated_at = NOW(), epoch = e.epoch + 1 \
+             WHERE e.id = $1 AND e.user_id = $2 AND e.status = 'waiting' \
+             RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, e.epoch, \
+                       (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
+                           AS workflow_default_actor_id, \
+                       (SELECT w.graph_json FROM workflows w WHERE w.id = e.workflow_id) \
+                           AS graph_json",
+        )
+        .bind(execution_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Terminal exit for a claimed (`resuming`) execution whose resume could
     /// not be dispatched (decrypt fail, engine build fail, NATS down, deleted
     /// workflow). Status-guarded on `resuming` so it never clobbers a row the

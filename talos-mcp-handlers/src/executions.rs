@@ -421,7 +421,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "submit_workflow_approval",
-            "description": "Approve or reject a workflow execution that is paused waiting for human review. Pass the execution_id from list_pending_approvals and set approved=true to allow execution to continue or approved=false to reject it. An optional reason string is recorded in the audit log.",
+            "description": "Approve or reject a workflow execution that is paused waiting for human review. Pass the execution_id from list_pending_approvals and set approved=true to allow execution to continue or approved=false to reject it. An optional reason string is recorded in the audit log. If the execution is suspended (status 'waiting' — e.g. a confidence-gate pause), the decision automatically resumes it from its checkpoint: approved executions continue, rejected ones fail with an approval-denied error. The response's resume_triggered/resume_status fields report whether that resume fired.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5628,14 +5628,90 @@ async fn handle_submit_workflow_approval(
         );
     }
 
+    // --- Resume the suspended execution (confidence-gate / approval pause) ---
+    // Post-#423 a confidence-gate pause correctly parks the execution at
+    // status='waiting'. Recording the decision above only flips the
+    // execution_approvals row — nothing re-runs the engine, so without
+    // this the execution stayed 'waiting' forever (the REST approval-gate
+    // path drives talos-continuation-trigger; this MCP write path lacked
+    // the equivalent wiring). `resume_waiting_execution` claims the row
+    // atomically (`waiting -> resuming`, tenant-scoped on user_id inside
+    // the claim UPDATE) and hands it to the shared checkpoint-resume
+    // kernel; on resume the gate re-evaluates and observes the decision
+    // just recorded (approved → proceed, denied → fail loudly). Fires for
+    // BOTH decisions — a rejected execution must also resume so it fails
+    // with the documented "approval denied" error instead of hanging.
+    //
+    // Double-resume guards: (a) skip when the inline NATS signal already
+    // unblocked an in-process Human_Approval_Gate run (that execution is
+    // 'running', not 'waiting'); (b) the claim's single-status
+    // precondition makes any remaining race (concurrent submission, the
+    // GraphQL resumeWorkflow mutation) resolve to exactly one dispatch.
+    let mut resume_triggered = false;
+    let mut resume_status: &'static str = "not_attempted";
+    if should_attempt_waiting_resume(nats_published, db_rows_updated) {
+        match state
+            .execution_orchestration_service
+            .resume_waiting_execution(exec_id, user_id)
+            .await
+        {
+            Ok(talos_execution_orchestration::WaitingResumeOutcome::Resumed) => {
+                resume_triggered = true;
+                resume_status = "resumed";
+            }
+            Ok(talos_execution_orchestration::WaitingResumeOutcome::NotWaiting) => {
+                // Not suspended: module-approval retry flow, an inline
+                // gate, or another resume path won the claim.
+                resume_status = "not_waiting";
+            }
+            Err(talos_execution_orchestration::OrchestrationError::AuthorizationDenied(msg)) => {
+                // The auth layer's messages are operator-facing by
+                // design (actor archived / budget / ceiling drift).
+                // The decision itself was recorded; the execution
+                // stays 'waiting' and can be resumed once the actor
+                // is eligible again.
+                tracing::warn!(
+                    %exec_id,
+                    %user_id,
+                    reason = %msg,
+                    "submit_workflow_approval: resume denied by actor authorization gate"
+                );
+                resume_status = "authorization_denied";
+            }
+            Err(e) => {
+                // Log full detail server-side; the response carries a
+                // stable classifier only (never internal error text).
+                tracing::error!(
+                    %exec_id,
+                    error = %e,
+                    "submit_workflow_approval: failed to resume waiting execution"
+                );
+                resume_status = "error";
+            }
+        }
+    }
+
     tracing::info!(
         %exec_id,
         %user_id,
         approved,
         db_rows_updated,
         nats_published,
+        resume_triggered,
+        resume_status,
         "submit_workflow_approval: decision recorded"
     );
+
+    let message = match (approved, resume_triggered) {
+        (true, true) => {
+            "Execution approved — the suspended execution has been resumed and will continue processing."
+        }
+        (false, true) => {
+            "Execution rejected — the suspended execution has been resumed and will fail with an approval denied error."
+        }
+        (true, false) => "Execution approved — it will continue processing.",
+        (false, false) => "Execution rejected — it will fail with an approval denied error.",
+    };
 
     mcp_text(
         req_id,
@@ -5645,14 +5721,31 @@ async fn handle_submit_workflow_approval(
             "reason": reason,
             "inline_signal_sent": nats_published,
             "db_rows_updated": db_rows_updated,
-            "message": if approved {
-                "Execution approved — it will continue processing."
-            } else {
-                "Execution rejected — it will fail with an approval denied error."
-            }
+            "resume_triggered": resume_triggered,
+            "resume_status": resume_status,
+            "message": message
         }))
         .unwrap_or_default(),
     )
+}
+
+/// Should the handler attempt to resume a suspended (`waiting`)
+/// execution after recording an approval decision?
+///
+/// * `inline_signal_sent` — the Redis/NATS inline Human_Approval_Gate
+///   path already delivered the decision to an IN-PROCESS run; that
+///   execution is 'running', not 'waiting', so a resume attempt is at
+///   best a no-op and at worst races the still-running engine.
+/// * `db_rows_updated == 0` — no pending approval row was flipped, so
+///   there is no recorded decision for a resumed gate to observe;
+///   resuming would just re-suspend on the still-pending approval.
+///
+/// Pure — unit-tested below. The authoritative double-resume guard is
+/// the atomic `waiting -> resuming` claim inside
+/// `resume_waiting_execution`; this predicate only avoids pointless
+/// attempts.
+fn should_attempt_waiting_resume(inline_signal_sent: bool, db_rows_updated: u64) -> bool {
+    !inline_signal_sent && db_rows_updated > 0
 }
 
 /// Get the input and output for a specific node in a workflow execution.
@@ -5784,6 +5877,32 @@ async fn handle_get_node_io(
         }))
         .unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod should_attempt_waiting_resume_tests {
+    use super::should_attempt_waiting_resume;
+
+    #[test]
+    fn resumes_when_decision_recorded_and_no_inline_signal() {
+        assert!(should_attempt_waiting_resume(false, 1));
+        assert!(should_attempt_waiting_resume(false, 3));
+    }
+
+    #[test]
+    fn skips_when_inline_signal_already_unblocked_the_run() {
+        // The in-process Human_Approval_Gate run is 'running', not
+        // 'waiting' — resuming would race the still-running engine.
+        assert!(!should_attempt_waiting_resume(true, 1));
+        assert!(!should_attempt_waiting_resume(true, 0));
+    }
+
+    #[test]
+    fn skips_when_no_pending_approval_row_was_decided() {
+        // No recorded decision for a resumed gate to observe — the
+        // resume would just re-suspend on the still-pending approval.
+        assert!(!should_attempt_waiting_resume(false, 0));
+    }
 }
 
 #[cfg(test)]
