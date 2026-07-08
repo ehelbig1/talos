@@ -126,7 +126,8 @@ impl WorkflowsMutations {
                     | OrchestrationError::WorkflowDisabled(_)
                     | OrchestrationError::StatusConflict(_)
                     | OrchestrationError::AuthorizationDenied(_)
-                    | OrchestrationError::ConcurrencyLimitExceeded(_) => {
+                    | OrchestrationError::ConcurrencyLimitExceeded(_)
+                    | OrchestrationError::GraphLoadFailed(_) => {
                         async_graphql::Error::new(e.to_string()).extend_safe()
                     }
                     OrchestrationError::DispatchFailed(_)

@@ -80,6 +80,20 @@ pub enum OrchestrationError {
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 
+    /// The workflow's stored graph could not be loaded into an engine —
+    /// most commonly an EMPTY graph (a workflow created with no nodes and
+    /// then triggered), or a malformed stored `graph_json`. This is a
+    /// WORKFLOW-DEFINITION problem the caller can fix (add a node, re-save
+    /// the graph), NOT a server fault — so it surfaces the actionable
+    /// message verbatim (already rendered by
+    /// `talos_engine::user_errors::render_graph_load_error` AND
+    /// DLP-redacted by the caller) and is NOT logged as a server-side
+    /// failure. Separated from `Internal` for exactly this reason (found
+    /// in regression round 6: empty-graph triggers returned a useless
+    /// "Internal server error" and paged as a server failure).
+    #[error("{0}")]
+    GraphLoadFailed(String),
+
     /// Catch-all for engine-builder failures, repository helper errors
     /// that don't surface a typed variant, and other infrastructure
     /// concerns the caller can't fix.
@@ -96,7 +110,9 @@ impl OrchestrationError {
     /// spec), Talos custom range starts at -32000.
     pub fn jsonrpc_code(&self) -> i32 {
         match self {
-            Self::InvalidArgument(_) | Self::ValidationFailed(_) => -32602,
+            Self::InvalidArgument(_) | Self::ValidationFailed(_) | Self::GraphLoadFailed(_) => {
+                -32602
+            }
             Self::WorkflowNotFound(_) | Self::ExecutionNotFound(_) => -32001,
             Self::ExecutionPaused | Self::WorkflowDisabled(_) | Self::StatusConflict(_) => -32003,
             Self::AuthorizationDenied(_) => -32004,
@@ -117,6 +133,12 @@ mod tests {
         // before flipping a value here.
         assert_eq!(
             OrchestrationError::InvalidArgument("x".into()).jsonrpc_code(),
+            -32602
+        );
+        // GraphLoadFailed (empty/malformed graph) is a client-error code —
+        // an actionable workflow-definition problem, not a server fault.
+        assert_eq!(
+            OrchestrationError::GraphLoadFailed("Workflow has no nodes".into()).jsonrpc_code(),
             -32602
         );
         assert_eq!(
