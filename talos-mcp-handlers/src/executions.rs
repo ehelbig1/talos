@@ -1013,7 +1013,7 @@ async fn handle_cancel_execution(
                     -32000,
                     &format!(
                         "Cannot cancel execution: current status '{}'. \
-                         Only executions with status 'running', 'queued', or 'pending' can be cancelled.",
+                         Only executions with status 'running', 'queued', 'waiting', or 'resuming' can be cancelled.",
                         exec.status
                     ),
                 ),

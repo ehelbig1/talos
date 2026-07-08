@@ -1695,11 +1695,23 @@ impl ExecutionRepository {
     }
 
     /// Cancel if in cancellable state. Returns true if cancelled, false if wrong state.
+    ///
+    /// `'waiting'` is cancellable (added 2026-07-08, regression round 4):
+    /// a suspended execution has no in-flight job — it sits parked until an
+    /// approval decision. Pre-#423 no execution ever persisted as 'waiting'
+    /// on the canonical paths, so the gap was invisible; post-#423 the only
+    /// exits from a suspension were approve/reject. Cancelling a waiting
+    /// execution simply terminates the parked row; a later approval finds
+    /// it NotWaiting and reports resume_triggered=false (no dangling
+    /// dispatch). `'pending'` kept in the predicate for pre-constraint
+    /// legacy rows even though new writes can't produce it
+    /// (workflow_executions_status_check).
     pub async fn mark_execution_cancelled(&self, exec_id: Uuid, user_id: Uuid) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE workflow_executions \
              SET status = 'cancelled', error_message = 'Cancelled by user', completed_at = NOW() \
-             WHERE id = $1 AND user_id = $2 AND status IN ('running', 'queued', 'pending', 'resuming')",
+             WHERE id = $1 AND user_id = $2 \
+               AND status IN ('running', 'queued', 'pending', 'resuming', 'waiting')",
         )
         .bind(exec_id)
         .bind(user_id)
