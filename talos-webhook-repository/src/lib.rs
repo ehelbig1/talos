@@ -331,7 +331,7 @@ impl WebhookRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows.iter().map(row_to_webhook).collect())
+        rows.iter().map(row_to_webhook).collect()
     }
 
     /// Paginated stats listing for the GraphQL `webhook_triggers` query.
@@ -427,7 +427,7 @@ impl WebhookRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows.iter().map(row_to_webhook).collect())
+        rows.iter().map(row_to_webhook).collect()
     }
 
     /// 24-hour aggregate of auth failures, rate-limit hits, and successes per
@@ -463,7 +463,7 @@ impl WebhookRepository {
         rows.iter()
             .map(|r| -> Result<WebhookSecurityStat> {
                 Ok(WebhookSecurityStat {
-                    trigger_id: r.get("trigger_id"),
+                    trigger_id: r.try_get("trigger_id")?,
                     trigger_name: r.try_get("trigger_name").ok().flatten(),
                     // RFC check-52: fail loud on schema drift (read as Option so a
                     // genuinely-NULL count still yields 0, but a renamed/retyped
@@ -477,14 +477,18 @@ impl WebhookRepository {
     }
 }
 
-fn row_to_webhook(row: &sqlx::postgres::PgRow) -> WebhookListRow {
-    WebhookListRow {
-        id: row.get("id"),
-        name: row.get("name"),
-        module_id: row.get("module_id"),
-        enabled: row.get("enabled"),
-        max_requests_per_minute: row.get("max_requests_per_minute"),
-        created_at: row.get("created_at"),
-        event_filter: row.get("event_filter"),
-    }
+/// Fallible row projection (check 55): bare `row.get` PANICS on a NULL or
+/// type-drifted column, killing the tokio task mid-request (the caller
+/// sees a connection reset — the #427 list_webhooks incident). `try_get`
+/// + `?` keeps the fail-loud contract as a clean error instead.
+fn row_to_webhook(row: &sqlx::postgres::PgRow) -> Result<WebhookListRow> {
+    Ok(WebhookListRow {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        module_id: row.try_get("module_id")?,
+        enabled: row.try_get("enabled")?,
+        max_requests_per_minute: row.try_get("max_requests_per_minute")?,
+        created_at: row.try_get("created_at")?,
+        event_filter: row.try_get("event_filter")?,
+    })
 }
