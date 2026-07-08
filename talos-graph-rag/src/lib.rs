@@ -68,6 +68,13 @@ pub struct GraphRagService {
     /// `OLLAMA_URL` points on-host, so the strict data-egress
     /// guarantee is preserved rather than assumed-away.
     ollama: Option<OllamaExtractor>,
+    /// Operator attestation (`TALOS_GRAPH_RAG_TIER1_LOCAL_OK`) that the
+    /// wired Ollama backend runs ON-HOST, unlocking graph extraction
+    /// for tier1 (local-only) actors via the LOCAL backend ONLY. See
+    /// `with_tier1_local_extraction` for the exact semantics; the
+    /// default (`false`) preserves the strict "tier1 skips all LLM
+    /// extraction" posture.
+    tier1_local_ok: bool,
 }
 
 /// Local-Ollama extraction backend: the shared hardened HTTP client
@@ -78,6 +85,85 @@ pub struct GraphRagService {
 struct OllamaExtractor {
     client: Arc<talos_llm::OllamaClient>,
     model: String,
+}
+
+/// What the tier gate permits for one extraction attempt. Computed per
+/// memory write by `actor_tier_decision`; the dispatcher
+/// (`extract_triples_llm`) selects backends strictly from this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TierDecision {
+    /// Tier2 actor (or legacy un-gated deployment): any configured
+    /// backend is permitted — Anthropic preferred, Ollama fallback.
+    External,
+    /// Tier1 actor on a deployment whose operator has attested the
+    /// Ollama backend is on-host (`TALOS_GRAPH_RAG_TIER1_LOCAL_OK`):
+    /// the LOCAL backend ONLY. Anthropic is never consulted on this
+    /// path, even when a key is present — the ceiling still forbids
+    /// external egress; the attestation only vouches for the local
+    /// backend.
+    LocalOnly,
+    /// No LLM extraction: tier1 without attestation, actor row
+    /// missing, tier lookup error, or a future stricter-than-tier1
+    /// variant. Fail-closed default.
+    Skip,
+}
+
+/// Since-boot, process-wide extraction outcome counters. Cheap relaxed
+/// atomics — the point is operator diagnosability (surfaced through the
+/// `graph_stats` MCP tool), not exact cross-thread ordering. Every skip
+/// path in the write-time extraction pipeline otherwise logs at DEBUG,
+/// which is invisible at the default filter — an empty graph looked
+/// identical whether extraction was failing, skipped by policy, or
+/// simply never attempted.
+#[derive(Debug, Default)]
+struct ExtractionMetrics {
+    /// Memory writes whose rule-based extraction produced triples
+    /// (no LLM call needed).
+    rule_based_hits: std::sync::atomic::AtomicU64,
+    /// LLM backend calls attempted (Anthropic or Ollama).
+    llm_attempts: std::sync::atomic::AtomicU64,
+    /// LLM backend calls that errored (HTTP failure, unparseable
+    /// output, timeout). `llm_attempts - llm_failures` = successes.
+    llm_failures: std::sync::atomic::AtomicU64,
+    /// Extractions skipped by the tier gate (tier1 without local
+    /// attestation, missing actor, or tier lookup error).
+    skipped_tier_gate: std::sync::atomic::AtomicU64,
+    /// Extractions skipped because no LLM backend is configured
+    /// (no Anthropic key AND no Ollama extractor wired).
+    skipped_no_backend: std::sync::atomic::AtomicU64,
+    /// Total triples persisted to Neo4j (rule-based + LLM).
+    triples_persisted: std::sync::atomic::AtomicU64,
+}
+
+static EXTRACTION_METRICS: ExtractionMetrics = ExtractionMetrics {
+    rule_based_hits: std::sync::atomic::AtomicU64::new(0),
+    llm_attempts: std::sync::atomic::AtomicU64::new(0),
+    llm_failures: std::sync::atomic::AtomicU64::new(0),
+    skipped_tier_gate: std::sync::atomic::AtomicU64::new(0),
+    skipped_no_backend: std::sync::atomic::AtomicU64::new(0),
+    triples_persisted: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// One-shot latch for the no-backend misconfiguration WARN. The
+/// condition is deployment-static (backends are wired at boot), so one
+/// loud line per process is signal and per-write repetition is noise —
+/// subsequent skips log at DEBUG and increment the counter.
+static NO_BACKEND_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Since-boot extraction counters as a JSON object, for the
+/// `graph_stats` MCP envelope. Deployment-level (process-wide), not
+/// per-actor.
+pub fn extraction_metrics_snapshot() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &EXTRACTION_METRICS;
+    serde_json::json!({
+        "rule_based_hits": m.rule_based_hits.load(Relaxed),
+        "llm_attempts": m.llm_attempts.load(Relaxed),
+        "llm_failures": m.llm_failures.load(Relaxed),
+        "skipped_tier_gate": m.skipped_tier_gate.load(Relaxed),
+        "skipped_no_backend": m.skipped_no_backend.load(Relaxed),
+        "triples_persisted": m.triples_persisted.load(Relaxed),
+    })
 }
 
 impl GraphRagService {
@@ -121,11 +207,35 @@ impl GraphRagService {
     ///
     /// `model` is the Ollama model tag to run (e.g. `qwen2.5:7b`) —
     /// wired from `TALOS_GRAPH_RAG_MODEL`. The tier gate
-    /// (`actor_allows_external_llm`) still applies: tier1 actors skip
+    /// (`actor_tier_decision`) still applies: tier1 actors skip
     /// LLM extraction entirely regardless of this backend.
     #[must_use]
     pub fn with_ollama(mut self, client: Arc<talos_llm::OllamaClient>, model: String) -> Self {
         self.ollama = Some(OllamaExtractor { client, model });
+        self
+    }
+
+    /// Operator attestation that the wired Ollama backend runs ON-HOST
+    /// (`TALOS_GRAPH_RAG_TIER1_LOCAL_OK` — see `main.rs` wiring),
+    /// unlocking graph extraction for tier1 actors via the LOCAL
+    /// backend ONLY.
+    ///
+    /// Security semantics (deliberate, reviewed):
+    /// * The tier1 ceiling means "this actor's data must not leave the
+    ///   host". The platform cannot verify where `OLLAMA_URL` points,
+    ///   so by default tier1 skips ALL LLM extraction. This flag is
+    ///   the operator asserting, at deployment level, that the Ollama
+    ///   endpoint does not leave the host — the same trust granularity
+    ///   as configuring `OLLAMA_URL` itself.
+    /// * Under the attestation, a tier1 actor's extraction NEVER
+    ///   consults Anthropic — even when a key is present. The
+    ///   attestation vouches for the local backend, not for external
+    ///   egress (`TierDecision::LocalOnly`).
+    /// * Missing-actor and tier-lookup-error cases still skip
+    ///   (fail-closed) — the attestation does not widen those paths.
+    #[must_use]
+    pub fn with_tier1_local_extraction(mut self, allowed: bool) -> Self {
+        self.tier1_local_ok = allowed;
         self
     }
 
@@ -174,6 +284,7 @@ impl GraphRagService {
             secrets: None,
             actor_repo: None,
             ollama: None,
+            tier1_local_ok: false,
         };
         service.init_schema().await?;
 
@@ -215,6 +326,7 @@ impl GraphRagService {
             secrets: None,
             actor_repo: None,
             ollama: None,
+            tier1_local_ok: false,
         }
     }
 
@@ -275,6 +387,10 @@ impl GraphRagService {
             triples = self
                 .extract_triples_llm(actor_id, memory_key, &value_str)
                 .await;
+        } else {
+            EXTRACTION_METRICS
+                .rule_based_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         if triples.is_empty() {
@@ -290,6 +406,9 @@ impl GraphRagService {
         // query per group (typically 1-3 groups). MERGE semantics are
         // byte-for-byte identical to the per-row version.
         self.upsert_triples(actor_id, memory_key, &triples).await?;
+        EXTRACTION_METRICS
+            .triples_persisted
+            .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
 
         tracing::debug!(
             actor_id = %actor_id,
@@ -466,51 +585,63 @@ impl GraphRagService {
         triples
     }
 
-    /// Tier-1 data-egress gate for the LLM-fallback extraction
-    /// path. Returns `true` when LLM extraction is permitted for
-    /// `actor_id`:
-    ///   * No `actor_repo` wired in → legacy un-gated behaviour
-    ///     (the controller has explicitly opted out of tier
+    /// Tier data-egress gate for the LLM-fallback extraction path.
+    /// Maps the actor's `max_llm_tier` to what this extraction attempt
+    /// may do (see [`TierDecision`]):
+    ///   * No `actor_repo` wired in → `External` (legacy un-gated
+    ///     behaviour — the controller has explicitly opted out of tier
     ///     enforcement; usually means the deployment doesn't have
     ///     tier-1 actors at all).
-    ///   * `actor_repo` returns `Tier2` → permitted.
-    ///   * `actor_repo` returns `Tier1` → BLOCKED (tier1 = local
-    ///     only, must not egress to Anthropic).
-    ///   * `actor_repo` returns `Ok(None)` (actor row missing) →
-    ///     BLOCKED. A memory write referencing a missing actor is
-    ///     unusual; fail closed rather than leak data.
-    ///   * `actor_repo` returns `Err(...)` → BLOCKED (DB error;
-    ///     fail closed). Same contract as
-    ///     `talos_engine::actor_binding::apply_actor_to_engine`.
-    async fn actor_allows_external_llm(&self, actor_id: Uuid) -> bool {
+    ///   * `Tier2` → `External` (any backend).
+    ///   * `Tier1` → `LocalOnly` when the operator has attested the
+    ///     Ollama backend is on-host (`with_tier1_local_extraction`)
+    ///     AND that backend is actually wired; otherwise `Skip`.
+    ///   * `Ok(None)` (actor row missing) → `Skip`. A memory write
+    ///     referencing a missing actor is unusual; fail closed rather
+    ///     than leak data. The attestation deliberately does NOT widen
+    ///     this path — it vouches for the backend's locality, not for
+    ///     unattributable writes.
+    ///   * `Err(...)` (DB error) → `Skip` (fail closed). Same contract
+    ///     as `talos_engine::actor_binding::apply_actor_to_engine`.
+    ///   * Any future stricter-than-tier1 variant → `Skip` (only the
+    ///     two known tiers are mapped; `LlmTier` is non-exhaustive).
+    async fn actor_tier_decision(&self, actor_id: Uuid) -> TierDecision {
         let Some(repo) = &self.actor_repo else {
             // Legacy path — caller didn't wire in the repo, so don't
             // gate. This preserves the pre-tier behaviour for
             // deployments that haven't migrated.
-            return true;
+            return TierDecision::External;
         };
         match repo.get_actor_max_llm_tier(actor_id).await {
-            Ok(Some(talos_workflow_job_protocol::LlmTier::Tier2)) => true,
-            // `LlmTier` is non-exhaustive (per upstream); only Tier2
-            // is permitted, anything else (Tier1 or any future
-            // stricter variant) fails closed.
-            Ok(Some(_)) => false,
+            Ok(Some(talos_workflow_job_protocol::LlmTier::Tier2)) => TierDecision::External,
+            Ok(Some(talos_workflow_job_protocol::LlmTier::Tier1)) => {
+                if self.tier1_local_ok && self.ollama.is_some() {
+                    TierDecision::LocalOnly
+                } else {
+                    TierDecision::Skip
+                }
+            }
+            // `LlmTier` is non-exhaustive (per upstream); a future
+            // stricter-than-tier1 variant must not inherit tier1's
+            // local-attestation carve-out — fail closed.
+            #[allow(unreachable_patterns)]
+            Ok(Some(_)) => TierDecision::Skip,
             Ok(None) => {
                 tracing::warn!(
                     target: "talos_graph_rag",
                     actor_id = %actor_id,
-                    "Actor not found during tier check — failing closed (Tier1)"
+                    "Actor not found during tier check — failing closed (skip LLM extraction)"
                 );
-                false
+                TierDecision::Skip
             }
             Err(e) => {
                 tracing::warn!(
                     target: "talos_graph_rag",
                     actor_id = %actor_id,
                     error = %e,
-                    "Tier lookup failed — failing closed (Tier1)"
+                    "Tier lookup failed — failing closed (skip LLM extraction)"
                 );
-                false
+                TierDecision::Skip
             }
         }
     }
@@ -564,100 +695,154 @@ impl GraphRagService {
     /// returns an empty `Vec` on every skip/failure path (never
     /// `Result`) so a failed extraction can't fail the memory write.
     ///
-    /// Backend selection, in priority order:
-    /// 1. **External Anthropic** — preferred when a real key resolves
-    ///    (best extraction quality; byte-identical to pre-refactor
-    ///    behaviour for deployments that already set the key). Gated
-    ///    on tier2 (see below).
-    /// 2. **Local Ollama** — the fallback when no Anthropic key is
-    ///    present. This is what populates the graph on Ollama-only /
-    ///    self-hosted deployments. Also gated on tier2.
-    /// 3. **Skip** — no usable backend, or the actor is tier1.
+    /// Backend selection is driven by [`TierDecision`]:
+    /// * `External` (tier2 / legacy): Anthropic preferred when a real
+    ///   key resolves (best extraction quality; byte-identical to
+    ///   pre-refactor behaviour for deployments that already set the
+    ///   key); local Ollama is the fallback — this is what populates
+    ///   the graph on Ollama-only / self-hosted deployments.
+    /// * `LocalOnly` (tier1 + operator attestation): the local Ollama
+    ///   backend ONLY. Anthropic is never consulted here, even when a
+    ///   key is present — the tier1 ceiling still forbids external
+    ///   egress; the attestation only vouches for the local backend.
+    /// * `Skip` (tier1 without attestation, missing actor, lookup
+    ///   error): no LLM sees the memory contents. Fail-closed default;
+    ///   we can't universally prove `OLLAMA_URL` resolves on-host, so
+    ///   the strict "data may not leave host" guarantee is preserved
+    ///   unless the operator explicitly attests otherwise.
     ///
-    /// **Tier gate (data-egress invariant).** BOTH backends sit behind
-    /// `actor_allows_external_llm` (tier2 only, fail-closed). A tier1
-    /// actor is policy-bound to keep data on-host; because we can't
-    /// universally prove `OLLAMA_URL` resolves on-host, tier1 skips
-    /// LLM extraction entirely rather than assume the local model is
-    /// safe. Operators who want tier1 graph extraction against a
-    /// provably-on-host Ollama can raise the actor to tier2 (on such a
-    /// deployment the extraction stays local anyway).
+    /// Every outcome increments the matching [`EXTRACTION_METRICS`]
+    /// counter so an empty graph is diagnosable through `graph_stats`
+    /// without raising log levels.
     async fn extract_triples_llm(
         &self,
         actor_id: Uuid,
         memory_key: &str,
         value_str: &str,
     ) -> Vec<Triple> {
-        if !self.actor_allows_external_llm(actor_id).await {
-            tracing::debug!(
-                target: "talos_graph_rag",
-                actor_id = %actor_id,
-                memory_key,
-                "Skipped LLM entity extraction: actor max_llm_tier=tier1 (or tier lookup failed) — data may not leave host"
-            );
-            return Vec::new();
-        }
+        use std::sync::atomic::Ordering::Relaxed;
 
-        // 1. External Anthropic — preferred when a real key resolves.
-        //    Vault-first (so `rotate_secret anthropic/api_key`
-        //    propagates), env fallback; placeholder strings are
-        //    filtered so dev setups don't burn HTTP 401s.
-        if let Some(key) = self.resolve_anthropic_key().await {
-            match self
-                .extract_triples_anthropic(&key, memory_key, value_str)
-                .await
-            {
-                Ok(triples) => return triples,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "talos_graph_rag",
-                        memory_key,
-                        error = %e,
-                        "Anthropic entity extraction failed — graph row will have no \
-                         relationships. Common causes: anthropic/api_key invalid or \
-                         revoked (HTTP 401), rate limit (HTTP 429), or model \
-                         deprecation. (No Ollama fallback attempted: a key was \
-                         present, so this is a provider-side failure, not a \
-                         missing-backend one.)"
-                    );
-                    return Vec::new();
+        let decision = self.actor_tier_decision(actor_id).await;
+        match decision {
+            TierDecision::Skip => {
+                EXTRACTION_METRICS.skipped_tier_gate.fetch_add(1, Relaxed);
+                tracing::debug!(
+                    target: "talos_graph_rag",
+                    actor_id = %actor_id,
+                    memory_key,
+                    "Skipped LLM entity extraction: tier gate (tier1 without local \
+                     attestation, missing actor, or tier lookup failure) — data may \
+                     not leave host"
+                );
+                Vec::new()
+            }
+            TierDecision::LocalOnly => {
+                // `actor_tier_decision` only returns LocalOnly when the
+                // extractor is wired; the `else` covers a future drift.
+                if let Some(extractor) = &self.ollama {
+                    self.run_ollama_extraction(extractor, memory_key, value_str)
+                        .await
+                } else {
+                    EXTRACTION_METRICS.skipped_no_backend.fetch_add(1, Relaxed);
+                    Vec::new()
                 }
             }
-        }
+            TierDecision::External => {
+                // 1. External Anthropic — preferred when a real key
+                //    resolves. Vault-first (so `rotate_secret
+                //    anthropic/api_key` propagates), env fallback;
+                //    placeholder strings are filtered so dev setups
+                //    don't burn HTTP 401s.
+                if let Some(key) = self.resolve_anthropic_key().await {
+                    EXTRACTION_METRICS.llm_attempts.fetch_add(1, Relaxed);
+                    return match self
+                        .extract_triples_anthropic(&key, memory_key, value_str)
+                        .await
+                    {
+                        Ok(triples) => triples,
+                        Err(e) => {
+                            EXTRACTION_METRICS.llm_failures.fetch_add(1, Relaxed);
+                            tracing::warn!(
+                                target: "talos_graph_rag",
+                                memory_key,
+                                error = %e,
+                                "Anthropic entity extraction failed — graph row will have no \
+                                 relationships. Common causes: anthropic/api_key invalid or \
+                                 revoked (HTTP 401), rate limit (HTTP 429), or model \
+                                 deprecation. (No Ollama fallback attempted: a key was \
+                                 present, so this is a provider-side failure, not a \
+                                 missing-backend one.)"
+                            );
+                            Vec::new()
+                        }
+                    };
+                }
 
-        // 2. Local Ollama — the fallback when no Anthropic key is set.
-        if let Some(extractor) = &self.ollama {
-            match self
-                .extract_triples_ollama(extractor, memory_key, value_str)
-                .await
-            {
-                Ok(triples) => return triples,
-                Err(e) => {
+                // 2. Local Ollama — the fallback when no Anthropic key
+                //    is set.
+                if let Some(extractor) = &self.ollama {
+                    return self
+                        .run_ollama_extraction(extractor, memory_key, value_str)
+                        .await;
+                }
+
+                // 3. No usable backend. Deployment-static
+                //    misconfiguration → one loud WARN per process (the
+                //    per-write repeat is DEBUG + counter).
+                EXTRACTION_METRICS.skipped_no_backend.fetch_add(1, Relaxed);
+                NO_BACKEND_WARNED.call_once(|| {
                     tracing::warn!(
                         target: "talos_graph_rag",
-                        memory_key,
-                        model = %extractor.model,
-                        error = %e,
-                        "Ollama entity extraction failed — graph row will have no \
-                         relationships. Common causes: model not pulled \
-                         (`ollama pull <model>`), OLLAMA_URL unreachable, or the \
-                         model returned unparseable JSON."
+                        "Graph-RAG LLM extraction has NO backend: no anthropic/api_key \
+                         (vault or env) and no local Ollama extractor wired. The \
+                         knowledge graph will only receive rule-based extractions. Set \
+                         anthropic/api_key OR configure TALOS_GRAPH_RAG_MODEL + a \
+                         reachable OLLAMA_URL. (Logged once per boot; subsequent skips \
+                         are counted in graph_stats.extraction_metrics.)"
                     );
-                    return Vec::new();
-                }
+                });
+                tracing::debug!(
+                    target: "talos_graph_rag",
+                    memory_key,
+                    "Skipped LLM entity extraction: no backend configured — \
+                     actor_memory writes still succeed without it."
+                );
+                Vec::new()
             }
         }
+    }
 
-        // 3. No usable backend.
-        tracing::debug!(
-            target: "talos_graph_rag",
-            memory_key,
-            "Skipped LLM entity extraction: no anthropic/api_key (vault or env) and \
-             no local Ollama extractor wired. Set anthropic/api_key OR configure \
-             TALOS_GRAPH_RAG_MODEL + a reachable OLLAMA_URL to enable graph \
-             extraction — actor_memory writes still succeed without it."
-        );
-        Vec::new()
+    /// Run one Ollama extraction attempt with counter + log handling.
+    /// Shared by the `External`-fallback and `LocalOnly` dispatch arms
+    /// so the failure accounting can't drift between them.
+    async fn run_ollama_extraction(
+        &self,
+        extractor: &OllamaExtractor,
+        memory_key: &str,
+        value_str: &str,
+    ) -> Vec<Triple> {
+        use std::sync::atomic::Ordering::Relaxed;
+        EXTRACTION_METRICS.llm_attempts.fetch_add(1, Relaxed);
+        match self
+            .extract_triples_ollama(extractor, memory_key, value_str)
+            .await
+        {
+            Ok(triples) => triples,
+            Err(e) => {
+                EXTRACTION_METRICS.llm_failures.fetch_add(1, Relaxed);
+                tracing::warn!(
+                    target: "talos_graph_rag",
+                    memory_key,
+                    model = %extractor.model,
+                    error = %e,
+                    "Ollama entity extraction failed — graph row will have no \
+                     relationships. Common causes: model not pulled \
+                     (`ollama pull <model>`), OLLAMA_URL unreachable, or the \
+                     model returned unparseable JSON."
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Deployment-level extraction-backend signal for `graph_stats`.
@@ -676,6 +861,15 @@ impl GraphRagService {
             (false, true) => "ollama",
             (false, false) => "none",
         }
+    }
+
+    /// Whether the operator has attested the Ollama backend is on-host
+    /// (`TALOS_GRAPH_RAG_TIER1_LOCAL_OK`), enabling tier1 graph
+    /// extraction via the local backend only. Surfaced through
+    /// `graph_stats` so a tier1-heavy deployment can see at a glance
+    /// whether its actors participate in the knowledge graph.
+    pub fn tier1_local_enabled(&self) -> bool {
+        self.tier1_local_ok && self.ollama.is_some()
     }
 
     /// LLM-based entity extraction using Anthropic's structured output.
@@ -1635,6 +1829,36 @@ mod placeholder_tests {
 }
 
 #[cfg(test)]
+mod metrics_tests {
+    use super::extraction_metrics_snapshot;
+
+    #[test]
+    fn snapshot_exposes_all_counters_as_numbers() {
+        // The graph_stats envelope depends on this exact key set — a
+        // rename would silently drop a diagnostic field. Assert the
+        // contract, not the values (process-wide counters are shared
+        // across the test binary and can't be asserted absolutely).
+        let snap = extraction_metrics_snapshot();
+        for key in [
+            "rule_based_hits",
+            "llm_attempts",
+            "llm_failures",
+            "skipped_tier_gate",
+            "skipped_no_backend",
+            "triples_persisted",
+        ] {
+            let v = snap
+                .get(key)
+                .unwrap_or_else(|| panic!("missing counter {key}"));
+            assert!(
+                v.is_u64(),
+                "counter {key} must serialize as an unsigned int"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod json_payload_tests {
     use super::extract_json_payload;
 
@@ -1761,64 +1985,110 @@ mod parse_triples_tests {
 
 /// Pure helper extracted so the tier-gate decision matrix is
 /// testable without a real ActorRepository or Postgres. Mirrors
-/// `actor_allows_external_llm` — keep both in sync if the policy
+/// `actor_tier_decision` — keep both in sync if the policy
 /// changes.
 #[cfg(test)]
 fn tier_decision_for_test(
     actor_repo_wired: bool,
     lookup: Option<Result<Option<talos_workflow_job_protocol::LlmTier>, ()>>,
-) -> bool {
+    tier1_local_ok: bool,
+    ollama_wired: bool,
+) -> TierDecision {
     if !actor_repo_wired {
-        return true;
+        return TierDecision::External;
     }
     match lookup {
-        Some(Ok(Some(talos_workflow_job_protocol::LlmTier::Tier2))) => true,
-        // `LlmTier` is non-exhaustive — only Tier2 permits egress.
-        Some(Ok(Some(_))) => false,
-        Some(Ok(None)) => false, // missing actor — fail closed
-        Some(Err(())) => false,  // DB error — fail closed
-        None => false,           // shouldn't happen but fail closed
+        Some(Ok(Some(talos_workflow_job_protocol::LlmTier::Tier2))) => TierDecision::External,
+        Some(Ok(Some(talos_workflow_job_protocol::LlmTier::Tier1))) => {
+            if tier1_local_ok && ollama_wired {
+                TierDecision::LocalOnly
+            } else {
+                TierDecision::Skip
+            }
+        }
+        // `LlmTier` is non-exhaustive — a future stricter variant must
+        // not inherit the tier1 local carve-out.
+        #[allow(unreachable_patterns)]
+        Some(Ok(Some(_))) => TierDecision::Skip,
+        Some(Ok(None)) => TierDecision::Skip, // missing actor — fail closed
+        Some(Err(())) => TierDecision::Skip,  // DB error — fail closed
+        None => TierDecision::Skip,           // shouldn't happen but fail closed
     }
 }
 
 #[cfg(test)]
 mod tier_gate_tests {
-    use super::tier_decision_for_test;
+    use super::{tier_decision_for_test, TierDecision};
     use talos_workflow_job_protocol::LlmTier;
 
     #[test]
     fn legacy_unwired_repo_permits_extraction() {
         // No actor_repo wired in — the deployment hasn't opted into
         // tier enforcement, so don't gate.
-        assert!(tier_decision_for_test(false, None));
+        assert_eq!(
+            tier_decision_for_test(false, None, false, false),
+            TierDecision::External
+        );
     }
 
     #[test]
-    fn tier2_actor_permits_extraction() {
-        assert!(tier_decision_for_test(true, Some(Ok(Some(LlmTier::Tier2)))));
+    fn tier2_actor_permits_external() {
+        assert_eq!(
+            tier_decision_for_test(true, Some(Ok(Some(LlmTier::Tier2))), false, false),
+            TierDecision::External
+        );
     }
 
     #[test]
-    fn tier1_actor_blocks_extraction() {
-        // The whole point: tier1 actors must not have data sent
-        // to Anthropic. This is the security property.
-        assert!(!tier_decision_for_test(
-            true,
-            Some(Ok(Some(LlmTier::Tier1)))
-        ));
+    fn tier1_actor_skips_without_attestation() {
+        // The core security property: tier1 actors must not have data
+        // sent to ANY LLM unless the operator attests the local
+        // backend is on-host — even when Ollama is wired.
+        assert_eq!(
+            tier_decision_for_test(true, Some(Ok(Some(LlmTier::Tier1))), false, true),
+            TierDecision::Skip
+        );
     }
 
     #[test]
-    fn missing_actor_fails_closed() {
-        assert!(!tier_decision_for_test(true, Some(Ok(None))));
+    fn tier1_actor_local_only_with_attestation() {
+        // With the operator attestation AND a wired local backend,
+        // tier1 gets LOCAL-ONLY extraction — never External.
+        assert_eq!(
+            tier_decision_for_test(true, Some(Ok(Some(LlmTier::Tier1))), true, true),
+            TierDecision::LocalOnly
+        );
     }
 
     #[test]
-    fn db_error_fails_closed() {
+    fn tier1_attestation_without_backend_skips() {
+        // Attestation set but no Ollama wired — nothing local to run,
+        // and the flag must NOT fall through to Anthropic.
+        assert_eq!(
+            tier_decision_for_test(true, Some(Ok(Some(LlmTier::Tier1))), true, false),
+            TierDecision::Skip
+        );
+    }
+
+    #[test]
+    fn missing_actor_fails_closed_even_with_attestation() {
+        // The attestation vouches for backend locality, not for
+        // unattributable writes — missing-actor still skips.
+        assert_eq!(
+            tier_decision_for_test(true, Some(Ok(None)), true, true),
+            TierDecision::Skip
+        );
+    }
+
+    #[test]
+    fn db_error_fails_closed_even_with_attestation() {
         // Same fail-closed contract as
         // talos_engine::actor_binding::apply_actor_to_engine — never silently
-        // promote to Tier2 on infra failure.
-        assert!(!tier_decision_for_test(true, Some(Err(()))));
+        // promote on infra failure.
+        assert_eq!(
+            tier_decision_for_test(true, Some(Err(())), true, true),
+            TierDecision::Skip
+        );
     }
 }
 

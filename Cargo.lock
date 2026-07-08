@@ -7070,9 +7070,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
+ "sqlx",
  "talos-graph-rag",
  "talos-memory",
  "talos-workflow-repository",
+ "tokio",
  "tracing",
  "uuid",
 ]
