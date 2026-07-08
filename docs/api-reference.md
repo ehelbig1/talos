@@ -12,6 +12,27 @@ All API requests require authentication via one of:
 
 CSRF protection is enforced on mutations in production via the `X-CSRF-Token` header.
 
+### MCP endpoint auth is a SEPARATE token type
+
+The `/mcp` endpoint does **not** accept GraphQL API keys (`talos_sk_…` from
+`createApiKey`) or session tokens — sending one yields a bare `401` by design
+(the response deliberately doesn't distinguish "wrong token type" from "invalid
+token"). MCP authenticates **agent tokens** from the `mcp_agents` table:
+
+```graphql
+mutation {
+  registerMcpAgent(name: "my-agent", roleName: "System Administrator") { token }
+}
+```
+
+`registerMcpAgent` requires an authenticated session (or `admin`-scoped API
+key) plus 2FA when enrolled. The returned token is shown once; pass it as
+`Authorization: Bearer <token>` on `/mcp` requests. The two token families are
+deliberately separate trust surfaces: API keys carry per-route scopes for the
+GraphQL/REST lane, while MCP agent tokens carry an agent ROLE and are the
+long-lived bearer credentials MCP clients hold — which is also why MCP is
+read-only for secrets (see MCP-1201 in `CLAUDE.md`).
+
 ## Queries
 
 ### User & Auth

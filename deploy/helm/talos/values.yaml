@@ -965,6 +965,21 @@ ollama:
       memory: 8Gi
 
 # ----------------------------------------------------------------------------
+# Graph-RAG (Neo4j knowledge-graph triple extraction)
+# ----------------------------------------------------------------------------
+graphRag:
+  # Ollama model for LOCAL triple extraction (used when no anthropic/api_key
+  # is configured). Empty → controller code default (qwen2.5:7b). 1B-class
+  # models are flaky at structured JSON; use a 7B-class instruct model if the
+  # knowledge graph matters. The model must be pulled in the target Ollama.
+  model: ""
+  # Operator attestation that OLLAMA_URL resolves ON-HOST. When true, tier1
+  # (local-only / "data must not leave host") actors get graph extraction via
+  # the LOCAL Ollama backend ONLY — never an external provider. Leave false
+  # unless you can vouch that the Ollama endpoint does not leave the host.
+  tier1LocalOk: false
+
+# ----------------------------------------------------------------------------
 # Migrations — one-shot sqlx migrate job, pre-install & pre-upgrade hook.
 # Uses the same image as the controller.
 # ----------------------------------------------------------------------------

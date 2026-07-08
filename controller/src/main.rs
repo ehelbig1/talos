@@ -2979,7 +2979,8 @@ async fn init_graph_rag(
                 // in the deployment's Ollama).
                 let ollama_url = talos_config::get_env("OLLAMA_URL", "http://ollama:11434");
                 let graph_rag_model = talos_config::get_env("TALOS_GRAPH_RAG_MODEL", "qwen2.5:7b");
-                if !ollama_url.is_empty() && !graph_rag_model.is_empty() {
+                let ollama_wired = !ollama_url.is_empty() && !graph_rag_model.is_empty();
+                if ollama_wired {
                     let ollama_client =
                         std::sync::Arc::new(talos_llm::OllamaClient::new(ollama_url.clone()));
                     service = service.with_ollama(ollama_client, graph_rag_model.clone());
@@ -2988,6 +2989,55 @@ async fn init_graph_rag(
                         model = %graph_rag_model,
                         "Graph RAG local-Ollama extraction backend wired (fallback when no anthropic/api_key)"
                     );
+                }
+
+                // TALOS_GRAPH_RAG_TIER1_LOCAL_OK — operator attestation
+                // that the Ollama endpoint above runs ON-HOST, unlocking
+                // graph extraction for tier1 (local-only) actors via the
+                // LOCAL backend only (never Anthropic; see
+                // `with_tier1_local_extraction` for the full security
+                // semantics). Empty-env hardening: unset/"" → off;
+                // explicit truthy ("1"/"true"/"yes") → on; anything else
+                // → off with a WARN (a typo like "on" must not silently
+                // disable a knob the operator believes is enabled —
+                // sibling of the MCP-590 empty-env class).
+                let tier1_local_raw = std::env::var("TALOS_GRAPH_RAG_TIER1_LOCAL_OK")
+                    .ok()
+                    .filter(|v| !v.is_empty());
+                let tier1_local_ok = match tier1_local_raw.as_deref() {
+                    Some(v) if matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes") => {
+                        true
+                    }
+                    Some(v) if matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no") => {
+                        false
+                    }
+                    Some(v) => {
+                        tracing::warn!(
+                            value = %v,
+                            "TALOS_GRAPH_RAG_TIER1_LOCAL_OK set to an unrecognized value — \
+                             treating as OFF. Use 1/true/yes to enable."
+                        );
+                        false
+                    }
+                    None => false,
+                };
+                if tier1_local_ok {
+                    if ollama_wired {
+                        service = service.with_tier1_local_extraction(true);
+                        tracing::info!(
+                            ollama_url = %ollama_url,
+                            "Graph RAG tier1 local extraction ENABLED — operator attests the \
+                             Ollama endpoint is on-host; tier1 actors' memories will be sent \
+                             to the LOCAL model (never an external provider) for graph \
+                             extraction"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "TALOS_GRAPH_RAG_TIER1_LOCAL_OK is set but no Ollama extraction \
+                             backend is wired (OLLAMA_URL / TALOS_GRAPH_RAG_MODEL empty) — \
+                             tier1 actors still skip graph extraction"
+                        );
+                    }
                 }
 
                 let _ = actor_memory_service::GRAPH_SERVICE.set(service);

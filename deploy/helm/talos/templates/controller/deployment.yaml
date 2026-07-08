@@ -129,6 +129,16 @@ spec:
               {{- else }}
               value: ""
               {{- end }}
+            # Graph-RAG local-Ollama triple-extraction model (fallback when
+            # no anthropic/api_key). 1B-class models are flaky at structured
+            # JSON — set graphRag.model to a 7B-class instruct model if the
+            # knowledge graph matters. Empty → the code default (qwen2.5:7b).
+            - name: TALOS_GRAPH_RAG_MODEL
+              value: {{ .Values.graphRag.model | default "" | quote }}
+            # Operator attestation that OLLAMA_URL is ON-HOST — unlocks
+            # tier1 graph extraction via the LOCAL model only. Default off.
+            - name: TALOS_GRAPH_RAG_TIER1_LOCAL_OK
+              value: {{ .Values.graphRag.tier1LocalOk | default false | quote }}
             # Embedding provider config — two independent sources, secret OR
             # values.yaml controller.env. r241 dropped the `ollama.enabled=true`
             # branch that hard-coded the in-cluster ollama service URL (the

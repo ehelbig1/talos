@@ -33,6 +33,19 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "graph_backfill",
+            "description": "Re-run knowledge-graph entity extraction over an actor's existing (live) memories. Extraction normally fires only when a memory is WRITTEN — memories that predate the extraction backend, or whose extraction failed transiently, stay graph-less forever until backfilled.\n\nRuns as a background task (one LLM call per memory, ~5-10s each on a local model): the response returns immediately with the queued count; poll graph_stats to watch node/edge counts and extraction_metrics move. One backfill per actor at a time; batches are capped at 200 memories per call (re-invoke for more — re-processing already-graphed memories is idempotent).\n\nThe actor's max_llm_tier gate applies exactly as at write time: a tier1 actor's memories are queued but skipped by the tier gate unless the deployment enables local-only tier1 extraction.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actor_id": { "type": "string", "description": "UUID of the actor whose memories to backfill." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max memories to process this run (default 50, cap 200)." },
+                    "memory_type": { "type": "string", "description": "Optional filter: only backfill memories of this type (e.g. 'episodic', 'semantic')." }
+                },
+                "required": ["actor_id"]
+            }
+        }),
+        serde_json::json!({
             "name": "graph_entity_context",
             "description": "Get the full context for a specific entity — all its relationships, connected entities, and the memory keys it was extracted from. Use this for deep-dive into a specific person, ticket, or project.\n\nExample: graph_entity_context(actor_id=..., entity_name='Jane Smith') returns all tickets Jane is assigned to, emails discussed, meetings attended, etc.",
             "inputSchema": {
@@ -58,6 +71,7 @@ pub async fn dispatch(
     match name {
         "graph_query" => Some(handle_graph_query(req_id, args, state, user_id).await),
         "graph_stats" => Some(handle_graph_stats(req_id, args, state, user_id).await),
+        "graph_backfill" => Some(handle_graph_backfill(req_id, args, state, user_id).await),
         "graph_entity_context" => {
             Some(handle_graph_entity_context(req_id, args, state, user_id).await)
         }
@@ -260,6 +274,15 @@ async fn handle_graph_stats(
                 "total_nodes": total_nodes,
                 "total_edges": total_edges,
                 "extraction_backend": extraction_backend,
+                // Whether the operator attested the local Ollama backend
+                // is on-host (TALOS_GRAPH_RAG_TIER1_LOCAL_OK) — when
+                // false, tier1 actors skip LLM extraction entirely.
+                "tier1_local_extraction": graph.tier1_local_enabled(),
+                // Since-boot, process-wide extraction outcome counters —
+                // distinguishes "extraction failing/skipped" from "graph
+                // legitimately has no data yet" without raising log
+                // levels. See graph_backfill for closing historical gaps.
+                "extraction_metrics": talos_graph_rag::extraction_metrics_snapshot(),
             });
             // Merge the underlying `nodes` + `edges` arrays alongside the
             // new envelope fields so existing callers keep reading them.
@@ -278,6 +301,84 @@ async fn handle_graph_stats(
         Err(e) => {
             tracing::error!(actor_id = %actor_id, "graph_stats failed: {:#}", e);
             mcp_error(req_id, -32000, "Graph stats failed (see controller logs)")
+        }
+    }
+}
+
+/// `graph_backfill` — re-run entity extraction over an actor's existing
+/// live memories (thin wrapper; the orchestration, per-actor in-flight
+/// guard, batch cap, and background task live in
+/// `talos_actor_memory_service::start_graph_backfill`).
+///
+/// SECURITY: tenancy via `require_owned_actor` (same gate as every
+/// other graph tool — backfill sends memory CONTENTS to the extraction
+/// LLM, so cross-tenant invocation would be an exfiltration primitive).
+/// The per-actor `max_llm_tier` gate is enforced INSIDE the extraction
+/// path itself, identically to write-time — this tool cannot widen it.
+async fn handle_graph_backfill(
+    req_id: Option<serde_json::Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    // Graph service must exist for a meaningful backfill; checked here
+    // for the crisp MCP error (the service function would report
+    // GraphUnavailable anyway — defense in depth, not a second gate).
+    if let Err(e) = require_graph_service(req_id.clone()) {
+        return e;
+    }
+
+    let actor_id = match require_owned_actor(req_id.clone(), args, state, user_id).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    // Clamp caller-supplied limit into the service cap (the service
+    // clamps again — belt and suspenders on a resource knob).
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .map(|l| l.clamp(1, talos_actor_memory_service::MAX_BACKFILL_BATCH));
+
+    let memory_type = crate::utils::json_optional_string(args, "memory_type");
+
+    match talos_actor_memory_service::start_graph_backfill(
+        &state.db_pool,
+        actor_id,
+        limit,
+        memory_type,
+    )
+    .await
+    {
+        Ok(talos_actor_memory_service::BackfillStart::Started { queued }) => {
+            let body = serde_json::json!({
+                "actor_id": actor_id.to_string(),
+                "status": "started",
+                "queued": queued,
+                "note": "Backfill runs in the background (one LLM extraction per memory). \
+                         Poll graph_stats to watch total_nodes/total_edges and \
+                         extraction_metrics advance. Re-invoke to process the next batch \
+                         if the actor has more memories than the limit.",
+            });
+            mcp_text(req_id, &serde_json::to_string_pretty(&body).unwrap_or_default())
+        }
+        Ok(talos_actor_memory_service::BackfillStart::AlreadyRunning) => {
+            let body = serde_json::json!({
+                "actor_id": actor_id.to_string(),
+                "status": "already_running",
+                "note": "A backfill for this actor is already in progress — one at a time \
+                         per actor. Poll graph_stats and retry after it completes.",
+            });
+            mcp_text(req_id, &serde_json::to_string_pretty(&body).unwrap_or_default())
+        }
+        Ok(talos_actor_memory_service::BackfillStart::GraphUnavailable) => mcp_error(
+            req_id,
+            -32000,
+            "Graph RAG service is not available. Ensure NEO4J_URI is configured and Neo4j is running.",
+        ),
+        Err(e) => {
+            tracing::error!(actor_id = %actor_id, "graph_backfill failed: {:#}", e);
+            mcp_error(req_id, -32000, "Graph backfill failed (see controller logs)")
         }
     }
 }
