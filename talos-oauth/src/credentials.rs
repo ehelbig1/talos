@@ -940,9 +940,24 @@ impl OAuthCredentialService {
     }
 }
 
-/// Returns true if `err` was caused by a PostgreSQL UNIQUE_VIOLATION (SQLState 23505).
+/// Returns true if `err` indicates the secret already exists (the create arm of
+/// the create-then-update upsert should fall back to an UPDATE).
+///
+/// Detection is two-layered so a single upstream change can't silently disable
+/// the fallback again (which previously made every OAuth token refresh fail to
+/// persist):
+///   1. PRIMARY — downcast through the anyhow source chain to a
+///      `sqlx::Error::Database` with SQLState 23505 (PG UNIQUE_VIOLATION). This
+///      is exact and is the path `SecretsManager::create_secret` preserves (it
+///      wraps the sqlx error instead of collapsing it to a string).
+///   2. FALLBACK — match the canonical duplicate message `create_secret` sets as
+///      its top-line context. Belt-and-suspenders for any layer in the chain
+///      that re-wraps and drops the typed error. The phrase is intentionally
+///      specific to avoid false positives; a false positive would at worst
+///      trigger an UPDATE that fails cleanly with "Secret not found".
 fn is_pg_unique_violation(err: &anyhow::Error) -> bool {
-    err.chain()
+    let has_sqlstate_23505 = err
+        .chain()
         .find_map(|cause| {
             cause.downcast_ref::<sqlx::Error>().and_then(|e| match e {
                 sqlx::Error::Database(db_err) => Some(db_err.as_ref()),
@@ -950,7 +965,14 @@ fn is_pg_unique_violation(err: &anyhow::Error) -> bool {
             })
         })
         .map(|db_err| db_err.code().as_deref() == Some("23505"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+
+    has_sqlstate_23505
+        || err.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("name or key path already exists")
+        })
 }
 
 #[cfg(test)]
