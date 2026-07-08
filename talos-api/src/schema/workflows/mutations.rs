@@ -12,25 +12,10 @@ use crate::schema::{
     require_2fa, require_scope, sync_workflow_module_refs, validate_max_concurrent_executions,
     validate_payload_size, validate_resource_name, SafeErrorExtensions,
 };
-use talos_engine::checkpoint_store::{load_checkpoint_for_full, ControllerCheckpointStore};
 use talos_engine::events::{ExecutionEvent, ExecutionStatus};
 use talos_registry::ModuleRegistry;
 use talos_workflow_engine_core::WorkerSharedKey;
 use talos_workflow_versions::WorkflowVersionService;
-
-/// Saturating u32→i32 conversion for `execution_events.iteration_index`
-/// / `iteration_total` columns (Postgres `int4`). Defense in depth on
-/// the WRITE boundary — the read boundary already saturates with
-/// `.max(0) as u32` (MCP-961). Source is `Option<u32>` from
-/// `talos_engine_events::NodeEventWrite`; the engine is internal and
-/// emits non-pathological counters today, but a future producer (or a
-/// manual row-write) exceeding `i32::MAX` (~2.1B) would silently land
-/// as a negative iteration index. Saturate to MAX so the dashboard
-/// renders an operator-recognisably absurd value rather than a
-/// nonsensical negative counter.
-fn saturating_u32_to_i32(v: u32) -> i32 {
-    i32::try_from(v).unwrap_or(i32::MAX)
-}
 
 #[derive(Default)]
 pub struct WorkflowsMutations;
@@ -192,609 +177,61 @@ impl WorkflowsMutations {
             .data_opt::<Uuid>()
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
 
-        let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?.clone();
-        let sender = ctx
-            .data::<tokio::sync::broadcast::Sender<ExecutionEvent>>()?
-            .clone();
-        let nats_client = ctx
-            .data_opt::<Option<Arc<async_nats::Client>>>()
-            .cloned()
-            .flatten()
-            .ok_or_else(|| async_graphql::Error::new("NATS client not available").extend_safe())?;
-        let worker_shared_key = ctx.data_opt::<Option<WorkerSharedKey>>().cloned().flatten();
-        let registry = ctx.data::<Arc<ModuleRegistry>>().ok().cloned();
-        let redis_client = ctx
-            .data_opt::<Option<Arc<redis::Client>>>()
-            .cloned()
-            .flatten();
-        let secrets_manager = ctx
-            .data::<Arc<talos_secrets_manager::SecretsManager>>()
-            .ok()
-            .cloned();
-        // 1. Verify user owns the execution and it is currently 'waiting'.
-        // MCP-652: the gate also pulls `actor_id` so the budget/status
-        // gate below can run (see `get_execution_resume_gate`'s doc — the
-        // read is deliberately bare-pool; its own predicate IS the
-        // authorization check).
-        // Include org-owned executions via the parent workflow's org_id.
-        // Resume is a write — use role-filtered helper so a Viewer can't
-        // resume someone else's suspended execution.
+        // Org-aware write scoping: org members with a WRITE role may
+        // resume org-owned executions (role-filtered — a Viewer cannot).
         let org_ids = crate::schema::user_writable_org_ids(ctx).await?;
-        let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
-        let exec_info = exec_repo
-            .get_execution_resume_gate(execution_id, *user_id, &org_ids)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to check execution: {}", e);
-                // MCP-964: extend_safe so "Execution not found or access
-                // denied" survives the scrubber (lowercase 'n' misses
-                // case-sensitive whitelist).
-                async_graphql::Error::new("Failed to check execution").extend_safe()
-            })?
-            .ok_or_else(|| {
-                async_graphql::Error::new("Execution not found or access denied").extend_safe()
-            })?;
 
-        if exec_info.status != "waiting" {
-            // MCP-916 cont.: .extend_safe() so the resume-status mismatch
-            // surfaces verbatim instead of being scrubbed.
-            return Err(async_graphql::Error::new(format!(
-                "Execution is in status '{}', not 'waiting'",
-                exec_info.status
-            ))
-            .extend_safe());
-        }
-
-        // MCP-652: actor-status/budget gate. While the execution was
-        // paused, the operator may have suspended or terminated the
-        // bound actor (or its rolling-hour cap may have flipped via
-        // other dispatches). Resuming dispatches new engine work — fuel
-        // burn, external HTTP, LLM spend — that the actor should not
-        // accrue if it is no longer eligible. Gates BEFORE the status
-        // transition so a denied resume leaves the execution in
-        // 'waiting' (recoverable by un-suspending the actor and re-calling
-        // resume), not stuck in 'pending' with no dispatcher behind it.
+        // Delegate to the shared resume service (the same
+        // `ExecutionOrchestrationService::resume_waiting_execution` behind
+        // MCP `submit_workflow_approval`): org/ownership advisory read,
+        // full trigger-authorization gate (actor status, budget,
+        // capability-ceiling drift — the MCP-726/MCP-652 shape this
+        // mutation previously inlined), atomic `waiting -> 'resuming'`
+        // claim with epoch fence, checkpoint reload and fenced re-run.
         //
-        // MCP-726 (2026-05-13): upgrade budget-only `check_execution_allowed`
-        // to full `authorize_workflow_trigger`. Same capability-ceiling-
-        // drift bypass class as MCP-707 (retry/replay) and MCP-708
-        // (scheduler/chain-dispatch/continuation-trigger): an operator
-        // who downgraded the actor's `max_capability_world` between
-        // suspension and resume would otherwise see the resume dispatch
-        // proceed with the previously-elevated ceiling. Budget-only is
-        // INSUFFICIENT — the canonical full gate also re-checks every
-        // module in the graph against the actor's current ceiling.
-        //
-        // Order matches MCP-707's pattern in replay.rs: load graph
-        // FIRST so we have something to gate against, then run the
-        // auth gate BEFORE the status UPDATE so a denied resume leaves
-        // the row in 'waiting' (recoverable). The full-gate variant
-        // returns rich error types; we map them to user-facing strings
-        // matching the existing GraphQL convention.
-        if let Some(actor_id) = exec_info.actor_id {
-            let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-            let actor_repo_for_gate = talos_actor_repository::ActorRepository::new(db_pool.clone());
-
-            let graph_json = match workflow_repo
-                .get_active_version_graph(exec_info.workflow_id, *user_id)
-                .await
-            {
-                Ok(Some((g, _version_id))) => g,
-                Ok(None) => {
-                    return Err(async_graphql::Error::new(
-                        "Workflow graph not found for execution",
-                    )
-                    .extend_safe());
-                }
-                Err(e) => {
-                    tracing::error!(
-                        execution_id = %execution_id,
-                        error = %e,
-                        "resume_workflow: graph load failed"
-                    );
-                    return Err(async_graphql::Error::new("Database error").extend_safe());
-                }
-            };
-
-            match talos_workflow_authorization::authorize_workflow_trigger(
-                &workflow_repo,
-                &actor_repo_for_gate,
-                &db_pool,
-                Some(actor_id),
-                *user_id,
-                &graph_json,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(talos_workflow_authorization::TriggerAuthError::ActorArchived) => {
-                    return Err(async_graphql::Error::new(
-                        "Cannot resume — owning actor is archived",
-                    )
-                    .extend_safe());
-                }
-                Err(talos_workflow_authorization::TriggerAuthError::ActorTerminated) => {
-                    return Err(async_graphql::Error::new(
-                        "Cannot resume — owning actor is terminated",
-                    )
-                    .extend_safe());
-                }
-                Err(talos_workflow_authorization::TriggerAuthError::ActorNotFoundOrInactive) => {
-                    return Err(async_graphql::Error::new(
-                        "Cannot resume — owning actor not found, not active, or belongs to a different user",
-                    )
-                    .extend_safe());
-                }
-                Err(talos_workflow_authorization::TriggerAuthError::ExecutionDenied(msg)) => {
-                    return Err(async_graphql::Error::new(msg).extend_safe());
-                }
-                Err(
-                    talos_workflow_authorization::TriggerAuthError::CapabilityCeilingViolation {
-                        module_id,
-                        module_world,
-                        max_world,
-                        ..
-                    },
-                ) => {
-                    tracing::warn!(
-                        execution_id = %execution_id,
-                        actor_id = %actor_id,
-                        module_id = %module_id,
-                        module_world = %module_world,
-                        max_world = %max_world,
-                        "resume_workflow: BLOCKED — capability ceiling violation (likely ceiling-drift since suspension)"
-                    );
-                    return Err(async_graphql::Error::new(format!(
-                        "Cannot resume — module {} requires '{}' but actor ceiling is '{}'. The actor's capability ceiling was likely downgraded while this execution was suspended.",
-                        module_id, module_world, max_world
-                    ))
-                    .extend_safe());
-                }
-                Err(talos_workflow_authorization::TriggerAuthError::Database(e)) => {
-                    tracing::error!(
-                        execution_id = %execution_id,
-                        error = %e,
-                        "resume_workflow: authorization DB error"
-                    );
-                    return Err(async_graphql::Error::new("Database error").extend_safe());
-                }
-            }
-        }
-
-        // 2. Atomically flip 'waiting' → 'pending'. The status check in step 1
-        //    reads a NON-locking `fetch_optional`, so it is advisory only — this
-        //    write is the authoritative gate via `AND status = 'waiting'`.
-        //    Without it (bare `WHERE id = $1`) two concurrent resume_workflow
-        //    calls both pass the step-1 check and both write 'pending' + both
-        //    spawn a resumption task — the advisory lock below can't prevent the
-        //    double-spawn because it's acquired INSIDE the spawned task, AFTER
-        //    this write — and a row that left 'waiting' between the read and here
-        //    (a completion landing, another resume) would be RESURRECTED from a
-        //    terminal state. `rows_affected() == 0` ⇒ no longer resumable; bail
-        //    before spawning.
-        let resume_flip_rows = exec_repo
-            .flip_waiting_to_pending(execution_id)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to update execution status: {}", e);
-                async_graphql::Error::new("Failed to resume execution").extend_safe()
+        // HISTORY: the previous ~550-line bespoke implementation here
+        // flipped the row to 'pending' — a status the
+        // `workflow_executions_status_check` constraint has FORBIDDEN
+        // since migration 20260530000000 — so every call failed at the
+        // claim ("Failed to resume execution") and all the resume code
+        // behind it was unreachable. One resume path for both protocols
+        // means they cannot drift again.
+        let orchestration = ctx
+            .data::<Arc<talos_execution_orchestration::ExecutionOrchestrationService>>()
+            .map_err(|_| {
+                async_graphql::Error::new("Orchestration service unavailable").extend_safe()
             })?;
-        if resume_flip_rows == 0 {
-            return Err(async_graphql::Error::new(
-                "Execution is no longer resumable (its status changed since it was checked)",
-            )
-            .extend_safe());
+        match orchestration
+            .resume_waiting_execution(execution_id, *user_id, &org_ids)
+            .await
+        {
+            Ok(talos_execution_orchestration::WaitingResumeOutcome::Resumed) => Ok(true),
+            Ok(talos_execution_orchestration::WaitingResumeOutcome::NotWaiting) => {
+                Err(async_graphql::Error::new(
+                    "Execution is not in 'waiting' status (already resumed, finished, or \
+                     claimed by another resume)",
+                )
+                .extend_safe())
+            }
+            Err(talos_execution_orchestration::OrchestrationError::ExecutionNotFound(_))
+            | Err(talos_execution_orchestration::OrchestrationError::WorkflowNotFound(_)) => {
+                Err(async_graphql::Error::new("Execution not found or access denied").extend_safe())
+            }
+            Err(talos_execution_orchestration::OrchestrationError::AuthorizationDenied(msg)) => {
+                // Operator-facing by design (actor archived / budget /
+                // ceiling drift) — same surfacing as the MCP path.
+                Err(async_graphql::Error::new(msg).extend_safe())
+            }
+            Err(e) => {
+                // Full detail server-side only; generic message out.
+                tracing::error!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "resume_workflow: shared resume service failed"
+                );
+                Err(async_graphql::Error::new("Failed to resume execution").extend_safe())
+            }
         }
-
-        // 3. Spawn background resumption (similar to trigger_workflow)
-        let user_id = *user_id;
-        let workflow_id = exec_info.workflow_id;
-        tokio::spawn(async move {
-            // Distributed lock
-            let mut conn = match db_pool.acquire().await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("Failed to acquire DB connection for locking: {}", e);
-                    return;
-                }
-            };
-            let lock_id = (execution_id.as_u128() % (i64::MAX as u128)) as i64;
-            let locked: bool = match talos_db::try_advisory_lock(&mut conn, lock_id).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!("Failed to acquire advisory lock: {}", e);
-                    false
-                }
-            };
-            if !locked {
-                tracing::warn!(execution_id = %execution_id, "Execution already in progress, skipping duplicate resume");
-                return;
-            }
-
-            // Create secrets_manager with proper error handling.
-            // allow-secrets-manager-new: defensive fallback. Production
-            // GraphQL context always supplies the shared instance via
-            // schema.data::<Arc<SecretsManager>>(); this branch only
-            // fires in dev/test paths that don't wire it. Carries the
-            // KEK-mismatch risk documented on subworkflow_contract_service
-            // — if it ever fires in production, that's the bug.
-            let secrets_manager = match secrets_manager {
-                Some(sm) => sm,
-                None => match talos_secrets_manager::SecretsManager::new(db_pool.clone()) {
-                    Ok(sm) => Arc::new(sm),
-                    Err(e) => {
-                        tracing::error!("Failed to create SecretsManager: {}", e);
-                        return;
-                    }
-                },
-            };
-
-            // Engine is built AFTER graph fetch via for_workflow so the
-            // graph's execution_timeout_secs is honored. Pre-r227 the resume
-            // path stripped every setter — no actor, no timeout, no
-            // actor_context. We preserve the no-actor + no-context posture
-            // (worth a separate decision per the refactor plan's open
-            // questions) but Honor the graph's timeout, which is the bug-fix
-            // theme of PR 3.
-            let resume_resolved_registry = registry
-                .unwrap_or_else(|| Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client)));
-
-            // Repo handle for the background task's execution reads/writes
-            // (event persistence, pinned-version read, fail-marking).
-            let exec_repo_bg =
-                talos_execution_repository::ExecutionRepository::new(db_pool.clone());
-
-            macro_rules! store_and_send {
-                ($event:expr) => {{
-                    let event = $event;
-                    let event_type = match (&event.node_id, &event.status) {
-                        (None, ExecutionStatus::Running) => "started",
-                        (Some(_), ExecutionStatus::Running) => "node_started",
-                        (Some(_), ExecutionStatus::Completed) => "node_completed",
-                        (Some(_), ExecutionStatus::Failed) => "node_failed",
-                        (Some(_), ExecutionStatus::Skipped) => "node_skipped",
-                        (Some(_), ExecutionStatus::Waiting) => "node_waiting",
-                        (None, ExecutionStatus::Completed) => "completed",
-                        (None, ExecutionStatus::Failed) => "failed",
-                        (None, ExecutionStatus::Waiting) => "waiting",
-                        (None, ExecutionStatus::Pending) => "pending",
-                        (Some(_), ExecutionStatus::Pending) => "pending",
-                        (None, ExecutionStatus::Skipped) => "skipped",
-                        (_, ExecutionStatus::OutputReady) => "output_ready",
-                    };
-
-                    // Broadcast FIRST so live subscribers get the event
-                    let _ = sender.send(event.clone());
-
-                    // MCP-965 (2026-05-15): sibling site to the
-                    // trigger_workflow event-persist DLP fix above.
-                    // Same redaction discipline applied here so the
-                    // resume_workflow path doesn't bypass redaction
-                    // when the engine emits sensitive log_message
-                    // content during a resumed run.
-                    //
-                    // MCP-1194 (2026-05-17): truncate-then-redact
-                    // discipline applied to the resume_workflow event
-                    // writer too. See the trigger_workflow site above
-                    // for the full rationale; both sites bind into
-                    // the same `execution_events.log_message` column
-                    // and need the same 8 KiB ceiling matching the
-                    // canonical MCP-1165 fix in engine event_sink.rs.
-                    let redacted_log_message = event.log_message.as_deref().map(|m| {
-                        let truncated: &str = if m.len() > 8192 {
-                            talos_text_util::truncate_at_char_boundary(m, 8192)
-                        } else {
-                            m
-                        };
-                        talos_dlp_provider::redact_str(truncated)
-                    });
-                    if let Err(db_err) = exec_repo_bg
-                        .insert_execution_event(
-                            event.execution_id,
-                            event_type,
-                            event.node_id,
-                            &format!("{:?}", event.status),
-                            redacted_log_message.as_deref(),
-                            event.iteration_index.map(saturating_u32_to_i32),
-                            event.iteration_total.map(saturating_u32_to_i32),
-                        )
-                        .await
-                    {
-                        tracing::error!("Failed to persist execution event: {}", db_err);
-                    }
-                }};
-            }
-
-            // Load checkpoint. MCP-684: DEK-fallback for Phase A
-            // deployments without WORKER_SHARED_KEY (same as the
-            // triggerWorkflow callsite above).
-            let initial_results = load_checkpoint_for_full(
-                &db_pool,
-                worker_shared_key.as_ref().map(WorkerSharedKey::as_bytes),
-                Some(secrets_manager.clone()),
-                execution_id,
-            )
-            .await;
-
-            // Load workflow definition: use the version pinned to this execution,
-            // or fall back to active version, then draft. The draft fallback
-            // reads via `get_workflow_graph_unchecked` (no ownership predicate
-            // — the resume ownership gate authorized this workflow_id before
-            // the task spawned; revisit on RLS SET-ROLE rollout).
-            let workflow_repo_bg =
-                talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-
-            // First try to load the version pinned to this execution record.
-            //
-            // MCP-839 (2026-05-14): propagate the DB error explicitly.
-            // Pre-fix `.ok().flatten()` collapsed every failure into
-            // None and the next block fell through to the unpinned
-            // branch, which loads the ACTIVE version or the DRAFT
-            // graph_json. For an execution that WAS pinned at trigger
-            // time, that means resuming on a DIFFERENT graph topology
-            // than the one the checkpoint references — nodes may have
-            // been added/removed, edges rewired. The engine resumes
-            // from a checkpoint that points at nodes that don't exist
-            // in the loaded graph and either errors opaquely partway
-            // through or worse, attributes results to the wrong node.
-            // Same graph-topology-drift class as MCP-435. Fail closed
-            // on DB error (mark execution failed + return) — the
-            // operator can retry once the DB recovers. The execution
-            // row already exists at this point (verified above), so
-            // sqlx::Error::RowNotFound cannot fire here; this match
-            // only handles real connection-level failures.
-            let pinned_version_id = match exec_repo_bg.get_pinned_version_id(execution_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(
-                        execution_id = %execution_id,
-                        error = %e,
-                        "resume_workflow: failed to load pinned workflow_version_id — refusing to fall back to draft graph (would drift execution topology)"
-                    );
-                    if let Err(db_err) = exec_repo_bg
-                        .fail_execution_unless_terminal(
-                            execution_id,
-                            "Workflow execution failed",
-                            false,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            execution_id = %execution_id,
-                            error = %db_err,
-                            "Failed to mark execution as failed; execution will appear stuck"
-                        );
-                    }
-                    talos_db::release_advisory_lock(conn, lock_id).await;
-                    return;
-                }
-            };
-
-            let graph_json_str = {
-                let versioned = if let Some(vid) = pinned_version_id {
-                    WorkflowVersionService::get_version(&db_pool, vid)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|v| v.graph_json.to_string())
-                } else {
-                    WorkflowVersionService::get_active_version(&db_pool, workflow_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|v| v.graph_json.to_string())
-                };
-                match versioned {
-                    Some(g) => g,
-                    None => {
-                        // Draft fallback (unchanged fallback order:
-                        // pinned/active version first, then draft).
-                        match workflow_repo_bg
-                            .get_workflow_graph_unchecked(workflow_id)
-                            .await
-                        {
-                            Ok(Some(g)) => g,
-                            Ok(None) | Err(_) => {
-                                tracing::error!(execution_id = %execution_id, "Failed to load workflow graph for resume");
-                                if let Err(db_err) = exec_repo_bg
-                                    .fail_execution_unless_terminal(
-                                        execution_id,
-                                        "Workflow execution failed",
-                                        false,
-                                    )
-                                    .await
-                                {
-                                    tracing::error!(
-                                        execution_id = %execution_id,
-                                        error = %db_err,
-                                        "Failed to mark execution as failed; execution will appear stuck"
-                                    );
-                                }
-                                talos_db::release_advisory_lock(conn, lock_id).await;
-                                return;
-                            }
-                        }
-                    }
-                }
-            };
-
-            // Build the engine via the canonical builder.
-            let resume_actor_repo = Arc::new(talos_actor_repository::ActorRepository::new(
-                db_pool.clone(),
-            ));
-            let resume_opts =
-                talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json_str);
-            // MCP-682 (2026-05-13): preserve a SecretsManager handle for
-            // the post-run persistence. Same fix-shape as the
-            // triggerWorkflow path above: raw SQL `output_data = $2`
-            // bypasses Phase A encryption.
-            let resume_sm_for_persist = secrets_manager.clone();
-            let engine = match talos_engine::builder::for_workflow(
-                resume_resolved_registry,
-                secrets_manager,
-                resume_actor_repo,
-                user_id,
-                resume_opts,
-            )
-            .await
-            {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!(execution_id = %execution_id, "Failed to build engine for resume: {}", e);
-                    if let Err(db_err) = exec_repo_bg
-                        .fail_execution_unless_terminal(
-                            execution_id,
-                            "Workflow execution failed",
-                            false,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            execution_id = %execution_id,
-                            error = %db_err,
-                            "Failed to mark execution as failed (engine-build path); execution will appear stuck"
-                        );
-                    }
-                    talos_db::release_advisory_lock(conn, lock_id).await;
-                    return;
-                }
-            };
-
-            // Emit resumption event
-            store_and_send!(ExecutionEvent {
-                execution_id,
-                node_id: None,
-                status: ExecutionStatus::Running,
-                trace_id: None,
-                span_id: None,
-                log_message: Some("Execution resumed from checkpoint".to_string()),
-                iteration_index: None,
-                iteration_total: None,
-                duration_ms: None,
-                output: None,
-            });
-
-            // Run engine
-            let wsk_for_checkpoint = worker_shared_key.clone();
-            match talos_engine::nats_run::run_with_seed_via_nats(
-                &engine,
-                nats_client,
-                worker_shared_key,
-                initial_results,
-                execution_id,
-            )
-            .await
-            {
-                Ok(ctx) => {
-                    let mut aggregated_output = serde_json::Map::new();
-                    for (node_id, output) in &ctx.results {
-                        aggregated_output.insert(node_id.to_string(), output.clone());
-                    }
-                    let aggregated_json = talos_dlp_provider::redact_json(
-                        &serde_json::Value::Object(aggregated_output),
-                    );
-
-                    // MCP-682: encryption-aware persistence path.
-                    let resume_wf_repo =
-                        talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
-                            .with_encryption(resume_sm_for_persist.clone());
-                    if ctx.waiting {
-                        if let Err(db_err) = resume_wf_repo
-                            .mark_execution_waiting(execution_id, &aggregated_json)
-                            .await
-                        {
-                            tracing::error!(
-                                "Database operation failed in resume_workflow: {}",
-                                db_err
-                            );
-                        }
-                        // Also persist an encrypted copy of the checkpoint.
-                        let store = ControllerCheckpointStore::new(
-                            db_pool.clone(),
-                            wsk_for_checkpoint.as_ref().map(|k| k.as_bytes().to_vec()),
-                        );
-                        // Monotonic seq = node-keyed snapshot cardinality (same
-                        // scale the engine's per-node saves use). The suspend-time
-                        // write holds the complete completed-node set, so its seq
-                        // is >= any racing interim save and a later resume's saves
-                        // continue above it.
-                        let checkpoint_seq =
-                            aggregated_json.as_object().map(|o| o.len()).unwrap_or(0) as i64;
-                        if let Err(e) = talos_workflow_engine_core::CheckpointStore::save(
-                            &store,
-                            execution_id,
-                            &aggregated_json,
-                            checkpoint_seq,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                %execution_id,
-                                error = %e,
-                                "Failed to persist encrypted checkpoint — resume will rely on plain output_data fallback",
-                            );
-                        }
-                    } else {
-                        if let Err(db_err) = resume_wf_repo
-                            .mark_execution_completed(execution_id, &aggregated_json)
-                            .await
-                        {
-                            tracing::error!(
-                                "Database operation failed in resume_workflow: {}",
-                                db_err
-                            );
-                        }
-
-                        store_and_send!(ExecutionEvent {
-                            execution_id,
-                            node_id: None,
-                            status: ExecutionStatus::Completed,
-                            trace_id: ctx.trace_id,
-                            span_id: None,
-                            log_message: Some("Workflow finished successfully".to_string()),
-                            iteration_index: None,
-                            iteration_total: None,
-                            duration_ms: None,
-                            output: None,
-                        });
-                    }
-                }
-                Err(e) => {
-                    // MCP-969 (2026-05-15): see sibling redact at the
-                    // trigger_workflow Err arm above. Same engine-error
-                    // bind path on the resume side.
-                    let redacted_e = talos_dlp_provider::redact_str(&e.to_string());
-                    let error_msg = format!("Resumed workflow failed: {}", redacted_e);
-                    if let Err(db_err) = exec_repo_bg
-                        .fail_execution_unless_terminal(execution_id, &error_msg, true)
-                        .await
-                    {
-                        tracing::error!(
-                            execution_id = %execution_id,
-                            error = %db_err,
-                            "Failed to mark resumed execution as failed; execution will appear stuck"
-                        );
-                    }
-                    store_and_send!(ExecutionEvent {
-                        execution_id,
-                        node_id: None,
-                        status: ExecutionStatus::Failed,
-                        trace_id: None,
-                        span_id: None,
-                        log_message: Some(error_msg),
-                        iteration_index: None,
-                        iteration_total: None,
-                        duration_ms: None,
-                        output: None,
-                    });
-                }
-            }
-
-            // Release the advisory lock on the SAME connection where it was acquired.
-            talos_db::release_advisory_lock(conn, lock_id).await;
-        });
-
-        Ok(true)
     }
 
     async fn create_workflow(
