@@ -3017,9 +3017,18 @@ async fn handle_test_workflow_draft(
                 }
                 let output_json =
                     talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
-                let _ = repo_for_draft
-                    .mark_execution_completed(exec_id, &output_json)
-                    .await;
+                // PR #423 sibling: a wait/confidence-gate pause is NOT
+                // completed — persist status='waiting' (mirrors the
+                // handle_test_workflow branch) so the row stays resumable.
+                if ctx.waiting {
+                    let _ = repo_for_draft
+                        .mark_execution_waiting(exec_id, &output_json)
+                        .await;
+                } else {
+                    let _ = repo_for_draft
+                        .mark_execution_completed(exec_id, &output_json)
+                        .await;
+                }
             }
             Err(e) => {
                 let fail_output = talos_dlp_provider::redact_json(
@@ -4216,16 +4225,27 @@ async fn handle_call_workflow(
             let node_labels = engine.node_labels();
             let output = crate::utils::project_engine_results_to_output(&ctx.results, node_labels);
             let output_json = talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
-            let _ = state
-                .workflow_repo
-                .mark_execution_completed(exec_id, &output_json)
-                .await;
+            // PR #423 sibling: a wait/confidence-gate pause is NOT completed —
+            // persist status='waiting' and surface "waiting" to the caller so
+            // the paused run isn't treated as terminal.
+            let is_waiting = ctx.waiting;
+            if is_waiting {
+                let _ = state
+                    .workflow_repo
+                    .mark_execution_waiting(exec_id, &output_json)
+                    .await;
+            } else {
+                let _ = state
+                    .workflow_repo
+                    .mark_execution_completed(exec_id, &output_json)
+                    .await;
+            }
 
             Some(mcp_text(
                 req_id.clone(),
                 &serde_json::to_string_pretty(&serde_json::json!({
                     "execution_id": exec_id.to_string(),
-                    "status": "completed",
+                    "status": if is_waiting { "waiting" } else { "completed" },
                     "output": output_json,
                 }))
                 .unwrap_or_default(),
@@ -5085,9 +5105,18 @@ async fn handle_bulk_trigger_workflow(
                     }
                     let output_json =
                         talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
-                    let _ = repo_for_bulk
-                        .mark_execution_completed(exec_id, &output_json)
-                        .await;
+                    // PR #423 sibling: a wait/confidence-gate pause is NOT
+                    // completed — persist status='waiting' so the row stays
+                    // resumable for the later approval/resume signal.
+                    if ctx.waiting {
+                        let _ = repo_for_bulk
+                            .mark_execution_waiting(exec_id, &output_json)
+                            .await;
+                    } else {
+                        let _ = repo_for_bulk
+                            .mark_execution_completed(exec_id, &output_json)
+                            .await;
+                    }
                 }
                 Err(e) => {
                     let fail_output = talos_dlp_provider::redact_json(
@@ -5513,9 +5542,18 @@ async fn handle_trigger_workflow_as_actors(
                     }
                     let output_json =
                         talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
-                    let _ = repo_clone
-                        .mark_execution_completed(exec_id, &output_json)
-                        .await;
+                    // PR #423 sibling: a wait/confidence-gate pause is NOT
+                    // completed — persist status='waiting' so the row stays
+                    // resumable for the later approval/resume signal.
+                    if ctx.waiting {
+                        let _ = repo_clone
+                            .mark_execution_waiting(exec_id, &output_json)
+                            .await;
+                    } else {
+                        let _ = repo_clone
+                            .mark_execution_completed(exec_id, &output_json)
+                            .await;
+                    }
                 }
                 Err(e) => {
                     let fail_output = talos_dlp_provider::redact_json(

@@ -693,11 +693,6 @@ async fn run_single_workflow_chain(
         Ok(ctx) => {
             // Subtract 1 for the pre-seeded trigger node itself.
             let downstream_count = ctx.results.len().saturating_sub(1);
-            tracing::info!(
-                "✅ Workflow {} chain complete — {} downstream node(s) ran",
-                workflow_id,
-                downstream_count
-            );
             let output_data = talos_dlp_provider::redact_json(
                 &serde_json::to_value(&ctx.results).unwrap_or(serde_json::json!({})),
             );
@@ -706,11 +701,36 @@ async fn run_single_workflow_chain(
             // Phase A deployments, matching the other writer paths.
             let wf_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
                 .with_encryption(secrets_manager_for_persist);
-            if let Err(db_err) = wf_repo
-                .mark_execution_completed(execution_id, &output_data)
-                .await
-            {
-                tracing::error!("Database operation failed in engine: {}", db_err);
+            // PR #423 sibling: run_with_seed_via_nats shares the engine's
+            // run loop, so a wait/confidence-gate pause surfaces here as
+            // `ctx.waiting = true` — NOT completed. Persist status='waiting'
+            // (row stays resumable) and skip the terminal "chain complete"
+            // log on that branch.
+            if ctx.waiting {
+                tracing::info!(
+                    "Workflow {} chain paused (waiting) — {} downstream node(s) ran; \
+                     awaiting external resume/approval",
+                    workflow_id,
+                    downstream_count
+                );
+                if let Err(db_err) = wf_repo
+                    .mark_execution_waiting(execution_id, &output_data)
+                    .await
+                {
+                    tracing::error!("Database operation failed in engine: {}", db_err);
+                }
+            } else {
+                tracing::info!(
+                    "✅ Workflow {} chain complete — {} downstream node(s) ran",
+                    workflow_id,
+                    downstream_count
+                );
+                if let Err(db_err) = wf_repo
+                    .mark_execution_completed(execution_id, &output_data)
+                    .await
+                {
+                    tracing::error!("Database operation failed in engine: {}", db_err);
+                }
             }
             Ok(())
         }
