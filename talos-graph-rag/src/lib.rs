@@ -51,6 +51,33 @@ pub struct GraphRagService {
     /// either wire this in or unset `ANTHROPIC_API_KEY` env (the
     /// extraction path falls off both gates).
     actor_repo: Option<Arc<talos_actor_repository::ActorRepository>>,
+    /// Local Ollama backend for provider-agnostic triple extraction.
+    /// When wired in (`with_ollama`), the LLM-fallback path uses a
+    /// LOCAL model instead of Anthropic on deployments that have no
+    /// external LLM key — so the knowledge graph populates on
+    /// Ollama-only / self-hosted / homelab stacks where semantic
+    /// search already works but the graph stayed empty.
+    ///
+    /// Backend selection at extraction time (`extract_triples_llm`):
+    /// external Anthropic is preferred when a key resolves (best
+    /// extraction quality, zero behaviour change for existing
+    /// deployments); local Ollama is the fallback when no Anthropic
+    /// key is present. BOTH external paths are gated on the actor's
+    /// `max_llm_tier` (tier2 only) — a tier1 actor's memory contents
+    /// never reach any LLM here, because we can't universally prove
+    /// `OLLAMA_URL` points on-host, so the strict data-egress
+    /// guarantee is preserved rather than assumed-away.
+    ollama: Option<OllamaExtractor>,
+}
+
+/// Local-Ollama extraction backend: the shared hardened HTTP client
+/// plus the model name to run. The model is resolved from
+/// `TALOS_GRAPH_RAG_MODEL` at wiring time (see `main.rs`) so operators
+/// can point extraction at any instruct model present in their Ollama.
+#[derive(Clone)]
+struct OllamaExtractor {
+    client: Arc<talos_llm::OllamaClient>,
+    model: String,
 }
 
 impl GraphRagService {
@@ -82,6 +109,23 @@ impl GraphRagService {
         actor_repo: Arc<talos_actor_repository::ActorRepository>,
     ) -> Self {
         self.actor_repo = Some(actor_repo);
+        self
+    }
+
+    /// Attach a local Ollama backend for the LLM-fallback extraction
+    /// path. On deployments with no external LLM key (Ollama-only /
+    /// homelab / self-hosted), this is what makes the knowledge graph
+    /// populate — extraction routes to the local model instead of
+    /// no-op'ing. Anthropic is still preferred when a key resolves
+    /// (best quality, zero regression); Ollama is the fallback.
+    ///
+    /// `model` is the Ollama model tag to run (e.g. `qwen2.5:7b`) —
+    /// wired from `TALOS_GRAPH_RAG_MODEL`. The tier gate
+    /// (`actor_allows_external_llm`) still applies: tier1 actors skip
+    /// LLM extraction entirely regardless of this backend.
+    #[must_use]
+    pub fn with_ollama(mut self, client: Arc<talos_llm::OllamaClient>, model: String) -> Self {
+        self.ollama = Some(OllamaExtractor { client, model });
         self
     }
 
@@ -129,6 +173,7 @@ impl GraphRagService {
             graph: Arc::new(graph),
             secrets: None,
             actor_repo: None,
+            ollama: None,
         };
         service.init_schema().await?;
 
@@ -169,6 +214,7 @@ impl GraphRagService {
             graph: Arc::new(graph),
             secrets: None,
             actor_repo: None,
+            ollama: None,
         }
     }
 
@@ -221,62 +267,14 @@ impl GraphRagService {
         let mut triples = self.extract_triples_rule_based(memory_key, memory_value);
 
         if triples.is_empty() {
-            // Tier-1 data-egress gate. Tier1 actors are policy-bound
-            // to keep data on-host (local Ollama only) — sending
-            // their memory contents to Anthropic for triple
-            // extraction would violate that ceiling, even though
-            // graph-RAG itself is best-effort. Fail closed: if the
-            // tier lookup errors, treat as Tier1 and skip — same
-            // contract as `talos_engine::actor_binding::apply_actor_to_engine`.
-            // When `actor_repo` is unset (e.g. unit tests), legacy
-            // un-gated behaviour applies.
-            if !self.actor_allows_external_llm(actor_id).await {
-                tracing::debug!(
-                    target: "talos_graph_rag",
-                    actor_id = %actor_id,
-                    memory_key,
-                    "Skipped LLM entity extraction: actor max_llm_tier=tier1 (or tier lookup failed) — data may not leave host"
-                );
-                return Ok(0);
-            }
-
-            // Resolve the Anthropic key with vault-first preference,
-            // env fallback. In vault-first deployments
-            // (`set_secret anthropic/api_key`), the env var isn't set
-            // and the original env-only path silently no-op'd —
-            // `graph_stats` came back empty even though the actor was
-            // accumulating memories. Both sources tolerate placeholder
-            // strings ("your-api-key-here", "") so dev setups don't
-            // burn HTTP 401s.
-            let api_key = self.resolve_anthropic_key().await;
-            if let Some(key) = api_key {
-                match self
-                    .extract_triples_via_llm(&key, memory_key, &value_str)
-                    .await
-                {
-                    Ok(llm_triples) => triples = llm_triples,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "talos_graph_rag",
-                            memory_key,
-                            error = %e,
-                            "LLM entity extraction failed — graph row will have no \
-                             relationships. Common causes: anthropic/api_key invalid \
-                             or revoked (HTTP 401), rate limit (HTTP 429), or model \
-                             deprecation."
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    target: "talos_graph_rag",
-                    memory_key,
-                    "Skipped LLM entity extraction: no anthropic/api_key in vault \
-                     and ANTHROPIC_API_KEY env missing/placeholder. Set the vault \
-                     path to enable graph extraction, or ignore — actor_memory \
-                     writes still succeed without it."
-                );
-            }
+            // Provider-agnostic LLM-fallback extraction. Picks the
+            // backend (external Anthropic vs. local Ollama), enforces
+            // the tier1 data-egress gate, and never errors (best-
+            // effort — a failed extraction leaves the graph row with
+            // no relationships but must not fail the memory write).
+            triples = self
+                .extract_triples_llm(actor_id, memory_key, &value_str)
+                .await;
         }
 
         if triples.is_empty() {
@@ -562,8 +560,126 @@ impl GraphRagService {
             .map(talos_secrets_manager::Zeroizing::new)
     }
 
+    /// Provider-agnostic LLM-fallback triple extraction. Best-effort:
+    /// returns an empty `Vec` on every skip/failure path (never
+    /// `Result`) so a failed extraction can't fail the memory write.
+    ///
+    /// Backend selection, in priority order:
+    /// 1. **External Anthropic** — preferred when a real key resolves
+    ///    (best extraction quality; byte-identical to pre-refactor
+    ///    behaviour for deployments that already set the key). Gated
+    ///    on tier2 (see below).
+    /// 2. **Local Ollama** — the fallback when no Anthropic key is
+    ///    present. This is what populates the graph on Ollama-only /
+    ///    self-hosted deployments. Also gated on tier2.
+    /// 3. **Skip** — no usable backend, or the actor is tier1.
+    ///
+    /// **Tier gate (data-egress invariant).** BOTH backends sit behind
+    /// `actor_allows_external_llm` (tier2 only, fail-closed). A tier1
+    /// actor is policy-bound to keep data on-host; because we can't
+    /// universally prove `OLLAMA_URL` resolves on-host, tier1 skips
+    /// LLM extraction entirely rather than assume the local model is
+    /// safe. Operators who want tier1 graph extraction against a
+    /// provably-on-host Ollama can raise the actor to tier2 (on such a
+    /// deployment the extraction stays local anyway).
+    async fn extract_triples_llm(
+        &self,
+        actor_id: Uuid,
+        memory_key: &str,
+        value_str: &str,
+    ) -> Vec<Triple> {
+        if !self.actor_allows_external_llm(actor_id).await {
+            tracing::debug!(
+                target: "talos_graph_rag",
+                actor_id = %actor_id,
+                memory_key,
+                "Skipped LLM entity extraction: actor max_llm_tier=tier1 (or tier lookup failed) — data may not leave host"
+            );
+            return Vec::new();
+        }
+
+        // 1. External Anthropic — preferred when a real key resolves.
+        //    Vault-first (so `rotate_secret anthropic/api_key`
+        //    propagates), env fallback; placeholder strings are
+        //    filtered so dev setups don't burn HTTP 401s.
+        if let Some(key) = self.resolve_anthropic_key().await {
+            match self
+                .extract_triples_anthropic(&key, memory_key, value_str)
+                .await
+            {
+                Ok(triples) => return triples,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "talos_graph_rag",
+                        memory_key,
+                        error = %e,
+                        "Anthropic entity extraction failed — graph row will have no \
+                         relationships. Common causes: anthropic/api_key invalid or \
+                         revoked (HTTP 401), rate limit (HTTP 429), or model \
+                         deprecation. (No Ollama fallback attempted: a key was \
+                         present, so this is a provider-side failure, not a \
+                         missing-backend one.)"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+
+        // 2. Local Ollama — the fallback when no Anthropic key is set.
+        if let Some(extractor) = &self.ollama {
+            match self
+                .extract_triples_ollama(extractor, memory_key, value_str)
+                .await
+            {
+                Ok(triples) => return triples,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "talos_graph_rag",
+                        memory_key,
+                        model = %extractor.model,
+                        error = %e,
+                        "Ollama entity extraction failed — graph row will have no \
+                         relationships. Common causes: model not pulled \
+                         (`ollama pull <model>`), OLLAMA_URL unreachable, or the \
+                         model returned unparseable JSON."
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+
+        // 3. No usable backend.
+        tracing::debug!(
+            target: "talos_graph_rag",
+            memory_key,
+            "Skipped LLM entity extraction: no anthropic/api_key (vault or env) and \
+             no local Ollama extractor wired. Set anthropic/api_key OR configure \
+             TALOS_GRAPH_RAG_MODEL + a reachable OLLAMA_URL to enable graph \
+             extraction — actor_memory writes still succeed without it."
+        );
+        Vec::new()
+    }
+
+    /// Deployment-level extraction-backend signal for `graph_stats`.
+    /// Reports which LLM backend the LLM-fallback path WOULD use if a
+    /// tier2 actor triggered it — so an operator staring at an empty
+    /// graph can tell "no backend configured" (`none`) apart from "the
+    /// graph legitimately has no data yet". This is deployment
+    /// granularity, not per-actor: a tier1 actor always skips
+    /// extraction regardless of what this returns.
+    pub async fn extraction_backend(&self) -> &'static str {
+        let anthropic = self.resolve_anthropic_key().await.is_some();
+        let ollama = self.ollama.is_some();
+        match (anthropic, ollama) {
+            (true, true) => "anthropic+ollama",
+            (true, false) => "anthropic",
+            (false, true) => "ollama",
+            (false, false) => "none",
+        }
+    }
+
     /// LLM-based entity extraction using Anthropic's structured output.
-    async fn extract_triples_via_llm(
+    async fn extract_triples_anthropic(
         &self,
         api_key: &str,
         memory_key: &str,
@@ -654,7 +770,79 @@ impl GraphRagService {
             .cloned()
             .unwrap_or_default();
 
-        let triples: Vec<Triple> = tool_input
+        Ok(Self::parse_triples_from_values(&tool_input))
+    }
+
+    /// Local-Ollama entity extraction. Same triple contract as the
+    /// Anthropic path, but over the OpenAI-compatible chat endpoint
+    /// (`OllamaClient::complete`) with a JSON-mode prompt instead of
+    /// forced tool-use — small local models don't support Anthropic's
+    /// tool schema, so we ask for a bare JSON object and parse it
+    /// defensively.
+    ///
+    /// Robustness: the model may wrap its answer in ```json fences or
+    /// prepend prose. `extract_json_payload` strips fences and, as a
+    /// last resort, slices the first balanced `{...}` / `[...]` span —
+    /// so a chatty model still yields triples. Anything unparseable
+    /// returns `Err` (logged, best-effort; the graph row just gets no
+    /// relationships). The 20-triple cap and per-field validation are
+    /// shared with the Anthropic path via `parse_triples_from_values`.
+    async fn extract_triples_ollama(
+        &self,
+        extractor: &OllamaExtractor,
+        memory_key: &str,
+        value_str: &str,
+    ) -> Result<Vec<Triple>> {
+        let system_prompt = "You are an entity-relationship extractor. You output ONLY a single \
+             JSON object and nothing else — no prose, no explanation, no markdown code fences.";
+        let user_prompt = format!(
+            "Extract entities and relationships from this data. \
+             Context: this is a '{}' memory from a personal work assistant.\n\n\
+             Data:\n{}\n\n\
+             Return ONLY a JSON object of this exact shape:\n\
+             {{\"triples\": [{{\"subject_label\": \"Person|Ticket|Project|Email|Meeting|Concept\", \
+             \"subject_name\": \"...\", \
+             \"predicate\": \"WORKS_ON|ASSIGNED_TO|DISCUSSED_IN|ATTENDED|RELATED_TO|MENTIONED_IN|BLOCKED_BY|CREATED\", \
+             \"object_label\": \"...\", \"object_name\": \"...\"}}]}}\n\n\
+             Only extract clear, factual relationships. Use {{\"triples\": []}} if nothing is \
+             extractable. Maximum 20 triples.",
+            memory_key, value_str
+        );
+
+        // `max_tokens` matches the Anthropic path (2000) — enough for
+        // ~20 triples of the compact shape above.
+        let raw = extractor
+            .client
+            .complete(&extractor.model, system_prompt, &user_prompt, 2000)
+            .await
+            .context("Ollama extraction request failed")?;
+
+        let parsed = extract_json_payload(&raw)
+            .ok_or_else(|| anyhow::anyhow!("Ollama response was not parseable JSON"))?;
+
+        // Accept both the documented `{"triples": [...]}` object and a
+        // bare `[...]` array (some models drop the wrapper).
+        let items = match &parsed {
+            serde_json::Value::Array(a) => a.clone(),
+            serde_json::Value::Object(_) => parsed
+                .get("triples")
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
+        Ok(Self::parse_triples_from_values(&items))
+    }
+
+    /// Map an array of `{subject_label, subject_name, predicate,
+    /// object_label, object_name}` JSON objects into validated
+    /// `Triple`s, dropping any row missing a required string field and
+    /// capping at 20 to prevent runaway extraction. Shared by the
+    /// Anthropic (tool-use) and Ollama (JSON-mode) backends so the
+    /// triple contract can't drift between providers.
+    fn parse_triples_from_values(items: &[serde_json::Value]) -> Vec<Triple> {
+        items
             .iter()
             .filter_map(|t| {
                 Some(Triple {
@@ -672,9 +860,7 @@ impl GraphRagService {
                 })
             })
             .take(20) // Cap to prevent runaway extraction
-            .collect();
-
-        Ok(triples)
+            .collect()
     }
 
     /// Batched upsert of triples into Neo4j.
@@ -1311,6 +1497,56 @@ fn is_placeholder_key(k: &str) -> bool {
         || lower.starts_with("example")
 }
 
+/// Defensively extract a JSON value from a chat model's raw text
+/// output. Local instruct models (unlike Anthropic's forced tool-use)
+/// often wrap JSON in ```json fences or prepend a sentence of prose;
+/// this recovers the payload so extraction still succeeds.
+///
+/// Strategy, cheapest-first:
+/// 1. Strip a leading/trailing ```json / ``` fence and try a direct
+///    parse of the whole body.
+/// 2. Fall back to slicing the span between the first `{` and last `}`
+///    (object) or first `[` and last `]` (array) and parsing that.
+///
+/// Returns `None` when nothing parses — the caller treats that as an
+/// extraction failure (best-effort; no relationships for that row).
+fn extract_json_payload(text: &str) -> Option<serde_json::Value> {
+    let mut t = text.trim();
+    // Strip a surrounding markdown code fence if present.
+    if let Some(rest) = t.strip_prefix("```json") {
+        t = rest.trim();
+    } else if let Some(rest) = t.strip_prefix("```") {
+        t = rest.trim();
+    }
+    if let Some(rest) = t.strip_suffix("```") {
+        t = rest.trim();
+    }
+
+    // 1. Direct parse of the (de-fenced) body.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        return Some(v);
+    }
+
+    // 2. Slice the widest balanced-looking object/array span and parse
+    //    that. Handles a chatty model that wrote a sentence before the
+    //    JSON. Prefer whichever bracket appears first.
+    let obj_span = match (t.find('{'), t.rfind('}')) {
+        (Some(s), Some(e)) if e > s => Some((s, e)),
+        _ => None,
+    };
+    let arr_span = match (t.find('['), t.rfind(']')) {
+        (Some(s), Some(e)) if e > s => Some((s, e)),
+        _ => None,
+    };
+    let span = match (obj_span, arr_span) {
+        (Some(o), Some(a)) => Some(if o.0 <= a.0 { o } else { a }),
+        (Some(o), None) => Some(o),
+        (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    span.and_then(|(s, e)| serde_json::from_str::<serde_json::Value>(&t[s..=e]).ok())
+}
+
 /// Process-wide singleton `GraphRagService`. Populated at controller
 /// startup when Neo4j is configured (see `controller::main` for the
 /// wiring). Pre-extraction this lived in
@@ -1395,6 +1631,131 @@ mod placeholder_tests {
         assert!(!is_placeholder_key(
             "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
+    }
+}
+
+#[cfg(test)]
+mod json_payload_tests {
+    use super::extract_json_payload;
+
+    #[test]
+    fn parses_bare_object() {
+        let v = extract_json_payload(r#"{"triples": []}"#).expect("bare object");
+        assert!(v.get("triples").is_some());
+    }
+
+    #[test]
+    fn strips_json_code_fence() {
+        // The exact shape a local instruct model tends to emit.
+        let raw = "```json\n{\"triples\": [{\"subject_name\": \"Alice\"}]}\n```";
+        let v = extract_json_payload(raw).expect("fenced object");
+        assert_eq!(v["triples"][0]["subject_name"].as_str(), Some("Alice"));
+    }
+
+    #[test]
+    fn strips_bare_backtick_fence() {
+        let v = extract_json_payload("```\n{\"triples\": []}\n```").expect("bare fence");
+        assert!(v.get("triples").is_some());
+    }
+
+    #[test]
+    fn recovers_object_after_prose() {
+        // A chatty model prepends a sentence before the JSON.
+        let raw =
+            "Sure! Here are the triples I found:\n{\"triples\": [{\"predicate\": \"WORKS_ON\"}]}";
+        let v = extract_json_payload(raw).expect("object after prose");
+        assert_eq!(v["triples"][0]["predicate"].as_str(), Some("WORKS_ON"));
+    }
+
+    #[test]
+    fn recovers_bare_array() {
+        let raw = "Here you go: [{\"subject_name\": \"Bob\"}]";
+        let v = extract_json_payload(raw).expect("bare array after prose");
+        assert!(v.is_array());
+        assert_eq!(v[0]["subject_name"].as_str(), Some("Bob"));
+    }
+
+    #[test]
+    fn unparseable_returns_none() {
+        assert!(extract_json_payload("I could not find anything to extract.").is_none());
+        assert!(extract_json_payload("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod parse_triples_tests {
+    use super::GraphRagService;
+    use serde_json::json;
+
+    fn triple_value(sl: &str, sn: &str, pred: &str, ol: &str, on: &str) -> serde_json::Value {
+        json!({
+            "subject_label": sl,
+            "subject_name": sn,
+            "predicate": pred,
+            "object_label": ol,
+            "object_name": on,
+        })
+    }
+
+    #[test]
+    fn maps_well_formed_triples() {
+        let items = vec![triple_value(
+            "Person", "Alice", "WORKS_ON", "Project", "Talos",
+        )];
+        let out = GraphRagService::parse_triples_from_values(&items);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].subject.label, "Person");
+        assert_eq!(out[0].subject.name, "Alice");
+        assert_eq!(out[0].predicate, "WORKS_ON");
+        assert_eq!(out[0].object.name, "Talos");
+    }
+
+    #[test]
+    fn drops_rows_missing_required_fields() {
+        let items = vec![
+            triple_value("Person", "Alice", "WORKS_ON", "Project", "Talos"),
+            json!({ "subject_label": "Person", "subject_name": "Bob" }), // missing predicate/object
+            json!({ "predicate": "RELATED_TO" }),                        // missing subject/object
+        ];
+        let out = GraphRagService::parse_triples_from_values(&items);
+        // Only the complete row survives — a partial extraction can't
+        // produce a half-formed graph edge.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].subject.name, "Alice");
+    }
+
+    #[test]
+    fn caps_at_twenty() {
+        // Runaway-extraction guard: the cap is shared with the
+        // Anthropic path so neither backend can flood Neo4j.
+        let items: Vec<_> = (0..50)
+            .map(|i| {
+                triple_value(
+                    "Concept",
+                    &format!("c{i}"),
+                    "RELATED_TO",
+                    "Concept",
+                    &format!("d{i}"),
+                )
+            })
+            .collect();
+        let out = GraphRagService::parse_triples_from_values(&items);
+        assert_eq!(out.len(), 20);
+    }
+
+    #[test]
+    fn non_string_fields_are_dropped() {
+        // A model that emits a number where a name is expected must
+        // not panic or coerce — the row is skipped.
+        let items = vec![json!({
+            "subject_label": "Person",
+            "subject_name": 42,
+            "predicate": "WORKS_ON",
+            "object_label": "Project",
+            "object_name": "Talos",
+        })];
+        let out = GraphRagService::parse_triples_from_values(&items);
+        assert!(out.is_empty());
     }
 }
 
