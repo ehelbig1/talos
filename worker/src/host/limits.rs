@@ -234,6 +234,12 @@ pub(crate) const MAX_TOOL_INPUT_BUF_BYTES: usize = 1024 * 1024;
 /// is comfortable for any legitimate completion (typical responses
 /// are 1-100 KiB).
 pub(crate) const MAX_LLM_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Hard cap on the caller-supplied `options` JSON for
+/// `llm::complete-with-options` (provider-feature passthrough). Provider
+/// tuning objects are tiny (a handful of scalar fields); 8 KiB is generous
+/// while bounding the merge work + outbound body growth from a runaway or
+/// hostile config value.
+pub(crate) const MAX_PROVIDER_OPTIONS_BYTES: usize = 8 * 1024;
 /// MCP-1213 (2026-05-18): hard cap on per-call LLM exchange wall time
 /// (send + receive). Pre-fix the 120s `tokio::time::timeout` wrapped
 /// ONLY `.send()` (header receipt) — body-read via `.json()` / `.text()`

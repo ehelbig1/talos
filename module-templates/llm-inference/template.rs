@@ -130,6 +130,20 @@ fn run(input: String) -> Result<String, String> {
         .unwrap_or_default();
     let has_output_schema = !output_schema_keys.is_empty();
 
+    // Structured-output routing. `RESPONSE_FORMAT=json` (or `json_object`)
+    // forces JSON mode; OUTPUT_SCHEMA presence implies JSON intent and
+    // enables the same path automatically. When set, the LLM call routes
+    // through the host's `complete_json` so OpenAI-compatible providers
+    // (OpenAI, Ollama) emit valid JSON at GENERATION time via
+    // `response_format` — far more reliable than prompt-only JSON, which
+    // truncated / fenced under the local model (dogfooding 2026-07-08).
+    let response_format_json = config
+        .response_format
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("json") || s.eq_ignore_ascii_case("json_object"))
+        .unwrap_or(false);
+    let want_json = has_output_schema || response_format_json;
+
     // ── System prompt assembly ───────────────────────────────────────────
     let system_prompt_base_raw: &str = config
         .system_prompt
@@ -142,10 +156,11 @@ fn run(input: String) -> Result<String, String> {
         interpolate_with_report(system_prompt_base_raw, &interp_ctx, spotlighting);
 
     // When OUTPUT_SCHEMA is set, append a soft instruction so models return
-    // raw JSON without markdown fences. The host's `llm::complete` doesn't
-    // expose a JSON-mode flag — prompt engineering + post-validation is the
-    // route. Anthropic users who need *enforced* structured output should
-    // call `llm-tools::complete-with-tools` directly (out of scope here).
+    // raw JSON. This complements the hard generation-time constraint applied
+    // via `complete_json` below (for OpenAI/Ollama) and is the PRIMARY
+    // mechanism for Anthropic, which has no `response_format` — Anthropic
+    // users needing *enforced* structured output should call
+    // `llm-tools::complete-with-tools` directly (out of scope here).
     let mut system_prompt = if has_output_schema {
         format!(
             "{} Return only valid JSON without markdown code fences.",
@@ -328,7 +343,44 @@ fn run(input: String) -> Result<String, String> {
         system_prompt: Some(system_prompt),
     };
 
-    let resp = llm::complete(&req).map_err(|e| llm_error_message(e, &provider_key, model))?;
+    // Build the provider-options overlay and route through the host's
+    // flexible passthrough (`complete_with_options`) when there's anything
+    // to apply. This is the single, explicit path for using ANY provider
+    // capability:
+    //   * PROVIDER_OPTIONS — arbitrary provider-specific request params the
+    //     caller sets deliberately (seed, top_p, stop, num_predict, top_k,
+    //     stop_sequences, …). Merged verbatim into the provider body.
+    //   * JSON mode — for OpenAI-compatible providers (OpenAI, Ollama), when
+    //     RESPONSE_FORMAT=json or OUTPUT_SCHEMA is set, we add
+    //     response_format:{type:json_object} so the model emits valid JSON at
+    //     generation time (any shape — the model still includes every key the
+    //     prompt asks for; OUTPUT_SCHEMA validates the required subset below).
+    //     A JSON Schema is intentionally NOT used: additionalProperties=true
+    //     let the local model ramble past max_tokens and truncate (tested).
+    //     Anthropic/Gemini have no response_format → they rely on the soft
+    //     JSON instruction appended to the system prompt.
+    // The host guardrails the merge (prompt + streaming are re-asserted), so
+    // options can only TUNE the request. When there are no options, the plain
+    // `complete` path is unchanged.
+    let openai_compat = matches!(provider, Provider::Openai | Provider::Ollama);
+    let mut options_obj = config
+        .provider_options
+        .as_ref()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if want_json && openai_compat && !options_obj.contains_key("response_format") {
+        options_obj.insert(
+            "response_format".to_string(),
+            serde_json::json!({ "type": "json_object" }),
+        );
+    }
+    let resp = if !options_obj.is_empty() {
+        let opts_str = serde_json::Value::Object(options_obj).to_string();
+        llm::complete_with_options(&req, Some(opts_str.as_str()))
+    } else {
+        llm::complete(&req)
+    }
+    .map_err(|e| llm_error_message(e, &provider_key, model))?;
     let raw_text = resp.text;
 
     // ── Fence stripping ──────────────────────────────────────────────────
@@ -456,6 +508,10 @@ struct Config {
     inject_context: Option<BoolOrString>,
     #[serde(rename = "SPOTLIGHTING")]
     spotlighting: Option<BoolOrString>,
+    #[serde(rename = "RESPONSE_FORMAT")]
+    response_format: Option<String>,
+    #[serde(rename = "PROVIDER_OPTIONS")]
+    provider_options: Option<serde_json::Value>,
     #[serde(rename = "MEMORY_WRITE_KEY")]
     memory_write_key: Option<String>,
     #[serde(rename = "MEMORY_WRITE_TYPE")]
