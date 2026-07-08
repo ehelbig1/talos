@@ -15,7 +15,13 @@ pub struct WebhookRepository {
 pub struct WebhookListRow {
     pub id: Uuid,
     pub name: String,
-    pub module_id: Uuid,
+    /// NULL for workflow-bound webhooks (`workflow_id` set instead) —
+    /// `webhook_triggers.module_id` is nullable by design. Pre-fix this
+    /// was a bare `Uuid`, so `row.get` PANICKED on the first
+    /// workflow-bound webhook and every `list_webhooks` call after it
+    /// died with a connection reset (found live, regression round 3
+    /// 2026-07-08).
+    pub module_id: Option<Uuid>,
     pub enabled: bool,
     pub max_requests_per_minute: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
