@@ -2014,6 +2014,24 @@ impl ActorRepository {
         Ok(email)
     }
 
+    /// The user's personal organization (id + name) — the org their
+    /// MCP-created resources are stamped with. Used by `whoami` so an
+    /// identity/tenancy mismatch (an MCP token authenticating as a
+    /// different user/org than the UI login) is diagnosable in one call
+    /// instead of an investigation.
+    pub async fn get_user_org_summary(&self, user_id: Uuid) -> Result<Option<(Uuid, String)>> {
+        let row: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT o.id, o.name FROM organizations o \
+             JOIN organization_members om ON om.org_id = o.id \
+             WHERE om.user_id = $1 AND o.is_personal = true \
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row)
+    }
+
     /// True if a user row exists for this id (any state — no `is_active`
     /// filter). Used as the target-exists gate before writing a
     /// capability grant.

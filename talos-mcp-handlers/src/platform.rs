@@ -9,6 +9,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
     let worlds_enum: Vec<&str> = crate::capability_worlds::compilable_worlds().to_vec();
     vec![
         serde_json::json!({
+            "name": "whoami",
+            "description": "Return the identity this MCP token authenticates as — the user (id + email), the MCP agent (name + role), the personal organization, and the capability ceiling. USE THIS FIRST when resources you created via MCP (workflows, actors, secrets) don't appear in the web UI: every resource is owned by the user_id returned here, and Talos row-level security only shows it to a UI session logged in as the SAME email. If that email differs from your browser login, that mismatch is the cause — create the MCP token under your own account (in the UI) so ownership matches.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
             "name": "get_wasm_config",
             "description": "Get the current WASM runtime resource limits (memory, fuel, timeout, result caps).",
             "inputSchema": {
@@ -213,6 +221,7 @@ pub async fn dispatch(
     // own `is_platform_admin(user_id)` gate; the agent-level
     // `is_admin()` capability is no longer consulted here.
     match name {
+        "whoami" => Some(handle_whoami(req_id, state, agent).await),
         "get_wasm_config" => Some(handle_get_wasm_config(req_id, state).await),
         "set_wasm_config" => Some(handle_set_wasm_config(req_id, args, state, user_id).await),
         "get_queue_status" => Some(handle_get_queue_status(req_id, args, state, user_id).await),
@@ -240,6 +249,60 @@ pub async fn dispatch(
         "call_a2a_agent" => Some(handle_call_a2a_agent(req_id, args, state).await),
         _ => None,
     }
+}
+
+/// `whoami` — surface the identity this MCP token resolves to so an
+/// identity/tenancy mismatch (the #1 "my workflows don't show in the UI"
+/// cause) is diagnosable in one call. Reads only the caller's own
+/// identity + user row; no cross-tenant exposure.
+async fn handle_whoami(
+    req_id: Option<serde_json::Value>,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    let repo = &state.actor_repo;
+    let (email, org, ceiling, is_admin) = match agent.user_id {
+        Some(uid) => {
+            let email = repo.get_user_email(uid).await.ok().flatten();
+            let org = repo.get_user_org_summary(uid).await.ok().flatten();
+            let ceiling = repo
+                .get_user_max_capability_world(uid)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "http-node".to_string());
+            let is_admin = repo.is_platform_admin(uid).await.unwrap_or(false);
+            (email, org, ceiling, is_admin)
+        }
+        None => (None, None, "http-node".to_string(), false),
+    };
+    let body = serde_json::json!({
+        "agent": {
+            "id": agent.agent_id.to_string(),
+            "name": agent.name,
+            "role": agent.role_name,
+        },
+        "user": {
+            "id": agent.user_id.map(|u| u.to_string()),
+            "email": email,
+        },
+        "organization": org.map(|(id, name)| serde_json::json!({
+            "id": id.to_string(),
+            "name": name,
+        })),
+        "capability_ceiling": ceiling,
+        "is_platform_admin": is_admin,
+        "visibility_note": "Resources you create via MCP (workflows, actors, secrets) are owned by \
+                            the user above. Under row-level security they appear in the web UI ONLY \
+                            to a browser session logged in as this same email. If your UI shows an \
+                            empty list, your browser login is a different user than this token — \
+                            create the MCP token under your own account (UI → API keys / MCP agents) \
+                            so ownership matches.",
+    });
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&body).unwrap_or_default(),
+    )
 }
 
 async fn handle_get_wasm_config(
