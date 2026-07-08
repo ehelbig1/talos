@@ -67,7 +67,21 @@
       },
       "MEMORY_WRITE_KEY": {
         "type": "string",
-        "description": "When set to a non-empty string, wraps the LLM output in the __memory_write__ protocol so the actor runtime stores it under this key in episodic memory (168h TTL). Leave empty (default) for normal passthrough output."
+        "description": "When set to a non-empty string, wraps the LLM output in the __memory_write__ protocol so the actor runtime persists it under this key. Supports {{key}} / {{key.subkey}} interpolation from the trigger input (e.g. 'essay_outline/{{slug}}'). Defaults to episodic memory with a 168h TTL — override with MEMORY_WRITE_TYPE / MEMORY_WRITE_TTL_HOURS. Leave empty (default) for normal passthrough output. NOTE: this is a routing key, not a secret."
+      },
+      "MEMORY_WRITE_TYPE": {
+        "type": "string",
+        "default": "episodic",
+        "description": "Memory type for the MEMORY_WRITE_KEY persist: 'semantic' (durable, embedded, ignores TTL — use for a permanent knowledge/idea bank), 'episodic' (default, TTL-bounded), 'working', or 'scratchpad'. Ignored unless MEMORY_WRITE_KEY is set. Supports {{...}} interpolation."
+      },
+      "MEMORY_WRITE_TTL_HOURS": {
+        "type": "number",
+        "default": 168,
+        "description": "TTL in hours for the persisted memory (default 168 = 7 days). Ignored for MEMORY_WRITE_TYPE=semantic (semantic memories never expire). Ignored unless MEMORY_WRITE_KEY is set."
+      },
+      "MEMORY_WRITE_METADATA_KIND": {
+        "type": "string",
+        "description": "Optional metadata.kind label stamped on the persisted memory (lands in actor_memory.metadata JSONB). Lets readers exclude synthetic LLM outputs from recall via search_filtered(exclude_kinds=[...]) — e.g. 'essay_outline'. Ignored unless MEMORY_WRITE_KEY is set. Supports {{...}} interpolation."
       },
       "SPOTLIGHTING": {
         "type": "boolean",

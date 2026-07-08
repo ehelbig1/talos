@@ -1785,6 +1785,24 @@ async fn handle_create_workflow(
     };
     let description_str = validated_description.description;
     let description_warning = validated_description.semantic_search_warning;
+
+    // Config-completeness + type analysis runs BEFORE the insert so the
+    // hard config-type gate ("Config type error(s) — workflow NOT
+    // created") is truthful: pre-fix this ran AFTER create_workflow, so a
+    // type-mismatched config returned "NOT created" while the workflow was
+    // in fact persisted (dogfooding 2026-07-08). The analysis reads only
+    // (module_ids, input_nodes, user_id) — no wf_id — so hoisting it is a
+    // pure reorder; the missing_config / required_secrets / vault_warnings
+    // it produces are consumed in the Ok branch below.
+    let analysis = match state
+        .workflow_creation_service
+        .quickstart_analyze(&module_ids, &input_nodes, user_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
+
     match state
         .workflow_repo
         .create_workflow(
@@ -1823,20 +1841,9 @@ async fn handle_create_workflow(
                     })),
                 );
             }
-            // Quickstart config-completeness check: batch-fetch template
-            // schemas + per-installation allowed_secrets, build the
-            // analyzer-input TemplateMeta map, run the pure analyzer.
-            // Pulled into WorkflowCreationService::quickstart_analyze —
-            // the override-resolution + parallel-fetch live there now and
-            // build_template_meta_map is unit-tested in isolation.
-            let analysis = match state
-                .workflow_creation_service
-                .quickstart_analyze(&module_ids, &input_nodes, user_id)
-                .await
-            {
-                Ok(a) => a,
-                Err(msg) => return mcp_error(req_id, -32602, &msg),
-            };
+            // `analysis` was computed pre-insert (see above) so the
+            // config-type gate could block creation truthfully. Consume
+            // its completeness signals for the response here.
             let mut missing_config = analysis.missing_config;
             let required_secrets_set = analysis.required_secrets;
             let vault_warnings = analysis.vault_warnings;
