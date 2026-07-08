@@ -3053,7 +3053,23 @@ impl TalosRuntime {
         let output_str: String = match output_result {
             Ok(s) => s,
             Err(e) => {
-                span.end_error(&format!("Component error: {}", e));
+                // DLP-redact the guest error before it enters the span sink.
+                // `e` is untrusted guest text — a module echoing an upstream
+                // 401 routinely carries `sk-*` / `ghp_*` / Bearer tokens.
+                // `span.end_error` writes it to BOTH the OTel `error.message`
+                // attribute AND a stderr `[TRACE] Span '…' failed` line
+                // (talos_trace::ExecutionSpan::end_error), a sink SEPARATE
+                // from the JobResult error the controller DLP-redacts at its
+                // persistence boundary. Same class as the stderr redaction
+                // ~80 lines up in this fn. The returned Err keeps the raw
+                // text — it's redacted downstream at the controller (proven:
+                // stored error_message + client response both scrub), and
+                // redact_str is idempotent so no double-scrub harm.
+                // (Regression round 7, 2026-07-08.)
+                span.end_error(&format!(
+                    "Component error: {}",
+                    talos_dlp_provider::redact_str(&e)
+                ));
                 return Err(anyhow::anyhow!("Component returned error: {}", e));
             }
         };
