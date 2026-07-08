@@ -1379,6 +1379,31 @@ impl ParallelWorkflowEngine {
         self.event_sink = Some(sink);
     }
 
+    /// Detach the execution-event sink.
+    ///
+    /// Used by [`Self::execute_subworkflow_graph`]: a sub-workflow runs
+    /// under a SYNTHETIC execution id (`Uuid::new_v4()`) that has no
+    /// `workflow_executions` row, so persisting per-node events would
+    /// violate `execution_events_execution_id_fkey` on EVERY event. The
+    /// default `PostgresEventSink` FKs `execution_id` to
+    /// `workflow_executions`; pre-fix the sub-engine inherited the
+    /// parent's persisting sink via `adapter_set`, then logged a WARN and
+    /// dropped every inner event — pure log noise plus a wasted failed DB
+    /// round-trip per event, with zero rows ever persisted. Detaching
+    /// makes the (already-effective) no-persist behaviour explicit and
+    /// cheap.
+    ///
+    /// Cost attribution and `__memory_write__` persistence are unaffected:
+    /// `execution_cost_rollup` has no FK to `workflow_executions` (so
+    /// sub-workflow fuel already lands) and memory writes are actor-keyed
+    /// — only the FK-bound event sink is the problem. If per-inner-node
+    /// event observability is ever wanted, attribute events to the PARENT
+    /// execution id with namespaced node ids rather than re-attaching this
+    /// FK-doomed sink.
+    pub(crate) fn clear_event_sink(&mut self) {
+        self.event_sink = None;
+    }
+
     /// Replace the default post-completion hook. Tests use this to
     /// capture per-node outputs without exercising fuel rollup or
     /// actor-memory persistence.
@@ -3445,6 +3470,16 @@ impl ParallelWorkflowEngine {
             .adapter_set()
             .into_engine_with_graph(&graph_json)
             .map_err(|e| SubflowError::BuildFailed(e.to_string()))?;
+
+        // The sub-workflow runs under a synthetic execution id with no
+        // `workflow_executions` row (see the `run_with_seed_with_transport`
+        // call below, seeded with `Uuid::new_v4()`). The parent's
+        // `PostgresEventSink` FKs every event's `execution_id` to
+        // `workflow_executions`, so leaving it attached logs a WARN and
+        // drops every inner node event — noise plus a wasted DB round-trip.
+        // Detach it (fuel + memory writes are unaffected — see
+        // `clear_event_sink`).
+        sub_engine.clear_event_sink();
 
         // Cross-actor isolation: when a parent dispatches a sub-workflow
         // bound to a *different* actor, hydrate the sub-engine with that
