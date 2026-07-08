@@ -3593,6 +3593,51 @@ else
 fi
 echo
 
+# ── 55. Bare `row.get(` / `r.get(` on sqlx rows in DB-layer crates — RATCHET ──
+# `row.get("col")` PANICS (not Err) on a NULL column or a type drift —
+# the unwind kills the tokio worker task mid-request and the caller sees
+# a bare connection reset. Found live 2026-07-08 (#427): the first
+# workflow-bound webhook (NULL module_id, legal by schema) made every
+# list_webhooks call die this way. This is the PANIC-side sibling of
+# check 52 (silent-default reads): the correct fail-loud idiom is
+# `try_get` + `?` — same loudness, clean error instead of a task-killing
+# unwind. Scope: the DB-layer crates where `r`/`row` reliably means a
+# sqlx row (repository crates + the check-52 widened family); sampled
+# 0 json-`.get` false positives in scope.
+#
+# RATCHET (introduced 2026-07-08 at 473 sites; baseline below reflects
+# burn-down progress — talos-webhook-repository already at 0): the count
+# must never EXCEED the baseline. When you burn sites down, LOWER the
+# baseline in the same PR. Do not raise it — convert the read instead.
+bold "▶ check 55: bare row.get() sqlx reads in DB-layer crates (ratchet)"
+BARE_ROW_GET_BASELINE=465
+BARE_ROW_GET_SCOPE="talos-actor-repository talos-advanced-repository talos-analytics-repository \
+    talos-execution-repository talos-github-repository talos-module-repository \
+    talos-webhook-repository talos-worker-identity-repository talos-workflow-repository \
+    talos-schedule-repo talos-memory talos-secrets-manager talos-registry \
+    talos-module-executions talos-integration-state talos-auth"
+# shellcheck disable=SC2086
+BARE_ROW_GET_COUNT="$( { grep -rEc '(row|r)\.get(::<[^(]*>)?\("' \
+        --include='*.rs' \
+        $BARE_ROW_GET_SCOPE 2>/dev/null || true; } \
+    | awk -F: '{s+=$2} END {print s+0}')"
+# subtract try_get lines the broad regex also matched (try_get contains ".get" only
+# when preceded by "try_" — the regex above does NOT match try_get, but keep the
+# guard cheap and explicit in case of drift)
+if [ "$BARE_ROW_GET_COUNT" -gt "$BARE_ROW_GET_BASELINE" ]; then
+    red "✗ bare row.get() count ${BARE_ROW_GET_COUNT} exceeds the ratchet baseline ${BARE_ROW_GET_BASELINE}"
+    yellow "  → a bare .get panics on NULL/type-drift and kills the request task (connection"
+    yellow "    reset). Use .try_get(\"col\")? — or, for new NULLABLE columns,"
+    yellow "    .try_get::<Option<_>, _>(\"col\")? with an explicit default."
+    yellow "  → if you burned sites down elsewhere in this change, lower the baseline instead."
+    EXIT_CODE=1
+elif [ "$BARE_ROW_GET_COUNT" -lt "$BARE_ROW_GET_BASELINE" ]; then
+    green "✓ bare row.get() count ${BARE_ROW_GET_COUNT} is BELOW baseline ${BARE_ROW_GET_BASELINE} — lower BARE_ROW_GET_BASELINE in scripts/lint-structural.sh to lock in the progress"
+else
+    green "✓ bare row.get() count ${BARE_ROW_GET_COUNT} == baseline (ratchet holding)"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
