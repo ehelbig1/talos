@@ -164,6 +164,55 @@ mod tests {
     }
 
     #[test]
+    fn memory_write_key_not_harvested_as_secret() {
+        // Regression (dogfooding 2026-07-08): MEMORY_WRITE_KEY ends in
+        // `_KEY` but holds a routing key, not a credential. Harvesting it
+        // scrubbed the module's own `__memory_write__.key` output as
+        // [REDACTED:SECRET]. It must NOT be treated as a secret.
+        let configs = vec![serde_json::json!({
+            "MEMORY_WRITE_KEY": "essay_outline/weekly-suggestion",
+            "PROVIDER": "ollama"
+        })];
+        let ctx = ExecutionContext::from_node_configs(configs.iter());
+        assert!(
+            ctx.is_empty(),
+            "MEMORY_WRITE_KEY must not be harvested as a secret"
+        );
+
+        // And the value must survive the output-redaction pass intact.
+        let output = serde_json::json!({
+            "__memory_write__": { "key": "essay_outline/weekly-suggestion" }
+        });
+        let redacted = ctx.redact_output(&output);
+        assert_eq!(
+            redacted["__memory_write__"]["key"].as_str(),
+            Some("essay_outline/weekly-suggestion"),
+            "routing key must not be redacted from output"
+        );
+    }
+
+    #[test]
+    fn real_secret_alongside_exempt_key_still_redacted() {
+        // Defense-in-depth: exempting MEMORY_WRITE_KEY must not leak a
+        // real secret sitting in the same config.
+        let configs = vec![serde_json::json!({
+            "MEMORY_WRITE_KEY": "notes/today",
+            "API_KEY": "sk-realsecretvalue123"
+        })];
+        let ctx = ExecutionContext::from_node_configs(configs.iter());
+        assert!(!ctx.is_empty());
+        let out = ctx.redact_output(&serde_json::json!({
+            "echo": "the key is sk-realsecretvalue123 and route notes/today"
+        }));
+        let s = out["echo"].as_str().unwrap();
+        assert!(
+            s.contains("[REDACTED:SECRET]"),
+            "real API_KEY must be redacted"
+        );
+        assert!(s.contains("notes/today"), "routing key must survive");
+    }
+
+    #[test]
     fn test_from_node_configs_skips_short_values() {
         let configs = vec![
             serde_json::json!({"API_KEY": "ab"}), // Less than 4 chars

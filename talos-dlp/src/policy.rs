@@ -15,11 +15,43 @@ pub const SENSITIVE_KEY_PATTERNS: &[&str] = &[
     "_AUTH",
 ];
 
-/// Returns `true` if `key` matches any of the [`SENSITIVE_KEY_PATTERNS`].
+/// Config field names that MATCH a sensitive-key suffix (they end in
+/// `_KEY`) but hold a NON-secret routing/identifier value — a memory
+/// address, dedup/partition/idempotency key, etc. — NOT a credential.
+///
+/// These are exempted because their values legitimately appear in module
+/// OUTPUT, and the value-based redactor ([`crate::context::ExecutionContext`])
+/// harvests every sensitive-named config value as a secret to scrub. Without
+/// this exemption, a `MEMORY_WRITE_KEY: "essay_outline/weekly"` config caused
+/// the module's own `__memory_write__.key` output to render as
+/// `[REDACTED:SECRET]` (dogfooding false-positive, 2026-07-08).
+///
+/// Matching is EXACT (case-insensitive) on the full field name, NOT a
+/// substring — so a genuinely-secret sibling like `MEMORY_KEY_SECRET`
+/// still matches `_SECRET` and stays redacted.
+pub const NON_SECRET_KEY_EXEMPTIONS: &[&str] = &[
+    "MEMORY_WRITE_KEY",
+    "MEMORY_KEY",
+    "DEDUP_KEY",
+    "IDEMPOTENCY_KEY",
+    "PARTITION_KEY",
+    "ROUTING_KEY",
+    "GROUP_KEY",
+    "SORT_KEY",
+    "CACHE_KEY",
+];
+
+/// Returns `true` if `key` matches any of the [`SENSITIVE_KEY_PATTERNS`]
+/// AND is not on the [`NON_SECRET_KEY_EXEMPTIONS`] allowlist.
 ///
 /// Comparison is case-insensitive.
 pub fn is_sensitive_key(key: &str) -> bool {
     let upper = key.to_uppercase();
+    // Exact-match exemption first — a routing/identifier key that merely
+    // ends in `_KEY` is not a credential and must not be harvested/redacted.
+    if NON_SECRET_KEY_EXEMPTIONS.contains(&upper.as_str()) {
+        return false;
+    }
     SENSITIVE_KEY_PATTERNS.iter().any(|p| upper.contains(p))
 }
 
@@ -155,5 +187,42 @@ mod tests {
         // Pattern can appear at start if it has underscore
         assert!(is_sensitive_key("_KEY_NAME"));
         assert!(is_sensitive_key("_SECRET"));
+    }
+
+    #[test]
+    fn non_secret_routing_keys_are_exempt() {
+        // Regression: these end in `_KEY` but are routing/identifier
+        // values, not credentials. Harvesting them as secrets scrubbed
+        // the module's own output (MEMORY_WRITE_KEY dogfooding bug).
+        assert!(!is_sensitive_key("MEMORY_WRITE_KEY"));
+        assert!(!is_sensitive_key("memory_write_key")); // case-insensitive
+        assert!(!is_sensitive_key("MEMORY_KEY"));
+        assert!(!is_sensitive_key("DEDUP_KEY"));
+        assert!(!is_sensitive_key("IDEMPOTENCY_KEY"));
+        assert!(!is_sensitive_key("PARTITION_KEY"));
+        assert!(!is_sensitive_key("ROUTING_KEY"));
+        assert!(!is_sensitive_key("CACHE_KEY"));
+    }
+
+    #[test]
+    fn exemption_is_exact_match_not_substring() {
+        // A genuinely-secret sibling that merely CONTAINS an exempt name
+        // must still redact — the exemption is exact-match, and `_SECRET`
+        // / `_KEY` patterns still apply to the non-exempt full name.
+        assert!(is_sensitive_key("MEMORY_KEY_SECRET")); // _SECRET
+        assert!(is_sensitive_key("MEMORY_WRITE_KEY_TOKEN")); // _TOKEN
+        assert!(is_sensitive_key("MY_MEMORY_KEY_PASSWORD")); // _PASSWORD
+    }
+
+    #[test]
+    fn real_secret_keys_still_redacted_after_exemption() {
+        // The exemption must not weaken any real credential field.
+        assert!(is_sensitive_key("API_KEY"));
+        assert!(is_sensitive_key("SECRET_KEY"));
+        assert!(is_sensitive_key("PRIVATE_KEY"));
+        assert!(is_sensitive_key("SIGNING_KEY"));
+        assert!(is_sensitive_key("ENCRYPTION_KEY"));
+        assert!(is_sensitive_key("ACCESS_KEY"));
+        assert!(is_sensitive_key("OPENAI_API_KEY"));
     }
 }
