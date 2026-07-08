@@ -15,11 +15,15 @@ serde.workspace = true
 serde_json.workspace = true
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-http-body = { path = "../talos-http-body" }
+talos-llm = { path = "../talos-llm" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 
 [lints]
 workspace = true

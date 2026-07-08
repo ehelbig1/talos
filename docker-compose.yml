@@ -358,6 +358,11 @@ services:
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
       # Ollama (Tier 1 — local LLM inference)
       OLLAMA_URL: "http://ollama:11434"
+      # Graph-RAG triple-extraction model (local Ollama fallback used when
+      # no anthropic/api_key is set — this is what populates the knowledge
+      # graph on Ollama-only deployments). Any instruct model present in
+      # the target Ollama works; defaults here to the in-stack model.
+      TALOS_GRAPH_RAG_MODEL: ${TALOS_GRAPH_RAG_MODEL:-llama3.2:1b}
       # Neo4j (Knowledge Graph)
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j

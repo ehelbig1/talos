@@ -247,11 +247,19 @@ async fn handle_graph_stats(
             } else {
                 "available"
             };
+            // Deployment-level extraction-backend signal so an empty
+            // graph is diagnosable: `none` means no LLM backend is
+            // configured (set anthropic/api_key OR TALOS_GRAPH_RAG_MODEL
+            // + a reachable OLLAMA_URL), distinct from a graph that
+            // legitimately has no data yet. Not per-actor: a tier1 actor
+            // always skips LLM extraction regardless of this value.
+            let extraction_backend = graph.extraction_backend().await;
             let mut envelope = serde_json::json!({
                 "actor_id": actor_id.to_string(),
                 "graph_status": graph_status,
                 "total_nodes": total_nodes,
                 "total_edges": total_edges,
+                "extraction_backend": extraction_backend,
             });
             // Merge the underlying `nodes` + `edges` arrays alongside the
             // new envelope fields so existing callers keep reading them.

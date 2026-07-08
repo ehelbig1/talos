@@ -2963,9 +2963,33 @@ async fn init_graph_rag(
                 // tier1 (local-only) actors. The fail-closed tier
                 // check inside the service blocks the call when
                 // the lookup errors or the actor row is missing.
-                let service = service
+                let mut service = service
                     .with_secrets(secrets_manager.clone())
                     .with_actor_repo(actor_repo.clone());
+
+                // Local-Ollama fallback for provider-agnostic triple
+                // extraction: on Ollama-only / self-hosted deployments
+                // (no anthropic/api_key), this is what populates the
+                // knowledge graph — extraction routes to the local
+                // model instead of no-op'ing. Anthropic stays preferred
+                // when a key resolves; the tier1 data-egress gate still
+                // applies to BOTH backends. Same `OLLAMA_URL` default
+                // the MCP Ollama handlers use; `TALOS_GRAPH_RAG_MODEL`
+                // picks the extraction model (any instruct model present
+                // in the deployment's Ollama).
+                let ollama_url = talos_config::get_env("OLLAMA_URL", "http://ollama:11434");
+                let graph_rag_model = talos_config::get_env("TALOS_GRAPH_RAG_MODEL", "qwen2.5:7b");
+                if !ollama_url.is_empty() && !graph_rag_model.is_empty() {
+                    let ollama_client =
+                        std::sync::Arc::new(talos_llm::OllamaClient::new(ollama_url.clone()));
+                    service = service.with_ollama(ollama_client, graph_rag_model.clone());
+                    tracing::info!(
+                        ollama_url = %ollama_url,
+                        model = %graph_rag_model,
+                        "Graph RAG local-Ollama extraction backend wired (fallback when no anthropic/api_key)"
+                    );
+                }
+
                 let _ = actor_memory_service::GRAPH_SERVICE.set(service);
                 actor_memory_service::install_graph_hook();
                 tracing::info!("Graph RAG service initialized and registered with talos-memory");
