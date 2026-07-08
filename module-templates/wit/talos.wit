@@ -704,6 +704,21 @@ interface llm {
     }
 
     complete: func(req: completion-request) -> result<completion-response, error>;
+
+    /// Structured-output completion. Identical to `complete` but instructs
+    /// providers that support it (OpenAI, Ollama) to constrain the response
+    /// to JSON via the OpenAI-compatible `response_format` field:
+    ///   * `json-schema = none`     → JSON mode (valid JSON, any shape).
+    ///   * `json-schema = some(s)`  → the response is constrained to the
+    ///     JSON Schema `s` (Ollama/OpenAI "structured outputs"). A malformed
+    ///     schema string degrades to plain JSON mode rather than erroring.
+    /// Providers without native support (Anthropic) behave exactly like
+    /// `complete` — callers should still prompt for JSON there.
+    ///
+    /// This is a NEW function rather than a field on `completion-request`
+    /// so already-compiled guests importing only `complete` keep linking
+    /// (adding a record field would break the component-model ABI).
+    complete-json: func(req: completion-request, json-schema: option<string>) -> result<completion-response, error>;
 }
 
 // ============================================================================

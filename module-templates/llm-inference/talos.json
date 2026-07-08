@@ -42,7 +42,11 @@
       },
       "OUTPUT_SCHEMA": {
         "type": ["string", "array"],
-        "description": "Required top-level JSON keys in the LLM output (e.g. 'action,target,confidence' or [\"action\",\"target\"]). When set, the output is parsed as JSON and each listed key must be present — failure raises an error. Also appends a soft instruction to the SYSTEM_PROMPT requesting raw JSON. For natively-enforced structured output (Anthropic tool_use), use the `llm-tools::complete-with-tools` host interface directly via a custom sandbox — out of scope here."
+        "description": "Required top-level JSON keys in the LLM output (e.g. 'action,target,confidence' or [\"action\",\"target\"]). When set, the output is parsed as JSON and each listed key must be present — failure raises an error. Setting OUTPUT_SCHEMA also automatically enables JSON mode (see RESPONSE_FORMAT): for OpenAI/Ollama the model is constrained to emit valid JSON at generation time via response_format, so fenced/prose output no longer trips the check. Anthropic (no response_format) falls back to the appended soft JSON instruction; for natively-enforced Anthropic structured output use the `llm-tools::complete-with-tools` host interface via a custom sandbox."
+      },
+      "RESPONSE_FORMAT": {
+        "type": "string",
+        "description": "Output format constraint. 'json' (or 'json_object') routes the call through the host's structured-output path (complete_json), which sets response_format so OpenAI/Ollama emit valid JSON at generation time — no markdown fences, no trailing prose. Default 'text' (freeform). Setting OUTPUT_SCHEMA implies 'json' automatically. Anthropic has no response_format and behaves like 'text' (prompt for JSON in SYSTEM_PROMPT)."
       },
       "BLOCKED_PATTERNS": {
         "type": ["string", "array"],

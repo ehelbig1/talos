@@ -52,6 +52,39 @@ pub(crate) fn local_llm_http_client() -> &'static reqwest::Client {
 }
 
 #[cfg(test)]
+mod response_format_tests {
+    use super::build_response_format;
+
+    #[test]
+    fn none_yields_json_object_mode() {
+        let rf = build_response_format(None).expect("some");
+        assert_eq!(rf["type"], "json_object");
+    }
+
+    #[test]
+    fn valid_schema_yields_json_schema_mode() {
+        let schema = r#"{"type":"object","required":["title"]}"#;
+        let rf = build_response_format(Some(schema.to_string())).expect("some");
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        assert_eq!(rf["json_schema"]["schema"]["required"][0], "title");
+    }
+
+    #[test]
+    fn malformed_schema_degrades_to_json_mode_not_error() {
+        // A bad schema must never harden into a hard failure on an
+        // otherwise-valid completion request.
+        for bad in ["not json", "[1,2,3]", "\"a string\"", "42"] {
+            let rf = build_response_format(Some(bad.to_string())).expect("some");
+            assert_eq!(
+                rf["type"], "json_object",
+                "malformed/non-object schema {bad:?} should degrade to json_object mode"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod llm_tier_decision_tests {
     use super::{decide_llm_tier_access, LlmTierDecision};
     use talos_workflow_job_protocol::LlmTier;
@@ -323,6 +356,35 @@ pub(crate) fn decide_llm_tier_access(
 // LLM
 // ============================================================================
 
+/// Build the OpenAI-compatible `response_format` value for `complete_json`.
+///
+/// * `None` → JSON mode: `{"type":"json_object"}` — the provider must emit
+///   syntactically-valid JSON (any shape).
+/// * `Some(schema)` where `schema` parses to a JSON **object** → structured
+///   outputs: `{"type":"json_schema","json_schema":{...}}` — the provider
+///   constrains generation to that JSON Schema (Ollama/OpenAI).
+/// * `Some(malformed)` → degrades to JSON mode rather than failing the call,
+///   with a warning. A bad schema should never harden into a hard error on
+///   an otherwise-valid completion request.
+fn build_response_format(json_schema: Option<String>) -> Option<serde_json::Value> {
+    match json_schema {
+        None => Some(serde_json::json!({ "type": "json_object" })),
+        Some(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(schema) if schema.is_object() => Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": { "name": "output", "strict": true, "schema": schema }
+            })),
+            _ => {
+                tracing::warn!(
+                    "complete_json: json-schema was not a valid JSON object — \
+                     falling back to plain JSON mode"
+                );
+                Some(serde_json::json!({ "type": "json_object" }))
+            }
+        },
+    }
+}
+
 /// 2026-05-28 audit Perf#1 (H7 sibling): typed projection of an LLM
 /// provider response. Deserializing into one of these instead of
 /// `serde_json::Value` saves the per-field `HashMap<String, Value>`
@@ -398,6 +460,35 @@ impl wit_llm::Host for TalosContext {
     async fn complete(
         &mut self,
         req: wit_llm::CompletionRequest,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        self.complete_impl(req, None).await
+    }
+
+    /// Structured-output completion — see the WIT doc on `complete-json`.
+    /// `json_schema = None` → JSON mode (valid JSON, any shape);
+    /// `Some(schema)` → response constrained to that JSON Schema. The
+    /// `response_format` only reaches OpenAI-compatible providers (OpenAI,
+    /// Ollama); Anthropic ignores it and behaves like `complete`.
+    #[::tracing::instrument(name = "llm.complete_json", skip_all)]
+    async fn complete_json(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        json_schema: Option<String>,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        let response_format = build_response_format(json_schema);
+        self.complete_impl(req, response_format).await
+    }
+}
+
+impl TalosContext {
+    /// Shared completion kernel behind `complete` (response_format = None)
+    /// and `complete_json` (response_format = Some(...)). Factored so the
+    /// tier gate, SSRF client selection, timeouts, bounded body read, and
+    /// response parsing live in exactly one place.
+    async fn complete_impl(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        response_format: Option<serde_json::Value>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
         // Check cancellation before making an expensive API call.
         if self.is_cancelled() {
@@ -498,6 +589,18 @@ impl wit_llm::Host for TalosContext {
                 });
                 // Remove the Anthropic-style top-level "system" field
                 body.as_object_mut().map(|obj| obj.remove("system"));
+            }
+        }
+
+        // Structured-output constraint (from complete_json). Only OpenAI-
+        // compatible providers (OpenAI, Ollama) honor `response_format`;
+        // Anthropic ignores it (its request has no such field), so a
+        // complete_json call to Anthropic degrades to prompt-only JSON —
+        // exactly like `complete`. Ollama's OpenAI-compat endpoint accepts
+        // both {"type":"json_object"} and {"type":"json_schema",...}.
+        if is_openai_format {
+            if let Some(ref rf) = response_format {
+                body["response_format"] = rf.clone();
             }
         }
 

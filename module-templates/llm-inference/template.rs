@@ -130,6 +130,20 @@ fn run(input: String) -> Result<String, String> {
         .unwrap_or_default();
     let has_output_schema = !output_schema_keys.is_empty();
 
+    // Structured-output routing. `RESPONSE_FORMAT=json` (or `json_object`)
+    // forces JSON mode; OUTPUT_SCHEMA presence implies JSON intent and
+    // enables the same path automatically. When set, the LLM call routes
+    // through the host's `complete_json` so OpenAI-compatible providers
+    // (OpenAI, Ollama) emit valid JSON at GENERATION time via
+    // `response_format` — far more reliable than prompt-only JSON, which
+    // truncated / fenced under the local model (dogfooding 2026-07-08).
+    let response_format_json = config
+        .response_format
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("json") || s.eq_ignore_ascii_case("json_object"))
+        .unwrap_or(false);
+    let want_json = has_output_schema || response_format_json;
+
     // ── System prompt assembly ───────────────────────────────────────────
     let system_prompt_base_raw: &str = config
         .system_prompt
@@ -142,10 +156,11 @@ fn run(input: String) -> Result<String, String> {
         interpolate_with_report(system_prompt_base_raw, &interp_ctx, spotlighting);
 
     // When OUTPUT_SCHEMA is set, append a soft instruction so models return
-    // raw JSON without markdown fences. The host's `llm::complete` doesn't
-    // expose a JSON-mode flag — prompt engineering + post-validation is the
-    // route. Anthropic users who need *enforced* structured output should
-    // call `llm-tools::complete-with-tools` directly (out of scope here).
+    // raw JSON. This complements the hard generation-time constraint applied
+    // via `complete_json` below (for OpenAI/Ollama) and is the PRIMARY
+    // mechanism for Anthropic, which has no `response_format` — Anthropic
+    // users needing *enforced* structured output should call
+    // `llm-tools::complete-with-tools` directly (out of scope here).
     let mut system_prompt = if has_output_schema {
         format!(
             "{} Return only valid JSON without markdown code fences.",
@@ -328,7 +343,21 @@ fn run(input: String) -> Result<String, String> {
         system_prompt: Some(system_prompt),
     };
 
-    let resp = llm::complete(&req).map_err(|e| llm_error_message(e, &provider_key, model))?;
+    // Route through the host's structured-output path when JSON is wanted.
+    // `complete_json(&req, None)` requests JSON mode (json_object) — valid
+    // JSON of any shape, so the model is free to include every key the
+    // system prompt asks for (title, thesis, sections, …) while the
+    // OUTPUT_SCHEMA check below still validates the required subset. We
+    // deliberately do NOT pass a JSON Schema: an additionalProperties=true
+    // schema let the local model ramble past max_tokens and truncate
+    // (tested), whereas plain JSON mode stays tight. Non-JSON calls keep
+    // the original `complete` path unchanged.
+    let resp = if want_json {
+        llm::complete_json(&req, None)
+    } else {
+        llm::complete(&req)
+    }
+    .map_err(|e| llm_error_message(e, &provider_key, model))?;
     let raw_text = resp.text;
 
     // ── Fence stripping ──────────────────────────────────────────────────
@@ -456,6 +485,8 @@ struct Config {
     inject_context: Option<BoolOrString>,
     #[serde(rename = "SPOTLIGHTING")]
     spotlighting: Option<BoolOrString>,
+    #[serde(rename = "RESPONSE_FORMAT")]
+    response_format: Option<String>,
     #[serde(rename = "MEMORY_WRITE_KEY")]
     memory_write_key: Option<String>,
     #[serde(rename = "MEMORY_WRITE_TYPE")]
