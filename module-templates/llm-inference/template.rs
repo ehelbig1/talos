@@ -343,17 +343,40 @@ fn run(input: String) -> Result<String, String> {
         system_prompt: Some(system_prompt),
     };
 
-    // Route through the host's structured-output path when JSON is wanted.
-    // `complete_json(&req, None)` requests JSON mode (json_object) — valid
-    // JSON of any shape, so the model is free to include every key the
-    // system prompt asks for (title, thesis, sections, …) while the
-    // OUTPUT_SCHEMA check below still validates the required subset. We
-    // deliberately do NOT pass a JSON Schema: an additionalProperties=true
-    // schema let the local model ramble past max_tokens and truncate
-    // (tested), whereas plain JSON mode stays tight. Non-JSON calls keep
-    // the original `complete` path unchanged.
-    let resp = if want_json {
-        llm::complete_json(&req, None)
+    // Build the provider-options overlay and route through the host's
+    // flexible passthrough (`complete_with_options`) when there's anything
+    // to apply. This is the single, explicit path for using ANY provider
+    // capability:
+    //   * PROVIDER_OPTIONS — arbitrary provider-specific request params the
+    //     caller sets deliberately (seed, top_p, stop, num_predict, top_k,
+    //     stop_sequences, …). Merged verbatim into the provider body.
+    //   * JSON mode — for OpenAI-compatible providers (OpenAI, Ollama), when
+    //     RESPONSE_FORMAT=json or OUTPUT_SCHEMA is set, we add
+    //     response_format:{type:json_object} so the model emits valid JSON at
+    //     generation time (any shape — the model still includes every key the
+    //     prompt asks for; OUTPUT_SCHEMA validates the required subset below).
+    //     A JSON Schema is intentionally NOT used: additionalProperties=true
+    //     let the local model ramble past max_tokens and truncate (tested).
+    //     Anthropic/Gemini have no response_format → they rely on the soft
+    //     JSON instruction appended to the system prompt.
+    // The host guardrails the merge (prompt + streaming are re-asserted), so
+    // options can only TUNE the request. When there are no options, the plain
+    // `complete` path is unchanged.
+    let openai_compat = matches!(provider, Provider::Openai | Provider::Ollama);
+    let mut options_obj = config
+        .provider_options
+        .as_ref()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if want_json && openai_compat && !options_obj.contains_key("response_format") {
+        options_obj.insert(
+            "response_format".to_string(),
+            serde_json::json!({ "type": "json_object" }),
+        );
+    }
+    let resp = if !options_obj.is_empty() {
+        let opts_str = serde_json::Value::Object(options_obj).to_string();
+        llm::complete_with_options(&req, Some(opts_str.as_str()))
     } else {
         llm::complete(&req)
     }
@@ -487,6 +510,8 @@ struct Config {
     spotlighting: Option<BoolOrString>,
     #[serde(rename = "RESPONSE_FORMAT")]
     response_format: Option<String>,
+    #[serde(rename = "PROVIDER_OPTIONS")]
+    provider_options: Option<serde_json::Value>,
     #[serde(rename = "MEMORY_WRITE_KEY")]
     memory_write_key: Option<String>,
     #[serde(rename = "MEMORY_WRITE_TYPE")]

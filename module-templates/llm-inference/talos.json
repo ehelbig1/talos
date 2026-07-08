@@ -46,7 +46,11 @@
       },
       "RESPONSE_FORMAT": {
         "type": "string",
-        "description": "Output format constraint. 'json' (or 'json_object') routes the call through the host's structured-output path (complete_json), which sets response_format so OpenAI/Ollama emit valid JSON at generation time — no markdown fences, no trailing prose. Default 'text' (freeform). Setting OUTPUT_SCHEMA implies 'json' automatically. Anthropic has no response_format and behaves like 'text' (prompt for JSON in SYSTEM_PROMPT)."
+        "description": "Output format constraint. 'json' (or 'json_object') asks OpenAI/Ollama to emit valid JSON at generation time (via response_format) — no markdown fences, no trailing prose. Default 'text' (freeform). Setting OUTPUT_SCHEMA implies 'json' automatically. Anthropic has no response_format and behaves like 'text' (prompt for JSON in SYSTEM_PROMPT). Equivalent to PROVIDER_OPTIONS={\"response_format\":{\"type\":\"json_object\"}} — a convenience for the common case."
+      },
+      "PROVIDER_OPTIONS": {
+        "type": "object",
+        "description": "Explicit, flexible passthrough of provider-specific request parameters — the escape hatch for any LLM capability the typed fields (MODEL/MAX_TOKENS/TEMPERATURE/RESPONSE_FORMAT) don't cover. A JSON object merged verbatim into the outbound provider request body; you are responsible for passing keys the SELECTED provider understands. Examples — Ollama/OpenAI (OpenAI-compatible): {\"seed\":42,\"top_p\":0.9,\"stop\":[\"\\n\\n\"],\"frequency_penalty\":0.3}; Anthropic: {\"top_k\":40,\"top_p\":0.95,\"stop_sequences\":[\"END\"]}. The host guardrails the merge — options can TUNE the request but can never replace the (SPOTLIGHTING-wrapped) prompt, enable streaming, or reach the URL/API key. Capped at 8KB. Combines with RESPONSE_FORMAT/OUTPUT_SCHEMA (JSON mode is merged in for OpenAI/Ollama unless you set response_format here yourself)."
       },
       "BLOCKED_PATTERNS": {
         "type": ["string", "array"],
