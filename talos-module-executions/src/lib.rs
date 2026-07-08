@@ -288,10 +288,10 @@ impl ModuleExecutionService {
         let mut re_encrypted = 0u64;
         let mut failed = 0u64;
         for r in &rows {
-            let id: Uuid = r.get("id");
+            let id: Uuid = r.try_get("id")?;
             let wei: Option<Uuid> = r.try_get("workflow_execution_id").ok().flatten();
             let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
-            let old_format: i16 = r.get("payload_format");
+            let old_format: i16 = r.try_get("payload_format")?;
             let input_enc: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
             let output_enc: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
             let trigger_enc: Option<Vec<u8>> = r.try_get("trigger_metadata_enc").ok().flatten();
@@ -952,23 +952,23 @@ impl ModuleExecutionService {
             )
             .await?;
         Ok(Some(ModuleExecution {
-            id: r.get("id"),
-            module_id: r.get("module_id"),
-            user_id: r.get("user_id"),
-            status: r.get("status"),
-            trigger_type: r.get("trigger_type"),
+            id: r.try_get("id")?,
+            module_id: r.try_get("module_id")?,
+            user_id: r.try_get("user_id")?,
+            status: r.try_get("status")?,
+            trigger_type: r.try_get("trigger_type")?,
             trigger_metadata,
             input_data,
             output_data,
-            started_at: r.get("started_at"),
+            started_at: r.try_get("started_at")?,
             completed_at: r.try_get("completed_at")?,
             duration_ms: r.try_get("duration_ms")?,
             error_message: r.try_get("error_message")?,
             error_type: r.try_get("error_type")?,
             fuel_consumed: r.try_get("fuel_consumed")?,
             memory_used_mb: r.try_get("memory_used_mb")?,
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
+            created_at: r.try_get("created_at")?,
+            updated_at: r.try_get("updated_at")?,
         }))
     }
 
@@ -1011,7 +1011,7 @@ impl ModuleExecutionService {
         .context("Failed to fetch module executions")?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let exec_id: Uuid = r.get("id");
+            let exec_id: Uuid = r.try_get("id")?;
             let pt_trigger: Option<JsonValue> = r.try_get("trigger_metadata").ok().flatten();
             let pt_input: Option<JsonValue> = r.try_get("input_data").ok().flatten();
             let pt_output: Option<JsonValue> = r.try_get("output_data").ok().flatten();
@@ -1063,23 +1063,23 @@ impl ModuleExecutionService {
                 )
                 .await?;
             out.push(ModuleExecution {
-                id: r.get("id"),
-                module_id: r.get("module_id"),
-                user_id: r.get("user_id"),
-                status: r.get("status"),
-                trigger_type: r.get("trigger_type"),
+                id: r.try_get("id")?,
+                module_id: r.try_get("module_id")?,
+                user_id: r.try_get("user_id")?,
+                status: r.try_get("status")?,
+                trigger_type: r.try_get("trigger_type")?,
                 trigger_metadata,
                 input_data,
                 output_data,
-                started_at: r.get("started_at"),
+                started_at: r.try_get("started_at")?,
                 completed_at: r.try_get("completed_at")?,
                 duration_ms: r.try_get("duration_ms")?,
                 error_message: r.try_get("error_message")?,
                 error_type: r.try_get("error_type")?,
                 fuel_consumed: r.try_get("fuel_consumed")?,
                 memory_used_mb: r.try_get("memory_used_mb")?,
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
+                created_at: r.try_get("created_at")?,
+                updated_at: r.try_get("updated_at")?,
             });
         }
         Ok(out)

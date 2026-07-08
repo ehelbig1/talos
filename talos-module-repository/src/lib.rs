@@ -744,19 +744,20 @@ impl ModuleRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|r| ModuleListItem {
-                id: r.get("id"),
-                name: r.get("name"),
-                // capability_world is NOT NULL on modules; surface as
-                // Some(_) so the type matches the dual-row contract.
-                capability_world: r.try_get::<String, _>("capability_world").ok(),
-                max_fuel: r.get("max_fuel"),
-                usage_count: r.try_get::<i64, _>("usage_count").ok(),
-                updated_at: r.get("updated_at"),
+        rows.iter()
+            .map(|r| -> Result<ModuleListItem> {
+                Ok(ModuleListItem {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    // capability_world is NOT NULL on modules; surface as
+                    // Some(_) so the type matches the dual-row contract.
+                    capability_world: r.try_get::<String, _>("capability_world").ok(),
+                    max_fuel: r.try_get("max_fuel")?,
+                    usage_count: r.try_get::<i64, _>("usage_count").ok(),
+                    updated_at: r.try_get("updated_at")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Batch-fetch full module details by id, scoped to modules the user
@@ -879,16 +880,17 @@ impl ModuleRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| UserModuleViewRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                capability_world: r.get("capability_world"),
-                source: r.get("source"),
-                template_id: r.try_get("template_id").ok().flatten(),
+        rows.iter()
+            .map(|r| -> Result<UserModuleViewRow> {
+                Ok(UserModuleViewRow {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    capability_world: r.try_get("capability_world")?,
+                    source: r.try_get("source")?,
+                    template_id: r.try_get("template_id").ok().flatten(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Delete user-owned modules whose ids are NOT referenced by any of
@@ -1465,7 +1467,7 @@ impl ModuleRepository {
         rows.iter()
             .map(|r| -> Result<OrgModuleRow> {
                 Ok(OrgModuleRow {
-                    id: r.get("id"),
+                    id: r.try_get("id")?,
                     name: r
                         .try_get::<Option<_>, _>("name")?
                         .unwrap_or_else(|| "unknown".to_string()),

@@ -190,10 +190,10 @@ impl WorkflowRepository {
 
         rows.into_iter()
             .map(|r| -> Result<NodeTemplateRow> {
-                let id: Uuid = r.get("id");
+                let id: Uuid = r.try_get("id")?;
                 Ok(NodeTemplateRow {
                     id,
-                    name: r.get("name"),
+                    name: r.try_get("name")?,
                     config_schema: r
                         .try_get::<Option<_>, _>("config_schema")?
                         .unwrap_or(serde_json::json!({})),
@@ -234,10 +234,10 @@ impl WorkflowRepository {
         .await?;
 
         row.map(|r| -> Result<NodeTemplateRow> {
-            let id: Uuid = r.get("id");
+            let id: Uuid = r.try_get("id")?;
             Ok(NodeTemplateRow {
                 id,
-                name: r.get("name"),
+                name: r.try_get("name")?,
                 config_schema: r
                     .try_get::<Option<_>, _>("config_schema")?
                     .unwrap_or(serde_json::json!({})),
@@ -522,9 +522,9 @@ impl WorkflowRepository {
 
         let mut out: Vec<ModuleExportInfo> = Vec::new();
         for r in &rows {
-            let id: Uuid = r.get("input_id");
+            let id: Uuid = r.try_get("input_id")?;
             let is_compiled: bool = r.try_get::<Option<_>, _>("is_compiled")?.unwrap_or(false);
-            let name: String = r.get("name");
+            let name: String = r.try_get("name")?;
             let capability_world: Option<String> = r.try_get("capability_world").ok();
             let category_persisted: Option<String> = r.try_get("category").ok();
             let source_code: Option<String> = if include_source {

@@ -100,12 +100,12 @@ impl ScheduleRepository {
         rows.iter()
             .map(|r| -> Result<ScheduleListRow> {
                 Ok(ScheduleListRow {
-                    id: r.get("id"),
-                    workflow_id: r.get("workflow_id"),
-                    workflow_name: r.get("workflow_name"),
-                    cron_expression: r.get("cron_expression"),
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
+                    workflow_name: r.try_get("workflow_name")?,
+                    cron_expression: r.try_get("cron_expression")?,
                     timezone: r.try_get::<Option<_>, _>("timezone")?,
-                    is_enabled: r.get("is_enabled"),
+                    is_enabled: r.try_get("is_enabled")?,
                     last_triggered_at: r.try_get::<Option<_>, _>("last_triggered_at")?,
                     next_trigger_at: r.try_get::<Option<_>, _>("next_trigger_at")?,
                 })
@@ -163,12 +163,12 @@ impl ScheduleRepository {
         rows.iter()
             .map(|r| -> Result<ScheduleNextRunRow> {
                 Ok(ScheduleNextRunRow {
-                    id: r.get("id"),
-                    cron_expression: r.get("cron_expression"),
+                    id: r.try_get("id")?,
+                    cron_expression: r.try_get("cron_expression")?,
                     timezone: r.try_get::<Option<_>, _>("timezone")?,
-                    next_trigger_at: r.get("next_trigger_at"),
-                    is_enabled: r.get("is_enabled"),
-                    workflow_name: r.get("workflow_name"),
+                    next_trigger_at: r.try_get("next_trigger_at")?,
+                    is_enabled: r.try_get("is_enabled")?,
+                    workflow_name: r.try_get("workflow_name")?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -194,16 +194,16 @@ impl ScheduleRepository {
         .await?;
         row.map(|r| -> Result<ScheduleHealthRow> {
             Ok(ScheduleHealthRow {
-                id: r.get("id"),
-                cron_expression: r.get("cron_expression"),
+                id: r.try_get("id")?,
+                cron_expression: r.try_get("cron_expression")?,
                 timezone: r
                     .try_get::<Option<String>, _>("timezone")?
                     .unwrap_or_else(|| "UTC".to_string()),
                 is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
                 last_triggered_at: r.try_get::<Option<_>, _>("last_triggered_at")?,
                 next_trigger_at: r.try_get::<Option<_>, _>("next_trigger_at")?,
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.get("workflow_name"),
+                workflow_id: r.try_get("workflow_id")?,
+                workflow_name: r.try_get("workflow_name")?,
             })
         })
         .transpose()

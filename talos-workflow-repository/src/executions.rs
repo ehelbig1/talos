@@ -1237,9 +1237,9 @@ impl WorkflowRepository {
 
         row.map(|r| -> Result<ActorRow> {
             Ok(ActorRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                status: r.get("status"),
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                status: r.try_get("status")?,
                 max_workflow_count: r.try_get::<Option<_>, _>("max_workflow_count")?,
                 max_executions_per_hour: r.try_get::<Option<_>, _>("max_executions_per_hour")?,
                 max_executions_total: r.try_get::<Option<_>, _>("max_executions_total")?,

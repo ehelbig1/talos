@@ -1132,8 +1132,8 @@ impl AnalyticsRepository {
         .await?;
         row.map(|r| -> Result<WorkflowGraphRow> {
             Ok(WorkflowGraphRow {
-                id: r.get("id"),
-                name: r.get("name"),
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
                 graph_json: r.try_get::<Option<_>, _>("graph_json")?,
                 status: r.try_get::<Option<_>, _>("status")?,
                 is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
@@ -1162,8 +1162,8 @@ impl AnalyticsRepository {
         .await?;
         row.map(|r| -> Result<WorkflowFullRow> {
             Ok(WorkflowFullRow {
-                id: r.get("id"),
-                name: r.get("name"),
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
                 graph_json: r.try_get::<Option<_>, _>("graph_json")?,
                 tags: r.try_get::<Option<_>, _>("tags")?,
                 description: r.try_get::<Option<_>, _>("description")?,
@@ -1211,8 +1211,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<WorkflowBasicRow> {
                 Ok(WorkflowBasicRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     status: r.try_get::<Option<_>, _>("status")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
                     workflow_type: r.try_get::<Option<_>, _>("workflow_type")?,
@@ -1253,8 +1253,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<WorkflowGraphRow> {
                 Ok(WorkflowGraphRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     graph_json: r.try_get::<Option<_>, _>("graph_json")?,
                     status: r.try_get::<Option<_>, _>("status")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
@@ -1305,10 +1305,9 @@ impl AnalyticsRepository {
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get("id"), r.get("name")))
-            .collect())
+        rows.into_iter()
+            .map(|r| -> Result<(Uuid, String)> { Ok((r.try_get("id")?, r.try_get("name")?)) })
+            .collect::<Result<Vec<_>>>()
     }
 
     // -- Module/template lookups ------------------------------------------
@@ -1319,13 +1318,14 @@ impl AnalyticsRepository {
             .bind(ids)
             .fetch_all(&self.db_pool)
             .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ModuleNameRow {
-                id: r.get("id"),
-                name: r.get("name"),
+        rows.into_iter()
+            .map(|r| -> Result<ModuleNameRow> {
+                Ok(ModuleNameRow {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Phase 5.1: queries unified modules table; canonical id only.
@@ -1420,8 +1420,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<FailingWorkflowRow> {
                 Ok(FailingWorkflowRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
                     total_count: r.try_get::<Option<_>, _>("total_count")?.unwrap_or(0),
                 })
@@ -1450,9 +1450,9 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<LongRunningRow> {
                 Ok(LongRunningRow {
-                    id: r.get("id"),
-                    workflow_id: r.get("workflow_id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
+                    name: r.try_get("name")?,
                     running_secs: r.try_get::<Option<_>, _>("running_secs")?.unwrap_or(0),
                 })
             })
@@ -1642,8 +1642,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<ScheduleRow> {
                 Ok(ScheduleRow {
-                    id: r.get("id"),
-                    cron_expression: r.get("cron_expression"),
+                    id: r.try_get("id")?,
+                    cron_expression: r.try_get("cron_expression")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
                     timezone: r.try_get("timezone").ok(),
                     last_triggered_at: r.try_get("last_triggered_at").ok(),
@@ -1679,8 +1679,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<WebhookRow> {
                 Ok(WebhookRow {
-                    id: r.get("id"),
-                    endpoint_path: r.get("endpoint_path"),
+                    id: r.try_get("id")?,
+                    endpoint_path: r.try_get("endpoint_path")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
                 })
             })
@@ -1703,8 +1703,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<WebhookRow> {
                 Ok(WebhookRow {
-                    id: r.get("id"),
-                    endpoint_path: r.get("endpoint_path"),
+                    id: r.try_get("id")?,
+                    endpoint_path: r.try_get("endpoint_path")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
                 })
             })
@@ -1746,10 +1746,10 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<AuditEventRow> {
                 Ok(AuditEventRow {
-                    id: r.get("id"),
-                    event_type: r.get("event_type"),
+                    id: r.try_get("id")?,
+                    event_type: r.try_get("event_type")?,
                     description: r.try_get::<Option<_>, _>("description")?,
-                    created_at: r.get("created_at"),
+                    created_at: r.try_get("created_at")?,
                     actor_id: r.try_get::<Option<_>, _>("actor_id")?,
                 })
             })
@@ -1786,8 +1786,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<ExecutionAuditRow> {
                 Ok(ExecutionAuditRow {
-                    id: r.get("id"),
-                    status: r.get("status"),
+                    id: r.try_get("id")?,
+                    status: r.try_get("status")?,
                     started_at: r.try_get::<Option<_>, _>("started_at")?,
                     completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                     error_message: r.try_get::<Option<_>, _>("error_message")?,
@@ -1882,7 +1882,7 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<NodeFailureCountRow> {
                 Ok(NodeFailureCountRow {
-                    node_id: r.get("node_id"),
+                    node_id: r.try_get("node_id")?,
                     fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
                 })
             })
@@ -1913,7 +1913,7 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<NodeFailureDetailRow> {
                 Ok(NodeFailureDetailRow {
-                    node_id: r.get("node_id"),
+                    node_id: r.try_get("node_id")?,
                     fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
                     latest_at: r.try_get::<Option<_>, _>("latest_at")?,
                     latest_error: r.try_get::<Option<_>, _>("latest_error")?,
@@ -1983,8 +1983,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<WorkflowStatSummaryRow> {
                 Ok(WorkflowStatSummaryRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     total: r.try_get::<Option<_>, _>("total")?.unwrap_or(0),
                     succeeded: r.try_get::<Option<_>, _>("succeeded")?.unwrap_or(0),
                     failed: r.try_get::<Option<_>, _>("failed")?.unwrap_or(0),
@@ -2007,8 +2007,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<UnusedSecretRow> {
                 Ok(UnusedSecretRow {
-                    name: r.get("name"),
-                    key_path: r.get("key_path"),
+                    name: r.try_get("name")?,
+                    key_path: r.try_get("key_path")?,
                     description: r.try_get::<Option<_>, _>("description")?,
                     created_at: r.try_get::<Option<_>, _>("created_at")?,
                     namespace: r.try_get::<Option<_>, _>("namespace")?,
@@ -2057,7 +2057,7 @@ impl AnalyticsRepository {
         .await?;
         row.map(|r| -> Result<ModuleInfoRow> {
             Ok(ModuleInfoRow {
-                name: r.get("name"),
+                name: r.try_get("name")?,
                 capability_world: r.try_get::<Option<_>, _>("capability_world")?,
             })
         })
@@ -2102,8 +2102,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<WorkflowCapabilityRow> {
                 Ok(WorkflowCapabilityRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     description: r.try_get::<Option<_>, _>("description")?,
                     capabilities: r.try_get::<Option<_>, _>("capabilities")?,
                     readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
@@ -2162,8 +2162,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<WorkflowGraphRow> {
                 Ok(WorkflowGraphRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     graph_json: r.try_get::<Option<_>, _>("graph_json")?,
                     status: r.try_get::<Option<_>, _>("status")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
@@ -2293,8 +2293,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<ReuseStatRow> {
                 Ok(ReuseStatRow {
-                    workflow_id: r.get("workflow_id"),
-                    name: r.get("name"),
+                    workflow_id: r.try_get("workflow_id")?,
+                    name: r.try_get("name")?,
                     graph_json: r.try_get::<Option<_>, _>("graph_json")?,
                     total_invocations: r.try_get::<Option<_>, _>("total_invocations")?.unwrap_or(0),
                     unique_days: r.try_get::<Option<_>, _>("unique_days")?.unwrap_or(0),
@@ -2739,16 +2739,17 @@ impl AnalyticsRepository {
         .bind(hours)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| RecentAlertSummaryRow {
-                workflow_name: r.get("workflow_name"),
-                message: r.get("message"),
-                occurrence_count: r.get("occurrence_count"),
-                last_occurred_at: r.get("last_occurred_at"),
-                acknowledged: r.get("acknowledged"),
+        rows.iter()
+            .map(|r| -> Result<RecentAlertSummaryRow> {
+                Ok(RecentAlertSummaryRow {
+                    workflow_name: r.try_get("workflow_name")?,
+                    message: r.try_get("message")?,
+                    occurrence_count: r.try_get("occurrence_count")?,
+                    last_occurred_at: r.try_get("last_occurred_at")?,
+                    acknowledged: r.try_get("acknowledged")?,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Delete acknowledged alerts older than `older_than_days`. CTE shape
@@ -2846,11 +2847,11 @@ impl AnalyticsRepository {
         .await?;
         row.map(|r| -> Result<WaterfallExecRow> {
             Ok(WaterfallExecRow {
-                status: r.get("status"),
+                status: r.try_get("status")?,
                 started_at: r.try_get::<Option<_>, _>("started_at")?,
                 completed_at: r.try_get::<Option<_>, _>("completed_at")?,
                 output_data: r.try_get::<Option<_>, _>("output_data")?,
-                workflow_id: r.get("workflow_id"),
+                workflow_id: r.try_get("workflow_id")?,
             })
         })
         .transpose()
@@ -2872,9 +2873,9 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<WaterfallEventRow> {
                 Ok(WaterfallEventRow {
-                    event_type: r.get("event_type"),
+                    event_type: r.try_get("event_type")?,
                     node_id: r.try_get::<Option<_>, _>("node_id")?,
-                    created_at: r.get("created_at"),
+                    created_at: r.try_get("created_at")?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -3027,7 +3028,7 @@ impl AnalyticsRepository {
         for r in &rows {
             let bucket: String = r.try_get::<Option<_>, _>("bucket")?.unwrap_or_default();
             let item = ExtremeExecution {
-                id: r.get("id"),
+                id: r.try_get("id")?,
                 started_at: r.try_get::<Option<_>, _>("started_at")?.unwrap_or_default(),
                 duration_ms: r.try_get::<Option<_>, _>("duration_ms")?.unwrap_or(0.0),
             };
@@ -3084,8 +3085,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<TopWorkflowRow> {
                 Ok(TopWorkflowRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     exec_count: r.try_get::<Option<_>, _>("exec_count")?.unwrap_or(0),
                 })
             })
@@ -3113,8 +3114,8 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<FailingWorkflowRow> {
                 Ok(FailingWorkflowRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     fail_count: r.try_get::<Option<_>, _>("fail_count")?.unwrap_or(0),
                     total_count: r.try_get::<Option<_>, _>("total_count")?.unwrap_or(0),
                 })
@@ -3145,11 +3146,11 @@ impl AnalyticsRepository {
         rows.into_iter()
             .map(|r| -> Result<ScheduleUpcomingRow> {
                 Ok(ScheduleUpcomingRow {
-                    id: r.get("id"),
-                    cron_expression: r.get("cron_expression"),
+                    id: r.try_get("id")?,
+                    cron_expression: r.try_get("cron_expression")?,
                     timezone: r.try_get::<Option<_>, _>("timezone")?,
-                    workflow_name: r.get("workflow_name"),
-                    workflow_id: r.get("workflow_id"),
+                    workflow_name: r.try_get("workflow_name")?,
+                    workflow_id: r.try_get("workflow_id")?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -3174,7 +3175,7 @@ impl AnalyticsRepository {
         .await?;
         rows.into_iter()
             .map(|r| -> Result<(String, Option<String>)> {
-                let status: String = r.get("status");
+                let status: String = r.try_get("status")?;
                 let error_message: Option<String> = r.try_get::<Option<_>, _>("error_message")?;
                 Ok((status, error_message))
             })
@@ -3240,8 +3241,8 @@ impl AnalyticsRepository {
         .await?;
         rows.into_iter()
             .map(|r| -> Result<(Uuid, String, Option<String>)> {
-                let id: Uuid = r.get("id");
-                let name: String = r.get("name");
+                let id: Uuid = r.try_get("id")?;
+                let name: String = r.try_get("name")?;
                 let category: Option<String> = r.try_get::<Option<_>, _>("category")?;
                 Ok((id, name, category))
             })
@@ -3267,14 +3268,13 @@ impl AnalyticsRepository {
         .bind(module_ids)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let id: Uuid = r.get("id");
-                let name: String = r.get("name");
-                (id, name)
+        rows.into_iter()
+            .map(|r| -> Result<(Uuid, String)> {
+                let id: Uuid = r.try_get("id")?;
+                let name: String = r.try_get("name")?;
+                Ok((id, name))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_risk_stale_templates(&self, module_ids: &[Uuid]) -> Result<Vec<Uuid>> {
@@ -3303,14 +3303,13 @@ impl AnalyticsRepository {
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let name: String = r.get("name");
-                let expires_at: DateTime<Utc> = r.get("expires_at");
-                (name, expires_at)
+        rows.into_iter()
+            .map(|r| -> Result<(String, DateTime<Utc>)> {
+                let name: String = r.try_get("name")?;
+                let expires_at: DateTime<Utc> = r.try_get("expires_at")?;
+                Ok((name, expires_at))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn get_risk_no_expiry_secrets(&self, user_id: Uuid) -> Result<Vec<String>> {
@@ -3365,11 +3364,11 @@ impl AnalyticsRepository {
             .into_iter()
             .map(|r| -> Result<HygieneWorkflowRow> {
                 Ok(HygieneWorkflowRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
                     description: r.try_get::<Option<_>, _>("description")?,
-                    created_at: r.get("created_at"),
+                    created_at: r.try_get("created_at")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3395,11 +3394,11 @@ impl AnalyticsRepository {
             .into_iter()
             .map(|r| -> Result<HygieneWorkflowRow> {
                 Ok(HygieneWorkflowRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
                     description: r.try_get::<Option<_>, _>("description")?,
-                    created_at: r.get("created_at"),
+                    created_at: r.try_get("created_at")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3516,10 +3515,10 @@ impl AnalyticsRepository {
             .into_iter()
             .map(|r| -> Result<OrphanedModuleRow> {
                 Ok(OrphanedModuleRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
                     size_bytes: r.try_get::<Option<_>, _>("size_bytes")?,
-                    compiled_at: r.get("compiled_at"),
+                    compiled_at: r.try_get("compiled_at")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3541,15 +3540,17 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| StaleExecutionRow {
-                id: r.get("id"),
-                workflow_id: r.get("workflow_id"),
-                workflow_name: r.get("workflow_name"),
-                started_at: r.get("started_at"),
-                status: r.get("status"),
+            .map(|r| -> Result<StaleExecutionRow> {
+                Ok(StaleExecutionRow {
+                    id: r.try_get("id")?,
+                    workflow_id: r.try_get("workflow_id")?,
+                    workflow_name: r.try_get("workflow_name")?,
+                    started_at: r.try_get("started_at")?,
+                    status: r.try_get("status")?,
+                })
             })
-            .collect();
-            rows
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 8. Dormant workflows
@@ -3569,9 +3570,9 @@ impl AnalyticsRepository {
             .unwrap_or_default()
             .into_iter()
             .map(|r| -> Result<DormantWorkflowRow> { Ok(DormantWorkflowRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                created_at: r.get("created_at"),
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                created_at: r.try_get("created_at")?,
                 last_execution: r.try_get::<Option<_>, _>("last_execution")?,
             }) })
             .collect::<Result<Vec<_>>>()?;
@@ -3597,9 +3598,9 @@ impl AnalyticsRepository {
             .into_iter()
             .map(|r| -> Result<StaleDraftRow> {
                 Ok(StaleDraftRow {
-                    id: r.get("id"),
-                    name: r.get("name"),
-                    created_at: r.get("created_at"),
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    created_at: r.try_get("created_at")?,
                     graph_json: r.try_get::<Option<_>, _>("graph_json")?,
                 })
             })
@@ -3638,9 +3639,9 @@ impl AnalyticsRepository {
             .unwrap_or_default()
             .into_iter()
             .map(|r| -> Result<IdleActorRow> { Ok(IdleActorRow {
-                id: r.get("id"),
-                name: r.get("name"),
-                status: r.get("status"),
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                status: r.try_get("status")?,
                 last_active: r.try_get::<Option<_>, _>("last_active")?,
                 total_executions: r.try_get::<Option<_>, _>("total_executions")?.unwrap_or(0),
             }) })
@@ -3679,7 +3680,7 @@ impl AnalyticsRepository {
             wildcard_module_names,
         ): (
             anyhow::Result<Vec<OrphanedModuleRow>>,
-            Vec<StaleExecutionRow>,
+            anyhow::Result<Vec<StaleExecutionRow>>,
             anyhow::Result<Vec<DormantWorkflowRow>>,
             anyhow::Result<Vec<StaleDraftRow>>,
             anyhow::Result<Vec<IdleActorRow>>,
@@ -3693,6 +3694,7 @@ impl AnalyticsRepository {
             wildcard_module_names_fut,
         );
         let orphaned_modules = orphaned_modules?;
+        let stale_executions = stale_executions?;
         let dormant_workflows = dormant_workflows?;
         let stale_draft_workflows = stale_draft_workflows?;
         let idle_actors = idle_actors?;
@@ -3746,7 +3748,7 @@ impl AnalyticsRepository {
                 secrets_rows
                     .into_iter()
                     .map(|r| -> anyhow::Result<Option<OrphanedSecretRow>> {
-                        let key_path: String = r.get("key_path");
+                        let key_path: String = r.try_get("key_path")?;
                         // Suppress controller-internal paths (LLM provider keys, OAuth
                         // refresh tokens) — these are by-design absent from every
                         // module's allowed_secrets grant. Flagging them as orphan
@@ -3760,10 +3762,10 @@ impl AnalyticsRepository {
                             Ok(None)
                         } else {
                             Ok(Some(OrphanedSecretRow {
-                                name: r.get("name"),
+                                name: r.try_get("name")?,
                                 key_path,
                                 namespace: r.try_get::<Option<_>, _>("namespace")?,
-                                created_at: r.get("created_at"),
+                                created_at: r.try_get("created_at")?,
                                 expires_at: r.try_get::<Option<_>, _>("expires_at")?,
                             }))
                         }
@@ -3792,13 +3794,15 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| SecretWithoutExpiryRow {
-                name: r.get("name"),
-                key_path: r.get("key_path"),
-                created_at: r.get("created_at"),
+            .map(|r| -> Result<SecretWithoutExpiryRow> {
+                Ok(SecretWithoutExpiryRow {
+                    name: r.try_get("name")?,
+                    key_path: r.try_get("key_path")?,
+                    created_at: r.try_get("created_at")?,
+                })
             })
-            .collect();
-            rows
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
         };
 
         // 14. Expiring actor memories
@@ -3818,11 +3822,11 @@ impl AnalyticsRepository {
             .into_iter()
             .map(|r| -> Result<ExpiringMemoryRow> {
                 Ok(ExpiringMemoryRow {
-                    actor_id: r.get("actor_id"),
-                    key: r.get("key"),
+                    actor_id: r.try_get("actor_id")?,
+                    key: r.try_get("key")?,
                     memory_type: r.try_get::<Option<_>, _>("memory_type")?,
-                    expires_at: r.get("expires_at"),
-                    actor_name: r.get("actor_name"),
+                    expires_at: r.try_get("expires_at")?,
+                    actor_name: r.try_get("actor_name")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3848,8 +3852,8 @@ impl AnalyticsRepository {
             .unwrap_or_default()
             .into_iter()
             .map(|r| -> Result<NeedsSchemaRow> { Ok(NeedsSchemaRow {
-                id: r.get("id"),
-                name: r.get("name"),
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
                 execution_count: r.try_get::<Option<_>, _>("execution_count")?.unwrap_or(0),
                 last_run: r.try_get::<Option<_>, _>("last_run")?,
             }) })
@@ -3937,7 +3941,7 @@ impl AnalyticsRepository {
             untyped_value_modules,
         ): (
             anyhow::Result<Vec<OrphanedSecretRow>>,
-            Vec<SecretWithoutExpiryRow>,
+            anyhow::Result<Vec<SecretWithoutExpiryRow>>,
             anyhow::Result<Vec<ExpiringMemoryRow>>,
             anyhow::Result<Vec<NeedsSchemaRow>>,
             Vec<UntypedValueModuleRow>,
@@ -3949,6 +3953,7 @@ impl AnalyticsRepository {
             untyped_value_modules_fut,
         );
         let orphaned_secrets = orphaned_secrets?;
+        let secrets_without_expiry = secrets_without_expiry?;
         let expiring_actor_memories = expiring_actor_memories?;
         let workflows_needing_schema = workflows_needing_schema?;
 
