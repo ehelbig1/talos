@@ -141,8 +141,17 @@ impl wit_agent_memory::Host for TalosContext {
             talos_memory::memory_rpc::MemoryOp::Set {
                 key,
                 value: json_val,
-                memory_type: "working".to_string(),
-                ttl_hours: None,
+                // The `set` binding is documented (wit/talos.wit) as *persistent*
+                // KV storage. Persist as durable `episodic` memory at the
+                // long-lived TTL ceiling rather than `working` (1 h): state a
+                // module writes via `set` MUST survive between scheduled runs.
+                // Pre-2026-07 this hardcoded `working`/1h, so any accumulating
+                // state (e.g. a weekly CRM) silently reset to empty every run.
+                // `episodic` (not `scratchpad`) so the value stays visible to
+                // actor-context injection and behaves identically to the
+                // engine's `__memory_write__` episodic durable-write path.
+                memory_type: "episodic".to_string(),
+                ttl_hours: Some(talos_memory::SET_KV_TTL_HOURS),
                 metadata: None,
             },
         )
