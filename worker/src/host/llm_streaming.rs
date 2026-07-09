@@ -7,38 +7,28 @@ use super::*;
 // ============================================================================
 
 impl TalosContext {
-    /// Build the provider-specific URL and auth headers, spawn an SSE reader
-    /// task, and return a stream ID that can be polled with `next_event`.
-    fn spawn_sse_stream(
+    /// Build the provider-specific URL and auth headers, spawn a stream
+    /// reader task, and return a stream ID that can be polled with
+    /// `next_event`. The provider adapter owns the wire framing — SSE
+    /// (`data: ` lines) for Anthropic/OpenAI, bare JSON-lines for native
+    /// Ollama — via its `StreamDecoder`; this helper owns everything
+    /// provider-independent: the channel, stream caps, connect + idle
+    /// timeouts, and the no-newline buffer bound.
+    fn spawn_llm_stream(
         &mut self,
-        provider_str: &str,
+        adapter: &'static dyn llm_providers::ProviderAdapter,
         api_key: &str,
         model: &str,
         body: serde_json::Value,
     ) -> Result<String, wit_llm_streaming::Error> {
-        let ollama_url_stream = ollama_base_url();
-        let (url, auth_header, auth_value): (String, &str, String) = match provider_str {
-            "openai" => (
-                "https://api.openai.com/v1/chat/completions".to_string(),
-                "Authorization",
-                format!("Bearer {}", api_key),
-            ),
-            "gemini" => (
-                "https://generativelanguage.googleapis.com/v1beta/models".to_string(),
-                "x-goog-api-key",
-                api_key.to_string(),
-            ),
-            "ollama" => (
-                format!("{}/v1/chat/completions", ollama_url_stream),
-                "",
-                String::new(),
-            ),
-            _ => (
-                "https://api.anthropic.com/v1/messages".to_string(),
-                "x-api-key",
-                api_key.to_string(),
-            ),
+        let Some(mut decoder) = adapter.stream_decoder() else {
+            return Err(wit_llm_streaming::Error::NotConfigured(format!(
+                "streaming is not supported for provider `{}`",
+                adapter.name()
+            )));
         };
+        let url = adapter.stream_url(model);
+        let auth_headers = adapter.auth_headers(api_key);
 
         // Enforce concurrent stream cap to prevent resource leaks from unbounded creation.
         {
@@ -70,25 +60,27 @@ impl TalosContext {
         tracing::info!(
             module_id = ?self.module_id,
             model = %model,
-            provider = %provider_str,
+            provider = %adapter.name(),
             stream_id = %stream_id,
             "LLM streaming request started"
         );
 
-        // Owned copies for the spawned task.
-        let url = url.to_string();
-        let auth_header = auth_header.to_string();
-        let is_anthropic = provider_str == "anthropic";
-        let spawn_http_client = self.http_client.clone();
+        // Local providers bypass the guest SSRF resolver, mirroring
+        // `complete_impl` (pre-trait, Ollama streams went through the
+        // SSRF-FILTERED per-execution client whose RFC1918 filter blocks
+        // the in-cluster `ollama:11434` — local streaming never even
+        // connected).
+        let spawn_http_client = if adapter.is_local() {
+            local_llm_http_client().clone()
+        } else {
+            self.http_client.clone()
+        };
 
         tokio::spawn(async move {
             let client = spawn_http_client;
             let mut req_builder = client.post(&url).header("Content-Type", "application/json");
-            if !auth_header.is_empty() {
-                req_builder = req_builder.header(&auth_header, &auth_value);
-            }
-            if is_anthropic {
-                req_builder = req_builder.header("anthropic-version", "2023-06-01");
+            for (name, value) in &auth_headers {
+                req_builder = req_builder.header(*name, value);
             }
 
             // MCP-1215: connect-phase timeout — mirrors MCP-721 on
@@ -132,13 +124,13 @@ impl TalosContext {
                 return;
             }
 
-            // Read SSE byte stream and parse events.
+            // Read the byte stream and feed complete lines to the
+            // provider's decoder (which owns SSE-vs-JSONL framing and any
+            // per-stream tool-call accumulation, with its own MCP-1113
+            // caps).
             use futures_util::StreamExt;
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
-            // For tool-use streaming, accumulate partial JSON inputs per content block index.
-            let mut tool_input_bufs: std::collections::HashMap<u64, (String, String, String)> =
-                std::collections::HashMap::new();
 
             // MCP-1215: idle-between-chunks timeout. Both major
             // providers emit something within seconds (Anthropic
@@ -191,164 +183,60 @@ impl TalosContext {
                     return;
                 }
 
-                // Process complete SSE lines.
+                // Process complete lines. The decoder translates its
+                // provider's wire framing into canonical events; the
+                // channel JSON protocol below is unchanged from the
+                // pre-trait code so `next_event` needs no changes.
                 while let Some(line_end) = buffer.find('\n') {
                     let line = buffer[..line_end].trim().to_string();
                     buffer = buffer[line_end + 1..].to_string();
 
-                    if !line.starts_with("data: ") {
-                        continue;
-                    }
-                    let data = &line[6..];
-                    if data == "[DONE]" {
-                        let _ = tx
-                            .send(serde_json::json!({"type": "done", "data": "end_turn"}))
-                            .await;
-                        return;
-                    }
-
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match event_type {
-                            "content_block_start" => {
-                                // Track start of tool_use blocks so we can
-                                // accumulate their streamed JSON input.
-                                if let Some(cb) = event.get("content_block") {
-                                    if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                                        // MCP-1113: cap the per-stream
-                                        // tool_use block count. A
-                                        // misbehaving provider emitting
-                                        // many `content_block_start`s
-                                        // without matching `_stop`s
-                                        // would otherwise grow this
-                                        // HashMap unbounded. Drop the
-                                        // new block (no insert) instead
-                                        // of aborting the whole stream
-                                        // — well-behaved tool-use
-                                        // workflows stay under 64.
-                                        if tool_input_bufs.len() >= MAX_TOOL_INPUT_BUFS_PER_STREAM {
-                                            tracing::warn!(
-                                                cap = MAX_TOOL_INPUT_BUFS_PER_STREAM,
-                                                "LLM SSE tool_input_bufs at cap; dropping new content_block_start"
-                                            );
-                                            continue;
-                                        }
-                                        let idx = event
-                                            .get("index")
-                                            .and_then(|i| i.as_u64())
-                                            .unwrap_or(0);
-                                        let name = cb
-                                            .get("name")
-                                            .and_then(|n| n.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let id = cb
-                                            .get("id")
-                                            .and_then(|i| i.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        tool_input_bufs.insert(idx, (name, id, String::new()));
-                                    }
-                                }
+                    let mut events = Vec::new();
+                    decoder.feed_line(&line, &mut events);
+                    for ev in events {
+                        match ev {
+                            llm_providers::StreamEventOut::TextDelta(t) => {
+                                let _ = tx
+                                    .send(serde_json::json!({"type": "text_delta", "data": t}))
+                                    .await;
                             }
-                            "content_block_delta" => {
-                                if let Some(delta) = event.get("delta") {
-                                    let delta_type =
-                                        delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                    if delta_type == "text_delta" {
-                                        if let Some(text) =
-                                            delta.get("text").and_then(|t| t.as_str())
-                                        {
-                                            let _ = tx
-                                                .send(serde_json::json!({
-                                                    "type": "text_delta",
-                                                    "data": text
-                                                }))
-                                                .await;
-                                        }
-                                    } else if delta_type == "input_json_delta" {
-                                        // Accumulate partial JSON for tool input.
-                                        let idx = event
-                                            .get("index")
-                                            .and_then(|i| i.as_u64())
-                                            .unwrap_or(0);
-                                        if let Some(partial) =
-                                            delta.get("partial_json").and_then(|p| p.as_str())
-                                        {
-                                            if let Some(entry) = tool_input_bufs.get_mut(&idx) {
-                                                // MCP-1113: cap per-
-                                                // entry accumulator. A
-                                                // misbehaving provider
-                                                // streaming long
-                                                // `partial_json`s
-                                                // without `_stop`
-                                                // would otherwise grow
-                                                // this String
-                                                // unbounded.
-                                                if entry.2.len().saturating_add(partial.len())
-                                                    > MAX_TOOL_INPUT_BUF_BYTES
-                                                {
-                                                    tracing::warn!(
-                                                        cap = MAX_TOOL_INPUT_BUF_BYTES,
-                                                        idx,
-                                                        "LLM SSE tool input buf at cap; dropping delta"
-                                                    );
-                                                } else {
-                                                    entry.2.push_str(partial);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            "content_block_stop" => {
-                                // Emit completed tool calls.
-                                let idx = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                                if let Some((name, id, input)) = tool_input_bufs.remove(&idx) {
-                                    let _ = tx
-                                        .send(serde_json::json!({
-                                            "type": "tool_call",
-                                            "data": {
-                                                "name": name,
-                                                "id": id,
-                                                "input": serde_json::from_str::<serde_json::Value>(&input).unwrap_or(serde_json::Value::Null),
-                                            }
-                                        }))
-                                        .await;
-                                }
-                            }
-                            "message_delta" => {
-                                if let Some(usage) = event.get("usage") {
-                                    let _ = tx
-                                        .send(serde_json::json!({
-                                            "type": "usage",
-                                            "data": usage
-                                        }))
-                                        .await;
-                                }
-                                if let Some(reason) = event
-                                    .get("delta")
-                                    .and_then(|d| d.get("stop_reason"))
-                                    .and_then(|s| s.as_str())
-                                {
-                                    let _ = tx
-                                        .send(serde_json::json!({
-                                            "type": "done",
-                                            "data": reason
-                                        }))
-                                        .await;
-                                }
-                            }
-                            "message_stop" => {
+                            llm_providers::StreamEventOut::ToolCall {
+                                call_id,
+                                tool_name,
+                                arguments,
+                            } => {
                                 let _ = tx
                                     .send(serde_json::json!({
-                                        "type": "done",
-                                        "data": "end_turn"
+                                        "type": "tool_call",
+                                        "data": {
+                                            "name": tool_name,
+                                            "id": call_id,
+                                            "input": serde_json::from_str::<serde_json::Value>(&arguments)
+                                                .unwrap_or(serde_json::Value::Null),
+                                        }
                                     }))
+                                    .await;
+                            }
+                            llm_providers::StreamEventOut::Usage {
+                                input_tokens,
+                                output_tokens,
+                            } => {
+                                let _ = tx
+                                    .send(serde_json::json!({
+                                        "type": "usage",
+                                        "data": {
+                                            "input_tokens": input_tokens,
+                                            "output_tokens": output_tokens,
+                                        }
+                                    }))
+                                    .await;
+                            }
+                            llm_providers::StreamEventOut::Done(reason) => {
+                                let _ = tx
+                                    .send(serde_json::json!({"type": "done", "data": reason}))
                                     .await;
                                 return;
                             }
-                            _ => {} // Skip ping, message_start, etc.
                         }
                     }
                 }
@@ -475,20 +363,22 @@ impl wit_llm_streaming::Host for TalosContext {
                 wit_llm_streaming::Error::InvalidRequest(format!("Invalid messages JSON: {e}"))
             })?;
 
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "max_tokens": req.max_tokens.unwrap_or(4096),
-            "stream": true,
-        });
-        if let Some(temp) = req.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(ref sys) = req.system_prompt {
-            body["system"] = serde_json::json!(sys);
-        }
+        // Adapter-owned body: system prompt placement and stream framing
+        // are provider-specific (pre-trait, a top-level `system` field
+        // was sent to ALL providers — OpenAI/Ollama simply ignored it).
+        let adapter = llm_providers::adapter_for(provider_str);
+        let body = adapter
+            .build_stream_body(
+                &model,
+                messages,
+                None,
+                req.system_prompt.as_deref(),
+                req.max_tokens.unwrap_or(4096),
+                req.temperature,
+            )
+            .map_err(wit_llm_streaming::Error::NotConfigured)?;
 
-        self.spawn_sse_stream(provider_str, &api_key, &model, body)
+        self.spawn_llm_stream(adapter, &api_key, &model, body)
     }
 
     async fn start_tool_stream(
@@ -558,21 +448,19 @@ impl wit_llm_streaming::Host for TalosContext {
             wit_llm_streaming::Error::InvalidRequest(format!("Invalid tools JSON: {e}"))
         })?;
 
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "max_tokens": req.max_tokens.unwrap_or(4096),
-            "stream": true,
-            "tools": tools,
-        });
-        if let Some(temp) = req.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(ref sys) = req.system_prompt {
-            body["system"] = serde_json::json!(sys);
-        }
+        let adapter = llm_providers::adapter_for(provider_str);
+        let body = adapter
+            .build_stream_body(
+                &model,
+                messages,
+                Some(tools),
+                req.system_prompt.as_deref(),
+                req.max_tokens.unwrap_or(4096),
+                req.temperature,
+            )
+            .map_err(wit_llm_streaming::Error::NotConfigured)?;
 
-        self.spawn_sse_stream(provider_str, &api_key, &model, body)
+        self.spawn_llm_stream(adapter, &api_key, &model, body)
     }
 
     async fn next_event(&mut self, stream_id: String) -> Option<wit_llm_streaming::StreamEvent> {

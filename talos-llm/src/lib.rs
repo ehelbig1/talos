@@ -543,7 +543,15 @@ impl OllamaClient {
     }
 
     /// Run a chat completion against a local Ollama model.
-    /// Uses the OpenAI-compatible `/v1/chat/completions` endpoint.
+    ///
+    /// Uses the NATIVE `/api/chat` endpoint (migrated off the
+    /// OpenAI-compat shim 2026-07-09, in lockstep with the worker's
+    /// `llm_providers::ollama` adapter): `max_tokens` maps to the native
+    /// `options.num_predict`, and the response is `message.content`
+    /// rather than `choices[0]`. Native also keeps the door open for
+    /// `think` / `format` / `options.num_ctx` without another endpoint
+    /// change. `stream:false` is explicit — the native default is
+    /// streaming.
     pub async fn complete(
         &self,
         model: &str,
@@ -560,13 +568,13 @@ impl OllamaClient {
         let body = json!({
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
             "stream": false,
+            "options": { "num_predict": max_tokens },
         });
 
         let resp = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            .post(format!("{}/api/chat", self.base_url))
             .json(&body)
             .send()
             .await?;
@@ -581,9 +589,7 @@ impl OllamaClient {
 
         let body: serde_json::Value = talos_http_body::read_json_capped(resp).await?;
         let text = body
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
+            .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|v| v.as_str())
             .unwrap_or("")

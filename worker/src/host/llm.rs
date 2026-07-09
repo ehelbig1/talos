@@ -52,101 +52,6 @@ pub(crate) fn local_llm_http_client() -> &'static reqwest::Client {
 }
 
 #[cfg(test)]
-mod response_format_tests {
-    use super::build_response_format;
-
-    #[test]
-    fn none_yields_json_object_mode() {
-        let rf = build_response_format(None).expect("some");
-        assert_eq!(rf["type"], "json_object");
-    }
-
-    #[test]
-    fn valid_schema_yields_json_schema_mode() {
-        let schema = r#"{"type":"object","required":["title"]}"#;
-        let rf = build_response_format(Some(schema.to_string())).expect("some");
-        assert_eq!(rf["type"], "json_schema");
-        assert_eq!(rf["json_schema"]["strict"], true);
-        assert_eq!(rf["json_schema"]["schema"]["required"][0], "title");
-    }
-
-    #[test]
-    fn malformed_schema_degrades_to_json_mode_not_error() {
-        // A bad schema must never harden into a hard failure on an
-        // otherwise-valid completion request.
-        for bad in ["not json", "[1,2,3]", "\"a string\"", "42"] {
-            let rf = build_response_format(Some(bad.to_string())).expect("some");
-            assert_eq!(
-                rf["type"], "json_object",
-                "malformed/non-object schema {bad:?} should degrade to json_object mode"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod provider_options_tests {
-    use super::apply_provider_options;
-    use serde_json::json;
-
-    fn map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-        v.as_object().unwrap().clone()
-    }
-
-    #[test]
-    fn merges_tuning_params() {
-        let mut body = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
-        apply_provider_options(
-            &mut body,
-            map(json!({"seed": 42, "top_p": 0.9, "response_format": {"type":"json_object"}})),
-        );
-        assert_eq!(body["seed"], 42);
-        assert_eq!(body["top_p"], 0.9);
-        assert_eq!(body["response_format"]["type"], "json_object");
-    }
-
-    #[test]
-    fn options_cannot_replace_messages() {
-        let mut body = json!({"model":"m","messages":[{"role":"user","content":"REAL prompt"}]});
-        apply_provider_options(
-            &mut body,
-            map(json!({"messages":[{"role":"user","content":"HIJACKED"}]})),
-        );
-        assert_eq!(
-            body["messages"][0]["content"], "REAL prompt",
-            "options must not hijack the assembled prompt"
-        );
-    }
-
-    #[test]
-    fn options_cannot_enable_streaming() {
-        let mut body = json!({"model":"m","messages":[]});
-        apply_provider_options(&mut body, map(json!({"stream": true})));
-        assert!(
-            body.get("stream").is_none(),
-            "stream must be stripped so the single-shot response stays parseable"
-        );
-    }
-
-    #[test]
-    fn anthropic_system_is_preserved() {
-        let mut body = json!({"model":"m","system":"REAL system","messages":[]});
-        apply_provider_options(&mut body, map(json!({"system":"HIJACKED","top_k":40})));
-        assert_eq!(body["system"], "REAL system");
-        assert_eq!(body["top_k"], 40);
-    }
-
-    #[test]
-    fn injected_system_dropped_on_openai_body() {
-        // OpenAI-format body has no top-level system; an injected one is
-        // dropped (system belongs in the messages array the host built).
-        let mut body = json!({"model":"m","messages":[{"role":"system","content":"real"}]});
-        apply_provider_options(&mut body, map(json!({"system":"sneaky"})));
-        assert!(body.get("system").is_none());
-    }
-}
-
-#[cfg(test)]
 mod llm_tier_decision_tests {
     use super::{decide_llm_tier_access, LlmTierDecision};
     use talos_workflow_job_protocol::LlmTier;
@@ -418,142 +323,14 @@ pub(crate) fn decide_llm_tier_access(
 // LLM
 // ============================================================================
 
-/// Build the OpenAI-compatible `response_format` value for `complete_json`.
-///
-/// * `None` → JSON mode: `{"type":"json_object"}` — the provider must emit
-///   syntactically-valid JSON (any shape).
-/// * `Some(schema)` where `schema` parses to a JSON **object** → structured
-///   outputs: `{"type":"json_schema","json_schema":{...}}` — the provider
-///   constrains generation to that JSON Schema (Ollama/OpenAI).
-/// * `Some(malformed)` → degrades to JSON mode rather than failing the call,
-///   with a warning. A bad schema should never harden into a hard error on
-///   an otherwise-valid completion request.
-fn build_response_format(json_schema: Option<String>) -> Option<serde_json::Value> {
-    match json_schema {
-        None => Some(serde_json::json!({ "type": "json_object" })),
-        Some(s) => match serde_json::from_str::<serde_json::Value>(&s) {
-            Ok(schema) if schema.is_object() => Some(serde_json::json!({
-                "type": "json_schema",
-                "json_schema": { "name": "output", "strict": true, "schema": schema }
-            })),
-            _ => {
-                tracing::warn!(
-                    "complete_json: json-schema was not a valid JSON object — \
-                     falling back to plain JSON mode"
-                );
-                Some(serde_json::json!({ "type": "json_object" }))
-            }
-        },
-    }
-}
-
-/// Merge caller-supplied provider `options` into an already-built request
-/// `body`, then re-assert the fields that carry prompt integrity and
-/// transport correctness. This is the guardrail behind
-/// `llm::complete-with-options`:
-///   * Every option key is merged (so callers can add/override tuning
-///     params: `seed`, `top_p`, `stop`, `response_format`, penalties, …).
-///   * `messages` (OpenAI-format) and `system` (Anthropic) are restored
-///     to what the host assembled — options can never replace the
-///     SPOTLIGHTING-wrapped prompt. A `system` the caller injected on an
-///     OpenAI-format body (where there was none) is dropped.
-///   * `stream` is removed unconditionally — the worker parses a single
-///     non-streamed response; `stream=true` would make the body
-///     unparseable.
-/// Pure so the guardrails are unit-tested without a live provider.
-fn apply_provider_options(
-    body: &mut serde_json::Value,
-    opts: serde_json::Map<String, serde_json::Value>,
-) {
-    let orig_messages = body.get("messages").cloned();
-    let orig_system = body.get("system").cloned();
-    if let Some(obj) = body.as_object_mut() {
-        for (k, v) in opts {
-            obj.insert(k, v);
-        }
-        if let Some(m) = orig_messages {
-            obj.insert("messages".to_string(), m);
-        }
-        match orig_system {
-            Some(s) => {
-                obj.insert("system".to_string(), s);
-            }
-            None => {
-                obj.remove("system");
-            }
-        }
-        obj.remove("stream");
-    }
-}
-
-/// 2026-05-28 audit Perf#1 (H7 sibling): typed projection of an LLM
-/// provider response. Deserializing into one of these instead of
-/// `serde_json::Value` saves the per-field `HashMap<String, Value>`
-/// allocation tree. The two variants match the only two formats the
-/// callers branch on (`is_openai_format`).
-///
-/// Lives at module scope so the structs participate in `#[derive]` —
-/// `serde::Deserialize` traits can't be derived inside a function body.
-enum LlmResponse {
-    OpenAi(OpenAiResponse),
-    Anthropic(AnthropicResponse),
-}
-
-#[derive(serde::Deserialize)]
-struct OpenAiResponse {
-    #[serde(default)]
-    choices: Vec<OpenAiChoice>,
-    #[serde(default)]
-    usage: Option<OpenAiUsage>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenAiChoice {
-    #[serde(default)]
-    message: Option<OpenAiMessage>,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenAiMessage {
-    #[serde(default)]
-    content: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenAiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
-
-#[derive(serde::Deserialize)]
-struct AnthropicResponse {
-    #[serde(default)]
-    content: Vec<AnthropicBlock>,
-    #[serde(default)]
-    usage: Option<AnthropicUsage>,
-    #[serde(default)]
-    stop_reason: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct AnthropicBlock {
-    /// Renamed because `type` is a Rust keyword.
-    #[serde(rename = "type", default)]
-    block_type: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct AnthropicUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
+/// Structured-output mode for `complete_impl` — `Off` for plain
+/// `complete`, `On(schema)` for `complete_json` (adapters own the
+/// provider-specific spelling: OpenAI `response_format`, native Ollama
+/// `format`, Gemini `generationConfig.responseMimeType`; Anthropic has
+/// no knob and degrades to prompt-level JSON).
+enum JsonMode {
+    Off,
+    On(Option<String>),
 }
 
 impl wit_llm::Host for TalosContext {
@@ -562,22 +339,22 @@ impl wit_llm::Host for TalosContext {
         &mut self,
         req: wit_llm::CompletionRequest,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
-        self.complete_impl(req, None, None).await
+        self.complete_impl(req, JsonMode::Off, None).await
     }
 
     /// Structured-output completion — see the WIT doc on `complete-json`.
     /// `json_schema = None` → JSON mode (valid JSON, any shape);
-    /// `Some(schema)` → response constrained to that JSON Schema. The
-    /// `response_format` only reaches OpenAI-compatible providers (OpenAI,
-    /// Ollama); Anthropic ignores it and behaves like `complete`.
+    /// `Some(schema)` → response constrained to that JSON Schema. Each
+    /// provider adapter owns its structured-output spelling; Anthropic
+    /// has none and behaves like `complete`.
     #[::tracing::instrument(name = "llm.complete_json", skip_all)]
     async fn complete_json(
         &mut self,
         req: wit_llm::CompletionRequest,
         json_schema: Option<String>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
-        let response_format = build_response_format(json_schema);
-        self.complete_impl(req, response_format, None).await
+        self.complete_impl(req, JsonMode::On(json_schema), None)
+            .await
     }
 
     /// Flexible provider-feature passthrough — see the WIT doc on
@@ -612,26 +389,23 @@ impl wit_llm::Host for TalosContext {
                 }
             }
         };
-        self.complete_impl(req, None, extra).await
+        self.complete_impl(req, JsonMode::Off, extra).await
     }
 }
 
 impl TalosContext {
     /// Shared completion kernel behind `complete` (no overlay),
-    /// `complete_json` (response_format overlay), and
+    /// `complete_json` (structured-output overlay), and
     /// `complete_with_options` (arbitrary provider-options overlay).
-    /// Factored so the tier gate, SSRF client selection, timeouts, bounded
-    /// body read, and response parsing live in exactly one place.
-    ///
-    /// `response_format` (worker-built, trusted) is injected only for
-    /// OpenAI-compatible providers. `extra_options` (caller-supplied, via
-    /// `complete_with_options`) is merged for ALL providers, then the
-    /// prompt-integrity + transport guardrails re-assert `messages` /
-    /// Anthropic `system` and force non-streaming.
+    /// Provider-INDEPENDENT concerns live here in exactly one place —
+    /// tier gate, key resolution, SSRF client selection, timeouts,
+    /// bounded body read, metrics — while every wire format (body shape,
+    /// structured-output spelling, options guardrails, response parse)
+    /// is delegated to the provider's `llm_providers::ProviderAdapter`.
     async fn complete_impl(
         &mut self,
         req: wit_llm::CompletionRequest,
-        response_format: Option<serde_json::Value>,
+        json_mode: JsonMode,
         extra_options: Option<serde_json::Value>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
         // Check cancellation before making an expensive API call.
@@ -673,6 +447,14 @@ impl TalosContext {
             }
         };
 
+        let provider_label = match provider {
+            wit_llm::Provider::Anthropic => "anthropic",
+            wit_llm::Provider::Openai => "openai",
+            wit_llm::Provider::Gemini => "gemini",
+            wit_llm::Provider::Ollama => "ollama",
+        };
+        let adapter = llm_providers::adapter_for(provider_label);
+
         let model = req.model.unwrap_or_else(|| match provider {
             wit_llm::Provider::Anthropic => "claude-sonnet-4-20250514".to_string(),
             wit_llm::Provider::Openai => "gpt-4o".to_string(),
@@ -680,122 +462,57 @@ impl TalosContext {
             wit_llm::Provider::Ollama => "mistral".to_string(),
         });
 
-        // Build the messages array. Anthropic doesn't support "system" as a
-        // message role (it uses a top-level field), so System maps to "user".
-        // OpenAI/Ollama support "system" as a message role natively.
-        let is_openai_format = matches!(
-            provider,
-            wit_llm::Provider::Openai | wit_llm::Provider::Ollama
-        );
-        let messages: Vec<serde_json::Value> = req
+        // Canonical messages — each adapter owns its wire role mapping
+        // (e.g. Anthropic folds System into `user` + a top-level `system`
+        // field; Gemini calls the assistant `model`).
+        let messages: Vec<llm_providers::ChatMessage> = req
             .messages
             .iter()
-            .map(|msg| {
-                let role = match msg.role {
-                    wit_llm::Role::System => {
-                        if is_openai_format {
-                            "system"
-                        } else {
-                            "user"
-                        }
-                    }
-                    wit_llm::Role::User => "user",
-                    wit_llm::Role::Assistant => "assistant",
-                };
-                serde_json::json!({"role": role, "content": msg.content})
+            .map(|msg| llm_providers::ChatMessage {
+                role: match msg.role {
+                    wit_llm::Role::System => llm_providers::ChatRole::System,
+                    wit_llm::Role::User => llm_providers::ChatRole::User,
+                    wit_llm::Role::Assistant => llm_providers::ChatRole::Assistant,
+                },
+                content: msg.content.clone(),
             })
             .collect();
 
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "max_tokens": req.max_tokens.unwrap_or(4096),
+        let mut body = adapter.build_completion_body(&llm_providers::CompletionParams {
+            model: &model,
+            messages: &messages,
+            system_prompt: req.system_prompt.as_deref(),
+            max_tokens: req.max_tokens.unwrap_or(4096),
+            temperature: req.temperature,
         });
 
-        if let Some(temp) = req.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(ref sys) = req.system_prompt {
-            body["system"] = serde_json::json!(sys);
-        }
-
-        // For OpenAI-compatible providers (OpenAI, Ollama), inject system_prompt
-        // as a system-role message rather than Anthropic's top-level "system" field.
-        if is_openai_format {
-            if let Some(ref sys) = req.system_prompt {
-                // Prepend system message for OpenAI-format providers
-                body.as_object_mut().and_then(|obj| {
-                    obj.get_mut("messages").and_then(|m| {
-                        m.as_array_mut().map(|arr| {
-                            arr.insert(0, serde_json::json!({"role": "system", "content": sys}));
-                        })
-                    })
-                });
-                // Remove the Anthropic-style top-level "system" field
-                body.as_object_mut().map(|obj| obj.remove("system"));
-            }
-        }
-
-        // Structured-output constraint (from complete_json). Only OpenAI-
-        // compatible providers (OpenAI, Ollama) honor `response_format`;
-        // Anthropic ignores it (its request has no such field), so a
-        // complete_json call to Anthropic degrades to prompt-only JSON —
-        // exactly like `complete`. Ollama's OpenAI-compat endpoint accepts
-        // both {"type":"json_object"} and {"type":"json_schema",...}.
-        if is_openai_format {
-            if let Some(ref rf) = response_format {
-                body["response_format"] = rf.clone();
-            }
+        // Structured-output constraint (from complete_json) — the adapter
+        // owns the spelling (`response_format` / `format` /
+        // `generationConfig`); Anthropic has none and degrades to
+        // prompt-level JSON, exactly like `complete`.
+        if let JsonMode::On(ref schema) = json_mode {
+            adapter.apply_response_format(&mut body, schema.as_deref());
         }
 
         // Flexible provider-feature passthrough (from complete_with_options).
-        // Merge the caller-supplied options object into the body, then
-        // re-assert the fields that carry prompt integrity + transport
+        // The adapter merges the caller-supplied options object, then
+        // re-asserts the fields that carry prompt integrity + transport
         // correctness. Net effect: options can only TUNE the request (seed,
-        // top_p, stop, response_format, penalties, …) — they can never
-        // replace the SPOTLIGHTING-wrapped prompt or switch on streaming
-        // (which would make the single-shot response body unparseable).
-        // Auth + URL live in headers / worker config and are never in the
-        // body, so options can't reach them.
+        // top_p, stop, think, num_ctx, …) — they can never replace the
+        // SPOTLIGHTING-wrapped prompt or switch on streaming (which would
+        // make the single-shot response body unparseable). Auth + URL live
+        // in headers / worker config and are never in the body, so options
+        // can't reach them.
         if let Some(serde_json::Value::Object(opts)) = extra_options {
-            apply_provider_options(&mut body, opts);
+            adapter.apply_provider_options(&mut body, opts);
         }
 
-        let ollama_url = ollama_base_url();
-
-        let (url, auth_header, auth_value) = match provider {
-            wit_llm::Provider::Anthropic => (
-                "https://api.anthropic.com/v1/messages".to_string(),
-                "x-api-key",
-                api_key,
-            ),
-            wit_llm::Provider::Openai => (
-                "https://api.openai.com/v1/chat/completions".to_string(),
-                "Authorization",
-                format!("Bearer {}", api_key),
-            ),
-            wit_llm::Provider::Gemini => (
-                "https://generativelanguage.googleapis.com/v1beta/models".to_string(),
-                "x-goog-api-key",
-                api_key,
-            ),
-            wit_llm::Provider::Ollama => (
-                format!("{}/v1/chat/completions", ollama_url),
-                "", // no auth header
-                String::new(),
-            ),
-        };
+        let url = adapter.completion_url(&model);
+        let auth_headers = adapter.auth_headers(&api_key);
 
         let body_bytes = serde_json::to_vec(&body).map_err(|e| {
             wit_llm::Error::InvalidRequest(format!("Failed to serialize request body: {e}"))
         })?;
-
-        let provider_label = match provider {
-            wit_llm::Provider::Anthropic => "anthropic",
-            wit_llm::Provider::Openai => "openai",
-            wit_llm::Provider::Gemini => "gemini",
-            wit_llm::Provider::Ollama => "ollama",
-        };
         tracing::info!(
             module_id = ?self.module_id,
             model = %model,
@@ -824,13 +541,12 @@ impl TalosContext {
             EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS
         };
         let mut http_req = client.post(&url).header("Content-Type", "application/json");
-        if !auth_header.is_empty() {
-            http_req = http_req.header(auth_header, &auth_value);
+        // Adapter-owned auth + protocol-version headers (empty for local
+        // providers). Values may embed the API key — never logged.
+        for (name, value) in &auth_headers {
+            http_req = http_req.header(*name, value);
         }
-        if matches!(provider, wit_llm::Provider::Anthropic) {
-            http_req = http_req.header("anthropic-version", "2023-06-01");
-        }
-        let resp_body: LlmResponse = tokio::time::timeout(
+        let resp_bytes: Vec<u8> = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             async move {
                 let response = http_req
@@ -874,98 +590,41 @@ impl TalosContext {
                     )));
                 }
 
-                // MCP-1213: bounded streaming body read + parse, NOT
-                // unbounded `.json()`. Caps response at MAX_LLM_BODY_BYTES.
-                let body_bytes = read_llm_response_body_bounded(
-                    response,
-                    MAX_LLM_BODY_BYTES,
-                )
-                .await
-                .ok_or_else(|| {
-                    wit_llm::Error::ApiError(format!(
-                        "LLM response exceeded {} bytes; aborted body read",
-                        MAX_LLM_BODY_BYTES
-                    ))
-                })?;
-                // 2026-05-28 audit Perf#1: H7 sibling. Pre-fix this
-                // materialised the full `serde_json::Value` tree only
-                // to pluck 3-5 fields per branch. Now we deserialize
-                // into format-specific typed structs — serde only
-                // allocates the strings we actually use, skipping the
-                // `HashMap<String, Value>` tree for every other field
-                // in the provider response. The two structs match the
-                // exact shape consumed below.
-                //
-                // OpenAI/Ollama:
-                //   { choices: [{ message: { content: "..." },
-                //                 finish_reason: "..." }],
-                //     usage: { prompt_tokens, completion_tokens } }
-                // Anthropic/Gemini:
-                //   { content: [{ type: "text", text: "..." }, ...],
-                //     usage: { input_tokens, output_tokens },
-                //     stop_reason: "..." }
-                //
-                // The format-divergent shapes return as enum variants
-                // so the extraction logic below stays
-                // strongly-typed instead of `get("...").and_then(...)`
-                // chains over `Value`.
-                if is_openai_format {
-                    serde_json::from_slice::<OpenAiResponse>(&body_bytes)
-                        .map(LlmResponse::OpenAi)
-                        .map_err(|e| {
-                            wit_llm::Error::ApiError(format!(
-                                "Failed to parse OpenAI-format response: {e}"
-                            ))
-                        })
-                } else {
-                    serde_json::from_slice::<AnthropicResponse>(&body_bytes)
-                        .map(LlmResponse::Anthropic)
-                        .map_err(|e| {
-                            wit_llm::Error::ApiError(format!(
-                                "Failed to parse Anthropic-format response: {e}"
-                            ))
-                        })
-                }
+                // MCP-1213: bounded streaming body read, NOT unbounded
+                // `.json()`. Caps response at MAX_LLM_BODY_BYTES. Parsing
+                // happens OUTSIDE the timeout closure — the bytes are in
+                // memory at that point, so parse time isn't network time.
+                read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                    .await
+                    .ok_or_else(|| {
+                        wit_llm::Error::ApiError(format!(
+                            "LLM response exceeded {} bytes; aborted body read",
+                            MAX_LLM_BODY_BYTES
+                        ))
+                    })
             },
         )
         .await
         .map_err(|_| wit_llm::Error::Timeout)??;
 
-        // Extract text + usage + stop_reason from the typed response.
-        let (text, usage, stop_reason) = match resp_body {
-            LlmResponse::OpenAi(r) => {
-                let text = r
-                    .choices
-                    .first()
-                    .and_then(|c| c.message.as_ref())
-                    .and_then(|m| m.content.clone())
-                    .unwrap_or_default();
-                let usage = r.usage.map(|u| wit_llm::TokenUsage {
-                    // MCP-1008: saturate-on-overflow to surface
-                    // malicious / corrupted provider responses as
-                    // visible spikes.
-                    input_tokens: u32::try_from(u.prompt_tokens.unwrap_or(0)).unwrap_or(u32::MAX),
-                    output_tokens: u32::try_from(u.completion_tokens.unwrap_or(0))
-                        .unwrap_or(u32::MAX),
-                });
-                let stop_reason = r.choices.into_iter().next().and_then(|c| c.finish_reason);
-                (text, usage, stop_reason)
-            }
-            LlmResponse::Anthropic(r) => {
-                let text = r
-                    .content
-                    .iter()
-                    .filter(|b| b.block_type.as_deref() == Some("text"))
-                    .filter_map(|b| b.text.as_deref())
-                    .collect::<Vec<_>>()
-                    .join("");
-                let usage = r.usage.map(|u| wit_llm::TokenUsage {
-                    // MCP-1008: saturate-on-overflow.
-                    input_tokens: u32::try_from(u.input_tokens.unwrap_or(0)).unwrap_or(u32::MAX),
-                    output_tokens: u32::try_from(u.output_tokens.unwrap_or(0)).unwrap_or(u32::MAX),
-                });
-                (text, usage, r.stop_reason)
-            }
+        // Typed, adapter-owned parse (2026-05-28 audit Perf#1 lineage:
+        // format-specific serde structs, no full `Value` tree). The
+        // adapter error is a plain description — wrap, never echo bodies.
+        let parsed = adapter
+            .parse_completion(&resp_bytes)
+            .map_err(wit_llm::Error::ApiError)?;
+
+        let text = parsed.text;
+        let stop_reason = parsed.stop_reason;
+        // MCP-1008: saturate-on-overflow to surface malicious / corrupted
+        // provider responses as visible spikes. `usage` stays `None` when
+        // the provider sent no counts at all (pre-trait behavior).
+        let usage = match (parsed.input_tokens, parsed.output_tokens) {
+            (None, None) => None,
+            (i, o) => Some(wit_llm::TokenUsage {
+                input_tokens: u32::try_from(i.unwrap_or(0)).unwrap_or(u32::MAX),
+                output_tokens: u32::try_from(o.unwrap_or(0)).unwrap_or(u32::MAX),
+            }),
         };
         if let Some(ref m) = self.metrics {
             let duration_ms = llm_start.elapsed().as_millis() as f64;
@@ -1255,182 +914,5 @@ impl wit_embedding::Host for TalosContext {
         }
 
         Ok(vec)
-    }
-}
-
-#[cfg(test)]
-mod llm_response_parse_tests {
-    //! 2026-05-28 audit Perf#1: typed-deserialize parser tests.
-    //!
-    //! Pre-fix the LLM response materialised into `serde_json::Value`
-    //! and the consumers did `get("...").and_then(...)` chains over
-    //! it. Post-fix the response goes through `OpenAiResponse` /
-    //! `AnthropicResponse` typed structs. These tests pin the field-
-    //! extraction contract end-to-end so a future refactor can't
-    //! regress the field plucking that the LLM hot path depends on.
-
-    use super::{AnthropicResponse, OpenAiResponse};
-
-    #[test]
-    fn openai_response_pulls_content_and_usage() {
-        let body = br#"{
-            "id": "chat-1",
-            "object": "chat.completion",
-            "model": "gpt-4o",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "hello world"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 12,
-                "completion_tokens": 25,
-                "total_tokens": 37
-            }
-        }"#;
-        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
-        let choice = &r.choices[0];
-        assert_eq!(
-            choice.message.as_ref().unwrap().content.as_deref(),
-            Some("hello world")
-        );
-        assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
-        let u = r.usage.unwrap();
-        assert_eq!(u.prompt_tokens, Some(12));
-        assert_eq!(u.completion_tokens, Some(25));
-    }
-
-    #[test]
-    fn openai_response_handles_missing_usage() {
-        // Providers sometimes omit `usage` on streaming or error
-        // responses. Parser must accept this without panicking.
-        let body = br#"{
-            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
-        }"#;
-        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
-        assert!(r.usage.is_none());
-        assert_eq!(
-            r.choices[0].message.as_ref().unwrap().content.as_deref(),
-            Some("ok")
-        );
-    }
-
-    #[test]
-    fn openai_response_handles_empty_choices() {
-        // Some Ollama wrappers return `{"choices": []}` on rate limit
-        // or model-not-found. Parser must accept; downstream code
-        // surfaces empty text.
-        let body = br#"{"choices": []}"#;
-        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
-        assert!(r.choices.is_empty());
-        assert!(r.usage.is_none());
-    }
-
-    #[test]
-    fn openai_response_ignores_unknown_fields() {
-        // Providers add fields over time (e.g., `system_fingerprint`).
-        // Parser must not break on unknown keys.
-        let body = br#"{
-            "choices": [{"message": {"content": "x"}}],
-            "system_fingerprint": "fp_abc",
-            "logprobs": null,
-            "x_some_future_field": {"nested": "value"}
-        }"#;
-        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
-        assert_eq!(
-            r.choices[0].message.as_ref().unwrap().content.as_deref(),
-            Some("x")
-        );
-    }
-
-    #[test]
-    fn anthropic_response_pulls_text_blocks() {
-        let body = br#"{
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "hello "},
-                {"type": "text", "text": "world"}
-            ],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 7, "output_tokens": 3}
-        }"#;
-        let r: AnthropicResponse = serde_json::from_slice(body).expect("parse");
-        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
-        let u = r.usage.unwrap();
-        assert_eq!(u.input_tokens, Some(7));
-        assert_eq!(u.output_tokens, Some(3));
-        // Match the post-fix join: filter for `type == "text"` then
-        // concatenate `.text`.
-        let joined: String = r
-            .content
-            .iter()
-            .filter(|b| b.block_type.as_deref() == Some("text"))
-            .filter_map(|b| b.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(joined, "hello world");
-    }
-
-    #[test]
-    fn anthropic_response_ignores_non_text_blocks() {
-        // Future Anthropic responses may include `tool_use`,
-        // `image`, etc. blocks. Parser must skip them when
-        // extracting text — matches the post-fix filter.
-        let body = br#"{
-            "content": [
-                {"type": "tool_use", "name": "calculator", "input": {}},
-                {"type": "text", "text": "the answer is 42"}
-            ]
-        }"#;
-        let r: AnthropicResponse = serde_json::from_slice(body).expect("parse");
-        let joined: String = r
-            .content
-            .iter()
-            .filter(|b| b.block_type.as_deref() == Some("text"))
-            .filter_map(|b| b.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(joined, "the answer is 42");
-    }
-
-    #[test]
-    fn anthropic_response_handles_missing_optional_fields() {
-        // Minimal valid response.
-        let body = br#"{"content": []}"#;
-        let r: AnthropicResponse = serde_json::from_slice(body).expect("parse");
-        assert!(r.content.is_empty());
-        assert!(r.usage.is_none());
-        assert!(r.stop_reason.is_none());
-    }
-
-    #[test]
-    fn token_count_saturates_on_overflow() {
-        // Direct integer larger than u32::MAX should deserialize
-        // into u64 cleanly. The post-fix saturating cast to u32 in
-        // the host_impl extraction is tested at the call site; here
-        // we just confirm the typed field accepts the full u64.
-        let body = br#"{"usage": {"prompt_tokens": 5000000000, "completion_tokens": 1}}"#;
-        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
-        let u = r.usage.unwrap();
-        assert_eq!(u.prompt_tokens, Some(5_000_000_000));
-        // The saturating-cast logic lives in the call site:
-        let saturated = u32::try_from(u.prompt_tokens.unwrap_or(0)).unwrap_or(u32::MAX);
-        assert_eq!(saturated, u32::MAX);
-    }
-
-    #[test]
-    fn token_count_handles_missing_with_default() {
-        // Older Ollama versions omit `usage` entirely; the
-        // call-site `.unwrap_or(0)` then `u32::try_from` produces 0.
-        let body = br#"{"usage": {}}"#;
-        let r: OpenAiResponse = serde_json::from_slice(body).expect("parse");
-        let u = r.usage.unwrap();
-        assert_eq!(u.prompt_tokens, None);
-        assert_eq!(u.completion_tokens, None);
     }
 }
