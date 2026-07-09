@@ -91,12 +91,45 @@ pub async fn list_integrations_handler(
                 }
             }
 
+            // Prefer the dedicated-flow `account_email` label (migration
+            // 20260708210000) over the legacy `oauth_accounts` lookup, which
+            // misses for decoupled rows (oauth_account_id is no longer an FK
+            // into oauth_accounts). One batched query, keyed by integration id.
+            let integration_ids: Vec<Uuid> = integrations.iter().map(|i| i.id).collect();
+            let mut email_by_integration: std::collections::HashMap<Uuid, String> =
+                std::collections::HashMap::new();
+            if !integration_ids.is_empty() {
+                match sqlx::query_as::<_, (Uuid, Option<String>)>(
+                    "SELECT id, account_email FROM google_calendar_integrations WHERE id = ANY($1)",
+                )
+                .bind(&integration_ids)
+                .fetch_all(&service.db_pool)
+                .await
+                {
+                    Ok(rows) => {
+                        for (id, email) in rows {
+                            if let Some(e) = email {
+                                email_by_integration.insert(id, e);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        user_id = %user_id,
+                        error = %e,
+                        "list_integrations: account_email lookup failed; falling back to oauth_accounts email"
+                    ),
+                }
+            }
+
             let infos: Vec<GoogleCalendarIntegrationInfo> = integrations
                 .into_iter()
                 .map(|i| GoogleCalendarIntegrationInfo {
                     id: i.id,
                     user_id: i.user_id,
-                    email: email_by_account.get(&i.oauth_account_id).cloned(),
+                    email: email_by_integration
+                        .get(&i.id)
+                        .cloned()
+                        .or_else(|| email_by_account.get(&i.oauth_account_id).cloned()),
                     oauth_account_id: i.oauth_account_id,
                     scope: i.scope,
                     is_active: i.is_active,
@@ -931,6 +964,121 @@ pub async fn stop_watch_channel_handler(
                 data: None::<&str>,
                 error: Some("Failed to stop watch channel".to_string()),
             })
+        }
+    }
+}
+
+/// Query params for the dedicated Calendar OAuth callback.
+#[derive(Deserialize)]
+pub struct CalendarOAuthCallbackParams {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OAuthUrlResponse {
+    authorization_url: String,
+    csrf_token: String,
+}
+
+/// `GET /api/google-calendar/connect` — start the DEDICATED Calendar OAuth flow.
+///
+/// Authenticated (the caller must be a logged-in user). Returns the Google
+/// authorization URL to open; `user_id` is bound into the CSRF state token so
+/// the callback recovers identity from the token, not a session cookie. This
+/// replaces the old SSO-login piggyback that 500s for existing password accounts.
+pub async fn connect_calendar_handler(
+    State(service): State<Arc<GoogleCalendarService>>,
+    Extension(user_id): Extension<Uuid>,
+) -> impl IntoResponse {
+    if !service.is_configured() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::<OAuthUrlResponse> {
+                success: false,
+                data: None,
+                error: Some("Google Calendar OAuth is not configured on this server".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
+    match service.get_authorization_url(user_id).await {
+        Ok((url, csrf_token)) => Json(ApiResponse {
+            success: true,
+            data: Some(OAuthUrlResponse {
+                authorization_url: url,
+                csrf_token,
+            }),
+            error: None,
+        })
+        .into_response(),
+        Err(e) => {
+            // Log server-side, generic to client (MCP-923/924 posture).
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "Failed to generate Google Calendar auth URL"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<OAuthUrlResponse> {
+                    success: false,
+                    data: None,
+                    error: Some("Failed to initiate OAuth flow".to_string()),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /api/google-calendar/callback` — dedicated Calendar OAuth callback.
+///
+/// NOT session-authenticated: cross-site redirects from Google don't carry the
+/// SameSite session cookie. The user is identified via the single-use CSRF state
+/// token bound at connect time (`handle_callback` → shared driver consume). On
+/// success/failure it redirects back to the settings page with a status param.
+pub async fn calendar_callback_handler(
+    axum::extract::Query(params): axum::extract::Query<CalendarOAuthCallbackParams>,
+    State(service): State<Arc<GoogleCalendarService>>,
+) -> impl IntoResponse {
+    use axum::response::Redirect;
+    let frontend_url = talos_config::get_frontend_url();
+
+    // Provider-reported error (user denied consent, etc.).
+    if let Some(err) = params.error.as_deref() {
+        tracing::warn!(provider_error = %err, "Google Calendar OAuth callback returned provider error");
+        return Redirect::to(&format!(
+            "{}/settings?google_calendar_error=access_denied#integrations",
+            frontend_url
+        ));
+    }
+
+    let (code, state) = match (params.code, params.state) {
+        (Some(c), Some(s)) if !c.is_empty() && !s.is_empty() => (c, s),
+        _ => {
+            return Redirect::to(&format!(
+                "{}/settings?google_calendar_error=missing_code_or_state#integrations",
+                frontend_url
+            ));
+        }
+    };
+
+    match service.handle_callback(code, state).await {
+        Ok(_integration) => Redirect::to(&format!(
+            "{}/settings?google_calendar_connected=1#integrations",
+            frontend_url
+        )),
+        Err(e) => {
+            // Log the full cause server-side; the query param stays generic so
+            // no internal detail leaks into the browser URL / history.
+            tracing::error!(error = %e, "Google Calendar OAuth callback failed");
+            Redirect::to(&format!(
+                "{}/settings?google_calendar_error=connect_failed#integrations",
+                frontend_url
+            ))
         }
     }
 }

@@ -376,6 +376,10 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/auth/oauth/google/callback}
+      # Dedicated Google Calendar OAuth callback (distinct from the SSO one
+      # above). Must also be registered as an Authorized redirect URI on the
+      # Google OAuth client. Used by the talos-google-calendar connect flow.
+      GOOGLE_CALENDAR_REDIRECT_URI: ${GOOGLE_CALENDAR_REDIRECT_URI:-http://localhost:8000/api/google-calendar/callback}
       # OAuth - Okta
       OKTA_DOMAIN: ${OKTA_DOMAIN:-}
       OKTA_CLIENT_ID: ${OKTA_CLIENT_ID:-}
