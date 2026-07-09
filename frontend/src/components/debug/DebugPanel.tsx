@@ -133,7 +133,9 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
 
       <Tabs
         defaultValue="input"
-        className="flex-1 flex flex-col overflow-hidden"
+        // min-h-0 so the flex column can shrink below its content and the inner
+        // TabsContent `overflow-auto` scrolls instead of the panel clipping.
+        className="flex-1 min-h-0 flex flex-col overflow-hidden"
       >
         <TabsList className="w-full justify-start rounded-none border-b border-border/5 bg-transparent px-2 gap-1 shrink-0">
           <TabsTrigger
@@ -162,7 +164,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
         {/* Input tab */}
         <TabsContent
           value="input"
-          className="flex-1 overflow-auto p-4 space-y-3"
+          className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
             <label className="text-[9px] font-bold text-cyan-400 uppercase tracking-widest">
@@ -188,7 +190,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
         {/* Output tab */}
         <TabsContent
           value="output"
-          className="flex-1 overflow-auto p-4 space-y-3"
+          className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
             <label className="text-[9px] font-bold text-cyan-400 uppercase tracking-widest">
@@ -214,7 +216,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
         {/* Metadata tab */}
         <TabsContent
           value="metadata"
-          className="flex-1 overflow-auto p-4 space-y-3"
+          className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
             <label className="text-[9px] font-bold text-cyan-400 uppercase tracking-widest">

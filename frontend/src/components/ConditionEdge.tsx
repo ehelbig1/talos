@@ -45,11 +45,17 @@ export function ConditionEdge({
   const activeColor = isAlert
     ? "hsl(var(--destructive))"
     : "hsl(var(--primary))";
+  // Resting (non-hovered, non-selected) edge color. These alphas were low
+  // enough (0.4–0.5) that, against the near-black canvas with a thin stroke,
+  // resting edges were effectively invisible — only hover/selected (which
+  // switch to the full-opacity activeColor) showed. Bumped so a saved
+  // workflow's connections are clearly visible at rest, while hover/selected
+  // still stands out via activeColor + the wider stroke below.
   const inactiveColor = isAlert
-    ? "hsla(var(--destructive), 0.4)"
+    ? "hsla(var(--destructive), 0.75)"
     : hasCondition
-      ? "hsla(var(--warning), 0.4)"
-      : "hsla(var(--muted-foreground), 0.5)";
+      ? "hsla(var(--warning), 0.75)"
+      : "hsla(var(--muted-foreground), 0.9)";
   const glowColor = isAlert
     ? "hsla(var(--destructive), 0.3)"
     : "hsla(var(--primary), 0.3)";
@@ -77,7 +83,7 @@ export function ConditionEdge({
         style={{
           ...style,
           stroke: selected || isHovered ? activeColor : inactiveColor,
-          strokeWidth: selected || isHovered ? 2.5 : 1.5,
+          strokeWidth: selected || isHovered ? 2.5 : 2,
           strokeDasharray: isRunning ? "8 8" : "none",
           animation: isRunning ? "edge-flow 2s linear infinite" : "none",
           transition: "all 300ms cubic-bezier(0.4, 0, 0.2, 1)",
