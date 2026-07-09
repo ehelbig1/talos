@@ -52,6 +52,101 @@ pub(crate) fn local_llm_http_client() -> &'static reqwest::Client {
 }
 
 #[cfg(test)]
+mod response_format_tests {
+    use super::build_response_format;
+
+    #[test]
+    fn none_yields_json_object_mode() {
+        let rf = build_response_format(None).expect("some");
+        assert_eq!(rf["type"], "json_object");
+    }
+
+    #[test]
+    fn valid_schema_yields_json_schema_mode() {
+        let schema = r#"{"type":"object","required":["title"]}"#;
+        let rf = build_response_format(Some(schema.to_string())).expect("some");
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        assert_eq!(rf["json_schema"]["schema"]["required"][0], "title");
+    }
+
+    #[test]
+    fn malformed_schema_degrades_to_json_mode_not_error() {
+        // A bad schema must never harden into a hard failure on an
+        // otherwise-valid completion request.
+        for bad in ["not json", "[1,2,3]", "\"a string\"", "42"] {
+            let rf = build_response_format(Some(bad.to_string())).expect("some");
+            assert_eq!(
+                rf["type"], "json_object",
+                "malformed/non-object schema {bad:?} should degrade to json_object mode"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_options_tests {
+    use super::apply_provider_options;
+    use serde_json::json;
+
+    fn map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn merges_tuning_params() {
+        let mut body = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        apply_provider_options(
+            &mut body,
+            map(json!({"seed": 42, "top_p": 0.9, "response_format": {"type":"json_object"}})),
+        );
+        assert_eq!(body["seed"], 42);
+        assert_eq!(body["top_p"], 0.9);
+        assert_eq!(body["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn options_cannot_replace_messages() {
+        let mut body = json!({"model":"m","messages":[{"role":"user","content":"REAL prompt"}]});
+        apply_provider_options(
+            &mut body,
+            map(json!({"messages":[{"role":"user","content":"HIJACKED"}]})),
+        );
+        assert_eq!(
+            body["messages"][0]["content"], "REAL prompt",
+            "options must not hijack the assembled prompt"
+        );
+    }
+
+    #[test]
+    fn options_cannot_enable_streaming() {
+        let mut body = json!({"model":"m","messages":[]});
+        apply_provider_options(&mut body, map(json!({"stream": true})));
+        assert!(
+            body.get("stream").is_none(),
+            "stream must be stripped so the single-shot response stays parseable"
+        );
+    }
+
+    #[test]
+    fn anthropic_system_is_preserved() {
+        let mut body = json!({"model":"m","system":"REAL system","messages":[]});
+        apply_provider_options(&mut body, map(json!({"system":"HIJACKED","top_k":40})));
+        assert_eq!(body["system"], "REAL system");
+        assert_eq!(body["top_k"], 40);
+    }
+
+    #[test]
+    fn injected_system_dropped_on_openai_body() {
+        // OpenAI-format body has no top-level system; an injected one is
+        // dropped (system belongs in the messages array the host built).
+        let mut body = json!({"model":"m","messages":[{"role":"system","content":"real"}]});
+        apply_provider_options(&mut body, map(json!({"system":"sneaky"})));
+        assert!(body.get("system").is_none());
+    }
+}
+
+#[cfg(test)]
 mod llm_tier_decision_tests {
     use super::{decide_llm_tier_access, LlmTierDecision};
     use talos_workflow_job_protocol::LlmTier;
@@ -323,6 +418,74 @@ pub(crate) fn decide_llm_tier_access(
 // LLM
 // ============================================================================
 
+/// Build the OpenAI-compatible `response_format` value for `complete_json`.
+///
+/// * `None` → JSON mode: `{"type":"json_object"}` — the provider must emit
+///   syntactically-valid JSON (any shape).
+/// * `Some(schema)` where `schema` parses to a JSON **object** → structured
+///   outputs: `{"type":"json_schema","json_schema":{...}}` — the provider
+///   constrains generation to that JSON Schema (Ollama/OpenAI).
+/// * `Some(malformed)` → degrades to JSON mode rather than failing the call,
+///   with a warning. A bad schema should never harden into a hard error on
+///   an otherwise-valid completion request.
+fn build_response_format(json_schema: Option<String>) -> Option<serde_json::Value> {
+    match json_schema {
+        None => Some(serde_json::json!({ "type": "json_object" })),
+        Some(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(schema) if schema.is_object() => Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": { "name": "output", "strict": true, "schema": schema }
+            })),
+            _ => {
+                tracing::warn!(
+                    "complete_json: json-schema was not a valid JSON object — \
+                     falling back to plain JSON mode"
+                );
+                Some(serde_json::json!({ "type": "json_object" }))
+            }
+        },
+    }
+}
+
+/// Merge caller-supplied provider `options` into an already-built request
+/// `body`, then re-assert the fields that carry prompt integrity and
+/// transport correctness. This is the guardrail behind
+/// `llm::complete-with-options`:
+///   * Every option key is merged (so callers can add/override tuning
+///     params: `seed`, `top_p`, `stop`, `response_format`, penalties, …).
+///   * `messages` (OpenAI-format) and `system` (Anthropic) are restored
+///     to what the host assembled — options can never replace the
+///     SPOTLIGHTING-wrapped prompt. A `system` the caller injected on an
+///     OpenAI-format body (where there was none) is dropped.
+///   * `stream` is removed unconditionally — the worker parses a single
+///     non-streamed response; `stream=true` would make the body
+///     unparseable.
+/// Pure so the guardrails are unit-tested without a live provider.
+fn apply_provider_options(
+    body: &mut serde_json::Value,
+    opts: serde_json::Map<String, serde_json::Value>,
+) {
+    let orig_messages = body.get("messages").cloned();
+    let orig_system = body.get("system").cloned();
+    if let Some(obj) = body.as_object_mut() {
+        for (k, v) in opts {
+            obj.insert(k, v);
+        }
+        if let Some(m) = orig_messages {
+            obj.insert("messages".to_string(), m);
+        }
+        match orig_system {
+            Some(s) => {
+                obj.insert("system".to_string(), s);
+            }
+            None => {
+                obj.remove("system");
+            }
+        }
+        obj.remove("stream");
+    }
+}
+
 /// 2026-05-28 audit Perf#1 (H7 sibling): typed projection of an LLM
 /// provider response. Deserializing into one of these instead of
 /// `serde_json::Value` saves the per-field `HashMap<String, Value>`
@@ -398,6 +561,78 @@ impl wit_llm::Host for TalosContext {
     async fn complete(
         &mut self,
         req: wit_llm::CompletionRequest,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        self.complete_impl(req, None, None).await
+    }
+
+    /// Structured-output completion — see the WIT doc on `complete-json`.
+    /// `json_schema = None` → JSON mode (valid JSON, any shape);
+    /// `Some(schema)` → response constrained to that JSON Schema. The
+    /// `response_format` only reaches OpenAI-compatible providers (OpenAI,
+    /// Ollama); Anthropic ignores it and behaves like `complete`.
+    #[::tracing::instrument(name = "llm.complete_json", skip_all)]
+    async fn complete_json(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        json_schema: Option<String>,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        let response_format = build_response_format(json_schema);
+        self.complete_impl(req, response_format, None).await
+    }
+
+    /// Flexible provider-feature passthrough — see the WIT doc on
+    /// `complete-with-options`. Parses `options` into a JSON object and
+    /// merges it into the outbound provider body (guardrailed in
+    /// `complete_impl`). A missing/empty `options` is equivalent to
+    /// `complete`; a malformed or non-object `options` is a hard
+    /// `invalid-request` (the caller set it explicitly and expects it to
+    /// apply).
+    #[::tracing::instrument(name = "llm.complete_with_options", skip_all)]
+    async fn complete_with_options(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        options: Option<String>,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        let extra = match options {
+            None => None,
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => {
+                if s.len() > MAX_PROVIDER_OPTIONS_BYTES {
+                    return Err(wit_llm::Error::InvalidRequest(format!(
+                        "provider options exceed {MAX_PROVIDER_OPTIONS_BYTES} bytes"
+                    )));
+                }
+                match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(v) if v.is_object() => Some(v),
+                    _ => {
+                        return Err(wit_llm::Error::InvalidRequest(
+                            "provider options must be a JSON object".to_string(),
+                        ))
+                    }
+                }
+            }
+        };
+        self.complete_impl(req, None, extra).await
+    }
+}
+
+impl TalosContext {
+    /// Shared completion kernel behind `complete` (no overlay),
+    /// `complete_json` (response_format overlay), and
+    /// `complete_with_options` (arbitrary provider-options overlay).
+    /// Factored so the tier gate, SSRF client selection, timeouts, bounded
+    /// body read, and response parsing live in exactly one place.
+    ///
+    /// `response_format` (worker-built, trusted) is injected only for
+    /// OpenAI-compatible providers. `extra_options` (caller-supplied, via
+    /// `complete_with_options`) is merged for ALL providers, then the
+    /// prompt-integrity + transport guardrails re-assert `messages` /
+    /// Anthropic `system` and force non-streaming.
+    async fn complete_impl(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        response_format: Option<serde_json::Value>,
+        extra_options: Option<serde_json::Value>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
         // Check cancellation before making an expensive API call.
         if self.is_cancelled() {
@@ -499,6 +734,31 @@ impl wit_llm::Host for TalosContext {
                 // Remove the Anthropic-style top-level "system" field
                 body.as_object_mut().map(|obj| obj.remove("system"));
             }
+        }
+
+        // Structured-output constraint (from complete_json). Only OpenAI-
+        // compatible providers (OpenAI, Ollama) honor `response_format`;
+        // Anthropic ignores it (its request has no such field), so a
+        // complete_json call to Anthropic degrades to prompt-only JSON —
+        // exactly like `complete`. Ollama's OpenAI-compat endpoint accepts
+        // both {"type":"json_object"} and {"type":"json_schema",...}.
+        if is_openai_format {
+            if let Some(ref rf) = response_format {
+                body["response_format"] = rf.clone();
+            }
+        }
+
+        // Flexible provider-feature passthrough (from complete_with_options).
+        // Merge the caller-supplied options object into the body, then
+        // re-assert the fields that carry prompt integrity + transport
+        // correctness. Net effect: options can only TUNE the request (seed,
+        // top_p, stop, response_format, penalties, …) — they can never
+        // replace the SPOTLIGHTING-wrapped prompt or switch on streaming
+        // (which would make the single-shot response body unparseable).
+        // Auth + URL live in headers / worker config and are never in the
+        // body, so options can't reach them.
+        if let Some(serde_json::Value::Object(opts)) = extra_options {
+            apply_provider_options(&mut body, opts);
         }
 
         let ollama_url = ollama_base_url();

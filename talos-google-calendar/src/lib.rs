@@ -118,6 +118,14 @@ pub struct GoogleCalendarService {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
+    /// Redirect URI for the DEDICATED Calendar OAuth connect flow
+    /// (`/api/google-calendar/callback`), distinct from `redirect_uri`
+    /// (the SSO-login callback `/auth/oauth/google/callback`). The
+    /// dedicated flow avoids the SSO account-link guard that 500s for
+    /// existing password accounts. Read from `GOOGLE_CALENDAR_REDIRECT_URI`.
+    /// Must be registered as an Authorized redirect URI on the Google
+    /// OAuth client alongside the SSO one.
+    pub connect_redirect_uri: String,
     // Token refresh locks removed — refresh is now handled entirely by
     // the centralized OAuthCredentialService which has its own per-
     // credential DashMap lock keyed on "provider:user_id:provider_key".
@@ -159,6 +167,12 @@ impl GoogleCalendarService {
         let client_secret = std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default();
         let redirect_uri = std::env::var("GOOGLE_REDIRECT_URI")
             .unwrap_or_else(|_| "http://localhost:8000/auth/oauth/google/callback".to_string());
+        // Dedicated Calendar connect callback (distinct from the SSO one above).
+        // Empty env → default; treat blank as unset (empty-env class).
+        let connect_redirect_uri = std::env::var("GOOGLE_CALENDAR_REDIRECT_URI")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "http://localhost:8000/api/google-calendar/callback".to_string());
 
         Self {
             db_pool,
@@ -166,6 +180,7 @@ impl GoogleCalendarService {
             client_id,
             client_secret,
             redirect_uri,
+            connect_redirect_uri,
             webhook_channel_limits: Arc::new(DashMap::new()),
             credentials_service: OnceLock::new(),
             shared_key: OnceLock::new(),
@@ -257,6 +272,27 @@ impl GoogleCalendarService {
 
     pub fn is_configured(&self) -> bool {
         !self.client_id.is_empty() && !self.client_secret.is_empty()
+    }
+
+    /// Generate the Google Calendar OAuth authorization URL for the DEDICATED
+    /// connect flow. `user_id` is bound into the CSRF state token so the
+    /// callback recovers identity from the token — never a session cookie
+    /// (see the `OAuthIntegration` impl for the anti-hijack rationale).
+    /// Returns `(authorization_url, csrf_state_token)`.
+    pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
+        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+    }
+
+    /// Handle the dedicated Calendar OAuth callback: the shared driver consumes
+    /// + validates the single-use CSRF state token (format / tenancy / expiry)
+    /// and only then hands the validated `ConsumedOAuthState` to
+    /// `complete_callback`, which exchanges the code and stores the integration.
+    pub async fn handle_callback(
+        &self,
+        code: String,
+        state: String,
+    ) -> Result<GoogleCalendarIntegration> {
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
     }
 
     /// Get integration by ID
@@ -557,5 +593,176 @@ impl GoogleCalendarService {
         }
 
         Ok(())
+    }
+}
+
+/// Dedicated Google Calendar OAuth flow — mirrors the canonical `talos-slack`
+/// `OAuthIntegration` reference implementation. The public
+/// [`GoogleCalendarService::get_authorization_url`] /
+/// [`GoogleCalendarService::handle_callback`] methods delegate to the
+/// `talos_oauth` drivers, which run the CSRF / PKCE / single-use / tenancy
+/// handling and call back into these provider-specific pieces. Consume-before-
+/// exchange is enforced by the driver, so this flow cannot skip validation.
+#[async_trait::async_trait]
+impl talos_oauth::OAuthIntegration for GoogleCalendarService {
+    type Connected = GoogleCalendarIntegration;
+
+    fn provider(&self) -> &'static str {
+        "google_calendar"
+    }
+
+    fn authorize_request(&self) -> Result<talos_oauth::AuthorizeRequest<'static>> {
+        if !self.is_configured() {
+            return Err(anyhow::anyhow!(
+                "Google Calendar OAuth is not configured. Set GOOGLE_CLIENT_ID, \
+                 GOOGLE_CLIENT_SECRET, and GOOGLE_CALENDAR_REDIRECT_URI"
+            ));
+        }
+        Ok(talos_oauth::AuthorizeRequest {
+            provider: "google_calendar",
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
+            token_url: "https://oauth2.googleapis.com/token",
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            // The DEDICATED callback, NOT the SSO one — bypasses the login
+            // account-link guard that 500s for existing password accounts.
+            redirect_uri: self.connect_redirect_uri.clone(),
+            // Least-privilege: read-only calendar + email (for the connected-
+            // account label). `openid` is required for the userinfo lookup.
+            scopes: &[
+                "https://www.googleapis.com/auth/calendar.readonly",
+                "https://www.googleapis.com/auth/calendar.events.readonly",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "openid",
+            ],
+            // access_type=offline + prompt=consent → Google returns a
+            // refresh_token on EVERY consent (not just the first), so reconnects
+            // re-provision a working refresh token cleanly.
+            extra_params: &[("access_type", "offline"), ("prompt", "consent")],
+        })
+    }
+
+    async fn complete_callback(
+        &self,
+        _pool: &sqlx::PgPool,
+        code: &str,
+        consumed: talos_oauth::ConsumedOAuthState,
+    ) -> Result<GoogleCalendarIntegration> {
+        // SECURITY: user_id comes from the state token (bound at connect time),
+        // NOT the callback request — the CSRF single-use / PKCE scrub / format /
+        // tenancy consume already happened in the shared driver before this call.
+        let user_id = consumed.user_id;
+
+        // ---- 1. Exchange the authorization code for tokens ------------------
+        let mut form: Vec<(&str, String)> = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code.to_string()),
+            ("client_id", self.client_id.clone()),
+            ("client_secret", self.client_secret.clone()),
+            ("redirect_uri", self.connect_redirect_uri.clone()),
+        ];
+        if let Some(verifier) = consumed.pkce_verifier {
+            form.push(("code_verifier", verifier));
+        }
+
+        // Fixed trusted host → hardened client (redirect-none + connect timeout,
+        // lint 49) with a capped body read (lint 31).
+        let http = talos_http_utils::trusted_client::build_integration_client(
+            std::time::Duration::from_secs(15),
+        );
+        let token_resp = http
+            .post("https://oauth2.googleapis.com/token")
+            .form(&form)
+            .send()
+            .await
+            .context("Google Calendar token exchange request failed")?;
+        #[derive(serde::Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+            refresh_token: Option<String>,
+            expires_in: Option<i64>,
+            scope: Option<String>,
+        }
+        let tokens: TokenResponse = talos_http_body::read_json_capped(token_resp)
+            .await
+            .context("Failed to parse Google Calendar token response")?;
+
+        // access_type=offline + prompt=consent should always return a refresh
+        // token; fail loudly rather than storing an empty one that would break
+        // the next refresh.
+        let refresh_token = tokens.refresh_token.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Google did not return a refresh_token — reconnect and grant offline access"
+            )
+        })?;
+        let scope = tokens.scope.unwrap_or_else(|| {
+            "https://www.googleapis.com/auth/calendar.readonly,\
+             https://www.googleapis.com/auth/calendar.events.readonly"
+                .to_string()
+        });
+
+        // ---- 2. Identify the connected Google account -----------------------
+        let userinfo_resp = http
+            .get("https://www.googleapis.com/oauth2/v2/userinfo")
+            .bearer_auth(&tokens.access_token)
+            .send()
+            .await
+            .context("Google userinfo request failed")?;
+        #[derive(serde::Deserialize)]
+        struct UserInfo {
+            id: String,
+            email: Option<String>,
+        }
+        let userinfo: UserInfo = talos_http_body::read_json_capped(userinfo_resp)
+            .await
+            .context("Failed to parse Google userinfo response")?;
+
+        // Derive a STABLE oauth_account_id from Google's immutable account id so
+        // reconnecting the SAME account UPDATEs (UNIQUE(user_id, oauth_account_id))
+        // instead of duplicating. No longer an oauth_accounts FK (migration
+        // 20260708210000) — it's purely the per-account vault-key segment.
+        let oauth_account_id = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(userinfo.id.as_bytes());
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            Uuid::from_bytes(bytes)
+        };
+
+        // ---- 3. Store integration + credentials (encrypted, vault-resolvable) -
+        let integration = self
+            .create_or_update_integration(
+                user_id,
+                oauth_account_id,
+                tokens.access_token,
+                refresh_token,
+                tokens.expires_in.unwrap_or(3600),
+                scope,
+            )
+            .await?;
+
+        // Human-readable connected-account label for the settings UI. Done as a
+        // targeted UPDATE so `create_or_update_integration` (shared with the
+        // legacy SSO path) keeps its signature. Non-fatal on failure — the
+        // integration is fully functional without the label.
+        if let Some(email) = userinfo.email.as_deref() {
+            if let Err(e) = sqlx::query(
+                "UPDATE google_calendar_integrations \
+                 SET account_email = $1, updated_at = NOW() WHERE id = $2",
+            )
+            .bind(email)
+            .bind(integration.id)
+            .execute(&self.db_pool)
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    integration_id = %integration.id,
+                    "Failed to set google_calendar_integrations.account_email label"
+                );
+            }
+        }
+
+        Ok(integration)
     }
 }

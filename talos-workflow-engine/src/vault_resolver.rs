@@ -99,7 +99,19 @@ pub fn extract_vault_refs(config: &serde_json::Value) -> Vec<VaultRef> {
     if let Some(obj) = config.as_object() {
         for (k, v) in obj {
             if let Some(val_str) = v.as_str() {
-                if let Some(path) = val_str.strip_prefix("vault://") {
+                // Match a `vault://` reference embedded ANYWHERE in the value,
+                // not only as an exact prefix. Catalog integration modules
+                // (Gmail, Google Calendar, …) carry it inside a header template,
+                // e.g. AUTH_HEADER = "Bearer vault://oauth/gmail/<uid>/<email>/access_token".
+                // The old `strip_prefix("vault://")` only matched a bare prefix,
+                // so those embedded refs were never extracted → never prefetched
+                // into the job's secrets → the worker received the literal
+                // "Bearer vault://…" string and every provider call 401'd.
+                // The path token runs from `vault://` to the first whitespace
+                // (header templates place the token last) or end-of-value; this
+                // matches the worker-side resolver's treatment of header values.
+                if let Some(after) = val_str.split("vault://").nth(1) {
+                    let path = after.split_whitespace().next().unwrap_or("");
                     if !path.is_empty() {
                         refs.push((k.clone(), path.to_string()));
                     }
@@ -226,6 +238,29 @@ mod tests {
         assert!(refs
             .iter()
             .any(|(k, p)| k == "API_KEY" && p == "anthropic/api_key"));
+    }
+
+    #[test]
+    fn extract_finds_embedded_vault_ref_in_bearer_header() {
+        // Regression: catalog integration modules put the vault ref inside a
+        // header template ("Bearer vault://…"), not as a bare prefix. It MUST
+        // still be extracted so the token is prefetched; otherwise the worker
+        // forwards the literal string and the provider returns 401.
+        let cfg = json!({
+            "AUTH_HEADER": "Bearer vault://oauth/gmail/56a7eea7/helbig.evan@gmail.com/access_token",
+            "QUERY": "is:unread"
+        });
+        let refs = extract_vault_refs(&cfg);
+        assert_eq!(
+            refs.len(),
+            1,
+            "the embedded Bearer vault:// ref must be found"
+        );
+        assert_eq!(refs[0].0, "AUTH_HEADER");
+        assert_eq!(
+            refs[0].1,
+            "oauth/gmail/56a7eea7/helbig.evan@gmail.com/access_token"
+        );
     }
 
     #[test]

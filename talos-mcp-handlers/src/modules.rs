@@ -3016,7 +3016,12 @@ async fn handle_install_module_from_catalog(
         .and_then(|n| n.to_str())
         .unwrap_or(name);
 
-    // Compile the module
+    // Compile the module. Forward the template's declared `dependencies` from
+    // talos.json — previously hard-coded to `None`, so a template that declared
+    // e.g. `"dependencies": {"chrono": "0.4"}` and `use chrono::...` in
+    // template.rs failed to install with "unresolved import `chrono`" even
+    // though the manifest was correct. Templates are author-signed; the
+    // compiler still gates deps through the allowlist (validate_dependencies).
     let job_id = uuid::Uuid::new_v4();
     let compilation = state
         .compiler
@@ -3026,7 +3031,7 @@ async fn handle_install_module_from_catalog(
             compile_name,
             &rust_code,
             &serde_json::json!({}),
-            None,
+            meta.get("dependencies"),
         )
         .await;
 

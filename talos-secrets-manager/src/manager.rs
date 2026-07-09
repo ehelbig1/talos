@@ -1197,9 +1197,21 @@ impl SecretsManager {
         let secret_id: Uuid = match insert_result {
             Ok(id) => id,
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
-                return Err(anyhow!(
-                    "Validation: a secret with this name or key path already exists"
-                ));
+                // Preserve the underlying sqlx::Error in the anyhow SOURCE chain
+                // rather than collapsing it into a bare string. Two independent
+                // callers rely on this:
+                //   1. The GraphQL error scrub keys on the top-line "Validation:"
+                //      message — `.context(...)` sets that as the Display, so the
+                //      operator-facing behaviour is unchanged.
+                //   2. Upsert helpers (e.g. talos-oauth's create-then-update
+                //      fallback) detect the duplicate by downcasting through the
+                //      chain to `sqlx::Error::Database` (SQLState 23505). The old
+                //      `anyhow!("Validation: …")` erased that typed error, so the
+                //      downcast failed, the fallback never fired, and every OAuth
+                //      token refresh failed to persist ("Failed to store refreshed
+                //      credentials"). Keeping the DB error reachable fixes that.
+                return Err(anyhow::Error::new(sqlx::Error::Database(db_err))
+                    .context("Validation: a secret with this name or key path already exists"));
             }
             Err(e) => return Err(anyhow::Error::new(e).context("Failed to insert secret")),
         };

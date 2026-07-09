@@ -1,4 +1,3 @@
-import { config } from "@/config";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import React, { useState, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -245,14 +244,41 @@ export function IntegrationsManager() {
   };
 
   // Connect Services
-  const handleConnectGcal = () => {
-    const scopes = [
-      "https://www.googleapis.com/auth/calendar.readonly",
-      "https://www.googleapis.com/auth/calendar.events.readonly",
-      "https://www.googleapis.com/auth/userinfo.email",
-      "https://www.googleapis.com/auth/userinfo.profile",
-    ].join(",");
-    const authUrl = `${config.apiUrl}/auth/oauth/google/login?scopes=${encodeURIComponent(scopes)}`;
+  const handleConnectGcal = async () => {
+    // Use the DEDICATED Calendar OAuth flow. The old flow hit
+    // /auth/oauth/google/login (SSO login), whose callback refuses to link a
+    // Google identity onto an existing password account and 500s. The backend
+    // /api/google-calendar/connect endpoint builds the authorize URL with
+    // read-only calendar scopes and binds the user into the CSRF state token,
+    // so the (unauthenticated) callback recovers identity from the token.
+    let authUrl: string;
+    try {
+      const res = await authedFetch("/api/google-calendar/connect");
+      if (!res.ok) {
+        toast.error(
+          res.status === 503
+            ? "Google Calendar OAuth is not configured on this server"
+            : `Service error: ${res.status}`,
+        );
+        return;
+      }
+      const d = await res.json();
+      if (!d.success || !d.data?.authorization_url) {
+        toast.error(
+          sanitizeErrorMessage(`Connect failed: ${d.error || "Unknown error"}`),
+        );
+        return;
+      }
+      if (!validateOAuthUrl(d.data.authorization_url)) {
+        toast.error("Invalid OAuth authorization URL received from server");
+        return;
+      }
+      authUrl = d.data.authorization_url;
+    } catch (err) {
+      if (import.meta.env.DEV) console.error("GCal connect error:", err);
+      toast.error("Error connecting Google Calendar");
+      return;
+    }
 
     const width = 600;
     const height = 700;

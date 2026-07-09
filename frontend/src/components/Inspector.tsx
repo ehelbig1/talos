@@ -159,14 +159,14 @@ function Inspector() {
 
           <TabsContent
             value="inspector"
-            className="flex-1 overflow-hidden relative z-10"
+            className="flex-1 min-h-0 overflow-hidden relative z-10"
           >
             {content}
           </TabsContent>
 
           <TabsContent
             value="debug"
-            className="flex-1 overflow-hidden relative z-10"
+            className="flex-1 min-h-0 overflow-hidden relative z-10"
           >
             <DebugPanel nodeId={debugNodeId} />
           </TabsContent>
@@ -174,7 +174,9 @@ function Inspector() {
       ) : (
         <div className="flex flex-col h-full bg-surface-1/60 backdrop-blur-3xl relative">
           <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-          <div className="flex-1 relative z-10">{content}</div>
+          {/* min-h-0 so the inspector's inner scroll area (overflow-auto) is
+              bounded and scrolls instead of overflowing the sidebar. */}
+          <div className="flex-1 min-h-0 relative z-10">{content}</div>
         </div>
       )}
       <ConfirmDialog

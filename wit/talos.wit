@@ -704,6 +704,42 @@ interface llm {
     }
 
     complete: func(req: completion-request) -> result<completion-response, error>;
+
+    /// Structured-output completion. Identical to `complete` but instructs
+    /// providers that support it (OpenAI, Ollama) to constrain the response
+    /// to JSON via the OpenAI-compatible `response_format` field:
+    ///   * `json-schema = none`     → JSON mode (valid JSON, any shape).
+    ///   * `json-schema = some(s)`  → the response is constrained to the
+    ///     JSON Schema `s` (Ollama/OpenAI "structured outputs"). A malformed
+    ///     schema string degrades to plain JSON mode rather than erroring.
+    /// Providers without native support (Anthropic) behave exactly like
+    /// `complete` — callers should still prompt for JSON there.
+    ///
+    /// This is a NEW function rather than a field on `completion-request`
+    /// so already-compiled guests importing only `complete` keep linking
+    /// (adding a record field would break the component-model ABI).
+    complete-json: func(req: completion-request, json-schema: option<string>) -> result<completion-response, error>;
+
+    /// Flexible, explicit provider-feature passthrough. `options` is a JSON
+    /// **object** string whose members are merged into the outbound
+    /// provider request body — the single mechanism for using any
+    /// provider-specific capability the typed `completion-request` fields
+    /// don't cover, for EVERY provider:
+    ///   * Ollama / OpenAI (OpenAI-compatible body): `response_format`,
+    ///     `seed`, `top_p`, `stop`, `frequency_penalty`, `presence_penalty`,
+    ///     `logit_bias`, `n`, `logprobs`, …
+    ///   * Anthropic: `top_p`, `top_k`, `stop_sequences`, `metadata`, …
+    ///   * Gemini: fields the OpenAI-compat shim accepts.
+    /// The caller is responsible for passing provider-appropriate keys
+    /// (explicit by design). Malformed / non-object `options` fails the
+    /// call with `invalid-request`.
+    ///
+    /// Safety: merged options CANNOT hijack the prompt or transport — after
+    /// the merge the host re-asserts `messages` (and Anthropic `system`) and
+    /// forces non-streaming, and never exposes the URL or API key to the
+    /// body. Options are capped in size. Everything else (tier gate, SSRF
+    /// client, timeouts, bounded body read) is identical to `complete`.
+    complete-with-options: func(req: completion-request, options: option<string>) -> result<completion-response, error>;
 }
 
 // ============================================================================

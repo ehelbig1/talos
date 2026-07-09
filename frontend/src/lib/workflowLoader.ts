@@ -8,6 +8,7 @@ import {
   GetModulesLoaderDocument,
 } from "@/generated/graphql";
 import { useWorkflowStore } from "@/store/workflowStore";
+import type { WorkflowEdge, EdgeData } from "@/store/workflowStore";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { toast } from "sonner";
 // Node/Edge types imported via workflowStore
@@ -123,9 +124,19 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
       );
     }
 
-    // Extract unique module IDs from nodes
+    // Extract unique module IDs from nodes. Structural/system nodes
+    // (collect, loop, sub_workflow, capability_dispatch, …) carry a
+    // "system:<kind>" sentinel in `type`, NOT a module UUID — they must be
+    // EXCLUDED here, otherwise the "system:collect" string is sent to
+    // wasmModules(ids: [UUID!]!) and the server rejects the whole query with
+    // a "Failed to parse UUID" error, making any workflow with a fan-in /
+    // loop node unopenable in the editor.
     const moduleIds = Array.from(
-      new Set(graph.nodes.map((n: GraphNode) => n.type)),
+      new Set(
+        graph.nodes
+          .map((n: GraphNode) => n.type)
+          .filter((t) => typeof t === "string" && !t.startsWith("system:")),
+      ),
     );
 
     // Fetch module metadata (names and configs) for all modules in this workflow
@@ -167,8 +178,14 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
 
     // Convert backend format to React Flow format
     const nodes = graph.nodes.map((n: GraphNode) => {
+      const isSystemNode =
+        typeof n.type === "string" && n.type.startsWith("system:");
       const moduleData = moduleMap.get(n.type);
-      const moduleName = moduleData?.name || n.type;
+      // System/structural nodes have no module row — label them by kind
+      // (e.g. "system:collect" → "Collect") instead of the raw sentinel.
+      const moduleName = isSystemNode
+        ? n.type.slice("system:".length).replace(/^\w/, (c) => c.toUpperCase())
+        : moduleData?.name || n.type;
 
       // Workflow config takes precedence over module default config
       const config = n.data || moduleData?.config || {};
@@ -190,13 +207,35 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
       };
     });
 
-    const edges = graph.edges.map((e: GraphEdge) => {
-      const { source, target, id, data, ...rest } = e;
+    const edges: WorkflowEdge[] = graph.edges.map((e: GraphEdge) => {
+      const existing = (e.data as Record<string, unknown> | undefined) ?? {};
+      // Carry the engine's edge_type / condition (top-level on the stored edge,
+      // or already nested under data) so conditional / error edges show their
+      // label + styling. Only set `condition` when present (exactOptional).
+      const edgeData: EdgeData = {
+        ...existing,
+        edgeType: ((existing.edgeType as string | undefined) ??
+          (e.edge_type as string | undefined) ??
+          "default") as EdgeData["edgeType"],
+      };
+      const condition =
+        (existing.condition as string | undefined) ??
+        (e.condition as string | undefined);
+      if (condition !== undefined) {
+        edgeData.condition = condition;
+      }
       return {
-        id: id || `${source}-${target}`,
-        source,
-        target,
-        data: data || (rest as Record<string, unknown>),
+        id: e.id || `${e.source}-${e.target}`,
+        source: e.source,
+        target: e.target,
+        // Loaded edges MUST use the same "conditionEdge" type as edges created
+        // interactively (workflowStore.connectNodes). Without an explicit type,
+        // React Flow falls back to its built-in default edge, which does not
+        // render in this canvas (custom edgeTypes are registered and the app
+        // renders every edge through ConditionEdge) — so connections in a saved
+        // workflow were invisible after loading it in the editor.
+        type: "conditionEdge",
+        data: edgeData,
       };
     });
 
