@@ -1094,8 +1094,8 @@ interface http-stream {
 // Agent Memory Interface - Persistent key-value + vector similarity search
 // ============================================================================
 interface agent-memory {
-    /// Store a key-value pair in the agent's persistent memory.
-    /// Memory persists across executions within the same workflow.
+    /// A key-value entry for `store-with-embedding`. Persisted durably in the
+    /// actor's memory and retained across executions and scheduled runs.
     record memory-entry {
         key: string,
         value: string,
@@ -1119,10 +1119,17 @@ interface agent-memory {
         invalid-input,
     }
 
-    /// Store a value in persistent memory.
+    /// Store a value in durable key-value memory, keyed by `key`.
+    ///
+    /// The value is retained long-term (~10 years) and survives across
+    /// executions AND scheduled runs — use this for state that must accumulate
+    /// between workflow runs (e.g. a CRM, a running tally). Overwrites any
+    /// existing value for the same key. For semantically-searchable storage,
+    /// use `store-with-embedding` instead.
     set: func(key: string, value: string) -> result<_, error>;
 
-    /// Retrieve a value by key.
+    /// Retrieve a value by key. Reads back a value written by `set` or
+    /// `store-with-embedding` regardless of its memory type.
     get: func(key: string) -> result<string, error>;
 
     /// Delete a key from memory.
