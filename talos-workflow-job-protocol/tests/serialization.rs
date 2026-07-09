@@ -3,7 +3,7 @@
 use serde_json::json;
 use talos_workflow_job_protocol::{
     EncryptedSecrets, JobRequest, JobResult, JobStatus, LlmTier, PipelineJobRequest,
-    PipelineJobResult, PipelineStep, PipelineStepResult,
+    PipelineJobResult, PipelineStep, PipelineStepResult, WriteCeiling,
 };
 use uuid::Uuid;
 
@@ -40,6 +40,7 @@ fn job_request_roundtrip() {
         dry_run: false,
         reply_topic: None,
         max_llm_tier: LlmTier::default(),
+        max_write_ceiling: WriteCeiling::default(),
     };
     let ser = serde_json::to_string(&req).expect("serialize request");
     let de: JobRequest = serde_json::from_str(&ser).expect("deserialize request");
@@ -111,6 +112,7 @@ fn pipeline_job_request_roundtrip() {
         share_sandbox: true,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        max_write_ceiling: WriteCeiling::default(),
         reply_topic: None,
         job_nonce: "0:deadbeef".to_string(),
         user_id: Uuid::new_v4(),
@@ -142,6 +144,7 @@ fn pipeline_job_request_sign_and_verify() {
         share_sandbox: false,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        max_write_ceiling: WriteCeiling::default(),
         reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
@@ -170,6 +173,7 @@ fn pipeline_job_request_tampered_step_fails() {
         share_sandbox: false,
         signature: vec![],
         max_llm_tier: LlmTier::default(),
+        max_write_ceiling: WriteCeiling::default(),
         reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),

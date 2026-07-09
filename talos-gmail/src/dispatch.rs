@@ -206,7 +206,9 @@ async fn dispatch_single_message(
     // OPEN to actor-less Tier-2 (today's behaviour) on any resolution error so
     // a transient DB hiccup never drops an inbound message.
     let actor_repo = talos_actor_repository::ActorRepository::new(ctx.db_pool.clone());
-    let (resolved_actor, actor_tier) = match actor_repo.resolve_effective_actor(user_id, None).await
+    let (resolved_actor, actor_tier, actor_write_ceiling) = match actor_repo
+        .resolve_effective_actor(user_id, None)
+        .await
     {
         Ok(aid) => {
             let tier = actor_repo
@@ -215,14 +217,24 @@ async fn dispatch_single_message(
                 .ok()
                 .flatten()
                 .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
-            (Some(aid), tier)
+            let write_ceiling = actor_repo
+                .get_actor_max_write_ceiling(aid)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
+            (Some(aid), tier, write_ceiling)
         }
         Err(e) => {
             tracing::warn!(
                 %user_id, error = %e,
                 "gmail dispatch: default-actor resolution failed; dispatching actor-less (Tier-2)"
             );
-            (None, talos_workflow_job_protocol::LlmTier::default())
+            (
+                None,
+                talos_workflow_job_protocol::LlmTier::default(),
+                talos_workflow_job_protocol::WriteCeiling::default(),
+            )
         }
     };
 
@@ -299,6 +311,7 @@ async fn dispatch_single_message(
         // data-egress control for inbound-mail processing without the
         // wrap-in-a-workflow workaround.
         max_llm_tier: actor_tier,
+        max_write_ceiling: actor_write_ceiling,
         wasm_bytes: None,
         capability_world: None,
         integration_name: exec_info.integration_name.clone(),

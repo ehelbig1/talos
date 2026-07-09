@@ -1003,7 +1003,7 @@ impl WebhookRouter {
             // travels with the job below. Fail OPEN to actor-less Tier-2
             // (today's behaviour) on any resolution error so a transient DB
             // hiccup never drops an inbound webhook.
-            let (resolved_actor, actor_tier) = {
+            let (resolved_actor, actor_tier, actor_write_ceiling) = {
                 let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
                 match actor_repo
                     .resolve_effective_actor(trigger.user_id, None)
@@ -1016,14 +1016,28 @@ impl WebhookRouter {
                             .ok()
                             .flatten()
                             .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
-                        (Some(aid), tier)
+                        // Same shape as the tier: the actor's write ceiling
+                        // travels with the direct-dispatched webhook job.
+                        // Permissive `Write` fallback (grandfathered existing
+                        // actors are `write`) so it's non-breaking.
+                        let write_ceiling = actor_repo
+                            .get_actor_max_write_ceiling(aid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
+                        (Some(aid), tier, write_ceiling)
                     }
                     Err(e) => {
                         tracing::warn!(
                             user_id = %trigger.user_id, error = %e,
                             "webhook dispatch: default-actor resolution failed; dispatching actor-less (Tier-2)"
                         );
-                        (None, talos_workflow_job_protocol::LlmTier::default())
+                        (
+                            None,
+                            talos_workflow_job_protocol::LlmTier::default(),
+                            talos_workflow_job_protocol::WriteCeiling::default(),
+                        )
                     }
                 }
             };
@@ -1132,6 +1146,7 @@ impl WebhookRouter {
                         // webhook-triggered module dispatch without the
                         // wrap-in-a-workflow workaround.
                         max_llm_tier: actor_tier,
+                        max_write_ceiling: actor_write_ceiling,
                         job_nonce: String::new(),
                         wasm_bytes: None,
                         capability_world: None,
@@ -2530,7 +2545,7 @@ impl WebhookRouter {
             // the live webhook path above). Webhook triggers carry no actor →
             // the user's default actor; its tier travels with the re-dispatched
             // job. Fail OPEN to actor-less Tier-2 on any resolution error.
-            let (resolved_actor, actor_tier) = {
+            let (resolved_actor, actor_tier, actor_write_ceiling) = {
                 let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
                 match actor_repo.resolve_effective_actor(user_id, None).await {
                     Ok(aid) => {
@@ -2540,14 +2555,24 @@ impl WebhookRouter {
                             .ok()
                             .flatten()
                             .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
-                        (Some(aid), tier)
+                        let write_ceiling = actor_repo
+                            .get_actor_max_write_ceiling(aid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
+                        (Some(aid), tier, write_ceiling)
                     }
                     Err(e) => {
                         tracing::warn!(
                             %user_id, error = %e,
                             "DLQ replay: default-actor resolution failed; dispatching actor-less (Tier-2)"
                         );
-                        (None, talos_workflow_job_protocol::LlmTier::default())
+                        (
+                            None,
+                            talos_workflow_job_protocol::LlmTier::default(),
+                            talos_workflow_job_protocol::WriteCeiling::default(),
+                        )
                     }
                 }
             };
@@ -2606,6 +2631,7 @@ impl WebhookRouter {
                     // re-dispatched job (Tier-2 default → non-breaking; the
                     // user's default actor at tier1 gives egress control).
                     max_llm_tier: actor_tier,
+                    max_write_ceiling: actor_write_ceiling,
                     wasm_bytes: None,
                     capability_world: None,
                     // MCP-1090: propagate integration_name (DLQ replay).

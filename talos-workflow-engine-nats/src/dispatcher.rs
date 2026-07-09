@@ -859,6 +859,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // preserving wire compat with existing workers.
             user_id: job.user_id.unwrap_or_else(uuid::Uuid::nil),
             max_llm_tier: job.max_llm_tier,
+            max_write_ceiling: job.max_write_ceiling,
             // H-1: stamp the pre-allocated inbox into the request
             // BEFORE signing. The worker will verify wire
             // `msg.reply == req.reply_topic` and refuse to publish
@@ -1086,6 +1087,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // dispatch above).
             user_id: request.user_id.unwrap_or_else(uuid::Uuid::nil),
             max_llm_tier: request.max_llm_tier,
+            max_write_ceiling: request.max_write_ceiling,
             // H-1: bind the pre-allocated inbox into the signing
             // payload. Worker will refuse to publish anywhere else.
             reply_topic: reply_inbox.clone(),
@@ -1658,6 +1660,7 @@ mod p3_full_loop_tests {
             steps: vec![mk(S0), mk(S1)],
             share_sandbox: false,
             max_llm_tier: talos_workflow_engine_core::LlmTier::Tier2,
+            max_write_ceiling: talos_workflow_engine_core::WriteCeiling::Write,
             total_timeout: std::time::Duration::from_secs(20),
             max_retries: 0,
             backoff_ms: 0,

@@ -686,6 +686,12 @@ pub struct ParallelWorkflowEngine {
     /// Default `Tier1` (fail-closed) — see `set_max_llm_tier` for the
     /// canonical stamp path.
     pub(crate) max_llm_tier: talos_workflow_engine_core::LlmTier,
+    /// Data-mutation ceiling stamped by `apply_actor_to_engine` from
+    /// `actors.max_write_ceiling`. Propagated to every `DispatchJob` and
+    /// thus into every `JobRequest`/`PipelineJobRequest` the worker sees.
+    /// Permissive `Write` default (system/actor-less jobs); actor binding
+    /// stamps the real ceiling (new actors → `ReadOnly`).
+    pub(crate) max_write_ceiling: talos_workflow_engine_core::WriteCeiling,
     /// Parent workflow definition id. Threaded into the
     /// [`NodeLifecycleHook::on_node_completed`] context so per-workflow
     /// cost rollups attribute to the right workflow row, not the
@@ -848,6 +854,7 @@ pub struct AdapterSet {
     /// controller stamps in the actor's ceiling (`actors.max_llm_tier`)
     /// via `set_max_llm_tier` before running.
     max_llm_tier: talos_workflow_engine_core::LlmTier,
+    max_write_ceiling: talos_workflow_engine_core::WriteCeiling,
     sandbox_root: Option<std::path::PathBuf>,
     agent_loop_max_history: usize,
     max_prefetch_successors: usize,
@@ -916,6 +923,7 @@ impl AdapterSet {
         // (fail-closed, but it strips external-LLM access from every judge /
         // ensemble / sub-workflow a tier-2 actor legitimately runs).
         engine.max_llm_tier = self.max_llm_tier;
+        engine.max_write_ceiling = self.max_write_ceiling;
         engine.dry_run = self.dry_run;
         engine.sandbox_root = self.sandbox_root;
         engine.agent_loop_max_history = self.agent_loop_max_history;
@@ -982,6 +990,10 @@ impl ParallelWorkflowEngine {
             // Paired with `DispatchJob::default()`'s Tier1 default so
             // the engine→dispatch chain is uniformly fail-closed.
             max_llm_tier: talos_workflow_engine_core::LlmTier::Tier1,
+            // Permissive default; actor binding stamps `ReadOnly` for new
+            // actors. Unlike Tier1 above, a `ReadOnly` default would break
+            // trusted actor-less system writes (see DispatchJob::default).
+            max_write_ceiling: talos_workflow_engine_core::WriteCeiling::Write,
             actor_context: None,
             module_prefetch_cache: Arc::new(dashmap::DashMap::new()),
             module_artifact_cache: Arc::new(dashmap::DashMap::new()),
@@ -1503,6 +1515,7 @@ impl ParallelWorkflowEngine {
             actor_id: self.actor_id,
             dry_run: self.dry_run,
             max_llm_tier: self.max_llm_tier,
+            max_write_ceiling: self.max_write_ceiling,
             sandbox_root: self.sandbox_root.clone(),
             agent_loop_max_history: self.agent_loop_max_history,
             max_prefetch_successors: self.max_prefetch_successors,
@@ -1797,6 +1810,13 @@ impl ParallelWorkflowEngine {
     /// from `actors.max_llm_tier` before calling `run()` / `run_with_seed()`.
     pub fn set_max_llm_tier(&mut self, tier: talos_workflow_engine_core::LlmTier) {
         self.max_llm_tier = tier;
+    }
+
+    /// Stamp the data-mutation ceiling. Called by
+    /// `talos_engine::actor_binding::apply_actor_to_engine` from
+    /// `actors.max_write_ceiling` before `run()` / `run_with_seed()`.
+    pub fn set_max_write_ceiling(&mut self, ceiling: talos_workflow_engine_core::WriteCeiling) {
+        self.max_write_ceiling = ceiling;
     }
 
     /// Build encrypted secrets for a node dispatch.

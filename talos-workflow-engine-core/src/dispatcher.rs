@@ -214,6 +214,19 @@ pub struct DispatchJob {
     /// in the most-restrictive ceiling.
     pub max_llm_tier: crate::LlmTier,
 
+    /// Data-mutation ceiling for the dispatched job. `ReadOnly` refuses
+    /// every data-mutating host surface at the worker; `Write` permits
+    /// mutation (subject to the module's capability grant).
+    ///
+    /// **Default `Write`** (permissive) so trusted actor-less system jobs
+    /// and legacy wire messages are never silently blocked. Real
+    /// actor-bound dispatch overrides this via
+    /// `talos_engine::actor_binding::apply_actor_to_engine`, which sources
+    /// `actors.max_write_ceiling` (new actors default `readonly`) and
+    /// fail-closes to `ReadOnly` on DB errors — so a user-built workflow
+    /// can't silently mutate data without an explicit grant.
+    pub max_write_ceiling: crate::WriteCeiling,
+
     // ── Retry policy ─────────────────────────────────────────────────
     /// Max retries for transient failures. Timeouts do not retry.
     pub max_retries: u32,
@@ -312,6 +325,14 @@ impl Default for DispatchJob {
             // must opt in explicitly via the builder, not implicitly via
             // the default.
             max_llm_tier: crate::LlmTier::Tier1,
+            // Permissive `Write` default (unlike the restrictive Tier1 above):
+            // a `ReadOnly` default would break trusted actor-less system writes
+            // (module-bound push → integration_state). The default-deny
+            // guarantee is enforced at the actor layer — `apply_actor_to_engine`
+            // stamps the actor's `max_write_ceiling` (new actors → `readonly`),
+            // and every user workflow must pass through it (lint check 29), so a
+            // user-built workflow can't reach this permissive default.
+            max_write_ceiling: crate::WriteCeiling::Write,
             max_retries: 0,
             backoff_ms: 0,
             retry_condition: None,
@@ -521,6 +542,15 @@ impl DispatchJobBuilder {
         self
     }
 
+    /// Data-mutation ceiling for the dispatched job. `ReadOnly` refuses
+    /// every mutating host surface; `Write` permits mutation. Sourced from
+    /// `actors.max_write_ceiling` via the actor-stamping step; permissive
+    /// `Write` default for trusted actor-less jobs.
+    pub fn max_write_ceiling(mut self, ceiling: crate::WriteCeiling) -> Self {
+        self.inner.max_write_ceiling = ceiling;
+        self
+    }
+
     /// Set the encrypted-secrets ciphertext + nonce together — the
     /// pair must always come from the same seal call. Use
     /// [`Self::encrypted_secrets`] rather than two independent
@@ -641,6 +671,7 @@ impl fmt::Debug for DispatchJob {
             .field("priority", &self.priority)
             .field("dry_run", &self.dry_run)
             .field("max_llm_tier", &self.max_llm_tier)
+            .field("max_write_ceiling", &self.max_write_ceiling)
             .field("max_retries", &self.max_retries)
             .field("backoff_ms", &self.backoff_ms)
             .field("retry_condition", &self.retry_condition)
@@ -728,6 +759,12 @@ pub struct ChainDispatchRequest {
     /// `actors.max_llm_tier` on the owning workflow's actor via the
     /// canonical builder.
     pub max_llm_tier: crate::LlmTier,
+    /// Data-mutation ceiling for the chain. Same enforcement as
+    /// `DispatchJob::max_write_ceiling` — every step's `TalosContext` gets
+    /// stamped with this and refuses mutating host calls when `ReadOnly`.
+    /// Sourced from `actors.max_write_ceiling` via the canonical builder;
+    /// permissive `Write` default for trusted actor-less jobs.
+    pub max_write_ceiling: crate::WriteCeiling,
     /// Aggregate budget for the whole chain (sum of per-step budgets
     /// plus any slack the caller wants).
     pub total_timeout: Duration,
