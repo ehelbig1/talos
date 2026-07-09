@@ -27,6 +27,12 @@ impl wit_messaging::Host for TalosContext {
                 tracing::warn!(module_id = ?self.module_id, "WASM module attempted messaging but lacks Messaging capability");
                 return Err(wit_messaging::Error::Publishfailed);
             }
+            // Write-ceiling gate: publishing a message is an outbound side
+            // effect — refuse for read-only actors. Inert unless enforcement
+            // is on.
+            if self.write_ceiling_refuses("messaging-publish", &topic).await {
+                return Err(wit_messaging::Error::Publishfailed);
+            }
             // MCP-756 (2026-05-13): cap topic length BEFORE it flows into
             // any logging / audit / NATS sink. See MAX_MESSAGING_TOPIC_BYTES
             // doc. Runs before the reserved-prefix check below so an
@@ -143,6 +149,13 @@ impl wit_messaging::Host for TalosContext {
             tracing::warn!(module_id = ?self.module_id, "WASM module attempted messaging but lacks Messaging capability");
             return Err(wit_messaging::Error::Publishfailed);
         }
+        // Write-ceiling gate: outbound publish — refuse for read-only actors.
+        if self
+            .write_ceiling_refuses("messaging-publish", &msg.topic)
+            .await
+        {
+            return Err(wit_messaging::Error::Publishfailed);
+        }
         // MCP-756: cap topic length, sibling-parity with `publish` above.
         if msg.topic.is_empty() || msg.topic.len() > MAX_MESSAGING_TOPIC_BYTES {
             tracing::warn!(
@@ -249,6 +262,14 @@ impl wit_messaging::Host for TalosContext {
                 .await;
             tracing::warn!(module_id = ?self.module_id, "WASM module attempted messaging request but lacks Messaging capability");
             return Err(wit_messaging::Error::Subscribefailed);
+        }
+        // Write-ceiling gate: request/reply publishes to a responder that may
+        // mutate — refuse for read-only actors. Inert unless enforcement is on.
+        if self
+            .write_ceiling_refuses("messaging-request", &topic)
+            .await
+        {
+            return Err(wit_messaging::Error::Publishfailed);
         }
         // MCP-756: cap topic length, sibling-parity with `publish`.
         if topic.is_empty() || topic.len() > MAX_MESSAGING_TOPIC_BYTES {

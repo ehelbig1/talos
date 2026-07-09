@@ -3,6 +3,22 @@
 
 use super::*;
 
+/// Whether an HTTP method mutates server state — the write-ceiling axis.
+/// `GET` is the only read verb in `wit_http::Method`; every other verb
+/// (`POST` / `PUT` / `PATCH` / `DELETE`) can mutate, so a read-only actor
+/// is refused those under enforcement. Fail-safe by construction: the
+/// `match` is exhaustive, so a future non-mutating verb added to the WIT
+/// must be classified explicitly rather than defaulting to "read".
+pub(crate) fn http_method_mutates(method: &wit_http::Method) -> bool {
+    match method {
+        wit_http::Method::Get => false,
+        wit_http::Method::Post
+        | wit_http::Method::Put
+        | wit_http::Method::Patch
+        | wit_http::Method::Delete => true,
+    }
+}
+
 // ============================================================================
 // HTTP
 // ============================================================================
@@ -169,6 +185,16 @@ impl wit_http::Host for TalosContext {
                 );
                 return Err(wit_http::Error::Forbiddenhost);
             }
+        }
+
+        // Write-ceiling gate: a read-only actor may issue read requests (GET)
+        // but not mutating ones (POST / PUT / PATCH / DELETE). Pure decision,
+        // in the cheap-validation block before the rate-limit charge. Inert
+        // unless `TALOS_WRITE_CEILING_ENFORCED=1`.
+        if http_method_mutates(&req.method)
+            && self.write_ceiling_refuses("http-fetch", host).await
+        {
+            return Err(wit_http::Error::Forbiddenhost);
         }
 
         // Rate limit + cancellation: charged AFTER the cheap pure-validation
@@ -716,6 +742,16 @@ impl wit_http::Host for TalosContext {
                 }
             }
 
+            // 5b. Write-ceiling gate: read-only actors may GET but not
+            //     mutate. Per-request so a mixed batch rejects only the
+            //     mutating entries. Inert unless enforcement is on.
+            if http_method_mutates(&req.method)
+                && self.write_ceiling_refuses("http-fetch-all", &host).await
+            {
+                validated.push(Err(wit_http::Error::Forbiddenhost));
+                continue;
+            }
+
             // 6. HTTP method allowlist.
             let method_str = match req.method {
                 wit_http::Method::Get => "GET",
@@ -1122,5 +1158,27 @@ impl wit_http::Host for TalosContext {
         drop(header_value);
         req.headers.insert(0, (header_name, owned_value));
         self.fetch(req).await
+    }
+}
+
+#[cfg(test)]
+mod write_ceiling_http_tests {
+    use super::*;
+
+    #[test]
+    fn get_is_a_read() {
+        assert!(!http_method_mutates(&wit_http::Method::Get));
+    }
+
+    #[test]
+    fn write_verbs_mutate() {
+        for m in [
+            wit_http::Method::Post,
+            wit_http::Method::Put,
+            wit_http::Method::Patch,
+            wit_http::Method::Delete,
+        ] {
+            assert!(http_method_mutates(&m), "{m:?} must be a mutation");
+        }
     }
 }

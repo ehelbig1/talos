@@ -153,6 +153,14 @@ impl wit_object_storage::Host for TalosContext {
         // MCP-1098: bucket/key URL-injection guard.
         validate_s3_bucket(&req.bucket)?;
         validate_s3_key(&req.key)?;
+        // Write-ceiling gate: an object put mutates storage — refuse for
+        // read-only actors. Inert unless enforcement is on.
+        if self
+            .write_ceiling_refuses("object-storage-put", &format!("{}/{}", req.bucket, req.key))
+            .await
+        {
+            return Err(wit_object_storage::Error::AccessDenied);
+        }
         let endpoint = self
             .s3_endpoint
             .as_ref()
@@ -385,6 +393,14 @@ impl wit_object_storage::Host for TalosContext {
         // MCP-1098: bucket/key URL-injection guard.
         validate_s3_bucket(&bucket)?;
         validate_s3_key(&key)?;
+        // Write-ceiling gate: an object delete mutates storage — refuse for
+        // read-only actors. Inert unless enforcement is on.
+        if self
+            .write_ceiling_refuses("object-storage-delete", &format!("{}/{}", bucket, key))
+            .await
+        {
+            return Err(wit_object_storage::Error::AccessDenied);
+        }
         let endpoint = self
             .s3_endpoint
             .as_ref()

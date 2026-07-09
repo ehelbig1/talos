@@ -163,6 +163,15 @@ pub struct TalosContext {
     /// or from pre-tier workers.
     pub max_llm_tier: talos_workflow_job_protocol::LlmTier,
 
+    /// Per-actor write ceiling — the mutation-permission gate. `ReadOnly`
+    /// refuses every data-mutating host op (agent-memory writes, non-GET
+    /// HTTP, DB execute, webhook/email/messaging sends, object-storage
+    /// puts/deletes, integration-state writes) when enforcement is on.
+    /// Default `Write` for jobs without actor context or from pre-ceiling
+    /// workers. Enforcement is gated on [`write_ceiling_enforced`] so the
+    /// signed field stays inert until an operator opts in.
+    pub max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+
     /// Keeps the ephemeral `TempDir` alive until this context is dropped.
     /// Dropping `_ephemeral_dir` removes the directory from the file system.
     _ephemeral_dir: TempDir,
@@ -595,6 +604,50 @@ fn build_per_execution_http_client(
 /// `TalosContext::new` for why Database/Agent are no-preopen (the read-only
 /// preopen they used to get was an empty, unpopulated dir whose only guard was
 /// WASI `FilePerms` — the surface RUSTSEC-2026-0149 bypassed).
+/// Whether the per-actor write ceiling is ENFORCED at the worker host-fn
+/// boundary. Default **off**: the signed `JobRequest.max_write_ceiling`
+/// field travels on every job (PR-A plumbing) but changes no runtime
+/// behavior until an operator sets `TALOS_WRITE_CEILING_ENFORCED=1`,
+/// mirroring the staged rollout of `TALOS_ENVELOPE_SEALING`. Read once and
+/// cached — [`TalosContext::write_ceiling_refuses`] sits on every mutating
+/// host call, so this must not re-parse the env per invocation.
+pub(crate) fn write_ceiling_enforced() -> bool {
+    static ENFORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENFORCED
+        .get_or_init(|| talos_config::bool_env_or_default("TALOS_WRITE_CEILING_ENFORCED", false))
+}
+
+/// Pure write-ceiling decision, split from the env read + audit side effects
+/// in [`TalosContext::write_ceiling_refuses`] so the gate logic is unit-tested
+/// without a live context or process env. Returns `true` when a data-mutating
+/// host op MUST be refused: enforcement is on AND the ceiling forbids writes.
+/// Mirrors the `decide_llm_tier_access` split for the tier-1 gate.
+pub(crate) fn write_ceiling_denies(
+    enforced: bool,
+    ceiling: talos_workflow_job_protocol::WriteCeiling,
+) -> bool {
+    enforced && !ceiling.allows_write()
+}
+
+#[cfg(test)]
+mod write_ceiling_decision_tests {
+    use super::write_ceiling_denies;
+    use talos_workflow_job_protocol::WriteCeiling;
+
+    #[test]
+    fn disabled_never_refuses() {
+        // Flag off (the default): the signed ceiling is inert regardless.
+        assert!(!write_ceiling_denies(false, WriteCeiling::ReadOnly));
+        assert!(!write_ceiling_denies(false, WriteCeiling::Write));
+    }
+
+    #[test]
+    fn enforced_refuses_only_read_only() {
+        assert!(write_ceiling_denies(true, WriteCeiling::ReadOnly));
+        assert!(!write_ceiling_denies(true, WriteCeiling::Write));
+    }
+}
+
 pub(crate) fn capability_world_has_fs_preopen(
     world: &crate::wit_inspector::CapabilityWorld,
 ) -> bool {
@@ -949,6 +1002,11 @@ impl TalosContext {
             // `new()` (a no-op since they pass the same value); legacy /
             // test paths that pass `LlmTier::default()` keep Tier-2.
             max_llm_tier,
+            // Default `Write` (permissive) at construction; live dispatch
+            // paths re-stamp this from the signed `JobRequest.max_write_ceiling`
+            // right after `new()`, mirroring `max_llm_tier`. Tests / legacy
+            // paths keep the permissive default.
+            max_write_ceiling: talos_workflow_job_protocol::WriteCeiling::default(),
         })
     }
 
@@ -1236,6 +1294,38 @@ impl TalosContext {
                 }
             });
         }
+    }
+
+    /// Write-ceiling gate for data-mutating host ops.
+    ///
+    /// Returns `true` when the op MUST be refused: enforcement is on
+    /// (`TALOS_WRITE_CEILING_ENFORCED=1`) AND this job's actor is
+    /// `ReadOnly`. On refusal it records a `wasi:capability_denied` audit
+    /// event (`policy = "write-ceiling"`) and emits a WARN, mirroring the
+    /// tier-1 egress gate. When enforcement is off — the default — it
+    /// short-circuits to `false` before any allocation, so the signed
+    /// `max_write_ceiling` field stays inert on the hot path until an
+    /// operator opts in.
+    ///
+    /// `op` is a stable, non-secret label (e.g. `"agent-memory-set"`);
+    /// `target` is a non-secret detail (key, sanitized URL, table) for the
+    /// audit trail — never a secret value.
+    pub async fn write_ceiling_refuses(&mut self, op: &str, target: &str) -> bool {
+        // Pure decision (flag + ceiling) split out for unit testing; the
+        // audit + warn side effects stay here. Short-circuits before any
+        // allocation on the default (disabled) path.
+        if !write_ceiling_denies(write_ceiling_enforced(), self.max_write_ceiling) {
+            return false;
+        }
+        self.record_capability_denied(op, "write-ceiling", target)
+            .await;
+        tracing::warn!(
+            op,
+            actor_id = ?self.actor_id,
+            module_id = self.module_id.as_deref(),
+            "write-ceiling: refused data-mutating host op for a read-only actor"
+        );
+        true
     }
 
     /// Build a module-scoped state key to isolate per-module state within a

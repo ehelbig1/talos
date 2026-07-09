@@ -32,6 +32,11 @@ impl wit_webhook::Host for TalosContext {
         // stay paired with the rate-limit charge.
 
         let url = req.url.clone();
+        // Write-ceiling gate: an outbound webhook is a mutation/side effect —
+        // refuse for read-only actors. Inert unless enforcement is on.
+        if self.write_ceiling_refuses("webhook-send", &url).await {
+            return Err(wit_webhook::Error::Sendfailed);
+        }
         // MCP-1148: cap URL bytes BEFORE invoking `url::Url::parse`
         // below. Sibling-parity with wit_http::fetch / wit_graphql.
         if url.len() > MAX_OUTBOUND_URL_BYTES {

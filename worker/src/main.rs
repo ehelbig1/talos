@@ -1004,6 +1004,7 @@ async fn execute_job(
             req.actor_id,
             req.user_id,
             req.max_llm_tier,
+            req.max_write_ceiling,
         ),
     )
     .await
@@ -1283,6 +1284,7 @@ async fn execute_pipeline_job(
             overall_timeout,
             req.share_sandbox,
             req.max_llm_tier,
+            req.max_write_ceiling,
         )
         .await
     {

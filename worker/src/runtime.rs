@@ -2227,12 +2227,13 @@ impl TalosRuntime {
             RetryPolicy::default(),  // Default retry policy (3 attempts)
             Some(300),               // Result cache TTL: 5 minutes
             SecurityPolicy::default(),
-            None,                                            // capability_world_hint
+            None,                                                 // capability_world_hint
             None,              // max_fuel_override — use runtime default
             false,             // dry_run
             None,              // actor_id
             uuid::Uuid::nil(), // user_id — legacy helper has no user context
             talos_workflow_job_protocol::LlmTier::default(), // tier2 for legacy helper
+            talos_workflow_job_protocol::WriteCeiling::default(), // write (permissive) for legacy helper
         )
         .await
     }
@@ -2280,6 +2281,10 @@ impl TalosRuntime {
         // LLM data-egress ceiling for this job. `Tier1` refuses to
         // resolve external-provider keys (Anthropic / OpenAI / Gemini).
         max_llm_tier: talos_workflow_job_protocol::LlmTier,
+        // Per-actor write ceiling. `ReadOnly` refuses data-mutating host
+        // ops when `TALOS_WRITE_CEILING_ENFORCED=1`. Stamped onto the
+        // TalosContext alongside `max_llm_tier`.
+        max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
     ) -> Result<JsonValue> {
         // Per-job fuel override: use the controller-supplied value when non-zero,
         // otherwise fall back to the runtime's global fuel_limit.
@@ -2462,6 +2467,7 @@ impl TalosRuntime {
                     actor_id,
                     user_id,
                     max_llm_tier,
+                    max_write_ceiling,
                 )
                 .await
             {
@@ -2609,6 +2615,10 @@ impl TalosRuntime {
         // LLM data-egress ceiling for this job. `Tier1` refuses to
         // resolve external-provider keys (Anthropic / OpenAI / Gemini).
         max_llm_tier: talos_workflow_job_protocol::LlmTier,
+        // Per-actor write ceiling. `ReadOnly` refuses data-mutating host
+        // ops when `TALOS_WRITE_CEILING_ENFORCED=1`. Stamped onto the
+        // TalosContext alongside `max_llm_tier`.
+        max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
     ) -> Result<JsonValue> {
         // DISTRIBUTED TRACING: Create execution span
         let execution_id = execution_context
@@ -2705,6 +2715,9 @@ impl TalosRuntime {
         // Wire LLM tier ceiling. `get_llm_api_key` refuses to resolve
         // external-provider keys when this is Tier1.
         context.max_llm_tier = max_llm_tier;
+        // Wire write ceiling. `write_ceiling_refuses` gates every mutating
+        // host op on `ReadOnly` when enforcement is on.
+        context.max_write_ceiling = max_write_ceiling;
         // Wire user_id for integration_state scoping + per-user rate limiting.
         // Uuid::nil() means the controller didn't supply one (system
         // execution); integration_state host fns treat that as "not
@@ -3384,6 +3397,11 @@ impl TalosRuntime {
         // LLM tier ceiling stamped on every step's TalosContext so pipeline
         // steps enforce the same tier gate as single-node JobRequest dispatch.
         max_llm_tier: talos_workflow_job_protocol::LlmTier,
+        // Per-actor write ceiling stamped on every step's TalosContext so
+        // pipeline steps enforce the same mutation gate as single-node
+        // dispatch. `ReadOnly` + enforcement on = data-mutating host ops
+        // refused.
+        max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
     ) -> Result<PipelineResult> {
         if steps.is_empty() {
             anyhow::bail!("pipeline must have at least one step");
@@ -3489,6 +3507,9 @@ impl TalosRuntime {
             // host-fn gates (llm::*, wit_http, graphql, webhook, http_stream)
             // enforce the same contract as a single-node JobRequest.
             context.max_llm_tier = max_llm_tier;
+            // Same for the write ceiling — every step's mutating host ops
+            // enforce the same `ReadOnly` gate as single-node dispatch.
+            context.max_write_ceiling = max_write_ceiling;
 
             // Correlate step execution logs with the module ID.
             context.set_request_id(step.module_id.clone());

@@ -53,6 +53,13 @@ impl wit_email::Host for TalosContext {
             return Err(wit_email::Error::Sendfailed);
         }
 
+        // Write-ceiling gate: sending email is an outbound mutation — refuse
+        // for read-only actors. Target is empty (recipient addresses are PII
+        // and must not enter the WORM ledger). Inert unless enforcement is on.
+        if self.write_ceiling_refuses("email-send", "").await {
+            return Err(wit_email::Error::Unauthorized);
+        }
+
         // Validate recipient addresses.
         // SECURITY: Reject control characters (CR, LF, NUL) to prevent email
         // header injection attacks (e.g., "victim@example.com\r\nBcc: attacker@evil.com").

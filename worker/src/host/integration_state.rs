@@ -63,6 +63,15 @@ impl wit_integration_state::Host for TalosContext {
             .await;
         }
         require_integration_state_capability(&self.capability_world)?;
+        // Write-ceiling gate: integration-state is the durable write path
+        // for OAuth tokens + watch state — refuse for read-only actors.
+        // Inert unless enforcement is on.
+        if self
+            .write_ceiling_refuses("integration-state-set", &entry.key)
+            .await
+        {
+            return Err(wit_integration_state::Error::Unauthorized);
+        }
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         // Bail before the NATS round-trip if the execution was cancelled
@@ -134,6 +143,14 @@ impl wit_integration_state::Host for TalosContext {
             .await;
         }
         require_integration_state_capability(&self.capability_world)?;
+        // Write-ceiling gate: read-only actors cannot delete integration
+        // state. Inert unless enforcement is on.
+        if self
+            .write_ceiling_refuses("integration-state-delete", &key)
+            .await
+        {
+            return Err(wit_integration_state::Error::Unauthorized);
+        }
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         if self.is_cancelled() {

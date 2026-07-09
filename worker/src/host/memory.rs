@@ -116,6 +116,11 @@ impl wit_agent_memory::Host for TalosContext {
                 .await;
             return Err(wit_agent_memory::Error::NotAvailable);
         }
+        // Write-ceiling gate: a read-only actor may recall from memory but
+        // never mutate it. Inert unless `TALOS_WRITE_CEILING_ENFORCED=1`.
+        if self.write_ceiling_refuses("agent-memory-set", &key).await {
+            return Err(wit_agent_memory::Error::NotAvailable);
+        }
         // Fail-fast key validation via the canonical validator the controller's
         // memory_rpc verify() also runs (trim, non-empty, ≤500 chars, no control
         // chars/null). Parity with the per-key caps on wit_cache (MCP-754) and
@@ -174,6 +179,13 @@ impl wit_agent_memory::Host for TalosContext {
         if require_agent_memory_capability(&self.capability_world).is_err() {
             self.record_capability_denied("agent-memory-delete", "capability-world", &key)
                 .await;
+            return Err(wit_agent_memory::Error::NotAvailable);
+        }
+        // Write-ceiling gate: read-only actors cannot delete memory.
+        if self
+            .write_ceiling_refuses("agent-memory-delete", &key)
+            .await
+        {
             return Err(wit_agent_memory::Error::NotAvailable);
         }
         // Fail-fast key validation (parity with get/set + the controller's
@@ -245,6 +257,13 @@ impl wit_agent_memory::Host for TalosContext {
                 &entry.key,
             )
             .await;
+            return Err(wit_agent_memory::Error::NotAvailable);
+        }
+        // Write-ceiling gate: read-only actors cannot write semantic memory.
+        if self
+            .write_ceiling_refuses("agent-memory-store-with-embedding", &entry.key)
+            .await
+        {
             return Err(wit_agent_memory::Error::NotAvailable);
         }
         let (actor_id, nats) = match mem_rpc_prereqs_owned(self) {

@@ -327,6 +327,7 @@ async fn pipeline_mid_step_failure_propagates() {
             Duration::from_secs(30),
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
+            talos_workflow_job_protocol::WriteCeiling::Write,
         )
         .await;
 
@@ -371,6 +372,7 @@ async fn pipeline_mid_step_trap_propagates() {
             Duration::from_secs(30),
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
+            talos_workflow_job_protocol::WriteCeiling::Write,
         )
         .await;
 
@@ -397,6 +399,7 @@ async fn pipeline_all_steps_ok_succeeds() {
             Duration::from_secs(30),
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
+            talos_workflow_job_protocol::WriteCeiling::Write,
         )
         .await
         .expect("all-ok pipeline should succeed");
