@@ -8,6 +8,7 @@ import {
   GetModulesLoaderDocument,
 } from "@/generated/graphql";
 import { useWorkflowStore } from "@/store/workflowStore";
+import type { WorkflowEdge, EdgeData } from "@/store/workflowStore";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { toast } from "sonner";
 // Node/Edge types imported via workflowStore
@@ -206,13 +207,35 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
       };
     });
 
-    const edges = graph.edges.map((e: GraphEdge) => {
-      const { source, target, id, data, ...rest } = e;
+    const edges: WorkflowEdge[] = graph.edges.map((e: GraphEdge) => {
+      const existing = (e.data as Record<string, unknown> | undefined) ?? {};
+      // Carry the engine's edge_type / condition (top-level on the stored edge,
+      // or already nested under data) so conditional / error edges show their
+      // label + styling. Only set `condition` when present (exactOptional).
+      const edgeData: EdgeData = {
+        ...existing,
+        edgeType: ((existing.edgeType as string | undefined) ??
+          (e.edge_type as string | undefined) ??
+          "default") as EdgeData["edgeType"],
+      };
+      const condition =
+        (existing.condition as string | undefined) ??
+        (e.condition as string | undefined);
+      if (condition !== undefined) {
+        edgeData.condition = condition;
+      }
       return {
-        id: id || `${source}-${target}`,
-        source,
-        target,
-        data: data || (rest as Record<string, unknown>),
+        id: e.id || `${e.source}-${e.target}`,
+        source: e.source,
+        target: e.target,
+        // Loaded edges MUST use the same "conditionEdge" type as edges created
+        // interactively (workflowStore.connectNodes). Without an explicit type,
+        // React Flow falls back to its built-in default edge, which does not
+        // render in this canvas (custom edgeTypes are registered and the app
+        // renders every edge through ConditionEdge) — so connections in a saved
+        // workflow were invisible after loading it in the editor.
+        type: "conditionEdge",
+        data: edgeData,
       };
     });
 
