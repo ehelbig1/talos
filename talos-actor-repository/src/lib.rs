@@ -1991,6 +1991,44 @@ impl ActorRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Fetch the data-mutation ceiling for an actor.
+    /// Returns `Ok(Some(ceiling))` on success, `Ok(None)` when the actor
+    /// doesn't exist, `Err` on DB failure. Never masks DB errors as
+    /// `Write` — see `talos_engine::actor_binding::apply_actor_to_engine`
+    /// for the fail-closed (`ReadOnly`) contract.
+    pub async fn get_actor_max_write_ceiling(
+        &self,
+        actor_id: Uuid,
+    ) -> Result<Option<talos_workflow_job_protocol::WriteCeiling>> {
+        let row: Option<String> =
+            sqlx::query_scalar("SELECT max_write_ceiling FROM actors WHERE id = $1")
+                .bind(actor_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(row
+            .as_deref()
+            .map(talos_workflow_job_protocol::WriteCeiling::from_db_str))
+    }
+
+    /// Set an actor's data-mutation ceiling. Validates user ownership
+    /// before mutating. Returns true if the row was updated, false if
+    /// the actor doesn't exist or doesn't belong to the user.
+    pub async fn set_actor_max_write_ceiling(
+        &self,
+        actor_id: Uuid,
+        user_id: Uuid,
+        ceiling: talos_workflow_job_protocol::WriteCeiling,
+    ) -> Result<bool> {
+        let result =
+            sqlx::query("UPDATE actors SET max_write_ceiling = $1 WHERE id = $2 AND user_id = $3")
+                .bind(ceiling.as_signing_str())
+                .bind(actor_id)
+                .bind(user_id)
+                .execute(&self.db_pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Fetch only the max_capability_world string for a user (used by user_max_world helper).
     /// Returns None if no explicit grant exists.
     pub async fn get_user_max_capability_world(&self, user_id: Uuid) -> Result<Option<String>> {

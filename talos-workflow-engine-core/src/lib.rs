@@ -134,6 +134,7 @@ mod shared_key;
 mod sub_actor_context;
 mod system_node;
 mod transport;
+mod write_ceiling;
 
 pub use approval_gate::{ApprovalGate, ApprovalStatus};
 pub use checkpoint::CheckpointStore;
@@ -164,3 +165,4 @@ pub use shared_key::{WorkerKeyRing, WorkerSharedKey};
 pub use sub_actor_context::SubworkflowActorContextResolver;
 pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;
+pub use write_ceiling::WriteCeiling;

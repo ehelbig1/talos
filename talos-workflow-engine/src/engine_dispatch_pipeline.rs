@@ -300,6 +300,7 @@ impl ParallelWorkflowEngine {
                 // Inherit the engine's tier ceiling (stamped from
                 // `actors.max_llm_tier` by the controller at dispatch time).
                 max_llm_tier: self.max_llm_tier,
+                max_write_ceiling: self.max_write_ceiling,
                 max_retries: 0,
                 backoff_ms: 0,
                 retry_condition: None,
@@ -406,6 +407,7 @@ impl ParallelWorkflowEngine {
             // `actors.max_llm_tier`). Worker stamps every step's
             // TalosContext with this value.
             max_llm_tier: self.max_llm_tier,
+            max_write_ceiling: self.max_write_ceiling,
             total_timeout: std::time::Duration::from_secs(timeout_secs),
             max_retries: chain_retry.max_retries,
             backoff_ms: chain_retry.backoff_ms,

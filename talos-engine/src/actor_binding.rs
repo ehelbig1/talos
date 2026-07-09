@@ -18,6 +18,7 @@ use anyhow::Result;
 use talos_actor_repository::ActorRepository;
 use talos_workflow_engine::ParallelWorkflowEngine;
 use talos_workflow_engine_core::LlmTier;
+use talos_workflow_engine_core::WriteCeiling;
 use uuid::Uuid;
 
 /// Apply the actor context to a workflow engine: sets `actor_id`
@@ -68,5 +69,33 @@ pub async fn apply_actor_to_engine(
         }
     };
     engine.set_max_llm_tier(tier);
+
+    // Data-mutation ceiling — same fail-closed contract as the tier above,
+    // but fail-closed to `ReadOnly` (refuse mutation) rather than Tier1.
+    // New actors resolve to `ReadOnly` (the migration's column default), so a
+    // freshly-built workflow can't mutate data until an operator grants write.
+    let ceiling = match repo.get_actor_max_write_ceiling(actor_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            tracing::warn!(
+                %actor_id,
+                "apply_actor_to_engine: actor not found; stamping ReadOnly and erroring"
+            );
+            engine.set_max_write_ceiling(WriteCeiling::ReadOnly);
+            return Err(anyhow::anyhow!(
+                "actor {actor_id} not found when resolving write ceiling"
+            ));
+        }
+        Err(e) => {
+            tracing::error!(
+                %actor_id,
+                error = %e,
+                "apply_actor_to_engine: DB error resolving write ceiling; stamping ReadOnly and erroring"
+            );
+            engine.set_max_write_ceiling(WriteCeiling::ReadOnly);
+            return Err(e.context("apply_actor_to_engine: failed to resolve actor write ceiling"));
+        }
+    };
+    engine.set_max_write_ceiling(ceiling);
     Ok(())
 }

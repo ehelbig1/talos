@@ -1183,6 +1183,7 @@ pub fn is_llm_provider_vault_path(path: &str) -> bool {
 /// engine-core because `DispatchJob` carries it through the dispatch
 /// pipeline and engine-core sits below job-protocol in the dep graph.
 pub use talos_workflow_engine_core::LlmTier;
+pub use talos_workflow_engine_core::WriteCeiling;
 
 /// Map a provider name (case-insensitive) to its data-egress tier.
 /// Anthropic / OpenAI / Gemini = Tier 2 (external). Ollama = Tier 1
@@ -2338,6 +2339,22 @@ pub struct JobRequest {
     #[serde(default)]
     pub max_llm_tier: LlmTier,
 
+    /// Data-mutation ceiling this job is allowed to exercise. Sourced from
+    /// `actors.max_write_ceiling` for actor-bound executions; `Write` (no
+    /// restriction) for trusted system / actor-less jobs and — via
+    /// `#[serde(default)]` — for legacy wire messages that predate this field.
+    ///
+    /// Worker enforcement (gated by `TALOS_WRITE_CEILING_ENFORCED`): when
+    /// this is `ReadOnly`, every data-mutating host surface (actor-memory
+    /// writes, DB DML, non-GET HTTP, webhook/email/messaging/object-storage/
+    /// integration-state writes, GraphQL execute) is refused, failing closed.
+    ///
+    /// HMAC-bound: included in the signing payload so an on-wire attacker
+    /// can't upgrade a `readonly` job to `write` and make a read-only actor
+    /// mutate data.
+    #[serde(default)]
+    pub max_write_ceiling: WriteCeiling,
+
     /// When true, non-GET HTTP requests are mocked (returns 200 with dry_run metadata).
     /// GET requests execute normally for data fetching.
     #[serde(default)]
@@ -2416,6 +2433,7 @@ impl JobRequest {
     /// When `wasm_bytes` is absent but `expected_wasm_hash` is set, the field is that hash
     /// (tamper-evident commitment to the content the worker will load from `module_uri`).
     /// Otherwise the sentinel "none" is used.
+    #[allow(clippy::too_many_lines)] // canonical signing payload — one linear format!
     fn signing_payload(&self) -> Vec<u8> {
         use sha2::Digest;
 
@@ -2540,7 +2558,7 @@ impl JobRequest {
         let cancellation_token_str = self.cancellation_token.as_deref().unwrap_or("-");
 
         let mut payload = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             lp(&self.module_uri),
@@ -2583,6 +2601,13 @@ impl JobRequest {
             self.deadline_unix_secs,
             // H-7 (2026-05-23): cancellation_token appended AT THE END.
             lp(cancellation_token_str),
+            // Write-ceiling appended AT THE END (after all prior fields, before
+            // the conditional sealing block) per the wire-format stability rule.
+            // HMAC-bound so an on-wire attacker can't upgrade a `readonly` job to
+            // `write` and make a read-only actor mutate data. As a new signed
+            // field this needs a coordinated controller+worker restart, same as
+            // `max_llm_tier` before it.
+            self.max_write_ceiling.as_signing_str(),
         );
 
         // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
@@ -3237,6 +3262,14 @@ pub struct PipelineJobRequest {
     #[serde(default)]
     pub max_llm_tier: LlmTier,
 
+    /// Data-mutation ceiling — MUST match the owning workflow's actor's
+    /// `max_write_ceiling`. The worker stamps this into every step's
+    /// `TalosContext` so each pipeline step enforces the same write gate as
+    /// a single-node JobRequest. HMAC-bound (appended at end). `Write`
+    /// default for backward compat with older controllers.
+    #[serde(default)]
+    pub max_write_ceiling: WriteCeiling,
+
     /// H-1: signed reply-inbox commitment. Same semantics as
     /// [`JobRequest::reply_topic`] — the worker MUST publish its
     /// `PipelineJobResult` to this exact NATS subject when set,
@@ -3279,6 +3312,7 @@ impl PipelineJobRequest {
     /// Format:
     /// `pipeline:{job_id}:{wex_id}:{nonce}:{total_timeout_ms}:{share_sandbox}:
     ///  {num_steps}:{user_id}:{sha256(step0_wasm)}:{sha256(step1_wasm)}:...`
+    #[allow(clippy::too_many_lines)] // canonical signing payload — one linear format!
     fn signing_payload(&self) -> Vec<u8> {
         use sha2::Digest;
 
@@ -3432,7 +3466,7 @@ impl PipelineJobRequest {
         let step_policies_str = step_policies.join(";;");
 
         let mut payload = format!(
-            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             self.job_nonce,
@@ -3459,6 +3493,10 @@ impl PipelineJobRequest {
             // cancellation_token) appended AT THE END per the
             // wire-format stability rule.
             lp(&step_policies_str),
+            // Write-ceiling appended AT THE END (same reasoning as
+            // `JobRequest::signing_payload`). A tamperer can't upgrade a
+            // `readonly` pipeline to `write` without invalidating the signature.
+            self.max_write_ceiling.as_signing_str(),
         );
 
         // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
@@ -4397,6 +4435,7 @@ mod tests {
             allow_tier2_exposure: false,
             signature: vec![],
             max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -4449,6 +4488,7 @@ mod tests {
             allow_tier2_exposure: false,
             signature: vec![],
             max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -4493,6 +4533,7 @@ mod tests {
             allow_tier2_exposure: false,
             signature: vec![],
             max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -4660,6 +4701,7 @@ mod tests {
             allow_tier2_exposure: false,
             signature: vec![],
             max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -4704,6 +4746,7 @@ mod tests {
             allow_tier2_exposure: false,
             signature: vec![],
             max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -4764,6 +4807,7 @@ mod tests {
             allow_tier2_exposure: false,
             signature: vec![],
             max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
             job_nonce: String::new(),
             actor_id,
             wasm_bytes: None,
@@ -5553,6 +5597,7 @@ mod tests {
             job_nonce: String::new(),
             user_id: Uuid::nil(),
             max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
             reply_topic: Some("_INBOX.legit.xyz".to_string()),
         };
         req.sign(&key).unwrap();
@@ -5764,6 +5809,7 @@ mod tests {
             job_nonce: String::new(),
             user_id: Uuid::nil(),
             max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
             reply_topic: None,
         }
     }

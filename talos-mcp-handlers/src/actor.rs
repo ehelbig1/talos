@@ -336,6 +336,25 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "set_actor_write_ceiling",
+            "description": "Set the data-mutation (WRITE) ceiling for an actor — a default-deny gate on data-mutating operations. \
+                'readonly' = the actor's workflows may only READ; every mutating host surface (actor-memory writes, DB DML, non-GET HTTP, webhook/email/messaging/object-storage/integration-state writes, GraphQL execute) is refused at the worker. \
+                'write' = mutation permitted (subject to the module's capability grant). \
+                Enforcement is worker-side, gated by TALOS_WRITE_CEILING_ENFORCED. NEW actors default to 'readonly' (so a freshly-built workflow can't silently mutate your data); existing actors were grandfathered to 'write'. Grant 'write' deliberately to actors that need to mutate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actor_id": { "type": "string" },
+                    "ceiling": {
+                        "type": "string",
+                        "enum": ["readonly", "write"],
+                        "description": "readonly = refuse all data mutation, write = mutation permitted"
+                    }
+                },
+                "required": ["actor_id", "ceiling"]
+            }
+        }),
+        serde_json::json!({
             "name": "get_actor_budget",
             "description": "Get the budget policy and current rolling-window usage for an actor.",
             "inputSchema": {
@@ -904,6 +923,9 @@ pub async fn dispatch(
         "set_actor_budget" => handle_set_actor_budget(req_id, args, state, user_id).await,
         "set_actor_llm_tier_ceiling" => {
             handle_set_actor_llm_tier_ceiling(req_id, args, state, user_id).await
+        }
+        "set_actor_write_ceiling" => {
+            handle_set_actor_write_ceiling(req_id, args, state, user_id).await
         }
         "get_actor_budget" => handle_get_actor_budget(req_id, args, state, user_id).await,
         "add_actor_approval_policy" => {
@@ -2567,6 +2589,114 @@ async fn handle_set_actor_llm_tier_ceiling(
             "previous_tier": prev_str,
             "max_llm_tier": tier.as_signing_str(),
             "enforcement": "Worker-side at llm::complete entry + HTTP host gate + vault-header gate. Takes effect on the NEXT job dispatched for this actor.",
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+/// Set an actor's data-mutation (write) ceiling.
+/// Thin wrapper: resolve + validate → `ActorRepository::set_actor_max_write_ceiling` → log audit event.
+async fn handle_set_actor_write_ceiling(
+    req_id: Option<serde_json::Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let actor_id = match resolve_actor_via_repo(&req_id, args, &state.actor_repo, user_id).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let ceiling = match args.get("ceiling") {
+        None => {
+            return mcp_error(
+                req_id,
+                -32602,
+                "ceiling must be 'readonly' (refuse data mutation) or 'write' (mutation permitted)",
+            );
+        }
+        Some(v) => match v.as_str() {
+            Some("readonly") => talos_workflow_job_protocol::WriteCeiling::ReadOnly,
+            Some("write") => talos_workflow_job_protocol::WriteCeiling::Write,
+            Some(other) => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!(
+                        "ceiling must be 'readonly' or 'write', got '{}'",
+                        talos_text_util::bounded_preview(other, 64)
+                    ),
+                );
+            }
+            None => {
+                let kind = crate::utils::json_type_name(v);
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("ceiling must be a string ('readonly' or 'write'), got {kind}"),
+                );
+            }
+        },
+    };
+
+    let previous = state
+        .actor_repo
+        .get_actor_max_write_ceiling(actor_id)
+        .await
+        .ok()
+        .flatten();
+
+    let updated = match state
+        .actor_repo
+        .set_actor_max_write_ceiling(actor_id, user_id, ceiling)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(%actor_id, error = %e, "set_actor_write_ceiling failed");
+            return mcp_error(req_id, -32603, "Failed to update actor write ceiling");
+        }
+    };
+    if !updated {
+        return mcp_error(req_id, -32602, "Actor not found or access denied");
+    }
+
+    // Audit log — write-ceiling changes are security-sensitive policy changes
+    // (append-only trigger on admin_event_log). Best-effort.
+    let prev_str = previous.map(|c| c.as_signing_str()).unwrap_or("unknown");
+    let details = serde_json::json!({
+        "previous_ceiling": prev_str,
+        "new_ceiling": ceiling.as_signing_str(),
+    });
+    if let Err(e) = state
+        .actor_repo
+        .insert_admin_event_log(
+            user_id,
+            "actor_write_ceiling_set",
+            "actor",
+            Some(actor_id),
+            &format!(
+                "Actor write ceiling: {prev_str} → {}",
+                ceiling.as_signing_str()
+            ),
+            Some(&details),
+        )
+        .await
+    {
+        tracing::warn!(
+            %actor_id,
+            error = %e,
+            "set_actor_write_ceiling: audit log write failed (policy change applied)"
+        );
+    }
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "actor_id": actor_id.to_string(),
+            "previous_ceiling": prev_str,
+            "max_write_ceiling": ceiling.as_signing_str(),
+            "enforcement": "Worker-side at every data-mutating host surface, gated by TALOS_WRITE_CEILING_ENFORCED. Takes effect on the NEXT job dispatched for this actor.",
         }))
         .unwrap_or_default(),
     )

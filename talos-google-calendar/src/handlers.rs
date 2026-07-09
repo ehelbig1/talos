@@ -1150,7 +1150,9 @@ pub async fn process_webhook_events(
     // OPEN to actor-less Tier-2 (today's behaviour) on any resolution error so a
     // transient DB hiccup never drops inbound calendar events.
     let actor_repo = talos_actor_repository::ActorRepository::new(service.db_pool.clone());
-    let (resolved_actor, actor_tier) = match actor_repo.resolve_effective_actor(user_id, None).await
+    let (resolved_actor, actor_tier, actor_write_ceiling) = match actor_repo
+        .resolve_effective_actor(user_id, None)
+        .await
     {
         Ok(aid) => {
             let tier = actor_repo
@@ -1159,14 +1161,24 @@ pub async fn process_webhook_events(
                 .ok()
                 .flatten()
                 .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
-            (Some(aid), tier)
+            let write_ceiling = actor_repo
+                .get_actor_max_write_ceiling(aid)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
+            (Some(aid), tier, write_ceiling)
         }
         Err(e) => {
             tracing::warn!(
                 %user_id, error = %e,
                 "gcal dispatch: default-actor resolution failed; dispatching actor-less (Tier-2)"
             );
-            (None, talos_workflow_job_protocol::LlmTier::default())
+            (
+                None,
+                talos_workflow_job_protocol::LlmTier::default(),
+                talos_workflow_job_protocol::WriteCeiling::default(),
+            )
         }
     };
 
@@ -1465,6 +1477,7 @@ pub async fn process_webhook_events(
             // enforcement on calendar-triggered processing without the
             // wrap-in-a-workflow workaround.
             max_llm_tier: actor_tier,
+            max_write_ceiling: actor_write_ceiling,
             wasm_bytes: None, // PERFORMANCE: Include bytes directly (avoids file I/O)
             capability_world: None,
             // MCP-1090 (2026-05-16): propagate per-module integration_name
