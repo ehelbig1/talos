@@ -2019,13 +2019,28 @@ impl ActorRepository {
         user_id: Uuid,
         ceiling: talos_workflow_job_protocol::WriteCeiling,
     ) -> Result<bool> {
+        // The `actors_write_ceiling_grant_guard` trigger (migration
+        // 20260709180000) blocks any `readonly -> write` escalation unless
+        // the session opts in via this transaction-local GUC. This is the
+        // ONLY sanctioned grant path, so it is the only place the GUC is set
+        // — a bulk / migration-re-run `UPDATE actors SET
+        // max_write_ceiling='write'` carries no GUC and is refused, which is
+        // exactly the clobber we're guarding against. `set_config(..., true)`
+        // scopes the setting to this transaction. Locking DOWN
+        // (write -> readonly) doesn't strictly need the GUC, but setting it
+        // unconditionally keeps this path simple and is harmless.
+        let mut tx = self.db_pool.begin().await?;
+        sqlx::query("SELECT set_config('talos.allow_ceiling_grant', 'on', true)")
+            .execute(&mut *tx)
+            .await?;
         let result =
             sqlx::query("UPDATE actors SET max_write_ceiling = $1 WHERE id = $2 AND user_id = $3")
                 .bind(ceiling.as_signing_str())
                 .bind(actor_id)
                 .bind(user_id)
-                .execute(&self.db_pool)
+                .execute(&mut *tx)
                 .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
