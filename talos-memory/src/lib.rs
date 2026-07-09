@@ -132,6 +132,19 @@ pub fn validate_memory_key(key: &str) -> Result<&str, &'static str> {
 /// 10 years = 87 600 hours.
 pub const MAX_TTL_HOURS: f64 = 87_600.0;
 
+/// Default retention for values written through the `agent_memory::set` host
+/// binding (WASM guest KV writes).
+///
+/// The WIT contract (`wit/talos.wit`) documents `set` as *persistent* storage.
+/// Before 2026-07 the worker binding hardcoded `memory_type = "working"` (1 h
+/// TTL), so any state a module wrote via `set` silently vanished before the
+/// next scheduled workflow run — a durable-KV API that wasn't durable. `set`
+/// now writes `episodic` memory at this ceiling: effectively permanent, and
+/// (unlike `scratchpad`, which is filtered out of actor-context injection)
+/// first-class for context loading. Equals [`MAX_TTL_HOURS`]; the clamp in
+/// [`default_expires_at`] keeps them in lockstep even if the ceiling changes.
+pub const SET_KV_TTL_HOURS: f64 = MAX_TTL_HOURS;
+
 pub fn default_expires_at(memory_type: &str, ttl_hours: Option<f64>) -> Option<DateTime<Utc>> {
     let hours = ttl_hours.or(match memory_type {
         "working" => Some(1.0),
@@ -2403,6 +2416,27 @@ mod tests {
         let custom = default_expires_at("semantic", Some(2.0)).unwrap();
         let delta = custom.signed_duration_since(Utc::now());
         assert!(delta.num_hours() >= 1 && delta.num_hours() <= 2);
+    }
+
+    #[test]
+    fn set_kv_default_is_durable_not_working() {
+        // Regression guard for the pre-2026-07 footgun: the `agent_memory::set`
+        // host binding hardcoded `working`/1h, so state written via `set`
+        // silently vanished before the next scheduled workflow run. `set` now
+        // persists `episodic` at SET_KV_TTL_HOURS — this must resolve to an
+        // effectively-permanent expiry, NOT the 1h working default.
+        let exp = default_expires_at("episodic", Some(SET_KV_TTL_HOURS))
+            .expect("set() TTL must yield a durable expiry");
+        assert!(
+            exp > Utc::now() + Duration::days(365 * 9),
+            "set() retention must be >9 years (effectively permanent), got {exp}"
+        );
+        // Lockstep with the ceiling so the clamp in default_expires_at can never
+        // silently shorten it.
+        assert_eq!(SET_KV_TTL_HOURS, MAX_TTL_HOURS);
+        // And unambiguously longer-lived than the old working/1h default.
+        let working = default_expires_at("working", None).unwrap();
+        assert!(exp > working + Duration::days(3000));
     }
 
     #[test]
