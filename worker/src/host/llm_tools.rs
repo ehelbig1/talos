@@ -99,132 +99,83 @@ impl wit_llm_tools::Host for TalosContext {
             wit_llm_tools::Provider::Ollama => "mistral".to_string(),
         });
 
-        // 4. Build the messages array from rich messages.
-        let messages: Vec<serde_json::Value> = req
+        // 4. Convert the WIT rich messages + tool defs into canonical form
+        //    and let the provider adapter build its own wire body.
+        //    Pre-trait, every provider received the ANTHROPIC tools shape
+        //    (`input_schema` tools, `content[]` block messages) — on
+        //    OpenAI-format wires the tools were silently ignored and no
+        //    tool call ever parsed back.
+        let adapter = llm_providers::adapter_for(provider_name);
+
+        let messages: Vec<llm_providers::ToolMessage> = req
             .messages
             .iter()
-            .map(|msg| {
-                let role = match msg.role {
-                    wit_llm_tools::Role::System => "user",
-                    wit_llm_tools::Role::User => "user",
-                    wit_llm_tools::Role::Assistant => "assistant",
-                    wit_llm_tools::Role::Tool => "user",
-                };
-                let content: Vec<serde_json::Value> = msg
+            .map(|msg| llm_providers::ToolMessage {
+                role: match msg.role {
+                    wit_llm_tools::Role::System => llm_providers::ChatRole::System,
+                    wit_llm_tools::Role::Assistant => llm_providers::ChatRole::Assistant,
+                    wit_llm_tools::Role::User | wit_llm_tools::Role::Tool => {
+                        llm_providers::ChatRole::User
+                    }
+                },
+                is_tool_result_turn: matches!(msg.role, wit_llm_tools::Role::Tool),
+                content: msg
                     .content
                     .iter()
                     .map(|block| match block {
                         wit_llm_tools::ContentBlock::Text(t) => {
-                            serde_json::json!({"type": "text", "text": t})
+                            llm_providers::ToolContentBlock::Text(t.clone())
                         }
                         wit_llm_tools::ContentBlock::ToolUse(tc) => {
-                            serde_json::json!({
-                                "type": "tool_use",
-                                "id": tc.call_id,
-                                "name": tc.tool_name,
-                                "input": serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                    .unwrap_or(serde_json::json!({})),
-                            })
+                            llm_providers::ToolContentBlock::ToolUse {
+                                call_id: tc.call_id.clone(),
+                                tool_name: tc.tool_name.clone(),
+                                arguments: tc.arguments.clone(),
+                            }
                         }
                         wit_llm_tools::ContentBlock::ToolResult(tr) => {
-                            serde_json::json!({
-                                "type": "tool_result",
-                                "tool_use_id": tr.call_id,
-                                "content": tr.output,
-                                "is_error": tr.is_error,
-                            })
+                            llm_providers::ToolContentBlock::ToolResult {
+                                call_id: tr.call_id.clone(),
+                                output: tr.output.clone(),
+                                is_error: tr.is_error,
+                            }
                         }
                         wit_llm_tools::ContentBlock::Image(img) => {
-                            serde_json::json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": img.media_type,
-                                    "data": img.data,
-                                }
-                            })
+                            llm_providers::ToolContentBlock::Image {
+                                media_type: img.media_type.clone(),
+                                data: img.data.clone(),
+                            }
                         }
                     })
-                    .collect();
-                serde_json::json!({"role": role, "content": content})
+                    .collect(),
             })
             .collect();
 
-        // 5. Build tools array from tool definitions.
-        let tools: Vec<serde_json::Value> = req
+        let tools: Vec<llm_providers::ToolDef> = req
             .tools
             .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": serde_json::from_str::<serde_json::Value>(&t.input_schema)
-                        .unwrap_or(serde_json::json!({})),
-                })
+            .map(|t| llm_providers::ToolDef {
+                name: &t.name,
+                description: &t.description,
+                input_schema: serde_json::from_str::<serde_json::Value>(&t.input_schema)
+                    .unwrap_or(serde_json::json!({})),
             })
             .collect();
 
-        // 6. Assemble the request body.
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "max_tokens": req.max_tokens.unwrap_or(4096),
-        });
+        let body = adapter
+            .build_tools_body(&llm_providers::ToolCompletionParams {
+                model: &model,
+                messages: &messages,
+                tools: &tools,
+                system_prompt: req.system_prompt.as_deref(),
+                max_tokens: req.max_tokens.unwrap_or(4096),
+                temperature: req.temperature,
+                force_tool: req.force_tool.as_deref(),
+            })
+            .map_err(wit_llm_tools::Error::NotConfigured)?;
 
-        if let Some(temp) = req.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(ref sys) = req.system_prompt {
-            body["system"] = serde_json::json!(sys);
-        }
-        if let Some(ref force) = req.force_tool {
-            body["tool_choice"] = serde_json::json!({"type": "tool", "name": force});
-        }
-
-        // For OpenAI-compatible providers, convert system_prompt to a message.
-        let uses_openai_format_tools = matches!(
-            provider,
-            wit_llm_tools::Provider::Openai | wit_llm_tools::Provider::Ollama
-        );
-        if uses_openai_format_tools {
-            if let Some(ref sys) = req.system_prompt {
-                body.as_object_mut().and_then(|obj| {
-                    obj.get_mut("messages").and_then(|m| {
-                        m.as_array_mut().map(|arr| {
-                            arr.insert(0, serde_json::json!({"role": "system", "content": sys}));
-                        })
-                    })
-                });
-                body.as_object_mut().map(|obj| obj.remove("system"));
-            }
-        }
-
-        // 7. Determine endpoint and auth based on provider.
-        let ollama_url_tools = ollama_base_url();
-
-        let (url, auth_header, auth_value) = match provider {
-            wit_llm_tools::Provider::Anthropic => (
-                "https://api.anthropic.com/v1/messages".to_string(),
-                "x-api-key",
-                api_key,
-            ),
-            wit_llm_tools::Provider::Openai => (
-                "https://api.openai.com/v1/chat/completions".to_string(),
-                "Authorization",
-                format!("Bearer {}", api_key),
-            ),
-            wit_llm_tools::Provider::Gemini => (
-                "https://generativelanguage.googleapis.com/v1beta/models".to_string(),
-                "x-goog-api-key",
-                api_key,
-            ),
-            wit_llm_tools::Provider::Ollama => (
-                format!("{}/v1/chat/completions", ollama_url_tools),
-                "",
-                String::new(),
-            ),
-        };
+        let url = adapter.completion_url(&model);
+        let auth_headers = adapter.auth_headers(&api_key);
 
         let body_bytes = serde_json::to_vec(&body).map_err(|e| {
             wit_llm_tools::Error::InvalidRequest(format!("Failed to serialize request body: {e}"))
@@ -251,13 +202,12 @@ impl wit_llm_tools::Host for TalosContext {
             EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS
         };
         let mut http_req_tools = client.post(&url).header("Content-Type", "application/json");
-        if !auth_header.is_empty() {
-            http_req_tools = http_req_tools.header(auth_header, &auth_value);
+        // Adapter-owned auth + protocol-version headers (empty for local
+        // providers). Values may embed the API key — never logged.
+        for (name, value) in &auth_headers {
+            http_req_tools = http_req_tools.header(*name, value);
         }
-        if matches!(provider, wit_llm_tools::Provider::Anthropic) {
-            http_req_tools = http_req_tools.header("anthropic-version", "2023-06-01");
-        }
-        let resp_body: serde_json::Value = tokio::time::timeout(
+        let resp_bytes: Vec<u8> = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs_tools),
             async move {
                 let response = http_req_tools.body(body_bytes).send().await.map_err(|e| {
@@ -289,66 +239,58 @@ impl wit_llm_tools::Host for TalosContext {
                     )));
                 }
 
-                let body_bytes = read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
                     .await
                     .ok_or_else(|| {
                         wit_llm_tools::Error::ApiError(format!(
                             "LLM tool-use response exceeded {} bytes; aborted body read",
                             MAX_LLM_BODY_BYTES
                         ))
-                    })?;
-                serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|e| {
-                    wit_llm_tools::Error::ApiError(format!("Failed to parse response JSON: {e}"))
-                })
+                    })
             },
         )
         .await
         .map_err(|_| wit_llm_tools::Error::Timeout)??;
 
-        // 9. Parse response into content blocks.
-        let content_blocks: Vec<wit_llm_tools::ContentBlock> = resp_body
-            .get("content")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|block| {
-                        let block_type = block.get("type")?.as_str()?;
-                        match block_type {
-                            "text" => {
-                                let text = block.get("text")?.as_str()?.to_string();
-                                Some(wit_llm_tools::ContentBlock::Text(text))
-                            }
-                            "tool_use" => {
-                                let tc = wit_llm_tools::ToolCall {
-                                    tool_name: block.get("name")?.as_str()?.to_string(),
-                                    call_id: block.get("id")?.as_str()?.to_string(),
-                                    arguments: block.get("input")?.to_string(),
-                                };
-                                Some(wit_llm_tools::ContentBlock::ToolUse(tc))
-                            }
-                            _ => None,
-                        }
-                    })
-                    .collect()
+        // 9. Adapter-owned parse into canonical blocks. `arguments` is
+        //    ALWAYS the JSON string form here — the native-Ollama wire
+        //    returns an object and its adapter re-serializes it.
+        let parsed = adapter
+            .parse_tool_completion(&resp_bytes)
+            .map_err(wit_llm_tools::Error::ApiError)?;
+
+        let content_blocks: Vec<wit_llm_tools::ContentBlock> = parsed
+            .blocks
+            .into_iter()
+            .map(|b| match b {
+                llm_providers::ParsedToolBlock::Text(t) => wit_llm_tools::ContentBlock::Text(t),
+                llm_providers::ParsedToolBlock::ToolUse {
+                    call_id,
+                    tool_name,
+                    arguments,
+                } => wit_llm_tools::ContentBlock::ToolUse(wit_llm_tools::ToolCall {
+                    tool_name,
+                    call_id,
+                    arguments,
+                }),
             })
-            .unwrap_or_default();
+            .collect();
 
-        let usage = resp_body.get("usage").map(|u| wit_llm_tools::TokenUsage {
-            // MCP-1008: saturate-on-overflow (see helper docs).
-            input_tokens: json_token_count_as_u32(u.get("input_tokens"), 0),
-            output_tokens: json_token_count_as_u32(u.get("output_tokens"), 0),
-        });
-
-        let stop_reason = resp_body
-            .get("stop_reason")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        // MCP-1008: saturate-on-overflow; `usage` stays `None` when the
+        // provider sent no counts at all.
+        let usage = match (parsed.input_tokens, parsed.output_tokens) {
+            (None, None) => None,
+            (i, o) => Some(wit_llm_tools::TokenUsage {
+                input_tokens: u32::try_from(i.unwrap_or(0)).unwrap_or(u32::MAX),
+                output_tokens: u32::try_from(o.unwrap_or(0)).unwrap_or(u32::MAX),
+            }),
+        };
 
         Ok(wit_llm_tools::ToolCompletionResponse {
             content: content_blocks,
             model,
             usage,
-            stop_reason,
+            stop_reason: parsed.stop_reason,
         })
     }
 }

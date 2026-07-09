@@ -300,10 +300,9 @@ pub(crate) struct AnthropicSseDecoder {
     tool_input_bufs: std::collections::HashMap<u64, (String, String, String)>,
 }
 
-// MCP-1113 caps (mirrored from the pre-trait constants in limits.rs; kept
-// here because they bound DECODER state, which now lives per-adapter).
-const MAX_TOOL_INPUT_BUFS_PER_STREAM: usize = 64;
-const MAX_TOOL_INPUT_BUF_BYTES: usize = 1024 * 1024;
+// MCP-1113 caps — canonical values live in `host::limits`; the decoder
+// state they bound now lives per-adapter.
+use crate::host::{MAX_TOOL_INPUT_BUFS_PER_STREAM, MAX_TOOL_INPUT_BUF_BYTES};
 
 impl StreamDecoder for AnthropicSseDecoder {
     fn feed_line(&mut self, line: &str, out: &mut Vec<StreamEventOut>) {

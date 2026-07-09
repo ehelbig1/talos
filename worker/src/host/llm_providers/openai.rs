@@ -371,8 +371,10 @@ pub(crate) struct OpenAiSseDecoder {
     done_emitted: bool,
 }
 
-const MAX_TOOL_BUFS: usize = 64;
-const MAX_TOOL_BUF_BYTES: usize = 1024 * 1024;
+// MCP-1113 caps — same bounds as the Anthropic decoder, canonical values
+// in `host::limits`.
+use crate::host::MAX_TOOL_INPUT_BUFS_PER_STREAM as MAX_TOOL_BUFS;
+use crate::host::MAX_TOOL_INPUT_BUF_BYTES as MAX_TOOL_BUF_BYTES;
 
 impl OpenAiSseDecoder {
     fn flush_tools(&mut self, out: &mut Vec<StreamEventOut>) {
