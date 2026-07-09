@@ -48,6 +48,7 @@ mod http_stream;
 mod integration_state;
 mod limits;
 mod llm;
+pub(crate) mod llm_providers;
 mod llm_streaming;
 mod llm_tools;
 mod logging;
