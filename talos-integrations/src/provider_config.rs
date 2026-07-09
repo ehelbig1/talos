@@ -89,9 +89,22 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         env_vars: &["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
         redirect_path: "/auth/oauth/google/callback",
         db_table: "google_calendar_integrations",
-        account_identifier_column: "o.email",
-        account_identifier_join: Some("JOIN oauth_accounts o ON g.oauth_account_id = o.id"),
-        extra_where: "",
+        // PR #440 decoupled Google Calendar from the SSO-login `oauth_accounts`
+        // table (dropped the FK) and moved the connected-account label to the
+        // `account_email` column, written by the dedicated connect callback.
+        // So: prefer `g.account_email`, LEFT JOIN (not INNER) `oauth_accounts`
+        // so decoupled rows — whose synthetic `oauth_account_id` has no
+        // matching login-identity row — still surface, and fall back to
+        // `o.email` for legacy SSO-piggyback rows. The trailing literal
+        // guarantees a non-NULL identifier (the row struct's `identifier` is
+        // non-nullable — a NULL would fail the whole UNION-ALL query and hide
+        // EVERY provider's integrations). Pre-fix the INNER JOIN matched zero
+        // rows for the new flow, so a connected calendar showed no account.
+        account_identifier_column: "COALESCE(g.account_email, o.email, 'Google Calendar')",
+        account_identifier_join: Some("LEFT JOIN oauth_accounts o ON g.oauth_account_id = o.id"),
+        // Hide soft-disconnected integrations (the dedicated GCal disconnect
+        // flow sets is_active = false).
+        extra_where: "AND g.is_active = true",
         disconnect_is_soft_delete: false,
     },
     IntegrationProviderConfig {
@@ -143,3 +156,46 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         disconnect_is_soft_delete: true,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the "Google Calendar shows no connected account"
+    /// bug: PR #440 dropped the `google_calendar_integrations → oauth_accounts`
+    /// FK and moved the label to `account_email`, but the serviceIntegrations
+    /// query still INNER-JOINed `oauth_accounts` on the now-synthetic
+    /// `oauth_account_id`, matching zero rows. The config must (a) prefer
+    /// `account_email`, (b) LEFT JOIN so decoupled rows survive, and (c) never
+    /// yield a NULL identifier (non-nullable row field → a NULL fails the whole
+    /// UNION-ALL and hides every provider).
+    #[test]
+    fn google_calendar_surfaces_decoupled_rows() {
+        let gcal = PROVIDERS
+            .iter()
+            .find(|p| p.id == "google-calendar")
+            .expect("google-calendar provider must exist");
+
+        assert!(
+            gcal.account_identifier_column.contains("account_email"),
+            "must prefer the decoupled account_email column, got: {}",
+            gcal.account_identifier_column
+        );
+        let join = gcal
+            .account_identifier_join
+            .expect("gcal still LEFT JOINs oauth_accounts for legacy SSO rows");
+        assert!(
+            join.trim_start().to_uppercase().starts_with("LEFT JOIN"),
+            "join must be a LEFT JOIN so decoupled rows without an oauth_accounts \
+             match still appear, got: {join}"
+        );
+        assert!(
+            gcal.account_identifier_column
+                .to_uppercase()
+                .contains("COALESCE"),
+            "identifier must be COALESCE-guarded so it is never NULL (non-nullable \
+             row field), got: {}",
+            gcal.account_identifier_column
+        );
+    }
+}
