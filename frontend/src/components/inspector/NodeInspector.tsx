@@ -186,7 +186,11 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
 
       <Tabs
         defaultValue="config"
-        className="flex-1 flex flex-col overflow-hidden relative z-10"
+        // min-h-0: a flex child defaults to min-height:auto, which refuses to
+        // shrink below its content — so the inner TabsContent `overflow-auto`
+        // never scrolls and tall node details overflow (get clipped). Allow the
+        // column to shrink so the scroll area is bounded and scrolls.
+        className="flex-1 min-h-0 flex flex-col overflow-hidden relative z-10"
       >
         <div className="px-8 pt-6 pb-2 border-b border-white/5 bg-white/[0.01]">
           <TabsList className="w-full justify-start rounded-2xl border border-white/5 bg-black/20 p-1.5 gap-1 shrink-0 h-auto">
@@ -209,7 +213,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
 
         <TabsContent
           value="config"
-          className="flex-1 overflow-auto p-8 space-y-10 custom-scrollbar focus:outline-none"
+          className="flex-1 min-h-0 overflow-auto p-8 space-y-10 custom-scrollbar focus:outline-none"
         >
           <div className="flex flex-wrap gap-2.5">
             {node.data.capabilityWorld && (
@@ -373,7 +377,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
 
         <TabsContent
           value="logs"
-          className="flex-1 overflow-auto p-8 space-y-10 custom-scrollbar focus:outline-none"
+          className="flex-1 min-h-0 overflow-auto p-8 space-y-10 custom-scrollbar focus:outline-none"
         >
           <div className="space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500">
             {/* Status Panel */}
