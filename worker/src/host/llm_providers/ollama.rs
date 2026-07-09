@@ -292,9 +292,11 @@ impl ProviderAdapter for OllamaAdapter {
         // the OpenAI message/tool assembly, then swap the transport
         // fields to native shape.
         let openai_body = super::openai::OpenAiAdapter.build_tools_body(p)?;
+        let mut messages = openai_body.get("messages").cloned().unwrap_or_default();
+        normalize_native_message_content(&mut messages);
         let mut body = serde_json::json!({
             "model": p.model,
-            "messages": openai_body.get("messages").cloned().unwrap_or_default(),
+            "messages": messages,
             "tools": openai_body.get("tools").cloned().unwrap_or_default(),
             "stream": false,
             "options": { "num_predict": p.max_tokens },
@@ -359,6 +361,8 @@ impl ProviderAdapter for OllamaAdapter {
         if let Some(sys) = system_prompt {
             msgs.insert(0, serde_json::json!({"role": "system", "content": sys}));
         }
+        let mut msgs = serde_json::Value::Array(msgs);
+        normalize_native_message_content(&mut msgs);
         let mut options = serde_json::json!({ "num_predict": max_tokens });
         if let Some(t) = temperature {
             options["temperature"] = serde_json::json!(t);
@@ -377,6 +381,73 @@ impl ProviderAdapter for OllamaAdapter {
 
     fn stream_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
         Some(Box::new(OllamaJsonlDecoder::default()))
+    }
+}
+
+/// Native `/api/chat` requires `message.content` to be a STRING — it
+/// 400s on array content ("json: cannot unmarshal array into Go struct
+/// field ChatRequest.messages.content of type string", verified live on
+/// 0.31.2). The OpenAI-compat endpoint tolerated two array shapes that
+/// can still reach this adapter:
+///   * OpenAI multimodal parts (`{type:"text"|"image_url", …}`) from the
+///     shared tools-body assembly when images are present;
+///   * rich blocks (`{type:"text", text}`) per the WIT `stream-request`
+///     doc for `messages-json`.
+/// Flatten both: text parts join into the string `content`; image parts
+/// move to the native per-message `images` field (raw base64 — strip the
+/// data-URL prefix); other block kinds are dropped (native chat has no
+/// wire for them).
+fn normalize_native_message_content(messages: &mut serde_json::Value) {
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    for msg in arr {
+        let Some(parts) = msg.get("content").and_then(|c| c.as_array()).cloned() else {
+            continue; // already a string (or absent) — native-safe
+        };
+        let mut text = String::new();
+        let mut images: Vec<serde_json::Value> = Vec::new();
+        for part in &parts {
+            match part.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+                Some("image_url") => {
+                    // OpenAI part: {"image_url":{"url":"data:<mime>;base64,<DATA>"}}
+                    if let Some(url) = part
+                        .get("image_url")
+                        .and_then(|i| i.get("url"))
+                        .and_then(|u| u.as_str())
+                    {
+                        if let Some((_, b64)) = url.split_once("base64,") {
+                            images.push(serde_json::json!(b64));
+                        }
+                    }
+                }
+                Some("image") => {
+                    // rich block: {"type":"image","source":{"data": <b64>}}
+                    if let Some(d) = part
+                        .get("source")
+                        .and_then(|s| s.get("data"))
+                        .and_then(|d| d.as_str())
+                    {
+                        images.push(serde_json::json!(d));
+                    }
+                }
+                _ => {
+                    // tool-use / tool-result / unknown blocks have no
+                    // native content wire — dropped (assistant tool calls
+                    // ride the separate `tool_calls` field, already
+                    // handled by the body builders).
+                }
+            }
+        }
+        msg["content"] = serde_json::json!(text);
+        if !images.is_empty() {
+            msg["images"] = serde_json::json!(images);
+        }
     }
 }
 
@@ -645,6 +716,53 @@ mod tests {
         );
         assert_eq!(out[3], StreamEventOut::Done("stop".into()));
         assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn stream_body_flattens_rich_block_content_to_string() {
+        // Native /api/chat 400s on array content (verified live 0.31.2);
+        // the WIT stream-request doc tells guests to send rich blocks.
+        let messages = serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "Hello "},
+                                          {"type": "text", "text": "world"}]},
+            {"role": "assistant", "content": "already a string"},
+        ]);
+        let body = OllamaAdapter
+            .build_stream_body("m", messages, None, Some("SYS"), 64, None)
+            .unwrap();
+        assert_eq!(body["messages"][0]["content"], "SYS"); // system prepend
+        assert_eq!(body["messages"][1]["content"], "Hello world");
+        assert_eq!(body["messages"][2]["content"], "already a string");
+    }
+
+    #[test]
+    fn tools_body_moves_image_parts_to_native_images_field() {
+        // Images arrive from the shared OpenAI assembly as multimodal
+        // parts with data-URLs; native wants raw base64 in `images`.
+        let messages = [ToolMessage {
+            role: ChatRole::User,
+            is_tool_result_turn: false,
+            content: vec![
+                ToolContentBlock::Text("what is this?".into()),
+                ToolContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAAABBBB".into(),
+                },
+            ],
+        }];
+        let body = OllamaAdapter
+            .build_tools_body(&ToolCompletionParams {
+                model: "m",
+                messages: &messages,
+                tools: &[],
+                system_prompt: None,
+                max_tokens: 10,
+                temperature: None,
+                force_tool: None,
+            })
+            .unwrap();
+        assert_eq!(body["messages"][0]["content"], "what is this?");
+        assert_eq!(body["messages"][0]["images"][0], "AAAABBBB");
     }
 
     #[test]
