@@ -816,6 +816,14 @@ async fn run_replays(
                 // which would let stored Tier-1 data egress to external
                 // LLM hosts during replay.
                 llm_tier,
+                // Write ceiling: replay is an operator-invoked regression
+                // diagnostic against stored samples, not live actor
+                // execution. Run permissively (`Write`) so a workflow that
+                // legitimately mutates doesn't surface a spurious
+                // write-ceiling refusal in the replay diff; the ceiling
+                // gate governs live execution, which the actor binding
+                // stamps there.
+                talos_workflow_job_protocol::WriteCeiling::Write,
             )
             .await;
         let duration_ms = start.elapsed().as_millis() as i64;
