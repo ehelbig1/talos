@@ -399,10 +399,16 @@ pub async fn for_workflow(
     //     Fail-open + cached; kill switch `TALOS_ADAPTIVE_FUEL=0`.
     let learned = crate::adaptive_fuel::learned_fuel_ceilings(&pool, opts.workflow_id).await;
     if !learned.is_empty() {
-        tracing::debug!(
+        // INFO so operators see adaptation in the logs without querying the
+        // rollup. Fires once per engine build (per execution) when any node has
+        // ≥5 samples; `ceilings` carries the learned value per node label.
+        // Guard mode means each is a floor, so a node is only actually raised
+        // when its learned value exceeds its configured baseline at dispatch.
+        tracing::info!(
             workflow_id = %opts.workflow_id,
             nodes = learned.len(),
-            "adaptive fuel: applied learned per-node ceilings"
+            ceilings = ?learned,
+            "adaptive fuel: loaded learned per-node ceilings (guard mode — raises only)"
         );
         engine.set_learned_fuel_ceilings(learned);
     }
