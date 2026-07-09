@@ -212,6 +212,20 @@ pub struct ModuleFuelStats {
     pub wall_time_p95_ms: i64,
 }
 
+/// Per-node fuel-consumption statistics for one workflow, aggregated across
+/// executions. Feeds the adaptive-fuel learned ceiling (Phase 2): a node's
+/// effective `max_fuel` is raised to `max(configured, adaptive_ceiling(p95, max))`
+/// so it never silently under-provisions. `node_label` matches the label the
+/// engine dispatches under (the `execution_cost_rollup.node_id` column, which
+/// stores the human label, not a UUID).
+#[derive(Debug, Clone)]
+pub struct NodeFuelStat {
+    pub node_label: String,
+    pub executions: i64,
+    pub fuel_p95: u64,
+    pub fuel_max: u64,
+}
+
 #[derive(Debug)]
 pub struct VersionChangelogRow {
     pub version_number: Option<i32>,
@@ -4067,6 +4081,61 @@ impl AnalyticsRepository {
                     }
                 },
             )
+            .collect())
+    }
+
+    /// Per-node fuel-consumption stats for ONE workflow, aggregated across its
+    /// recent executions. Powers the adaptive-fuel learned ceiling (Phase 2).
+    ///
+    /// Scoped by `workflow_id` (the tenant boundary — a workflow belongs to one
+    /// owner) with the `workflows` join kept as the RLS backstop for when the
+    /// per-tenant policy lands. `min_executions` gates out nodes with too few
+    /// samples to trust a percentile; zero-fuel structural nodes (collect/loop
+    /// scaffolding) are excluded. Returns at most one row per distinct node
+    /// label — small and index-served via `idx_cost_rollup_workflow`.
+    pub async fn get_workflow_node_fuel_stats(
+        &self,
+        workflow_id: Uuid,
+        days: i32,
+        min_executions: i64,
+    ) -> Result<Vec<NodeFuelStat>> {
+        let rows = sqlx::query_as::<_, (String, i64, Option<f64>, Option<i64>)>(
+            "SELECT \
+                r.node_id, \
+                COUNT(*) AS executions, \
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY r.fuel_consumed) AS fuel_p95, \
+                MAX(r.fuel_consumed) AS fuel_max \
+             FROM execution_cost_rollup r \
+             JOIN workflows w ON w.id = r.workflow_id \
+             WHERE r.workflow_id = $1 \
+               AND r.recorded_at > NOW() - make_interval(days => $2::int) \
+               AND r.fuel_consumed > 0 \
+             GROUP BY r.node_id \
+             HAVING COUNT(*) >= $3",
+        )
+        .bind(workflow_id)
+        .bind(days)
+        .bind(min_executions)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(node_label, executions, p95, fmax)| {
+                // PERCENTILE_CONT / MAX are non-negative here (fuel_consumed > 0),
+                // but clamp defensively before the u64 cast.
+                let fuel_p95 = p95.unwrap_or(0.0).max(0.0) as u64;
+                let fuel_max = i64::max(fmax.unwrap_or(0), 0) as u64;
+                if fuel_max == 0 {
+                    return None;
+                }
+                Some(NodeFuelStat {
+                    node_label,
+                    executions,
+                    fuel_p95,
+                    fuel_max,
+                })
+            })
             .collect())
     }
 

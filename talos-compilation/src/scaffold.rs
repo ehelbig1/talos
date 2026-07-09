@@ -314,6 +314,38 @@ pub fn describe_fuel(limit: u64, consumed: Option<u64>) -> FuelHuman {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive fuel (Phase 2): learn a per-node ceiling from observed consumption.
+// ---------------------------------------------------------------------------
+
+/// Headroom multiplier applied to the p95 of a node's observed consumption.
+/// p95 (not max) resists a single anomalous run inflating the ceiling.
+pub(crate) const ADAPTIVE_P95_MULTIPLIER: f64 = 2.0;
+/// Headroom multiplier applied to the single worst observed run — guarantees
+/// the learned ceiling covers even the heaviest payload seen, with slack.
+pub(crate) const ADAPTIVE_MAX_MULTIPLIER: f64 = 1.3;
+
+/// Compute a learned per-node fuel ceiling from observed consumption stats.
+///
+/// GUARD-MODE semantics: this returns a ceiling that comfortably covers what a
+/// node has actually used — `p95 × 2`, and never less than `worst_run × 1.3` —
+/// clamped to the dispatcher's `[FUEL_MIN, FUEL_MAX]` range. The caller applies
+/// it as a **floor**: `max(configured_baseline, adaptive_ceiling(...))`. So
+/// adaptation can only ever RAISE a node's ceiling to prevent silent
+/// under-provisioning; it can never lower it below a deliberately-set value, and
+/// therefore can never introduce a fuel-exhaustion failure that the static
+/// ceiling wouldn't already have had.
+///
+/// Invariant (unit-tested): the result always covers the worst observed run —
+/// `adaptive_ceiling(p95, max) >= max` for any `max <= FUEL_MAX` — so a node
+/// dispatched at (at least) this ceiling would not have exhausted on any run in
+/// the sample window.
+pub fn adaptive_ceiling(p95_consumed: u64, max_consumed: u64) -> u64 {
+    let from_p95 = (p95_consumed as f64 * ADAPTIVE_P95_MULTIPLIER) as u64;
+    let from_max = (max_consumed as f64 * ADAPTIVE_MAX_MULTIPLIER) as u64;
+    from_p95.max(from_max).clamp(FUEL_MIN, FUEL_MAX)
+}
+
 /// Parameters accepted by `generate_module_scaffold`.
 #[derive(Debug, Clone)]
 pub struct ScaffoldParams<'a> {
@@ -1100,5 +1132,43 @@ mod tests {
         let b = describe_fuel(8_000_000, None);
         assert!(b.health.is_none());
         assert!(b.summary.contains("handles"));
+    }
+
+    #[test]
+    fn adaptive_ceiling_always_covers_the_worst_run() {
+        // The core safety invariant: a node dispatched at the learned ceiling
+        // would not have exhausted on ANY run in the sample — the ceiling always
+        // covers the worst observed consumption (unless that already sits at the
+        // 50M rail, where max itself is the ceiling).
+        for (p95, max) in [
+            (100_000u64, 100_000u64),
+            (500_000, 900_000),
+            (1_000_000, 1_000_000),
+            (2_000_000, 3_500_000),
+            (10_000_000, 12_000_000),
+            (33_000_000, 40_000_000),
+        ] {
+            let c = adaptive_ceiling(p95, max);
+            assert!(
+                c >= max,
+                "learned ceiling {c} must cover worst run {max} (p95 {p95})"
+            );
+            assert!(
+                (FUEL_MIN..=FUEL_MAX).contains(&c),
+                "ceiling {c} out of bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_ceiling_bounds_and_headroom() {
+        // Tiny usage clamps up to the 1M floor (never below).
+        assert_eq!(adaptive_ceiling(100_000, 100_000), FUEL_MIN);
+        // Typical: p95×2 dominates for a stable node.
+        assert_eq!(adaptive_ceiling(1_000_000, 1_000_000), 2_000_000);
+        // A spike: worst_run×1.3 provides the floor when p95 is much lower.
+        assert_eq!(adaptive_ceiling(500_000, 3_000_000), 3_900_000);
+        // Huge usage clamps to the 50M ceiling (never above).
+        assert_eq!(adaptive_ceiling(40_000_000, 45_000_000), FUEL_MAX);
     }
 }

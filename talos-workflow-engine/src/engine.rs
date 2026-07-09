@@ -767,6 +767,14 @@ pub struct ParallelWorkflowEngine {
     /// `max_fuel` overrides from the graph JSON and the module's
     /// declared fuel budget.
     pub(crate) max_fuel_per_node: u64,
+    /// Adaptive-fuel (Phase 2) learned ceilings, keyed by node LABEL (matching
+    /// `execution_cost_rollup.node_id`). Populated by the controller via
+    /// [`set_learned_fuel_ceilings`](Self::set_learned_fuel_ceilings) before a
+    /// run; empty by default, in which case behaviour is identical to the
+    /// static ceiling. Applied as a FLOOR in `resolve_node_max_fuel` — it can
+    /// only ever RAISE a node's ceiling toward observed demand, never lower a
+    /// deliberately-set value (so it can never introduce a new fuel failure).
+    pub(crate) learned_fuel_ceilings: HashMap<String, u64>,
     /// Optional pluggable backing store for the per-module
     /// rate-limit counter. When `None` (the default), the engine
     /// uses the process-global in-memory `MODULE_RATE_LIMITS`
@@ -951,6 +959,7 @@ impl ParallelWorkflowEngine {
             graph: DiGraph::new(),
             node_map: HashMap::new(),
             node_labels: HashMap::new(),
+            learned_fuel_ceilings: HashMap::new(),
             node_configs: HashMap::new(),
             module_fetcher: None,
             event_sink: None,
@@ -1237,6 +1246,40 @@ impl ParallelWorkflowEngine {
     /// any single dispatch can occupy.
     pub fn set_max_fuel_per_node(&mut self, max_fuel: u64) {
         self.max_fuel_per_node = max_fuel;
+    }
+
+    /// Install the adaptive-fuel (Phase 2) learned ceilings for this run, keyed
+    /// by node label. The controller computes these from `execution_cost_rollup`
+    /// history (p95/max × headroom, tenant-scoped) and injects them before
+    /// running. Empty ⇒ adaptive off / no history ⇒ static-ceiling behaviour.
+    pub fn set_learned_fuel_ceilings(&mut self, ceilings: HashMap<String, u64>) {
+        self.learned_fuel_ceilings = ceilings;
+    }
+
+    /// Resolve a node's effective `max_fuel` — the single decision point shared
+    /// by every dispatch path (single-node, pipeline step, loop body).
+    ///
+    /// Precedence: an explicit `config_override` (graph-JSON `max_fuel`) or the
+    /// module default forms the **baseline**; the adaptive learned ceiling is
+    /// then applied as a FLOOR (`max(baseline, learned)`) so it can only RAISE
+    /// the ceiling to cover observed demand, never lower a deliberately-set
+    /// value. The result is clamped to the engine-wide `max_fuel_per_node`
+    /// ceiling. When no learned value exists for the node the result equals the
+    /// pre-adaptive `baseline.min(max_fuel_per_node)`, byte-for-byte.
+    pub(crate) fn resolve_node_max_fuel(
+        &self,
+        node_id: &Uuid,
+        config_override: Option<u64>,
+        module_default: u64,
+    ) -> u64 {
+        let baseline = config_override.unwrap_or(module_default);
+        let learned = self
+            .node_labels
+            .get(node_id)
+            .and_then(|label| self.learned_fuel_ceilings.get(label))
+            .copied()
+            .unwrap_or(0);
+        baseline.max(learned).min(self.max_fuel_per_node)
     }
 
     /// Replace the per-module rate-limit counter backing store.

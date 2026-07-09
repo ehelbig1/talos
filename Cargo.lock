@@ -7594,6 +7594,8 @@ dependencies = [
  "sqlx",
  "talos-actor-memory-service",
  "talos-actor-repository",
+ "talos-analytics-repository",
+ "talos-compilation",
  "talos-config",
  "talos-cost-attribution",
  "talos-dlp",

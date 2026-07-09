@@ -35,6 +35,8 @@ talos-engine-events = { path = "../talos-engine-events" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-memory = { path = "../talos-memory" }
 talos-metrics = { path = "../talos-metrics" }
+talos-analytics-repository = { path = "../talos-analytics-repository" }
+talos-compilation = { path = "../talos-compilation" }
 talos-module-executions = { path = "../talos-module-executions" }
 talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
 talos-oauth = { path = "../talos-oauth" }
