@@ -5169,6 +5169,13 @@ fn build_router(
             "/api/google-calendar/watch-channels/{channel_uuid}",
             axum::routing::delete(google_calendar::handlers::stop_watch_channel_handler),
         )
+        // Dedicated Calendar OAuth connect (authenticated). Returns the Google
+        // authorize URL; identity is bound into the CSRF state token so the
+        // (unauthenticated) callback recovers the user from the token.
+        .route(
+            "/api/google-calendar/connect",
+            get(google_calendar::handlers::connect_calendar_handler),
+        )
         .with_state(google_calendar_service.clone())
         // MCP-1159 (2026-05-16): 8 KiB body cap. `CreateWatchRequest`
         // is `{ integration_id: Uuid, calendar_id: String, webhook_url:
@@ -5220,6 +5227,20 @@ fn build_router(
         .route(
             "/api/google-calendar/webhook",
             post(google_calendar::handlers::webhook_notification_handler),
+        )
+        .with_state(google_calendar_service.clone())
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(webhook_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // Dedicated Calendar OAuth callback (PUBLIC — no session auth). Identity is
+    // recovered from the single-use CSRF state token inside handle_callback;
+    // cross-site redirects from Google don't carry the SameSite session cookie.
+    // Rate-limited with the webhook limiter to prevent state-token enumeration.
+    let google_calendar_callback_routes = Router::new()
+        .route(
+            "/api/google-calendar/callback",
+            get(google_calendar::handlers::calendar_callback_handler),
         )
         .with_state(google_calendar_service.clone())
         .layer(from_fn(rate_limit::rate_limit_middleware))
@@ -5555,6 +5576,7 @@ fn build_router(
         .merge(suspension_callback_routes)
         .merge(google_calendar_routes)
         .merge(google_calendar_webhook_routes)
+        .merge(google_calendar_callback_routes)
         .merge(gcal_admin_routes)
         // M-8 (talos-registry review): /api/registry/publish writes
         // globally-visible catalog rows (`kind='catalog', user_id=NULL`)
