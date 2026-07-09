@@ -20,6 +20,7 @@ import ErrorBoundary from "@/components/ErrorBoundary";
 import { CompilationStatus } from "@/components/CompilationStatus";
 
 const Dashboard = lazy(() => import("@/pages/dashboard"));
+const Briefings = lazy(() => import("@/pages/Briefings"));
 const EditorPage = lazy(() => import("@/pages/EditorPage"));
 const Settings = lazy(() => import("@/pages/Settings"));
 const Actors = lazy(() => import("@/pages/Actors"));
@@ -134,6 +135,27 @@ function AuthenticatedApp() {
                 className="bg-surface-4 border-white/5 text-[10px] font-black uppercase tracking-widest shadow-2xl"
               >
                 View and manage saved workflows
+              </TooltipContent>
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <NavLink to="/briefings" className={navLinkClass}>
+                  {({ isActive }) => (
+                    <>
+                      Briefings
+                      {isActive && (
+                        <span className="absolute -bottom-1.5 left-4 right-4 h-0.5 bg-primary rounded-full shadow-[0_0_10px_hsla(var(--primary),0.5)] animate-in fade-in zoom-in-50 duration-500" />
+                      )}
+                    </>
+                  )}
+                </NavLink>
+              </TooltipTrigger>
+              <TooltipContent
+                side="bottom"
+                className="bg-surface-4 border-white/5 text-[10px] font-black uppercase tracking-widest shadow-2xl"
+              >
+                Latest results from your workflows
               </TooltipContent>
             </Tooltip>
 
@@ -285,6 +307,7 @@ function AuthenticatedApp() {
             <Suspense fallback={<LoadingScreen />}>
               <Routes>
                 <Route path="/" element={<Dashboard />} />
+                <Route path="/briefings" element={<Briefings />} />
                 <Route path="/editor/:id?" element={<EditorPage />} />
                 <Route path="/actors" element={<Actors />} />
                 <Route path="/actors/compare" element={<ActorCompare />} />
