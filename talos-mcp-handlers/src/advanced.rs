@@ -1774,6 +1774,7 @@ async fn handle_run_scratch_session(
             None,                                            // actor_id
             uuid::Uuid::nil(), // user_id (controller-internal test path)
             talos_workflow_job_protocol::LlmTier::default(), // tier2 for internal tests
+            talos_workflow_job_protocol::WriteCeiling::Write, // permissive: internal test path
         )
         .await;
 

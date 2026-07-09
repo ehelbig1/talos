@@ -1864,6 +1864,11 @@ async fn handle_run_sandbox(
             Some(effective_actor_id),
             caller_user_id,
             llm_tier,
+            // Write ceiling: diagnostic in-process execution
+            // (run_sandbox / test_module), an operator-invoked test path —
+            // run permissively. The ceiling gates live actor dispatch,
+            // which the actor binding stamps at engine dispatch.
+            talos_workflow_job_protocol::WriteCeiling::Write,
         )
         .await;
 
@@ -3229,6 +3234,11 @@ async fn handle_test_module(
             Some(effective_actor_id),
             user_id,
             llm_tier,
+            // Write ceiling: diagnostic in-process execution
+            // (run_sandbox / test_module), an operator-invoked test path —
+            // run permissively. The ceiling gates live actor dispatch,
+            // which the actor binding stamps at engine dispatch.
+            talos_workflow_job_protocol::WriteCeiling::Write,
         )
         .await;
     let duration_ms = start.elapsed().as_millis();
