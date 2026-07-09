@@ -3,6 +3,16 @@
 
 use super::*;
 
+/// Whether a validated SQL statement type is read-only for the write-ceiling
+/// axis. Only `SELECT` and `EXPLAIN` read; every other `stmt_type` produced by
+/// `sql_validator::statement_type` — including the `UNKNOWN` catch-all for any
+/// sqlparser variant not yet enumerated — is treated as a mutation
+/// (fail-closed). A read-only actor is refused everything this returns `false`
+/// for.
+pub(crate) fn sql_stmt_type_is_read_only(stmt_type: &str) -> bool {
+    matches!(stmt_type, "SELECT" | "EXPLAIN")
+}
+
 // ============================================================================
 // Database (placeholder — enforce row-level scoping in production)
 // ============================================================================
@@ -185,6 +195,21 @@ impl wit_database::Host for TalosContext {
                         return Err(wit_database::Error::Invalidquery);
                     }
                 };
+
+            // Write-ceiling gate: a read-only actor may run read statements
+            // (SELECT / EXPLAIN) but never a mutation. Fail-closed — any
+            // non-read `stmt_type`, including the validator's `UNKNOWN`
+            // catch-all, is treated as a mutation and refused. The read
+            // check short-circuits so SELECTs never touch the audit path.
+            if !sql_stmt_type_is_read_only(&validated.stmt_type)
+                && self
+                    .write_ceiling_refuses("database-query", &validated.stmt_type)
+                    .await
+            {
+                self.last_db_error =
+                    "write ceiling: this read-only actor cannot run a mutating query".to_string();
+                return Err(wit_database::Error::Unauthorized);
+            }
 
             if let Some(ledger_mutex) = &self.audit_ledger {
                 // Wasm-security review 2026-05-23 (M): stop logging the
@@ -370,5 +395,38 @@ impl wit_database::Host for TalosContext {
 
     async fn get_last_error(&mut self) -> String {
         self.last_db_error.clone()
+    }
+}
+
+#[cfg(test)]
+mod write_ceiling_db_tests {
+    use super::sql_stmt_type_is_read_only;
+
+    #[test]
+    fn only_select_and_explain_read() {
+        assert!(sql_stmt_type_is_read_only("SELECT"));
+        assert!(sql_stmt_type_is_read_only("EXPLAIN"));
+    }
+
+    #[test]
+    fn dml_and_ddl_are_mutations() {
+        // Every non-read `stmt_type` the validator emits must be treated as
+        // a mutation so a read-only actor is refused.
+        for m in [
+            "INSERT", "UPDATE", "DELETE", "COPY", "MERGE", "CALL", "CREATE", "DROP", "ALTER",
+            "TRUNCATE", "GRANT", "REVOKE", "ATTACH",
+        ] {
+            assert!(!sql_stmt_type_is_read_only(m), "{m} must be a mutation");
+        }
+    }
+
+    #[test]
+    fn unknown_fails_closed_as_mutation() {
+        // The validator's fail-closed catch-all for un-enumerated sqlparser
+        // variants must NOT read as a read — otherwise a novel statement
+        // shape would slip past the ceiling.
+        assert!(!sql_stmt_type_is_read_only("UNKNOWN"));
+        assert!(!sql_stmt_type_is_read_only(""));
+        assert!(!sql_stmt_type_is_read_only("select")); // case-sensitive by design
     }
 }

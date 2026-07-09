@@ -29,12 +29,13 @@ async fn test_runtime_no_nested_block_on() {
             RetryPolicy::none(),
             None,
             SecurityPolicy::default(),
-            None,           // capability_world_hint
-            None,           // max_fuel_override
-            false,          // dry_run
-            None,           // actor_id
-            Uuid::nil(),    // user_id
-            LlmTier::Tier2, // max_llm_tier
+            None,                                             // capability_world_hint
+            None,                                             // max_fuel_override
+            false,                                            // dry_run
+            None,                                             // actor_id
+            Uuid::nil(),                                      // user_id
+            LlmTier::Tier2,                                   // max_llm_tier
+            talos_workflow_job_protocol::WriteCeiling::Write, // max_write_ceiling
         )
         .await;
 

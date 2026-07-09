@@ -37,12 +37,13 @@ async fn main() -> anyhow::Result<()> {
             worker::runtime::RetryPolicy::default(),
             None,
             worker::runtime::SecurityPolicy::default(),
-            None,                                        // capability_world_hint
-            None,                                        // max_fuel_override
-            false,                                       // dry_run
-            None,                                        // actor_id
-            uuid::Uuid::nil(),                           // user_id
-            talos_workflow_job_protocol::LlmTier::Tier2, // max_llm_tier
+            None,                                             // capability_world_hint
+            None,                                             // max_fuel_override
+            false,                                            // dry_run
+            None,                                             // actor_id
+            uuid::Uuid::nil(),                                // user_id
+            talos_workflow_job_protocol::LlmTier::Tier2,      // max_llm_tier
+            talos_workflow_job_protocol::WriteCeiling::Write, // max_write_ceiling
         )
         .await
     {

@@ -496,6 +496,17 @@ worker:
     # Keep in lockstep with controller.env TALOS_ENVELOPE_SEALING; the
     # worker enforces the inline-WSK downgrade guard under "required".
     # TALOS_ENVELOPE_SEALING: "required"
+    # ── Per-actor write ceiling (mutation-permission gate) ───────────
+    # When "1"/"true", the worker refuses every data-mutating host op
+    # (agent-memory writes, non-GET HTTP, DB mutations, webhook/email/
+    # messaging sends, object-storage put/delete, integration-state
+    # writes) for any actor whose `max_write_ceiling` is `readonly`
+    # (set via the `set_actor_write_ceiling` operator tool). Default
+    # off: the signed ceiling travels on every job but changes nothing
+    # until enabled — a staged rollout, same shape as the tier ceiling.
+    # Read once at boot; controller side needs no change (the field is
+    # already HMAC-bound on every JobRequest). Worker-only env.
+    # TALOS_WRITE_CEILING_ENFORCED: "1"
 
   # Sigstore enforcement for OCI template signatures. The publish workflow
   # (.github/workflows/template-publish.yml) signs every artifact via

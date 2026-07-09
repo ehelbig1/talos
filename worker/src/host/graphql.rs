@@ -679,6 +679,14 @@ impl TalosContext {
             );
             return Err(wit_graphql::Error::Networkerror);
         }
+        // Write-ceiling gate: a GraphQL operation may be a query (read) or a
+        // mutation, and the operation type can't be cheaply proven read-only
+        // from the request string. Fail-closed — treat GraphQL as a mutation
+        // and refuse for read-only actors. An actor that needs GraphQL reads
+        // uses the `Write` ceiling. Inert unless enforcement is on.
+        if self.write_ceiling_refuses("graphql-execute", "").await {
+            return Err(wit_graphql::Error::Queryerror);
+        }
         // MCP-787 (2026-05-14): pure-validation surfaces (query size,
         // variables size, URL parse, empty allowlist, SSRF IP literal,
         // allowed_hosts pattern, DNS-rebinding, Tier-1 LLM egress, POST
