@@ -4826,12 +4826,28 @@ pub async fn build_execution_trace_json(
                 } else {
                     None
                 };
+                // Human-readable framing of the opaque instruction count: a size
+                // tier ("standard"), a run's utilization health ("comfortable"),
+                // and a plain-English capacity ("handles ~60 items of ~2 KB").
+                // Only meaningful when the ceiling is known (>0).
+                let human = if f.effective_max_fuel > 0 {
+                    Some(talos_compilation::scaffold::describe_fuel(
+                        f.effective_max_fuel as u64,
+                        Some(f.fuel_consumed.max(0) as u64),
+                    ))
+                } else {
+                    None
+                };
                 serde_json::json!({
                     "module_id": f.module_id.map(|m| m.to_string()),
                     "fuel_consumed": f.fuel_consumed,
                     "wall_time_ms": f.wall_time_ms,
                     "current_max_fuel": if f.effective_max_fuel > 0 { Some(f.effective_max_fuel) } else { None },
                     "utilization_pct": utilization_pct,
+                    "budget": human.as_ref().map(|h| h.tier),
+                    "health": human.as_ref().and_then(|h| h.health),
+                    "capacity": human.as_ref().map(|h| h.capacity.clone()),
+                    "summary": human.as_ref().map(|h| h.summary.clone()),
                 })
             });
             serde_json::json!({

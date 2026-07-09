@@ -123,20 +123,18 @@ pub fn compute_max_fuel_with_llm_output(
     llm_output_bytes: u64,
     safety_multiplier: f64,
 ) -> u64 {
-    const BASELINE: u64 = 50_000;
-    const PER_ITEM_TYPED_PARSE: u64 = 60_000;
-    const FUEL_PER_BYTE: u64 = 2;
-    const MIN_FUEL: u64 = 1_000_000;
-    const MAX_FUEL: u64 = 50_000_000;
-
+    // Coefficients hoisted to module scope (see the "Fuel-budget coefficients"
+    // section below) so the human-translation helpers invert the SAME formula —
+    // the forward estimate and the tier/capacity labels shown back to operators
+    // can never drift apart.
     let per_item_bytes = item_count
         .saturating_mul(bytes_per_item)
         .saturating_mul(FUEL_PER_BYTE);
-    let per_item_parse = item_count.saturating_mul(PER_ITEM_TYPED_PARSE);
+    let per_item_parse = item_count.saturating_mul(FUEL_PER_ITEM_TYPED_PARSE);
     // LLM output is parsed once per execution (not per item) so it enters the
     // total directly, not multiplied by item_count.
     let llm_output_fuel = llm_output_bytes.saturating_mul(FUEL_PER_BYTE);
-    let subtotal = BASELINE
+    let subtotal = FUEL_BASELINE
         .saturating_add(per_item_parse)
         .saturating_add(per_item_bytes)
         .saturating_add(llm_output_fuel);
@@ -146,7 +144,174 @@ pub fn compute_max_fuel_with_llm_output(
     let mult = safety_multiplier.clamp(1.0, 5.0);
     let scaled = (subtotal as f64 * mult) as u64;
 
-    scaled.clamp(MIN_FUEL, MAX_FUEL)
+    scaled.clamp(FUEL_MIN, FUEL_MAX)
+}
+
+// ============================================================================
+// Fuel-budget coefficients + human translation
+// ============================================================================
+//
+// A raw `max_fuel` number (a wasmtime instruction-count ceiling) is opaque to
+// humans — "8,000,000" says nothing about whether a node will handle its data
+// or how close it is to failing. These helpers translate any fuel value into
+// the two things an operator actually cares about: "how big a payload does this
+// handle?" (capacity / size tier) and "how close to the edge am I?"
+// (utilization health). They INVERT the same formula `compute_max_fuel_*` uses,
+// with the coefficients living here at module scope so the two directions share
+// one source of truth.
+
+/// Fixed per-execution parsing overhead (fuel).
+pub(crate) const FUEL_BASELINE: u64 = 50_000;
+/// Typed-struct parse cost per input item (fuel).
+pub(crate) const FUEL_PER_ITEM_TYPED_PARSE: u64 = 60_000;
+/// Wasmtime fuel charged per raw input byte.
+pub(crate) const FUEL_PER_BYTE: u64 = 2;
+/// Dispatcher clamp floor — the smallest max_fuel any module is given.
+pub const FUEL_MIN: u64 = 1_000_000;
+/// Dispatcher clamp ceiling — the largest max_fuel any module is given.
+pub const FUEL_MAX: u64 = 50_000_000;
+
+/// Reference item size (bytes) used when expressing a fuel budget as a capacity
+/// ("handles ~N items of ~2 KB"). Matches the formula's default `bytes_per_item`.
+pub(crate) const FUEL_REF_BYTES_PER_ITEM: u64 = 2_000;
+/// Reference safety multiplier for the capacity estimate — the formula default.
+pub(crate) const FUEL_REF_SAFETY: f64 = 2.0;
+
+/// Coarse, human-facing size label for a fuel budget. Spans the dispatcher's
+/// [`FUEL_MIN`, `FUEL_MAX`] range so every real budget maps to exactly one tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FuelTier {
+    Light,
+    Standard,
+    Heavy,
+    Max,
+}
+
+impl FuelTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FuelTier::Light => "light",
+            FuelTier::Standard => "standard",
+            FuelTier::Heavy => "heavy",
+            FuelTier::Max => "max",
+        }
+    }
+}
+
+/// Map a fuel budget to its size tier. Boundaries are chosen relative to the
+/// [1M, 50M] dispatcher range: the ~2.2M default budget lands in `Light`, and
+/// only near-ceiling budgets read as `Max`.
+pub fn fuel_tier(fuel: u64) -> FuelTier {
+    match fuel {
+        f if f < 4_000_000 => FuelTier::Light,
+        f if f < 12_000_000 => FuelTier::Standard,
+        f if f < 30_000_000 => FuelTier::Heavy,
+        _ => FuelTier::Max,
+    }
+}
+
+/// How close a node came to exhausting its budget on a given run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuelHealth {
+    /// Comfortable headroom (< 60% used).
+    Comfortable,
+    /// Getting close — worth watching (60–85%).
+    Tight,
+    /// One bad payload from failing (85–100%).
+    AtRisk,
+    /// Consumed its entire budget — the run hit the ceiling.
+    Exhausted,
+}
+
+impl FuelHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FuelHealth::Comfortable => "comfortable",
+            FuelHealth::Tight => "tight",
+            FuelHealth::AtRisk => "at_risk",
+            FuelHealth::Exhausted => "exhausted",
+        }
+    }
+}
+
+/// Classify how close `consumed` came to `limit`. `limit == 0` (unknown ceiling)
+/// yields `Comfortable` — risk can't be judged without a ceiling.
+pub fn fuel_health(consumed: u64, limit: u64) -> FuelHealth {
+    if limit == 0 {
+        return FuelHealth::Comfortable;
+    }
+    let pct = (consumed as f64 / limit as f64) * 100.0;
+    if pct >= 100.0 {
+        FuelHealth::Exhausted
+    } else if pct >= 85.0 {
+        FuelHealth::AtRisk
+    } else if pct >= 60.0 {
+        FuelHealth::Tight
+    } else {
+        FuelHealth::Comfortable
+    }
+}
+
+/// Estimate how many reference-sized (~2 KB) items a fuel budget can process, by
+/// inverting `compute_max_fuel` at the default safety multiplier. This is the
+/// intuitive reading of a budget: "handles ~N items of ~2 KB". Always ≥ 1 (any
+/// real budget clears the baseline).
+pub fn fuel_capacity_items(fuel: u64) -> u64 {
+    // fuel ≈ safety × (BASELINE + items × (PER_ITEM_PARSE + bytes × PER_BYTE))
+    // → items ≈ (fuel/safety − BASELINE) / (PER_ITEM_PARSE + bytes × PER_BYTE)
+    let per_item = FUEL_PER_ITEM_TYPED_PARSE + FUEL_REF_BYTES_PER_ITEM * FUEL_PER_BYTE;
+    let usable = (fuel as f64 / FUEL_REF_SAFETY) - FUEL_BASELINE as f64;
+    if usable <= 0.0 {
+        return 1;
+    }
+    ((usable / per_item as f64).floor() as u64).max(1)
+}
+
+/// A human-facing description of a fuel budget (and optionally a run's usage).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FuelHuman {
+    /// Size tier label (light/standard/heavy/max).
+    pub tier: FuelTier,
+    /// Approximate payload capacity: reference-sized items this budget handles.
+    pub capacity_items: u64,
+    /// Plain-English capacity phrase, e.g. "handles ~60 items of ~2 KB".
+    pub capacity: String,
+    /// Utilization health for a specific run, if `consumed` was provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<FuelHealth>,
+    /// One-line summary suitable for a UI chip or log line.
+    pub summary: String,
+}
+
+/// Translate a fuel budget into human framing. Pass `consumed` from a completed
+/// run to include utilization health; pass `None` to describe the budget alone.
+pub fn describe_fuel(limit: u64, consumed: Option<u64>) -> FuelHuman {
+    let tier = fuel_tier(limit);
+    let capacity_items = fuel_capacity_items(limit);
+    let capacity = format!(
+        "handles ~{} items of ~{} KB",
+        capacity_items,
+        FUEL_REF_BYTES_PER_ITEM / 1000
+    );
+    let health = consumed.map(|c| fuel_health(c, limit));
+    let summary = match (health, consumed) {
+        (Some(h), Some(c)) if limit > 0 => format!(
+            "{} budget · used {:.0}% — {}",
+            tier.as_str(),
+            (c as f64 / limit as f64) * 100.0,
+            h.as_str().replace('_', " ")
+        ),
+        _ => format!("{} budget · {}", tier.as_str(), capacity),
+    };
+    FuelHuman {
+        tier,
+        capacity_items,
+        capacity,
+        health,
+        summary,
+    }
 }
 
 /// Parameters accepted by `generate_module_scaffold`.
@@ -872,5 +1037,68 @@ mod tests {
         // Must not contain a raw */ that could close the comment block.
         assert!(!src.contains("bad*/"));
         assert!(src.contains("bad*_/"));
+    }
+
+    #[test]
+    fn fuel_tier_spans_the_dispatcher_range() {
+        assert_eq!(fuel_tier(FUEL_MIN), FuelTier::Light); // 1M floor
+        assert_eq!(fuel_tier(2_200_000), FuelTier::Light); // ~default budget
+        assert_eq!(fuel_tier(3_999_999), FuelTier::Light);
+        assert_eq!(fuel_tier(4_000_000), FuelTier::Standard);
+        assert_eq!(fuel_tier(8_000_000), FuelTier::Standard);
+        assert_eq!(fuel_tier(12_000_000), FuelTier::Heavy);
+        assert_eq!(fuel_tier(29_999_999), FuelTier::Heavy);
+        assert_eq!(fuel_tier(30_000_000), FuelTier::Max);
+        assert_eq!(fuel_tier(FUEL_MAX), FuelTier::Max); // 50M ceiling
+    }
+
+    #[test]
+    fn fuel_health_maps_utilization_bands() {
+        assert_eq!(fuel_health(0, 0), FuelHealth::Comfortable); // unknown ceiling
+        assert_eq!(fuel_health(59, 100), FuelHealth::Comfortable);
+        assert_eq!(fuel_health(60, 100), FuelHealth::Tight);
+        assert_eq!(fuel_health(84, 100), FuelHealth::Tight);
+        assert_eq!(fuel_health(85, 100), FuelHealth::AtRisk);
+        assert_eq!(fuel_health(99, 100), FuelHealth::AtRisk);
+        assert_eq!(fuel_health(100, 100), FuelHealth::Exhausted);
+        assert_eq!(fuel_health(140, 100), FuelHealth::Exhausted);
+    }
+
+    #[test]
+    fn capacity_inverts_the_forward_formula() {
+        // For a budget the forward formula produced for N items of the reference
+        // size, the capacity estimate must recover ~N (single source of truth).
+        for n in [10u64, 30, 60, 120, 200] {
+            let fuel = compute_max_fuel(n, FUEL_REF_BYTES_PER_ITEM, FUEL_REF_SAFETY);
+            if fuel == FUEL_MIN || fuel == FUEL_MAX {
+                continue; // clamped — inverse can't recover N at the rails
+            }
+            let recovered = fuel_capacity_items(fuel);
+            let diff = recovered.abs_diff(n);
+            assert!(
+                diff <= 1,
+                "capacity({fuel}) = {recovered}, expected ~{n} (diff {diff})"
+            );
+        }
+        // Never returns 0, even for a floor budget.
+        assert!(fuel_capacity_items(FUEL_MIN) >= 1);
+        assert!(fuel_capacity_items(0) >= 1);
+    }
+
+    #[test]
+    fn describe_fuel_produces_a_human_summary() {
+        // The daily-brief example: 8M budget, a run that used 968_107 fuel.
+        let h = describe_fuel(8_000_000, Some(968_107));
+        assert_eq!(h.tier, FuelTier::Standard);
+        assert_eq!(h.health, Some(FuelHealth::Comfortable)); // 12%
+        assert!(h.capacity.contains("items of ~2 KB"));
+        assert!(h.summary.contains("standard"));
+        assert!(h.summary.contains("comfortable"));
+        assert!(h.summary.contains("12%"));
+
+        // Budget-only (no run): no health, summary describes capacity.
+        let b = describe_fuel(8_000_000, None);
+        assert!(b.health.is_none());
+        assert!(b.summary.contains("handles"));
     }
 }
