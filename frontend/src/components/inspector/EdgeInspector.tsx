@@ -65,7 +65,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto custom-scrollbar relative z-10">
+      <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar relative z-10">
         <div className="p-6 space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
           <div className="space-y-4">
             <label className="text-[10px] text-muted-foreground/40 uppercase tracking-[0.2em] font-black ml-1">
