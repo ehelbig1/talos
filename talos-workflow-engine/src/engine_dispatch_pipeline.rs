@@ -182,18 +182,20 @@ impl ParallelWorkflowEngine {
             // moved into the DispatchJob below.
             let vault_paths = extract_vault_paths(&module_config);
 
-            // Per-node fuel precedence: node-config `max_fuel` > module
-            // default > 1M fallback. Capped at 50M.
+            // Per-node fuel precedence: node-config `max_fuel` > module default
+            // > 1M fallback, then the adaptive learned ceiling as a floor,
+            // clamped to 50M. Shared decision point with the single + loop
+            // paths (see `resolve_node_max_fuel`).
             let module_default_fuel = artifact
                 .as_ref()
                 .map(|a| a.max_fuel)
                 .filter(|f| *f > 0)
                 .unwrap_or(1_000_000);
-            let node_max_fuel = module_config
-                .get("max_fuel")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(module_default_fuel)
-                .min(self.max_fuel_per_node);
+            let node_max_fuel = self.resolve_node_max_fuel(
+                &step_node_id,
+                module_config.get("max_fuel").and_then(|v| v.as_u64()),
+                module_default_fuel,
+            );
 
             // RFC 0010 P3 (D3b): resolve each step's secrets in whichever form the
             // sealing mode needs — inline WSK envelope, OR plaintext for

@@ -262,14 +262,15 @@ impl ParallelWorkflowEngine {
             }
         }
 
-        // Per-node fuel limit: config override > module default,
-        // clamped to `self.max_fuel_per_node` (engine-configurable;
-        // see `set_max_fuel_per_node`).
-        let node_max_fuel = module_config
-            .get("max_fuel")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(wasm_module.max_fuel)
-            .min(self.max_fuel_per_node);
+        // Per-node fuel limit: config override > module default, then the
+        // adaptive learned ceiling applied as a floor, clamped to
+        // `self.max_fuel_per_node`. Single decision point shared with the
+        // pipeline + loop paths (see `resolve_node_max_fuel`).
+        let node_max_fuel = self.resolve_node_max_fuel(
+            &node_id,
+            module_config.get("max_fuel").and_then(|v| v.as_u64()),
+            wasm_module.max_fuel,
+        );
 
         // Resolve secrets. RFC 0010 P3 (D3b): `build_dispatch_secrets_for` is the
         // single decision point — under claim-based sealing it returns the

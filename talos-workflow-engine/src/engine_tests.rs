@@ -977,3 +977,63 @@ async fn sub_engine_event_sink_is_detachable() {
          aren't persisted under a synthetic execution id"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Adaptive fuel (Phase 2): resolve_node_max_fuel guard-mode semantics.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolve_node_max_fuel_guard_mode() {
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_max_fuel_per_node(50_000_000);
+
+    let brief = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    engine.node_labels.insert(brief, "brief".to_string());
+    engine.node_labels.insert(other, "other".to_string());
+
+    let mut learned = HashMap::new();
+    learned.insert("brief".to_string(), 8_000_000u64); // learned ceiling for `brief`
+    engine.set_learned_fuel_ceilings(learned);
+
+    // Learned ceiling RAISES a too-low module default (the daily-brief case).
+    assert_eq!(
+        engine.resolve_node_max_fuel(&brief, None, 1_400_000),
+        8_000_000
+    );
+
+    // A deliberately-HIGHER explicit override is respected — guard mode never
+    // lowers below a set value.
+    assert_eq!(
+        engine.resolve_node_max_fuel(&brief, Some(20_000_000), 1_400_000),
+        20_000_000
+    );
+
+    // A baseline already above the learned ceiling is kept (never lowered).
+    assert_eq!(
+        engine.resolve_node_max_fuel(&brief, None, 12_000_000),
+        12_000_000
+    );
+
+    // A node with NO learned entry behaves byte-for-byte like the old path:
+    // config override > module default, clamped to the engine ceiling.
+    assert_eq!(
+        engine.resolve_node_max_fuel(&other, None, 2_000_000),
+        2_000_000
+    );
+    assert_eq!(
+        engine.resolve_node_max_fuel(&other, Some(3_000_000), 2_000_000),
+        3_000_000
+    );
+
+    // The engine-wide ceiling always clamps the result.
+    assert_eq!(
+        engine.resolve_node_max_fuel(&brief, Some(60_000_000), 1_400_000),
+        50_000_000
+    );
+
+    // Empty learned map ⇒ adaptive fully inert (default engine state).
+    let plain = ParallelWorkflowEngine::new();
+    let n = Uuid::new_v4();
+    assert_eq!(plain.resolve_node_max_fuel(&n, None, 2_200_000), 2_200_000);
+}

@@ -1802,10 +1802,12 @@ impl ParallelWorkflowEngine {
                 integration_name: wasm_module.integration_name.clone(),
                 input_payload: job_input,
                 timeout: std::time::Duration::from_secs(body_timeout_secs),
-                // Clamp to the engine-configured per-node fuel ceiling
-                // — `set_max_fuel_per_node` on the parent engine
-                // propagates here via `AdapterSet`.
-                max_fuel: wasm_module.max_fuel.min(self.max_fuel_per_node()),
+                // Module default + adaptive learned ceiling (floor), clamped to
+                // the engine-configured per-node ceiling. Loop bodies carry no
+                // graph-JSON `max_fuel` override (generated per iteration), so
+                // the override is `None`. Shared decision point with the single
+                // + pipeline paths (see `resolve_node_max_fuel`).
+                max_fuel: self.resolve_node_max_fuel(&body_uuid, None, wasm_module.max_fuel),
                 allowed_hosts: wasm_module.allowed_hosts.clone(),
                 allowed_methods: wasm_module.allowed_methods.clone(),
                 allowed_secrets: wasm_module.allowed_secrets.clone(),

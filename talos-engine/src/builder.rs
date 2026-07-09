@@ -381,11 +381,31 @@ pub async fn for_workflow(
     user_id: Uuid,
     opts: EngineOpts,
 ) -> Result<ParallelWorkflowEngine, BuildError> {
+    // Capture the pool before `registry` is moved into the engine builder —
+    // needed for the adaptive-fuel history lookup below.
+    let pool = registry.db_pool.clone();
+
     // 1. Base engine.
     let mut engine = build_controller_engine(registry, secrets_manager, user_id);
 
     // 2. Workflow id (analytics rollups).
     engine.set_workflow_id(opts.workflow_id);
+
+    // 2b. Adaptive fuel (Phase 2): raise per-node ceilings toward observed
+    //     demand so a node never silently under-provisions. GUARD MODE — the
+    //     learned value is applied as a floor by `resolve_node_max_fuel`, so it
+    //     can only RAISE a ceiling, never lower a deliberately-set one, and can
+    //     never introduce a fuel failure the static ceiling wouldn't have had.
+    //     Fail-open + cached; kill switch `TALOS_ADAPTIVE_FUEL=0`.
+    let learned = crate::adaptive_fuel::learned_fuel_ceilings(&pool, opts.workflow_id).await;
+    if !learned.is_empty() {
+        tracing::debug!(
+            workflow_id = %opts.workflow_id,
+            nodes = learned.len(),
+            "adaptive fuel: applied learned per-node ceilings"
+        );
+        engine.set_learned_fuel_ceilings(learned);
+    }
 
     // 3. Actor identity. The helper stamps Tier1 fail-closed on error,
     //    so we log + continue; bubbling would defeat the fail-closed
