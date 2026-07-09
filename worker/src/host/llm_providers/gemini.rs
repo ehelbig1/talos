@@ -175,10 +175,7 @@ impl ProviderAdapter for GeminiAdapter {
             .unwrap_or_default();
         Ok(ParsedCompletion {
             text,
-            input_tokens: r
-                .usage_metadata
-                .as_ref()
-                .and_then(|u| u.prompt_token_count),
+            input_tokens: r.usage_metadata.as_ref().and_then(|u| u.prompt_token_count),
             output_tokens: r
                 .usage_metadata
                 .as_ref()

@@ -635,7 +635,9 @@ mod tests {
     fn parse_completion_handles_empty_choices_and_missing_usage() {
         // Some Ollama-compat wrappers return `{"choices": []}` on rate
         // limit or model-not-found; providers omit `usage` on errors.
-        let p = OpenAiAdapter.parse_completion(br#"{"choices": []}"#).unwrap();
+        let p = OpenAiAdapter
+            .parse_completion(br#"{"choices": []}"#)
+            .unwrap();
         assert_eq!(p.text, "");
         assert!(p.input_tokens.is_none() && p.output_tokens.is_none());
     }
@@ -680,7 +682,11 @@ mod tests {
         assert_eq!(out[0], StreamEventOut::TextDelta("Hel".into()));
         assert_eq!(out[1], StreamEventOut::TextDelta("lo".into()));
         assert_eq!(out[2], StreamEventOut::Done("stop".into()));
-        assert_eq!(out.len(), 3, "[DONE] after finish_reason must not double-emit");
+        assert_eq!(
+            out.len(),
+            3,
+            "[DONE] after finish_reason must not double-emit"
+        );
     }
 
     #[test]

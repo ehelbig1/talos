@@ -510,7 +510,9 @@ mod tests {
     fn parse_completion_handles_missing_optional_fields() {
         // Ported from the pre-trait `llm_response_parse_tests`: minimal
         // valid response must parse, with non-text blocks skipped.
-        let p = AnthropicAdapter.parse_completion(br#"{"content": []}"#).unwrap();
+        let p = AnthropicAdapter
+            .parse_completion(br#"{"content": []}"#)
+            .unwrap();
         assert_eq!(p.text, "");
         assert!(p.stop_reason.is_none());
         let p2 = AnthropicAdapter

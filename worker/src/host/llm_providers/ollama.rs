@@ -278,10 +278,7 @@ impl ProviderAdapter for OllamaAdapter {
         let r: NativeChatResponse = serde_json::from_slice(bytes)
             .map_err(|e| format!("Failed to parse native Ollama response: {e}"))?;
         Ok(ParsedCompletion {
-            text: r
-                .message
-                .and_then(|m| m.content)
-                .unwrap_or_default(),
+            text: r.message.and_then(|m| m.content).unwrap_or_default(),
             input_tokens: r.prompt_eval_count,
             output_tokens: r.eval_count,
             stop_reason: r.done_reason,
@@ -434,7 +431,10 @@ impl StreamDecoder for OllamaJsonlDecoder {
                 .get("prompt_eval_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let output = chunk.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let output = chunk
+                .get("eval_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             if input > 0 || output > 0 {
                 out.push(StreamEventOut::Usage {
                     input_tokens: input,
@@ -472,11 +472,17 @@ mod tests {
     #[test]
     fn completion_body_is_native_shape_with_explicit_stream_false() {
         let body = base_body();
-        assert_eq!(body["stream"], false, "native default is stream:true — must be explicit");
+        assert_eq!(
+            body["stream"], false,
+            "native default is stream:true — must be explicit"
+        );
         assert_eq!(body["options"]["num_predict"], 1800);
         assert!((body["options"]["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-6);
         assert_eq!(body["messages"][0]["role"], "system");
-        assert!(body.get("max_tokens").is_none(), "compat spelling must not leak");
+        assert!(
+            body.get("max_tokens").is_none(),
+            "compat spelling must not leak"
+        );
     }
 
     #[test]
@@ -509,7 +515,10 @@ mod tests {
         assert!(body.get("response_format").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("max_tokens").is_none());
-        assert!(body.get("top_p").is_none(), "sampler keys must nest under options");
+        assert!(
+            body.get("top_p").is_none(),
+            "sampler keys must nest under options"
+        );
     }
 
     #[test]
@@ -554,7 +563,10 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert!(body.get("template").is_none());
         assert!(body.get("raw").is_none());
-        assert!(body.get("system").is_none(), "system rides in messages for native chat");
+        assert!(
+            body.get("system").is_none(),
+            "system rides in messages for native chat"
+        );
     }
 
     #[test]
@@ -584,7 +596,9 @@ mod tests {
                         "arguments":{"city":"Paris"}}}]},
             "done":true,"done_reason":"stop",
             "prompt_eval_count":100,"eval_count":20}"#;
-        let p = OllamaAdapter.parse_tool_completion(fixture.as_bytes()).unwrap();
+        let p = OllamaAdapter
+            .parse_tool_completion(fixture.as_bytes())
+            .unwrap();
         match &p.blocks[0] {
             ParsedToolBlock::ToolUse {
                 call_id,

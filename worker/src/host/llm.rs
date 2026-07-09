@@ -353,7 +353,8 @@ impl wit_llm::Host for TalosContext {
         req: wit_llm::CompletionRequest,
         json_schema: Option<String>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
-        self.complete_impl(req, JsonMode::On(json_schema), None).await
+        self.complete_impl(req, JsonMode::On(json_schema), None)
+            .await
     }
 
     /// Flexible provider-feature passthrough — see the WIT doc on
@@ -915,4 +916,3 @@ impl wit_embedding::Host for TalosContext {
         Ok(vec)
     }
 }
-
