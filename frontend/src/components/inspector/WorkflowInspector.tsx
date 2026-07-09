@@ -220,7 +220,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
 
       <Tabs
         defaultValue="info"
-        className="flex-1 flex flex-col overflow-hidden relative z-10"
+        className="flex-1 min-h-0 flex flex-col overflow-hidden relative z-10"
       >
         <div className="px-8 pt-6 pb-2 border-b border-white/5 bg-white/[0.01]">
           <TabsList className="w-full justify-start rounded-2xl border border-white/5 bg-black/20 p-1.5 gap-1 shrink-0 h-auto">
@@ -243,7 +243,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
 
         <TabsContent
           value="info"
-          className="flex-1 overflow-auto p-8 space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500 custom-scrollbar focus:outline-none"
+          className="flex-1 min-h-0 overflow-auto p-8 space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500 custom-scrollbar focus:outline-none"
         >
           <div className="space-y-4">
             <label className="text-[10px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
@@ -404,7 +404,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
 
         <TabsContent
           value="executions"
-          className="flex-1 overflow-auto p-4 custom-scrollbar focus:outline-none"
+          className="flex-1 min-h-0 overflow-auto p-4 custom-scrollbar focus:outline-none"
         >
           {workflowId ? (
             <WorkflowExecutionHistoryPanel workflowId={workflowId} />
