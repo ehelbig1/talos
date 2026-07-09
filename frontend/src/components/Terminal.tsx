@@ -230,7 +230,7 @@ const Terminal = () => {
       {/* Log Feed */}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto font-mono text-[11px] p-6 space-y-1 custom-scrollbar bg-surface-1/40 relative z-10"
+        className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] p-6 space-y-1 custom-scrollbar bg-surface-1/40 relative z-10"
       >
         <div className="absolute inset-0 pointer-events-none opacity-20">
           <div className="h-full w-full bg-[radial-gradient(hsla(var(--primary),0.05)_1px,transparent_1px)] bg-[size:20px_20px]" />
