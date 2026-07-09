@@ -123,9 +123,19 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
       );
     }
 
-    // Extract unique module IDs from nodes
+    // Extract unique module IDs from nodes. Structural/system nodes
+    // (collect, loop, sub_workflow, capability_dispatch, …) carry a
+    // "system:<kind>" sentinel in `type`, NOT a module UUID — they must be
+    // EXCLUDED here, otherwise the "system:collect" string is sent to
+    // wasmModules(ids: [UUID!]!) and the server rejects the whole query with
+    // a "Failed to parse UUID" error, making any workflow with a fan-in /
+    // loop node unopenable in the editor.
     const moduleIds = Array.from(
-      new Set(graph.nodes.map((n: GraphNode) => n.type)),
+      new Set(
+        graph.nodes
+          .map((n: GraphNode) => n.type)
+          .filter((t) => typeof t === "string" && !t.startsWith("system:")),
+      ),
     );
 
     // Fetch module metadata (names and configs) for all modules in this workflow
@@ -167,8 +177,14 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
 
     // Convert backend format to React Flow format
     const nodes = graph.nodes.map((n: GraphNode) => {
+      const isSystemNode =
+        typeof n.type === "string" && n.type.startsWith("system:");
       const moduleData = moduleMap.get(n.type);
-      const moduleName = moduleData?.name || n.type;
+      // System/structural nodes have no module row — label them by kind
+      // (e.g. "system:collect" → "Collect") instead of the raw sentinel.
+      const moduleName = isSystemNode
+        ? n.type.slice("system:".length).replace(/^\w/, (c) => c.toUpperCase())
+        : moduleData?.name || n.type;
 
       // Workflow config takes precedence over module default config
       const config = n.data || moduleData?.config || {};
