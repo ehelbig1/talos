@@ -629,6 +629,39 @@ pub(crate) fn write_ceiling_denies(
     enforced && !ceiling.allows_write()
 }
 
+/// Whether read-side STRICT EGRESS is enforced for read-only actors.
+/// Default **off**, and only meaningful when `TALOS_WRITE_CEILING_ENFORCED`
+/// is also on. Background: the write ceiling gates MUTATING host ops, but a
+/// GET URL (path + query string) is guest-influenceable outbound DATA — an
+/// exfiltration channel the mutation gate cannot close. Perfectly closing it
+/// is impossible while allowing any egress at all (query strings reach the
+/// server logs of every reachable host); what CAN be bounded is *where* that
+/// data may land. With this flag on, a read-only actor's non-mutating HTTP
+/// (fetch / fetch-all / SSE connect) is admitted only to hosts an operator
+/// NAMED in the module's `allowed_hosts` (exact or `.suffix` entries) —
+/// wildcard (`"*"`) admissions are refused. Same staged-rollout shape as the
+/// parent flag.
+pub(crate) fn write_ceiling_strict_egress() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| {
+        talos_config::bool_env_or_default("TALOS_WRITE_CEILING_STRICT_EGRESS", false)
+    })
+}
+
+/// Pure strict-egress decision (see [`write_ceiling_strict_egress`]).
+/// Refuse when: ceiling enforcement is on, strict egress is on, the actor
+/// is read-only, AND the host was admitted only via the `"*"` wildcard.
+/// Named admissions (exact / suffix) always pass — the operator made a
+/// deliberate per-host egress decision there.
+pub(crate) fn strict_egress_denies(
+    enforced: bool,
+    strict: bool,
+    ceiling: talos_workflow_job_protocol::WriteCeiling,
+    matched: crate::host::HostMatchKind,
+) -> bool {
+    enforced && strict && !ceiling.allows_write() && matched == crate::host::HostMatchKind::Wildcard
+}
+
 #[cfg(test)]
 mod write_ceiling_decision_tests {
     use super::write_ceiling_denies;
@@ -645,6 +678,52 @@ mod write_ceiling_decision_tests {
     fn enforced_refuses_only_read_only() {
         assert!(write_ceiling_denies(true, WriteCeiling::ReadOnly));
         assert!(!write_ceiling_denies(true, WriteCeiling::Write));
+    }
+
+    #[test]
+    fn strict_egress_refuses_only_wildcard_reads_for_readonly() {
+        use super::strict_egress_denies;
+        use crate::host::HostMatchKind::{Exact, Suffix, Wildcard};
+        // Both flags on + readonly + wildcard admission → refused.
+        assert!(strict_egress_denies(
+            true,
+            true,
+            WriteCeiling::ReadOnly,
+            Wildcard
+        ));
+        // Named admissions always pass — deliberate operator egress intent.
+        assert!(!strict_egress_denies(
+            true,
+            true,
+            WriteCeiling::ReadOnly,
+            Exact
+        ));
+        assert!(!strict_egress_denies(
+            true,
+            true,
+            WriteCeiling::ReadOnly,
+            Suffix
+        ));
+        // Write-ceiling actors are unaffected.
+        assert!(!strict_egress_denies(
+            true,
+            true,
+            WriteCeiling::Write,
+            Wildcard
+        ));
+        // Either flag off → inert.
+        assert!(!strict_egress_denies(
+            false,
+            true,
+            WriteCeiling::ReadOnly,
+            Wildcard
+        ));
+        assert!(!strict_egress_denies(
+            true,
+            false,
+            WriteCeiling::ReadOnly,
+            Wildcard
+        ));
     }
 }
 
@@ -1324,6 +1403,39 @@ impl TalosContext {
             actor_id = ?self.actor_id,
             module_id = self.module_id.as_deref(),
             "write-ceiling: refused data-mutating host op for a read-only actor"
+        );
+        true
+    }
+
+    /// Strict-egress gate for NON-mutating outbound requests from
+    /// read-only actors (see [`write_ceiling_strict_egress`]). Returns
+    /// `true` when the read MUST be refused: both flags on, actor is
+    /// read-only, and the host was admitted only via the `"*"` wildcard.
+    /// Audit policy is `"write-ceiling-strict-egress"` so operators can
+    /// distinguish read-egress refusals from mutation refusals.
+    pub(crate) async fn read_egress_refuses(
+        &mut self,
+        op: &str,
+        host: &str,
+        matched: crate::host::HostMatchKind,
+    ) -> bool {
+        if !strict_egress_denies(
+            write_ceiling_enforced(),
+            write_ceiling_strict_egress(),
+            self.max_write_ceiling,
+            matched,
+        ) {
+            return false;
+        }
+        self.record_capability_denied(op, "write-ceiling-strict-egress", host)
+            .await;
+        tracing::warn!(
+            op,
+            host,
+            actor_id = ?self.actor_id,
+            module_id = self.module_id.as_deref(),
+            "strict-egress: refused wildcard-admitted read for a read-only actor \
+             (name the host in allowed_hosts to permit it)"
         );
         true
     }

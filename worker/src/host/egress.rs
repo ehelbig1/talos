@@ -210,8 +210,31 @@ mod tier1_egress_tests {
 /// `is_external_llm_host`). This function is the operator-grant gate,
 /// not the platform deny-gate.
 pub(crate) fn host_allowlist_match(allowed: &[String], host: &str) -> bool {
+    host_allowlist_match_kind(allowed, host).is_some()
+}
+
+/// HOW an allowlist admitted a host. The write-ceiling strict-egress gate
+/// treats a wildcard admission differently from a named one: an operator
+/// who typed the host (or its domain suffix) made a deliberate egress
+/// decision; `"*"` made none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostMatchKind {
+    /// Exact hostname entry (`api.example.com`).
+    Exact,
+    /// Leading-dot suffix pattern (`.example.com`).
+    Suffix,
+    /// The `"*"` wildcard — no host-specific operator intent.
+    Wildcard,
+}
+
+/// Like [`host_allowlist_match`] but reports HOW the host matched
+/// (`None` = not admitted). A named match wins over a coexisting `"*"`
+/// entry — `["*", "api.example.com"]` reports `Exact` for that host —
+/// because the strict-egress gate must credit explicit operator intent
+/// wherever it exists.
+pub(crate) fn host_allowlist_match_kind(allowed: &[String], host: &str) -> Option<HostMatchKind> {
     if allowed.is_empty() {
-        return false;
+        return None;
     }
     // Strip the FQDN trailing dot before compare. `url::Url::parse` preserves
     // it (RFC 3986); DNS resolves both forms to the same record. Without the
@@ -220,20 +243,78 @@ pub(crate) fn host_allowlist_match(allowed: &[String], host: &str) -> bool {
     // an operator who pastes a copy of the FQDN-with-dot still matches the
     // dotless form a client sends.
     let host_lower = host.trim_end_matches('.').to_ascii_lowercase();
-    allowed.iter().any(|pattern| {
+    let mut saw_wildcard = false;
+    for pattern in allowed {
         if pattern == "*" {
-            return true;
+            saw_wildcard = true;
+            continue;
         }
         // Patterns starting with `.` are suffix patterns by design — preserve
         // that leading dot, only strip the TRAILING one. `.example.com.` and
         // `.example.com` should both match `api.example.com`.
         let pattern_lower = pattern.trim_end_matches('.').to_ascii_lowercase();
         if pattern_lower.starts_with('.') {
-            host_lower.ends_with(pattern_lower.as_str())
-        } else {
-            host_lower == pattern_lower
+            if host_lower.ends_with(pattern_lower.as_str()) {
+                return Some(HostMatchKind::Suffix);
+            }
+        } else if host_lower == pattern_lower {
+            return Some(HostMatchKind::Exact);
         }
-    })
+    }
+    if saw_wildcard {
+        return Some(HostMatchKind::Wildcard);
+    }
+    None
+}
+
+#[cfg(test)]
+mod host_allowlist_match_kind_tests {
+    use super::{host_allowlist_match_kind, HostMatchKind};
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reports_exact_suffix_wildcard_and_none() {
+        assert_eq!(
+            host_allowlist_match_kind(&v(&["api.example.com"]), "api.example.com"),
+            Some(HostMatchKind::Exact)
+        );
+        assert_eq!(
+            host_allowlist_match_kind(&v(&[".example.com"]), "api.example.com"),
+            Some(HostMatchKind::Suffix)
+        );
+        assert_eq!(
+            host_allowlist_match_kind(&v(&["*"]), "anything.example.com"),
+            Some(HostMatchKind::Wildcard)
+        );
+        assert_eq!(
+            host_allowlist_match_kind(&v(&["other.com"]), "api.example.com"),
+            None
+        );
+        assert_eq!(host_allowlist_match_kind(&[], "api.example.com"), None);
+    }
+
+    #[test]
+    fn named_entry_wins_over_coexisting_wildcard() {
+        // The strict-egress gate must credit explicit operator intent:
+        // ["*", "api.example.com"] reports Exact for that host, Wildcard
+        // for everything else.
+        let allowed = v(&["*", "api.example.com", ".trusted.com"]);
+        assert_eq!(
+            host_allowlist_match_kind(&allowed, "api.example.com"),
+            Some(HostMatchKind::Exact)
+        );
+        assert_eq!(
+            host_allowlist_match_kind(&allowed, "svc.trusted.com"),
+            Some(HostMatchKind::Suffix)
+        );
+        assert_eq!(
+            host_allowlist_match_kind(&allowed, "elsewhere.io"),
+            Some(HostMatchKind::Wildcard)
+        );
+    }
 }
 
 #[cfg(test)]
