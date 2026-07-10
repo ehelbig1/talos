@@ -195,7 +195,21 @@ impl wit_llm_tools::Host for TalosContext {
         // bare `complete` path above. See helper
         // `read_llm_response_body_bounded` and constants
         // `EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS` / `MAX_LLM_BODY_BYTES`.
-        let client = self.http_client.clone();
+        //
+        // Local provider (Ollama) bypasses the guest SSRF resolver —
+        // mirrors `complete_impl` / `spawn_llm_stream`. Pre-2026-07-10
+        // this path used the SSRF-filtered per-execution client for ALL
+        // providers, so local tool-use died at connect with "Network
+        // error" (the RFC1918 filter blocks the in-cluster/host Ollama
+        // address). Masked pre-#456 because the tools wire itself was
+        // broken; found live-probing the fixed wire through real worker
+        // dispatch (the controller-embedded runtime's client resolves
+        // differently, so test_module alone could not catch it).
+        let client = if is_local_tools {
+            local_llm_http_client().clone()
+        } else {
+            self.http_client.clone()
+        };
         let timeout_secs_tools: u64 = if is_local_tools {
             LOCAL_LLM_EXCHANGE_TIMEOUT_SECS
         } else {
