@@ -690,6 +690,39 @@ mod tests {
     }
 
     #[test]
+    fn sse_decoder_done_without_finish_reason_flushes_tools() {
+        // Some proxies terminate with [DONE] and never send finish_reason;
+        // accumulated tool calls must still flush before Done.
+        let mut d = OpenAiSseDecoder::default();
+        let mut out = Vec::new();
+        d.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            &mut out,
+        );
+        d.feed_line("data: [DONE]", &mut out);
+        assert!(matches!(out[0], StreamEventOut::ToolCall { .. }));
+        assert_eq!(out[1], StreamEventOut::Done("stop".into()));
+    }
+
+    #[test]
+    fn sse_decoder_usage_only_chunk_with_empty_choices() {
+        // stream_options.include_usage sends a final choice-less chunk.
+        let mut d = OpenAiSseDecoder::default();
+        let mut out = Vec::new();
+        d.feed_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#,
+            &mut out,
+        );
+        assert_eq!(
+            out[0],
+            StreamEventOut::Usage {
+                input_tokens: 11,
+                output_tokens: 7
+            }
+        );
+    }
+
+    #[test]
     fn sse_decoder_accumulates_tool_call_fragments() {
         let mut d = OpenAiSseDecoder::default();
         let mut out = Vec::new();

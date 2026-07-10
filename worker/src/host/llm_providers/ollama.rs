@@ -198,26 +198,48 @@ impl ProviderAdapter for OllamaAdapter {
         body: &mut serde_json::Value,
         opts: serde_json::Map<String, serde_json::Value>,
     ) {
+        // Defensive accessor for the nested `options` map: never index
+        // into a non-object (serde_json's IndexMut PANICS on type
+        // mismatch, and a worker-host panic is a co-tenant DoS). The
+        // builder always seeds `options` as an object and no merge arm
+        // writes a non-object there, but this must stay panic-free under
+        // any future call-order change.
+        fn options_obj(
+            obj: &mut serde_json::Map<String, serde_json::Value>,
+        ) -> &mut serde_json::Value {
+            let entry = obj
+                .entry("options")
+                .or_insert_with(|| serde_json::json!({}));
+            if !entry.is_object() {
+                *entry = serde_json::json!({});
+            }
+            entry
+        }
+
         let orig_messages = body.get("messages").cloned();
         let orig_model = body.get("model").cloned();
         let Some(obj) = body.as_object_mut() else {
             return;
         };
-        for (k, v) in opts {
+        // TWO-PASS merge with EXPLICIT precedence: compat-era spellings
+        // first, native fields second — so on collision (e.g. caller sends
+        // both `max_tokens` AND `options.num_predict`, or `response_format`
+        // AND `format`) the NATIVE spelling always wins, deterministically.
+        // Without the split, precedence depended on serde_json::Map
+        // iteration order — BTreeMap-sorted today, which arbitrarily gave
+        // nested-options wins for keys < "o" and compat wins for keys > "o",
+        // and would silently flip to insertion order if ANY workspace crate
+        // ever enabled serde_json/preserve_order (cargo feature unification
+        // is global).
+        //
+        // Pass 1 — compat-era spellings, translated to native.
+        for (k, v) in &opts {
             match k.as_str() {
-                _ if STRIPPED_OPTION_KEYS.contains(&k.as_str()) => {
-                    // Guardrail-stripped (re-asserted below anyway, but
-                    // skipping avoids ever holding a hijacked value).
-                }
-                // ── compat-era spellings, translated to native ──
                 "max_tokens" => {
-                    let entry = obj
-                        .entry("options")
-                        .or_insert_with(|| serde_json::json!({}));
-                    entry["num_predict"] = v;
+                    options_obj(obj)["num_predict"] = v.clone();
                 }
                 "response_format" => {
-                    if let Some(fmt) = translate_response_format(&v) {
+                    if let Some(fmt) = translate_response_format(v) {
                         obj.insert("format".to_string(), fmt);
                     } else {
                         tracing::warn!(
@@ -226,33 +248,59 @@ impl ProviderAdapter for OllamaAdapter {
                     }
                 }
                 "reasoning_effort" => {
-                    // Undocumented compat mapping, shimmed for the
-                    // configs deployed while the worker still spoke
-                    // compat: none/minimal → thinking OFF; any other
-                    // level → thinking ON.
-                    let think_on =
-                        !matches!(v.as_str(), Some("none") | Some("minimal") | Some("off"));
-                    obj.insert("think".to_string(), serde_json::json!(think_on));
+                    // Undocumented compat mapping, shimmed for the configs
+                    // deployed while the worker still spoke compat:
+                    // none/minimal → thinking OFF; other LEVELS → ON.
+                    // A NON-STRING value is ignored with a warning rather
+                    // than defaulting thinking ON — failing open into the
+                    // expensive direction is the exact 65s-over-the-60s-
+                    // local-timeout mode this control exists to prevent.
+                    match v.as_str() {
+                        Some("none") | Some("minimal") | Some("off") => {
+                            obj.insert("think".to_string(), serde_json::json!(false));
+                        }
+                        Some(_) => {
+                            obj.insert("think".to_string(), serde_json::json!(true));
+                        }
+                        None => {
+                            tracing::warn!(
+                                "ollama provider options: non-string reasoning_effort; ignored"
+                            );
+                        }
+                    }
                 }
-                _ if SAMPLER_OPTION_KEYS.contains(&k.as_str()) => {
-                    let entry = obj
-                        .entry("options")
-                        .or_insert_with(|| serde_json::json!({}));
-                    entry[k.as_str()] = v;
+                k2 if SAMPLER_OPTION_KEYS.contains(&k2) => {
+                    options_obj(obj)[k2] = v.clone();
                 }
+                _ => {}
+            }
+        }
+        // Pass 2 — native request-level fields; win over pass-1
+        // translations on collision.
+        for (k, v) in opts {
+            match k.as_str() {
+                _ if STRIPPED_OPTION_KEYS.contains(&k.as_str()) => {
+                    // Guardrail-stripped (re-asserted below anyway, but
+                    // skipping avoids ever holding a hijacked value).
+                }
+                // consumed by pass 1
+                "max_tokens" | "response_format" | "reasoning_effort" => {}
+                k2 if SAMPLER_OPTION_KEYS.contains(&k2) => {}
                 // ── native request-level fields ──
                 "options" => {
                     // Merge (not replace) so explicit nested options
-                    // compose with the remapped sampler keys.
+                    // compose with — and override — the remapped sampler
+                    // keys from pass 1.
                     if let Some(incoming) = v.as_object() {
-                        let entry = obj
-                            .entry("options")
-                            .or_insert_with(|| serde_json::json!({}));
-                        if let Some(existing) = entry.as_object_mut() {
+                        if let Some(existing) = options_obj(obj).as_object_mut() {
                             for (ok, ov) in incoming {
                                 existing.insert(ok.clone(), ov.clone());
                             }
                         }
+                    } else {
+                        tracing::warn!(
+                            "ollama provider options: non-object `options` value; ignored"
+                        );
                     }
                 }
                 // `think`, `format`, `keep_alive`, and any future native
@@ -294,6 +342,7 @@ impl ProviderAdapter for OllamaAdapter {
         let openai_body = super::openai::OpenAiAdapter.build_tools_body(p)?;
         let mut messages = openai_body.get("messages").cloned().unwrap_or_default();
         normalize_native_message_content(&mut messages);
+        nativize_tool_call_arguments(&mut messages);
         let mut body = serde_json::json!({
             "model": p.model,
             "messages": messages,
@@ -363,6 +412,7 @@ impl ProviderAdapter for OllamaAdapter {
         }
         let mut msgs = serde_json::Value::Array(msgs);
         normalize_native_message_content(&mut msgs);
+        nativize_tool_call_arguments(&mut msgs);
         let mut options = serde_json::json!({ "num_predict": max_tokens });
         if let Some(t) = temperature {
             options["temperature"] = serde_json::json!(t);
@@ -447,6 +497,36 @@ fn normalize_native_message_content(messages: &mut serde_json::Value) {
         msg["content"] = serde_json::json!(text);
         if !images.is_empty() {
             msg["images"] = serde_json::json!(images);
+        }
+    }
+}
+
+/// Native `/api/chat` unmarshals assistant-history
+/// `tool_calls[].function.arguments` as a MAP — echoing the canonical
+/// JSON-STRING form back 400s with `"Value looks like object, but can't
+/// find closing '}' symbol"` (verified live on 0.31.2; the object form
+/// round-trips fine). Parse the string form back to an object; an
+/// unparseable arguments string degrades to `{}` rather than failing the
+/// whole request. Sibling of `normalize_native_message_content` — same
+/// compat-tolerated-it, native-rejects-it class, for the multi-turn tool
+/// loop (turn 2+) instead of message content.
+fn nativize_tool_call_arguments(messages: &mut serde_json::Value) {
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    for msg in arr {
+        let Some(tcs) = msg.get_mut("tool_calls").and_then(|t| t.as_array_mut()) else {
+            continue;
+        };
+        for tc in tcs {
+            let Some(f) = tc.get_mut("function").and_then(|f| f.as_object_mut()) else {
+                continue;
+            };
+            if let Some(s) = f.get("arguments").and_then(|a| a.as_str()) {
+                let parsed = serde_json::from_str::<serde_json::Value>(s)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                f.insert("arguments".to_string(), parsed);
+            }
         }
     }
 }
@@ -615,6 +695,111 @@ mod tests {
         assert_eq!(body["options"]["seed"], 7);
         // builder-set options survive the nested merge
         assert_eq!(body["options"]["num_predict"], 1800);
+    }
+
+    #[test]
+    fn tools_body_nativizes_echo_back_string_arguments_to_objects() {
+        // Multi-turn tool loop, turn 2: the guest echoes the assistant's
+        // prior ToolUse (canonical STRING arguments). Native /api/chat
+        // 400s on the string form (verified live 0.31.2) — the builder
+        // must re-parse it to an object.
+        let messages = [
+            ToolMessage {
+                role: ChatRole::Assistant,
+                is_tool_result_turn: false,
+                content: vec![ToolContentBlock::ToolUse {
+                    call_id: "c1".into(),
+                    tool_name: "get_weather".into(),
+                    arguments: "{\"city\":\"Paris\"}".into(),
+                }],
+            },
+            ToolMessage {
+                role: ChatRole::User,
+                is_tool_result_turn: true,
+                content: vec![ToolContentBlock::ToolResult {
+                    call_id: "c1".into(),
+                    output: "22C".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let body = OllamaAdapter
+            .build_tools_body(&ToolCompletionParams {
+                model: "m",
+                messages: &messages,
+                tools: &[],
+                system_prompt: None,
+                max_tokens: 10,
+                temperature: None,
+                force_tool: None,
+            })
+            .unwrap();
+        let args = &body["messages"][0]["tool_calls"][0]["function"]["arguments"];
+        assert!(
+            args.is_object(),
+            "arguments must be an OBJECT on the native wire, got {args}"
+        );
+        assert_eq!(args["city"], "Paris");
+    }
+
+    #[test]
+    fn options_native_spellings_win_over_compat_on_collision() {
+        // Explicit two-pass precedence: native always beats the compat
+        // translation, deterministically — NOT dependent on
+        // serde_json::Map iteration order.
+        let mut body = base_body();
+        let opts = serde_json::json!({
+            "max_tokens": 100,
+            "options": {"num_predict": 200},
+            "response_format": {"type": "json_object"},
+            "format": {"type": "object"},
+            "reasoning_effort": "none",
+            "think": true,
+        });
+        OllamaAdapter.apply_provider_options(&mut body, opts.as_object().cloned().unwrap());
+        assert_eq!(
+            body["options"]["num_predict"], 200,
+            "nested options beats max_tokens"
+        );
+        assert_eq!(
+            body["format"]["type"], "object",
+            "native format beats response_format"
+        );
+        assert_eq!(body["think"], true, "native think beats reasoning_effort");
+    }
+
+    #[test]
+    fn options_reasoning_effort_non_string_is_ignored_not_fail_open() {
+        // A malformed reasoning_effort must NOT default thinking ON —
+        // that's the expensive 65s-over-the-60s-local-timeout direction.
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(null),
+            serde_json::json!(true),
+        ] {
+            let mut body = base_body();
+            let mut opts = serde_json::Map::new();
+            opts.insert("reasoning_effort".to_string(), bad);
+            OllamaAdapter.apply_provider_options(&mut body, opts);
+            assert!(
+                body.get("think").is_none(),
+                "non-string reasoning_effort must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn options_merge_is_panic_free_when_options_is_a_hostile_scalar() {
+        // serde_json's IndexMut panics on type mismatch; the accessor must
+        // reset a non-object `options` instead of indexing into it. The
+        // builder can't produce this today — the test pins the property
+        // against future call-order changes (worker panic = co-tenant DoS).
+        let mut body = base_body();
+        body["options"] = serde_json::json!(5);
+        let opts = serde_json::json!({"top_p": 0.5, "max_tokens": 9});
+        OllamaAdapter.apply_provider_options(&mut body, opts.as_object().cloned().unwrap());
+        assert!((body["options"]["top_p"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(body["options"]["num_predict"], 9);
     }
 
     #[test]

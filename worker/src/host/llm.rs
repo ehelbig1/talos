@@ -617,8 +617,12 @@ impl TalosContext {
         let text = parsed.text;
         let stop_reason = parsed.stop_reason;
         // MCP-1008: saturate-on-overflow to surface malicious / corrupted
-        // provider responses as visible spikes. `usage` stays `None` when
-        // the provider sent no counts at all (pre-trait behavior).
+        // provider responses as visible spikes. `usage` is `None` when
+        // BOTH counts are absent — a deliberate (small) change from the
+        // pre-trait code, which mapped a bare `"usage": {}` to
+        // `Some({0,0})` and recorded fake zero-token metric samples;
+        // `None` = "unknown" is the faithful WIT `option<token-usage>`
+        // encoding. Real providers always send both counts non-streaming.
         let usage = match (parsed.input_tokens, parsed.output_tokens) {
             (None, None) => None,
             (i, o) => Some(wit_llm::TokenUsage {

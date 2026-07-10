@@ -111,13 +111,21 @@ impl ProviderAdapter for GeminiAdapter {
     }
 
     fn apply_response_format(&self, body: &mut serde_json::Value, json_schema: Option<&str>) {
-        let gc = body
-            .as_object_mut()
-            .map(|o| {
-                o.entry("generationConfig")
-                    .or_insert_with(|| serde_json::json!({}))
-            })
-            .expect("body is an object");
+        // Defensive no-op instead of `.expect`: the body always IS an
+        // object today (built by `build_completion_body`, and this runs
+        // before the options merge — see `complete_impl` ordering), but a
+        // worker-host panic is a co-tenant DoS, so never arm one on a
+        // future call-order change.
+        let Some(obj) = body.as_object_mut() else {
+            tracing::warn!("gemini apply_response_format: body is not an object; skipping");
+            return;
+        };
+        let gc = obj
+            .entry("generationConfig")
+            .or_insert_with(|| serde_json::json!({}));
+        if !gc.is_object() {
+            *gc = serde_json::json!({});
+        }
         gc["responseMimeType"] = serde_json::json!("application/json");
         if let Some(s) = json_schema {
             if let Ok(schema) = serde_json::from_str::<serde_json::Value>(s) {
@@ -272,6 +280,50 @@ mod tests {
             "application/json"
         );
         assert_eq!(body["generationConfig"]["responseSchema"]["type"], "object");
+    }
+
+    #[test]
+    fn options_guardrails_preserve_prompt_and_drop_stream() {
+        // The prompt-integrity guardrail every other adapter pins in
+        // tests — contents/systemInstruction re-asserted, stream dropped.
+        let msgs = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "real".into(),
+        }];
+        let mut body = GeminiAdapter.build_completion_body(&CompletionParams {
+            model: "m",
+            messages: &msgs,
+            system_prompt: Some("REAL_SYS"),
+            max_tokens: 10,
+            temperature: None,
+        });
+        let opts = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "HIJACKED"}]}],
+            "systemInstruction": {"parts": [{"text": "HIJACKED"}]},
+            "stream": true,
+            "safetySettings": [{"category": "X"}],
+        });
+        GeminiAdapter.apply_provider_options(&mut body, opts.as_object().cloned().unwrap());
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "real");
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "REAL_SYS");
+        assert!(body.get("stream").is_none());
+        assert_eq!(body["safetySettings"][0]["category"], "X"); // tuning applies
+    }
+
+    #[test]
+    fn response_format_is_panic_free_on_hostile_body_shapes() {
+        // Non-object body → warn + no-op (was `.expect` — a worker panic
+        // is a co-tenant DoS); scalar generationConfig → reset to object.
+        let mut not_obj = serde_json::json!("nope");
+        GeminiAdapter.apply_response_format(&mut not_obj, None);
+        assert_eq!(not_obj, serde_json::json!("nope"));
+
+        let mut body = serde_json::json!({"contents": [], "generationConfig": 7});
+        GeminiAdapter.apply_response_format(&mut body, None);
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
     }
 
     #[test]
