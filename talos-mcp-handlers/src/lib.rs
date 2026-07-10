@@ -526,14 +526,21 @@ async fn sse_handler(
     // Send notifications/tools/list_changed so MCP bridges (mcp-remote, etc.) that
     // cache tools/list will re-fetch. Fire at 3 s, 15 s, and 60 s to handle bridges
     // that miss the first notification due to connection setup latency.
+    //
+    // `params` MUST be OMITTED, never `null`: JSON-RPC 2.0 requires params to
+    // be a structured value when present, and the MCP schema types it as an
+    // optional OBJECT. Strict clients (mcp-remote's Zod validator, live
+    // incident 2026-07-10) reject `"params": null` messages with a ZodError
+    // on every notification — three per connection — which can break tool
+    // registration in clients that treat stream errors as fatal. Same rule
+    // applies to the two sibling emission sites below.
     let tx_notif = tx.clone();
     tokio::spawn(async move {
         for delay_secs in [3u64, 15, 60] {
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             let data = serde_json::json!({
                 "jsonrpc": "2.0",
-                "method": "notifications/tools/list_changed",
-                "params": null
+                "method": "notifications/tools/list_changed"
             });
             let event = Event::default().event("message").data(data.to_string());
             if tx_notif.send(event).is_err() {
@@ -827,8 +834,7 @@ async fn streamable_http_get_handler(
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             let data = serde_json::json!({
                 "jsonrpc": "2.0",
-                "method": "notifications/tools/list_changed",
-                "params": null
+                "method": "notifications/tools/list_changed"
             });
             yield Ok::<_, Infallible>(
                 Event::default().event("message").data(data.to_string())
@@ -854,8 +860,7 @@ async fn local_get_handler() -> impl IntoResponse {
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             let data = serde_json::json!({
                 "jsonrpc": "2.0",
-                "method": "notifications/tools/list_changed",
-                "params": null
+                "method": "notifications/tools/list_changed"
             });
             yield Ok::<_, Infallible>(
                 Event::default().event("message").data(data.to_string())
