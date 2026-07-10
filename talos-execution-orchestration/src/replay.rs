@@ -165,9 +165,16 @@ impl ExecutionOrchestrationService {
         //
         // Inherits the original execution's actor — replay debits
         // the same budget as the original AND must respect the same
-        // ceiling. `Unbound` (no actor) skips all three sub-checks,
-        // matching pre-fix semantics for unbound executions.
-        if let Err(e) = talos_workflow_authorization::authorize_workflow_trigger(
+        // ceiling.
+        //
+        // Phase D2 (PR #461 follow-up): CAPTURE the gate-resolved actor
+        // instead of discarding it. Pre-fix this path ran the gate,
+        // threw the answer away, and built the engine from a bare
+        // `EngineOpts::for_run` — so every replay ran actorless at the
+        // engine's Tier-1 fail-safe (external-LLM nodes failed,
+        // `__memory_write__` dropped) while the row was stamped with
+        // the inherited actor.
+        let effective_actor = match talos_workflow_authorization::resolve_effective_actor(
             &self.workflow_repo,
             &self.actor_repo,
             &self.db_pool,
@@ -177,8 +184,9 @@ impl ExecutionOrchestrationService {
         )
         .await
         {
-            return Err(map_trigger_auth_error(e));
-        }
+            Ok(resolved) => resolved,
+            Err(e) => return Err(map_trigger_auth_error(e)),
+        };
 
         // 6. Recover the original trigger input from the stored output
         // bundle, then optionally merge overrides on top.
@@ -227,7 +235,8 @@ impl ExecutionOrchestrationService {
             self.secrets_manager.clone(),
             self.actor_repo.clone(),
             user_id,
-            EngineOpts::for_run(workflow_id, graph_json.clone()),
+            EngineOpts::for_run(workflow_id, graph_json.clone())
+                .with_effective_actor(effective_actor, None),
         )
         .await
         {

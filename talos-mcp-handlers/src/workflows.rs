@@ -4187,6 +4187,10 @@ async fn handle_call_workflow(
         Err(resp) => return Some(resp),
     };
     let opts = talos_engine::builder::EngineOpts::for_run(wf_id, graph_json.clone())
+        // allow-unresolved-effective-actor: test_workflow's wf-actor-only
+        // binding is a documented asymmetry (refactor-plan open question #3);
+        // an unbound draft test running at the Tier-1 fail-safe is acceptable
+        // for a test path and matches its historical behavior.
         .with_effective_actor(None, wf_record.actor_id)
         .with_timeout_override(timeout_secs)
         .with_dry_run(dry_run);
@@ -5067,6 +5071,10 @@ async fn handle_bulk_trigger_workflow(
             // parse_graph_document reads execution_timeout_secs from the graph
             // during load (TimeoutPolicy::Honor default).
             let opts = talos_engine::builder::EngineOpts::for_run(wf_id, graph_json)
+                // allow-unresolved-effective-actor: bulk_trigger is
+                // user-initiated (failures immediately visible, unlike the
+                // silent scheduled/webhook paths); D2 gate plumbing for the
+                // fan-out loop is tracked as a follow-up.
                 .with_effective_actor(None, bulk_agent_id);
             let mut engine = match talos_engine::builder::for_workflow(
                 registry,

@@ -1047,7 +1047,7 @@ async fn run_scheduled_execution(
         let workflow_repo_for_auth =
             talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let actor_repo_for_auth = talos_actor_repository::ActorRepository::new(db_pool.clone());
-        match talos_workflow_authorization::authorize_workflow_trigger(
+        match talos_workflow_authorization::resolve_effective_actor(
             &workflow_repo_for_auth,
             &actor_repo_for_auth,
             &db_pool,
@@ -1057,13 +1057,7 @@ async fn run_scheduled_execution(
         )
         .await
         {
-            Ok(talos_workflow_authorization::TriggerAuthorization::Authorized { actor_id }) => {
-                Some(actor_id)
-            }
-            // Phase D1 no longer returns Unbound, but match exhaustively;
-            // if it ever surfaces, fall back to the workflow's own actor
-            // (the engine's Tier-1 default remains the fail-safe).
-            Ok(talos_workflow_authorization::TriggerAuthorization::Unbound) => workflow.actor_id,
+            Ok(resolved) => resolved,
             Err(talos_workflow_authorization::TriggerAuthError::ActorArchived)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorTerminated)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorNotFoundOrInactive) => {

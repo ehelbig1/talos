@@ -591,6 +591,48 @@ pub async fn authorize_workflow_trigger(
     Ok(TriggerAuthorization::Authorized { actor_id: agent_id })
 }
 
+/// Run the trigger gate and return the effective actor to bind on the
+/// engine AND stamp on the execution row — the Phase D2 contract that
+/// authorization, attribution, and runtime tier all use one answer.
+///
+/// This single-sources the Ok-side resolution that the PR #461 review
+/// found hand-copied (with divergent site-local fallbacks) across the
+/// manual-trigger, scheduler, and chain dispatch paths. `Authorized {
+/// actor_id }` is the gate-resolved actor (explicit → workflow-default →
+/// user-default fallback already applied inside the gate). The legacy
+/// `Unbound` variant has not been constructed since Phase D1; if it ever
+/// resurfaces, this falls back to the caller's own `trigger_agent_id` so
+/// a hypothetical revert degrades to pre-D2 behavior at every site
+/// uniformly instead of each site inventing its own.
+///
+/// Callers keep their per-site deny policy (log target, event_kind,
+/// return type) in the `Err` arm — that mapping is site policy, not
+/// resolution logic. `TriggerAuthError` is deliberately NOT
+/// `#[non_exhaustive]`, so a new deny class fails to compile at every
+/// site rather than silently taking a wildcard arm.
+pub async fn resolve_effective_actor(
+    workflow_repo: &WorkflowRepository,
+    actor_repo: &talos_actor_repository::ActorRepository,
+    db_pool: &PgPool,
+    trigger_agent_id: Option<Uuid>,
+    user_id: Uuid,
+    graph_json: &str,
+) -> Result<Option<Uuid>, TriggerAuthError> {
+    match authorize_workflow_trigger(
+        workflow_repo,
+        actor_repo,
+        db_pool,
+        trigger_agent_id,
+        user_id,
+        graph_json,
+    )
+    .await?
+    {
+        TriggerAuthorization::Authorized { actor_id } => Ok(Some(actor_id)),
+        TriggerAuthorization::Unbound => Ok(trigger_agent_id),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Pure-logic tests for [`check_capability_ceiling`].

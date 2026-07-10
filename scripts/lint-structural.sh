@@ -3638,6 +3638,49 @@ else
 fi
 echo
 
+# ── 56. Unresolved effective-actor engine binding ─────────────────────
+# The engine's fail-safe default for an UNBOUND actor is Tier-1
+# (local-egress-only) — correct as a fail-safe, catastrophic as an
+# accident: a dispatch path that builds an engine without resolving the
+# effective actor makes the same workflow behave differently per trigger
+# path (PR #461: unbound scheduled workflows died for 16h with generic
+# `networkerror` while manual triggers worked; the review then found the
+# identical defect pre-existing on the retry, replay, webhook-router and
+# continuation paths). The Phase D2 contract: run the authorization gate
+# (whose Phase D1 fallback resolves the user's default actor) via
+# `talos_workflow_authorization::resolve_effective_actor` and bind ITS
+# answer — never a literal `None`. Opt-out for deliberate fail-safe
+# paths: `// allow-unresolved-effective-actor: <reason>` within 8 lines
+# above the call.
+bold "▶ check 56: with_effective_actor(None, …) without gate-resolved actor"
+UNRESOLVED_ACTOR_HITS="$(grep -rn 'with_effective_actor(None,' \
+        --include='*.rs' \
+        talos-engine/src talos-scheduler/src talos-webhooks/src \
+        talos-continuation-trigger/src talos-execution-orchestration/src \
+        talos-mcp-handlers/src talos-api/src controller/src 2>/dev/null \
+    | grep -v 'src/builder.rs' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
+    | while IFS= read -r hit; do
+        f="${hit%%:*}"; n="$(echo "$hit" | cut -d: -f2)"
+        start=$(( n > 8 ? n - 8 : 1 ))
+        if ! sed -n "${start},${n}p" "$f" | grep -q 'allow-unresolved-effective-actor'; then
+            echo "$hit"
+        fi
+    done)"
+if [ -n "$UNRESOLVED_ACTOR_HITS" ]; then
+    red "✗ engine built with a literal-None effective actor (Tier-1 fail-safe by accident):"
+    echo "$UNRESOLVED_ACTOR_HITS" | sed 's/^/    /'
+    yellow "  → resolve the actor through the authorization gate"
+    yellow "    (talos_workflow_authorization::resolve_effective_actor) and bind its answer,"
+    yellow "    so authorization, attribution, and runtime tier use one value (PR #461)."
+    yellow "  → deliberate fail-safe paths: // allow-unresolved-effective-actor: <reason>"
+    yellow "    within 8 lines above the call."
+    EXIT_CODE=1
+else
+    green "✓ no unresolved-effective-actor engine bindings"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
