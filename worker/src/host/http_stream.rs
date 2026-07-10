@@ -127,9 +127,23 @@ impl wit_http_stream::Host for TalosContext {
             );
             return Err(wit_http_stream::Error::ForbiddenHost);
         }
-        if !host_allowlist_match(&self.allowed_hosts, &host) {
-            self.record_capability_denied("http-stream", "allowed-hosts", &host)
-                .await;
+        let host_match = match host_allowlist_match_kind(&self.allowed_hosts, &host) {
+            Some(kind) => kind,
+            None => {
+                self.record_capability_denied("http-stream", "allowed-hosts", &host)
+                    .await;
+                return Err(wit_http_stream::Error::ForbiddenHost);
+            }
+        };
+        // Strict-egress gate: an SSE connect is a READ channel, but its URL
+        // is guest-influenceable outbound data — same exfil surface as a
+        // GET (see http.rs fetch). Read-only actors under
+        // `TALOS_WRITE_CEILING_STRICT_EGRESS=1` may stream only from
+        // operator-NAMED hosts; wildcard admissions are refused.
+        if self
+            .read_egress_refuses("http-stream", &host, host_match)
+            .await
+        {
             return Err(wit_http_stream::Error::ForbiddenHost);
         }
 

@@ -827,6 +827,7 @@ async fn handle_get_module_info(
             "allowed_hosts": info.allowed_hosts,
             "allowed_secrets": info.allowed_secrets,
             "host_managed_access": host_managed,
+            "mutation_profile": mutation_profile_for_world(Some(info.capability_world.as_str())),
             "has_source_code": info.has_source_code,
             "template_id": info.template_id,
             "rate_limit_per_minute": info.rate_limit_per_minute,
@@ -884,6 +885,7 @@ async fn handle_get_module_info(
             "allowed_hosts": tmpl.allowed_hosts,
             "allowed_secrets": tmpl.allowed_secrets,
             "host_managed_access": host_managed,
+            "mutation_profile": mutation_profile_for_world(tmpl.capability_world.as_deref()),
             "has_source_code": tmpl.has_source_code,
             "compiled_at": tmpl.created_at.map(|t| t.to_rfc3339()),
         });
@@ -917,6 +919,26 @@ async fn handle_get_module_info(
 /// (`Option<String>` for wasm_modules, plain `String` for
 /// node_templates) can be projected via `.as_deref()` without
 /// cloning.
+/// Write-ceiling MUTATION PROFILE for a module's capability world: which
+/// data-mutating host ops the module can reach, using the exact `op`
+/// labels the worker audits with (`wasi:capability_denied`,
+/// `policy = "write-ceiling"`). The op list is derived in ONE place —
+/// `talos_capability_world::write_gated_ops` — so this surface can never
+/// drift from the lattice. An absent/unknown world reports the FULL
+/// profile (fail-closed presentation for operator review).
+fn mutation_profile_for_world(capability_world: Option<&str>) -> serde_json::Value {
+    let ops = talos_capability_world::write_gated_ops_str(capability_world.unwrap_or("unknown"));
+    serde_json::json!({
+        "write_gated_ops": ops,
+        "note": "Ops a READ-ONLY actor is refused when TALOS_WRITE_CEILING_ENFORCED=1. \
+                 `http-fetch`/`http-fetch-all` are gated for mutating methods only — GET \
+                 passes (the ceiling is a mutation control, not an egress control; \
+                 TALOS_WRITE_CEILING_STRICT_EGRESS=1 additionally restricts read-only \
+                 actors' reads to hosts NAMED in allowed_hosts). Labels match the \
+                 worker's write-ceiling audit events one-to-one.",
+    })
+}
+
 fn host_managed_access_for_world(capability_world: Option<&str>) -> serde_json::Value {
     let normalized = capability_world
         .map(|s| s.trim_end_matches("-node").to_ascii_lowercase())

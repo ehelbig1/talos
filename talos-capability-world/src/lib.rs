@@ -550,6 +550,187 @@ pub fn world_allows_secrets(world: &str) -> bool {
     )
 }
 
+// ============================================================================
+// Write-ceiling mutation profile
+// ============================================================================
+
+/// The HTTP suite of write-ceiling-gated ops every world above `Minimal`
+/// imports (`http`, `webhook`, `graphql`, `email` in `wit/talos.wit`).
+/// `http-fetch`/`http-fetch-all` are gated for MUTATING methods only
+/// (POST/PUT/PATCH/DELETE); GET passes — the write ceiling is a mutation
+/// control, not an egress control (see `TALOS_WRITE_CEILING_STRICT_EGRESS`
+/// for the read-side hardening knob).
+const HTTP_SUITE_OPS: &[&str] = &[
+    "http-fetch",
+    "http-fetch-all",
+    "webhook-send",
+    "graphql-execute",
+    "email-send",
+];
+
+const MESSAGING_OPS: &[&str] = &["messaging-publish", "messaging-request"];
+const DATABASE_OPS: &[&str] = &["database-query"];
+const AGENT_MEMORY_OPS: &[&str] = &[
+    "agent-memory-set",
+    "agent-memory-delete",
+    "agent-memory-store-with-embedding",
+];
+const INTEGRATION_STATE_OPS: &[&str] = &["integration-state-set", "integration-state-delete"];
+const OBJECT_STORAGE_OPS: &[&str] = &["object-storage-put", "object-storage-delete"];
+
+/// Write-ceiling MUTATION PROFILE: the data-mutating host operations a
+/// module compiled for this world can reach. Labels are the EXACT `op`
+/// strings the worker audits via `TalosContext::write_ceiling_refuses`
+/// (`wasi:capability_denied` rows with `policy = "write-ceiling"`), so an
+/// operator can correlate each profile entry to audit events one-to-one.
+///
+/// Derived from the `wit/talos.wit` world imports (verified 2026-07-10):
+/// every world above Minimal imports the HTTP suite; Messaging adds NATS
+/// publish/request; Database adds SQL + agent-memory; Agent adds
+/// agent-memory + integration-state; Trusted (automation-node) has all of
+/// the above plus object-storage. NOT in any profile because the worker
+/// deliberately does not ceiling-gate them: `http-stream` (read channel),
+/// Redis `cache` (ephemeral), sandboxed `files` writes (module-local
+/// scratch), and execution `state` (engine-internal durability).
+///
+/// `Unknown` returns the FULL Trusted profile — fail-closed presentation:
+/// a world the inspector can't classify must be assumed capable of
+/// everything when an operator reviews it.
+pub fn write_gated_ops(world: &CapabilityWorld) -> Vec<&'static str> {
+    // Exhaustive match: a NEW world variant is a compile error here,
+    // forcing an explicit mutation-profile decision (same pattern as the
+    // worker's fs-preopen policy).
+    let extra: &[&[&str]] = match world {
+        CapabilityWorld::Minimal => return Vec::new(),
+        CapabilityWorld::Http
+        | CapabilityWorld::Network
+        | CapabilityWorld::Secrets
+        | CapabilityWorld::Governance
+        | CapabilityWorld::Cache
+        | CapabilityWorld::Filesystem => &[],
+        CapabilityWorld::Messaging => &[MESSAGING_OPS],
+        CapabilityWorld::Database => &[DATABASE_OPS, AGENT_MEMORY_OPS],
+        CapabilityWorld::Agent => &[AGENT_MEMORY_OPS, INTEGRATION_STATE_OPS],
+        CapabilityWorld::Trusted | CapabilityWorld::Unknown => &[
+            MESSAGING_OPS,
+            DATABASE_OPS,
+            AGENT_MEMORY_OPS,
+            INTEGRATION_STATE_OPS,
+            OBJECT_STORAGE_OPS,
+        ],
+    };
+    let mut ops: Vec<&'static str> = HTTP_SUITE_OPS.to_vec();
+    for group in extra {
+        ops.extend_from_slice(group);
+    }
+    ops
+}
+
+/// String-form convenience for handler code that holds the world as text
+/// (module rows store `capability_world` as a string). Unparseable input
+/// maps to `Unknown` → the fail-closed full profile.
+pub fn write_gated_ops_str(world: &str) -> Vec<&'static str> {
+    let parsed = world
+        .parse::<CapabilityWorld>()
+        .unwrap_or(CapabilityWorld::Unknown);
+    write_gated_ops(&parsed)
+}
+
+#[cfg(test)]
+mod mutation_profile_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn minimal_mutates_nothing() {
+        assert!(write_gated_ops(&CapabilityWorld::Minimal).is_empty());
+    }
+
+    #[test]
+    fn unknown_is_fail_closed_to_the_full_profile() {
+        assert_eq!(
+            write_gated_ops(&CapabilityWorld::Unknown),
+            write_gated_ops(&CapabilityWorld::Trusted)
+        );
+        // Unparseable strings take the same fail-closed path.
+        assert_eq!(
+            write_gated_ops_str("not-a-world"),
+            write_gated_ops(&CapabilityWorld::Trusted)
+        );
+    }
+
+    #[test]
+    fn profile_is_monotone_with_the_capability_lattice() {
+        // If world A's imports are a subset of world B's, A's mutation
+        // profile must be a subset of B's — otherwise the profile claims
+        // a capability the lattice says A doesn't have (or hides one).
+        for a in CapabilityWorld::ALL {
+            for b in CapabilityWorld::ALL {
+                if a.is_subset_of(b) {
+                    let ops_a: HashSet<_> = write_gated_ops(a).into_iter().collect();
+                    let ops_b: HashSet<_> = write_gated_ops(b).into_iter().collect();
+                    assert!(
+                        ops_a.is_subset(&ops_b),
+                        "{} ⊆ {} in the lattice, but its mutation profile is not a subset",
+                        a.as_str(),
+                        b.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn str_form_accepts_short_and_node_spellings() {
+        assert_eq!(
+            write_gated_ops_str("agent-node"),
+            write_gated_ops(&CapabilityWorld::Agent)
+        );
+        assert_eq!(
+            write_gated_ops_str("agent"),
+            write_gated_ops(&CapabilityWorld::Agent)
+        );
+        assert_eq!(
+            write_gated_ops_str("automation-node"),
+            write_gated_ops(&CapabilityWorld::Trusted)
+        );
+    }
+
+    #[test]
+    fn every_profile_op_is_a_known_worker_audit_label() {
+        // The full label universe — must stay in lockstep with the worker's
+        // write_ceiling_refuses call sites (op strings are the audit key).
+        let known: HashSet<&str> = [
+            "http-fetch",
+            "http-fetch-all",
+            "webhook-send",
+            "graphql-execute",
+            "email-send",
+            "messaging-publish",
+            "messaging-request",
+            "database-query",
+            "agent-memory-set",
+            "agent-memory-delete",
+            "agent-memory-store-with-embedding",
+            "integration-state-set",
+            "integration-state-delete",
+            "object-storage-put",
+            "object-storage-delete",
+        ]
+        .into_iter()
+        .collect();
+        for w in CapabilityWorld::ALL {
+            for op in write_gated_ops(w) {
+                assert!(
+                    known.contains(op),
+                    "unknown op label {op} in {}",
+                    w.as_str()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod ceiling_tests {
     use super::*;

@@ -150,16 +150,19 @@ impl wit_http::Host for TalosContext {
             return Err(wit_http::Error::Forbiddenhost);
         }
 
-        if !host_allowlist_match(&self.allowed_hosts, host) {
-            self.record_capability_denied("http-fetch", "allowed-hosts", host)
-                .await;
-            tracing::warn!(
-                host,
-                allowed_count = self.allowed_hosts.len(),
-                "WASM module attempted to reach a forbidden host"
-            );
-            return Err(wit_http::Error::Forbiddenhost);
-        }
+        let host_match = match host_allowlist_match_kind(&self.allowed_hosts, host) {
+            Some(kind) => kind,
+            None => {
+                self.record_capability_denied("http-fetch", "allowed-hosts", host)
+                    .await;
+                tracing::warn!(
+                    host,
+                    allowed_count = self.allowed_hosts.len(),
+                    "WASM module attempted to reach a forbidden host"
+                );
+                return Err(wit_http::Error::Forbiddenhost);
+            }
+        };
 
         // Tier-1 LLM egress ceiling — deny external LLM provider hosts
         // regardless of `allowed_hosts`. Closes the HTTP bypass: a
@@ -193,6 +196,16 @@ impl wit_http::Host for TalosContext {
         // unless `TALOS_WRITE_CEILING_ENFORCED=1`.
         if http_method_mutates(&req.method)
             && self.write_ceiling_refuses("http-fetch", host).await
+        {
+            return Err(wit_http::Error::Forbiddenhost);
+        }
+        // Strict-egress gate for the READ side: a GET URL is guest-
+        // influenceable outbound data (exfil channel), so with
+        // `TALOS_WRITE_CEILING_STRICT_EGRESS=1` a read-only actor may
+        // read only from operator-NAMED hosts — wildcard admissions are
+        // refused. Inert unless both ceiling flags are on.
+        if !http_method_mutates(&req.method)
+            && self.read_egress_refuses("http-fetch", host, host_match).await
         {
             return Err(wit_http::Error::Forbiddenhost);
         }
@@ -714,12 +727,15 @@ impl wit_http::Host for TalosContext {
             }
 
             // 4. allowed_hosts pattern match.
-            if !host_allowlist_match(&self.allowed_hosts, &host) {
-                self.record_capability_denied("http-fetch-all", "allowed-hosts", &host)
-                    .await;
-                validated.push(Err(wit_http::Error::Forbiddenhost));
-                continue;
-            }
+            let host_match = match host_allowlist_match_kind(&self.allowed_hosts, &host) {
+                Some(kind) => kind,
+                None => {
+                    self.record_capability_denied("http-fetch-all", "allowed-hosts", &host)
+                        .await;
+                    validated.push(Err(wit_http::Error::Forbiddenhost));
+                    continue;
+                }
+            };
 
             // 5. Tier-1 LLM egress ceiling. Per-request so a mixed batch
             //    rejects only the tier-2 LLM entries.
@@ -747,6 +763,17 @@ impl wit_http::Host for TalosContext {
             //     mutating entries. Inert unless enforcement is on.
             if http_method_mutates(&req.method)
                 && self.write_ceiling_refuses("http-fetch-all", &host).await
+            {
+                validated.push(Err(wit_http::Error::Forbiddenhost));
+                continue;
+            }
+            // 5c. Strict-egress gate for the READ side (see the fetch()
+            //     sibling): read-only actors may read only from
+            //     operator-NAMED hosts; wildcard admissions refused.
+            if !http_method_mutates(&req.method)
+                && self
+                    .read_egress_refuses("http-fetch-all", &host, host_match)
+                    .await
             {
                 validated.push(Err(wit_http::Error::Forbiddenhost));
                 continue;
