@@ -247,6 +247,15 @@ async fn run_single_workflow_chain(
     // The gate's Phase D1 fallback (`get_or_create_default_actor`) is
     // the single source of truth for "who does an unbound workflow run
     // as" — authorization and runtime tier now use the same answer.
+    // Deny-arm log context: for an unbound chain the actor being denied is
+    // the gate's internally-resolved user-default actor, whose id the error
+    // variants don't carry — `actor_id: None` alone is unactionable. This
+    // field plus `user_id` makes the denied principal recoverable.
+    let denied_actor_source = if workflow_actor_id.is_some() {
+        "workflow-bound"
+    } else {
+        "user-default-actor"
+    };
     let effective_actor_id: Option<Uuid> = {
         let workflow_repo_for_auth =
             talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
@@ -275,6 +284,8 @@ async fn run_single_workflow_chain(
                     event_kind = "chain_dispatch_denied_actor_state",
                     workflow_id = %workflow_id,
                     actor_id = ?workflow_actor_id,
+                    %user_id,
+                    denied_actor_source,
                     trigger_module_id = %trigger_module_id,
                     trigger_context_id = %trigger_context_id,
                     "MCP-708: chained workflow denied — actor not in a runnable state"
@@ -287,6 +298,8 @@ async fn run_single_workflow_chain(
                     event_kind = "chain_dispatch_denied_by_budget",
                     workflow_id = %workflow_id,
                     actor_id = ?workflow_actor_id,
+                    %user_id,
+                    denied_actor_source,
                     trigger_module_id = %trigger_module_id,
                     trigger_context_id = %trigger_context_id,
                     reason = %reason,
@@ -305,6 +318,8 @@ async fn run_single_workflow_chain(
                     event_kind = "chain_dispatch_denied_capability_ceiling",
                     workflow_id = %workflow_id,
                     actor_id = ?workflow_actor_id,
+                    %user_id,
+                    denied_actor_source,
                     trigger_module_id = %trigger_module_id,
                     trigger_context_id = %trigger_context_id,
                     %module_id,
@@ -324,6 +339,8 @@ async fn run_single_workflow_chain(
                     event_kind = "chain_dispatch_denied_db_error",
                     workflow_id = %workflow_id,
                     actor_id = ?workflow_actor_id,
+                    %user_id,
+                    denied_actor_source,
                     error = %e,
                     "MCP-708: chained workflow denied — auth-gate DB error (fail-closed)"
                 );
@@ -624,13 +641,21 @@ async fn run_single_workflow_chain(
         let pool = db_pool.clone();
         let trigger_exec_id = trigger_execution_id;
         tokio::spawn(async move {
+            // Phase D2: stamp the gate-resolved actor so row attribution
+            // matches the engine binding. Pre-fix the column was omitted and
+            // the DB auto-stamp trigger filled the user's DEFAULT actor even
+            // when the chain ran as the workflow's own actor — so per-actor
+            // budget COUNTs (WHERE actor_id = $1) never saw chain runs and
+            // the bound actor's caps were under-enforced on the
+            // highest-amplification dispatch path.
             if let Err(db_err) = sqlx::query(
-                "INSERT INTO workflow_executions (id, workflow_id, user_id, status, started_at) \
-                 VALUES ($1, $2, $3, 'running', NOW()) ON CONFLICT DO NOTHING",
+                "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at) \
+                 VALUES ($1, $2, $3, $4, 'running', NOW()) ON CONFLICT DO NOTHING",
             )
             .bind(execution_id)
             .bind(workflow_id)
             .bind(user_id)
+            .bind(effective_actor_id)
             .execute(&pool)
             .await
             {
@@ -683,8 +708,8 @@ async fn run_single_workflow_chain(
         // ordering; the spawned INSERT's `ON CONFLICT DO NOTHING` then preserves
         // it. The conflict-update WHERE keeps the existing terminal-state guard.
         if let Err(db_err) = sqlx::query(
-            "INSERT INTO workflow_executions (id, workflow_id, user_id, status, started_at, completed_at, error_message) \
-             VALUES ($2, $3, $4, 'failed', NOW(), NOW(), $1) \
+            "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at, completed_at, error_message) \
+             VALUES ($2, $3, $4, $5, 'failed', NOW(), NOW(), $1) \
              ON CONFLICT (id) DO UPDATE SET status = 'failed', completed_at = NOW(), error_message = $1 \
              WHERE workflow_executions.status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
         )
@@ -692,6 +717,7 @@ async fn run_single_workflow_chain(
         .bind(execution_id)
         .bind(workflow_id)
         .bind(user_id)
+        .bind(effective_actor_id)
         .execute(db_pool)
         .await {
             tracing::error!("Database operation failed in engine: {}", db_err);
@@ -763,8 +789,8 @@ async fn run_single_workflow_chain(
             // UPDATE could orphan the row at `'running'`. Upsert is correct in
             // either ordering.
             if let Err(db_err) = sqlx::query(
-                "INSERT INTO workflow_executions (id, workflow_id, user_id, status, started_at, completed_at, error_message) \
-                 VALUES ($2, $3, $4, 'failed', NOW(), NOW(), $1) \
+                "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at, completed_at, error_message) \
+                 VALUES ($2, $3, $4, $5, 'failed', NOW(), NOW(), $1) \
                  ON CONFLICT (id) DO UPDATE SET status = 'failed', completed_at = NOW(), error_message = $1 \
                  WHERE workflow_executions.status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
             )
@@ -772,6 +798,7 @@ async fn run_single_workflow_chain(
             .bind(execution_id)
             .bind(workflow_id)
             .bind(user_id)
+            .bind(effective_actor_id)
             .execute(db_pool)
             .await {
     tracing::error!("Database operation failed in engine: {}", db_err);
