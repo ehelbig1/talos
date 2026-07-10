@@ -1018,9 +1018,32 @@ async fn run_scheduled_execution(
     //
     // Skip-with-warn semantics preserved per-rejection-class so
     // operators can distinguish budget vs ceiling vs actor-state.
-    // Only fires when the workflow has an actor; un-bound scheduled
-    // workflows have no actor to enforce.
-    if workflow.actor_id.is_some() {
+    //
+    // Phase D2 parity with `trigger.rs` (2026-07-10): the gate now runs
+    // UNCONDITIONALLY and its resolved actor is captured. Pre-fix the
+    // scheduler skipped the gate for unbound workflows ("no actor to
+    // enforce") and built the engine with `with_effective_actor(None,
+    // None)` — so an unbound scheduled workflow ran at the engine's
+    // fail-safe Tier-1 default (local-egress-only: every external HTTP
+    // call died as a generic `networkerror`) while the SAME workflow
+    // triggered manually resolved the user's default actor (Tier-2) and
+    // worked. Worse, the DB auto-stamp trigger recorded the default
+    // actor on the execution row, so attribution said one actor while
+    // the runtime tier came from none. The gate's Phase D1 fallback
+    // (`get_or_create_default_actor`) is the single source of truth for
+    // "who does an unbound workflow run as" — authorization,
+    // attribution, and runtime tier now all use its answer.
+    // Deny-arm log context: for an unbound workflow the actor being denied
+    // is the gate's internally-resolved user-default actor, whose id the
+    // error variants don't carry — `actor_id: None` alone is unactionable
+    // (the operator can't tell WHICH actor to resume/fund). This field plus
+    // `user_id` makes the denied principal recoverable in one lookup.
+    let denied_actor_source = if workflow.actor_id.is_some() {
+        "workflow-bound"
+    } else {
+        "user-default-actor"
+    };
+    let effective_actor_id: Option<Uuid> = {
         let workflow_repo_for_auth =
             talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let actor_repo_for_auth = talos_actor_repository::ActorRepository::new(db_pool.clone());
@@ -1034,7 +1057,13 @@ async fn run_scheduled_execution(
         )
         .await
         {
-            Ok(_) => {}
+            Ok(talos_workflow_authorization::TriggerAuthorization::Authorized { actor_id }) => {
+                Some(actor_id)
+            }
+            // Phase D1 no longer returns Unbound, but match exhaustively;
+            // if it ever surfaces, fall back to the workflow's own actor
+            // (the engine's Tier-1 default remains the fail-safe).
+            Ok(talos_workflow_authorization::TriggerAuthorization::Unbound) => workflow.actor_id,
             Err(talos_workflow_authorization::TriggerAuthError::ActorArchived)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorTerminated)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorNotFoundOrInactive) => {
@@ -1042,6 +1071,8 @@ async fn run_scheduled_execution(
                     execution_id = %execution_id,
                     workflow_id = %workflow_id,
                     actor_id = ?workflow.actor_id,
+                    %user_id,
+                    denied_actor_source,
                     schedule_id = %schedule_id,
                     "MCP-708: scheduled fire denied — actor not in a runnable state"
                 );
@@ -1052,6 +1083,8 @@ async fn run_scheduled_execution(
                     execution_id = %execution_id,
                     workflow_id = %workflow_id,
                     actor_id = ?workflow.actor_id,
+                    %user_id,
+                    denied_actor_source,
                     schedule_id = %schedule_id,
                     reason = %reason,
                     "MCP-708: scheduled fire denied by actor budget/status gate — skipping dispatch"
@@ -1068,6 +1101,8 @@ async fn run_scheduled_execution(
                     execution_id = %execution_id,
                     workflow_id = %workflow_id,
                     actor_id = ?workflow.actor_id,
+                    %user_id,
+                    denied_actor_source,
                     schedule_id = %schedule_id,
                     %module_id,
                     %module_world,
@@ -1085,6 +1120,8 @@ async fn run_scheduled_execution(
                     execution_id = %execution_id,
                     workflow_id = %workflow_id,
                     actor_id = ?workflow.actor_id,
+                    %user_id,
+                    denied_actor_source,
                     schedule_id = %schedule_id,
                     error = %e,
                     "MCP-708: scheduled fire denied — auth-gate DB error (fail-closed)"
@@ -1092,13 +1129,13 @@ async fn run_scheduled_execution(
                 return;
             }
         }
-    }
+    };
 
     // 2. Create execution record via the canonical
     //    `WorkflowRepository::create_execution_with_lineage` helper so
     //    the row stamps both `provenance` (trigger_type='scheduled' +
-    //    schedule_id) AND `actor_id` (workflow.actor_id) in one
-    //    ownership-gated INSERT. This consolidates the scheduler onto
+    //    schedule_id) AND `actor_id` (the gate-resolved effective actor —
+    //    see the Phase D2 note above) in one ownership-gated INSERT. This consolidates the scheduler onto
     //    the same write path used by `trigger_workflow` /
     //    `replay_execution`, so analytics queries that filter by
     //    `provenance->>'trigger_type' = 'scheduled'`
@@ -1132,7 +1169,10 @@ async fn run_scheduled_execution(
             user_id,
             None, // version_id — scheduler runs the draft graph
             None, // priority — defaults to "normal"
-            workflow.actor_id,
+            // Phase D2: the gate-resolved actor (default-actor fallback
+            // included) so the row's attribution matches the runtime tier
+            // instead of relying on the DB auto-stamp trigger to fill NULL.
+            effective_actor_id,
             Some(&provenance),
             None, // parent_execution_id — top-level run
             None, // root_execution_id — top-level run
@@ -1151,23 +1191,50 @@ async fn run_scheduled_execution(
             return;
         }
     };
-    if let talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running } =
-        admission
-    {
-        // Respect the per-workflow concurrency cap. `next_trigger_at` was
-        // already advanced before this spawn (commit-before-dispatch), so a
-        // skipped fire simply drops to the next occurrence — consistent with the
-        // scheduler's skip-to-next philosophy (no catch-up storm) and the
-        // MCP-708 auth-gate skip semantics already in this function.
-        tracing::warn!(
-            execution_id = %execution_id,
-            workflow_id = %workflow_id,
+    match admission {
+        talos_workflow_repository::ConcurrencyAdmission::Created => {}
+        talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running } => {
+            // Respect the per-workflow concurrency cap. `next_trigger_at` was
+            // already advanced before this spawn (commit-before-dispatch), so a
+            // skipped fire simply drops to the next occurrence — consistent with the
+            // scheduler's skip-to-next philosophy (no catch-up storm) and the
+            // MCP-708 auth-gate skip semantics already in this function.
+            tracing::warn!(
+                execution_id = %execution_id,
+                workflow_id = %workflow_id,
+                limit,
+                running,
+                "Scheduler: skipping fire — per-workflow max_concurrent_executions reached; \
+                 the next scheduled occurrence will retry"
+            );
+            return;
+        }
+        talos_workflow_repository::ConcurrencyAdmission::ActorBudgetExceeded {
+            kind,
             limit,
-            running,
-            "Scheduler: skipping fire — per-workflow max_concurrent_executions reached; \
-             the next scheduled occurrence will retry"
-        );
-        return;
+            count,
+        } => {
+            // The atomic backstop rolled back the INSERT — no execution row
+            // exists. Pre-fix this arm fell through an `if let LimitReached`
+            // and the engine ran anyway: a budget-bypassing ghost run whose
+            // status/checkpoint writes all matched zero rows. The backstop
+            // covers caps the gate's pre-check does not (per-minute, fuel/hr),
+            // so this arm is reachable deterministically, not just via race.
+            // Skip-to-next semantics, same as LimitReached; trigger.rs
+            // rejects the same variant on the manual path.
+            tracing::warn!(
+                execution_id = %execution_id,
+                workflow_id = %workflow_id,
+                actor_id = ?effective_actor_id,
+                schedule_id = %schedule_id,
+                reason = %talos_workflow_repository::actor_budget_exceeded_message(
+                    kind, limit, count
+                ),
+                "Scheduler: skipping fire — actor budget exceeded (atomic backstop); \
+                 the next scheduled occurrence will retry"
+            );
+            return;
+        }
     }
 
     // 3. Resolve actor memory context (independent of engine construction).
@@ -1214,7 +1281,12 @@ async fn run_scheduled_execution(
         db_pool.clone(),
     ));
     let opts = talos_engine::builder::EngineOpts::for_run(workflow_id, workflow.graph_json.clone())
-        .with_effective_actor(None, workflow.actor_id)
+        // Phase D2: the gate-resolved actor (explicit → workflow → default
+        // fallback already applied) so the engine tier matches the stamped
+        // execution row. Pre-fix an unbound workflow passed (None, None)
+        // here and silently ran at the engine's fail-safe Tier-1 while the
+        // same workflow triggered manually ran Tier-2.
+        .with_effective_actor(effective_actor_id, workflow.actor_id)
         .with_actor_context(actor_context);
     let mut engine = match talos_engine::builder::for_workflow(
         registry,
