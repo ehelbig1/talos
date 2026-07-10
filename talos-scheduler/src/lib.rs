@@ -1243,6 +1243,17 @@ async fn run_scheduled_execution(
     //    The workflow's description is forwarded as the relevance hint so
     //    graph RAG and vector similarity pick the most pertinent memories
     //    rather than just the most recent.
+    // INTENT (PR #461 review follow-up): context injection deliberately keys
+    // on `workflow.actor_id`, NOT the gate-resolved `effective_actor_id`.
+    // For an unbound workflow the effective actor is the user's SHARED
+    // auto-provisioned Default actor — a fallback identity/budget bucket
+    // whose memory pool accumulates writes from every unbound flow. Injecting
+    // that pool as `__actor_context__` would cross-contaminate unrelated
+    // workflows (and feed LLM nodes other flows' synthetic outputs — the
+    // metadata.kind poisoning class). A workflow that wants its memory read
+    // back on scheduled runs must be bound to its own actor
+    // (`set_workflow_actor_id`); writes under the Default actor remain
+    // reachable via explicit `agent_memory::get/search` calls.
     let actor_context = if let Some(actor_id) = workflow.actor_id {
         let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let context_hint = workflow.description.as_deref();
