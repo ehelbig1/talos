@@ -1557,15 +1557,26 @@ impl WebhookRouter {
         //     against the actor's `max_capability_world`).
         // The MCP-555 / MCP-557 / MCP-564 sweep covered scheduler /
         // chains / retry / continuation; this closes the last surface.
-        // No-op when `wf_row.actor_id` is None — module-bound dispatch
-        // intentionally has no owning actor and skips the gate.
-        if wf_row.actor_id.is_some() {
-            use talos_workflow_authorization::{authorize_workflow_trigger, TriggerAuthError};
+        //
+        // Phase D2 parity (PR #461 follow-up): the gate now runs
+        // UNCONDITIONALLY and its resolved actor is captured for the row
+        // stamp + engine binding below. Pre-fix, an unbound workflow's
+        // webhook dispatch skipped the gate AND left the engine unbound —
+        // running at the engine's fail-safe Tier-1 (external-LLM calls
+        // denied, `__memory_write__` dropped) while the SAME workflow
+        // triggered manually resolved the user's default actor (Tier-2).
+        let denied_actor_source = if wf_row.actor_id.is_some() {
+            "workflow-bound"
+        } else {
+            "user-default-actor"
+        };
+        let effective_actor_id: Option<uuid::Uuid> = {
+            use talos_workflow_authorization::TriggerAuthError;
             let workflow_repo_for_auth =
                 talos_workflow_repository::WorkflowRepository::new(self.db_pool.clone());
             let actor_repo_for_auth =
                 talos_actor_repository::ActorRepository::new(self.db_pool.clone());
-            match authorize_workflow_trigger(
+            match talos_workflow_authorization::resolve_effective_actor(
                 &workflow_repo_for_auth,
                 &actor_repo_for_auth,
                 &self.db_pool,
@@ -1575,7 +1586,7 @@ impl WebhookRouter {
             )
             .await
             {
-                Ok(_) => {}
+                Ok(resolved) => resolved,
                 Err(TriggerAuthError::ActorNotFoundOrInactive)
                 | Err(TriggerAuthError::ActorArchived)
                 | Err(TriggerAuthError::ActorTerminated) => {
@@ -1584,6 +1595,8 @@ impl WebhookRouter {
                         event_kind = "webhook_dispatch_denied_actor_state",
                         workflow_id = %workflow_id,
                         trigger_id = %trigger_id,
+                        %user_id,
+                        denied_actor_source,
                         "MCP-565: webhook dispatch denied — actor not in a runnable state"
                     );
                     return Ok((StatusCode::FORBIDDEN, "Actor not runnable").into_response());
@@ -1594,6 +1607,8 @@ impl WebhookRouter {
                         event_kind = "webhook_dispatch_denied_by_budget",
                         workflow_id = %workflow_id,
                         trigger_id = %trigger_id,
+                        %user_id,
+                        denied_actor_source,
                         reason = %reason,
                         "MCP-565: webhook dispatch denied by actor budget/status gate"
                     );
@@ -1607,6 +1622,8 @@ impl WebhookRouter {
                         event_kind = "webhook_dispatch_denied_capability_ceiling",
                         workflow_id = %workflow_id,
                         trigger_id = %trigger_id,
+                        %user_id,
+                        denied_actor_source,
                         "MCP-565: webhook dispatch denied — workflow exceeds actor capability ceiling"
                     );
                     return Ok((
@@ -1620,6 +1637,8 @@ impl WebhookRouter {
                         target: "talos_webhooks",
                         event_kind = "webhook_dispatch_auth_db_error",
                         workflow_id = %workflow_id,
+                        %user_id,
+                        denied_actor_source,
                         error = %e,
                         "MCP-565: webhook dispatch authorization DB error — failing closed"
                     );
@@ -1629,7 +1648,7 @@ impl WebhookRouter {
                     return Err(anyhow::anyhow!("Internal authorization error"));
                 }
             }
-        }
+        };
 
         // 2. Create the execution row via the canonical
         //    `create_execution_under_concurrency_limit` helper. This
@@ -1656,7 +1675,9 @@ impl WebhookRouter {
                 user_id,
                 None, // version_id — webhook runs the active graph
                 None, // priority — defaults to "normal"
-                wf_row.actor_id,
+                // Phase D2: the gate-resolved actor so row attribution
+                // matches the engine binding below.
+                effective_actor_id,
                 Some(&provenance),
                 None, // parent_execution_id
                 None, // root_execution_id
@@ -1672,17 +1693,36 @@ impl WebhookRouter {
                 return Err(anyhow::anyhow!("Internal server error"));
             }
         };
-        if let talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, .. } =
-            admission
-        {
-            // FU-3: transient pre-dispatch failure — a concurrency slot may free
-            // up, so a later retry can succeed; release the dedup claim.
-            self.release_dedup_claim(trigger_id, dedup_claim).await;
-            return Ok((
-                StatusCode::TOO_MANY_REQUESTS,
-                format!("Concurrency limit reached: {}", limit),
-            )
-                .into_response());
+        match admission {
+            talos_workflow_repository::ConcurrencyAdmission::Created => {}
+            talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, .. } => {
+                // FU-3: transient pre-dispatch failure — a concurrency slot may free
+                // up, so a later retry can succeed; release the dedup claim.
+                self.release_dedup_claim(trigger_id, dedup_claim).await;
+                return Ok((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("Concurrency limit reached: {}", limit),
+                )
+                    .into_response());
+            }
+            talos_workflow_repository::ConcurrencyAdmission::ActorBudgetExceeded {
+                kind,
+                limit,
+                count,
+            } => {
+                // The atomic backstop rolled back the INSERT — no execution
+                // row exists. Pre-fix this arm fell through an `if let
+                // LimitReached` and the engine ran anyway (budget-bypassing
+                // ghost run) — same defect the PR #461 review confirmed in
+                // the scheduler. Budget windows refill, so release the dedup
+                // claim and 429 like LimitReached.
+                self.release_dedup_claim(trigger_id, dedup_claim).await;
+                return Ok((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    talos_workflow_repository::actor_budget_exceeded_message(kind, limit, count),
+                )
+                    .into_response());
+            }
         }
 
         // Canonical engine builder. TimeoutPolicy::Honor closes a latent
@@ -1694,17 +1734,18 @@ impl WebhookRouter {
         // load_graph_from_json which now correctly populates the field
         // from the JSON.
         //
-        // Actor-binding behavior preserved: if wf_row.actor_id is Some,
-        // the engine is stamped with that actor_id + max_llm_tier so
-        // __memory_write__ + tier-1 enforcement work as before
-        // (pain-point-#15 close-out from 2026-04-23 stays intact).
+        // Phase D2: bind the gate-resolved actor (explicit → workflow →
+        // default fallback already applied inside the gate) so the engine
+        // tier matches the stamped execution row. Pre-fix an unbound
+        // workflow left the engine actorless here and it ran at the
+        // Tier-1 fail-safe while the same workflow triggered manually ran
+        // Tier-2 under the default actor. Bound workflows behave exactly
+        // as before (the gate returns their own actor).
         let actor_repo = std::sync::Arc::new(talos_actor_repository::ActorRepository::new(
             self.db_pool.clone(),
         ));
-        let mut opts = talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json.clone());
-        if let Some(aid) = wf_row.actor_id {
-            opts = opts.with_actor_id(aid);
-        }
+        let opts = talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json.clone())
+            .with_effective_actor(effective_actor_id, wf_row.actor_id);
         let mut engine = match talos_engine::builder::for_workflow(
             self.registry.clone(),
             self.secrets_manager.clone(),

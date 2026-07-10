@@ -110,9 +110,18 @@ impl ExecutionOrchestrationService {
         // A retry resets `started_at = NOW()` via
         // `mark_execution_running` below, so the retried row enters
         // the rolling 1-hour window — the budget check stays
-        // necessary. `Unbound` (no actor) skips all three sub-checks,
-        // matching pre-fix semantics for unbound executions.
-        if let Err(e) = talos_workflow_authorization::authorize_workflow_trigger(
+        // necessary.
+        //
+        // Phase D2 (PR #461 follow-up): CAPTURE the gate-resolved actor
+        // instead of discarding it. Pre-fix this path ran the gate,
+        // threw the answer away, and built the engine from a bare
+        // `EngineOpts::for_run` — so EVERY retry (including of a
+        // Tier-2-actor workflow) ran actorless at the engine's Tier-1
+        // fail-safe: external-LLM nodes that succeeded on the original
+        // run failed on retry (keys filtered, hosts denied) and
+        // `__memory_write__` envelopes were silently dropped, while the
+        // row was stamped with the inherited actor.
+        let effective_actor = match talos_workflow_authorization::resolve_effective_actor(
             &self.workflow_repo,
             &self.actor_repo,
             &self.db_pool,
@@ -122,8 +131,9 @@ impl ExecutionOrchestrationService {
         )
         .await
         {
-            return Err(map_trigger_auth_error(e));
-        }
+            Ok(resolved) => resolved,
+            Err(e) => return Err(map_trigger_auth_error(e)),
+        };
 
         // 3. In-place reset to running BEFORE the engine build so that
         // status is consistent for any concurrent observer; if the
@@ -165,7 +175,8 @@ impl ExecutionOrchestrationService {
             self.secrets_manager.clone(),
             self.actor_repo.clone(),
             user_id,
-            EngineOpts::for_run(workflow_id, graph_json.clone()),
+            EngineOpts::for_run(workflow_id, graph_json.clone())
+                .with_effective_actor(effective_actor, None),
         )
         .await
         {

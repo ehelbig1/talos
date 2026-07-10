@@ -229,7 +229,7 @@ impl ExecutionOrchestrationService {
         // the user's default actor when both are None, so this is never None on
         // success.
         let effective_actor: Option<Uuid> =
-            match talos_workflow_authorization::authorize_workflow_trigger(
+            match talos_workflow_authorization::resolve_effective_actor(
                 &self.workflow_repo,
                 &self.actor_repo,
                 &self.db_pool,
@@ -239,14 +239,7 @@ impl ExecutionOrchestrationService {
             )
             .await
             {
-                Ok(talos_workflow_authorization::TriggerAuthorization::Authorized { actor_id }) => {
-                    Some(actor_id)
-                }
-                // Phase D1 no longer returns Unbound, but match exhaustively;
-                // if it ever surfaces, fall back to the pre-D2 value.
-                Ok(talos_workflow_authorization::TriggerAuthorization::Unbound) => {
-                    trigger_agent_id.or(wf_record.actor_id)
-                }
+                Ok(resolved) => resolved,
                 Err(e) => return Err(map_trigger_auth_error(e)),
             };
 

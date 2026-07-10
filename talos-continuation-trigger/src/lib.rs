@@ -140,8 +140,21 @@ pub async fn trigger_continuation_workflow(
             return None;
         }
     };
-    if workflow_actor_id.is_some() {
-        match talos_workflow_authorization::authorize_workflow_trigger(
+    // Phase D2 parity (PR #461 follow-up): the gate runs UNCONDITIONALLY
+    // and its resolved actor is captured for the engine binding below.
+    // Pre-fix, unbound continuations skipped the gate AND the engine was
+    // built with no actor at all — in fact even a BOUND workflow's actor
+    // never reached the engine here, so every approval-gate resume ran at
+    // the engine's Tier-1 fail-safe (external-LLM nodes denied,
+    // `__memory_write__` dropped): the pre-approval half of a run and the
+    // post-approval half executed at different tiers.
+    let denied_actor_source = if workflow_actor_id.is_some() {
+        "workflow-bound"
+    } else {
+        "user-default-actor"
+    };
+    let effective_actor_id: Option<Uuid> = {
+        match talos_workflow_authorization::resolve_effective_actor(
             &workflow_repo_for_auth,
             &actor_repo,
             db_pool,
@@ -151,7 +164,7 @@ pub async fn trigger_continuation_workflow(
         )
         .await
         {
-            Ok(_) => {}
+            Ok(resolved) => resolved,
             Err(talos_workflow_authorization::TriggerAuthError::ActorArchived)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorTerminated)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorNotFoundOrInactive) => {
@@ -162,6 +175,8 @@ pub async fn trigger_continuation_workflow(
                     source_kind = ?source_kind,
                     workflow_id = %workflow_id,
                     actor_id = ?workflow_actor_id,
+                    %user_id,
+                    denied_actor_source,
                     "MCP-708: continuation dispatch denied — actor not in a runnable state"
                 );
                 return None;
@@ -174,6 +189,8 @@ pub async fn trigger_continuation_workflow(
                     source_kind = ?source_kind,
                     workflow_id = %workflow_id,
                     actor_id = ?workflow_actor_id,
+                    %user_id,
+                    denied_actor_source,
                     reason = %reason,
                     "MCP-708: continuation dispatch denied by actor budget/status gate"
                 );
@@ -192,6 +209,8 @@ pub async fn trigger_continuation_workflow(
                     source_kind = ?source_kind,
                     workflow_id = %workflow_id,
                     actor_id = ?workflow_actor_id,
+                    %user_id,
+                    denied_actor_source,
                     %module_id,
                     %module_world,
                     %max_world,
@@ -205,13 +224,15 @@ pub async fn trigger_continuation_workflow(
                     event_kind = "continuation_dispatch_denied_db_error",
                     workflow_id = %workflow_id,
                     actor_id = ?workflow_actor_id,
+                    %user_id,
+                    denied_actor_source,
                     error = %e,
                     "MCP-708: continuation dispatch denied — auth-gate DB error (fail-closed)"
                 );
                 return None;
             }
         }
-    }
+    };
 
     // 1. Create execution record (queued; transitions to running in the spawn below)
     if let Err(e) = repo
@@ -337,7 +358,11 @@ pub async fn trigger_continuation_workflow(
         secrets_manager,
         actor_repo,
         user_id,
-        EngineOpts::for_run(workflow_id, graph_json.clone()),
+        // Phase D2: bind the gate-resolved actor so the resumed half of
+        // the run executes at the same tier (and with the same
+        // `__memory_write__` capability) as the pre-suspension half.
+        EngineOpts::for_run(workflow_id, graph_json.clone())
+            .with_effective_actor(effective_actor_id, workflow_actor_id),
     )
     .await
     {
