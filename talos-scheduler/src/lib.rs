@@ -1018,9 +1018,22 @@ async fn run_scheduled_execution(
     //
     // Skip-with-warn semantics preserved per-rejection-class so
     // operators can distinguish budget vs ceiling vs actor-state.
-    // Only fires when the workflow has an actor; un-bound scheduled
-    // workflows have no actor to enforce.
-    if workflow.actor_id.is_some() {
+    //
+    // Phase D2 parity with `trigger.rs` (2026-07-10): the gate now runs
+    // UNCONDITIONALLY and its resolved actor is captured. Pre-fix the
+    // scheduler skipped the gate for unbound workflows ("no actor to
+    // enforce") and built the engine with `with_effective_actor(None,
+    // None)` — so an unbound scheduled workflow ran at the engine's
+    // fail-safe Tier-1 default (local-egress-only: every external HTTP
+    // call died as a generic `networkerror`) while the SAME workflow
+    // triggered manually resolved the user's default actor (Tier-2) and
+    // worked. Worse, the DB auto-stamp trigger recorded the default
+    // actor on the execution row, so attribution said one actor while
+    // the runtime tier came from none. The gate's Phase D1 fallback
+    // (`get_or_create_default_actor`) is the single source of truth for
+    // "who does an unbound workflow run as" — authorization,
+    // attribution, and runtime tier now all use its answer.
+    let effective_actor_id: Option<Uuid> = {
         let workflow_repo_for_auth =
             talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let actor_repo_for_auth = talos_actor_repository::ActorRepository::new(db_pool.clone());
@@ -1034,7 +1047,13 @@ async fn run_scheduled_execution(
         )
         .await
         {
-            Ok(_) => {}
+            Ok(talos_workflow_authorization::TriggerAuthorization::Authorized { actor_id }) => {
+                Some(actor_id)
+            }
+            // Phase D1 no longer returns Unbound, but match exhaustively;
+            // if it ever surfaces, fall back to the workflow's own actor
+            // (the engine's Tier-1 default remains the fail-safe).
+            Ok(talos_workflow_authorization::TriggerAuthorization::Unbound) => workflow.actor_id,
             Err(talos_workflow_authorization::TriggerAuthError::ActorArchived)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorTerminated)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorNotFoundOrInactive) => {
@@ -1092,7 +1111,7 @@ async fn run_scheduled_execution(
                 return;
             }
         }
-    }
+    };
 
     // 2. Create execution record via the canonical
     //    `WorkflowRepository::create_execution_with_lineage` helper so
@@ -1132,7 +1151,10 @@ async fn run_scheduled_execution(
             user_id,
             None, // version_id — scheduler runs the draft graph
             None, // priority — defaults to "normal"
-            workflow.actor_id,
+            // Phase D2: the gate-resolved actor (default-actor fallback
+            // included) so the row's attribution matches the runtime tier
+            // instead of relying on the DB auto-stamp trigger to fill NULL.
+            effective_actor_id,
             Some(&provenance),
             None, // parent_execution_id — top-level run
             None, // root_execution_id — top-level run
@@ -1214,7 +1236,12 @@ async fn run_scheduled_execution(
         db_pool.clone(),
     ));
     let opts = talos_engine::builder::EngineOpts::for_run(workflow_id, workflow.graph_json.clone())
-        .with_effective_actor(None, workflow.actor_id)
+        // Phase D2: the gate-resolved actor (explicit → workflow → default
+        // fallback already applied) so the engine tier matches the stamped
+        // execution row. Pre-fix an unbound workflow passed (None, None)
+        // here and silently ran at the engine's fail-safe Tier-1 while the
+        // same workflow triggered manually ran Tier-2.
+        .with_effective_actor(effective_actor_id, workflow.actor_id)
         .with_actor_context(actor_context);
     let mut engine = match talos_engine::builder::for_workflow(
         registry,

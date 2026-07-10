@@ -235,10 +235,19 @@ async fn run_single_workflow_chain(
     //
     // Skip-with-warn semantics preserved per-rejection-class so
     // operators can still distinguish "dropped by budget" from
-    // "dropped by ceiling drift". Only fires when the chained workflow
-    // has its own actor binding; unbound chains have no actor to
-    // enforce.
-    if workflow_actor_id.is_some() {
+    // "dropped by ceiling drift".
+    //
+    // Phase D2 parity with `trigger.rs` (2026-07-10): the gate runs
+    // UNCONDITIONALLY and its resolved actor is captured for the engine
+    // binding below. Pre-fix, unbound chains skipped the gate AND built
+    // the engine with `with_effective_actor(None, None)` — running at
+    // the engine's fail-safe Tier-1 default (local-egress-only: every
+    // external HTTP call died as `networkerror`) while a manual trigger
+    // of the same workflow resolved the user's default actor (Tier-2).
+    // The gate's Phase D1 fallback (`get_or_create_default_actor`) is
+    // the single source of truth for "who does an unbound workflow run
+    // as" — authorization and runtime tier now use the same answer.
+    let effective_actor_id: Option<Uuid> = {
         let workflow_repo_for_auth =
             talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         match talos_workflow_authorization::authorize_workflow_trigger(
@@ -251,7 +260,13 @@ async fn run_single_workflow_chain(
         )
         .await
         {
-            Ok(_) => {}
+            Ok(talos_workflow_authorization::TriggerAuthorization::Authorized { actor_id }) => {
+                Some(actor_id)
+            }
+            // Phase D1 no longer returns Unbound, but match exhaustively;
+            // if it ever surfaces, fall back to the workflow's own actor
+            // (the engine's Tier-1 default remains the fail-safe).
+            Ok(talos_workflow_authorization::TriggerAuthorization::Unbound) => workflow_actor_id,
             Err(talos_workflow_authorization::TriggerAuthError::ActorArchived)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorTerminated)
             | Err(talos_workflow_authorization::TriggerAuthError::ActorNotFoundOrInactive) => {
@@ -315,7 +330,7 @@ async fn run_single_workflow_chain(
                 return Ok(());
             }
         }
-    }
+    };
 
     let graph: Value =
         serde_json::from_str(graph_json).map_err(|e| format!("Invalid graph_json: {}", e))?;
@@ -343,8 +358,11 @@ async fn run_single_workflow_chain(
     // across webhook/scheduled-trigger chain dispatch. Pre-fix, chains
     // ran with `actor_id = None` regardless of `workflows.actor_id` —
     // silently downgrading to Tier-2 and dropping memory writes.
+    // Phase D2: prefer the gate-resolved actor (default-actor fallback
+    // included) so unbound chains run at the default actor's tier
+    // instead of the engine's unbound Tier-1 fail-safe.
     let opts = crate::builder::EngineOpts::for_skip_load(workflow_id)
-        .with_effective_actor(None, workflow_actor_id);
+        .with_effective_actor(effective_actor_id, workflow_actor_id);
     // MCP-682 (2026-05-13): retain a SecretsManager handle for the
     // post-run persistence step. Pre-fix the chain dispatch wrote
     // `output_data = $1` via raw SQL — bypassing Phase A encryption.
