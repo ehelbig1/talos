@@ -75,7 +75,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ml_eval_model",
-            "description": "Run the knn-pgvector backend over a fresh stratified holdout (advisory-locked so concurrent evals can't corrupt each other) and record the metrics as a NEW model version. Compare the report's accuracy against your LLM baseline before promoting.",
+            "description": "Run the knn-pgvector backend over a fresh stratified holdout (advisory-locked so concurrent evals can't corrupt each other) and record the metrics as a NEW model version. Judge the coverage_curve (fast-path accuracy@threshold; production falls back to the LLM below it) and the gold subreport (human-corrected truth) — overall accuracy is teacher-agreement only.",
             "inputSchema": { "type": "object", "properties": {
                 "model_id": { "type": "string" },
                 "k": { "type": "integer", "description": "Neighbors to vote (default 7)" },
@@ -486,6 +486,10 @@ async fn handle_eval_model(
     };
     let metrics = serde_json::json!({
         "backend": "knn-pgvector",
+        // Confidence semantics are voting-scheme-specific: thresholds
+        // calibrated under one scheme do not transfer. P1 versions 1-5
+        // predate this field (raw similarity-share voting).
+        "voting": "balanced-sqrt",
         "k": k,
         "holdout_fraction": holdout_fraction,
         "report": report,
@@ -512,7 +516,7 @@ async fn handle_eval_model(
                 "version_id": version.id.to_string(),
                 "version": version.version,
                 "report": report,
-                "next_step": "compare report.accuracy against your LLM baseline; ml_promote_model if it clears the gate",
+                "next_step": "judge by report.coverage_curve (fast-path accuracy at the serving threshold) and report.gold (human-truth subset) — overall accuracy is teacher-agreement only; ml_promote_model when the policy clears",
             }))
             .unwrap_or_default(),
         ),

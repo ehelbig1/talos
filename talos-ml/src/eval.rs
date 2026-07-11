@@ -25,7 +25,11 @@ pub struct ClassMetrics {
 pub struct CoveragePoint {
     pub threshold: f64,
     pub coverage: f64,
-    pub accuracy: f64,
+    /// None when NOTHING was covered at this threshold — a no-data band
+    /// must be distinguishable from "everything covered was wrong"
+    /// (a policy evaluator reading 0.0 would treat absence of data as
+    /// catastrophic quality).
+    pub accuracy: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,11 +165,7 @@ pub fn coverage_curve(
             CoveragePoint {
                 threshold: t,
                 coverage: covered as f64 / total as f64,
-                accuracy: if covered > 0 {
-                    correct as f64 / covered as f64
-                } else {
-                    0.0
-                },
+                accuracy: (covered > 0).then(|| correct as f64 / covered as f64),
             }
         })
         .collect()
@@ -222,6 +222,8 @@ pub async fn run_knn_eval(
     holdout_fraction: f64,
 ) -> anyhow::Result<EvalReport> {
     service.lock_dataset(&mut *conn, dataset_id).await?;
+    // ONCE per tx — knn_search does not pin (see pin_ann_probes).
+    service.pin_ann_probes(&mut *conn).await?;
     let labels = service.load_labels(&mut *conn, dataset_id).await?;
     anyhow::ensure!(
         labels.len() >= 10,
@@ -339,10 +341,10 @@ mod tests {
         let p50 = &curve[0];
         let p90 = &curve[4];
         assert!((p50.coverage - 0.75).abs() < 1e-9);
-        assert!((p50.accuracy - 2.0 / 3.0).abs() < 1e-9);
+        assert!((p50.accuracy.unwrap() - 2.0 / 3.0).abs() < 1e-9);
         assert!((p90.coverage - 0.25).abs() < 1e-9);
         assert!(
-            (p90.accuracy - 1.0).abs() < 1e-9,
+            (p90.accuracy.unwrap() - 1.0).abs() < 1e-9,
             "high threshold sheds the wrong answer"
         );
         assert!(coverage_curve(&[], &[]).is_empty());

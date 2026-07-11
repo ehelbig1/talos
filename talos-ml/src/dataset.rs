@@ -340,7 +340,9 @@ impl DatasetService {
                                 features_format = EXCLUDED.features_format, \
                                 label_json = EXCLUDED.label_json, \
                                 embedding = COALESCE(EXCLUDED.embedding, ml_examples.embedding), \
-                                source = EXCLUDED.source",
+                                source = EXCLUDED.source \
+                  WHERE ml_examples.source <> 'correction' \
+                     OR EXCLUDED.source = 'correction'",
             );
             let res = qb
                 .build()
@@ -481,7 +483,7 @@ impl DatasetService {
     ) -> Result<std::collections::HashMap<String, i64>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT label_json->>'label', COUNT(*) FROM ml_examples \
-             WHERE dataset_id = $1 AND label_json ? 'label' GROUP BY 1",
+             WHERE dataset_id = $1 AND label_json->>'label' IS NOT NULL GROUP BY 1",
         )
         .bind(dataset_id)
         .fetch_all(&mut *conn)
@@ -595,6 +597,22 @@ impl DatasetService {
         Ok((id, label, source, text))
     }
 
+    /// Pin `ivfflat.probes` to the index's `lists` for THIS transaction
+    /// (exact scan within the index; `set_config(..., true)` is
+    /// transaction-local so nothing leaks to the pooled connection).
+    /// Idempotent and cheap, but per-search re-pinning doubles eval's
+    /// statement count, so `knn_search` does NOT pin — every caller
+    /// pins once per transaction (`run_knn_eval` and `knn_predict_text`
+    /// both do; new callers must too or they silently search at
+    /// probes=1 recall).
+    pub async fn pin_ann_probes(&self, conn: &mut PgConnection) -> Result<()> {
+        sqlx::query_scalar::<_, String>("SELECT set_config('ivfflat.probes', '20', true)")
+            .fetch_one(&mut *conn)
+            .await
+            .context("pin ivfflat.probes")?;
+        Ok(())
+    }
+
     /// End-to-end text prediction on the knn backend: embed locally,
     /// retrieve, vote. Returns None when the input can't be embedded or
     /// the neighborhood abstains — the caller decides the fallback.
@@ -611,9 +629,17 @@ impl DatasetService {
         if embedding.len() != expected_embedding_dims() {
             return Ok(None);
         }
+        self.pin_ann_probes(&mut *conn).await?;
         let neighbors = self
             .knn_search(conn, dataset_id, &embedding, k, true)
             .await?;
+        if neighbors.is_empty() {
+            // Abstain without paying the class-priors aggregate.
+            return Ok(None);
+        }
+        // Hot-path note (P2d): priors change only on append — the
+        // lifecycle service should cache these keyed on the dataset's
+        // updated_at instead of re-aggregating per prediction.
         let counts = self.class_counts(conn, dataset_id).await?;
         Ok(crate::knn::knn_vote_balanced(&neighbors, &counts))
     }
@@ -641,10 +667,6 @@ impl DatasetService {
     ) -> Result<Vec<Neighbor>> {
         let k = k.clamp(1, 50);
         let qvec = pgvector::Vector::from(query.to_vec());
-        sqlx::query_scalar::<_, String>("SELECT set_config('ivfflat.probes', '20', true)")
-            .fetch_one(&mut *conn)
-            .await
-            .context("pin ivfflat.probes")?;
         let rows: Vec<(String, f64)> = sqlx::query_as(
             "SELECT label_json->>'label', 1 - (embedding <=> $2) AS sim \
              FROM ml_examples \
