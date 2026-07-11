@@ -8271,6 +8271,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-ml"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "pgvector",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "talos-memory",
+ "talos-secrets-manager",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-module-executions"
 version = "0.1.0"
 dependencies = [
