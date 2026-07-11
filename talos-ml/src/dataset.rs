@@ -139,6 +139,9 @@ pub struct HoldoutExample {
     pub id: Uuid,
     pub features_text: Zeroizing<String>,
     pub label: String,
+    /// Provenance — 'correction' rows are GOLD truth (human labels);
+    /// everything else is silver (teacher labels). Eval reports both.
+    pub source: String,
     pub embedding: Option<Vec<f32>>,
 }
 
@@ -469,6 +472,23 @@ impl DatasetService {
         .await?)
     }
 
+    /// Dataset-level label frequencies (classification rows only) — the
+    /// class priors for balanced voting. One indexed grouped count.
+    pub async fn class_counts(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT label_json->>'label', COUNT(*) FROM ml_examples \
+             WHERE dataset_id = $1 AND label_json ? 'label' GROUP BY 1",
+        )
+        .bind(dataset_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Serialize split/eval work per dataset. `pg_advisory_xact_lock`
     /// holds until the caller's transaction ends, so an eval that locks,
     /// assigns splits, and scores inside ONE tx cannot have its holdout
@@ -536,7 +556,7 @@ impl DatasetService {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for (id, enc, key_id, format, label, source, example_key, embedding) in rows {
-            let (id, label, _source, text) = self
+            let (id, label, source, text) = self
                 .decrypt_row(
                     dataset_id,
                     (id, enc, key_id, format, label, source, example_key),
@@ -546,6 +566,7 @@ impl DatasetService {
                 id,
                 features_text: text,
                 label,
+                source,
                 embedding: embedding.map(|v| v.to_vec()),
             });
         }
@@ -593,7 +614,8 @@ impl DatasetService {
         let neighbors = self
             .knn_search(conn, dataset_id, &embedding, k, true)
             .await?;
-        Ok(crate::knn::knn_vote(&neighbors))
+        let counts = self.class_counts(conn, dataset_id).await?;
+        Ok(crate::knn::knn_vote_balanced(&neighbors, &counts))
     }
 
     /// knn retrieval for one query embedding. `train_only` excludes the
