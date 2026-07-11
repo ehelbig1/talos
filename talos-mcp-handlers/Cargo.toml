@@ -69,6 +69,9 @@ talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }
 talos-scheduler = { path = "../talos-scheduler" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-ml = { path = "../talos-ml" }
+talos-db = { path = "../talos-db" }
+talos-tenancy = { path = "../talos-tenancy" }
 talos-subworkflow-contract = { path = "../talos-subworkflow-contract" }
 talos-system-repo = { path = "../talos-system-repo" }
 talos-text-util = { path = "../talos-text-util" }

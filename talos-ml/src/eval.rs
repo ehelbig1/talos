@@ -144,6 +144,52 @@ pub fn stratified_holdout(
     holdout
 }
 
+/// Full knn eval pass, designed to run inside ONE caller transaction:
+/// takes the per-dataset advisory lock (held to tx end, so a concurrent
+/// eval can't thrash the splits mid-scoring), assigns a fresh stratified
+/// split, then scores every holdout example using its STORED embedding
+/// (no re-embedding; deterministic w.r.t. the geometry knn searches).
+/// Examples without stored embeddings score as abstentions — they'd
+/// abstain in production too.
+pub async fn run_knn_eval(
+    service: &crate::dataset::DatasetService,
+    conn: &mut sqlx::PgConnection,
+    dataset_id: uuid::Uuid,
+    k: i64,
+    holdout_fraction: f64,
+) -> anyhow::Result<EvalReport> {
+    service.lock_dataset(&mut *conn, dataset_id).await?;
+    let labels = service.load_labels(&mut *conn, dataset_id).await?;
+    anyhow::ensure!(
+        labels.len() >= 10,
+        "dataset has only {} labeled examples — need at least 10 for a meaningful eval",
+        labels.len()
+    );
+    let holdout_ids = stratified_holdout(&labels, holdout_fraction);
+    anyhow::ensure!(
+        !holdout_ids.is_empty(),
+        "stratified split produced an empty holdout (all classes below the minimum size)"
+    );
+    service
+        .assign_splits(&mut *conn, dataset_id, &holdout_ids)
+        .await?;
+    let holdout = service.load_holdout(&mut *conn, dataset_id).await?;
+    let mut truths = Vec::with_capacity(holdout.len());
+    let mut predictions = Vec::with_capacity(holdout.len());
+    for ex in &holdout {
+        truths.push(ex.label.clone());
+        let pred = match &ex.embedding {
+            Some(embedding) => service
+                .knn_search(&mut *conn, dataset_id, embedding, k, true)
+                .await
+                .map(|n| crate::knn::knn_vote(&n))?,
+            None => None,
+        };
+        predictions.push(pred.map(|p| p.label));
+    }
+    evaluate_predictions(&truths, &predictions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

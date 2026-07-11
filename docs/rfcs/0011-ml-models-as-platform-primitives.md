@@ -266,14 +266,16 @@ correction without a manual retrain step (knn) or with a scheduled one
 
 - **P1 (ship the pattern)**: `ml_datasets`/`ml_examples`/`ml_models`/
   `ml_model_versions` migrations; `talos-ml` crate (dataset service +
-  registry + knn-pgvector + llm backends + eval harness); MCP surface;
-  `dataset-append` + `Model_Predict` catalog modules (predict via
-  controller RPC — WIT host fn deferred to P2 so P1 needs no
-  worker/WIT change); inbox classifier end-to-end on it.
+  registry + knn-pgvector + llm backends + eval harness); MCP surface
+  (incl. `ml_predict` — the controller-side predict path, which is also
+  how bootstrap/eval/production flows run until P2); inbox classifier end-to-end on it.
 - **P2 (native inference)**: WIT `model` interface + worker host fn,
   tract-embedded ONNX + classical param evaluation in-worker, Tier A
   trainers (linfa linear/trees + statistical), `predict-batch`,
-  capability-world wiring + lint coverage. **Gate: the knn predict RPC
+  capability-world wiring + lint coverage; the `dataset-append` +
+  `Model_Predict` catalog modules land HERE (they are worker-side and
+  need the RPC/WIT path — P1's in-workflow consumers go through the
+  controller-side services instead). **Gate: the knn predict RPC
   (`talos.ml.predict`) is a new signed-RPC primitive — walk
   `docs/platform-primitive-checklist.md` end-to-end before building it
   (pattern-copying `memory_rpc` is NOT a substitute: zombie semaphore

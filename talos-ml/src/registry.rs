@@ -152,6 +152,70 @@ impl ModelRegistry {
         Ok(())
     }
 
+    /// List models visible to the caller's scope (RLS) with their
+    /// promoted-version summary.
+    pub async fn list_models(conn: &mut PgConnection) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT m.id, m.name, m.task_type, m.dataset_id, m.created_at,                     v.version AS promoted_version, v.backend AS promoted_backend,                     v.metrics_json AS promoted_metrics              FROM ml_models m              LEFT JOIN ml_model_versions v ON v.id = m.production_version_id              ORDER BY m.created_at DESC LIMIT 100",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.into_iter()
+            .map(|r| -> Result<serde_json::Value> {
+                Ok(serde_json::json!({
+                    "id": r.try_get::<Uuid, _>("id")?.to_string(),
+                    "name": r.try_get::<String, _>("name")?,
+                    "task_type": r.try_get::<String, _>("task_type")?,
+                    "dataset_id": r.try_get::<Option<Uuid>, _>("dataset_id")?.map(|d| d.to_string()),
+                    "promoted_version": r.try_get::<Option<i32>, _>("promoted_version")?,
+                    "promoted_backend": r.try_get::<Option<String>, _>("promoted_backend")?,
+                    "promoted_metrics": r.try_get::<Option<serde_json::Value>, _>("promoted_metrics")?,
+                }))
+            })
+            .collect()
+    }
+
+    /// All versions of one model, newest first (the model card's history).
+    pub async fn list_versions(
+        conn: &mut PgConnection,
+        model_id: Uuid,
+    ) -> Result<Vec<ModelVersionRow>> {
+        let rows = sqlx::query(
+            "SELECT id, model_id, version, backend, metrics_json, status              FROM ml_model_versions WHERE model_id = $1 ORDER BY version DESC",
+        )
+        .bind(model_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.into_iter()
+            .map(|r| -> Result<ModelVersionRow> {
+                Ok(ModelVersionRow {
+                    id: r.try_get("id")?,
+                    model_id: r.try_get("model_id")?,
+                    version: r.try_get("version")?,
+                    backend: r.try_get("backend")?,
+                    metrics_json: r.try_get("metrics_json")?,
+                    status: r.try_get("status")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve a model by id (same shape as name resolution; RLS scopes
+    /// visibility).
+    pub async fn resolve_by_id(
+        conn: &mut PgConnection,
+        model_id: Uuid,
+    ) -> Result<Option<ResolvedModel>> {
+        let model = sqlx::query(
+            "SELECT id, dataset_id, config_json, production_version_id \
+             FROM ml_models WHERE id = $1",
+        )
+        .bind(model_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Self::hydrate_resolved(conn, model).await
+    }
+
     /// Resolve a model by name. RLS scopes visibility; name is unique
     /// only PER SCOPE (personal / each org), so a caller may see several
     /// same-named rows — precedence is deterministic: the caller's OWN
@@ -170,6 +234,15 @@ impl ModelRegistry {
         .bind(name)
         .fetch_optional(&mut *conn)
         .await?;
+        Self::hydrate_resolved(conn, model).await
+    }
+
+    /// Shared tail of the by-name/by-id resolvers: decode the model row
+    /// and fetch its promoted version.
+    async fn hydrate_resolved(
+        conn: &mut PgConnection,
+        model: Option<sqlx::postgres::PgRow>,
+    ) -> Result<Option<ResolvedModel>> {
         let Some(m) = model else { return Ok(None) };
         let model_id: Uuid = m.try_get("id")?;
         let dataset_id: Option<Uuid> = m.try_get("dataset_id")?;
