@@ -26,11 +26,19 @@ use uuid::Uuid;
 
 use crate::knn::Neighbor;
 
-/// The embedding column is `vector(768)` (local nomic). A configured
-/// local model with different dimensionality must degrade to
-/// embedding-NULL rows (backfillable) rather than failing every INSERT —
-/// the actor_memory 1536-vs-768 incident class.
-const EMBEDDING_COLUMN_DIMS: usize = 768;
+/// Expected embedding dimensionality — read from the deployment's
+/// embedding config (the same source `generate_embedding` validates
+/// against), falling back to the platform default (1024,
+/// mxbai-embed-large-class, per migration 20260429120000 which resized
+/// every embedding column). A vector of any OTHER length must degrade
+/// to an embedding-NULL row (backfillable) rather than failing every
+/// INSERT — the actor_memory dimensionality-drift incident class. The
+/// column type is corrected to vector(1024) by 20260711150000.
+fn expected_embedding_dims() -> usize {
+    talos_memory::embedding::EmbeddingConfig::cached()
+        .map(|c| c.dimensions)
+        .unwrap_or(1024)
+}
 
 /// Rows per multi-row INSERT statement (11 binds per row; comfortably
 /// under Postgres' 65535-bind limit with headroom).
@@ -237,7 +245,7 @@ impl DatasetService {
                     talos_memory::embedding::generate_embedding(&ex.features_text, true)
                         .await
                         .and_then(|v| {
-                            if v.len() == EMBEDDING_COLUMN_DIMS {
+                            if v.len() == expected_embedding_dims() {
                                 Some(pgvector::Vector::from(v))
                             } else {
                                 // Configured local model has a different
@@ -248,7 +256,7 @@ impl DatasetService {
                                     target: "talos_ml",
                                     %dataset_id,
                                     got_dims = v.len(),
-                                    expected_dims = EMBEDDING_COLUMN_DIMS,
+                                    expected_dims = expected_embedding_dims(),
                                     "embedding dimensionality mismatch — storing NULL"
                                 );
                                 None
@@ -576,7 +584,7 @@ impl DatasetService {
         let Some(embedding) = talos_memory::embedding::generate_embedding(text, true).await else {
             return Ok(None);
         };
-        if embedding.len() != EMBEDDING_COLUMN_DIMS {
+        if embedding.len() != expected_embedding_dims() {
             return Ok(None);
         }
         let neighbors = self
