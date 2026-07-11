@@ -16,6 +16,18 @@ pub struct ClassMetrics {
     pub support: usize,
 }
 
+/// One point on the accuracy@coverage curve: among predictions with
+/// confidence >= threshold, what fraction of ALL examples is covered
+/// and how accurate is the covered fast path. Production falls back to
+/// the LLM below the threshold, so THIS — not overall accuracy — is
+/// the deploy-decision number.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoveragePoint {
+    pub threshold: f64,
+    pub coverage: f64,
+    pub accuracy: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EvalReport {
     pub accuracy: f64,
@@ -27,6 +39,16 @@ pub struct EvalReport {
     pub abstained: usize,
     /// BTreeMap for deterministic JSON ordering in metrics_json.
     pub per_class: BTreeMap<String, ClassMetrics>,
+    /// accuracy@coverage at the standard thresholds (empty when the
+    /// caller supplied no confidences).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub coverage_curve: Vec<CoveragePoint>,
+    /// GOLD subset (source='correction' — human truth) scored
+    /// separately: teacher labels grade agreement, gold grades
+    /// correctness, and a distilled model can legitimately beat its
+    /// teacher here. None until corrections exist in the holdout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gold: Option<Box<EvalReport>>,
 }
 
 /// Compute the report from parallel truth/prediction slices.
@@ -105,7 +127,48 @@ pub fn evaluate_predictions(
         total,
         abstained,
         per_class,
+        coverage_curve: Vec::new(),
+        gold: None,
     })
+}
+
+/// accuracy@coverage from (truth, prediction-with-confidence) rows.
+/// Abstentions count as below every threshold (they cover nothing).
+pub fn coverage_curve(
+    truths: &[String],
+    predictions: &[Option<(String, f32)>],
+) -> Vec<CoveragePoint> {
+    const THRESHOLDS: [f64; 5] = [0.5, 0.6, 0.7, 0.8, 0.9];
+    let total = truths.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    THRESHOLDS
+        .iter()
+        .map(|&t| {
+            let mut covered = 0usize;
+            let mut correct = 0usize;
+            for (truth, pred) in truths.iter().zip(predictions.iter()) {
+                if let Some((label, conf)) = pred {
+                    if f64::from(*conf) >= t {
+                        covered += 1;
+                        if label == truth {
+                            correct += 1;
+                        }
+                    }
+                }
+            }
+            CoveragePoint {
+                threshold: t,
+                coverage: covered as f64 / total as f64,
+                accuracy: if covered > 0 {
+                    correct as f64 / covered as f64
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect()
 }
 
 /// Classes smaller than this stay wholly in the train set: a class with
@@ -174,20 +237,49 @@ pub async fn run_knn_eval(
         .assign_splits(&mut *conn, dataset_id, &holdout_ids)
         .await?;
     let holdout = service.load_holdout(&mut *conn, dataset_id).await?;
+    // Class priors for balanced voting (matches knn_predict_text so the
+    // eval measures exactly what production serves).
+    let counts = service.class_counts(&mut *conn, dataset_id).await?;
     let mut truths = Vec::with_capacity(holdout.len());
-    let mut predictions = Vec::with_capacity(holdout.len());
+    let mut scored = Vec::with_capacity(holdout.len());
+    let mut sources = Vec::with_capacity(holdout.len());
     for ex in &holdout {
         truths.push(ex.label.clone());
+        sources.push(ex.source.clone());
         let pred = match &ex.embedding {
             Some(embedding) => service
                 .knn_search(&mut *conn, dataset_id, embedding, k, true)
                 .await
-                .map(|n| crate::knn::knn_vote(&n))?,
+                .map(|n| crate::knn::knn_vote_balanced(&n, &counts))?,
             None => None,
         };
-        predictions.push(pred.map(|p| p.label));
+        scored.push(pred.map(|p| (p.label, p.confidence)));
     }
-    evaluate_predictions(&truths, &predictions)
+    let predictions: Vec<Option<String>> = scored
+        .iter()
+        .map(|p| p.as_ref().map(|(l, _)| l.clone()))
+        .collect();
+    let mut report = evaluate_predictions(&truths, &predictions)?;
+    report.coverage_curve = coverage_curve(&truths, &scored);
+    // GOLD subset: human-corrected rows only.
+    let gold_idx: Vec<usize> = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.as_str() == "correction")
+        .map(|(i, _)| i)
+        .collect();
+    if !gold_idx.is_empty() {
+        let gt: Vec<String> = gold_idx.iter().map(|&i| truths[i].clone()).collect();
+        let gs: Vec<Option<(String, f32)>> = gold_idx.iter().map(|&i| scored[i].clone()).collect();
+        let gp: Vec<Option<String>> = gs
+            .iter()
+            .map(|p| p.as_ref().map(|(l, _)| l.clone()))
+            .collect();
+        let mut gold = evaluate_predictions(&gt, &gp)?;
+        gold.coverage_curve = coverage_curve(&gt, &gs);
+        report.gold = Some(Box::new(gold));
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -231,6 +323,29 @@ mod tests {
         assert_eq!(r.per_class["a"].precision, 0.0);
         assert_eq!(r.per_class["b"].recall, 0.0);
         assert_eq!(r.per_class["b"].support, 1);
+    }
+
+    #[test]
+    fn coverage_curve_trades_coverage_for_accuracy() {
+        let truths = vec![s("a"), s("a"), s("b"), s("b")];
+        // Two confident correct, one hesitant wrong, one abstention.
+        let preds = vec![
+            Some((s("a"), 0.95f32)),
+            Some((s("a"), 0.85)),
+            Some((s("a"), 0.55)), // wrong, low confidence
+            None,
+        ];
+        let curve = coverage_curve(&truths, &preds);
+        let p50 = &curve[0];
+        let p90 = &curve[4];
+        assert!((p50.coverage - 0.75).abs() < 1e-9);
+        assert!((p50.accuracy - 2.0 / 3.0).abs() < 1e-9);
+        assert!((p90.coverage - 0.25).abs() < 1e-9);
+        assert!(
+            (p90.accuracy - 1.0).abs() < 1e-9,
+            "high threshold sheds the wrong answer"
+        );
+        assert!(coverage_curve(&[], &[]).is_empty());
     }
 
     #[test]
