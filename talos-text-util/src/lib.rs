@@ -430,9 +430,16 @@ pub fn bounded_preview(s: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
 /// storing/looking-up the raw secret and (b) make the DB lookup keyed on
 /// a non-secret digest rather than the secret itself.
 pub fn sha256_hex(input: &str) -> String {
+    sha256_hex_bytes(input.as_bytes())
+}
+
+/// Byte-slice form of [`sha256_hex`] — one algorithm + encoding for
+/// every digest in the workspace (artifact integrity, lookup hashes),
+/// so a write side and its verifier can never drift.
+pub fn sha256_hex_bytes(input: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
+    hasher.update(input.as_ref());
     hex::encode(hasher.finalize())
 }
 

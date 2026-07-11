@@ -33,6 +33,7 @@ members = [
     "talos-schedule-repo",
     "talos-config",
     "talos-integration-state",
+    "talos-ml",
     "talos-system-repo",
     "talos-api-keys",
     "talos-graph-rag",
