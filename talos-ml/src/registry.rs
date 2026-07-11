@@ -3,7 +3,6 @@
 //! DatasetService (`&mut PgConnection`, scoped-tx-compatible).
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 use sqlx::Row;
 use uuid::Uuid;
@@ -16,6 +15,16 @@ pub struct ModelVersionRow {
     pub backend: String,
     pub metrics_json: serde_json::Value,
     pub status: String,
+}
+
+/// Name-resolution result (named struct, not tuple-soup — future fields
+/// like task_type are additive instead of positionally breaking).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResolvedModel {
+    pub model_id: Uuid,
+    pub dataset_id: Option<Uuid>,
+    pub config_json: serde_json::Value,
+    pub promoted_version: Option<ModelVersionRow>,
 }
 
 pub struct ModelRegistry;
@@ -61,7 +70,18 @@ impl ModelRegistry {
         metrics_json: &serde_json::Value,
     ) -> Result<ModelVersionRow> {
         let id = Uuid::new_v4();
-        let sha = artifact.map(|a| format!("{:x}", Sha256::digest(a)));
+        let sha = artifact.map(talos_text_util::sha256_hex_bytes);
+        // Serialize concurrent version creates for one model: without
+        // the lock, two writers both read MAX(version)=N and the loser
+        // dies on the UNIQUE(model_id, version) constraint AFTER its
+        // (expensive) train/eval work. xact-scoped, so it releases with
+        // the caller's transaction. hashtextextended = full-width int8
+        // key (the L-17 birthday-collision lesson).
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('ml_model:' || $1::text, 0))")
+            .bind(model_id)
+            .execute(&mut *conn)
+            .await
+            .context("advisory-lock model")?;
         let row = sqlx::query(
             "INSERT INTO ml_model_versions \
                (id, model_id, user_id, org_id, version, backend, artifact, \
@@ -132,22 +152,20 @@ impl ModelRegistry {
         Ok(())
     }
 
-    /// Resolve (model_id, dataset_id, config, promoted version) by name.
-    /// RLS scopes visibility; name is unique per owner/org.
+    /// Resolve a model by name. RLS scopes visibility; name is unique
+    /// only PER SCOPE (personal / each org), so a caller may see several
+    /// same-named rows — precedence is deterministic: the caller's OWN
+    /// personal model first, then org models by fixed org order. Without
+    /// the ORDER BY, `LIMIT 1` was planner-dependent and an org member
+    /// could shadow a colleague's personal model name nondeterministically.
     pub async fn resolve_by_name(
         conn: &mut PgConnection,
         name: &str,
-    ) -> Result<
-        Option<(
-            Uuid,
-            Option<Uuid>,
-            serde_json::Value,
-            Option<ModelVersionRow>,
-        )>,
-    > {
+    ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
             "SELECT id, dataset_id, config_json, production_version_id \
-             FROM ml_models WHERE name = $1 LIMIT 1",
+             FROM ml_models WHERE name = $1 \
+             ORDER BY (org_id IS NULL) DESC, org_id, id LIMIT 1",
         )
         .bind(name)
         .fetch_optional(&mut *conn)
@@ -180,6 +198,11 @@ impl ModelRegistry {
             }
             None => None,
         };
-        Ok(Some((model_id, dataset_id, config, version)))
+        Ok(Some(ResolvedModel {
+            model_id,
+            dataset_id,
+            config_json: config,
+            promoted_version: version,
+        }))
     }
 }

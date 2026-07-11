@@ -73,6 +73,21 @@ semantic memory is the dataset" design — datasets are platform tables,
 not actor-memory tenants, so they get real schemas, splits, dedupe
 keys, and bulk operations without straining recall semantics.
 
+**Growth is bounded by policy, not by hope.** Active learning appends on
+every low-confidence prediction, forever; unbounded datasets bloat the
+vector index and eval cost (the cap-resource-consumption rule).
+`ml_datasets.schema_json` carries a `max_examples` policy (P1b default
+50k) enforced at append time: over the cap, eviction removes oldest
+`llm_bootstrap`/`llm_fallback` rows first — `correction` rows are
+pinned (human labels are the dataset's most valuable asset).
+
+**Deletion lifecycle.** Deleting a dataset that a PROMOTED model version
+depends on is refused (the dataset IS a lazy backend's artifact —
+deleting it would silently lobotomize the model into 100% LLM
+fallback). Retire or re-point the model first. A model whose
+`dataset_id` is NULL serves `not-available` from `predict` (a loud,
+distinct error), never a silent abstain-and-fallback.
+
 ### 2. Model registry (`ml_models`, `ml_model_versions`)
 
 ```sql
@@ -88,7 +103,11 @@ ml_model_versions: id, model_id, version int, backend text,
 ```
 
 A model NAME is what workflows reference; the registry maps it to the
-**promoted version**. Promotion is explicit (`promote_model`), gated on
+**promoted version**. Names are unique only PER SCOPE (personal / each
+org), so resolution precedence is deterministic and personal-first
+(`ORDER BY (org_id IS NULL) DESC, org_id`): an org member creating a
+same-named org model cannot shadow a caller's own model, and repeated
+calls always resolve the same row. Promotion is explicit (`promote_model`), gated on
 eval metrics, and auditable. Artifacts are content-addressed
 (sha256 verified on every load — same posture as OCI WASM digests).
 
@@ -228,6 +247,17 @@ correction without a manual retrain step (knn) or with a scheduled one
   in-platform; Tier B containers get network only during dependency
   install, never with dataset mounted (datasets stream in read-only
   after network drop).
+- **Dataset-derived LLM calls are locality-pinned.** "No new egress"
+  must hold for the LLM legs too: the eval baseline and the production
+  fallback both feed DECRYPTED example content to an LLM, and eval runs
+  as a controller job with no owning actor — so `max_llm_tier` never
+  applies (the PR #461 unbound-principal gap, one layer up). Guard:
+  `config_json.fallback.provider` and the eval-baseline provider are
+  validated against LOCAL providers (`ollama`) by default; configuring
+  an external provider for either requires an explicit
+  `allow_external_llm: true` on the model config, is refused for
+  datasets whose owning workflow/actor is tier-1-pinned, and is
+  audit-logged at WARN on every eval/fallback invocation.
 - **Model cards** record provenance (labeler model + prompt hash,
   source mix, eval fingerprint) — auditability for "why did the model
   say X".
@@ -243,7 +273,12 @@ correction without a manual retrain step (knn) or with a scheduled one
 - **P2 (native inference)**: WIT `model` interface + worker host fn,
   tract-embedded ONNX + classical param evaluation in-worker, Tier A
   trainers (linfa linear/trees + statistical), `predict-batch`,
-  capability-world wiring + lint coverage.
+  capability-world wiring + lint coverage. **Gate: the knn predict RPC
+  (`talos.ml.predict`) is a new signed-RPC primitive — walk
+  `docs/platform-primitive-checklist.md` end-to-end before building it
+  (pattern-copying `memory_rpc` is NOT a substitute: zombie semaphore
+  permits, verify-once discipline, canonical bytes, and shutdown
+  orphaning all bite here).**
 - **P3 (heavy training + ops)**: Tier B containerized training (ONNX
   out), artifact signing (cosign, mirroring template publishing), drift
   monitoring (rolling agreement between fast path and sampled LLM

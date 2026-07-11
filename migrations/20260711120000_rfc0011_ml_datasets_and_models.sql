@@ -136,32 +136,127 @@ CREATE TABLE IF NOT EXISTS ml_model_versions (
     UNIQUE (model_id, version)
 );
 
-ALTER TABLE ml_models
-    ADD CONSTRAINT fk_ml_models_production_version
-    FOREIGN KEY (production_version_id)
-    REFERENCES ml_model_versions(id) ON DELETE SET NULL;
+-- Postgres has no ADD CONSTRAINT IF NOT EXISTS — guard explicitly so the
+-- file stays fully idempotent (Migration Rules: IF NOT EXISTS everywhere).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_ml_models_production_version'
+    ) THEN
+        ALTER TABLE ml_models
+            ADD CONSTRAINT fk_ml_models_production_version
+            FOREIGN KEY (production_version_id)
+            REFERENCES ml_model_versions(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_ml_model_versions_model
     ON ml_model_versions (model_id, version DESC);
 
--- ── RLS (fail-closed, membership-union shape) ────────────────────────
+-- ── RLS (fail-closed, membership-union read + write-pinned) ─────────
+--
+-- READ (USING): membership-union — own rows or rows in any org the
+-- caller belongs to (app.current_org_ids).
+--
+-- WRITE (WITH CHECK): pinned per the 2026-06-02 write-isolation audit
+-- (20260602120000): USING alone would let a multi-org member INSERT
+-- rows into (or move rows to) ANY org in their membership set. Each
+-- clause is "<write GUC> unset → permit" (rollout-safe: it can only
+-- RESTRICT wired paths, never break un-wired ones):
+--   * user pin  — user-scoped writes (begin_user_scoped sets
+--     app.current_user_id) must stamp the acting user;
+--   * org pin   — org-scoped writes (begin_org_scoped sets
+--     app.current_org_id) must land in the single ACTIVE org or be
+--     personal (org_id IS NULL).
+-- Explicit per-table blocks (not a FOREACH loop) so `grep ml_examples
+-- migrations/` surfaces the actual policy text, matching the house
+-- style of the 202605291xxxxx RLS migrations.
 
-DO $$
-DECLARE
-    t TEXT;
-BEGIN
-    FOREACH t IN ARRAY ARRAY['ml_datasets', 'ml_examples',
-                             'ml_models', 'ml_model_versions']
-    LOOP
-        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
-        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
-        EXECUTE format('DROP POLICY IF EXISTS %I_tenant_isolation ON %I', t, t);
-        EXECUTE format(
-            'CREATE POLICY %I_tenant_isolation ON %I USING (
-                user_id = NULLIF(current_setting(''app.current_user_id'', true), '''')::uuid
-                OR org_id = ANY(
-                     string_to_array(NULLIF(current_setting(''app.current_org_ids'', true), ''''), '','')::uuid[]
-                   )
-            )', t, t);
-    END LOOP;
-END $$;
+ALTER TABLE ml_datasets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ml_datasets FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS ml_datasets_tenant_isolation ON ml_datasets;
+CREATE POLICY ml_datasets_tenant_isolation ON ml_datasets
+USING (
+    user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    OR org_id = ANY(
+         string_to_array(NULLIF(current_setting('app.current_org_ids', true), ''), ',')::uuid[]
+       )
+)
+WITH CHECK (
+    (
+        NULLIF(current_setting('app.current_user_id', true), '') IS NULL
+        OR user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    )
+    AND (
+        NULLIF(current_setting('app.current_org_id', true), '') IS NULL
+        OR org_id IS NULL
+        OR org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+    )
+);
+
+ALTER TABLE ml_examples ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ml_examples FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS ml_examples_tenant_isolation ON ml_examples;
+CREATE POLICY ml_examples_tenant_isolation ON ml_examples
+USING (
+    user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    OR org_id = ANY(
+         string_to_array(NULLIF(current_setting('app.current_org_ids', true), ''), ',')::uuid[]
+       )
+)
+WITH CHECK (
+    (
+        NULLIF(current_setting('app.current_user_id', true), '') IS NULL
+        OR user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    )
+    AND (
+        NULLIF(current_setting('app.current_org_id', true), '') IS NULL
+        OR org_id IS NULL
+        OR org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+    )
+);
+
+ALTER TABLE ml_models ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ml_models FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS ml_models_tenant_isolation ON ml_models;
+CREATE POLICY ml_models_tenant_isolation ON ml_models
+USING (
+    user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    OR org_id = ANY(
+         string_to_array(NULLIF(current_setting('app.current_org_ids', true), ''), ',')::uuid[]
+       )
+)
+WITH CHECK (
+    (
+        NULLIF(current_setting('app.current_user_id', true), '') IS NULL
+        OR user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    )
+    AND (
+        NULLIF(current_setting('app.current_org_id', true), '') IS NULL
+        OR org_id IS NULL
+        OR org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+    )
+);
+
+ALTER TABLE ml_model_versions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ml_model_versions FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS ml_model_versions_tenant_isolation ON ml_model_versions;
+CREATE POLICY ml_model_versions_tenant_isolation ON ml_model_versions
+USING (
+    user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    OR org_id = ANY(
+         string_to_array(NULLIF(current_setting('app.current_org_ids', true), ''), ',')::uuid[]
+       )
+)
+WITH CHECK (
+    (
+        NULLIF(current_setting('app.current_user_id', true), '') IS NULL
+        OR user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    )
+    AND (
+        NULLIF(current_setting('app.current_org_id', true), '') IS NULL
+        OR org_id IS NULL
+        OR org_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+    )
+);
+

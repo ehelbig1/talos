@@ -30,12 +30,18 @@ pub struct EvalReport {
 }
 
 /// Compute the report from parallel truth/prediction slices.
-/// `predictions[i] = None` records an abstention.
-pub fn evaluate_predictions(truths: &[String], predictions: &[Option<String>]) -> EvalReport {
-    assert_eq!(
+/// `predictions[i] = None` records an abstention. Errors (rather than
+/// panicking a tokio task) on desynced slices — the zip below would
+/// otherwise silently truncate and compute wrong accuracy.
+pub fn evaluate_predictions(
+    truths: &[String],
+    predictions: &[Option<String>],
+) -> anyhow::Result<EvalReport> {
+    anyhow::ensure!(
+        truths.len() == predictions.len(),
+        "truth/prediction slices must be parallel ({} vs {})",
         truths.len(),
-        predictions.len(),
-        "truth/prediction slices must be parallel"
+        predictions.len()
     );
     let total = truths.len();
     let mut correct = 0usize;
@@ -90,7 +96,7 @@ pub fn evaluate_predictions(truths: &[String], predictions: &[Option<String>]) -
         })
         .collect();
 
-    EvalReport {
+    Ok(EvalReport {
         accuracy: if total > 0 {
             correct as f64 / total as f64
         } else {
@@ -99,14 +105,23 @@ pub fn evaluate_predictions(truths: &[String], predictions: &[Option<String>]) -
         total,
         abstained,
         per_class,
-    }
+    })
 }
 
+/// Classes smaller than this stay wholly in the train set: a class with
+/// 1-2 examples would otherwise donate its ONLY representation to the
+/// holdout, making it unpredictable-by-construction and skewing the
+/// eval against the fast backend for a splitter artifact, not model
+/// quality.
+pub const MIN_CLASS_FOR_HOLDOUT: usize = 3;
+
 /// Deterministic stratified holdout assignment: within each class,
-/// examples are ordered by their UUID (stable regardless of insertion
-/// order) and every `1/holdout_fraction`-th is assigned to the holdout.
-/// Determinism matters: re-running eval on an unchanged dataset must
-/// produce the same split, or metric deltas between runs are noise.
+/// examples are sorted by UUID (v4 → a uniformly random but STABLE
+/// permutation, independent of insertion/query order) and the first
+/// `round(n × fraction)` are assigned to the holdout. Determinism
+/// matters: re-running eval on an unchanged dataset must produce the
+/// same split, or metric deltas between runs are noise. Classes below
+/// [`MIN_CLASS_FOR_HOLDOUT`] are excluded (kept wholly in train).
 /// Returns the ids assigned to the holdout.
 pub fn stratified_holdout(
     examples: &[(uuid::Uuid, String)],
@@ -119,16 +134,12 @@ pub fn stratified_holdout(
     }
     let mut holdout = Vec::new();
     for ids in by_class.values_mut() {
-        ids.sort(); // stable order independent of query order
-        let take = ((ids.len() as f64) * fraction).round().max(1.0) as usize;
-        // Evenly spaced picks cover the class's UUID range rather than
-        // biasing toward one end.
-        let step = (ids.len() as f64 / take as f64).max(1.0);
-        let mut cursor = 0.0f64;
-        for _ in 0..take.min(ids.len()) {
-            holdout.push(ids[cursor as usize]);
-            cursor += step;
+        if ids.len() < MIN_CLASS_FOR_HOLDOUT {
+            continue;
         }
+        ids.sort(); // stable order independent of query order
+        let take = (((ids.len() as f64) * fraction).round() as usize).clamp(1, ids.len() - 1); // never donate a whole class
+        holdout.extend_from_slice(&ids[..take]);
     }
     holdout
 }
@@ -146,7 +157,7 @@ mod tests {
     fn perfect_predictions_score_one() {
         let truths = vec![s("a"), s("b"), s("a")];
         let preds = vec![Some(s("a")), Some(s("b")), Some(s("a"))];
-        let r = evaluate_predictions(&truths, &preds);
+        let r = evaluate_predictions(&truths, &preds).unwrap();
         assert_eq!(r.accuracy, 1.0);
         assert_eq!(r.per_class["a"].f1, 1.0);
         assert_eq!(r.per_class["a"].support, 2);
@@ -157,7 +168,7 @@ mod tests {
     fn abstentions_count_against_accuracy_and_recall() {
         let truths = vec![s("a"), s("a")];
         let preds = vec![Some(s("a")), None];
-        let r = evaluate_predictions(&truths, &preds);
+        let r = evaluate_predictions(&truths, &preds).unwrap();
         assert_eq!(r.accuracy, 0.5);
         assert_eq!(r.abstained, 1);
         assert_eq!(r.per_class["a"].recall, 0.5);
@@ -170,10 +181,41 @@ mod tests {
         // truth b predicted a: fp for a, fn for b.
         let truths = vec![s("b")];
         let preds = vec![Some(s("a"))];
-        let r = evaluate_predictions(&truths, &preds);
+        let r = evaluate_predictions(&truths, &preds).unwrap();
         assert_eq!(r.per_class["a"].precision, 0.0);
         assert_eq!(r.per_class["b"].recall, 0.0);
         assert_eq!(r.per_class["b"].support, 1);
+    }
+
+    #[test]
+    fn tiny_classes_stay_wholly_in_train() {
+        // 1- and 2-example classes must not donate to holdout; a
+        // 3-example class donates exactly one but never all.
+        let mut examples = vec![
+            (Uuid::from_u128(1), s("singleton")),
+            (Uuid::from_u128(2), s("pair")),
+            (Uuid::from_u128(3), s("pair")),
+        ];
+        for i in 0..3 {
+            examples.push((Uuid::from_u128(10 + i), s("trio")));
+        }
+        let h = stratified_holdout(&examples, 0.5);
+        assert!(!h.contains(&Uuid::from_u128(1)), "singleton donated");
+        assert!(
+            !h.iter()
+                .any(|id| *id == Uuid::from_u128(2) || *id == Uuid::from_u128(3)),
+            "pair donated"
+        );
+        let trio_in_holdout = h
+            .iter()
+            .filter(|id| (10..13).contains(&id.as_u128()))
+            .count();
+        assert!(trio_in_holdout >= 1 && trio_in_holdout < 3);
+    }
+
+    #[test]
+    fn desynced_slices_error_instead_of_panicking() {
+        assert!(evaluate_predictions(&[s("a")], &[]).is_err());
     }
 
     #[test]

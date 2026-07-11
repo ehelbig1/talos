@@ -19,7 +19,12 @@ pub mod eval;
 pub mod knn;
 pub mod registry;
 
-pub use dataset::{AppendExample, DatasetService, DatasetStats, SampledExample};
-pub use eval::{evaluate_predictions, ClassMetrics, EvalReport};
+pub use dataset::{
+    AppendExample, DatasetService, DatasetStats, DatasetTenancy, ExampleSource, HoldoutExample,
+    PreparedExample, SampledExample,
+};
+pub use eval::{
+    evaluate_predictions, stratified_holdout, ClassMetrics, EvalReport, MIN_CLASS_FOR_HOLDOUT,
+};
 pub use knn::{knn_vote, KnnPrediction, Neighbor};
-pub use registry::{ModelRegistry, ModelVersionRow};
+pub use registry::{ModelRegistry, ModelVersionRow, ResolvedModel};

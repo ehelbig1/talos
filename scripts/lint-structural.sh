@@ -3616,7 +3616,7 @@ BARE_ROW_GET_SCOPE="talos-actor-repository talos-advanced-repository talos-analy
     talos-execution-repository talos-github-repository talos-module-repository \
     talos-webhook-repository talos-worker-identity-repository talos-workflow-repository \
     talos-schedule-repo talos-memory talos-secrets-manager talos-registry \
-    talos-module-executions talos-integration-state talos-auth"
+    talos-module-executions talos-integration-state talos-auth talos-ml"
 # shellcheck disable=SC2086
 BARE_ROW_GET_COUNT="$( { grep -rEc '(row|r)\.get(::<[^(]*>)?\("' \
         --include='*.rs' \

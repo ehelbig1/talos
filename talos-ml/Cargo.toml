@@ -11,11 +11,12 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+futures = "0.3"
 pgvector = { version = "0.4", features = ["sqlx"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-memory = { path = "../talos-memory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-text-util = { path = "../talos-text-util" }
 tracing.workspace = true
 uuid.workspace = true
 
