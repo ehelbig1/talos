@@ -231,6 +231,59 @@ only on genuinely ambiguous items, and the model improves from every
 correction without a manual retrain step (knn) or with a scheduled one
 (parametric backends).
 
+## The managed distillation lifecycle (P2 — shaped by P1's live results)
+
+P1 proved the substrate and its first *refusal*: 721 bootstrap examples
+peaked at 91.7% teacher-agreement (follow_up recall 0.545) against the
+95.8% gate. Three findings reshape P2:
+
+1. **Teacher-agreement is the wrong truth.** Bootstrap labels ARE the
+   LLM's output, so eval measured agreement-with-teacher, and the
+   teacher scores 100% on itself by construction. As `correction` rows
+   (human truth) accumulate they become the GOLD truth set — eval
+   reports gold-vs-silver separately, and a distilled model can
+   legitimately beat its teacher.
+2. **One accuracy number hides the costly class.** Promotion policy is
+   per-class recall floors (e.g. `follow_up ≥ 0.9`) plus overall
+   accuracy, not accuracy alone.
+3. **Production has a fallback, so eval should too.** The deploy
+   decision is **accuracy@coverage**: fast-path accuracy measured only
+   above the confidence threshold, with coverage% alongside — low-
+   confidence traffic goes to the LLM either way.
+
+**The lifecycle** makes the hybrid pattern declarative — a state
+machine on `ml_models` (`lifecycle_state` + `policy_json`), driven by
+production traffic instead of manual runs:
+
+```
+llm_only ──> shadow ──> hybrid ──> fast_primary
+```
+
+- **llm_only**: an LLM node declares `DISTILL: {model: "..."}`; every
+  production answer auto-appends (`source = 'llm_production'`,
+  example_key-deduped). Nothing else changes.
+- **shadow**: the fast backend predicts silently alongside; agreement
+  and confidence-banded metrics accumulate on the model card.
+- **hybrid**: predictions above the threshold serve from the fast
+  path; below it, the LLM answers AND appends (active learning).
+- **fast_primary**: LLM only on fallback; drift monitoring (rolling
+  fast-vs-sampled-LLM agreement + correction rate) auto-DEMOTES if
+  quality decays.
+
+**Human-in-the-loop enforcement**: corrections are authoritative gold
+labels (the organizer's existing harvest); a periodic **disagreement
+digest** (fast-vs-LLM divergences + low-confidence samples, delivered
+like the daily brief) turns review into one-tap verdicts; transition
+policy can require ≥N human-verified examples per class before any
+state advances. Transitions notify; every switch is one command to
+reverse (`ml_promote_model` to a prior version / state demotion).
+
+`policy_json` (per model): `{min_examples, min_corrections_per_class,
+accuracy_at_coverage: {min_accuracy, min_coverage}, recall_floors:
+{class: floor}, auto_advance: bool}`. The scheduled re-eval job
+evaluates the policy on dataset change; `auto_advance: false` keeps a
+human on the promote button.
+
 ## Security & tenancy
 
 - **Example content is encrypted at rest** (per-org AEAD v4, same

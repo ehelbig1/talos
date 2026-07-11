@@ -43,7 +43,7 @@ pub fn tool_schemas() -> Vec<Value> {
                 "examples": { "type": "array", "items": { "type": "object", "properties": {
                     "features_text": { "type": "string", "description": "The text that is encrypted AND embedded. Do NOT include the label." },
                     "label": { "type": "string" },
-                    "source": { "type": "string", "enum": ["llm_bootstrap", "correction", "llm_fallback", "import", "synthetic"] },
+                    "source": { "type": "string", "enum": ["llm_bootstrap", "correction", "llm_fallback", "llm_production", "import", "synthetic"] },
                     "example_key": { "type": "string", "description": "Dedupe key (e.g. gmail message id)" }
                 }, "required": ["features_text", "label", "source"] } }
             }, "required": ["dataset_id", "examples"] }
@@ -175,10 +175,11 @@ fn parse_source(s: &str) -> Result<ExampleSource, String> {
         "llm_bootstrap" => Ok(ExampleSource::LlmBootstrap),
         "correction" => Ok(ExampleSource::Correction),
         "llm_fallback" => Ok(ExampleSource::LlmFallback),
+        "llm_production" => Ok(ExampleSource::LlmProduction),
         "import" => Ok(ExampleSource::Import),
         "synthetic" => Ok(ExampleSource::Synthetic),
         other => Err(format!(
-            "invalid source '{other}' (expected llm_bootstrap|correction|llm_fallback|import|synthetic)"
+            "invalid source '{other}' (expected llm_bootstrap|correction|llm_fallback|llm_production|import|synthetic)"
         )),
     }
 }
