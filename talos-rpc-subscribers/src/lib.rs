@@ -698,6 +698,265 @@ pub fn spawn_graph_rpc_subscriber(
     });
 }
 
+/// Serving context for the ML predict RPC — installed once from
+/// `main()` (pool + a `DatasetService` over the canonical
+/// `SecretsManager`) before [`spawn_ml_rpc_subscriber`]. Same
+/// OnceLock-injection shape as `GRAPH_SERVICE`; until it is set the
+/// subscriber answers `NotAvailable` rather than panicking.
+pub struct MlPredictContext {
+    pub db_pool: sqlx::PgPool,
+    pub dataset_service: talos_ml::DatasetService,
+}
+
+pub static ML_PREDICT_CONTEXT: std::sync::OnceLock<MlPredictContext> = std::sync::OnceLock::new();
+
+/// RFC 0011 P2c: `talos.ml.predict` — the worker's only path to model
+/// inference (workers are credential-free; datasets/registry live
+/// behind the controller's Postgres). Batch-first: one signed request
+/// carries up to `MAX_INPUTS` feature texts.
+///
+/// Security shape (docs/platform-primitive-checklist.md walk,
+/// 2026-07-11): every routing/tenancy field (`user_id`, `model_name`,
+/// each input) is HMAC-bound; `verify()` gates before any DB touch;
+/// nonce recording happens only after verify (verify/nonce split);
+/// model resolution runs on a tenant-scoped read tx opened from the
+/// SIGNED `user_id`, so RLS backstops the app-layer scoping; error
+/// variants are coarse (NotFound covers absent AND foreign models —
+/// no cross-tenant enumeration); the permit-holding serve future is
+/// wrapped in the protocol's 8 s op timeout (tighter than the worker's
+/// 10 s request timeout, so a stalled Postgres releases the permit
+/// before the caller has already given up).
+pub fn spawn_ml_rpc_subscriber(
+    nats: std::sync::Arc<async_nats::Client>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use talos_memory::ml_rpc::{
+        MlPredictRequest, MlPredictResponse, MlRpcError, MAX_IN_FLIGHT, SUBJECT_ML_PREDICT,
+        SUBSCRIBER_OP_TIMEOUT_MS,
+    };
+
+    async fn publish_reply(
+        nats: &async_nats::Client,
+        reply_to: async_nats::Subject,
+        resp: &talos_memory::ml_rpc::MlPredictResponse,
+    ) {
+        let _ = nats
+            .publish(
+                reply_to,
+                serde_json::to_vec(resp).unwrap_or_default().into(),
+            )
+            .await;
+    }
+
+    let spec = kernel::RpcSubscriberSpec {
+        subject: SUBJECT_ML_PREDICT,
+        max_in_flight: MAX_IN_FLIGHT,
+        active_msg: "ML-predict RPC subscriber active",
+        subscribe_failed_msg: "ML-predict RPC subscribe failed; retrying after backoff (worker model::predict calls time out in the meantime)",
+        rebind_event_kind: "ml_rpc_subscriber_rebinding",
+        rebind_msg: "ML-predict RPC subscriber stream ended; supervisor re-binding",
+    };
+    let handler_nats = nats.clone();
+    kernel::spawn_rpc_subscriber(nats, shutdown, spec, move |msg, sem| {
+        let nats_client = handler_nats.clone();
+        async move {
+            let start = std::time::Instant::now();
+            let reply_to = match msg.reply.clone() {
+                Some(r) => r,
+                None => return,
+            };
+
+            let req: MlPredictRequest = match serde_json::from_slice(&msg.payload) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Generic Invalid — parse detail stays server-side.
+                    publish_reply(
+                        &nats_client,
+                        reply_to,
+                        &MlPredictResponse::Err(MlRpcError::Invalid),
+                    )
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_ML_PREDICT,
+                        uuid::Uuid::nil(),
+                        "invalid",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+            };
+
+            // verify() covers HMAC + freshness + the structural caps
+            // (validate_structure runs inside it), so no separate
+            // size-cap pass is needed here.
+            if !req.verify()
+                || !crossreplica_replay_ok(SUBJECT_ML_PREDICT, req.actor_id, &req.nonce).await
+            {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "ml-predict RPC: HMAC or freshness verification failed"
+                );
+                publish_reply(
+                    &nats_client,
+                    reply_to,
+                    &MlPredictResponse::Err(MlRpcError::Unauthorized),
+                )
+                .await;
+                record_rpc_metric(
+                    SUBJECT_ML_PREDICT,
+                    req.actor_id,
+                    "unauthorized",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            if !talos_memory::rpc_auth::check_and_record_nonce(
+                talos_memory::ml_rpc::SUBJECT_NAME,
+                req.actor_id,
+                &req.nonce,
+            ) {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "ml-predict RPC: nonce replay rejected"
+                );
+                publish_reply(
+                    &nats_client,
+                    reply_to,
+                    &MlPredictResponse::Err(MlRpcError::Unauthorized),
+                )
+                .await;
+                record_rpc_metric(
+                    SUBJECT_ML_PREDICT,
+                    req.actor_id,
+                    "replay",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            let Some(ctx) = ML_PREDICT_CONTEXT.get() else {
+                publish_reply(
+                    &nats_client,
+                    reply_to,
+                    &MlPredictResponse::Err(MlRpcError::NotAvailable),
+                )
+                .await;
+                record_rpc_metric(
+                    SUBJECT_ML_PREDICT,
+                    req.actor_id,
+                    "not_available",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            };
+
+            // Bound concurrent predict batches (embedding provider +
+            // ANN queries). Dropping the permit on any exit releases it.
+            let _permit = sem.acquire_owned().await;
+            let permit_at = std::time::Instant::now();
+
+            // Zombie-permit guard (checklist §3) at the protocol's own
+            // 8 s cap: covers the tenant tx open, model resolution, and
+            // the whole embed+knn batch.
+            let served = kernel::guard_op_with(
+                std::time::Duration::from_millis(SUBSCRIBER_OP_TIMEOUT_MS),
+                async {
+                    // Tenancy from the SIGNED user_id — never from
+                    // anything the guest could vary without re-signing.
+                    let mut tx = talos_db::begin_tenant_read_scoped(
+                        &ctx.db_pool,
+                        &talos_tenancy::TenantReadScope::new(req.user_id, Vec::new()),
+                    )
+                    .await
+                    .map_err(talos_ml::ServeError::Internal)?;
+                    let reply = talos_ml::serve_predict_batch(
+                        &ctx.dataset_service,
+                        &mut tx,
+                        req.user_id,
+                        &req.model_name,
+                        &req.inputs,
+                    )
+                    .await?;
+                    // Read-only tx; commit releases the scope cleanly.
+                    tx.commit()
+                        .await
+                        .map_err(|e| talos_ml::ServeError::Internal(anyhow::anyhow!(e)))?;
+                    Ok::<_, talos_ml::ServeError>(reply)
+                },
+            )
+            .await;
+
+            let resp = match served {
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        timeout_ms = SUBSCRIBER_OP_TIMEOUT_MS,
+                        "ml-predict RPC: op exceeded permit-guard timeout — permit released"
+                    );
+                    MlPredictResponse::Err(MlRpcError::Timeout)
+                }
+                Ok(Ok(reply)) => MlPredictResponse::Ok(talos_memory::ml_rpc::MlPredictReply {
+                    predictions: reply
+                        .predictions
+                        .into_iter()
+                        .map(|p| {
+                            p.map(|p| talos_memory::ml_rpc::WirePrediction {
+                                label: p.label,
+                                confidence: p.confidence,
+                            })
+                        })
+                        .collect(),
+                    model_version: reply.model_version,
+                    backend: reply.backend,
+                }),
+                Ok(Err(talos_ml::ServeError::NotFound)) => {
+                    MlPredictResponse::Err(MlRpcError::NotFound)
+                }
+                Ok(Err(talos_ml::ServeError::NotPromoted)) => {
+                    MlPredictResponse::Err(MlRpcError::NotPromoted)
+                }
+                Ok(Err(talos_ml::ServeError::NotAvailable)) => {
+                    MlPredictResponse::Err(MlRpcError::NotAvailable)
+                }
+                Ok(Err(talos_ml::ServeError::Internal(e))) => {
+                    // Full detail server-side only; wire gets the bare
+                    // variant (no schema/query leakage).
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        error = %e,
+                        "ml-predict RPC: serve error"
+                    );
+                    MlPredictResponse::Err(MlRpcError::Internal)
+                }
+            };
+
+            let outcome = match &resp {
+                MlPredictResponse::Ok(_) => "ok",
+                MlPredictResponse::Err(MlRpcError::Unauthorized) => "unauthorized",
+                MlPredictResponse::Err(MlRpcError::NotFound) => "not_found",
+                MlPredictResponse::Err(MlRpcError::NotPromoted) => "not_promoted",
+                MlPredictResponse::Err(MlRpcError::NotAvailable) => "not_available",
+                MlPredictResponse::Err(MlRpcError::Invalid) => "invalid",
+                MlPredictResponse::Err(MlRpcError::Timeout) => "timeout",
+                MlPredictResponse::Err(MlRpcError::Internal) => "internal",
+            };
+            publish_reply(&nats_client, reply_to, &resp).await;
+            record_rpc_metric(
+                SUBJECT_ML_PREDICT,
+                req.actor_id,
+                outcome,
+                permit_at.saturating_duration_since(start).as_millis() as u64,
+                permit_at.elapsed().as_millis() as u64,
+            );
+        }
+    });
+}
+
 pub fn spawn_memory_rpc_subscriber(
     nats: std::sync::Arc<async_nats::Client>,
     pool: sqlx::PgPool,

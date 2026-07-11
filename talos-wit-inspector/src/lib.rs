@@ -53,6 +53,8 @@ const ALL_TALOS_INTERFACES: &[&str] = &[
     "talos:core/context-window",
     "talos:core/resource-quotas",
     "talos:core/embedding",
+    // Model inference (RFC 0011) — secrets-node and above, same tier as llm
+    "talos:core/model",
     // Advanced (automation-node only)
     "talos:core/agent-memory",
     "talos:core/agent-orchestration",
@@ -336,7 +338,8 @@ fn classify_world(imports: &HashSet<String>, has_sockets: bool) -> CapabilityWor
         || imports.contains("talos:core/llm-streaming")
         || imports.contains("talos:core/context-window")
         || imports.contains("talos:core/resource-quotas")
-        || imports.contains("talos:core/embedding");
+        || imports.contains("talos:core/embedding")
+        || imports.contains("talos:core/model");
 
     let has_agent_memory = imports.contains("talos:core/agent-memory");
     let has_agent_orchestration = imports.contains("talos:core/agent-orchestration");

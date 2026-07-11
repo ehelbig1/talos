@@ -20,6 +20,13 @@ pub(crate) const MAX_HTTP_CALLS_PER_EXECUTION: u64 = 1000;
 pub(crate) const MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION: u64 = 200;
 /// Maximum database queries per execution.
 pub(crate) const MAX_DB_QUERIES_PER_EXECUTION: u64 = 500;
+/// RFC 0011 P2c: maximum `model::predict*` INPUTS per execution (a
+/// batch of N counts N). Each input costs the controller a local embed
+/// + an ANN query under the shared in-flight semaphore (cap 8), so an
+/// unbounded guest loop would starve every other tenant's predict
+/// traffic. 2000 ≈ 60+ full batches — far above any legitimate
+/// classify node (inbox batches run ~25) while bounding the abuse case.
+pub(crate) const MAX_MODEL_PREDICT_INPUTS_PER_EXECUTION: u64 = 2000;
 /// Maximum NATS publish calls per execution.
 pub(crate) const MAX_MESSAGING_PUBLISHES_PER_EXECUTION: u64 = 1000;
 /// MCP-524: subject prefixes reserved for the platform that WASM modules

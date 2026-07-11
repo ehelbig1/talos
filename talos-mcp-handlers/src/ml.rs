@@ -553,14 +553,20 @@ async fn handle_promote_model(
     }
     match ModelRegistry::promote_version(&mut tx, model_id, version_id).await {
         Ok(()) => match tx.commit().await {
-            Ok(()) => mcp_text(
-                req_id,
-                &serde_json::json!({
-                    "model_id": model_id.to_string(),
-                    "promoted_version_id": version_id.to_string(),
-                })
-                .to_string(),
-            ),
+            Ok(()) => {
+                // P2c serving cache: drop the resolved entry so the RPC
+                // path serves the newly promoted version immediately
+                // (same-process; the 15 s TTL bounds other replicas).
+                talos_ml::serve::invalidate_serving_cache(user_id, &model.name);
+                mcp_text(
+                    req_id,
+                    &serde_json::json!({
+                        "model_id": model_id.to_string(),
+                        "promoted_version_id": version_id.to_string(),
+                    })
+                    .to_string(),
+                )
+            }
             Err(e) => internal(req_id, "promote_model commit", &e.into()),
         },
         Err(e) => internal(req_id, "promote_model", &e),

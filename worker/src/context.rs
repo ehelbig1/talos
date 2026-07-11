@@ -221,6 +221,11 @@ pub struct TalosContext {
     pub(crate) http_calls_per_host: dashmap::DashMap<String, u64>,
     pub(crate) db_query_count: AtomicU64,
     pub(crate) messaging_publish_count: AtomicU64,
+    /// RFC 0011 P2c: per-execution count of `model::predict*` INPUTS
+    /// (a batch of N counts N — each input costs the controller one
+    /// local embed + one ANN query). Capped at
+    /// `MAX_MODEL_PREDICT_INPUTS_PER_EXECUTION` in host/limits.rs.
+    pub(crate) model_predict_input_count: AtomicU64,
     /// MCP-523: per-execution email-send count. Pre-fix `wit_email::send`
     /// had no rate limit — see `MAX_EMAIL_SENDS_PER_EXECUTION` in
     /// `host_impl.rs`.
@@ -1008,6 +1013,7 @@ impl TalosContext {
             http_calls_per_host: dashmap::DashMap::new(),
             db_query_count: AtomicU64::new(0),
             messaging_publish_count: AtomicU64::new(0),
+            model_predict_input_count: AtomicU64::new(0),
             email_send_count: AtomicU64::new(0),
             webhook_send_count: AtomicU64::new(0),
             graphql_query_count: AtomicU64::new(0),

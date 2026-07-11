@@ -21,6 +21,7 @@ pub struct ModelVersionRow {
 /// like task_type are additive instead of positionally breaking).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedModel {
+    pub name: String,
     pub model_id: Uuid,
     pub dataset_id: Option<Uuid>,
     pub config_json: serde_json::Value,
@@ -207,7 +208,7 @@ impl ModelRegistry {
         model_id: Uuid,
     ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
-            "SELECT id, dataset_id, config_json, production_version_id \
+            "SELECT id, name, dataset_id, config_json, production_version_id \
              FROM ml_models WHERE id = $1",
         )
         .bind(model_id)
@@ -227,7 +228,7 @@ impl ModelRegistry {
         name: &str,
     ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
-            "SELECT id, dataset_id, config_json, production_version_id \
+            "SELECT id, name, dataset_id, config_json, production_version_id \
              FROM ml_models WHERE name = $1 \
              ORDER BY (org_id IS NULL) DESC, org_id, id LIMIT 1",
         )
@@ -245,6 +246,7 @@ impl ModelRegistry {
     ) -> Result<Option<ResolvedModel>> {
         let Some(m) = model else { return Ok(None) };
         let model_id: Uuid = m.try_get("id")?;
+        let name: String = m.try_get("name")?;
         let dataset_id: Option<Uuid> = m.try_get("dataset_id")?;
         let config: serde_json::Value = m.try_get("config_json")?;
         let prod_id: Option<Uuid> = m.try_get("production_version_id")?;
@@ -273,6 +275,7 @@ impl ModelRegistry {
         };
         Ok(Some(ResolvedModel {
             model_id,
+            name,
             dataset_id,
             config_json: config,
             promoted_version: version,

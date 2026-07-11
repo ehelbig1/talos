@@ -487,6 +487,7 @@ async fn main() -> anyhow::Result<()> {
         db_pool.clone(),
         nats_client.clone(),
         rpc_subscribers_enabled,
+        core.secrets_manager.clone(),
     );
 
     // Embedding backfill, readiness recomputation, SLA degradation alerting.
@@ -3205,6 +3206,7 @@ fn wire_rpc_subscribers(
     db_pool: sqlx::Pool<sqlx::Postgres>,
     nats_client: Option<std::sync::Arc<async_nats::Client>>,
     rpc_subscribers_enabled: bool,
+    secrets_manager: std::sync::Arc<SecretsManager>,
 ) -> std::sync::Arc<tokio::sync::watch::Sender<bool>> {
     // ---------- Graph-search NATS-RPC subscriber (Phase 3) ----------
     // Workers can't reach the Neo4j driver directly (it's a
@@ -3243,6 +3245,16 @@ fn wire_rpc_subscribers(
         }
         if let Some(nats) = nats_client.clone() {
             spawn_integration_state_subscriber(nats, db_pool.clone(), rpc_shutdown_rx.clone());
+        }
+        if let Some(nats) = nats_client.clone() {
+            // RFC 0011 P2c: `talos.ml.predict`. Context install before
+            // spawn so no request races an unset OnceLock (an unset
+            // context answers NotAvailable, never panics).
+            let _ = rpc_subscribers::ML_PREDICT_CONTEXT.set(rpc_subscribers::MlPredictContext {
+                db_pool: db_pool.clone(),
+                dataset_service: talos_ml::DatasetService::new(secrets_manager),
+            });
+            spawn_ml_rpc_subscriber(nats, rpc_shutdown_rx.clone());
         }
     }
     // Background sweep for expired integration_state rows. Runs
@@ -6065,7 +6077,8 @@ mod integration_state_service;
 mod rpc_subscribers;
 use rpc_subscribers::{
     spawn_database_rpc_subscriber, spawn_graph_rpc_subscriber, spawn_integration_state_subscriber,
-    spawn_integration_state_sweeper, spawn_memory_rpc_subscriber, spawn_state_write_subscriber,
+    spawn_integration_state_sweeper, spawn_memory_rpc_subscriber, spawn_ml_rpc_subscriber,
+    spawn_state_write_subscriber,
 };
 
 /// RFC 0010 P2 inc.4: load the active `worker_identities` registry and install it

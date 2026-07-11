@@ -1,0 +1,42 @@
+{
+  "name": "model-predict",
+  "version": "v1.0.0",
+  "display_name": "Model Predict",
+  "description": "Batch inference against a registered platform ML model (RFC 0011). Names a model from the ml registry; the host signs a predict RPC to the controller, which resolves the model under the execution user's tenancy and serves the promoted version — local embeddings + in-Postgres ANN, no data egress (Tier-1-clean). Abstained/low-confidence slots come back null with their indices in abstained_idx, ready to route to an LLM fallback branch (the distillation pattern).",
+  "category": "AI",
+  "capability_world": "secrets-node",
+  "allowed_hosts": [],
+  "allowed_secrets": [],
+  "recommended_fuel": {
+    "expected_items": 100,
+    "bytes_per_item": 2000,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["MODEL_NAME"],
+    "properties": {
+      "MODEL_NAME": {
+        "type": "string",
+        "description": "Registered ml_models name to serve (e.g. 'inbox-classifier-personal'). Resolved under the execution user's tenancy — personal model first, then org models deterministically. The model must have a PROMOTED version (ml_promote_model)."
+      },
+      "INPUT_PATH": {
+        "type": "string",
+        "description": "Dotted path to the item array in the node input (e.g. 'messages' or 'fetch.messages'). When omitted, the module probes 'inputs', 'items', 'messages', then a bare top-level array."
+      },
+      "FEATURE_TEMPLATE": {
+        "type": "string",
+        "description": "Per-item {{key}} / {{key.subkey}} template that builds the feature text the model sees — MUST match how the model's dataset examples were built (e.g. 'Subject: {{subject}}\\nFrom: {{from}}\\nSnippet: {{snippet}}' for the inbox classifier). Strings inline; other values JSON-serialize; unresolved placeholders stay visible. When omitted, string items pass through and objects JSON-serialize. Feature text is capped at 16KB per item."
+      },
+      "CONFIDENCE_THRESHOLD": {
+        "type": "number",
+        "description": "Predictions below this confidence are treated as abstentions (null slot + abstained_idx entry). Calibrate from the model's eval coverage_curve — thresholds only transfer between identical voting schemes (see metrics_json.voting). Default 0 (no thresholding beyond the model's own abstention)."
+      },
+      "MAX_ITEMS": {
+        "type": "number",
+        "default": 200,
+        "description": "Cap on items processed per run (hard cap 512). Items are sent in batches of 32 per signed RPC; each item costs the controller one local embed + one ANN query, and a per-execution budget of 2000 inputs applies."
+      }
+    }
+  }
+}
