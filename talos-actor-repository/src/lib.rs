@@ -361,6 +361,60 @@ fn is_unique_violation(e: &anyhow::Error) -> bool {
         .is_some_and(|db| db.is_unique_violation())
 }
 
+/// Process-global `user_id → (default actor id, cached-at)` cache for
+/// [`ActorRepository::get_or_create_default_actor`].
+///
+/// Since Phase D2 the authorization gate resolves the default actor on
+/// EVERY unbound dispatch — per scheduled tick and per webhook-chain
+/// fan-out item — and each resolution is a user-scoped transaction
+/// (BEGIN + GUC SETs + SELECT + COMMIT). The mapping it computes is
+/// IMMUTABLE once created: the `idx_one_default_actor_per_user` partial
+/// unique index guarantees a single default-actor row per user, the
+/// row's id is never re-pointed, and actors are archived (never
+/// hard-deleted) — so a cached hit can only ever return the same id the
+/// SELECT would. Actor STATE (archived/suspended/budget) is deliberately
+/// NOT part of this cache's contract: every dispatch path re-reads the
+/// actor row through the gate's `get_actor` + `check_execution_allowed`,
+/// which fail closed. The TTL is a belt-and-braces bound (a dangling id
+/// after out-of-band row deletion heals within one TTL and fails closed
+/// downstream in the meantime), not a correctness requirement.
+///
+/// Process-global (not per-`ActorRepository`) because call sites
+/// construct fresh repository handles per dispatch. Bounded per the
+/// keyed-cache sweep rule: inserts past `DEFAULT_ACTOR_CACHE_MAX` prune
+/// expired entries first and fall back to clearing (cache, not store).
+static DEFAULT_ACTOR_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<Uuid, (Uuid, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+const DEFAULT_ACTOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+const DEFAULT_ACTOR_CACHE_MAX: usize = 8192;
+
+/// Cache read, extracted for unit testing (`default_actor_cache_tests`).
+/// Returns the cached default-actor id when present and unexpired.
+pub(crate) fn default_actor_cache_get(user_id: Uuid, now: std::time::Instant) -> Option<Uuid> {
+    let cache = DEFAULT_ACTOR_CACHE.read().ok()?;
+    cache.get(&user_id).and_then(|(actor_id, cached_at)| {
+        (now.duration_since(*cached_at) < DEFAULT_ACTOR_CACHE_TTL).then_some(*actor_id)
+    })
+}
+
+/// Cache write with the size-bound sweep. A poisoned lock degrades to
+/// cache-off (every read misses) rather than panicking a dispatch path.
+pub(crate) fn default_actor_cache_put(user_id: Uuid, actor_id: Uuid, now: std::time::Instant) {
+    if let Ok(mut cache) = DEFAULT_ACTOR_CACHE.write() {
+        if cache.len() >= DEFAULT_ACTOR_CACHE_MAX && !cache.contains_key(&user_id) {
+            cache.retain(|_, (_, cached_at)| {
+                now.duration_since(*cached_at) < DEFAULT_ACTOR_CACHE_TTL
+            });
+            if cache.len() >= DEFAULT_ACTOR_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(user_id, (actor_id, now));
+    }
+}
+
 pub struct ActorRepository {
     db_pool: PgPool,
     /// Optional SecretsManager — when set, `complete_execution` encrypts
@@ -508,6 +562,22 @@ impl ActorRepository {
     ///
     /// [`resolve_effective_actor`]: Self::resolve_effective_actor
     pub async fn get_or_create_default_actor(&self, user_id: Uuid) -> Result<Uuid> {
+        // Hot path: the mapping is immutable once created (see the
+        // DEFAULT_ACTOR_CACHE doc-comment for why a stale hit is safe),
+        // and Phase D2 resolves it on every unbound scheduled fire and
+        // chain fan-out item — the cache collapses a user-scoped tx
+        // (4 round-trips) to a map read.
+        let now = std::time::Instant::now();
+        if let Some(id) = default_actor_cache_get(user_id, now) {
+            return Ok(id);
+        }
+        let resolved = self.get_or_create_default_actor_uncached(user_id).await?;
+        default_actor_cache_put(user_id, resolved, now);
+        Ok(resolved)
+    }
+
+    /// The pre-cache body of [`Self::get_or_create_default_actor`].
+    async fn get_or_create_default_actor_uncached(&self, user_id: Uuid) -> Result<Uuid> {
         if let Some(id) = self.find_default_actor(user_id).await? {
             return Ok(id);
         }
@@ -3182,5 +3252,53 @@ mod summary_truncation_tests {
         assert!(truncated.len() <= 1000);
         // Validity check: the truncation must produce a well-formed UTF-8 string.
         assert!(truncated.chars().next().is_some());
+    }
+}
+
+#[cfg(test)]
+mod default_actor_cache_tests {
+    //! Exercises the REAL cache helpers (`default_actor_cache_get`/`_put`)
+    //! per the no-shadow-copies testing convention. The cache is
+    //! process-global, so each test uses fresh user UUIDs — tests can run
+    //! concurrently without interfering.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn miss_then_hit_roundtrip() {
+        let user = Uuid::new_v4();
+        let actor = Uuid::new_v4();
+        let now = Instant::now();
+        assert_eq!(default_actor_cache_get(user, now), None);
+        default_actor_cache_put(user, actor, now);
+        assert_eq!(default_actor_cache_get(user, now), Some(actor));
+    }
+
+    #[test]
+    fn entry_expires_after_ttl() {
+        let user = Uuid::new_v4();
+        let actor = Uuid::new_v4();
+        let now = Instant::now();
+        default_actor_cache_put(user, actor, now);
+        // One nanosecond short of the TTL: still a hit.
+        let almost = now + DEFAULT_ACTOR_CACHE_TTL - Duration::from_nanos(1);
+        assert_eq!(default_actor_cache_get(user, almost), Some(actor));
+        // At the TTL boundary: expired (strict `<` comparison).
+        let expired = now + DEFAULT_ACTOR_CACHE_TTL;
+        assert_eq!(default_actor_cache_get(user, expired), None);
+    }
+
+    #[test]
+    fn put_overwrites_and_refreshes() {
+        let user = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let t0 = Instant::now();
+        default_actor_cache_put(user, first, t0);
+        let t1 = t0 + Duration::from_secs(200);
+        default_actor_cache_put(user, second, t1);
+        // The refreshed entry survives past the ORIGINAL entry's expiry.
+        let t2 = t0 + DEFAULT_ACTOR_CACHE_TTL + Duration::from_secs(1);
+        assert_eq!(default_actor_cache_get(user, t2), Some(second));
     }
 }
