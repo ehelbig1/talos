@@ -24,7 +24,8 @@ pub use dataset::{
     PreparedExample, SampledExample,
 };
 pub use eval::{
-    evaluate_predictions, stratified_holdout, ClassMetrics, EvalReport, MIN_CLASS_FOR_HOLDOUT,
+    evaluate_predictions, run_knn_eval, stratified_holdout, ClassMetrics, EvalReport,
+    MIN_CLASS_FOR_HOLDOUT,
 };
 pub use knn::{knn_vote, KnnPrediction, Neighbor};
 pub use registry::{ModelRegistry, ModelVersionRow, ResolvedModel};

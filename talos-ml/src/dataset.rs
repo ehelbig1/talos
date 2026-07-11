@@ -563,6 +563,28 @@ impl DatasetService {
         Ok((id, label, source, text))
     }
 
+    /// End-to-end text prediction on the knn backend: embed locally,
+    /// retrieve, vote. Returns None when the input can't be embedded or
+    /// the neighborhood abstains — the caller decides the fallback.
+    pub async fn knn_predict_text(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+        text: &str,
+        k: i64,
+    ) -> Result<Option<crate::knn::KnnPrediction>> {
+        let Some(embedding) = talos_memory::embedding::generate_embedding(text, true).await else {
+            return Ok(None);
+        };
+        if embedding.len() != EMBEDDING_COLUMN_DIMS {
+            return Ok(None);
+        }
+        let neighbors = self
+            .knn_search(conn, dataset_id, &embedding, k, true)
+            .await?;
+        Ok(crate::knn::knn_vote(&neighbors))
+    }
+
     /// knn retrieval for one query embedding. `train_only` excludes the
     /// holdout so eval never lets a holdout row vote for itself.
     ///
