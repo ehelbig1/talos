@@ -57,6 +57,8 @@ pub enum ExampleSource {
     LlmBootstrap,
     Correction,
     LlmFallback,
+    /// Auto-appended from live traffic by the DISTILL lifecycle hook.
+    LlmProduction,
     Import,
     Synthetic,
 }
@@ -67,6 +69,7 @@ impl ExampleSource {
             Self::LlmBootstrap => "llm_bootstrap",
             Self::Correction => "correction",
             Self::LlmFallback => "llm_fallback",
+            Self::LlmProduction => "llm_production",
             Self::Import => "import",
             Self::Synthetic => "synthetic",
         }
