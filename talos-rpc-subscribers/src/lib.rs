@@ -860,6 +860,36 @@ pub fn spawn_ml_rpc_subscriber(
             let _permit = sem.acquire_owned().await;
             let permit_at = std::time::Instant::now();
 
+            // Dead-reply guard: the semaphore queue wait sits OUTSIDE
+            // the op timeout, so under saturation a request can win its
+            // permit after the worker's REQUEST_TIMEOUT_MS has already
+            // expired. Running the batch then burns a full embed+ANN
+            // round into a dead reply inbox — while the caller retries,
+            // deepening the queue. Skip instead (review 2026-07-11).
+            if start.elapsed()
+                >= std::time::Duration::from_millis(talos_memory::ml_rpc::REQUEST_TIMEOUT_MS)
+            {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    queued_ms = start.elapsed().as_millis() as u64,
+                    "ml-predict RPC: caller deadline already passed after permit wait — skipping"
+                );
+                publish_reply(
+                    &nats_client,
+                    reply_to,
+                    &MlPredictResponse::Err(MlRpcError::Timeout),
+                )
+                .await;
+                record_rpc_metric(
+                    SUBJECT_ML_PREDICT,
+                    req.actor_id,
+                    "stale_deadline",
+                    permit_at.saturating_duration_since(start).as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
             // Zombie-permit guard (checklist §3) at the protocol's own
             // 8 s cap: covers the tenant tx open, model resolution, and
             // the whole embed+knn batch.

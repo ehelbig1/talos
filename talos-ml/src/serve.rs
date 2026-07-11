@@ -1,17 +1,23 @@
 //! Serving layer for `talos.ml.predict` (RFC 0011 P2c).
 //!
 //! One entry point, [`serve_predict_batch`], designed for the RPC
-//! subscriber: resolve the named model UNDER THE SIGNED USER'S TENANCY
-//! (the caller supplies a tenant-scoped connection), check the promoted
+//! subscriber: resolve the named model under the SIGNED user's OWNER
+//! scope (app-layer `user_id` predicate in the registry + the caller's
+//! tenant-scoped connection as the RLS backstop), check the promoted
 //! version is servable, then run the batch with the expensive
 //! invariants hoisted — probes pinned once, class priors aggregated
-//! once — so per-input cost is one local embed + one indexed knn query.
+//! once, embeddings computed CONCURRENTLY (they are independent local
+//! HTTP calls; only the ANN queries serialize on the tx connection) —
+//! so a full 32-input batch fits comfortably inside the subscriber's
+//! 8 s op guard.
 //!
 //! Model resolution is cached process-globally (TTL + explicit
 //! invalidation from the promote path, which runs in the same
 //! controller process). Cache entries carry NO dataset content — only
-//! registry metadata — and are keyed by (user_id, model_name) so one
-//! tenant's resolution can never serve another's request.
+//! registry metadata — and are keyed by (user_id, model_name); entries
+//! are only ever written AFTER the owner-scoped resolution and the
+//! dataset-ownership belt both pass, so a cached entry can never serve
+//! another tenant's request.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
@@ -25,12 +31,25 @@ use crate::dataset::DatasetService;
 use crate::knn::knn_vote_balanced;
 use crate::registry::ModelRegistry;
 
+/// Default knn neighborhood when the model's `config_json` doesn't pin
+/// one. SINGLE source of truth for the MCP eval/predict handlers AND
+/// this serving path — a divergence here means the promotion gate
+/// certifies a different model than the one being served.
+pub const DEFAULT_KNN_K: i64 = 7;
+
 /// How long a resolved (user, model_name) → serving-config entry may be
 /// reused. Promotion invalidates same-process immediately (the MCP
 /// promote handler calls [`invalidate_serving_cache`]); the TTL bounds
 /// staleness for out-of-band writers.
 const SERVING_CACHE_TTL: Duration = Duration::from_secs(15);
 const SERVING_CACHE_MAX: usize = 4096;
+
+/// Concurrent local-embed calls per batch. Embeds are independent
+/// requests against the local embedding endpoint (which has its own
+/// LRU + in-flight dedupe); 8 keeps a full 32-input batch ~4 embed
+/// round-trips deep instead of 32 sequential ones without saturating
+/// a single-instance Ollama.
+const EMBED_CONCURRENCY: usize = 8;
 
 /// Registry metadata needed to serve — no tenant content.
 #[derive(Debug, Clone)]
@@ -44,33 +63,52 @@ struct ServingConfig {
 static SERVING_CACHE: LazyLock<RwLock<HashMap<(Uuid, String), (ServingConfig, Instant)>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Recover from lock poisoning instead of silently no-op'ing: the map
+/// holds only plain data (no invariants spanning entries), so the
+/// poisoned contents are safe to keep using. Without this, one panic
+/// while holding the write lock would permanently turn
+/// [`invalidate_serving_cache`] into a no-op and pin stale promotions
+/// until process restart.
+fn cache_write(
+) -> std::sync::RwLockWriteGuard<'static, HashMap<(Uuid, String), (ServingConfig, Instant)>> {
+    SERVING_CACHE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Drop the cached resolution for one (user, model) — called by the
 /// promote handler so a newly promoted version serves immediately.
 pub fn invalidate_serving_cache(user_id: Uuid, model_name: &str) {
-    if let Ok(mut cache) = SERVING_CACHE.write() {
-        cache.remove(&(user_id, model_name.to_string()));
-    }
+    cache_write().remove(&(user_id, model_name.to_string()));
 }
 
 fn cache_get(user_id: Uuid, model_name: &str) -> Option<ServingConfig> {
-    let cache = SERVING_CACHE.read().ok()?;
+    let cache = SERVING_CACHE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache
         .get(&(user_id, model_name.to_string()))
         .and_then(|(cfg, at)| (at.elapsed() < SERVING_CACHE_TTL).then(|| cfg.clone()))
 }
 
 fn cache_put(user_id: Uuid, model_name: &str, cfg: ServingConfig) {
-    if let Ok(mut cache) = SERVING_CACHE.write() {
-        if cache.len() >= SERVING_CACHE_MAX
-            && !cache.contains_key(&(user_id, model_name.to_string()))
-        {
-            cache.retain(|_, (_, at)| at.elapsed() < SERVING_CACHE_TTL);
-            if cache.len() >= SERVING_CACHE_MAX {
-                cache.clear();
+    let mut cache = cache_write();
+    if cache.len() >= SERVING_CACHE_MAX && !cache.contains_key(&(user_id, model_name.to_string())) {
+        cache.retain(|_, (_, at)| at.elapsed() < SERVING_CACHE_TTL);
+        if cache.len() >= SERVING_CACHE_MAX {
+            // Still saturated with FRESH entries: evict the single
+            // oldest instead of clearing — a full clear() collapses the
+            // hit rate for every tenant to admit one key.
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
             }
         }
-        cache.insert((user_id, model_name.to_string()), (cfg, Instant::now()));
     }
+    cache.insert((user_id, model_name.to_string()), (cfg, Instant::now()));
 }
 
 /// Serve-time failure taxonomy — mirrors the wire enum; deliberately
@@ -98,9 +136,12 @@ pub struct ServeReply {
 }
 
 /// Batch predict for one signed principal. The connection MUST be a
-/// tenant-scoped transaction for `user_id` (RLS enforcement) — the RPC
+/// tenant-scoped transaction for `user_id` (RLS backstop) — the RPC
 /// subscriber opens it from the SIGNED request's user_id, never from
-/// anything the guest supplied unsigned.
+/// anything the guest supplied unsigned. Tenancy does NOT rest on the
+/// connection alone: the registry resolver carries an app-layer
+/// `user_id` predicate, and the dataset the model points at is
+/// ownership-checked before anything is cached or searched.
 pub async fn serve_predict_batch(
     service: &DatasetService,
     conn: &mut PgConnection,
@@ -112,17 +153,26 @@ pub async fn serve_predict_batch(
     let cfg = match cache_get(user_id, model_name) {
         Some(cfg) => cfg,
         None => {
-            let resolved = ModelRegistry::resolve_by_name(&mut *conn, model_name)
+            let resolved = ModelRegistry::resolve_by_name(&mut *conn, model_name, user_id)
                 .await
                 .map_err(ServeError::Internal)?
                 .ok_or(ServeError::NotFound)?;
             let promoted = resolved.promoted_version.ok_or(ServeError::NotPromoted)?;
             let dataset_id = resolved.dataset_id.ok_or(ServeError::NotAvailable)?;
+            // Dataset-ownership belt (mirrors the MCP handlers'
+            // `require_dataset_owner`): even a legitimately-owned model
+            // must not search a dataset the signed user doesn't own.
+            // Coarse NotAvailable — no foreign-dataset enumeration.
+            match service.dataset_tenancy(&mut *conn, dataset_id).await {
+                Ok(t) if t.user_id == user_id => {}
+                Ok(_) => return Err(ServeError::NotAvailable),
+                Err(_) => return Err(ServeError::NotAvailable),
+            }
             let k = resolved
                 .config_json
                 .get("k")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(5)
+                .unwrap_or(DEFAULT_KNN_K)
                 .clamp(1, 50);
             let cfg = ServingConfig {
                 dataset_id,
@@ -153,16 +203,31 @@ pub async fn serve_predict_batch(
         return Err(ServeError::NotAvailable);
     }
 
-    // 3. Per input: local embed → knn → damped balanced vote.
+    // 3. Embed all inputs CONCURRENTLY in waves of EMBED_CONCURRENCY
+    // (independent local HTTP calls; join_all preserves order). None =
+    // embedder down / non-local config → that slot abstains and
+    // production callers fall back to their LLM branch per input.
+    let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(inputs.len());
+    for wave in inputs.chunks(EMBED_CONCURRENCY) {
+        let results = futures::future::join_all(
+            wave.iter()
+                .map(|input| talos_memory::embedding::generate_embedding(input, true)),
+        )
+        .await;
+        embeddings.extend(results);
+    }
+
+    // 4. Per input: knn → damped balanced vote (sequential — the ANN
+    // queries share the one tx connection, but each is a fast indexed
+    // lookup once the embeds are in hand).
+    let expected_dims = crate::dataset::expected_embedding_dims();
     let mut predictions = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let Some(embedding) = talos_memory::embedding::generate_embedding(input, true).await else {
-            // Embedder down / non-local config: abstain — production
-            // callers fall back to their LLM branch per input.
+    for embedding in &embeddings {
+        let Some(embedding) = embedding else {
             predictions.push(None);
             continue;
         };
-        if embedding.len() != crate::dataset::expected_embedding_dims() {
+        if embedding.len() != expected_dims {
             // Dimensionality drift (embedding model changed under the
             // dataset): abstain rather than error mid-batch — same
             // guard as `knn_predict_text`.
@@ -170,7 +235,7 @@ pub async fn serve_predict_batch(
             continue;
         }
         let neighbors = service
-            .knn_search(&mut *conn, cfg.dataset_id, &embedding, cfg.k, true)
+            .knn_search(&mut *conn, cfg.dataset_id, embedding, cfg.k, true)
             .await
             .map_err(ServeError::Internal)?;
         predictions.push(
@@ -192,20 +257,50 @@ pub async fn serve_predict_batch(
 mod tests {
     use super::*;
 
-    #[test]
-    fn cache_roundtrip_ttl_and_invalidate() {
-        let user = Uuid::from_u128(7);
-        let cfg = ServingConfig {
+    fn test_cfg(k: i64) -> ServingConfig {
+        ServingConfig {
             dataset_id: Uuid::from_u128(8),
             version: 3,
             backend: "knn-pgvector".into(),
-            k: 5,
-        };
-        cache_put(user, "m-test", cfg);
+            k,
+        }
+    }
+
+    #[test]
+    fn cache_roundtrip_ttl_and_invalidate() {
+        let user = Uuid::from_u128(7);
+        cache_put(user, "m-test", test_cfg(5));
         assert!(cache_get(user, "m-test").is_some());
         // Tenancy isolation: same name, different user — miss.
         assert!(cache_get(Uuid::from_u128(9), "m-test").is_none());
         invalidate_serving_cache(user, "m-test");
         assert!(cache_get(user, "m-test").is_none());
+    }
+
+    #[test]
+    fn saturated_cache_evicts_one_not_all() {
+        // Use a disjoint user-id range so this test doesn't interact
+        // with the roundtrip test sharing the process-global cache.
+        let base = 1_000_000u128;
+        for i in 0..SERVING_CACHE_MAX as u128 {
+            cache_put(Uuid::from_u128(base + i), "m-sat", test_cfg(7));
+        }
+        // All entries are fresh; inserting one more must evict exactly
+        // one (the oldest), not clear the map.
+        cache_put(
+            Uuid::from_u128(base + SERVING_CACHE_MAX as u128),
+            "m-sat",
+            test_cfg(7),
+        );
+        let cache = SERVING_CACHE
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let survivors = (0..=SERVING_CACHE_MAX as u128)
+            .filter(|i| cache.contains_key(&(Uuid::from_u128(base + i), "m-sat".to_string())))
+            .count();
+        assert!(
+            survivors >= SERVING_CACHE_MAX - 1,
+            "clear()-style mass eviction detected"
+        );
     }
 }

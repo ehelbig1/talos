@@ -22,7 +22,14 @@ impl TalosContext {
         method: &'static str,
     ) -> Result<wit_model::PredictReply, wit_model::Error> {
         if self.is_cancelled() {
-            return Err(wit_model::Error::Timeout);
+            // Distinct, non-retryable variant + the cancel metric —
+            // same convention as `wit_llm::complete` (Timeout invites
+            // retry loops against a cancelled execution).
+            tracing::info!(module_id = ?self.module_id, "Execution cancelled");
+            if let Some(ref m) = self.metrics {
+                m.record_execution_cancelled();
+            }
+            return Err(wit_model::Error::Cancelled);
         }
         // Same capability tier as `wit_embedding::generate` — the model
         // interface ships in the secrets-node+ worlds (grep `import
@@ -56,23 +63,6 @@ impl TalosContext {
                 return Err(wit_model::Error::InvalidInput);
             }
 
-            // Per-execution input budget (fetch_add is race-free under
-            // guest-visible concurrency; overshoot by one batch at the
-            // boundary is acceptable — the cap is load-shaping, not a
-            // security boundary).
-            let batch = inputs.len() as u64;
-            let prior = self
-                .model_predict_input_count
-                .fetch_add(batch, std::sync::atomic::Ordering::Relaxed);
-            if prior + batch > crate::host::limits::MAX_MODEL_PREDICT_INPUTS_PER_EXECUTION {
-                tracing::warn!(
-                    execution_id = ?self.execution_id,
-                    used = prior,
-                    "model::predict per-execution input budget exhausted"
-                );
-                return Err(wit_model::Error::RateLimited);
-            }
-
             let Some(actor_id) = self.actor_id else {
                 // No actor binding — no HMAC identity to sign under.
                 return Err(wit_model::Error::NotAvailable);
@@ -86,6 +76,27 @@ impl TalosContext {
             let Some(nats) = self.nats_client.as_ref().cloned() else {
                 return Err(wit_model::Error::NotAvailable);
             };
+
+            // Per-execution input budget, charged only once every
+            // prerequisite short of the send is satisfied — a guest
+            // retry loop against transient infra (NATS down, missing
+            // key) must not burn the budget on requests that never
+            // reached the controller. fetch_add is race-free under
+            // guest-visible concurrency; overshoot by one batch at the
+            // boundary is acceptable — the cap is load-shaping, not a
+            // security boundary.
+            let batch = inputs.len() as u64;
+            let prior = self
+                .model_predict_input_count
+                .fetch_add(batch, std::sync::atomic::Ordering::Relaxed);
+            if prior + batch > crate::host::limits::MAX_MODEL_PREDICT_INPUTS_PER_EXECUTION {
+                tracing::warn!(
+                    execution_id = ?self.execution_id,
+                    used = prior,
+                    "model::predict per-execution input budget exhausted"
+                );
+                return Err(wit_model::Error::RateLimited);
+            }
 
             let req = match MlPredictRequest::new_signed(actor_id, user_id, model_name, inputs) {
                 Some(r) => r,

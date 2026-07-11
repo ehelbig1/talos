@@ -119,6 +119,7 @@ fn model_error_message(err: talos::core::model::Error, model_name: &str) -> Stri
         Error::RateLimited => {
             "Per-execution model-predict budget exhausted — reduce items per run".to_string()
         }
+        Error::Cancelled => "Execution cancelled — not retrying".to_string(),
         Error::Internal => "Model predict failed internally — see controller logs".to_string(),
     }
 }
@@ -166,21 +167,39 @@ pub fn run(input: String) -> Result<String, String> {
             "total": 0,
             "predicted": 0,
             "abstained": 0,
+            "truncated": 0,
         })
         .to_string());
     }
 
+    let total = items.len();
     let max_items = config.max_items.unwrap_or(200).clamp(1, HARD_MAX_ITEMS);
-    let items = &items[..items.len().min(max_items)];
-    let features: Vec<String> = items
-        .iter()
-        .map(|it| feature_text(it, config.feature_template.as_deref()))
-        .collect();
+    let truncated = total.saturating_sub(max_items);
+    let processed = &items[..total.min(max_items)];
 
-    // Batch through the protocol cap; slot order is preserved.
+    // Build feature texts, routing BLANK renders (empty string item, or
+    // a template whose placeholders all resolved empty) straight to the
+    // abstain lane — the host rejects any batch containing a blank
+    // input, so one degenerate item must not poison its whole chunk.
+    let mut features: Vec<String> = Vec::with_capacity(processed.len());
+    let mut feature_idx: Vec<usize> = Vec::with_capacity(processed.len());
+    let mut abstained_idx: Vec<usize> = Vec::new();
+    for (idx, item) in processed.iter().enumerate() {
+        let text = feature_text(item, config.feature_template.as_deref());
+        if text.trim().is_empty() {
+            abstained_idx.push(idx);
+        } else {
+            features.push(text);
+            feature_idx.push(idx);
+        }
+    }
+
+    // Batch through the protocol cap; slot order is preserved within
+    // the non-blank subset and mapped back via feature_idx.
     let mut slots = Vec::with_capacity(features.len());
     let mut model_version: i32 = 0;
     let mut backend = String::new();
+    let mut versions_seen: Vec<i32> = Vec::new();
     for chunk in features.chunks(RPC_BATCH) {
         let reply = predict_batch(model_name, chunk)
             .map_err(|e| model_error_message(e, model_name))?;
@@ -189,39 +208,53 @@ pub fn run(input: String) -> Result<String, String> {
         }
         model_version = reply.model_version;
         backend = reply.backend;
+        if !versions_seen.contains(&model_version) {
+            versions_seen.push(model_version);
+        }
         slots.extend(reply.predictions);
     }
 
+    // Reassemble a predictions array parallel to the ORIGINAL items
+    // (nulls for blanks, sub-threshold, and truncated tail) so
+    // downstream index-joins stay correct.
     let threshold = config.confidence_threshold.unwrap_or(0.0);
-    let mut abstained_idx = Vec::new();
-    let predictions: Vec<serde_json::Value> = slots
-        .into_iter()
-        .enumerate()
-        .map(|(idx, slot)| match slot {
-            Some(p) if p.confidence >= threshold => serde_json::json!({
-                "idx": idx,
-                "label": p.label,
-                "confidence": p.confidence,
-            }),
+    let mut predictions: Vec<serde_json::Value> = vec![serde_json::Value::Null; total];
+    for (slot, &idx) in slots.into_iter().zip(feature_idx.iter()) {
+        match slot {
+            Some(p) if p.confidence >= threshold => {
+                predictions[idx] = serde_json::json!({
+                    "idx": idx,
+                    "label": p.label,
+                    "confidence": p.confidence,
+                });
+            }
             // Abstained (or below the calibrated threshold): the
             // caller's LLM fallback branch owns this item.
-            _ => {
-                abstained_idx.push(idx);
-                serde_json::Value::Null
-            }
-        })
-        .collect();
+            _ => abstained_idx.push(idx),
+        }
+    }
+    // Truncated tail items were never predicted — route them to the
+    // fallback lane too and say so, instead of silently dropping them.
+    abstained_idx.extend(max_items.min(total)..total);
+    abstained_idx.sort_unstable();
 
     let predicted = predictions.iter().filter(|p| !p.is_null()).count();
     let abstained = abstained_idx.len();
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "predictions": predictions,
         "abstained_idx": abstained_idx,
         "model_version": model_version,
         "backend": backend,
-        "total": items.len(),
+        "total": total,
         "predicted": predicted,
         "abstained": abstained,
-    })
-    .to_string())
+        "truncated": truncated,
+    });
+    // A promote landing mid-run means earlier chunks were served by a
+    // different version — surface it so threshold calibration isn't
+    // silently attributed to the wrong version's voting scheme.
+    if versions_seen.len() > 1 {
+        out["model_versions"] = serde_json::json!(versions_seen);
+    }
+    Ok(out.to_string())
 }

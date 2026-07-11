@@ -35,7 +35,7 @@
       "MAX_ITEMS": {
         "type": "number",
         "default": 200,
-        "description": "Cap on items processed per run (hard cap 512). Items are sent in batches of 32 per signed RPC; each item costs the controller one local embed + one ANN query, and a per-execution budget of 2000 inputs applies."
+        "description": "Cap on items processed per run (hard cap 512). Items beyond the cap are NOT silently dropped: they get null prediction slots, join abstained_idx (so the LLM-fallback branch still handles them), and are counted in the output's truncated field. Items are sent in batches of 32 per signed RPC; each item costs the controller one local embed + one ANN query, and a per-execution budget of 2000 inputs applies."
       }
     }
   }
