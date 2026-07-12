@@ -490,11 +490,6 @@ async fn handle_eval_model(
         Ok(v) => v,
         Err(m) => return mcp_error(req_id, -32602, &m),
     };
-    let k = args
-        .get("k")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(DEFAULT_KNN_K)
-        .clamp(1, 50);
     let holdout_fraction = args
         .get("holdout_fraction")
         .and_then(|v| v.as_f64())
@@ -508,6 +503,15 @@ async fn handle_eval_model(
     let Ok(Some(models)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
         return mcp_error(req_id, -32000, "Model not found");
     };
+    // Effective k: explicit arg > the MODEL's configured k > default. Using
+    // the model's own k (like the scheduled evaluator does) keeps the eval
+    // from certifying a different neighborhood than production serves.
+    let k = args
+        .get("k")
+        .and_then(|v| v.as_i64())
+        .or_else(|| models.config_json.get("k").and_then(|v| v.as_i64()))
+        .unwrap_or(DEFAULT_KNN_K)
+        .clamp(1, 50);
     let Some(dataset_id) = models.dataset_id else {
         return mcp_error(
             req_id,
@@ -595,7 +599,7 @@ async fn handle_eval_model(
                 "selected_backend": winner_backend,
                 "backend_comparison": comparison,
                 "report": metrics.get("report"),
-                "next_step": "the eval scored every backend on one holdout and picked the highest macro-F1; judge report.coverage_curve + report.gold, then ml_promote_model when the policy clears",
+                "next_step": "the eval scored every backend on one holdout and picked the highest macro-recall (balanced accuracy, aligned with the policy's per-class recall floors); judge report.coverage_curve + report.gold, then ml_promote_model when the policy clears",
             }))
             .unwrap_or_default(),
         ),

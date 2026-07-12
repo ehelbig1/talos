@@ -283,13 +283,17 @@ impl ModelRegistry {
         let Some((Some(bytes), sha)) = row else {
             return Ok(None);
         };
-        if let Some(expected) = sha {
-            let actual = talos_text_util::sha256_hex_bytes(&bytes);
-            anyhow::ensure!(
-                actual == expected,
-                "version artifact sha256 mismatch — refusing to load a corrupted model"
-            );
-        }
+        // Fail CLOSED: an artifact must carry its digest. `create_version`
+        // always writes both, so a present artifact with a NULL sha256 is a
+        // partial/hand-written row — refuse the unverified bytes rather than
+        // loading them into the live serving path.
+        let expected =
+            sha.context("artifact present but no sha256 digest — refusing unverified bytes")?;
+        let actual = talos_text_util::sha256_hex_bytes(&bytes);
+        anyhow::ensure!(
+            actual == expected,
+            "version artifact sha256 mismatch — refusing to load a corrupted model"
+        );
         Ok(Some(bytes))
     }
 

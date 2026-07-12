@@ -207,13 +207,24 @@ pub fn stratified_holdout(
     holdout
 }
 
-/// Macro-averaged F1 (unweighted mean over the classes present) — reported
-/// alongside the selection score for transparency.
+/// Macro-averaged F1, over the classes actually PRESENT in the holdout
+/// truth (support > 0) — reported alongside the selection score for
+/// transparency. Excluding `support == 0` classes matters: a backend that
+/// predicts a label absent from the holdout truth (e.g. a rare class kept
+/// wholly in train by the min-class rule) would otherwise add a phantom
+/// recall-0 class that unfairly deflates exactly the diverse-predicting
+/// backend. Standard macro averaging is over y_true classes only.
 pub fn macro_f1(report: &EvalReport) -> f64 {
-    if report.per_class.is_empty() {
+    let scored: Vec<f64> = report
+        .per_class
+        .values()
+        .filter(|m| m.support > 0)
+        .map(|m| m.f1)
+        .collect();
+    if scored.is_empty() {
         return 0.0;
     }
-    report.per_class.values().map(|m| m.f1).sum::<f64>() / report.per_class.len() as f64
+    scored.iter().sum::<f64>() / scored.len() as f64
 }
 
 /// Macro-averaged recall (a.k.a. balanced accuracy) — the unweighted mean
@@ -225,10 +236,20 @@ pub fn macro_f1(report: &EvalReport) -> f64 {
 /// macro-F1 (~0.83), but linear wins macro-recall clearly (~0.89 vs ~0.84)
 /// precisely because it recovers the minority class knn abandons.
 pub fn macro_recall(report: &EvalReport) -> f64 {
-    if report.per_class.is_empty() {
+    // Over the classes PRESENT in the holdout truth (support > 0) only — a
+    // predicted-only phantom class (support 0, recall 0) would otherwise
+    // deflate the score of the very backend that predicts more diverse
+    // labels. See [`macro_f1`].
+    let scored: Vec<f64> = report
+        .per_class
+        .values()
+        .filter(|m| m.support > 0)
+        .map(|m| m.recall)
+        .collect();
+    if scored.is_empty() {
         return 0.0;
     }
-    report.per_class.values().map(|m| m.recall).sum::<f64>() / report.per_class.len() as f64
+    scored.iter().sum::<f64>() / scored.len() as f64
 }
 
 /// Build the full report (overall + coverage curve + gold subset) from a
@@ -560,6 +581,22 @@ mod tests {
     #[test]
     fn desynced_slices_error_instead_of_panicking() {
         assert!(evaluate_predictions(&[s("a")], &[]).is_err());
+    }
+
+    #[test]
+    fn macro_metrics_exclude_predicted_only_phantom_classes() {
+        // Holdout truth is all class "a"; a backend predicts "b" on one row.
+        // "b" is a phantom (support 0 — never a truth) and must NOT drag the
+        // macro scores down, or it would penalize the diverse-predicting
+        // backend the selector is meant to favor.
+        let truths = vec![s("a"), s("a"), s("a")];
+        let preds = vec![Some(s("a")), Some(s("a")), Some(s("b"))];
+        let r = evaluate_predictions(&truths, &preds).unwrap();
+        assert_eq!(r.per_class["a"].support, 3);
+        assert_eq!(r.per_class["b"].support, 0, "b is predicted-only");
+        // Macro over support>0 = just 'a' (recall 2/3), NOT (2/3 + 0)/2.
+        assert!((macro_recall(&r) - 2.0 / 3.0).abs() < 1e-9);
+        assert!((macro_f1(&r) - r.per_class["a"].f1).abs() < 1e-9);
     }
 
     #[test]
