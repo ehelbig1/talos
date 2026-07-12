@@ -508,6 +508,17 @@ async fn main() -> anyhow::Result<()> {
         )),
         bg_shutdown_rx.clone(),
     );
+    // RFC 0011 P2d: disagreement-digest delivery — surfaces pending
+    // fast-vs-LLM divergences to each model's configured digest actor so
+    // the human-in-the-loop corrections the promotion policy requires
+    // actually get made.
+    talos_ml::spawn_disagreement_digest(
+        db_pool.clone(),
+        std::sync::Arc::new(talos_ml::LifecycleService::new(
+            core.secrets_manager.clone(),
+        )),
+        bg_shutdown_rx.clone(),
+    );
 
     // Embedding backfill, readiness recomputation, SLA degradation alerting.
     spawn_analytics_tasks(db_pool.clone(), bg_shutdown_rx.clone());
