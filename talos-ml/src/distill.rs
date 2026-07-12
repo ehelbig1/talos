@@ -62,6 +62,16 @@ pub struct DistillContext {
 
 pub static DISTILL_CONTEXT: OnceLock<DistillContext> = OnceLock::new();
 
+/// Concurrency bound on in-flight distill flows (review 2026-07-11):
+/// guest output triggers the spawn, and each flow costs embeds + a knn
+/// batch + AEAD round-trips — without a bound, a loop node emitting
+/// envelopes per iteration is a guest-triggerable amplification DoS.
+/// Saturation SHEDS (WARN + drop): distillation is best-effort
+/// observation, and shedding under pressure is strictly safer than an
+/// unbounded queue of parked tasks.
+const MAX_CONCURRENT_DISTILL_FLOWS: usize = 4;
+static DISTILL_PERMITS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
 #[derive(Debug, serde::Deserialize)]
 struct DistillEnvelope {
     model: String,
@@ -163,8 +173,20 @@ pub fn spawn_distill_from_output(actor_id: Option<Uuid>, output: &serde_json::Va
         );
         return;
     };
+    let permits = DISTILL_PERMITS.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DISTILL_FLOWS))
+    });
+    let Ok(permit) = permits.clone().try_acquire_owned() else {
+        tracing::warn!(
+            model,
+            cap = MAX_CONCURRENT_DISTILL_FLOWS,
+            "__ml_distill__ shed: concurrent distill flows saturated"
+        );
+        return;
+    };
     // Fire-and-forget: the hot path ends here.
     tokio::spawn(async move {
+        let _permit = permit;
         if let Err(e) = process_distill(ctx, actor_id, &model, items).await {
             tracing::warn!(
                 target: "talos_ml",
@@ -219,39 +241,22 @@ async fn process_distill(
     }
     tx.commit().await.context("commit distill resolve tx")?;
 
-    // 1. Auto-append (ALL states): prepare (embed+encrypt, NO conn
-    // held) → short write tx. DatasetService is the only writer, so
-    // encryption/embedding/growth-cap all apply.
-    let append: Vec<AppendExample> = items
-        .iter()
-        .map(|i| AppendExample {
-            features_text: i.features_text.clone(),
-            label: i.label.clone(),
-            source: ExampleSource::LlmProduction,
-            example_key: i.example_key.clone(),
-        })
-        .collect();
-    let prepared = ctx
-        .dataset_service
-        .prepare_examples(dataset_id, tenancy, append)
-        .await
-        .context("prepare distill examples")?;
-    let mut tx = talos_db::begin_tenant_read_scoped(
-        &ctx.db_pool,
-        &talos_tenancy::TenantReadScope::new(user_id, Vec::new()),
-    )
-    .await
-    .context("open distill write tx")?;
-    let stored = ctx
-        .dataset_service
-        .insert_prepared(&mut tx, dataset_id, tenancy, prepared)
-        .await
-        .context("insert distill examples")?;
-
-    // 2. Shadow (shadow/hybrid/fast_primary): predict the same items on
-    // the fast path and record agreement + divergences.
+    // 1. Shadow FIRST (shadow/hybrid/fast_primary): the fast path must
+    // predict these items BEFORE they enter the dataset — `knn_search`
+    // includes fresh (split-NULL) rows, so predicting after the append
+    // would find each item as its own nearest neighbor at similarity
+    // 1.0 carrying the LLM's label, structurally inflating shadow
+    // agreement (the one number the demote guard and the human trust).
+    // The doubled embedding cost is absorbed by the embedding LRU
+    // (prepare_examples re-embeds the same texts as cache hits).
     let mut shadow_recorded = 0usize;
     if state != LifecycleState::LlmOnly {
+        let mut tx = talos_db::begin_tenant_read_scoped(
+            &ctx.db_pool,
+            &talos_tenancy::TenantReadScope::new(user_id, Vec::new()),
+        )
+        .await
+        .context("open distill shadow tx")?;
         let inputs: Vec<String> = items.iter().map(|i| i.features_text.clone()).collect();
         match serve_predict_batch(&ctx.dataset_service, &mut tx, user_id, model_name, &inputs).await
         {
@@ -318,16 +323,46 @@ async fn process_distill(
             }
             Err(e) => {
                 // Shadow is best-effort observation — an unavailable
-                // fast path must not lose the append.
+                // fast path must not lose the append below.
                 tracing::warn!(
                     target: "talos_ml",
                     model = model_name,
                     error = ?e,
-                    "shadow predict failed; append still committed"
+                    "shadow predict failed; proceeding to append"
                 );
             }
         }
+        tx.commit().await.context("commit distill shadow tx")?;
     }
+
+    // 2. Auto-append (ALL states): prepare (embed+encrypt, NO conn
+    // held) → short write tx. DatasetService is the only writer, so
+    // encryption/embedding/growth-cap all apply.
+    let append: Vec<AppendExample> = items
+        .iter()
+        .map(|i| AppendExample {
+            features_text: i.features_text.clone(),
+            label: i.label.clone(),
+            source: ExampleSource::LlmProduction,
+            example_key: i.example_key.clone(),
+        })
+        .collect();
+    let prepared = ctx
+        .dataset_service
+        .prepare_examples(dataset_id, tenancy, append)
+        .await
+        .context("prepare distill examples")?;
+    let mut tx = talos_db::begin_tenant_read_scoped(
+        &ctx.db_pool,
+        &talos_tenancy::TenantReadScope::new(user_id, Vec::new()),
+    )
+    .await
+    .context("open distill write tx")?;
+    let stored = ctx
+        .dataset_service
+        .insert_prepared(&mut tx, dataset_id, tenancy, prepared)
+        .await
+        .context("insert distill examples")?;
     tx.commit().await.context("commit distill write tx")?;
 
     tracing::info!(

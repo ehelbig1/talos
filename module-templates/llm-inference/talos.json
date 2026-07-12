@@ -112,11 +112,15 @@
       },
       "DISTILL_MODEL": {
         "type": "string",
-        "description": "RFC 0011 distillation opt-in: the registered ml_models NAME to distill this node's answers into. When set, the output carries an __ml_distill__ envelope; the engine hook auto-appends {input → answer} as source='llm_production' to the model's dataset (encrypted, locally embedded, growth-capped) and — once the model is in shadow or beyond — runs the fast backend alongside for agreement accounting. Single-example semantics: the LLM's whole (trimmed) answer is the label, so use this on classify-style nodes whose output is one class name. Requires an actor-bound workflow (the actor resolves dataset tenancy). Supports {{...}} interpolation."
+        "description": "RFC 0011 distillation opt-in: the registered ml_models NAME to distill this node's answers into. When set, the output carries an __ml_distill__ envelope; the engine hook auto-appends {input → answer} as source='llm_production' to the model's dataset (encrypted, locally embedded, growth-capped) and — once the model is in shadow or beyond — runs the fast backend alongside for agreement accounting. Single-example semantics: the LLM's whole (trimmed) answer is the label, so use this on classify-style nodes whose output is one class name. Requires an actor-bound workflow (the actor resolves dataset tenancy). Supports {{...}} interpolation. In JSON mode you MUST also set DISTILL_LABEL_KEY or nothing is distilled."
       },
       "DISTILL_EXAMPLE_KEY": {
         "type": "string",
         "description": "Dedupe key for the distilled example (e.g. '{{__trigger_input__.message_id}}') — same-key rows REPLACE earlier ones, and a later human correction with this key overrides the production label. Optional; supports {{...}} interpolation. Ignored unless DISTILL_MODEL is set."
+      },
+      "DISTILL_LABEL_KEY": {
+        "type": "string",
+        "description": "When the node runs in JSON mode (OUTPUT_SCHEMA / RESPONSE_FORMAT=json), the top-level key of the parsed answer whose STRING value is the class label to distill (e.g. 'category'). REQUIRED for JSON-mode distillation — without it the envelope is skipped entirely so near-unique JSON blobs can never poison the dataset's label space. Ignored unless DISTILL_MODEL is set."
       }
     }
   }

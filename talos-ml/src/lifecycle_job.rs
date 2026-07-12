@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::dataset::DatasetService;
 use crate::lifecycle::{
-    confidence_band, evaluate_policy, LifecycleService, LifecycleState, PolicyInputs, PolicyJson,
+    evaluate_policy, LifecycleService, LifecycleState, PolicyInputs, PolicyJson,
 };
 use crate::registry::ModelRegistry;
 use crate::serve::{invalidate_serving_cache, DEFAULT_KNN_K};
@@ -117,16 +117,19 @@ pub async fn run_policy_tick(
     dataset_service: &DatasetService,
     lifecycle_service: &LifecycleService,
 ) -> Result<usize> {
-    // Candidates: models with a non-empty policy and a dataset. The
-    // drift guard applies every tick; the eval leg is gated per model
-    // on dataset change (skip-if-unchanged).
+    // Candidates: models with a non-empty policy and a dataset,
+    // LEAST-recently-VISITED first (review 2026-07-11: ordering by
+    // dataset heat let 25 hot DISTILL datasets permanently starve every
+    // other model from its drift check). `last_policy_eval_at` is
+    // stamped on EVERY completed visit — including drift-only and
+    // skip-unchanged visits — so the LIMIT window rotates fairly.
     let rows = sqlx::query(
         "SELECT m.id, m.user_id, m.org_id, m.name, m.dataset_id, m.lifecycle_state, \
                 m.policy_json, m.config_json, m.last_policy_eval_at, \
                 d.updated_at AS dataset_updated_at \
          FROM ml_models m JOIN ml_datasets d ON d.id = m.dataset_id \
          WHERE m.policy_json <> '{}'::jsonb \
-         ORDER BY d.updated_at DESC LIMIT $1",
+         ORDER BY m.last_policy_eval_at ASC NULLS FIRST, m.id LIMIT $1",
     )
     .bind(MODELS_PER_TICK)
     .fetch_all(pool)
@@ -197,6 +200,13 @@ async fn evaluate_one_model(
     if !locked {
         return Ok(false);
     }
+    // Visit stamp FIRST, on the POOL (autocommit, not this tx): it must
+    // survive an eval that aborts the tx (review 2026-07-11: stamping
+    // on the same tx after a SQL-level eval failure hits "current
+    // transaction is aborted", losing the stamp and hot-looping the
+    // full eval every tick). The stamp doubles as the rotation cursor;
+    // the eval-decision below uses the PRE-visit value from the scan.
+    stamp_last_eval_pool(pool, model_id).await;
 
     // ── Drift guard (fail-safe demote) ──────────────────────────────
     if matches!(state, LifecycleState::Hybrid | LifecycleState::FastPrimary) {
@@ -205,8 +215,14 @@ async fn evaluate_one_model(
             let serving_threshold = config_json
                 .get("confidence_threshold")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as f32;
-            let min_band = confidence_band(Some(serving_threshold));
+                .unwrap_or(0.0);
+            // Bands are tenths; CEIL the threshold to a band boundary
+            // so the drift pool is a SUBSET of what production actually
+            // serves — flooring would dilute the signal with
+            // sub-threshold predictions users never see (review
+            // 2026-07-11). 0.75 → band 8 ([0.8, ...)); a clean tenth
+            // maps to its own band.
+            let min_band = ((serving_threshold.clamp(0.0, 1.0) * 10.0).ceil() as i16).min(10);
             if let Some((agreement, total)) = lifecycle_service
                 .shadow_agreement(&mut tx, model_id, min_band)
                 .await?
@@ -247,12 +263,29 @@ async fn evaluate_one_model(
         }
     }
 
-    // ── Policy re-eval — only on dataset change ─────────────────────
-    if state == LifecycleState::FastPrimary
-        || last_eval.map(|t| dataset_updated <= t).unwrap_or(false)
-    {
+    // ── Policy re-eval — only on dataset change, debounced ──────────
+    // fast_primary is governed by the drift guard alone (RFC: LLM only
+    // runs on fallback there; re-eval resumes if it demotes). The
+    // debounce bounds eval churn for actively-distilling models: the
+    // DISTILL hook touches ml_datasets.updated_at on every production
+    // call, and each eval rewrites every row's split + scans the whole
+    // holdout — once per ML_POLICY_EVAL_MIN_INTERVAL_SECS (default 1 h)
+    // is governance-fresh without the per-tick full-dataset churn.
+    let now = chrono::Utc::now();
+    let min_eval_interval = chrono::Duration::seconds(
+        std::env::var("ML_POLICY_EVAL_MIN_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(3600),
+    );
+    let unchanged = last_eval.map(|t| dataset_updated <= t).unwrap_or(false);
+    let debounced = last_eval
+        .map(|t| now - t < min_eval_interval)
+        .unwrap_or(false);
+    if state == LifecycleState::FastPrimary || unchanged || debounced {
         tx.commit().await.ok();
-        return Ok(false);
+        return Ok(true);
     }
 
     let k = config_json
@@ -271,11 +304,11 @@ async fn evaluate_one_model(
     {
         Ok(r) => r,
         Err(e) => {
-            // Not enough data / embedder down: stamp the attempt so
-            // we don't hot-loop on the same broken dataset, then
-            // surface. NEVER advances (fail-safe).
-            stamp_last_eval(&mut tx, model_id).await?;
-            tx.commit().await?;
+            // Not enough data / embedder down / SQL failure. The visit
+            // stamp already landed on the pool (pre-eval), so a
+            // possibly-poisoned tx here can't hot-loop the model —
+            // drop it and surface. NEVER advances (fail-safe).
+            drop(tx);
             tracing::info!(%model_id, error = %e, "policy eval not runnable yet");
             return Ok(true);
         }
@@ -319,7 +352,6 @@ async fn evaluate_one_model(
     )
     .await
     .context("record evaluator version")?;
-    stamp_last_eval(&mut tx, model_id).await?;
 
     let next = state.next();
     if decision.satisfied && policy.auto_advance {
@@ -328,8 +360,23 @@ async fn evaluate_one_model(
             let swapped = lifecycle_service
                 .transition(&mut tx, model_id, user_id, state, to)
                 .await?;
+            if !swapped {
+                // Lost the CAS to a concurrent manual command: roll the
+                // WHOLE tx back (promote included) — promote+advance is
+                // one atomic decision, and committing half of it would
+                // silently swap production_version_id under whatever
+                // state the operator just chose (review 2026-07-11).
+                // The eval version is re-recorded on the next visit.
+                drop(tx);
+                tracing::warn!(
+                    target: "talos_ml",
+                    %model_id,
+                    "auto-advance lost the state CAS; promote rolled back"
+                );
+                return Ok(true);
+            }
             tx.commit().await?;
-            if swapped {
+            {
                 invalidate_serving_cache(user_id, &name);
                 audit_transition(
                     pool,
@@ -384,11 +431,15 @@ async fn evaluate_one_model(
     Ok(true)
 }
 
-async fn stamp_last_eval(conn: &mut sqlx::PgConnection, model_id: Uuid) -> Result<()> {
-    sqlx::query("UPDATE ml_models SET last_policy_eval_at = NOW() WHERE id = $1")
+/// Visit stamp on the pool (autocommit): rotation cursor + hot-loop
+/// guard. Failure is non-fatal (WARN) — worst case the model is
+/// revisited next tick.
+async fn stamp_last_eval_pool(pool: &PgPool, model_id: Uuid) {
+    if let Err(e) = sqlx::query("UPDATE ml_models SET last_policy_eval_at = NOW() WHERE id = $1")
         .bind(model_id)
-        .execute(conn)
+        .execute(pool)
         .await
-        .context("stamp last_policy_eval_at")?;
-    Ok(())
+    {
+        tracing::warn!(%model_id, error = %e, "failed to stamp last_policy_eval_at");
+    }
 }

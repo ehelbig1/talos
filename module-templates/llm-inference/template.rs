@@ -129,6 +129,11 @@ fn run(input: String) -> Result<String, String> {
         .as_deref()
         .filter(|k| !k.is_empty())
         .map(|k| interpolate_raw(k, &interp_ctx));
+    let distill_label_key = config
+        .distill_label_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .map(str::to_string);
     let memory_write_metadata_kind = config
         .memory_write_metadata_kind
         .as_deref()
@@ -477,14 +482,34 @@ fn run(input: String) -> Result<String, String> {
     // the answer IS the label, so this fits classify-style nodes whose
     // output is one class name; batch classifiers emit the envelope
     // themselves from their own module code.
-    let distill_envelope = distill_model.as_ref().map(|model| {
-        serde_json::json!({
+    // Label derivation guards against dataset poisoning (review
+    // 2026-07-11): under JSON mode the raw answer is a near-unique JSON
+    // blob — one "class" per example, destroying the balanced-vote
+    // priors and every per-class policy gate. With DISTILL_LABEL_KEY
+    // the label is that key's string value from the parsed answer;
+    // without it, JSON mode SKIPS the envelope entirely rather than
+    // poisoning the dataset. Plain-text mode uses the trimmed answer.
+    let distill_label: Option<String> = if distill_model.is_some() {
+        match (&distill_label_key, want_json) {
+            (Some(key), _) => serde_json::from_str::<serde_json::Value>(&content_str)
+                .ok()
+                .and_then(|v| v.get(key).and_then(|l| l.as_str().map(str::to_string)))
+                .filter(|l| !l.trim().is_empty()),
+            (None, true) => None,
+            (None, false) => Some(content_str.trim().to_string()).filter(|l| !l.is_empty()),
+        }
+    } else {
+        None
+    };
+    let distill_envelope = match (&distill_model, distill_label) {
+        (Some(model), Some(label)) => Some(serde_json::json!({
             "model": model,
             "features_text": distill_features,
-            "label": content_str.trim(),
+            "label": label,
             "example_key": distill_example_key,
-        })
-    });
+        })),
+        _ => None,
+    };
 
     if memory_write_key.is_some() || distill_envelope.is_some() {
         let mut wrapped = serde_json::json!({ "content": content_str });
@@ -563,6 +588,8 @@ struct Config {
     distill_model: Option<String>,
     #[serde(rename = "DISTILL_EXAMPLE_KEY")]
     distill_example_key: Option<String>,
+    #[serde(rename = "DISTILL_LABEL_KEY")]
+    distill_label_key: Option<String>,
     #[serde(rename = "OUTPUT_SCHEMA")]
     output_schema: Option<StringOrList>,
     #[serde(rename = "SYSTEM_PROMPT")]
