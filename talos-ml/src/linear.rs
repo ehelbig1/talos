@@ -126,10 +126,31 @@ pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
         .context("no rows to infer dimensionality")?;
     anyhow::ensure!(dims > 0, "embeddings have zero dimensionality");
 
-    // Stable class index (sorted → deterministic weight layout across runs).
+    // Normalize features + drop dim-mismatched rows FIRST, then derive the
+    // class set from the SURVIVORS. A class whose rows are ALL dropped by
+    // dim-filtering (embedder drift hitting exactly that class) must not
+    // linger in `n_classes` with count 0: that would make `weight_sum` fall
+    // below `n`, silently mis-scaling both the gradient-mean/L2 balance
+    // (which relies on `weight_sum == n`) and the balanced class weights.
+    let mut norm_rows: Vec<(Vec<f32>, &str)> = Vec::with_capacity(train.len());
+    for (x, label) in train {
+        if x.len() != dims {
+            continue;
+        }
+        let mut xn = x.clone();
+        l2_normalize(&mut xn);
+        norm_rows.push((xn, label.as_str()));
+    }
+    anyhow::ensure!(
+        !norm_rows.is_empty(),
+        "no usable rows after dimensionality filtering"
+    );
+
+    // Stable class index over the SURVIVING rows (sorted → deterministic
+    // weight layout; every class here has ≥1 row so counts are all > 0).
     let mut class_set: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for (_, label) in train {
-        class_set.insert(label.as_str());
+    for (_, label) in &norm_rows {
+        class_set.insert(label);
     }
     let classes: Vec<String> = class_set.iter().map(|s| s.to_string()).collect();
     let class_idx: BTreeMap<&str, usize> = classes
@@ -143,30 +164,26 @@ pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
         "need at least 2 classes to fit a classifier"
     );
 
-    // Normalize features + drop dim-mismatched rows.
-    let mut xs: Vec<Vec<f32>> = Vec::with_capacity(train.len());
-    let mut ys: Vec<usize> = Vec::with_capacity(train.len());
+    let mut xs: Vec<Vec<f32>> = Vec::with_capacity(norm_rows.len());
+    let mut ys: Vec<usize> = Vec::with_capacity(norm_rows.len());
     let mut class_counts = vec![0usize; n_classes];
-    for (x, label) in train {
-        if x.len() != dims {
-            continue;
-        }
-        let mut xn = x.clone();
-        l2_normalize(&mut xn);
-        let ci = class_idx[label.as_str()];
+    for (xn, label) in norm_rows {
+        let ci = class_idx[label];
         class_counts[ci] += 1;
         xs.push(xn);
         ys.push(ci);
     }
     let n = xs.len();
-    anyhow::ensure!(n > 0, "no usable rows after dimensionality filtering");
 
     // Per-class sample weights: balanced = n / (n_classes * count_c) so a
-    // rare class's gradient contribution matches an abundant one's.
-    let class_weight: Vec<f32> = (0..n_classes)
-        .map(|c| {
-            if opts.balanced && class_counts[c] > 0 {
-                n as f32 / (n_classes as f32 * class_counts[c] as f32)
+    // rare class's gradient contribution matches an abundant one's. Every
+    // count is > 0 (classes derive from survivors), so `weight_sum == n`
+    // exactly — keeping the mean-gradient and L2 terms on the same scale.
+    let class_weight: Vec<f32> = class_counts
+        .iter()
+        .map(|&count| {
+            if opts.balanced && count > 0 {
+                n as f32 / (n_classes as f32 * count as f32)
             } else {
                 1.0
             }
@@ -178,13 +195,15 @@ pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
     let mut bias = vec![0.0f32; n_classes];
     let mut grad_w = vec![0.0f32; n_classes * dims];
     let mut grad_b = vec![0.0f32; n_classes];
+    // Reused across every sample/epoch (fully overwritten each pass) — avoids
+    // ~epochs×n heap allocations of a tiny Vec on the eval hot path.
+    let mut probs = vec![0.0f32; n_classes];
 
     for _ in 0..opts.epochs {
         grad_w.iter_mut().for_each(|g| *g = 0.0);
         grad_b.iter_mut().for_each(|g| *g = 0.0);
         for (x, &y) in xs.iter().zip(ys.iter()) {
-            // logits = W·x + b, then softmax.
-            let mut probs = vec![0.0f32; n_classes];
+            // logits = W·x + b, then softmax (probs overwritten in full).
             for (c, prob) in probs.iter_mut().enumerate() {
                 let row = &weights[c * dims..(c + 1) * dims];
                 *prob = bias[c] + row.iter().zip(x.iter()).map(|(w, xi)| w * xi).sum::<f32>();
@@ -263,6 +282,12 @@ impl LinearModel {
             model.version
         );
         anyhow::ensure!(
+            model.dims > 0 && model.classes.len() >= 2,
+            "degenerate linear artifact (dims={}, classes={})",
+            model.dims,
+            model.classes.len()
+        );
+        anyhow::ensure!(
             model.weights.len() == model.classes.len() * model.dims
                 && model.bias.len() == model.classes.len(),
             "linear artifact shape mismatch"
@@ -317,6 +342,29 @@ mod tests {
         assert_eq!(
             p.label, "minor",
             "balanced weighting lost the minority class"
+        );
+    }
+
+    #[test]
+    fn class_emptied_by_dim_filter_is_dropped() {
+        // "c"'s rows are all the WRONG dimensionality (3 vs the modal 2), so
+        // they're filtered out — the fit must drop "c" entirely rather than
+        // carry a count-0 class (which would push weight_sum below n and
+        // mis-scale the L2/gradient balance + the balanced weights).
+        let train = vec![
+            (vec![1.0, 0.0], "a".to_string()),
+            (vec![1.0, 0.1], "a".to_string()),
+            (vec![0.0, 1.0], "b".to_string()),
+            (vec![0.1, 1.0], "b".to_string()),
+            (vec![0.0, 0.0, 1.0], "c".to_string()),
+            (vec![0.0, 0.1, 1.0], "c".to_string()),
+        ];
+        let model = fit(&train, FitOpts::default()).unwrap();
+        assert_eq!(model.dims, 2);
+        assert_eq!(
+            model.classes,
+            vec!["a".to_string(), "b".to_string()],
+            "the dim-mismatched class must be dropped, not carried empty"
         );
     }
 

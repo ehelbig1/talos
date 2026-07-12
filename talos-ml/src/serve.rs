@@ -147,9 +147,16 @@ async fn load_linear_model(
         crate::linear::LinearModel::open(&bytes).map_err(ServeError::Internal)?,
     );
     let mut cache = LINEAR_CACHE.write().unwrap_or_else(|p| p.into_inner());
-    // Soft cap: once full, serve from the fresh parse without caching
-    // (rare — distinct promoted versions per process is tiny).
-    if cache.len() < LINEAR_CACHE_MAX {
+    if !cache.contains_key(&version_id) {
+        // Bounded: at cap, evict an arbitrary entry so the cache keeps
+        // WORKING under version churn instead of silently ceasing to cache
+        // (artifacts are immutable + cheaply re-loadable, so which entry we
+        // drop can't affect correctness — only which one re-parses next).
+        if cache.len() >= LINEAR_CACHE_MAX {
+            if let Some(evict) = cache.keys().next().copied() {
+                cache.remove(&evict);
+            }
+        }
         cache.insert(version_id, model.clone());
     }
     Ok(model)
@@ -335,7 +342,28 @@ pub async fn serve_predict_batch(
         // Parametric: one W·x+b + softmax per input, NO DB round-trip.
         // `predict()` dim-checks internally (abstain on drift); a
         // below-threshold softmax abstains → LLM fallback.
-        let model = load_linear_model(&mut *conn, cfg.version_id).await?;
+        let model = match load_linear_model(&mut *conn, cfg.version_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                // A promoted parametric version with a missing / corrupt /
+                // unverifiable artifact can't answer — ABSTAIN on every slot
+                // (→ LLM fallback), matching knn's empty-dataset path rather
+                // than hard-failing the batch for a consumer that doesn't
+                // catch the RPC error. Logged (not silent) so the corruption
+                // is visible.
+                tracing::error!(
+                    target: "talos_ml",
+                    version_id = %cfg.version_id,
+                    error = ?e,
+                    "parametric artifact unavailable; abstaining to LLM"
+                );
+                return Ok(ServeReply {
+                    predictions: inputs.iter().map(|_| None).collect(),
+                    model_version: cfg.version,
+                    backend: cfg.backend,
+                });
+            }
+        };
         embeddings
             .iter()
             .map(|embedding| {
