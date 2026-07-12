@@ -266,6 +266,33 @@ impl ModelRegistry {
             .collect()
     }
 
+    /// Load a version's artifact bytes (parametric backends only),
+    /// verifying the stored sha256 — a corrupted or tampered artifact must
+    /// never be loaded into a live serving path. `None` = no artifact
+    /// (e.g. a lazy knn version) or the version doesn't exist.
+    pub async fn get_version_artifact(
+        conn: &mut PgConnection,
+        version_id: Uuid,
+    ) -> Result<Option<Vec<u8>>> {
+        let row: Option<(Option<Vec<u8>>, Option<String>)> =
+            sqlx::query_as("SELECT artifact, artifact_sha256 FROM ml_model_versions WHERE id = $1")
+                .bind(version_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .context("load version artifact")?;
+        let Some((Some(bytes), sha)) = row else {
+            return Ok(None);
+        };
+        if let Some(expected) = sha {
+            let actual = talos_text_util::sha256_hex_bytes(&bytes);
+            anyhow::ensure!(
+                actual == expected,
+                "version artifact sha256 mismatch — refusing to load a corrupted model"
+            );
+        }
+        Ok(Some(bytes))
+    }
+
     /// All versions of one model, newest first (the model card's history).
     pub async fn list_versions(
         conn: &mut PgConnection,

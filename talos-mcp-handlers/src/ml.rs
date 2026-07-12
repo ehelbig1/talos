@@ -521,28 +521,63 @@ async fn handle_eval_model(
     // Split + score + record inside ONE tx: the advisory lock taken by
     // run_knn_eval holds until commit, so a concurrent eval can't thrash
     // this run's holdout mid-scoring.
-    let report = match talos_ml::run_knn_eval(&svc, &mut tx, dataset_id, k, holdout_fraction).await
+    // Split ONCE, evaluate EVERY backend on it (knn + linear), and record
+    // the highest-macro-F1 winner as a version — all inside ONE tx (the
+    // advisory lock the selector takes holds until commit, so a concurrent
+    // eval can't thrash this run's split mid-scoring).
+    let candidates = match talos_ml::run_backend_selection_eval(
+        &svc,
+        &mut tx,
+        dataset_id,
+        k,
+        holdout_fraction,
+        talos_ml::FitOpts::default(),
+    )
+    .await
     {
-        Ok(r) => r,
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => return mcp_error(req_id, -32000, "eval produced no backend candidates"),
         Err(e) => return internal(req_id, "eval_model", &e),
     };
-    let metrics = serde_json::json!({
-        "backend": "knn-pgvector",
-        // Confidence semantics are voting-scheme-specific: thresholds
-        // calibrated under one scheme do not transfer. P1 versions 1-5
-        // predate this field (raw similarity-share voting).
-        "voting": "balanced-sqrt",
-        "k": k,
+    // Winner is first (selector sorts best-first). Clone what outlives the
+    // borrow so the version record + response can both reference it.
+    let winner_backend = candidates[0].backend;
+    let report = candidates[0].report.clone();
+    let artifact = candidates[0].artifact.clone();
+    let params = candidates[0].params.clone();
+    let comparison: Vec<Value> = candidates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "backend": c.backend,
+                "macro_recall": c.macro_recall,
+                "macro_f1": c.macro_f1,
+            })
+        })
+        .collect();
+
+    let mut metrics = serde_json::json!({
+        "backend": winner_backend,
         "holdout_fraction": holdout_fraction,
         "report": report,
+        "selected_backend": winner_backend,
+        "backend_comparison": comparison.clone(),
     });
+    // Fold in the winner's backend-specific hyperparameters (voting/k for
+    // knn, epochs/l2/balanced for linear) so the card records exactly what
+    // produced the artifact.
+    if let (Some(obj), Some(p)) = (metrics.as_object_mut(), params.as_object()) {
+        for (kk, vv) in p {
+            obj.insert(kk.clone(), vv.clone());
+        }
+    }
     let version = match ModelRegistry::create_version(
         &mut tx,
         model_id,
         user_id,
         None,
-        "knn-pgvector",
-        None,
+        winner_backend,
+        artifact.as_deref(),
         &metrics,
     )
     .await
@@ -557,8 +592,10 @@ async fn handle_eval_model(
                 "model_id": model_id.to_string(),
                 "version_id": version.id.to_string(),
                 "version": version.version,
-                "report": report,
-                "next_step": "judge by report.coverage_curve (fast-path accuracy at the serving threshold) and report.gold (human-truth subset) — overall accuracy is teacher-agreement only; ml_promote_model when the policy clears",
+                "selected_backend": winner_backend,
+                "backend_comparison": comparison,
+                "report": metrics.get("report"),
+                "next_step": "the eval scored every backend on one holdout and picked the highest macro-F1; judge report.coverage_curve + report.gold, then ml_promote_model when the policy clears",
             }))
             .unwrap_or_default(),
         ),
@@ -714,65 +751,54 @@ async fn handle_predict(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "predict", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
-        return mcp_error(req_id, -32000, "Model not found");
-    };
-    let Some(promoted) = &model.promoted_version else {
-        return mcp_error(
+    // Route through the shared serving path (ServingMode::Raw = predict
+    // unconditionally, backend-agnostic) so this sanity check reflects
+    // EXACTLY what production serving returns for whichever backend is
+    // promoted — knn OR linear.
+    let inputs = [text.to_string()];
+    match talos_ml::serve_predict_batch(
+        &svc,
+        &mut tx,
+        user_id,
+        name,
+        &inputs,
+        talos_ml::ServingMode::Raw,
+    )
+    .await
+    {
+        Ok(reply) => match reply.predictions.into_iter().next().flatten() {
+            Some(p) => mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "model": name,
+                    "version": reply.model_version,
+                    "backend": reply.backend,
+                    "prediction": { "label": p.label, "confidence": p.confidence },
+                }))
+                .unwrap_or_default(),
+            ),
+            None => mcp_text(
+                req_id,
+                &serde_json::json!({
+                    "model": name,
+                    "abstained": true,
+                    "note": "degenerate neighborhood, below-threshold vote, or embedding unavailable — production callers fall back to the LLM here",
+                })
+                .to_string(),
+            ),
+        },
+        Err(talos_ml::ServeError::NotFound) => mcp_error(req_id, -32000, "Model not found"),
+        Err(talos_ml::ServeError::NotPromoted) => mcp_error(
             req_id,
             -32000,
             "Model has no promoted version — run ml_eval_model + ml_promote_model first",
-        );
-    };
-    if promoted.backend != "knn-pgvector" {
-        return mcp_error(
+        ),
+        Err(talos_ml::ServeError::NotAvailable) => mcp_error(
             req_id,
             -32000,
-            &format!(
-                "backend '{}' is not servable in P1 (knn-pgvector only)",
-                promoted.backend
-            ),
-        );
-    }
-    // Loud, distinct failure for a dataset-less lazy backend (the RFC's
-    // deletion-lifecycle contract), never a silent abstain.
-    let Some(dataset_id) = model.dataset_id else {
-        return mcp_error(
-            req_id,
-            -32000,
-            "Model's dataset is gone — knn backend not available",
-        );
-    };
-    if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
-        return mcp_error(req_id, -32000, &m);
-    }
-    let k = model
-        .config_json
-        .get("k")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(DEFAULT_KNN_K)
-        .clamp(1, 50);
-    match svc.knn_predict_text(&mut tx, dataset_id, text, k).await {
-        Ok(Some(pred)) => mcp_text(
-            req_id,
-            &serde_json::to_string_pretty(&serde_json::json!({
-                "model": name,
-                "version": promoted.version,
-                "backend": "knn-pgvector",
-                "prediction": pred,
-            }))
-            .unwrap_or_default(),
+            "Model's backend or dataset is not available for serving",
         ),
-        Ok(None) => mcp_text(
-            req_id,
-            &serde_json::json!({
-                "model": name,
-                "abstained": true,
-                "note": "empty/degenerate neighborhood or embedding unavailable — production callers fall back to the LLM here",
-            })
-            .to_string(),
-        ),
-        Err(e) => internal(req_id, "predict", &e),
+        Err(talos_ml::ServeError::Internal(e)) => internal(req_id, "predict", &e),
     }
 }
 

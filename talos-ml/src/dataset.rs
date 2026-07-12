@@ -553,6 +553,34 @@ impl DatasetService {
         .await?)
     }
 
+    /// Train-split embeddings + labels for fitting a parametric backend.
+    /// Skips decryption (only the vector + label are needed) and rows with
+    /// no stored embedding (a parametric model can't use them — they'd
+    /// have abstained under knn too). Mirrors `knn_search(train_only)`'s
+    /// exclusion of the holdout so the fit never sees eval rows.
+    pub async fn load_train_embeddings(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+    ) -> Result<Vec<(Vec<f32>, String)>> {
+        let rows: Vec<(Option<pgvector::Vector>, Option<String>)> = sqlx::query_as(
+            "SELECT embedding, label_json->>'label' FROM ml_examples \
+             WHERE dataset_id = $1 AND split = 'train' \
+               AND embedding IS NOT NULL AND label_json ? 'label'",
+        )
+        .bind(dataset_id)
+        .fetch_all(&mut *conn)
+        .await
+        .context("load train embeddings")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(emb, label)| match (emb, label) {
+                (Some(v), Some(l)) => Some((v.to_vec(), l)),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Dataset-level label frequencies (classification rows only) — the
     /// class priors for balanced voting. One indexed grouped count.
     pub async fn class_counts(

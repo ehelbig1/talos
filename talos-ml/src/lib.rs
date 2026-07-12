@@ -22,6 +22,7 @@ pub mod eval;
 pub mod knn;
 pub mod lifecycle;
 pub mod lifecycle_job;
+pub mod linear;
 pub mod registry;
 pub mod serve;
 
@@ -33,8 +34,9 @@ pub use dataset::{
 pub use digest::{run_digest_tick, spawn_disagreement_digest};
 pub use distill::{spawn_distill_from_output, DistillContext, DISTILL_CONTEXT};
 pub use eval::{
-    coverage_curve, evaluate_predictions, run_knn_eval, stratified_holdout, ClassMetrics,
-    CoveragePoint, EvalReport, MIN_CLASS_FOR_HOLDOUT,
+    coverage_curve, evaluate_predictions, macro_f1, macro_recall, run_backend_selection_eval,
+    run_knn_eval, stratified_holdout, BackendCandidate, ClassMetrics, CoveragePoint, EvalReport,
+    MIN_CLASS_FOR_HOLDOUT,
 };
 pub use knn::{knn_vote, knn_vote_balanced, KnnPrediction, Neighbor};
 pub use lifecycle::{
@@ -42,6 +44,7 @@ pub use lifecycle::{
     LifecycleState, PolicyDecision, PolicyInputs, PolicyJson,
 };
 pub use lifecycle_job::{run_policy_tick, spawn_policy_evaluator};
+pub use linear::{FitOpts, LinearModel, LinearPrediction};
 pub use registry::{ModelRegistry, ModelReviewSummary, ModelVersionRow, ResolvedModel};
 pub use serve::{
     invalidate_serving_cache, serve_predict_batch, ServeError, ServeReply, ServedPrediction,
