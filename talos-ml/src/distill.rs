@@ -258,7 +258,15 @@ async fn process_distill(
         .await
         .context("open distill shadow tx")?;
         let inputs: Vec<String> = items.iter().map(|i| i.features_text.clone()).collect();
-        match serve_predict_batch(&ctx.dataset_service, &mut tx, user_id, model_name, &inputs).await
+        match serve_predict_batch(
+            &ctx.dataset_service,
+            &mut tx,
+            user_id,
+            model_name,
+            &inputs,
+            crate::serve::ServingMode::Raw,
+        )
+        .await
         {
             Ok(reply) => {
                 for (item, slot) in items.iter().zip(reply.predictions) {

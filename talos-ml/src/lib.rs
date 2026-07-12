@@ -41,4 +41,5 @@ pub use lifecycle_job::{run_policy_tick, spawn_policy_evaluator};
 pub use registry::{ModelRegistry, ModelVersionRow, ResolvedModel};
 pub use serve::{
     invalidate_serving_cache, serve_predict_batch, ServeError, ServeReply, ServedPrediction,
+    ServingMode,
 };

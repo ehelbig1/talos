@@ -237,6 +237,17 @@ async fn evaluate_one_model(
                         .await?
                     {
                         tx.commit().await?;
+                        // Drop THIS process's cached serving config so
+                        // the demoted state takes effect on the local RPC
+                        // path immediately rather than at the 15 s TTL —
+                        // the serving gate keys on the cached
+                        // lifecycle_state. Invalidation is process-local
+                        // (same as promote/advance); on other controller
+                        // replicas a drifted hybrid model can still serve
+                        // for up to the 15 s TTL after this demote. That
+                        // bound is acceptable for a fail-safe demote and
+                        // matches every other transition path.
+                        invalidate_serving_cache(user_id, &name);
                         audit_transition(
                             pool,
                             user_id,
