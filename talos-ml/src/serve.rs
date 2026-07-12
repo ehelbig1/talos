@@ -37,6 +37,13 @@ use crate::registry::ModelRegistry;
 /// certifies a different model than the one being served.
 pub const DEFAULT_KNN_K: i64 = 7;
 
+/// Confidence floor applied by the CONSUMER serving gate when a model's
+/// `config_json` doesn't set `confidence_threshold`. Non-zero on
+/// purpose: an unset threshold must NOT serve thin, low-confidence votes
+/// to production — those fall back to the LLM (safe default; an explicit
+/// `confidence_threshold: 0.0` opts out).
+pub const GATED_DEFAULT_THRESHOLD: f32 = 0.5;
+
 /// How long a resolved (user, model_name) → serving-config entry may be
 /// reused. Promotion invalidates same-process immediately (the MCP
 /// promote handler calls [`invalidate_serving_cache`]); the TTL bounds
@@ -51,13 +58,55 @@ const SERVING_CACHE_MAX: usize = 4096;
 /// a single-instance Ollama.
 const EMBED_CONCURRENCY: usize = 8;
 
-/// Registry metadata needed to serve — no tenant content.
+/// Registry metadata needed to serve — no tenant content. Cached; the
+/// lifecycle-transition + promote paths invalidate on change, so
+/// `lifecycle_state` here is never staler than the 15 s TTL.
 #[derive(Debug, Clone)]
 struct ServingConfig {
     dataset_id: Uuid,
     version: i32,
     backend: String,
     k: i64,
+    lifecycle_state: String,
+    confidence_threshold: f32,
+}
+
+/// Whether a call applies the lifecycle serving gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServingMode {
+    /// Predict unconditionally, return every neighborhood vote. Used by
+    /// the shadow-accounting hook (needs all predictions + confidences
+    /// to record per-band agreement) and the MCP sanity-check tool.
+    Raw,
+    /// Production consumer serving: the model only serves when it has
+    /// earned it. Returns a prediction ONLY when the model is in
+    /// `hybrid`/`fast_primary` AND the vote is at/above the model's
+    /// `confidence_threshold`; otherwise the slot abstains so the
+    /// caller falls back to the LLM. This is what makes the
+    /// shadow → hybrid → fast_primary progression actually change what
+    /// production serves (in shadow/llm_only the consumer gets
+    /// abstain-all and nothing about the workflow's behavior changes).
+    Gated,
+}
+
+/// Whether the model may serve the consumer at all, given its lifecycle
+/// state. Raw always serves; Gated serves only once the model advanced
+/// to `hybrid`/`fast_primary`.
+fn model_serves(mode: ServingMode, lifecycle_state: &str) -> bool {
+    match mode {
+        ServingMode::Raw => true,
+        ServingMode::Gated => matches!(lifecycle_state, "hybrid" | "fast_primary"),
+    }
+}
+
+/// Whether one slot's vote is returned to the consumer. Gated abstains
+/// below the confidence threshold (→ LLM fallback); Raw keeps every
+/// vote for agreement accounting.
+fn keep_vote(mode: ServingMode, confidence: f32, threshold: f32) -> bool {
+    match mode {
+        ServingMode::Raw => true,
+        ServingMode::Gated => confidence >= threshold,
+    }
 }
 
 static SERVING_CACHE: LazyLock<RwLock<HashMap<(Uuid, String), (ServingConfig, Instant)>>> =
@@ -148,6 +197,7 @@ pub async fn serve_predict_batch(
     user_id: Uuid,
     model_name: &str,
     inputs: &[String],
+    mode: ServingMode,
 ) -> Result<ServeReply, ServeError> {
     // 1. Resolve (cached) — registry metadata only.
     let cfg = match cache_get(user_id, model_name) {
@@ -174,16 +224,44 @@ pub async fn serve_predict_batch(
                 .and_then(|v| v.as_i64())
                 .unwrap_or(DEFAULT_KNN_K)
                 .clamp(1, 50);
+            // Safe-by-default (review 2026-07-12): an UNSET threshold
+            // defaults to GATED_DEFAULT_THRESHOLD, not 0.0 — otherwise a
+            // model created with the default `{}` config would, in
+            // hybrid, serve every non-abstaining vote (including thin
+            // 0.05-confidence guesses) and the "below threshold → LLM"
+            // fallback would never fire. An EXPLICIT 0.0 is honored as a
+            // deliberate "serve everything the model votes on" opt-out.
+            let confidence_threshold = resolved
+                .config_json
+                .get("confidence_threshold")
+                .and_then(|v| v.as_f64())
+                .map(|t| t.clamp(0.0, 1.0) as f32)
+                .unwrap_or(GATED_DEFAULT_THRESHOLD);
             let cfg = ServingConfig {
                 dataset_id,
                 version: promoted.version,
                 backend: promoted.backend,
                 k,
+                lifecycle_state: resolved.lifecycle_state,
+                confidence_threshold,
             };
             cache_put(user_id, model_name, cfg.clone());
             cfg
         }
     };
+
+    // Consumer serving gate: in shadow/llm_only the model has not earned
+    // the right to serve, so abstain on every slot and let the caller's
+    // LLM handle the whole batch (the workflow behaves exactly as it did
+    // pre-distillation). The append/shadow-accounting path uses
+    // `ServingMode::Raw` and skips this.
+    if !model_serves(mode, &cfg.lifecycle_state) {
+        return Ok(ServeReply {
+            predictions: inputs.iter().map(|_| None).collect(),
+            model_version: cfg.version,
+            backend: cfg.backend,
+        });
+    }
     if cfg.backend != "knn-pgvector" {
         // P2 serves the lazy backend; parametric backends arrive with
         // the tract runtime. Loud, distinct failure (RFC lifecycle).
@@ -238,12 +316,16 @@ pub async fn serve_predict_batch(
             .knn_search(&mut *conn, cfg.dataset_id, embedding, cfg.k, true)
             .await
             .map_err(ServeError::Internal)?;
-        predictions.push(
-            knn_vote_balanced(&neighbors, &counts).map(|p| ServedPrediction {
-                label: p.label,
-                confidence: p.confidence,
-            }),
-        );
+        let vote = knn_vote_balanced(&neighbors, &counts).filter(|p| {
+            // Gated: a below-threshold vote abstains so the LLM handles
+            // it (the RFC's "below the threshold, the LLM answers"
+            // path). Raw keeps every vote for agreement accounting.
+            keep_vote(mode, p.confidence, cfg.confidence_threshold)
+        });
+        predictions.push(vote.map(|p| ServedPrediction {
+            label: p.label,
+            confidence: p.confidence,
+        }));
     }
 
     Ok(ServeReply {
@@ -263,7 +345,32 @@ mod tests {
             version: 3,
             backend: "knn-pgvector".into(),
             k,
+            lifecycle_state: "shadow".into(),
+            confidence_threshold: 0.6,
         }
+    }
+
+    #[test]
+    fn gate_serves_only_in_hybrid_or_above() {
+        // Raw always serves regardless of state.
+        for s in ["llm_only", "shadow", "hybrid", "fast_primary"] {
+            assert!(model_serves(ServingMode::Raw, s));
+        }
+        // Gated serves only once the model earned hybrid+.
+        assert!(!model_serves(ServingMode::Gated, "llm_only"));
+        assert!(!model_serves(ServingMode::Gated, "shadow"));
+        assert!(model_serves(ServingMode::Gated, "hybrid"));
+        assert!(model_serves(ServingMode::Gated, "fast_primary"));
+    }
+
+    #[test]
+    fn gate_threshold_abstains_below_only_when_gated() {
+        // Raw keeps every vote (agreement accounting needs them all).
+        assert!(keep_vote(ServingMode::Raw, 0.1, 0.6));
+        // Gated abstains below threshold → LLM fallback, serves at/above.
+        assert!(!keep_vote(ServingMode::Gated, 0.59, 0.6));
+        assert!(keep_vote(ServingMode::Gated, 0.6, 0.6));
+        assert!(keep_vote(ServingMode::Gated, 0.95, 0.6));
     }
 
     #[test]

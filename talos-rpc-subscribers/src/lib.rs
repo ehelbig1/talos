@@ -904,12 +904,21 @@ pub fn spawn_ml_rpc_subscriber(
                     )
                     .await
                     .map_err(talos_ml::ServeError::Internal)?;
+                    // The ml.predict RPC is only called by production
+                    // `model::predict` workflow nodes, so it always
+                    // applies the lifecycle serving gate: a model in
+                    // shadow/llm_only abstains on every slot (the
+                    // caller's LLM handles the batch), and hybrid/
+                    // fast_primary serve only above the confidence
+                    // threshold. Shadow accounting + the MCP sanity
+                    // check call serve_predict_batch directly with Raw.
                     let reply = talos_ml::serve_predict_batch(
                         &ctx.dataset_service,
                         &mut tx,
                         req.user_id,
                         &req.model_name,
                         &req.inputs,
+                        talos_ml::ServingMode::Gated,
                     )
                     .await?;
                     // Read-only tx; commit releases the scope cleanly.
