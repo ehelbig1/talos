@@ -304,16 +304,25 @@ async fn evaluate_one_model(
         .and_then(|v| v.as_i64())
         .unwrap_or(DEFAULT_KNN_K)
         .clamp(1, 50);
-    let report = match crate::eval::run_knn_eval(
+    // Evaluate EVERY backend on one shared split and take the highest
+    // macro-F1 winner — the policy then gates on the BEST backend's report,
+    // and an auto-advance promotes that backend's version (+ artifact).
+    let candidates = match crate::eval::run_backend_selection_eval(
         dataset_service,
         &mut tx,
         dataset_id,
         k,
         EVAL_HOLDOUT_FRACTION,
+        crate::linear::FitOpts::default(),
     )
     .await
     {
-        Ok(r) => r,
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => {
+            drop(tx);
+            tracing::info!(%model_id, "policy eval produced no backend candidates");
+            return Ok(true);
+        }
         Err(e) => {
             // Not enough data / embedder down / SQL failure. The visit
             // stamp already landed on the pool (pre-eval), so a
@@ -324,6 +333,8 @@ async fn evaluate_one_model(
             return Ok(true);
         }
     };
+    let winner = &candidates[0];
+    let report = &winner.report;
 
     let class_counts = dataset_service.class_counts(&mut tx, dataset_id).await?;
     let total_examples: i64 = class_counts.values().sum();
@@ -334,31 +345,43 @@ async fn evaluate_one_model(
     let decision = evaluate_policy(
         &policy,
         &PolicyInputs {
-            report: &report,
+            report,
             total_examples,
             corrections_per_class: &corrections,
             dataset_classes: &dataset_classes,
         },
     );
 
-    // Record the eval as a version (same shape as ml_eval_model) so the
-    // model card carries the evidence either way.
-    let metrics = serde_json::json!({
-        "backend": "knn-pgvector",
-        "voting": "balanced-sqrt",
-        "k": k,
+    // Record the winning backend as a version (same shape as ml_eval_model)
+    // so the model card carries the evidence + the backend comparison.
+    let mut metrics = serde_json::json!({
+        "backend": winner.backend,
         "holdout_fraction": EVAL_HOLDOUT_FRACTION,
-        "report": report,
+        "report": winner.report.clone(),
         "policy_decision": {"satisfied": decision.satisfied, "unmet": decision.unmet},
         "evaluator": "scheduled",
+        "selected_backend": winner.backend,
+        "backend_comparison": candidates
+            .iter()
+            .map(|c| serde_json::json!({
+                "backend": c.backend,
+                "macro_recall": c.macro_recall,
+                "macro_f1": c.macro_f1,
+            }))
+            .collect::<Vec<_>>(),
     });
+    if let (Some(obj), Some(p)) = (metrics.as_object_mut(), winner.params.as_object()) {
+        for (kk, vv) in p {
+            obj.insert(kk.clone(), vv.clone());
+        }
+    }
     let version = ModelRegistry::create_version(
         &mut tx,
         model_id,
         user_id,
         org_id,
-        "knn-pgvector",
-        None,
+        winner.backend,
+        winner.artifact.as_deref(),
         &metrics,
     )
     .await

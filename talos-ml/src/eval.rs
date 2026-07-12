@@ -207,6 +207,211 @@ pub fn stratified_holdout(
     holdout
 }
 
+/// Macro-averaged F1 (unweighted mean over the classes present) — reported
+/// alongside the selection score for transparency.
+pub fn macro_f1(report: &EvalReport) -> f64 {
+    if report.per_class.is_empty() {
+        return 0.0;
+    }
+    report.per_class.values().map(|m| m.f1).sum::<f64>() / report.per_class.len() as f64
+}
+
+/// Macro-averaged recall (a.k.a. balanced accuracy) — the unweighted mean
+/// of per-class recall. This is the BACKEND-SELECTION score, chosen over
+/// macro-F1 deliberately: the promotion policy gates on per-class recall
+/// FLOORS, and macro-recall is the metric that rewards lifting the worst
+/// class rather than letting one strong class (archive) mask a weak one
+/// (follow_up). On the live inbox model knn and a converged linear tie on
+/// macro-F1 (~0.83), but linear wins macro-recall clearly (~0.89 vs ~0.84)
+/// precisely because it recovers the minority class knn abandons.
+pub fn macro_recall(report: &EvalReport) -> f64 {
+    if report.per_class.is_empty() {
+        return 0.0;
+    }
+    report.per_class.values().map(|m| m.recall).sum::<f64>() / report.per_class.len() as f64
+}
+
+/// Build the full report (overall + coverage curve + gold subset) from a
+/// backend's scored holdout. Shared by every backend so the eval shape is
+/// identical no matter which one produced the predictions.
+fn report_from_scored(
+    truths: &[String],
+    sources: &[String],
+    scored: &[Option<(String, f32)>],
+) -> anyhow::Result<EvalReport> {
+    let predictions: Vec<Option<String>> = scored
+        .iter()
+        .map(|p| p.as_ref().map(|(l, _)| l.clone()))
+        .collect();
+    let mut report = evaluate_predictions(truths, &predictions)?;
+    report.coverage_curve = coverage_curve(truths, scored);
+    // GOLD subset: human-corrected rows only.
+    let gold_idx: Vec<usize> = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.as_str() == "correction")
+        .map(|(i, _)| i)
+        .collect();
+    if !gold_idx.is_empty() {
+        let gt: Vec<String> = gold_idx.iter().map(|&i| truths[i].clone()).collect();
+        let gs: Vec<Option<(String, f32)>> = gold_idx.iter().map(|&i| scored[i].clone()).collect();
+        let gp: Vec<Option<String>> = gs
+            .iter()
+            .map(|p| p.as_ref().map(|(l, _)| l.clone()))
+            .collect();
+        let mut gold = evaluate_predictions(&gt, &gp)?;
+        gold.coverage_curve = coverage_curve(&gt, &gs);
+        report.gold = Some(Box::new(gold));
+    }
+    Ok(report)
+}
+
+/// One backend's evaluation on the shared holdout, plus what's needed to
+/// persist it as a model version.
+pub struct BackendCandidate {
+    pub backend: &'static str,
+    pub report: EvalReport,
+    /// Serialized model bytes to store as the version artifact (linear);
+    /// `None` for the lazy knn backend (nothing to persist).
+    pub artifact: Option<Vec<u8>>,
+    /// Backend-specific hyperparameters folded into the version's
+    /// `metrics_json` (`{voting,k}` for knn, `{epochs,l2,balanced}` for
+    /// linear).
+    pub params: serde_json::Value,
+    /// Reported for transparency (see [`macro_f1`]).
+    pub macro_f1: f64,
+    /// The SELECTION score — see [`macro_recall`].
+    pub macro_recall: f64,
+}
+
+/// Evaluate EVERY available backend on ONE shared stratified holdout and
+/// return the candidates ordered best-first (macro-RECALL; ties break
+/// toward `knn-pgvector`, which serves without an artifact). This is the RFC's
+/// "eval harness selects a backend empirically" — the split is assigned
+/// once so knn and linear are compared apples-to-apples on the same rows.
+/// A linear-fit failure (too little train signal, single class) is a
+/// warn+skip, never a hard error: knn stands alone.
+pub async fn run_backend_selection_eval(
+    service: &crate::dataset::DatasetService,
+    conn: &mut sqlx::PgConnection,
+    dataset_id: uuid::Uuid,
+    k: i64,
+    holdout_fraction: f64,
+    linear_opts: crate::linear::FitOpts,
+) -> anyhow::Result<Vec<BackendCandidate>> {
+    service.lock_dataset(&mut *conn, dataset_id).await?;
+    service.pin_ann_probes(&mut *conn).await?;
+    let labels = service.load_labels(&mut *conn, dataset_id).await?;
+    anyhow::ensure!(
+        labels.len() >= 10,
+        "dataset has only {} labeled examples — need at least 10 for a meaningful eval",
+        labels.len()
+    );
+    let holdout_ids = stratified_holdout(&labels, holdout_fraction);
+    anyhow::ensure!(
+        !holdout_ids.is_empty(),
+        "stratified split produced an empty holdout (all classes below the minimum size)"
+    );
+    service
+        .assign_splits(&mut *conn, dataset_id, &holdout_ids)
+        .await?;
+    let holdout = service.load_holdout(&mut *conn, dataset_id).await?;
+    let counts = service.class_counts(&mut *conn, dataset_id).await?;
+    let truths: Vec<String> = holdout.iter().map(|e| e.label.clone()).collect();
+    let sources: Vec<String> = holdout.iter().map(|e| e.source.clone()).collect();
+
+    let mut candidates = Vec::new();
+
+    // --- knn (lazy): vote over the train split for each holdout row ---
+    let mut knn_scored = Vec::with_capacity(holdout.len());
+    for ex in &holdout {
+        let pred = match &ex.embedding {
+            Some(embedding) => service
+                .knn_search(&mut *conn, dataset_id, embedding, k, true)
+                .await
+                .map(|n| crate::knn::knn_vote_balanced(&n, &counts))?,
+            None => None,
+        };
+        knn_scored.push(pred.map(|p| (p.label, p.confidence)));
+    }
+    let knn_report = report_from_scored(&truths, &sources, &knn_scored)?;
+    candidates.push(BackendCandidate {
+        backend: "knn-pgvector",
+        macro_f1: macro_f1(&knn_report),
+        macro_recall: macro_recall(&knn_report),
+        report: knn_report,
+        artifact: None,
+        params: serde_json::json!({ "voting": "balanced-sqrt", "k": k }),
+    });
+
+    // --- linear (parametric): fit on train, predict holdout ---
+    // Regularization is the dominant lever in the high-dim / few-rows
+    // embedding regime, so sweep L2 and keep the best-macro-F1 fit
+    // (auto-tuning; a few sub-second fits). Everything else comes from the
+    // caller's base opts.
+    let train = service
+        .load_train_embeddings(&mut *conn, dataset_id)
+        .await?;
+    if train.len() >= 10 {
+        const L2_GRID: [f32; 3] = [1e-4, 1e-2, 1e-1];
+        // (report, artifact, l2, macro_recall) of the best fit so far —
+        // grid points are ranked by the same macro-recall selection score.
+        let mut best: Option<(EvalReport, Vec<u8>, f32, f64)> = None;
+        for &l2 in &L2_GRID {
+            let opts = crate::linear::FitOpts { l2, ..linear_opts };
+            let model = match crate::linear::fit(&train, opts) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(target: "talos_ml", %l2, error = %e, "linear fit failed at this l2");
+                    continue;
+                }
+            };
+            let scored: Vec<Option<(String, f32)>> = holdout
+                .iter()
+                .map(|ex| {
+                    ex.embedding
+                        .as_ref()
+                        .and_then(|e| model.predict(e))
+                        .map(|p| (p.label, p.confidence))
+                })
+                .collect();
+            let report = report_from_scored(&truths, &sources, &scored)?;
+            let mr = macro_recall(&report);
+            if best.as_ref().map(|(_, _, _, b)| mr > *b).unwrap_or(true) {
+                best = Some((report, model.to_artifact()?, l2, mr));
+            }
+        }
+        match best {
+            Some((report, artifact, l2, _mr)) => candidates.push(BackendCandidate {
+                backend: crate::linear::BACKEND_NAME,
+                macro_f1: macro_f1(&report),
+                macro_recall: macro_recall(&report),
+                report,
+                artifact: Some(artifact),
+                params: serde_json::json!({
+                    "epochs": linear_opts.epochs,
+                    "lr": linear_opts.lr,
+                    "l2": l2,
+                    "balanced": linear_opts.balanced,
+                    "selected_by": "l2-grid",
+                }),
+            }),
+            None => {
+                tracing::warn!(target: "talos_ml", "all linear fits failed; knn stands alone")
+            }
+        }
+    }
+
+    // Best macro-RECALL first; a tie prefers knn (no artifact, cheaper).
+    candidates.sort_by(|a, b| {
+        b.macro_recall
+            .partial_cmp(&a.macro_recall)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| (a.backend != "knn-pgvector").cmp(&(b.backend != "knn-pgvector")))
+    });
+    Ok(candidates)
+}
+
 /// Full knn eval pass, designed to run inside ONE caller transaction:
 /// takes the per-dataset advisory lock (held to tx end, so a concurrent
 /// eval can't thrash the splits mid-scoring), assigns a fresh stratified
@@ -257,31 +462,7 @@ pub async fn run_knn_eval(
         };
         scored.push(pred.map(|p| (p.label, p.confidence)));
     }
-    let predictions: Vec<Option<String>> = scored
-        .iter()
-        .map(|p| p.as_ref().map(|(l, _)| l.clone()))
-        .collect();
-    let mut report = evaluate_predictions(&truths, &predictions)?;
-    report.coverage_curve = coverage_curve(&truths, &scored);
-    // GOLD subset: human-corrected rows only.
-    let gold_idx: Vec<usize> = sources
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.as_str() == "correction")
-        .map(|(i, _)| i)
-        .collect();
-    if !gold_idx.is_empty() {
-        let gt: Vec<String> = gold_idx.iter().map(|&i| truths[i].clone()).collect();
-        let gs: Vec<Option<(String, f32)>> = gold_idx.iter().map(|&i| scored[i].clone()).collect();
-        let gp: Vec<Option<String>> = gs
-            .iter()
-            .map(|p| p.as_ref().map(|(l, _)| l.clone()))
-            .collect();
-        let mut gold = evaluate_predictions(&gt, &gp)?;
-        gold.coverage_curve = coverage_curve(&gt, &gs);
-        report.gold = Some(Box::new(gold));
-    }
-    Ok(report)
+    report_from_scored(&truths, &sources, &scored)
 }
 
 #[cfg(test)]

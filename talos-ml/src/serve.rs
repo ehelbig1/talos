@@ -64,6 +64,9 @@ const EMBED_CONCURRENCY: usize = 8;
 #[derive(Debug, Clone)]
 struct ServingConfig {
     dataset_id: Uuid,
+    /// Promoted version's row id — the key for loading a parametric
+    /// backend's artifact (and the linear-model cache).
+    version_id: Uuid,
     version: i32,
     backend: String,
     k: i64,
@@ -111,6 +114,46 @@ fn keep_vote(mode: ServingMode, confidence: f32, threshold: f32) -> bool {
 
 static SERVING_CACHE: LazyLock<RwLock<HashMap<(Uuid, String), (ServingConfig, Instant)>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Parsed parametric artifacts, keyed by version id. A version's artifact
+/// is IMMUTABLE (a new fit is always a new version id), so entries never
+/// go stale and need no TTL — only a soft cap so distinct-versions-ever-
+/// served can't grow unbounded. Small: a linear artifact is ~tens of KB.
+static LINEAR_CACHE: LazyLock<RwLock<HashMap<Uuid, std::sync::Arc<crate::linear::LinearModel>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+const LINEAR_CACHE_MAX: usize = 256;
+
+/// Load (cached) the linear model for a promoted version. The artifact is
+/// sha256-verified by the registry before parse; a corrupted/foreign
+/// artifact surfaces as NotAvailable so the caller falls back to the LLM
+/// rather than serving garbage.
+async fn load_linear_model(
+    conn: &mut PgConnection,
+    version_id: Uuid,
+) -> Result<std::sync::Arc<crate::linear::LinearModel>, ServeError> {
+    if let Some(m) = LINEAR_CACHE
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&version_id)
+        .cloned()
+    {
+        return Ok(m);
+    }
+    let bytes = crate::registry::ModelRegistry::get_version_artifact(conn, version_id)
+        .await
+        .map_err(ServeError::Internal)?
+        .ok_or(ServeError::NotAvailable)?;
+    let model = std::sync::Arc::new(
+        crate::linear::LinearModel::open(&bytes).map_err(ServeError::Internal)?,
+    );
+    let mut cache = LINEAR_CACHE.write().unwrap_or_else(|p| p.into_inner());
+    // Soft cap: once full, serve from the fresh parse without caching
+    // (rare — distinct promoted versions per process is tiny).
+    if cache.len() < LINEAR_CACHE_MAX {
+        cache.insert(version_id, model.clone());
+    }
+    Ok(model)
+}
 
 /// Recover from lock poisoning instead of silently no-op'ing: the map
 /// holds only plain data (no invariants spanning entries), so the
@@ -239,6 +282,7 @@ pub async fn serve_predict_batch(
                 .unwrap_or(GATED_DEFAULT_THRESHOLD);
             let cfg = ServingConfig {
                 dataset_id,
+                version_id: promoted.id,
                 version: promoted.version,
                 backend: promoted.backend,
                 k,
@@ -262,40 +306,17 @@ pub async fn serve_predict_batch(
             backend: cfg.backend,
         });
     }
-    if cfg.backend != "knn-pgvector" {
-        // P2 serves the lazy backend; parametric backends arrive with
-        // the tract runtime. Loud, distinct failure (RFC lifecycle).
+    let is_parametric = cfg.backend == crate::linear::BACKEND_NAME;
+    if cfg.backend != "knn-pgvector" && !is_parametric {
+        // Unknown backend (a future type not yet servable here). Loud,
+        // distinct failure rather than silently mis-serving.
         return Err(ServeError::NotAvailable);
     }
 
-    // 2. Hoist per-batch invariants: probes pin + class priors, once.
-    service
-        .pin_ann_probes(&mut *conn)
-        .await
-        .map_err(ServeError::Internal)?;
-    let counts = service
-        .class_counts(&mut *conn, cfg.dataset_id)
-        .await
-        .map_err(ServeError::Internal)?;
-    if counts.is_empty() {
-        // Empty dataset (all examples pruned/deleted) — the model can't
-        // answer, so ABSTAIN on every slot and let the caller's LLM handle
-        // the batch, exactly as the None-embed (line ~305) and
-        // dimensionality-drift (line ~308) per-slot abstentions do.
-        // Erroring the whole batch instead would break production
-        // classification for a consumer that doesn't catch the RPC error,
-        // contradicting the RFC's graceful-LLM-fallback contract.
-        return Ok(ServeReply {
-            predictions: inputs.iter().map(|_| None).collect(),
-            model_version: cfg.version,
-            backend: cfg.backend,
-        });
-    }
-
-    // 3. Embed all inputs CONCURRENTLY in waves of EMBED_CONCURRENCY
-    // (independent local HTTP calls; join_all preserves order). None =
-    // embedder down / non-local config → that slot abstains and
-    // production callers fall back to their LLM branch per input.
+    // 2. Embed all inputs CONCURRENTLY in waves of EMBED_CONCURRENCY
+    // (independent local HTTP calls; join_all preserves order). Shared by
+    // both backends. None = embedder down / non-local config → that slot
+    // abstains and production callers fall back to their LLM branch.
     let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(inputs.len());
     for wave in inputs.chunks(EMBED_CONCURRENCY) {
         let results = futures::future::join_all(
@@ -305,39 +326,76 @@ pub async fn serve_predict_batch(
         .await;
         embeddings.extend(results);
     }
-
-    // 4. Per input: knn → damped balanced vote (sequential — the ANN
-    // queries share the one tx connection, but each is a fast indexed
-    // lookup once the embeds are in hand).
     let expected_dims = crate::dataset::expected_embedding_dims();
-    let mut predictions = Vec::with_capacity(inputs.len());
-    for embedding in &embeddings {
-        let Some(embedding) = embedding else {
-            predictions.push(None);
-            continue;
-        };
-        if embedding.len() != expected_dims {
-            // Dimensionality drift (embedding model changed under the
-            // dataset): abstain rather than error mid-batch — same
-            // guard as `knn_predict_text`.
-            predictions.push(None);
-            continue;
-        }
-        let neighbors = service
-            .knn_search(&mut *conn, cfg.dataset_id, embedding, cfg.k, true)
+
+    // 3. Score per input, backend-specific. Both apply the same
+    // confidence gate (`keep_vote`) so the LLM-fallback threshold behaves
+    // identically regardless of backend.
+    let predictions: Vec<Option<ServedPrediction>> = if is_parametric {
+        // Parametric: one W·x+b + softmax per input, NO DB round-trip.
+        // `predict()` dim-checks internally (abstain on drift); a
+        // below-threshold softmax abstains → LLM fallback.
+        let model = load_linear_model(&mut *conn, cfg.version_id).await?;
+        embeddings
+            .iter()
+            .map(|embedding| {
+                embedding
+                    .as_ref()
+                    .and_then(|e| model.predict(e))
+                    .filter(|p| keep_vote(mode, p.confidence, cfg.confidence_threshold))
+                    .map(|p| ServedPrediction {
+                        label: p.label,
+                        confidence: p.confidence,
+                    })
+            })
+            .collect()
+    } else {
+        // knn-pgvector: pin ANN probes + class priors once, then a damped
+        // balanced vote per input over the train split.
+        service
+            .pin_ann_probes(&mut *conn)
             .await
             .map_err(ServeError::Internal)?;
-        let vote = knn_vote_balanced(&neighbors, &counts).filter(|p| {
-            // Gated: a below-threshold vote abstains so the LLM handles
-            // it (the RFC's "below the threshold, the LLM answers"
-            // path). Raw keeps every vote for agreement accounting.
-            keep_vote(mode, p.confidence, cfg.confidence_threshold)
-        });
-        predictions.push(vote.map(|p| ServedPrediction {
-            label: p.label,
-            confidence: p.confidence,
-        }));
-    }
+        let counts = service
+            .class_counts(&mut *conn, cfg.dataset_id)
+            .await
+            .map_err(ServeError::Internal)?;
+        if counts.is_empty() {
+            // Empty dataset (all examples pruned) — abstain-all → LLM,
+            // matching the per-slot embed/dim-drift abstentions rather than
+            // erroring the whole batch (a consumer that doesn't catch the
+            // RPC error would otherwise lose production classification).
+            return Ok(ServeReply {
+                predictions: inputs.iter().map(|_| None).collect(),
+                model_version: cfg.version,
+                backend: cfg.backend,
+            });
+        }
+        let mut out = Vec::with_capacity(inputs.len());
+        for embedding in &embeddings {
+            let Some(embedding) = embedding else {
+                out.push(None);
+                continue;
+            };
+            if embedding.len() != expected_dims {
+                // Dimensionality drift (embedding model changed under the
+                // dataset): abstain rather than error mid-batch.
+                out.push(None);
+                continue;
+            }
+            let neighbors = service
+                .knn_search(&mut *conn, cfg.dataset_id, embedding, cfg.k, true)
+                .await
+                .map_err(ServeError::Internal)?;
+            let vote = knn_vote_balanced(&neighbors, &counts)
+                .filter(|p| keep_vote(mode, p.confidence, cfg.confidence_threshold));
+            out.push(vote.map(|p| ServedPrediction {
+                label: p.label,
+                confidence: p.confidence,
+            }));
+        }
+        out
+    };
 
     Ok(ServeReply {
         predictions,
@@ -353,6 +411,7 @@ mod tests {
     fn test_cfg(k: i64) -> ServingConfig {
         ServingConfig {
             dataset_id: Uuid::from_u128(8),
+            version_id: Uuid::from_u128(88),
             version: 3,
             backend: "knn-pgvector".into(),
             k,
