@@ -1,0 +1,46 @@
+# RFC 0011 ML lifecycle operations — the model-review UI (human-in-the-loop
+# disagreement resolution). Source documents for graphql-codegen —
+# `npm run codegen` regenerates the typed react-query hooks + Document
+# constants from these.
+
+query MlModels {
+  mlModels {
+    id
+    name
+    taskType
+    lifecycleState
+    promotedVersion
+    promotedAccuracy
+    pendingDisagreements
+  }
+}
+
+query MlModelDisagreements($modelName: String!, $limit: Int) {
+  mlModelDisagreements(modelName: $modelName, limit: $limit) {
+    modelId
+    lifecycleState
+    shadowAgreement
+    shadowObservations
+    pending {
+      id
+      exampleKey
+      featuresText
+      kind
+      fastLabel
+      fastConfidence
+      llmLabel
+      createdAt
+    }
+  }
+}
+
+mutation ResolveMlDisagreement($disagreementId: UUID!, $correctLabel: String) {
+  resolveMlDisagreement(
+    disagreementId: $disagreementId
+    correctLabel: $correctLabel
+  ) {
+    disagreementId
+    status
+    correctionAppended
+  }
+}

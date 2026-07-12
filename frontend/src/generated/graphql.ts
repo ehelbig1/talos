@@ -881,6 +881,57 @@ export type RevokeMcpAgentMutationVariables = Exact<{
 
 export type RevokeMcpAgentMutation = { revokeMcpAgent: boolean };
 
+export type MlModelsQueryVariables = Exact<{ [key: string]: never }>;
+
+export type MlModelsQuery = {
+  mlModels: Array<{
+    id: string;
+    name: string;
+    taskType: string;
+    lifecycleState: string;
+    promotedVersion: number | null;
+    promotedAccuracy: number | null;
+    pendingDisagreements: number;
+  }>;
+};
+
+export type MlModelDisagreementsQueryVariables = Exact<{
+  modelName: string;
+  limit?: number | null | undefined;
+}>;
+
+export type MlModelDisagreementsQuery = {
+  mlModelDisagreements: {
+    modelId: string;
+    lifecycleState: string;
+    shadowAgreement: number | null;
+    shadowObservations: number;
+    pending: Array<{
+      id: string;
+      exampleKey: string | null;
+      featuresText: string;
+      kind: string;
+      fastLabel: string | null;
+      fastConfidence: number | null;
+      llmLabel: string;
+      createdAt: string;
+    }>;
+  };
+};
+
+export type ResolveMlDisagreementMutationVariables = Exact<{
+  disagreementId: string;
+  correctLabel?: string | null | undefined;
+}>;
+
+export type ResolveMlDisagreementMutation = {
+  resolveMlDisagreement: {
+    disagreementId: string;
+    status: string;
+    correctionAppended: boolean;
+  };
+};
+
 export type MyModulesQueryVariables = Exact<{
   limit?: number | null | undefined;
   offset?: number | null | undefined;
@@ -3689,6 +3740,123 @@ export const useRevokeMcpAgentMutation = <TError = unknown, TContext = unknown>(
         RevokeMcpAgentDocument,
         variables,
       )(),
+    ...options,
+  });
+};
+
+export const MlModelsDocument = new TypedDocumentString(`
+    query MlModels {
+  mlModels {
+    id
+    name
+    taskType
+    lifecycleState
+    promotedVersion
+    promotedAccuracy
+    pendingDisagreements
+  }
+}
+    `);
+
+export const useMlModelsQuery = <TData = MlModelsQuery, TError = unknown>(
+  variables?: MlModelsQueryVariables,
+  options?: Omit<UseQueryOptions<MlModelsQuery, TError, TData>, "queryKey"> & {
+    queryKey?: UseQueryOptions<MlModelsQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<MlModelsQuery, TError, TData>({
+    queryKey: variables === undefined ? ["MlModels"] : ["MlModels", variables],
+    queryFn: graphqlFetcher<MlModelsQuery, MlModelsQueryVariables>(
+      MlModelsDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const MlModelDisagreementsDocument = new TypedDocumentString(`
+    query MlModelDisagreements($modelName: String!, $limit: Int) {
+  mlModelDisagreements(modelName: $modelName, limit: $limit) {
+    modelId
+    lifecycleState
+    shadowAgreement
+    shadowObservations
+    pending {
+      id
+      exampleKey
+      featuresText
+      kind
+      fastLabel
+      fastConfidence
+      llmLabel
+      createdAt
+    }
+  }
+}
+    `);
+
+export const useMlModelDisagreementsQuery = <
+  TData = MlModelDisagreementsQuery,
+  TError = unknown,
+>(
+  variables: MlModelDisagreementsQueryVariables,
+  options?: Omit<
+    UseQueryOptions<MlModelDisagreementsQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      MlModelDisagreementsQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<MlModelDisagreementsQuery, TError, TData>({
+    queryKey: ["MlModelDisagreements", variables],
+    queryFn: graphqlFetcher<
+      MlModelDisagreementsQuery,
+      MlModelDisagreementsQueryVariables
+    >(MlModelDisagreementsDocument, variables),
+    ...options,
+  });
+};
+
+export const ResolveMlDisagreementDocument = new TypedDocumentString(`
+    mutation ResolveMlDisagreement($disagreementId: UUID!, $correctLabel: String) {
+  resolveMlDisagreement(
+    disagreementId: $disagreementId
+    correctLabel: $correctLabel
+  ) {
+    disagreementId
+    status
+    correctionAppended
+  }
+}
+    `);
+
+export const useResolveMlDisagreementMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    ResolveMlDisagreementMutation,
+    TError,
+    ResolveMlDisagreementMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    ResolveMlDisagreementMutation,
+    TError,
+    ResolveMlDisagreementMutationVariables,
+    TContext
+  >({
+    mutationKey: ["ResolveMlDisagreement"],
+    mutationFn: (variables?: ResolveMlDisagreementMutationVariables) =>
+      graphqlFetcher<
+        ResolveMlDisagreementMutation,
+        ResolveMlDisagreementMutationVariables
+      >(ResolveMlDisagreementDocument, variables)(),
     ...options,
   });
 };

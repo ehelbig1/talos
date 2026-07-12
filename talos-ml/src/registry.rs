@@ -17,6 +17,21 @@ pub struct ModelVersionRow {
     pub status: String,
 }
 
+/// Per-model summary for the human-in-the-loop review UI: lifecycle
+/// position, promoted accuracy, and the count of pending disagreements —
+/// everything the review surface needs to show a model list with a
+/// "needs review" badge, resolved in ONE query.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelReviewSummary {
+    pub model_id: Uuid,
+    pub name: String,
+    pub task_type: String,
+    pub lifecycle_state: String,
+    pub promoted_version: Option<i32>,
+    pub promoted_accuracy: Option<f64>,
+    pub pending_disagreements: i64,
+}
+
 /// Name-resolution result (named struct, not tuple-soup — future fields
 /// like task_type are additive instead of positionally breaking).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -205,6 +220,48 @@ impl ModelRegistry {
                     "promoted_backend": r.try_get::<Option<String>, _>("promoted_backend")?,
                     "promoted_metrics": r.try_get::<Option<serde_json::Value>, _>("promoted_metrics")?,
                 }))
+            })
+            .collect()
+    }
+
+    /// Per-model review summaries, owner-scoped, in ONE query. The
+    /// pending-disagreement count is a correlated subquery (no N+1);
+    /// ordered so the models with the most pending review float to the
+    /// top. `promoted_accuracy` is lifted from the promoted version's
+    /// eval report (NULL when unpromoted).
+    pub async fn list_models_for_review(
+        conn: &mut PgConnection,
+        user_id: Uuid,
+    ) -> Result<Vec<ModelReviewSummary>> {
+        let rows = sqlx::query(
+            "SELECT m.id, m.name, m.task_type, m.lifecycle_state, \
+                    v.version AS promoted_version, \
+                    (v.metrics_json #>> '{report,accuracy}')::float8 AS promoted_accuracy, \
+                    (SELECT COUNT(*) FROM ml_disagreements d \
+                       WHERE d.model_id = m.id AND d.user_id = m.user_id \
+                         AND d.status = 'pending') AS pending \
+             FROM ml_models m \
+             LEFT JOIN ml_model_versions v ON v.id = m.production_version_id \
+             WHERE m.user_id = $1 \
+             ORDER BY pending DESC, m.created_at DESC LIMIT 100",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *conn)
+        .await
+        .context("list models for review")?;
+        rows.into_iter()
+            .map(|r| -> Result<ModelReviewSummary> {
+                Ok(ModelReviewSummary {
+                    model_id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    task_type: r.try_get("task_type")?,
+                    lifecycle_state: r.try_get("lifecycle_state")?,
+                    promoted_version: r.try_get::<Option<i32>, _>("promoted_version")?,
+                    promoted_accuracy: r.try_get::<Option<f64>, _>("promoted_accuracy")?,
+                    // NULL can't occur (COUNT), but read as Option so a
+                    // schema/type drift errors via `?` instead of panicking.
+                    pending_disagreements: r.try_get::<Option<i64>, _>("pending")?.unwrap_or(0),
+                })
             })
             .collect()
     }

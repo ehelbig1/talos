@@ -5,6 +5,7 @@ pub struct MutationRoot(
     crate::schema::actors::mutations::ActorsMutations,
     crate::schema::auth::mutations::AuthMutations,
     crate::schema::executions::mutations::ExecutionsMutations,
+    crate::schema::ml::mutations::MlMutations,
     crate::schema::modules::mutations::ModulesMutations,
     crate::schema::organizations::mutations::OrganizationsMutations,
     crate::schema::platform::mutations::PlatformMutations,

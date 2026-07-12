@@ -1009,105 +1009,32 @@ async fn handle_resolve_disagreement(
         Ok(v) => v,
         Err(m) => return mcp_error(req_id, -32602, &m),
     };
-    let correct_label = args
-        .get("correct_label")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && s.len() <= 256);
+    let correct_label = args.get("correct_label").and_then(|v| v.as_str());
     let lsvc = lifecycle_service(state);
     let dsvc = dataset_service(state);
 
-    // Short tx #1: fetch the pending row (owner-scoped, decrypted) and,
-    // for the correction path, resolve the target dataset + ownership.
-    // Then embed/encrypt with NO connection held, then a short tx #2
-    // for the insert + status flip — mirroring handle_append_examples'
-    // prepare-outside-tx discipline (the file header contract: a slow
-    // local embedder must never pin an idle-in-transaction connection).
-    let (pending, correction) = {
-        let mut tx = match user_tx(state, user_id).await {
-            Ok(tx) => tx,
-            Err(e) => return internal(req_id, "resolve_disagreement", &e),
-        };
-        let Ok(Some((model_id, pending))) = lsvc.get_disagreement(&mut tx, id, user_id).await
-        else {
-            return mcp_error(req_id, -32000, "Disagreement not found or already handled");
-        };
-        let correction = match correct_label {
-            Some(label) => {
-                let Ok(Some(model)) =
-                    ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await
-                else {
-                    return mcp_error(req_id, -32000, "Model not found");
-                };
-                let Some(dataset_id) = model.dataset_id else {
-                    return mcp_error(req_id, -32000, "Model has no dataset to correct into");
-                };
-                let tenancy = match require_dataset_owner(&dsvc, &mut tx, dataset_id, user_id).await
-                {
-                    Ok(t) => t,
-                    Err(m) => return mcp_error(req_id, -32000, &m),
-                };
-                Some((dataset_id, tenancy, label.to_string()))
-            }
-            None => None,
-        };
-        // Read-only so far; drop the tx (the write happens in tx #2).
-        (pending, correction)
-    };
-
-    // Embed + encrypt OUTSIDE any transaction.
-    let prepared = match &correction {
-        Some((dataset_id, tenancy, label)) => {
-            let example = AppendExample {
-                features_text: pending.features_text.clone(),
-                label: label.clone(),
-                source: ExampleSource::Correction,
-                example_key: pending.example_key.clone(),
-            };
-            match dsvc
-                .prepare_examples(*dataset_id, *tenancy, vec![example])
-                .await
-            {
-                Ok(p) => Some(p),
-                Err(e) => return internal(req_id, "resolve_disagreement prepare", &e),
-            }
-        }
-        None => None,
-    };
-
-    // Short tx #2: insert the prepared correction (if any) + flip the
-    // status, atomically.
-    let mut tx = match user_tx(state, user_id).await {
-        Ok(tx) => tx,
-        Err(e) => return internal(req_id, "resolve_disagreement", &e),
-    };
-    let appended = prepared.is_some();
-    if let (Some(prepared), Some((dataset_id, tenancy, _))) = (prepared, &correction) {
-        if let Err(e) = dsvc
-            .insert_prepared(&mut tx, *dataset_id, *tenancy, prepared)
-            .await
-        {
-            return internal(req_id, "resolve_disagreement append", &e);
-        }
-    }
-    let status = if appended { "resolved" } else { "dismissed" };
-    match lsvc
-        .set_disagreement_status(&mut tx, id, user_id, status)
+    // The full two-tx, prepare-outside-tx, owner-scoped flow lives in
+    // `talos_ml::resolve_disagreement` — the ONE implementation shared with
+    // the GraphQL resolver so the tenancy invariants can't drift between
+    // the two surfaces. This handler only parses input + maps the outcome.
+    match talos_ml::resolve_disagreement(&state.db_pool, &lsvc, &dsvc, id, user_id, correct_label)
         .await
     {
-        Ok(true) => match tx.commit().await {
-            Ok(()) => mcp_text(
-                req_id,
-                &serde_json::json!({
-                    "disagreement_id": id.to_string(),
-                    "status": status,
-                    "correction_appended": appended,
-                })
-                .to_string(),
-            ),
-            Err(e) => internal(req_id, "resolve_disagreement commit", &e.into()),
-        },
-        Ok(false) => mcp_error(req_id, -32000, "Disagreement not found or already handled"),
-        Err(e) => internal(req_id, "resolve_disagreement", &e),
+        Ok(outcome) => mcp_text(
+            req_id,
+            &serde_json::json!({
+                "disagreement_id": id.to_string(),
+                "status": outcome.status,
+                "correction_appended": outcome.correction_appended,
+            })
+            .to_string(),
+        ),
+        Err(talos_ml::ResolveError::NotFound) => {
+            mcp_error(req_id, -32000, "Disagreement not found or already handled")
+        }
+        Err(talos_ml::ResolveError::NoDataset) => {
+            mcp_error(req_id, -32000, "Model has no dataset to correct into")
+        }
+        Err(talos_ml::ResolveError::Internal(e)) => internal(req_id, "resolve_disagreement", &e),
     }
 }

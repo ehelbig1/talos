@@ -556,6 +556,72 @@ export type McpAgentCreated = {
   token: Scalars["String"]["output"];
 };
 
+/**
+ * A single pending fast-vs-LLM divergence awaiting the user's verdict.
+ * `features_text` is decrypted email-derived content — same egress
+ * surface as the MCP `ml_disagreements` tool, owner-only.
+ */
+export type MlDisagreement = {
+  __typename?: "MlDisagreement";
+  /** RFC-3339 timestamp. */
+  createdAt: Scalars["String"]["output"];
+  exampleKey?: Maybe<Scalars["String"]["output"]>;
+  fastConfidence?: Maybe<Scalars["Float"]["output"]>;
+  fastLabel?: Maybe<Scalars["String"]["output"]>;
+  featuresText: Scalars["String"]["output"];
+  id: Scalars["UUID"]["output"];
+  /**
+   * `divergence` (model disagreed with the LLM) or `low_confidence`
+   * (model abstained; the LLM answered).
+   */
+  kind: Scalars["String"]["output"];
+  llmLabel: Scalars["String"]["output"];
+};
+
+/**
+ * The disagreement feed for one model, plus the lifecycle context the
+ * review page shows above the queue.
+ */
+export type MlDisagreementFeed = {
+  __typename?: "MlDisagreementFeed";
+  lifecycleState: Scalars["String"]["output"];
+  modelId: Scalars["UUID"]["output"];
+  pending: Array<MlDisagreement>;
+  /**
+   * Rolling shadow agreement (fast-vs-LLM, all bands), 0–1. `None`
+   * when the model has no shadow observations yet.
+   */
+  shadowAgreement?: Maybe<Scalars["Float"]["output"]>;
+  shadowObservations: Scalars["Int"]["output"];
+};
+
+/**
+ * One model's review summary — enough to render a list with a
+ * "needs review" badge and lifecycle status.
+ */
+export type MlModelSummary = {
+  __typename?: "MlModelSummary";
+  id: Scalars["UUID"]["output"];
+  /** `llm_only` | `shadow` | `hybrid` | `fast_primary`. */
+  lifecycleState: Scalars["String"]["output"];
+  name: Scalars["String"]["output"];
+  /** Count of `pending` disagreements awaiting human review. */
+  pendingDisagreements: Scalars["Int"]["output"];
+  /** Holdout accuracy of the promoted version (0–1), if promoted. */
+  promotedAccuracy?: Maybe<Scalars["Float"]["output"]>;
+  promotedVersion?: Maybe<Scalars["Int"]["output"]>;
+  taskType: Scalars["String"]["output"];
+};
+
+/** Outcome of resolving one disagreement. */
+export type MlResolveResult = {
+  __typename?: "MlResolveResult";
+  correctionAppended: Scalars["Boolean"]["output"];
+  disagreementId: Scalars["UUID"]["output"];
+  /** `"resolved"` (a gold correction was appended) or `"dismissed"`. */
+  status: Scalars["String"]["output"];
+};
+
 export type ModuleExecution = {
   __typename?: "ModuleExecution";
   completedAt?: Maybe<Scalars["String"]["output"]>;
@@ -674,6 +740,14 @@ export type MutationRoot = {
   removeMember: Scalars["Boolean"]["output"];
   replayDeadLetterEntry: Scalars["Boolean"]["output"];
   replayWebhookDeadLetterEntry: Scalars["Boolean"]["output"];
+  /**
+   * Resolve one pending disagreement. `correctLabel` present → append a
+   * `source=correction` gold example (built from the disagreement's own
+   * stored features; the caller supplies only the label) and mark it
+   * resolved. Omitted/blank → dismiss. Counts toward the model's
+   * promotion policy.
+   */
+  resolveMlDisagreement: MlResolveResult;
   resumeWorkflow: Scalars["Boolean"]["output"];
   retryExecution: Scalars["UUID"]["output"];
   revokeApiKey: Scalars["Boolean"]["output"];
@@ -838,6 +912,11 @@ export type MutationRootReplayWebhookDeadLetterEntryArgs = {
   id: Scalars["UUID"]["input"];
 };
 
+export type MutationRootResolveMlDisagreementArgs = {
+  correctLabel?: InputMaybe<Scalars["String"]["input"]>;
+  disagreementId: Scalars["UUID"]["input"];
+};
+
 export type MutationRootResumeWorkflowArgs = {
   executionId: Scalars["UUID"]["input"];
 };
@@ -966,12 +1045,34 @@ export type MutationRootWriteActorMemoryArgs = {
 export type NodeTemplate = {
   __typename?: "NodeTemplate";
   allowedHosts: Array<Scalars["String"]["output"]>;
+  /**
+   * The WIT capability world this template compiles to (e.g.
+   * `"secrets-node"`, `"http-node"`, `"minimal-node"`). Surfaced so a
+   * caller can see, BEFORE installing, the minimum actor capability
+   * ceiling required to run a module built from this template — instead
+   * of discovering it via a ceiling-denial at trigger time. Pair with
+   * the `capabilityWorldHierarchy` query for the rank + description.
+   */
+  capabilityWorld: Scalars["String"]["output"];
   category: Scalars["String"]["output"];
   configSchema: Scalars["String"]["output"];
   description?: Maybe<Scalars["String"]["output"]>;
   icon?: Maybe<Scalars["String"]["output"]>;
   id: Scalars["UUID"]["output"];
   name: Scalars["String"]["output"];
+  /**
+   * Operation categories that make a module built from this template
+   * pause for human approval at run time (e.g. `["network_scan"]`).
+   * Empty for templates that never suspend. Surfaced so a suspension
+   * isn't a surprise.
+   */
+  requiresApprovalFor: Array<Scalars["String"]["output"]>;
+  /**
+   * Vault secret paths (or prefix globs) this template needs granted,
+   * e.g. `["oauth/gmail/*"]`. Surfaced so a caller knows what to set up
+   * before running rather than hitting a resolution failure.
+   */
+  requiresSecrets: Array<Scalars["String"]["output"]>;
 };
 
 export type OauthAccount = {
@@ -1118,6 +1219,16 @@ export type QueryRoot = {
    */
   mcpAgents: Array<McpAgent>;
   me: UserInfo;
+  /**
+   * Pending disagreements for one model (owner-scoped, decrypted),
+   * plus lifecycle + shadow context for the review header.
+   */
+  mlModelDisagreements: MlDisagreementFeed;
+  /**
+   * The caller's models, owner-scoped, ordered so the ones with the
+   * most pending review float to the top.
+   */
+  mlModels: Array<MlModelSummary>;
   moduleExecutionHistory: Array<ModuleExecution>;
   moduleExecutionLogs: Array<ModuleExecutionLog>;
   myCapabilityCeiling: Scalars["String"]["output"];
@@ -1227,6 +1338,11 @@ export type QueryRootLatestWorkflowExecutionsArgs = {
 
 export type QueryRootMcpAgentsArgs = {
   limit?: InputMaybe<Scalars["Int"]["input"]>;
+};
+
+export type QueryRootMlModelDisagreementsArgs = {
+  limit?: InputMaybe<Scalars["Int"]["input"]>;
+  modelName: Scalars["String"]["input"];
 };
 
 export type QueryRootModuleExecutionHistoryArgs = {

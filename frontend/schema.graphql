@@ -583,6 +583,80 @@ type McpAgentCreated {
 	role: String!
 }
 
+"""
+A single pending fast-vs-LLM divergence awaiting the user's verdict.
+`features_text` is decrypted email-derived content — same egress
+surface as the MCP `ml_disagreements` tool, owner-only.
+"""
+type MlDisagreement {
+	id: UUID!
+	exampleKey: String
+	featuresText: String!
+	"""
+	`divergence` (model disagreed with the LLM) or `low_confidence`
+	(model abstained; the LLM answered).
+	"""
+	kind: String!
+	fastLabel: String
+	fastConfidence: Float
+	llmLabel: String!
+	"""
+	RFC-3339 timestamp.
+	"""
+	createdAt: String!
+}
+
+"""
+The disagreement feed for one model, plus the lifecycle context the
+review page shows above the queue.
+"""
+type MlDisagreementFeed {
+	modelId: UUID!
+	lifecycleState: String!
+	"""
+	Rolling shadow agreement (fast-vs-LLM, all bands), 0–1. `None`
+	when the model has no shadow observations yet.
+	"""
+	shadowAgreement: Float
+	shadowObservations: Int!
+	pending: [MlDisagreement!]!
+}
+
+"""
+One model's review summary — enough to render a list with a
+"needs review" badge and lifecycle status.
+"""
+type MlModelSummary {
+	id: UUID!
+	name: String!
+	taskType: String!
+	"""
+	`llm_only` | `shadow` | `hybrid` | `fast_primary`.
+	"""
+	lifecycleState: String!
+	promotedVersion: Int
+	"""
+	Holdout accuracy of the promoted version (0–1), if promoted.
+	"""
+	promotedAccuracy: Float
+	"""
+	Count of `pending` disagreements awaiting human review.
+	"""
+	pendingDisagreements: Int!
+}
+
+"""
+Outcome of resolving one disagreement.
+"""
+type MlResolveResult {
+	disagreementId: UUID!
+	"""
+	`"resolved"` (a gold correction was appended) or `"dismissed"`.
+	"""
+	status: String!
+	correctionAppended: Boolean!
+}
+
 type ModuleExecution {
 	id: UUID!
 	moduleId: UUID!
@@ -660,6 +734,14 @@ type MutationRoot {
 	retryExecution(executionId: UUID!): UUID!
 	approveExecution(id: UUID!, reason: String): Boolean!
 	denyExecution(id: UUID!, reason: String): Boolean!
+	"""
+	Resolve one pending disagreement. `correctLabel` present → append a
+	`source=correction` gold example (built from the disagreement's own
+	stored features; the caller supplies only the label) and mark it
+	resolved. Omitted/blank → dismiss. Counts toward the model's
+	promotion policy.
+	"""
+	resolveMlDisagreement(disagreementId: UUID!, correctLabel: String): MlResolveResult!
 	createModuleFromTemplate(input: CreateModuleInput!): WasmModule!
 	testModule(moduleId: UUID!, input: String, timeoutSecs: Int): TestModuleResult!
 	createOrganization(name: String!, slug: String!): OrganizationObj!
@@ -764,6 +846,28 @@ type NodeTemplate {
 	configSchema: String!
 	icon: String
 	allowedHosts: [String!]!
+	"""
+	The WIT capability world this template compiles to (e.g.
+	`"secrets-node"`, `"http-node"`, `"minimal-node"`). Surfaced so a
+	caller can see, BEFORE installing, the minimum actor capability
+	ceiling required to run a module built from this template — instead
+	of discovering it via a ceiling-denial at trigger time. Pair with
+	the `capabilityWorldHierarchy` query for the rank + description.
+	"""
+	capabilityWorld: String!
+	"""
+	Vault secret paths (or prefix globs) this template needs granted,
+	e.g. `["oauth/gmail/*"]`. Surfaced so a caller knows what to set up
+	before running rather than hitting a resolution failure.
+	"""
+	requiresSecrets: [String!]!
+	"""
+	Operation categories that make a module built from this template
+	pause for human approval at run time (e.g. `["network_scan"]`).
+	Empty for templates that never suspend. Surfaced so a suspension
+	isn't a surprise.
+	"""
+	requiresApprovalFor: [String!]!
 }
 
 type OauthAccount {
@@ -888,6 +992,16 @@ type QueryRoot {
 	me: UserInfo!
 	oauthLoginUrl(provider: String!): OauthAuthUrl!
 	linkedOauthAccounts: [OauthAccount!]!
+	"""
+	The caller's models, owner-scoped, ordered so the ones with the
+	most pending review float to the top.
+	"""
+	mlModels: [MlModelSummary!]!
+	"""
+	Pending disagreements for one model (owner-scoped, decrypted),
+	plus lifecycle + shadow context for the review header.
+	"""
+	mlModelDisagreements(modelName: String!, limit: Int): MlDisagreementFeed!
 	moduleExecutionHistory(moduleId: UUID!, pagination: PaginationInput): [ModuleExecution!]!
 	moduleExecutionLogs(executionId: UUID!): [ModuleExecutionLog!]!
 	nodeTemplates(category: String, pagination: PaginationInput): [NodeTemplate!]!
@@ -1447,4 +1561,3 @@ schema {
 	mutation: MutationRoot
 	subscription: SubscriptionRoot
 }
-
