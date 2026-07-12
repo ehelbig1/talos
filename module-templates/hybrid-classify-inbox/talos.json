@@ -1,0 +1,46 @@
+{
+  "name": "hybrid-classify-inbox",
+  "version": "v1.0.0",
+  "display_name": "Hybrid Classify (Inbox)",
+  "description": "RFC 0011 hybrid-serve reference consumer: classifies a batch of inbox messages by consulting a distilled model first (talos:core/model predict-batch, lifecycle-gated server-side) and routing ONLY the messages the model isn't confident about to the LLM. Emits the same {classifications:[{idx,bucket}]} shape a plain LLM classify node does — so a downstream organize node is unchanged — plus an __ml_distill__ envelope for the LLM-labeled subset only (active learning; the model's own predictions are never distilled back). While the model is in shadow/llm_only the gate makes it abstain on everything, so behavior is identical to the pre-hybrid organizer; the LLM-cost reduction turns on automatically when the model earns hybrid. Both the model's and the LLM's labels are validated against the allowed bucket set before they reach the output.",
+  "category": "AI",
+  "capability_world": "agent-node",
+  "allowed_hosts": [],
+  "allowed_secrets": [],
+  "recommended_fuel": {
+    "expected_items": 20,
+    "bytes_per_item": 2500,
+    "llm_output_bytes": 3000,
+    "safety_multiplier": 2.5
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["MODEL_NAME", "SYSTEM_PROMPT"],
+    "properties": {
+      "MODEL_NAME": {
+        "type": "string",
+        "description": "Registered ml_models name to consult (e.g. 'inbox-classifier-personal'). Resolved under the execution user's tenancy; served only once the model reaches hybrid/fast_primary (shadow → abstain-all → LLM handles everything)."
+      },
+      "SYSTEM_PROMPT": {
+        "type": "string",
+        "description": "The classification instructions for the LLM leg. Must instruct the model to return {\"classifications\":[{\"idx\":<int>,\"bucket\":\"follow_up|to_read|archive\"}]} referencing each message by its idx. Email content is wrapped in <untrusted_data> (spotlighting) before the LLM sees it."
+      },
+      "MODEL": {
+        "type": "string",
+        "default": "qwen3.6:latest",
+        "description": "LLM model identifier for the fallback leg."
+      },
+      "PROVIDER": {
+        "type": "string",
+        "enum": ["ollama", "anthropic", "openai", "gemini"],
+        "default": "ollama",
+        "description": "LLM provider for the fallback leg. 'ollama' (default, Tier 1, local) keeps email content on-host."
+      },
+      "MAX_TOKENS": {
+        "type": "number",
+        "default": 1800,
+        "description": "Max tokens for the LLM classification response."
+      }
+    }
+  }
+}

@@ -36,9 +36,31 @@ const DIGEST_ENTRIES: i64 = 20;
 /// Feature preview length in the digest (the full text stays encrypted
 /// in ml_disagreements; the digest carries a short reviewable excerpt).
 const PREVIEW_CHARS: usize = 160;
-/// Digest memory TTL — refreshed every tick, so a couple of days keeps
-/// it present between reviews without lingering forever.
+/// Digest memory TTL FLOOR — refreshed every tick, so a couple of days
+/// keeps it present between reviews without lingering forever. The
+/// EFFECTIVE ttl is `max(floor, 2× interval)` so raising the interval
+/// above 48 h can't let the entry lapse between refreshes (see
+/// [`effective_ttl_hours`]).
 const DIGEST_TTL_HOURS: f64 = 48.0;
+
+/// Parsed `ML_DIGEST_INTERVAL_SECS` (default 6 h, min 60 s). Shared by the
+/// loop cadence and the effective-TTL derivation so they can't diverge.
+fn digest_interval_secs() -> u64 {
+    std::env::var("ML_DIGEST_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v >= 60)
+        .unwrap_or(DEFAULT_DIGEST_INTERVAL_SECS)
+}
+
+/// Digest memory TTL, floored at [`DIGEST_TTL_HOURS`] and always at least
+/// two refresh intervals so a single missed/late tick can't let the entry
+/// expire out of the actor's memory (the pending items remain in
+/// `ml_disagreements` regardless — this only governs the review surface).
+fn effective_ttl_hours() -> f64 {
+    let interval_hours = digest_interval_secs() as f64 / 3600.0;
+    (interval_hours * 2.0).max(DIGEST_TTL_HOURS)
+}
 
 /// UTF-8-safe truncation for the preview.
 fn preview(s: &str) -> String {
@@ -57,11 +79,7 @@ pub fn spawn_disagreement_digest(
     lifecycle_service: std::sync::Arc<LifecycleService>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let interval_secs = std::env::var("ML_DIGEST_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v >= 60)
-        .unwrap_or(DEFAULT_DIGEST_INTERVAL_SECS);
+    let interval_secs = digest_interval_secs();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -202,9 +220,12 @@ async fn deliver_one(
     let digest = serde_json::json!({
         "model": name,
         "pending": entries.len(),
-        "review_hint": "For each entry call ml_resolve_disagreement(disagreement_id, \
-                        correct_label) to append a gold correction, or omit correct_label \
-                        to dismiss. Corrections count toward the model's promotion policy.",
+        "review_hint": "Label each entry by the category the email should ARRIVE in based \
+                        on its content — not where you later filed it after acting (reading a \
+                        'to_read' and then archiving it is NOT an 'archive' correction). Call \
+                        ml_resolve_disagreement(disagreement_id, correct_label) to append a gold \
+                        correction, or omit correct_label to dismiss. Corrections count toward \
+                        the model's promotion policy.",
         "entries": entries,
     });
 
@@ -229,7 +250,7 @@ async fn deliver_one(
         &digest,
         Some(&serde_json::json!({ "kind": "ml_digest", "model": name })),
         "scratchpad",
-        Some(DIGEST_TTL_HOURS),
+        Some(effective_ttl_hours()),
     )
     .await
     .context("write digest to actor_memory")?;
