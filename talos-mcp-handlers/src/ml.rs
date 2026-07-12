@@ -114,6 +114,38 @@ pub fn tool_schemas() -> Vec<Value> {
                 "text": { "type": "string" }
             }, "required": ["model_name", "text"] }
         }),
+        serde_json::json!({
+            "name": "ml_set_policy",
+            "description": "Set a model's lifecycle transition policy (RFC 0011 P2d). Typed + strict: unknown keys are rejected. Keys: min_examples, min_corrections_per_class, accuracy_at_coverage {min_accuracy, min_coverage}, recall_floors {class: floor}, auto_advance (default false — evaluator reports but a human promotes), demote_below_agreement, min_shadow_total. The scheduled evaluator re-judges on every dataset change.",
+            "inputSchema": { "type": "object", "properties": {
+                "model_id": { "type": "string" },
+                "policy": { "type": "object", "description": "The policy document; {} clears it (evaluator skips the model)" }
+            }, "required": ["model_id", "policy"] }
+        }),
+        serde_json::json!({
+            "name": "ml_set_lifecycle",
+            "description": "Manually move a model's lifecycle state (llm_only → shadow → hybrid → fast_primary). Promotes advance ONE step; demotes may drop any distance (every switch is one command to reverse). Audit-logged.",
+            "inputSchema": { "type": "object", "properties": {
+                "model_id": { "type": "string" },
+                "state": { "type": "string", "enum": ["llm_only", "shadow", "hybrid", "fast_primary"] }
+            }, "required": ["model_id", "state"] }
+        }),
+        serde_json::json!({
+            "name": "ml_disagreements",
+            "description": "Pending fast-vs-LLM divergences and low-confidence samples for a model (decrypted, owner-only) — the disagreement digest feed. Review each with ml_resolve_disagreement.",
+            "inputSchema": { "type": "object", "properties": {
+                "model_name": { "type": "string" },
+                "limit": { "type": "integer", "description": "1-100, default 20" }
+            }, "required": ["model_name"] }
+        }),
+        serde_json::json!({
+            "name": "ml_resolve_disagreement",
+            "description": "One-tap digest verdict. With correct_label: appends a human CORRECTION example (gold truth, replaces the production row via example_key) and marks the disagreement resolved. Without: marks it dismissed.",
+            "inputSchema": { "type": "object", "properties": {
+                "disagreement_id": { "type": "string" },
+                "correct_label": { "type": "string", "description": "The human-verified label; omit to dismiss" }
+            }, "required": ["disagreement_id"] }
+        }),
     ]
 }
 
@@ -145,6 +177,12 @@ pub async fn dispatch(
         "ml_list_models" => Some(handle_list_models(req_id, state, user_id).await),
         "ml_get_model_card" => Some(handle_get_model_card(req_id, args, state, user_id).await),
         "ml_predict" => Some(handle_predict(req_id, args, state, user_id).await),
+        "ml_set_policy" => Some(handle_set_policy(req_id, args, state, user_id).await),
+        "ml_set_lifecycle" => Some(handle_set_lifecycle(req_id, args, state, user_id).await),
+        "ml_disagreements" => Some(handle_disagreements(req_id, args, state, user_id).await),
+        "ml_resolve_disagreement" => {
+            Some(handle_resolve_disagreement(req_id, args, state, user_id).await)
+        }
         _ => None,
     }
 }
@@ -624,9 +662,29 @@ async fn handle_get_model_card(
         },
         None => None,
     };
+    // P2d lifecycle visibility: state + shadow agreement (overall) +
+    // pending-review count ride on the card so "why did the model say
+    // X" and "is it safe to advance" read from one place.
+    let lsvc = lifecycle_service(state);
+    let shadow = lsvc
+        .shadow_agreement(&mut tx, model.model_id, 0)
+        .await
+        .ok()
+        .flatten()
+        .map(
+            |(agreement, total)| serde_json::json!({"agreement": agreement, "observations": total}),
+        );
+    let pending_disagreements = lsvc
+        .pending_disagreements(&mut tx, model.model_id, user_id, 1)
+        .await
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     let card = serde_json::json!({
         "model_id": model.model_id.to_string(),
         "name": name,
+        "lifecycle_state": model.lifecycle_state,
+        "shadow": shadow,
+        "has_pending_disagreements": pending_disagreements,
         "dataset_id": model.dataset_id.map(|d| d.to_string()),
         "config_json": model.config_json,
         "promoted_version": model.promoted_version,
@@ -715,5 +773,341 @@ async fn handle_predict(
             .to_string(),
         ),
         Err(e) => internal(req_id, "predict", &e),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// RFC 0011 P2d — lifecycle governance handlers
+// ────────────────────────────────────────────────────────────────────
+
+fn lifecycle_service(state: &McpState) -> talos_ml::LifecycleService {
+    talos_ml::LifecycleService::new(state.secrets_manager.clone())
+}
+
+/// Set (or clear, with `{}`) a model's transition policy. Typed +
+/// strict (`deny_unknown_fields` + range checks) so a typo can never
+/// silently disable a governance gate; the model's config is ALSO
+/// re-checked against the LLM-locality pin so a policy write can't
+/// coexist with an unguarded external fallback.
+async fn handle_set_policy(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let model_id = match parse_uuid(args, "model_id") {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    let Some(policy_raw) = args.get("policy") else {
+        return mcp_error(req_id, -32602, "Missing required parameter: policy");
+    };
+    let policy = match talos_ml::PolicyJson::parse(policy_raw) {
+        Ok(p) => p,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    if let Err(m) = policy.validate() {
+        return mcp_error(req_id, -32602, &m);
+    }
+    let mut tx = match user_tx(state, user_id).await {
+        Ok(tx) => tx,
+        Err(e) => return internal(req_id, "set_policy", &e),
+    };
+    let Ok(Some(model)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
+        return mcp_error(req_id, -32000, "Model not found");
+    };
+    // Locality pin (RFC guard): auto_advance may route production
+    // traffic; refuse a policy on a config whose fallback/baseline LLM
+    // is external without the explicit opt-in.
+    if let Err(m) = talos_ml::validate_llm_locality(&model.config_json) {
+        return mcp_error(req_id, -32000, &m);
+    }
+    match ModelRegistry::set_policy(&mut tx, model_id, user_id, policy_raw).await {
+        Ok(true) => match tx.commit().await {
+            Ok(()) => {
+                let _ = state
+                    .actor_repo
+                    .insert_admin_event_log(
+                        user_id,
+                        "ml_policy_set",
+                        "ml_model",
+                        Some(model_id),
+                        &format!(
+                            "Model '{}' lifecycle policy set (auto_advance={})",
+                            model.name, policy.auto_advance
+                        ),
+                        Some(policy_raw),
+                    )
+                    .await;
+                mcp_text(
+                    req_id,
+                    &serde_json::json!({
+                        "model_id": model_id.to_string(),
+                        "policy": policy_raw,
+                        "auto_advance": policy.auto_advance,
+                    })
+                    .to_string(),
+                )
+            }
+            Err(e) => internal(req_id, "set_policy commit", &e.into()),
+        },
+        Ok(false) => mcp_error(req_id, -32000, "Model not found"),
+        Err(e) => internal(req_id, "set_policy", &e),
+    }
+}
+
+/// Manual lifecycle transition — CAS from the CURRENT state, one step
+/// forward or any distance back, audit-logged.
+async fn handle_set_lifecycle(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let model_id = match parse_uuid(args, "model_id") {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    let Some(to) = args
+        .get("state")
+        .and_then(|v| v.as_str())
+        .and_then(talos_ml::LifecycleState::parse)
+    else {
+        return mcp_error(
+            req_id,
+            -32602,
+            "state must be one of llm_only|shadow|hybrid|fast_primary",
+        );
+    };
+    let svc = lifecycle_service(state);
+    let mut tx = match user_tx(state, user_id).await {
+        Ok(tx) => tx,
+        Err(e) => return internal(req_id, "set_lifecycle", &e),
+    };
+    let Ok(Some(model)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
+        return mcp_error(req_id, -32000, "Model not found");
+    };
+    let Some(from) = talos_ml::LifecycleState::parse(&model.lifecycle_state) else {
+        return internal(
+            req_id,
+            "set_lifecycle",
+            &anyhow::anyhow!("unrecognized stored lifecycle state"),
+        );
+    };
+    if from == to {
+        return mcp_text(
+            req_id,
+            &serde_json::json!({"model_id": model_id.to_string(), "state": to.as_str(), "changed": false})
+                .to_string(),
+        );
+    }
+    if !talos_ml::can_transition(from, to) {
+        return mcp_error(
+            req_id,
+            -32000,
+            &format!(
+                "Illegal transition {} -> {}: promotes advance one step at a time; demotes may drop any distance",
+                from.as_str(),
+                to.as_str()
+            ),
+        );
+    }
+    match svc.transition(&mut tx, model_id, user_id, from, to).await {
+        Ok(true) => match tx.commit().await {
+            Ok(()) => {
+                talos_ml::invalidate_serving_cache(user_id, &model.name);
+                let _ = state
+                    .actor_repo
+                    .insert_admin_event_log(
+                        user_id,
+                        "ml_lifecycle_set",
+                        "ml_model",
+                        Some(model_id),
+                        &format!(
+                            "Model '{}' lifecycle manually moved {} -> {}",
+                            model.name,
+                            from.as_str(),
+                            to.as_str()
+                        ),
+                        None,
+                    )
+                    .await;
+                mcp_text(
+                    req_id,
+                    &serde_json::json!({
+                        "model_id": model_id.to_string(),
+                        "from": from.as_str(),
+                        "to": to.as_str(),
+                        "changed": true,
+                    })
+                    .to_string(),
+                )
+            }
+            Err(e) => internal(req_id, "set_lifecycle commit", &e.into()),
+        },
+        // CAS miss: someone (the evaluator) moved it first.
+        Ok(false) => mcp_error(
+            req_id,
+            -32000,
+            "State changed concurrently — re-read the model card and retry",
+        ),
+        Err(e) => internal(req_id, "set_lifecycle", &e),
+    }
+}
+
+/// The digest feed: pending fast-vs-LLM divergences, decrypted,
+/// owner-only.
+async fn handle_disagreements(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let Some(name) = args.get("model_name").and_then(|v| v.as_str()) else {
+        return mcp_error(req_id, -32602, "Missing required parameter: model_name");
+    };
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+    let svc = lifecycle_service(state);
+    let mut tx = match user_tx(state, user_id).await {
+        Ok(tx) => tx,
+        Err(e) => return internal(req_id, "disagreements", &e),
+    };
+    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
+        return mcp_error(req_id, -32000, "Model not found");
+    };
+    match svc
+        .pending_disagreements(&mut tx, model.model_id, user_id, limit)
+        .await
+    {
+        Ok(items) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "model_id": model.model_id.to_string(),
+                "lifecycle_state": model.lifecycle_state,
+                "pending": items,
+                "next_step": "for each: ml_resolve_disagreement with correct_label (appends a gold correction) or without (dismiss)",
+            }))
+            .unwrap_or_default(),
+        ),
+        Err(e) => internal(req_id, "disagreements", &e),
+    }
+}
+
+/// One-tap digest verdict. With `correct_label`, the SYSTEM stamps a
+/// `source='correction'` example from the disagreement's own stored
+/// features + example_key (the trusted correction-provenance path: the
+/// caller supplies only the label; features/key come from the recorded
+/// production traffic), then marks the row resolved. Without it, the
+/// row is dismissed.
+async fn handle_resolve_disagreement(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let id = match parse_uuid(args, "disagreement_id") {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    let correct_label = args
+        .get("correct_label")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 256);
+    let lsvc = lifecycle_service(state);
+    let dsvc = dataset_service(state);
+
+    // Short tx #1: fetch the pending row (owner-scoped, decrypted) and,
+    // for the correction path, resolve the target dataset + ownership.
+    // Then embed/encrypt with NO connection held, then a short tx #2
+    // for the insert + status flip — mirroring handle_append_examples'
+    // prepare-outside-tx discipline (the file header contract: a slow
+    // local embedder must never pin an idle-in-transaction connection).
+    let (pending, correction) = {
+        let mut tx = match user_tx(state, user_id).await {
+            Ok(tx) => tx,
+            Err(e) => return internal(req_id, "resolve_disagreement", &e),
+        };
+        let Ok(Some((model_id, pending))) = lsvc.get_disagreement(&mut tx, id, user_id).await
+        else {
+            return mcp_error(req_id, -32000, "Disagreement not found or already handled");
+        };
+        let correction = match correct_label {
+            Some(label) => {
+                let Ok(Some(model)) =
+                    ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await
+                else {
+                    return mcp_error(req_id, -32000, "Model not found");
+                };
+                let Some(dataset_id) = model.dataset_id else {
+                    return mcp_error(req_id, -32000, "Model has no dataset to correct into");
+                };
+                let tenancy = match require_dataset_owner(&dsvc, &mut tx, dataset_id, user_id).await
+                {
+                    Ok(t) => t,
+                    Err(m) => return mcp_error(req_id, -32000, &m),
+                };
+                Some((dataset_id, tenancy, label.to_string()))
+            }
+            None => None,
+        };
+        // Read-only so far; drop the tx (the write happens in tx #2).
+        (pending, correction)
+    };
+
+    // Embed + encrypt OUTSIDE any transaction.
+    let prepared = match &correction {
+        Some((dataset_id, tenancy, label)) => {
+            let example = AppendExample {
+                features_text: pending.features_text.clone(),
+                label: label.clone(),
+                source: ExampleSource::Correction,
+                example_key: pending.example_key.clone(),
+            };
+            match dsvc
+                .prepare_examples(*dataset_id, *tenancy, vec![example])
+                .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => return internal(req_id, "resolve_disagreement prepare", &e),
+            }
+        }
+        None => None,
+    };
+
+    // Short tx #2: insert the prepared correction (if any) + flip the
+    // status, atomically.
+    let mut tx = match user_tx(state, user_id).await {
+        Ok(tx) => tx,
+        Err(e) => return internal(req_id, "resolve_disagreement", &e),
+    };
+    let appended = prepared.is_some();
+    if let (Some(prepared), Some((dataset_id, tenancy, _))) = (prepared, &correction) {
+        if let Err(e) = dsvc
+            .insert_prepared(&mut tx, *dataset_id, *tenancy, prepared)
+            .await
+        {
+            return internal(req_id, "resolve_disagreement append", &e);
+        }
+    }
+    let status = if appended { "resolved" } else { "dismissed" };
+    match lsvc
+        .set_disagreement_status(&mut tx, id, user_id, status)
+        .await
+    {
+        Ok(true) => match tx.commit().await {
+            Ok(()) => mcp_text(
+                req_id,
+                &serde_json::json!({
+                    "disagreement_id": id.to_string(),
+                    "status": status,
+                    "correction_appended": appended,
+                })
+                .to_string(),
+            ),
+            Err(e) => internal(req_id, "resolve_disagreement commit", &e.into()),
+        },
+        Ok(false) => mcp_error(req_id, -32000, "Disagreement not found or already handled"),
+        Err(e) => internal(req_id, "resolve_disagreement", &e),
     }
 }

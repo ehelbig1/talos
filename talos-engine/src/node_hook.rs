@@ -288,6 +288,13 @@ impl NodeLifecycleHook for ControllerNodeHook {
 
         // ── 2. `__memory_write__` protocol: persist to actor_memory ──
         self.persist_memory_write_if_present(ctx.actor_id, output);
+
+        // ── 3. `__ml_distill__` protocol (RFC 0011 P2d): LLM answers →
+        // dataset auto-append + shadow prediction. Same opt-in-output
+        // shape and actor-binding contract as `__memory_write__`; the
+        // whole flow is tokio::spawn'd inside, so node-completion
+        // latency is unchanged.
+        talos_ml::spawn_distill_from_output(ctx.actor_id, output);
     }
 
     fn on_pipeline_step_completed(&self, actor_id: Option<Uuid>, step_output: &JsonValue) {
@@ -296,6 +303,7 @@ impl NodeLifecycleHook for ControllerNodeHook {
         // head via on_node_completed; double-billing per step would
         // inflate rollups by the chain length.
         self.persist_memory_write_if_present(actor_id, step_output);
+        talos_ml::spawn_distill_from_output(actor_id, step_output);
     }
 
     fn on_node_failed(

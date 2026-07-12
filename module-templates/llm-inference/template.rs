@@ -117,6 +117,23 @@ fn run(input: String) -> Result<String, String> {
         .map(|s| interpolate_raw(s, &interp_ctx))
         .unwrap_or_else(|| "episodic".to_string());
     let memory_write_ttl_hours = config.memory_write_ttl_hours.unwrap_or(168);
+    // DISTILL_* use interpolate_raw for the same reason MEMORY_WRITE_*
+    // do: values route to the engine hook, not into the LLM prompt.
+    let distill_model = config
+        .distill_model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(|m| interpolate_raw(m, &interp_ctx));
+    let distill_example_key = config
+        .distill_example_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .map(|k| interpolate_raw(k, &interp_ctx));
+    let distill_label_key = config
+        .distill_label_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .map(str::to_string);
     let memory_write_metadata_kind = config
         .memory_write_metadata_kind
         .as_deref()
@@ -322,6 +339,13 @@ fn run(input: String) -> Result<String, String> {
         }
     }
 
+    // DISTILL feature text is the RAW model input (pre-spotlight): the
+    // dataset must store what a future fast model would receive, not the
+    // <untrusted_data> armor this template wraps around the LLM leg.
+    let distill_features = match user_prompt_interpolated.as_deref() {
+        Some(rendered) => rendered.to_string(),
+        None => input.clone(),
+    };
     let user_content = match user_prompt_interpolated {
         Some(rendered) => rendered,
         None if spotlighting => format!("<untrusted_data>\n{}\n</untrusted_data>", input),
@@ -450,22 +474,62 @@ fn run(input: String) -> Result<String, String> {
     // object lands in actor_memory.metadata JSONB so callers can filter
     // via search_filtered(exclude_kinds=[...]) without polluting the
     // recall-set with synthetic LLM outputs.
-    if let Some(ref key) = memory_write_key {
-        let mut envelope = serde_json::json!({
-            "key": key,
-            "value": content_str,
-            "memory_type": memory_write_type,
-            "ttl_hours": memory_write_ttl_hours,
-        });
-        if let Some(ref kind) = memory_write_metadata_kind {
-            if let Some(obj) = envelope.as_object_mut() {
-                obj.insert("metadata".to_string(), serde_json::json!({ "kind": kind }));
-            }
+    // ── DISTILL_MODEL (RFC 0011 P2d) ────────────────────────────────────
+    // Same opt-in-output protocol as __memory_write__: the engine hook
+    // auto-appends the answer as source='llm_production' to the named
+    // model's dataset and, once the model is in shadow+, runs the fast
+    // backend alongside for agreement accounting. Single-example form —
+    // the answer IS the label, so this fits classify-style nodes whose
+    // output is one class name; batch classifiers emit the envelope
+    // themselves from their own module code.
+    // Label derivation guards against dataset poisoning (review
+    // 2026-07-11): under JSON mode the raw answer is a near-unique JSON
+    // blob — one "class" per example, destroying the balanced-vote
+    // priors and every per-class policy gate. With DISTILL_LABEL_KEY
+    // the label is that key's string value from the parsed answer;
+    // without it, JSON mode SKIPS the envelope entirely rather than
+    // poisoning the dataset. Plain-text mode uses the trimmed answer.
+    let distill_label: Option<String> = if distill_model.is_some() {
+        match (&distill_label_key, want_json) {
+            (Some(key), _) => serde_json::from_str::<serde_json::Value>(&content_str)
+                .ok()
+                .and_then(|v| v.get(key).and_then(|l| l.as_str().map(str::to_string)))
+                .filter(|l| !l.trim().is_empty()),
+            (None, true) => None,
+            (None, false) => Some(content_str.trim().to_string()).filter(|l| !l.is_empty()),
         }
-        let wrapped = serde_json::json!({
-            "content": content_str,
-            "__memory_write__": envelope,
-        });
+    } else {
+        None
+    };
+    let distill_envelope = match (&distill_model, distill_label) {
+        (Some(model), Some(label)) => Some(serde_json::json!({
+            "model": model,
+            "features_text": distill_features,
+            "label": label,
+            "example_key": distill_example_key,
+        })),
+        _ => None,
+    };
+
+    if memory_write_key.is_some() || distill_envelope.is_some() {
+        let mut wrapped = serde_json::json!({ "content": content_str });
+        if let Some(ref key) = memory_write_key {
+            let mut envelope = serde_json::json!({
+                "key": key,
+                "value": content_str,
+                "memory_type": memory_write_type,
+                "ttl_hours": memory_write_ttl_hours,
+            });
+            if let Some(ref kind) = memory_write_metadata_kind {
+                if let Some(obj) = envelope.as_object_mut() {
+                    obj.insert("metadata".to_string(), serde_json::json!({ "kind": kind }));
+                }
+            }
+            wrapped["__memory_write__"] = envelope;
+        }
+        if let Some(envelope) = distill_envelope {
+            wrapped["__ml_distill__"] = envelope;
+        }
         Ok(wrapped.to_string())
     } else {
         Ok(content_str)
@@ -520,6 +584,12 @@ struct Config {
     memory_write_ttl_hours: Option<u64>,
     #[serde(rename = "MEMORY_WRITE_METADATA_KIND")]
     memory_write_metadata_kind: Option<String>,
+    #[serde(rename = "DISTILL_MODEL")]
+    distill_model: Option<String>,
+    #[serde(rename = "DISTILL_EXAMPLE_KEY")]
+    distill_example_key: Option<String>,
+    #[serde(rename = "DISTILL_LABEL_KEY")]
+    distill_label_key: Option<String>,
     #[serde(rename = "OUTPUT_SCHEMA")]
     output_schema: Option<StringOrList>,
     #[serde(rename = "SYSTEM_PROMPT")]

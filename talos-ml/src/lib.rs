@@ -15,8 +15,11 @@
 //! embedding pipeline only — dataset content never leaves the host.
 
 pub mod dataset;
+pub mod distill;
 pub mod eval;
 pub mod knn;
+pub mod lifecycle;
+pub mod lifecycle_job;
 pub mod registry;
 pub mod serve;
 
@@ -24,11 +27,17 @@ pub use dataset::{
     AppendExample, DatasetService, DatasetStats, DatasetTenancy, ExampleSource, HoldoutExample,
     PreparedExample, SampledExample,
 };
+pub use distill::{spawn_distill_from_output, DistillContext, DISTILL_CONTEXT};
 pub use eval::{
     coverage_curve, evaluate_predictions, run_knn_eval, stratified_holdout, ClassMetrics,
     CoveragePoint, EvalReport, MIN_CLASS_FOR_HOLDOUT,
 };
 pub use knn::{knn_vote, knn_vote_balanced, KnnPrediction, Neighbor};
+pub use lifecycle::{
+    can_transition, confidence_band, evaluate_policy, validate_llm_locality, LifecycleService,
+    LifecycleState, PolicyDecision, PolicyInputs, PolicyJson,
+};
+pub use lifecycle_job::{run_policy_tick, spawn_policy_evaluator};
 pub use registry::{ModelRegistry, ModelVersionRow, ResolvedModel};
 pub use serve::{
     invalidate_serving_cache, serve_predict_batch, ServeError, ServeReply, ServedPrediction,
