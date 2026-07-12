@@ -490,6 +490,25 @@ async fn main() -> anyhow::Result<()> {
         core.secrets_manager.clone(),
     );
 
+    // RFC 0011 P2d: install the DISTILL hook context (the engine's
+    // node hook consumes `__ml_distill__` envelopes through it) and
+    // start the bounded lifecycle policy evaluator. Installed BEFORE
+    // any workflow can run so no envelope races an unset OnceLock (an
+    // unset context drops envelopes with a WARN, never panics).
+    let _ = talos_ml::DISTILL_CONTEXT.set(talos_ml::DistillContext {
+        db_pool: db_pool.clone(),
+        dataset_service: talos_ml::DatasetService::new(core.secrets_manager.clone()),
+        lifecycle_service: talos_ml::LifecycleService::new(core.secrets_manager.clone()),
+    });
+    talos_ml::spawn_policy_evaluator(
+        db_pool.clone(),
+        talos_ml::DatasetService::new(core.secrets_manager.clone()),
+        std::sync::Arc::new(talos_ml::LifecycleService::new(
+            core.secrets_manager.clone(),
+        )),
+        bg_shutdown_rx.clone(),
+    );
+
     // Embedding backfill, readiness recomputation, SLA degradation alerting.
     spawn_analytics_tasks(db_pool.clone(), bg_shutdown_rx.clone());
 

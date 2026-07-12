@@ -356,7 +356,86 @@ impl DatasetService {
             .execute(&mut *conn)
             .await
             .context("touch ml_dataset")?;
+        self.enforce_growth_cap(conn, dataset_id).await?;
         Ok(stored)
+    }
+
+    /// RFC 0011 P2d growth cap: when `schema_json.max_examples` is set,
+    /// evict the OLDEST non-correction rows past the cap — corrections
+    /// are PINNED (human truth is never auto-evicted; if corrections
+    /// alone exceed the cap, nothing more is removed). Runs inside every
+    /// append so the DISTILL auto-append can't grow a dataset
+    /// unboundedly between digests. One indexed count + one bounded
+    /// delete; no-op when the cap is unset or unexceeded.
+    /// Public so the lifecycle integration tests can exercise the
+    /// eviction invariant (corrections pinned) directly; production
+    /// callers reach it through `insert_prepared`.
+    pub async fn enforce_growth_cap(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+    ) -> Result<()> {
+        let schema: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT schema_json FROM ml_datasets WHERE id = $1")
+                .bind(dataset_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .context("read dataset schema_json")?;
+        let Some(cap) = schema
+            .as_ref()
+            .and_then(|s| s.get("max_examples"))
+            .and_then(|v| v.as_i64())
+            .filter(|c| *c > 0)
+        else {
+            return Ok(());
+        };
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ml_examples WHERE dataset_id = $1")
+                .bind(dataset_id)
+                .fetch_one(&mut *conn)
+                .await
+                .context("count dataset examples")?;
+        let excess = total - cap;
+        if excess <= 0 {
+            return Ok(());
+        }
+        let evicted = sqlx::query(
+            "DELETE FROM ml_examples WHERE id IN ( \
+                 SELECT id FROM ml_examples \
+                 WHERE dataset_id = $1 AND source <> 'correction' \
+                 ORDER BY created_at ASC, id LIMIT $2)",
+        )
+        .bind(dataset_id)
+        .bind(excess)
+        .execute(&mut *conn)
+        .await
+        .context("evict oldest non-correction examples past growth cap")?;
+        tracing::info!(
+            %dataset_id,
+            cap,
+            evicted = evicted.rows_affected(),
+            "ml dataset growth cap enforced (corrections pinned)"
+        );
+        Ok(())
+    }
+
+    /// Human-correction counts per class (`source = 'correction'`) —
+    /// the lifecycle policy's human-in-the-loop gate input.
+    pub async fn corrections_per_class(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+    ) -> Result<std::collections::BTreeMap<String, i64>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT label_json->>'label', COUNT(*) FROM ml_examples \
+             WHERE dataset_id = $1 AND source = 'correction' \
+               AND label_json->>'label' IS NOT NULL GROUP BY 1",
+        )
+        .bind(dataset_id)
+        .fetch_all(&mut *conn)
+        .await
+        .context("count corrections per class")?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Convenience wrapper for SMALL batches (a bootstrap page, a

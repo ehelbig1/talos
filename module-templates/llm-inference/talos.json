@@ -18,7 +18,12 @@
     "properties": {
       "PROVIDER": {
         "type": "string",
-        "enum": ["anthropic", "openai", "gemini", "ollama"],
+        "enum": [
+          "anthropic",
+          "openai",
+          "gemini",
+          "ollama"
+        ],
         "default": "anthropic",
         "description": "LLM provider. 'anthropic' (default, Tier 2) → api.anthropic.com; 'openai' (Tier 2) → api.openai.com; 'gemini' (Tier 2) → generativelanguage.googleapis.com; 'ollama' (Tier 1, local) → host's configured Ollama instance, no API key needed, data stays on-prem. The host resolves the provider's vault key automatically — there is no API_KEY_SECRET config in this module."
       },
@@ -41,7 +46,10 @@
         "description": "Sampling temperature (0.0 = deterministic, higher = more creative). Provider-specific range — typically 0.0 to 1.0 or 0.0 to 2.0. Omit to use the provider's default."
       },
       "OUTPUT_SCHEMA": {
-        "type": ["string", "array"],
+        "type": [
+          "string",
+          "array"
+        ],
         "description": "Required top-level JSON keys in the LLM output (e.g. 'action,target,confidence' or [\"action\",\"target\"]). When set, the output is parsed as JSON and each listed key must be present — failure raises an error. Setting OUTPUT_SCHEMA also automatically enables JSON mode (see RESPONSE_FORMAT): for OpenAI/Ollama the model is constrained to emit valid JSON at generation time via response_format, so fenced/prose output no longer trips the check. Anthropic (no response_format) falls back to the appended soft JSON instruction; for natively-enforced Anthropic structured output use the `llm-tools::complete-with-tools` host interface via a custom sandbox."
       },
       "RESPONSE_FORMAT": {
@@ -53,11 +61,17 @@
         "description": "Explicit, flexible passthrough of provider-specific request parameters — the escape hatch for any LLM capability the typed fields (MODEL/MAX_TOKENS/TEMPERATURE/RESPONSE_FORMAT) don't cover. A JSON object merged verbatim into the outbound provider request body; you are responsible for passing keys the SELECTED provider understands. Examples — Ollama/OpenAI (OpenAI-compatible): {\"seed\":42,\"top_p\":0.9,\"stop\":[\"\\n\\n\"],\"frequency_penalty\":0.3}; Anthropic: {\"top_k\":40,\"top_p\":0.95,\"stop_sequences\":[\"END\"]}. The host guardrails the merge — options can TUNE the request but can never replace the (SPOTLIGHTING-wrapped) prompt, enable streaming, or reach the URL/API key. Capped at 8KB. Combines with RESPONSE_FORMAT/OUTPUT_SCHEMA (JSON mode is merged in for OpenAI/Ollama unless you set response_format here yourself)."
       },
       "BLOCKED_PATTERNS": {
-        "type": ["string", "array"],
+        "type": [
+          "string",
+          "array"
+        ],
         "description": "Substrings that must NOT appear in the LLM output (comma-separated string or JSON array). Any match causes the node to fail with a descriptive error. Use to prevent prompt-injection payloads or sensitive markers from reaching downstream nodes."
       },
       "BLOCKED_PATTERNS_INPUT": {
-        "type": ["string", "array"],
+        "type": [
+          "string",
+          "array"
+        ],
         "description": "Substrings that must NOT appear in the input passed to the LLM. Same format as BLOCKED_PATTERNS. Pre-call guard — saves a round-trip when adversarial content is detected in retrieved data or upstream output."
       },
       "MAX_OUTPUT_CHARS_ENFORCED": {
@@ -95,6 +109,14 @@
         "type": "boolean",
         "default": true,
         "description": "Anti-prompt-injection wrapping. When true (default), wraps user input in <untrusted_data> tags, injected memory in <agent_memory> tags, and appends a SECURITY DIRECTIVE to the system prompt instructing the model to treat all tagged content as data, never instructions. Set false ONLY when you trust the input source completely (e.g. an internal pipeline)."
+      },
+      "DISTILL_MODEL": {
+        "type": "string",
+        "description": "RFC 0011 distillation opt-in: the registered ml_models NAME to distill this node's answers into. When set, the output carries an __ml_distill__ envelope; the engine hook auto-appends {input → answer} as source='llm_production' to the model's dataset (encrypted, locally embedded, growth-capped) and — once the model is in shadow or beyond — runs the fast backend alongside for agreement accounting. Single-example semantics: the LLM's whole (trimmed) answer is the label, so use this on classify-style nodes whose output is one class name. Requires an actor-bound workflow (the actor resolves dataset tenancy). Supports {{...}} interpolation."
+      },
+      "DISTILL_EXAMPLE_KEY": {
+        "type": "string",
+        "description": "Dedupe key for the distilled example (e.g. '{{__trigger_input__.message_id}}') — same-key rows REPLACE earlier ones, and a later human correction with this key overrides the production label. Optional; supports {{...}} interpolation. Ignored unless DISTILL_MODEL is set."
       }
     }
   }

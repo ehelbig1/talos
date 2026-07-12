@@ -22,6 +22,8 @@ pub struct ModelVersionRow {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedModel {
     pub name: String,
+    /// P2d lifecycle position (llm_only/shadow/hybrid/fast_primary).
+    pub lifecycle_state: String,
     pub model_id: Uuid,
     pub dataset_id: Option<Uuid>,
     pub config_json: serde_json::Value,
@@ -118,6 +120,27 @@ impl ModelRegistry {
     /// Promote a version: it becomes what `predict(model_name)` serves.
     /// The previous promoted version is retired in the same transaction
     /// scope (caller owns the tx).
+    /// Owner-scoped policy write. Callers MUST have validated the value
+    /// through `PolicyJson::parse` + `validate()` first — this method is
+    /// storage only.
+    pub async fn set_policy(
+        conn: &mut PgConnection,
+        model_id: Uuid,
+        user_id: Uuid,
+        policy_json: &serde_json::Value,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE ml_models SET policy_json = $1, updated_at = NOW() \
+             WHERE id = $2 AND user_id = $3",
+        )
+        .bind(policy_json)
+        .bind(model_id)
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
     pub async fn promote_version(
         conn: &mut PgConnection,
         model_id: Uuid,
@@ -222,7 +245,7 @@ impl ModelRegistry {
         user_id: Uuid,
     ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
-            "SELECT id, name, dataset_id, config_json, production_version_id \
+            "SELECT id, name, lifecycle_state, dataset_id, config_json, production_version_id \
              FROM ml_models WHERE id = $1 AND user_id = $2",
         )
         .bind(model_id)
@@ -249,7 +272,7 @@ impl ModelRegistry {
         user_id: Uuid,
     ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
-            "SELECT id, name, dataset_id, config_json, production_version_id \
+            "SELECT id, name, lifecycle_state, dataset_id, config_json, production_version_id \
              FROM ml_models WHERE name = $1 AND user_id = $2 \
              ORDER BY (org_id IS NULL) DESC, org_id, id LIMIT 1",
         )
@@ -269,6 +292,7 @@ impl ModelRegistry {
         let Some(m) = model else { return Ok(None) };
         let model_id: Uuid = m.try_get("id")?;
         let name: String = m.try_get("name")?;
+        let lifecycle_state: String = m.try_get("lifecycle_state")?;
         let dataset_id: Option<Uuid> = m.try_get("dataset_id")?;
         let config: serde_json::Value = m.try_get("config_json")?;
         let prod_id: Option<Uuid> = m.try_get("production_version_id")?;
@@ -298,6 +322,7 @@ impl ModelRegistry {
         Ok(Some(ResolvedModel {
             model_id,
             name,
+            lifecycle_state,
             dataset_id,
             config_json: config,
             promoted_version: version,
