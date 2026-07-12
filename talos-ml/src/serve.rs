@@ -278,7 +278,18 @@ pub async fn serve_predict_batch(
         .await
         .map_err(ServeError::Internal)?;
     if counts.is_empty() {
-        return Err(ServeError::NotAvailable);
+        // Empty dataset (all examples pruned/deleted) — the model can't
+        // answer, so ABSTAIN on every slot and let the caller's LLM handle
+        // the batch, exactly as the None-embed (line ~305) and
+        // dimensionality-drift (line ~308) per-slot abstentions do.
+        // Erroring the whole batch instead would break production
+        // classification for a consumer that doesn't catch the RPC error,
+        // contradicting the RFC's graceful-LLM-fallback contract.
+        return Ok(ServeReply {
+            predictions: inputs.iter().map(|_| None).collect(),
+            model_version: cfg.version,
+            backend: cfg.backend,
+        });
     }
 
     // 3. Embed all inputs CONCURRENTLY in waves of EMBED_CONCURRENCY

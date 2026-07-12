@@ -49,6 +49,11 @@ use crate::serve::serve_predict_batch;
 pub const MAX_DISTILL_ITEMS: usize = 64;
 const MAX_FEATURE_BYTES: usize = 16 * 1024;
 const MAX_LABEL_BYTES: usize = 256;
+/// Cap on `example_key`. It indexes the `(dataset_id, example_key)`
+/// partial-unique btree; a key over Postgres's ~2704-byte btree row limit
+/// errors the whole append chunk. Kept well under that — an oversized key
+/// is dropped (append still succeeds; it just won't dedup), never fatal.
+const MAX_EXAMPLE_KEY_BYTES: usize = 512;
 
 /// Services the spawned flow needs — installed once from `main()`
 /// (same OnceLock-injection shape as `GRAPH_SERVICE` /
@@ -71,6 +76,51 @@ pub static DISTILL_CONTEXT: OnceLock<DistillContext> = OnceLock::new();
 /// unbounded queue of parked tasks.
 const MAX_CONCURRENT_DISTILL_FLOWS: usize = 4;
 static DISTILL_PERMITS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+/// Per-model serialization of the shadow→append critical section. Two
+/// distill flows for the SAME model must not interleave: if flow A's
+/// append lands between flow B's shadow predict and B's own append, B's
+/// `knn_search` sees A's fresh (split-NULL) row as a self-match at
+/// similarity ~1.0 carrying the LLM label, structurally inflating shadow
+/// agreement — the number the auto-demote guard and the human trust.
+/// Different models still run fully concurrent. The map is self-cleaning
+/// (entries removed once the last flow releases) so it can't grow with
+/// distinct-models-ever-seen — a keyed map needs a sweep, and reference
+/// counting is the sweep here.
+type FlowLockMap = std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>;
+static MODEL_FLOW_LOCKS: OnceLock<std::sync::Mutex<FlowLockMap>> = OnceLock::new();
+
+/// Acquire (or create) the per-model lock arc. Cloning under the map lock
+/// keeps strong-count observations consistent with [`ModelFlowGuard`]'s
+/// removal check.
+fn model_flow_lock(model_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let map = MODEL_FLOW_LOCKS.get_or_init(|| std::sync::Mutex::new(FlowLockMap::new()));
+    let mut g = map.lock().unwrap_or_else(|p| p.into_inner());
+    g.entry(model_id)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Drops the map entry once no flow holds it. Declared BEFORE the owned
+/// mutex guard so it drops AFTER it (reverse drop order) — by then the
+/// guard has released its arc ref, so `strong_count == 1` means only the
+/// map holds it and it is safe to remove under the same map lock that
+/// [`model_flow_lock`] clones under.
+struct ModelFlowGuard {
+    model_id: Uuid,
+}
+impl Drop for ModelFlowGuard {
+    fn drop(&mut self) {
+        if let Some(map) = MODEL_FLOW_LOCKS.get() {
+            let mut g = map.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(a) = g.get(&self.model_id) {
+                if std::sync::Arc::strong_count(a) == 1 {
+                    g.remove(&self.model_id);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct DistillEnvelope {
@@ -115,13 +165,33 @@ fn normalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
             example_key: envelope.example_key,
         });
     }
+    // Normalize + validate each item. The label is TRIMMED before storage
+    // and comparison: an untrimmed "  archive  " would pass validation,
+    // be stored as a DISTINCT class, and never equal the model's trimmed
+    // prediction — corrupting the demote signal with false divergences and
+    // splitting the kNN label space. features_text stays verbatim (it is
+    // freeform and the model predicts on the same untrimmed text).
     let before = items.len();
-    items.retain(|i| {
-        !i.features_text.trim().is_empty()
-            && i.features_text.len() <= MAX_FEATURE_BYTES
-            && !i.label.trim().is_empty()
-            && i.label.len() <= MAX_LABEL_BYTES
-    });
+    let mut cleaned: Vec<DistillItem> = Vec::with_capacity(items.len());
+    for mut i in items {
+        i.label = i.label.trim().to_string();
+        if i.features_text.trim().is_empty()
+            || i.features_text.len() > MAX_FEATURE_BYTES
+            || i.label.is_empty()
+            || i.label.len() > MAX_LABEL_BYTES
+        {
+            continue;
+        }
+        // Oversized dedup key → drop the key, keep the teacher signal.
+        if i.example_key
+            .as_ref()
+            .is_some_and(|k| k.len() > MAX_EXAMPLE_KEY_BYTES)
+        {
+            i.example_key = None;
+        }
+        cleaned.push(i);
+    }
+    let mut items = cleaned;
     if items.len() > MAX_DISTILL_ITEMS {
         tracing::warn!(
             model,
@@ -241,107 +311,55 @@ async fn process_distill(
     }
     tx.commit().await.context("commit distill resolve tx")?;
 
-    // 1. Shadow FIRST (shadow/hybrid/fast_primary): the fast path must
-    // predict these items BEFORE they enter the dataset — `knn_search`
-    // includes fresh (split-NULL) rows, so predicting after the append
-    // would find each item as its own nearest neighbor at similarity
-    // 1.0 carrying the LLM's label, structurally inflating shadow
-    // agreement (the one number the demote guard and the human trust).
-    // The doubled embedding cost is absorbed by the embedding LRU
-    // (prepare_examples re-embeds the same texts as cache hits).
-    let mut shadow_recorded = 0usize;
-    if state != LifecycleState::LlmOnly {
-        let mut tx = talos_db::begin_tenant_read_scoped(
-            &ctx.db_pool,
-            &talos_tenancy::TenantReadScope::new(user_id, Vec::new()),
-        )
-        .await
-        .context("open distill shadow tx")?;
-        let inputs: Vec<String> = items.iter().map(|i| i.features_text.clone()).collect();
-        match serve_predict_batch(
-            &ctx.dataset_service,
-            &mut tx,
+    // Serialize the shadow→append critical section per model so a
+    // concurrent flow's append can't interleave and self-match-inflate
+    // this flow's shadow agreement (see MODEL_FLOW_LOCKS). `_flow_cleanup`
+    // is declared BEFORE `_flow_guard` so it drops AFTER the mutex guard
+    // has released its arc ref — only then does strong_count==1 mean the
+    // map is the sole holder and the entry is safe to remove.
+    let _flow_cleanup = ModelFlowGuard {
+        model_id: resolved.model_id,
+    };
+    let _flow_guard = model_flow_lock(resolved.model_id).lock_owned().await;
+
+    // 1. Shadow FIRST (shadow/hybrid/fast_primary): predict these items
+    // BEFORE they enter the dataset — `knn_search` includes fresh
+    // (split-NULL) rows, so predicting after the append would find each
+    // item as its own nearest neighbor at similarity 1.0 carrying the
+    // LLM's label, structurally inflating shadow agreement (the one number
+    // the demote guard and the human trust). The doubled embedding cost is
+    // absorbed by the embedding LRU (prepare_examples re-embeds as hits).
+    //
+    // A shadow FAILURE (predict OR a stats/disagreement write) is logged
+    // and swallowed here — it must NEVER block the durable append below.
+    // The append is the teacher signal; shadow is best-effort observation.
+    // (Pre-fix, a mid-loop `?` on a shadow-stat write aborted the whole
+    // flow and silently dropped the append.)
+    let shadow_recorded = if state != LifecycleState::LlmOnly {
+        match run_shadow(
+            ctx,
+            resolved.model_id,
             user_id,
+            tenancy.org_id,
             model_name,
-            &inputs,
-            crate::serve::ServingMode::Raw,
+            &items,
         )
         .await
         {
-            Ok(reply) => {
-                for (item, slot) in items.iter().zip(reply.predictions) {
-                    match slot {
-                        Some(p) => {
-                            let agreed = p.label == item.label;
-                            ctx.lifecycle_service
-                                .record_shadow_outcome(
-                                    &mut tx,
-                                    resolved.model_id,
-                                    user_id,
-                                    tenancy.org_id,
-                                    Some(p.confidence),
-                                    agreed,
-                                )
-                                .await?;
-                            if !agreed {
-                                ctx.lifecycle_service
-                                    .record_disagreement(
-                                        &mut tx,
-                                        resolved.model_id,
-                                        user_id,
-                                        tenancy.org_id,
-                                        item.example_key.as_deref(),
-                                        &item.features_text,
-                                        Some((&p.label, p.confidence)),
-                                        &item.label,
-                                        "divergence",
-                                    )
-                                    .await?;
-                            }
-                            shadow_recorded += 1;
-                        }
-                        None => {
-                            ctx.lifecycle_service
-                                .record_shadow_outcome(
-                                    &mut tx,
-                                    resolved.model_id,
-                                    user_id,
-                                    tenancy.org_id,
-                                    None,
-                                    false,
-                                )
-                                .await?;
-                            ctx.lifecycle_service
-                                .record_disagreement(
-                                    &mut tx,
-                                    resolved.model_id,
-                                    user_id,
-                                    tenancy.org_id,
-                                    item.example_key.as_deref(),
-                                    &item.features_text,
-                                    None,
-                                    &item.label,
-                                    "low_confidence",
-                                )
-                                .await?;
-                            shadow_recorded += 1;
-                        }
-                    }
-                }
-            }
+            Ok(n) => n,
             Err(e) => {
-                // Shadow is best-effort observation — an unavailable
-                // fast path must not lose the append below.
                 tracing::warn!(
                     target: "talos_ml",
                     model = model_name,
-                    error = ?e,
-                    "shadow predict failed; proceeding to append"
+                    error = %e,
+                    "shadow accounting failed; proceeding to append"
                 );
+                0
             }
         }
-        tx.commit().await.context("commit distill shadow tx")?;
-    }
+    } else {
+        0
+    };
 
     // 2. Auto-append (ALL states): prepare (embed+encrypt, NO conn
     // held) → short write tx. DatasetService is the only writer, so
@@ -382,6 +400,109 @@ async fn process_distill(
         "distill hook processed"
     );
     Ok(())
+}
+
+/// Shadow accounting: predict `items` with the fast path (Raw mode) in a
+/// dedicated tx and record per-band agreement + divergences. A predict
+/// failure returns `Ok(0)` (unavailable fast path is best-effort); a
+/// record/commit failure returns `Err` for the caller to LOG — the caller
+/// MUST still run the append (shadow errors are never fatal to the durable
+/// teacher signal). The per-model flow lock is held by the caller across
+/// this call AND the subsequent append, so no concurrent same-model append
+/// can contaminate this prediction. Returns the number of items recorded.
+async fn run_shadow(
+    ctx: &'static DistillContext,
+    model_id: Uuid,
+    user_id: Uuid,
+    org_id: Option<Uuid>,
+    model_name: &str,
+    items: &[DistillItem],
+) -> Result<usize> {
+    let mut tx = talos_db::begin_tenant_read_scoped(
+        &ctx.db_pool,
+        &talos_tenancy::TenantReadScope::new(user_id, Vec::new()),
+    )
+    .await
+    .context("open distill shadow tx")?;
+    let inputs: Vec<String> = items.iter().map(|i| i.features_text.clone()).collect();
+    let reply = match serve_predict_batch(
+        &ctx.dataset_service,
+        &mut tx,
+        user_id,
+        model_name,
+        &inputs,
+        crate::serve::ServingMode::Raw,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(e) => {
+            // Unavailable fast path is best-effort — NOT an error to the
+            // caller (which would then skip the append). Swallow here.
+            tracing::warn!(
+                target: "talos_ml",
+                model = model_name,
+                error = ?e,
+                "shadow predict failed; proceeding to append"
+            );
+            return Ok(0);
+        }
+    };
+    let mut shadow_recorded = 0usize;
+    for (item, slot) in items.iter().zip(reply.predictions) {
+        match slot {
+            Some(p) => {
+                let agreed = p.label == item.label;
+                ctx.lifecycle_service
+                    .record_shadow_outcome(
+                        &mut tx,
+                        model_id,
+                        user_id,
+                        org_id,
+                        Some(p.confidence),
+                        agreed,
+                    )
+                    .await?;
+                if !agreed {
+                    ctx.lifecycle_service
+                        .record_disagreement(
+                            &mut tx,
+                            model_id,
+                            user_id,
+                            org_id,
+                            item.example_key.as_deref(),
+                            &item.features_text,
+                            Some((&p.label, p.confidence)),
+                            &item.label,
+                            "divergence",
+                        )
+                        .await?;
+                }
+                shadow_recorded += 1;
+            }
+            None => {
+                ctx.lifecycle_service
+                    .record_shadow_outcome(&mut tx, model_id, user_id, org_id, None, false)
+                    .await?;
+                ctx.lifecycle_service
+                    .record_disagreement(
+                        &mut tx,
+                        model_id,
+                        user_id,
+                        org_id,
+                        item.example_key.as_deref(),
+                        &item.features_text,
+                        None,
+                        &item.label,
+                        "low_confidence",
+                    )
+                    .await?;
+                shadow_recorded += 1;
+            }
+        }
+    }
+    tx.commit().await.context("commit distill shadow tx")?;
+    Ok(shadow_recorded)
 }
 
 #[cfg(test)]
@@ -434,5 +555,42 @@ mod tests {
             serde_json::from_value(serde_json::json!({"model": "m", "items": items})).unwrap();
         let (_, items) = normalize(env).unwrap();
         assert_eq!(items.len(), MAX_DISTILL_ITEMS);
+    }
+
+    #[test]
+    fn normalize_trims_label_before_storage() {
+        // An untrimmed label would be stored as a DISTINCT class and never
+        // equal the model's trimmed prediction (false divergences).
+        let env: DistillEnvelope = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "items": [{"features_text": "Subject: hi", "label": "  archive  "}]
+        }))
+        .unwrap();
+        let (_, items) = normalize(env).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "archive", "label must be trimmed");
+    }
+
+    #[test]
+    fn normalize_drops_oversized_example_key_keeps_item() {
+        // Oversized key would blow the (dataset_id, example_key) btree row
+        // limit and error the whole append — drop the KEY, keep the item.
+        let big_key = "k".repeat(MAX_EXAMPLE_KEY_BYTES + 1);
+        let env: DistillEnvelope = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "items": [
+                {"features_text": "Subject: a", "label": "archive", "example_key": big_key},
+                {"features_text": "Subject: b", "label": "to_read", "example_key": "ok"}
+            ]
+        }))
+        .unwrap();
+        let (_, items) = normalize(env).unwrap();
+        assert_eq!(items.len(), 2, "both items retained");
+        assert!(items[0].example_key.is_none(), "oversized key dropped");
+        assert_eq!(
+            items[1].example_key.as_deref(),
+            Some("ok"),
+            "normal key kept"
+        );
     }
 }
