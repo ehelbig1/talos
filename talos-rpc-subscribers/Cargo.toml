@@ -26,8 +26,13 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-integration-state = { path = "../talos-integration-state" }
+talos-db = { path = "../talos-db" }
 talos-memory = { path = "../talos-memory" }
+# RFC 0011 P2c: `talos.ml.predict` serving (model resolution + knn
+# batch inference under a tenant-scoped read tx).
+talos-ml = { path = "../talos-ml" }
 talos-replay-guard = { path = "../talos-replay-guard" }
+talos-tenancy = { path = "../talos-tenancy" }
 # Wasm-security review 2026-05-22 (MEDIUM-1): canonical SQL function
 # deny-list lives here so worker + controller subscriber agree byte-
 # identically. Same single-source-of-truth pattern as

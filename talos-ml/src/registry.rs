@@ -21,6 +21,7 @@ pub struct ModelVersionRow {
 /// like task_type are additive instead of positionally breaking).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedModel {
+    pub name: String,
     pub model_id: Uuid,
     pub dataset_id: Option<Uuid>,
     pub config_json: serde_json::Value,
@@ -152,12 +153,22 @@ impl ModelRegistry {
         Ok(())
     }
 
-    /// List models visible to the caller's scope (RLS) with their
-    /// promoted-version summary.
-    pub async fn list_models(conn: &mut PgConnection) -> Result<Vec<serde_json::Value>> {
+    /// List the caller's models with their promoted-version summary.
+    ///
+    /// App-layer `user_id` scoping is the belt; RLS (when enforced) is
+    /// the suspenders — same defense-in-depth posture as
+    /// `require_dataset_owner` on the dataset surface, because RLS only
+    /// enforces under `TALOS_RLS_SET_ROLE` and is bypassed entirely on
+    /// superuser pools (the common in-cluster deploy). P2 is
+    /// personal-only; org-shared visibility is a P2d decision.
+    pub async fn list_models(
+        conn: &mut PgConnection,
+        user_id: Uuid,
+    ) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
-            "SELECT m.id, m.name, m.task_type, m.dataset_id, m.created_at,                     v.version AS promoted_version, v.backend AS promoted_backend,                     v.metrics_json AS promoted_metrics              FROM ml_models m              LEFT JOIN ml_model_versions v ON v.id = m.production_version_id              ORDER BY m.created_at DESC LIMIT 100",
+            "SELECT m.id, m.name, m.task_type, m.dataset_id, m.created_at,                     v.version AS promoted_version, v.backend AS promoted_backend,                     v.metrics_json AS promoted_metrics              FROM ml_models m              LEFT JOIN ml_model_versions v ON v.id = m.production_version_id              WHERE m.user_id = $1              ORDER BY m.created_at DESC LIMIT 100",
         )
+        .bind(user_id)
         .fetch_all(&mut *conn)
         .await?;
         rows.into_iter()
@@ -200,38 +211,50 @@ impl ModelRegistry {
             .collect()
     }
 
-    /// Resolve a model by id (same shape as name resolution; RLS scopes
-    /// visibility).
+    /// Resolve a model by id, scoped to its OWNER (same shape as name
+    /// resolution). The `user_id` predicate is the app-layer tenancy
+    /// belt (foreign and absent ids are indistinguishable — `None`);
+    /// RLS backstops it when enforced. Every mutating caller (promote)
+    /// relies on this scoping as its ownership gate.
     pub async fn resolve_by_id(
         conn: &mut PgConnection,
         model_id: Uuid,
+        user_id: Uuid,
     ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
-            "SELECT id, dataset_id, config_json, production_version_id \
-             FROM ml_models WHERE id = $1",
+            "SELECT id, name, dataset_id, config_json, production_version_id \
+             FROM ml_models WHERE id = $1 AND user_id = $2",
         )
         .bind(model_id)
+        .bind(user_id)
         .fetch_optional(&mut *conn)
         .await?;
         Self::hydrate_resolved(conn, model).await
     }
 
-    /// Resolve a model by name. RLS scopes visibility; name is unique
-    /// only PER SCOPE (personal / each org), so a caller may see several
-    /// same-named rows — precedence is deterministic: the caller's OWN
-    /// personal model first, then org models by fixed org order. Without
-    /// the ORDER BY, `LIMIT 1` was planner-dependent and an org member
-    /// could shadow a colleague's personal model name nondeterministically.
+    /// Resolve a model by name, scoped to the caller's PERSONAL models.
+    ///
+    /// The `user_id` predicate is the app-layer tenancy belt (review
+    /// finding 2026-07-11: without it, cross-tenant isolation rested
+    /// entirely on RLS, which only enforces under `TALOS_RLS_SET_ROLE`
+    /// and never on superuser pools — a first for the signed-RPC
+    /// family, whose siblings all scope reads by the signed identity in
+    /// SQL). Name is unique per (user, name) under this predicate, so
+    /// the resolution is deterministic; the ORDER BY guards the org
+    /// extension (P2d), where a caller may additionally see same-named
+    /// org rows and personal must win deterministically.
     pub async fn resolve_by_name(
         conn: &mut PgConnection,
         name: &str,
+        user_id: Uuid,
     ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
-            "SELECT id, dataset_id, config_json, production_version_id \
-             FROM ml_models WHERE name = $1 \
+            "SELECT id, name, dataset_id, config_json, production_version_id \
+             FROM ml_models WHERE name = $1 AND user_id = $2 \
              ORDER BY (org_id IS NULL) DESC, org_id, id LIMIT 1",
         )
         .bind(name)
+        .bind(user_id)
         .fetch_optional(&mut *conn)
         .await?;
         Self::hydrate_resolved(conn, model).await
@@ -245,6 +268,7 @@ impl ModelRegistry {
     ) -> Result<Option<ResolvedModel>> {
         let Some(m) = model else { return Ok(None) };
         let model_id: Uuid = m.try_get("id")?;
+        let name: String = m.try_get("name")?;
         let dataset_id: Option<Uuid> = m.try_get("dataset_id")?;
         let config: serde_json::Value = m.try_get("config_json")?;
         let prod_id: Option<Uuid> = m.try_get("production_version_id")?;
@@ -273,6 +297,7 @@ impl ModelRegistry {
         };
         Ok(Some(ResolvedModel {
             model_id,
+            name,
             dataset_id,
             config_json: config,
             promoted_version: version,

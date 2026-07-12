@@ -1339,6 +1339,70 @@ interface graph-memory {
 }
 
 // ============================================================================
+// Model Interface - RFC 0011: platform ML-model inference (talos.ml.predict)
+//
+// Mirrors llm ergonomics for the distillation lifecycle: guests name a
+// registered model; the host signs a batch predict RPC to the controller,
+// which resolves the model under the EXECUTION USER's tenancy (RLS-scoped)
+// and serves the promoted version. Inference is host-local (local embeddings
+// + in-Postgres ANN) — no data leaves the host, so the surface is
+// Tier-1-clean by construction.
+// ============================================================================
+interface model {
+    /// One prediction. `confidence` is the winning share of (damped,
+    /// class-balanced) vote weight — comparable against a threshold only
+    /// when that threshold was calibrated under the same voting scheme
+    /// (see the model version's metrics_json.voting).
+    record prediction {
+        /// Predicted label (classification task types).
+        label: string,
+        /// Winning vote share in [0, 1].
+        confidence: f32,
+    }
+
+    /// Batch result: one slot per input, in request order. `none` in a
+    /// slot means the model ABSTAINED for that input (no usable
+    /// neighborhood / input could not be embedded) — callers route those
+    /// inputs to their LLM fallback branch.
+    record predict-reply {
+        predictions: list<option<prediction>>,
+        /// The promoted version that served this batch.
+        model-version: s32,
+        backend: string,
+    }
+
+    enum error {
+        /// No model with this name is visible to the execution user
+        /// (absent and foreign models are deliberately indistinguishable).
+        not-found,
+        /// Model exists but no version has been promoted to production.
+        not-promoted,
+        /// Promoted version can't serve: unsupported backend, dataset
+        /// missing/empty, or the serving path is not configured.
+        not-available,
+        /// Empty/oversized model name or inputs (caps: 32 inputs,
+        /// 16 KiB each), or no execution user context.
+        invalid-input,
+        /// Controller RPC did not reply within the timeout budget.
+        timeout,
+        /// Per-execution predict budget exhausted.
+        rate-limited,
+        /// The execution was cancelled — do NOT retry; unwind.
+        cancelled,
+        /// Controller replied with an internal error.
+        internal,
+    }
+
+    /// Predict one input. `none` = the model abstained (fall back to
+    /// the LLM branch). Sugar over predict-batch for single-item nodes.
+    predict: func(model-name: string, input: string) -> result<option<prediction>, error>;
+
+    /// Predict up to 32 inputs in one signed RPC (one embed + ANN query
+    /// per input server-side; batching saves the per-call overhead).
+    predict-batch: func(model-name: string, inputs: list<string>) -> result<predict-reply, error>;
+}
+
+// ============================================================================
 // Agent Orchestration Interface - Multi-agent coordination
 // ============================================================================
 interface agent-orchestration {
@@ -1463,6 +1527,7 @@ world secrets-node {
     import context-window;
     import resource-quotas;
     import embedding;
+    import model;
 
     export run: func(input: string) -> result<string, string>;
 }
@@ -1607,6 +1672,7 @@ world database-node {
     import context-window;
     import resource-quotas;
     import embedding;
+    import model;
     import database;
     import agent-memory;
     import graph-memory;
@@ -1649,6 +1715,7 @@ world agent-node {
     import context-window;
     import resource-quotas;
     import embedding;
+    import model;
 
     import agent-memory;
     import graph-memory;
@@ -1692,6 +1759,7 @@ world automation-node {
     import context-window;
     import resource-quotas;
     import embedding;
+    import model;
     import files;
     import cache;
     import messaging;

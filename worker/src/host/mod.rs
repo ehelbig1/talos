@@ -23,9 +23,9 @@ pub(crate) use crate::bindings::talos::core::{
     files as wit_files, graph_memory as wit_graph_memory, graphql as wit_graphql, http as wit_http,
     http_stream as wit_http_stream, integration_state as wit_integration_state, json as wit_json,
     llm as wit_llm, llm_streaming as wit_llm_streaming, llm_tools as wit_llm_tools,
-    logging as wit_logging, messaging as wit_messaging, object_storage as wit_object_storage,
-    resource_quotas as wit_resource_quotas, secrets as wit_secrets, state as wit_state,
-    templates as wit_templates, webhook as wit_webhook,
+    logging as wit_logging, messaging as wit_messaging, model as wit_model,
+    object_storage as wit_object_storage, resource_quotas as wit_resource_quotas,
+    secrets as wit_secrets, state as wit_state, templates as wit_templates, webhook as wit_webhook,
 };
 pub(crate) use futures_util::StreamExt;
 pub(crate) use sha2::{Digest, Sha256};
@@ -54,6 +54,7 @@ mod llm_tools;
 mod logging;
 mod memory;
 mod messaging;
+mod model;
 mod object_storage;
 mod orchestration;
 mod secrets;

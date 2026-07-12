@@ -1442,6 +1442,13 @@ fn build_secrets_linker(engine: &Engine) -> Result<Linker<TalosContext>> {
         &mut l,
         |c| c,
     )?;
+    // Model inference (RFC 0011): signed controller RPC — same secrets
+    // tier as llm/embedding so classify nodes can swap LLM → model
+    // without a world change.
+    crate::bindings::talos::core::model::add_to_linker::<TalosContext, HasSelf<TalosContext>>(
+        &mut l,
+        |c| c,
+    )?;
     Ok(l)
 }
 

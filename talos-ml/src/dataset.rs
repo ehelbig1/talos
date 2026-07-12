@@ -34,7 +34,7 @@ use crate::knn::Neighbor;
 /// to an embedding-NULL row (backfillable) rather than failing every
 /// INSERT — the actor_memory dimensionality-drift incident class. The
 /// column type is corrected to vector(1024) by 20260711150000.
-fn expected_embedding_dims() -> usize {
+pub(crate) fn expected_embedding_dims() -> usize {
     talos_memory::embedding::EmbeddingConfig::cached()
         .map(|c| c.dimensions)
         .unwrap_or(1024)

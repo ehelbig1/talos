@@ -18,6 +18,7 @@ pub mod dataset;
 pub mod eval;
 pub mod knn;
 pub mod registry;
+pub mod serve;
 
 pub use dataset::{
     AppendExample, DatasetService, DatasetStats, DatasetTenancy, ExampleSource, HoldoutExample,
@@ -29,3 +30,6 @@ pub use eval::{
 };
 pub use knn::{knn_vote, knn_vote_balanced, KnnPrediction, Neighbor};
 pub use registry::{ModelRegistry, ModelVersionRow, ResolvedModel};
+pub use serve::{
+    invalidate_serving_cache, serve_predict_batch, ServeError, ServeReply, ServedPrediction,
+};

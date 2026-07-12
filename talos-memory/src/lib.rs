@@ -29,6 +29,7 @@ pub mod embedding;
 pub mod graph_rpc;
 pub mod integration_state_rpc;
 pub mod memory_rpc;
+pub mod ml_rpc;
 pub mod rpc_auth;
 pub mod state_rpc;
 

@@ -22,7 +22,11 @@ use talos_ml::{AppendExample, DatasetService, ExampleSource, ModelRegistry};
 use uuid::Uuid;
 
 const MAX_EXAMPLES_PER_CALL: usize = 200;
-const DEFAULT_KNN_K: i64 = 7;
+// Single source of truth in talos-ml so the MCP predict/eval paths and
+// the RPC serving path can never diverge on the default neighborhood
+// (review finding 2026-07-11: a local 5-vs-7 split meant the promotion
+// gate certified a different model than the one being served).
+use talos_ml::serve::DEFAULT_KNN_K;
 
 pub fn tool_schemas() -> Vec<Value> {
     vec![
@@ -463,7 +467,7 @@ async fn handle_eval_model(
         Err(e) => return internal(req_id, "eval_model", &e),
     };
     // Resolve model + its dataset; ownership gate rides on the dataset.
-    let Ok(Some(models)) = ModelRegistry::resolve_by_id(&mut tx, model_id).await else {
+    let Ok(Some(models)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
         return mcp_error(req_id, -32000, "Model not found");
     };
     let Some(dataset_id) = models.dataset_id else {
@@ -543,7 +547,7 @@ async fn handle_promote_model(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "promote_model", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_id(&mut tx, model_id).await else {
+    let Ok(Some(model)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
         return mcp_error(req_id, -32000, "Model not found");
     };
     if let Some(dataset_id) = model.dataset_id {
@@ -553,14 +557,20 @@ async fn handle_promote_model(
     }
     match ModelRegistry::promote_version(&mut tx, model_id, version_id).await {
         Ok(()) => match tx.commit().await {
-            Ok(()) => mcp_text(
-                req_id,
-                &serde_json::json!({
-                    "model_id": model_id.to_string(),
-                    "promoted_version_id": version_id.to_string(),
-                })
-                .to_string(),
-            ),
+            Ok(()) => {
+                // P2c serving cache: drop the resolved entry so the RPC
+                // path serves the newly promoted version immediately
+                // (same-process; the 15 s TTL bounds other replicas).
+                talos_ml::serve::invalidate_serving_cache(user_id, &model.name);
+                mcp_text(
+                    req_id,
+                    &serde_json::json!({
+                        "model_id": model_id.to_string(),
+                        "promoted_version_id": version_id.to_string(),
+                    })
+                    .to_string(),
+                )
+            }
             Err(e) => internal(req_id, "promote_model commit", &e.into()),
         },
         Err(e) => internal(req_id, "promote_model", &e),
@@ -576,7 +586,7 @@ async fn handle_list_models(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "list_models", &e),
     };
-    match ModelRegistry::list_models(&mut tx).await {
+    match ModelRegistry::list_models(&mut tx, user_id).await {
         Ok(models) => mcp_text(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({ "models": models }))
@@ -600,7 +610,7 @@ async fn handle_get_model_card(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "get_model_card", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name).await else {
+    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
         return mcp_error(req_id, -32000, "Model not found");
     };
     let versions = match ModelRegistry::list_versions(&mut tx, model.model_id).await {
@@ -646,7 +656,7 @@ async fn handle_predict(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "predict", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name).await else {
+    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
         return mcp_error(req_id, -32000, "Model not found");
     };
     let Some(promoted) = &model.promoted_version else {
