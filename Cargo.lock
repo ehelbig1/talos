@@ -7247,6 +7247,7 @@ dependencies = [
  "talos-llm",
  "talos-mcp-tool-schema",
  "talos-memory",
+ "talos-ml",
  "talos-module-executions",
  "talos-module-repository",
  "talos-oauth",

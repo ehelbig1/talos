@@ -9,6 +9,7 @@
 pub mod actors;
 pub mod auth;
 pub mod executions;
+pub mod ml;
 pub mod modules;
 pub mod organizations;
 pub mod platform;

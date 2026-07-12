@@ -28,6 +28,7 @@ const ActorDetail = lazy(() => import("@/pages/ActorDetail"));
 const ActorCompare = lazy(() => import("@/pages/ActorCompare"));
 const Health = lazy(() => import("@/pages/Health"));
 const Library = lazy(() => import("@/pages/Library"));
+const ModelReview = lazy(() => import("@/pages/ModelReview"));
 
 function LoadingScreen() {
   return (
@@ -203,6 +204,27 @@ function AuthenticatedApp() {
 
             <Tooltip>
               <TooltipTrigger asChild>
+                <NavLink to="/models" className={navLinkClass}>
+                  {({ isActive }) => (
+                    <>
+                      Models
+                      {isActive && (
+                        <span className="absolute -bottom-1.5 left-4 right-4 h-0.5 bg-primary rounded-full shadow-[0_0_10px_hsla(var(--primary),0.5)] animate-in fade-in zoom-in-50 duration-500" />
+                      )}
+                    </>
+                  )}
+                </NavLink>
+              </TooltipTrigger>
+              <TooltipContent
+                side="bottom"
+                className="bg-surface-4 border-white/5 text-[10px] font-black uppercase tracking-widest shadow-2xl"
+              >
+                Review model disagreements
+              </TooltipContent>
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
                 <NavLink to="/library" className={navLinkClass}>
                   {({ isActive }) => (
                     <>
@@ -312,6 +334,7 @@ function AuthenticatedApp() {
                 <Route path="/actors" element={<Actors />} />
                 <Route path="/actors/compare" element={<ActorCompare />} />
                 <Route path="/actors/:id" element={<ActorDetail />} />
+                <Route path="/models" element={<ModelReview />} />
                 <Route path="/library" element={<Library />} />
                 <Route
                   path="/catalog"
