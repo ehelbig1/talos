@@ -146,6 +146,22 @@ pub fn tool_schemas() -> Vec<Value> {
                 "correct_label": { "type": "string", "description": "The human-verified label; omit to dismiss" }
             }, "required": ["disagreement_id"] }
         }),
+        serde_json::json!({
+            "name": "ml_provision_classifier",
+            "description": "One-call classifier setup: creates the dataset + model (born llm_only) + a safe default promotion policy (auto_advance OFF — a human promotes) under the given actor's tenancy, and returns the model_name to wire into a Smart Classifier / Model_Predict node. Idempotent: an existing model of the same name is reused. The classifier starts as pure-LLM and distills into a fast model as the workflow runs.",
+            "inputSchema": { "type": "object", "properties": {
+                "name": { "type": "string", "description": "Classifier name (per-user unique; [A-Za-z0-9._-])" },
+                "labels": { "type": "array", "items": {"type": "string"}, "description": "The label set — 2+ distinct classes" },
+                "actor_id": { "type": "string", "description": "The workflow's bound actor (must be yours); owns tenancy + digest delivery" },
+                "fallback_provider": { "type": "string", "description": "LLM fallback provider (default ollama, Tier-1 local)" },
+                "fallback_model": { "type": "string", "description": "LLM fallback model (default qwen3.6:latest)" },
+                "allow_external_llm": { "type": "boolean", "description": "Opt-in for a non-local (Tier-2) fallback provider; default false" },
+                "k": { "type": "integer", "description": "kNN neighborhood (default 7)" },
+                "confidence_threshold": { "type": "number", "description": "Serving confidence gate 0-1 (default 0.6)" },
+                "max_examples": { "type": "integer", "description": "Dataset growth cap" },
+                "policy": { "type": "object", "description": "Advanced: full policy override; omit for the safe default" }
+            }, "required": ["name", "labels", "actor_id"] }
+        }),
     ]
 }
 
@@ -182,6 +198,9 @@ pub async fn dispatch(
         "ml_disagreements" => Some(handle_disagreements(req_id, args, state, user_id).await),
         "ml_resolve_disagreement" => {
             Some(handle_resolve_disagreement(req_id, args, state, user_id).await)
+        }
+        "ml_provision_classifier" => {
+            Some(handle_provision_classifier(req_id, args, state, user_id).await)
         }
         _ => None,
     }
@@ -1066,5 +1085,81 @@ async fn handle_resolve_disagreement(
             mcp_error(req_id, -32000, "Model has no dataset to correct into")
         }
         Err(talos_ml::ResolveError::Internal(e)) => internal(req_id, "resolve_disagreement", &e),
+    }
+}
+
+/// One-call classifier provisioning — the Smart Classifier front door.
+/// Composes dataset + model + safe-default policy in one owner-scoped tx via
+/// the shared `talos_ml::provision_classifier` (the same service the GraphQL
+/// mutation calls). This handler only parses input + maps the outcome.
+async fn handle_provision_classifier(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
+        return mcp_error(req_id, -32602, "Missing required parameter: name");
+    };
+    let labels: Vec<String> = args
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if labels.is_empty() {
+        return mcp_error(
+            req_id,
+            -32602,
+            "Missing required parameter: labels (2+ distinct)",
+        );
+    }
+    let actor_id = match parse_uuid(args, "actor_id") {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    let input = talos_ml::ProvisionInput {
+        name: name.to_string(),
+        labels,
+        actor_id,
+        fallback_provider: args
+            .get("fallback_provider")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        fallback_model: args
+            .get("fallback_model")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        allow_external_llm: args
+            .get("allow_external_llm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        k: args.get("k").and_then(|v| v.as_i64()),
+        confidence_threshold: args.get("confidence_threshold").and_then(|v| v.as_f64()),
+        max_examples: args.get("max_examples").and_then(|v| v.as_i64()),
+        policy_override: args.get("policy").cloned(),
+    };
+    let dsvc = dataset_service(state);
+    match talos_ml::provision_classifier(&state.db_pool, &dsvc, input, user_id).await {
+        Ok(o) => mcp_text(
+            req_id,
+            &serde_json::json!({
+                "model_name": o.model_name,
+                "model_id": o.model_id.to_string(),
+                "dataset_id": o.dataset_id.to_string(),
+                "lifecycle_state": o.lifecycle_state,
+                "already_existed": o.already_existed,
+                "next_step": "wire model_name into a classifier node on an actor-bound workflow; it serves via the LLM until it distills enough data and you promote it in the Models page",
+            })
+            .to_string(),
+        ),
+        Err(talos_ml::ProvisionError::InvalidInput(m)) => mcp_error(req_id, -32602, &m),
+        Err(talos_ml::ProvisionError::InvalidActor) => {
+            mcp_error(req_id, -32000, "actor not found or not owned by you")
+        }
+        Err(talos_ml::ProvisionError::Internal(e)) => internal(req_id, "provision_classifier", &e),
     }
 }
