@@ -1430,6 +1430,11 @@ type WasmModule {
 	schema's REQUIRED KEYS as a rename-stable module identity.
 	"""
 	configSchema: String
+	"""
+	Origin catalog template slug (e.g. "smart-classifier"); stable under
+	display-name renames. None for sandbox/extracted modules.
+	"""
+	catalogSlug: String
 	capabilityWorld: String
 	importedInterfaces: [String!]
 	sourceCode: String

@@ -134,6 +134,9 @@ pub struct ModuleDetailsRow {
     /// Exposed so the editor can identify a module by its CONTRACT (stable
     /// under rename) instead of its mutable display name.
     pub config_schema: Option<serde_json::Value>,
+    /// Origin template slug for catalog modules (stable under display-name
+    /// renames); NULL for sandbox/extracted modules.
+    pub catalog_slug: Option<String>,
     pub source_code: Option<String>,
     pub capability_world: Option<String>,
     pub imported_interfaces: Option<Vec<String>>,
@@ -780,7 +783,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, config_schema, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, catalog_slug, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE id = ANY($1)
                AND (user_id = $2 OR org_id = ANY($3))",
@@ -806,7 +809,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, config_schema, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, catalog_slug, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE id = ANY($1)",
         )
@@ -832,7 +835,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, config_schema, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, catalog_slug, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE (user_id = $1 OR org_id = ANY($4))
              ORDER BY COALESCE(compiled_at, created_at) DESC, id DESC
@@ -875,13 +878,28 @@ impl ModuleRepository {
         user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<UserModuleViewRow>> {
+        self.list_user_modules_view_filtered(user_id, None, limit)
+            .await
+    }
+
+    /// `list_user_modules_view` with an optional case-insensitive name
+    /// substring filter. `name_like` must be a pre-escaped LIKE pattern
+    /// (caller escapes `\`/`%`/`_` — backslash first — and wraps in `%`).
+    pub async fn list_user_modules_view_filtered(
+        &self,
+        user_id: Uuid,
+        name_like: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<UserModuleViewRow>> {
         let rows = sqlx::query(
             "SELECT id, name, capability_world, source, template_id \
              FROM user_modules WHERE user_id = $1 \
+               AND ($3::text IS NULL OR name ILIKE $3 ESCAPE '\\') \
              ORDER BY compiled_at DESC LIMIT $2",
         )
         .bind(user_id)
         .bind(limit)
+        .bind(name_like)
         .fetch_all(&self.db_pool)
         .await?;
         rows.iter()
@@ -2492,6 +2510,7 @@ impl ModuleRepository {
         allowed_secrets: &[String],
         requires_approval_for: &[String],
         config_schema: &serde_json::Value,
+        catalog_slug: Option<&str>,
     ) -> Result<CatalogInstallResult> {
         let cw_long = if capability_world_short == "trusted" {
             "automation-node".to_string()
@@ -2523,15 +2542,16 @@ impl ModuleRepository {
                         user_id, name, kind, capability_world, config_schema, \
                         allowed_hosts, allowed_methods, allowed_secrets, requires_approval_for, \
                         source_code, wasm_bytes, content_hash, size_bytes, max_fuel, \
-                        language, created_at, compiled_at, updated_at \
+                        catalog_slug, language, created_at, compiled_at, updated_at \
                      ) VALUES ( \
                         $1, $2, 'catalog', $3, $4, \
                         $5, $6, $7, $8, \
                         $9, $10, $11, $12, $13, \
-                        'rust', NOW(), NOW(), NOW() \
+                        $14, 'rust', NOW(), NOW(), NOW() \
                      ) \
                      ON CONFLICT (user_id, name) WHERE user_id IS NOT NULL DO UPDATE SET \
                         capability_world = EXCLUDED.capability_world, \
+                        catalog_slug = COALESCE(EXCLUDED.catalog_slug, modules.catalog_slug), \
                         config_schema = EXCLUDED.config_schema, \
                         allowed_hosts = EXCLUDED.allowed_hosts, \
                         allowed_methods = EXCLUDED.allowed_methods, \
@@ -2567,6 +2587,7 @@ impl ModuleRepository {
             .bind(content_hash)
             .bind(wasm_bytes.len() as i32)
             .bind(max_fuel)
+            .bind(catalog_slug)
             .fetch_one(&self.db_pool)
             .await?;
         Ok(CatalogInstallResult {
@@ -2576,6 +2597,28 @@ impl ModuleRepository {
             compiled_at: row.3,
             bytes_changed: row.4,
         })
+    }
+
+    /// Platform catalog rows (user_id IS NULL, kind='catalog') for the
+    /// get_catalog_status diagnostic — name, origin slug, category. Catalog
+    /// rows are deployment-shared metadata (no tenant content), safe for any
+    /// authenticated caller to enumerate.
+    pub async fn list_catalog_rows(&self) -> Result<Vec<(String, Option<String>, String)>> {
+        let rows = sqlx::query(
+            "SELECT name, catalog_slug, COALESCE(category, 'General') AS category \
+             FROM modules WHERE user_id IS NULL AND kind = 'catalog' ORDER BY name",
+        )
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.iter()
+            .map(|r| -> Result<(String, Option<String>, String)> {
+                Ok((
+                    r.try_get("name")?,
+                    r.try_get::<Option<String>, _>("catalog_slug")?,
+                    r.try_get("category")?,
+                ))
+            })
+            .collect()
     }
 
     /// Phase 5: reconciliation sweep is now a no-op. The legacy tables it

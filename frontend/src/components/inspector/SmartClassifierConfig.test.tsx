@@ -108,6 +108,21 @@ describe("isSmartClassifierModule", () => {
     expect(isSmartClassifierModule("Smart Classifier", undefined)).toBe(true);
     expect(isSmartClassifierModule("Smart Classifier", {})).toBe(true);
   });
+  it("prefers the persisted catalog slug over everything else", () => {
+    // Renamed + reshaped module with the right slug → still the classifier.
+    expect(
+      isSmartClassifierModule("Anything", undefined, "smart-classifier"),
+    ).toBe(true);
+    // A DIFFERENT catalog module never matches, even with a matching name
+    // and a contract-shaped schema (slug is the strongest identity).
+    expect(
+      isSmartClassifierModule(
+        "Smart Classifier",
+        contractSchema,
+        "hybrid-classify-inbox",
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("SmartClassifierConfig", () => {

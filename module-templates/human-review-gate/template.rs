@@ -112,7 +112,7 @@ fn run(input: String) -> Result<String, String> {
         "timeout_minutes": timeout_minutes,
         "auto_approve_if_timeout": auto_approve,
         "input_data": if include_input { data.clone() } else { serde_json::Value::Null },
-        "timestamp": talos::core::datetime::now_utc(),
+        "timestamp": talos::core::datetime::now_iso(),
     });
 
     let payload_bytes =
@@ -122,15 +122,20 @@ fn run(input: String) -> Result<String, String> {
         ("Content-Type".to_string(), "application/json".to_string()),
     ];
 
-    // HMAC-SHA256 signing if webhook secret is configured
+    // HMAC-SHA256 signing if webhook secret is configured. The WIT crypto
+    // interface exposes `hmac(algorithm, key, data) -> list<u8>` +
+    // `encode(hex, ...)` — the old `hmac_sha256(...) -> String` call never
+    // existed in the current WIT (template drift caught by check-catalog).
     if let Some(ref secret) = webhook_secret {
-        let signature = talos::core::crypto::hmac_sha256(
+        use talos::core::crypto::{encode, hmac, Encoding, HashAlgorithm};
+        let mac = hmac(
+            HashAlgorithm::Sha256,
             secret.as_bytes(),
             &payload_bytes,
         );
         headers.push((
             "X-Talos-Signature".to_string(),
-            format!("sha256={}", signature),
+            format!("sha256={}", encode(Encoding::Hex, &mac)),
         ));
     }
 

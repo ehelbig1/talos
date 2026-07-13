@@ -1745,6 +1745,11 @@ export type WasmModule = {
   __typename?: "WasmModule";
   capabilityDescription?: Maybe<Scalars["String"]["output"]>;
   capabilityWorld?: Maybe<Scalars["String"]["output"]>;
+  /**
+   * Origin catalog template slug (e.g. "smart-classifier"); stable under
+   * display-name renames. None for sandbox/extracted modules.
+   */
+  catalogSlug?: Maybe<Scalars["String"]["output"]>;
   compiledAt: Scalars["String"]["output"];
   config: Scalars["String"]["output"];
   /**

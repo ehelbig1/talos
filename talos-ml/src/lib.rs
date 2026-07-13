@@ -16,6 +16,7 @@
 
 pub mod correction;
 pub mod dataset;
+pub mod delete;
 pub mod digest;
 pub mod distill;
 pub mod eval;
@@ -32,6 +33,7 @@ pub use dataset::{
     AppendExample, DatasetService, DatasetStats, DatasetTenancy, ExampleSource, HoldoutExample,
     PreparedExample, SampledExample,
 };
+pub use delete::{delete_model, DeleteError, DeleteOutcome};
 pub use digest::{run_digest_tick, spawn_disagreement_digest};
 pub use distill::{spawn_distill_from_output, DistillContext, DISTILL_CONTEXT};
 pub use eval::{

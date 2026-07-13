@@ -237,6 +237,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                 {isSmartClassifierModule(
                   node.data.moduleName,
                   node.data.configSchema,
+                  node.data.catalogSlug,
                 ) ? (
                   /* key: the inspector reuses this component instance across
                      node selections; without it, one node's staged

@@ -48,7 +48,9 @@ up: ## Build + start the full dev stack, wait for health
 	    printf '\033[1;31m✗ no .env found.\033[0m Run `make setup` to generate one (or see QUICKSTART.md).\n'; \
 	    exit 1; \
 	}
-	@docker compose build controller worker migrate
+	@GIT_SHA_OVERRIDE="$$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)" \
+	 GIT_DIRTY_OVERRIDE="$$([ -n "$$(git status --porcelain 2>/dev/null)" ] && echo true || echo false)" \
+	 docker compose build controller worker migrate
 	@docker compose up -d --scale worker=1
 	@$(MAKE) _wait-healthy
 	@printf '\033[1;32m✓ stack healthy — http://localhost:8000/health\033[0m\n'
@@ -57,7 +59,9 @@ down: ## Stop the stack (preserves data volumes)
 	@docker compose down
 
 rebuild: ## Hot-rebuild one service (SERVICE=controller|worker|frontend|...)
-	@docker compose up -d --build -- "$(SERVICE)"
+	@GIT_SHA_OVERRIDE="$$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)" \
+	 GIT_DIRTY_OVERRIDE="$$([ -n "$$(git status --porcelain 2>/dev/null)" ] && echo true || echo false)" \
+	 docker compose up -d --build -- "$(SERVICE)"
 
 restart: ## Restart one service without rebuilding (SERVICE=...)
 	@docker compose restart -- "$(SERVICE)"

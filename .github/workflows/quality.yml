@@ -223,6 +223,40 @@ jobs:
         # item from the never-in-CI sweep's docs/backlog.md note).
         run: cargo test --workspace --doc
 
+  # ── Catalog templates: compile every module-templates/* against the ────────
+  # current WIT (DX #13). This gate previously lived only in the
+  # workflow_dispatch-only ci.yml, so template type errors shipped silently
+  # until a user ran install_module_from_catalog; scaffold-at-install
+  # templates (no Cargo.toml — the whole ML set) were skipped even there.
+  catalog:
+    name: Catalog templates compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip2
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: catalog
+
+      - name: Install cargo-component
+        uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
+        with:
+          tool: cargo-component@0.21.1
+
+      - name: make check-catalog
+        run: make check-catalog
+
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable
   # pgvector + Redis via Docker (available on ubuntu-latest), applies the full
