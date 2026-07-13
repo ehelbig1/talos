@@ -30,16 +30,32 @@ const DEFAULT_MODEL = "qwen3.6:latest";
 // Mirrors talos-ml provision.rs: name is [A-Za-z0-9._-], 1–128 chars.
 const NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
 
+/** The module's config contract — the required keys its talos.json declares. */
+const CONTRACT_KEYS = ["MODEL_NAME", "SYSTEM_PROMPT", "LABELS"] as const;
+
 /**
- * Whether a node's `moduleName` identifies the smart-classifier module.
+ * Whether a node is the smart-classifier module.
  *
- * The node only carries the module's display `name` (`workflowLoader.ts` sets
- * `moduleName = moduleData.name`) plus a per-install UUID — and catalog modules
- * surface their DISPLAY name, so a loaded node reads "Smart Classifier", not the
- * "smart-classifier" slug. Normalize (lowercase, spaces/underscores → hyphens)
- * so we match the display name AND the slug across every code path.
+ * Identity comes from the module's declared CONFIG CONTRACT when available
+ * (`configSchema.required` ⊇ MODEL_NAME/SYSTEM_PROMPT/LABELS — hydrated by
+ * workflowLoader from the module row): it is stable under rename_module and
+ * never matches a user module that happens to share the display name but
+ * not the contract (this panel's fields and its provisioning side effects
+ * are only correct for modules implementing the contract).
+ *
+ * When the module declares NO schema (or the node predates hydration), fall
+ * back to the normalized display name — catalog modules surface "Smart
+ * Classifier", not the "smart-classifier" slug (the #480 bug), so normalize
+ * case/spaces/underscores.
  */
-export function isSmartClassifierModule(name: string | undefined): boolean {
+export function isSmartClassifierModule(
+  name: string | undefined,
+  configSchema?: Record<string, unknown>,
+): boolean {
+  const required = configSchema?.required;
+  if (Array.isArray(required)) {
+    return CONTRACT_KEYS.every((k) => required.includes(k));
+  }
   return (
     (name ?? "")
       .trim()
@@ -99,25 +115,39 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
     [config, nodeId, updateNodeData],
   );
 
-  // --- provisioning form state ---
-  const [name, setName] = useState(() => modelName);
+  // --- provisioning form state (transient; consumed at provision time).
+  // NOTE: NodeInspector renders this component with key={nodeId}, so state
+  // resets when the selection moves to another node — without the key, one
+  // node's staged name/actor would leak into the next node's setup form.
+  const [name, setName] = useState("");
   const [actorId, setActorId] = useState("");
   const [newLabel, setNewLabel] = useState("");
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Explicit egress acknowledgment. Deliberately NOT derived from the
+  // provider dropdown: allow_external_llm is a data-egress consent, and
+  // auto-deriving it would mean the server's opt-in gate can never actually
+  // gate an editor flow.
+  const [externalAck, setExternalAck] = useState(false);
 
+  // Actors are only needed while the setup form is visible; once provisioned
+  // the picker never renders, so don't refetch the list on every node select.
   const { data: actors = [] } = useQuery({
     queryKey: ["actors"],
     queryFn: listActors,
+    enabled: !modelName,
+    staleTime: 30_000,
   });
-  const activeActors = actors.filter(
-    (a) => a.status !== "archived" && a.status !== "terminated",
-  );
+  // Active only — same eligibility rule as the execution panel's actor
+  // picker (a suspended/retired actor shouldn't own a NEW classifier).
+  const activeActors = actors.filter((a) => a.status === "active");
 
   // Lifecycle state for the provisioned model (badge). All models, filtered
-  // client-side by name — mirrors the ModelReview page.
+  // client-side by name — mirrors the ModelReview page. staleTime bounds the
+  // per-focus/per-select refetch of a resolver that counts pending
+  // disagreements across every model.
   const { data: modelsData } = useMlModelsQuery(
     {},
-    { enabled: !!modelName, refetchOnWindowFocus: true },
+    { enabled: !!modelName, refetchOnWindowFocus: true, staleTime: 30_000 },
   );
   const liveModel = modelName
     ? modelsData?.mlModels.find((m) => m.name === modelName)
@@ -148,6 +178,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
     nameValid &&
     labels.length >= 2 &&
     !!actorId &&
+    (!external || externalAck) &&
     !isProvisioning;
 
   const provisionReason = !workflowId
@@ -160,7 +191,9 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           ? "Add at least 2 labels."
           : !actorId
             ? "Choose the actor that owns this classifier."
-            : null;
+            : external && !externalAck
+              ? "Confirm the external-provider data notice below."
+              : null;
 
   const handleProvision = async () => {
     if (!canProvision || !workflowId) return;
@@ -181,12 +214,16 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
       // tenancy from workflows.actor_id, so this is required, not cosmetic.
       await bindActor.mutateAsync({ workflowId, actorId });
 
-      // Stamp the resolved model name into config (idempotent-safe).
-      setField("MODEL_NAME", out.modelName);
-      // Keep advanced fallback fields explicit in config for the module.
+      // ONE config write, spread from the STORE's current config — the
+      // render-time `config` closure predates the two awaits above, and
+      // spreading it would silently revert any edit made while the
+      // "Setting up…" spinner ran.
+      const current =
+        useWorkflowStore.getState().nodes.find((n) => n.id === nodeId)?.data
+          .config ?? config;
       updateNodeData(nodeId, {
         config: {
-          ...config,
+          ...current,
           MODEL_NAME: out.modelName,
           PROVIDER: provider,
           MODEL: model,
@@ -198,6 +235,11 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           ? `Reused existing model "${out.modelName}" (${out.lifecycleState})`
           : `Classifier "${out.modelName}" provisioned — starts LLM-only, distills as it runs`,
       );
+      // The local-only contract is only enforced at runtime by the actor's
+      // tier ceiling — when the server says the two disagree, tell the user.
+      if (out.localityWarning) {
+        toast.warning(out.localityWarning, { duration: 12_000 });
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Provisioning failed");
     }
@@ -249,6 +291,19 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
               <ArrowUpRight className="w-3 h-3" />
             </Link>
           )}
+          {/* Escape hatch: without this, a mis-provisioned node (wrong
+              actor/labels, or a model deleted server-side) could never show
+              the setup form again — MODEL_NAME had no clearing affordance. */}
+          <button
+            onClick={() => {
+              const { MODEL_NAME: _cleared, ...rest } = config;
+              updateNodeData(nodeId, { config: rest });
+              setName("");
+            }}
+            className="text-[9px] font-bold text-muted-foreground/40 hover:text-muted-foreground uppercase tracking-widest transition-premium"
+          >
+            Re-configure classifier…
+          </button>
         </div>
       ) : (
         <div className="space-y-4 px-5 py-5 bg-primary/[0.03] border border-primary/10 rounded-[1.5rem]">
@@ -397,11 +452,21 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                 ))}
               </DarkSelect>
               {external && (
-                <p className="text-[9px] text-warning/70 font-medium px-1 flex items-center gap-1.5 leading-relaxed">
-                  <AlertTriangle className="w-3 h-3 shrink-0" />
-                  External provider — input leaves the host. Use ollama to keep
-                  classification local (Tier-1).
-                </p>
+                <label className="flex items-start gap-2 px-1 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={externalAck}
+                    onChange={(e) => setExternalAck(e.target.checked)}
+                    className="mt-0.5 accent-amber-500"
+                    aria-label="Acknowledge external provider data egress"
+                  />
+                  <span className="text-[9px] text-warning/70 font-medium leading-relaxed">
+                    <AlertTriangle className="w-3 h-3 shrink-0 inline mr-1" />I
+                    understand every classified input will be sent to this
+                    external provider. Use ollama to keep classification local
+                    (Tier-1).
+                  </span>
+                </label>
               )}
             </div>
             <div className="space-y-3">
@@ -412,6 +477,21 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                 placeholder={DEFAULT_MODEL}
                 className={inputBase}
               />
+            </div>
+            <div className="space-y-3">
+              <label className={labelStyle}>Max Tokens</label>
+              <Input
+                type="number"
+                value={(config.MAX_TOKENS as number) ?? 256}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  setField("MAX_TOKENS", Number.isNaN(n) ? 256 : n);
+                }}
+                className={inputBase}
+              />
+              <p className="text-[9px] text-muted-foreground/40 font-medium px-1">
+                Cap for the LLM classification response (one label is small).
+              </p>
             </div>
           </div>
         )}

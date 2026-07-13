@@ -951,6 +951,7 @@ export type ProvisionMlClassifierMutation = {
     datasetId: string;
     lifecycleState: string;
     alreadyExisted: boolean;
+    localityWarning: string | null;
   };
 };
 
@@ -1363,6 +1364,7 @@ export type GetModulesLoaderQuery = {
     id: string;
     name: string;
     config: string;
+    configSchema: string | null;
     sourceCode: string | null;
     capabilityWorld: string | null;
     importedInterfaces: Array<string> | null;
@@ -3908,6 +3910,7 @@ export const ProvisionMlClassifierDocument = new TypedDocumentString(`
     datasetId
     lifecycleState
     alreadyExisted
+    localityWarning
   }
 }
     `);
@@ -5035,6 +5038,7 @@ export const GetModulesLoaderDocument = new TypedDocumentString(`
     id
     name
     config
+    configSchema
     sourceCode
     capabilityWorld
     importedInterfaces

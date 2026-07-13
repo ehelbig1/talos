@@ -56,6 +56,10 @@ pub struct WasmModule {
     pub content_hash: String,
     pub compiled_at: String, // ISO datetime
     pub config: String,      // JSON string of module configuration
+    /// JSON string of the module's declared config schema (talos.json
+    /// `config_schema`), when the module declares one. The editor uses the
+    /// schema's REQUIRED KEYS as a rename-stable module identity.
+    pub config_schema: Option<String>,
     pub capability_world: Option<String>,
     pub imported_interfaces: Option<Vec<String>>,
     pub source_code: Option<String>,
@@ -499,6 +503,7 @@ impl async_graphql::dataloader::Loader<Uuid> for ModuleLoader {
                     .config
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "{}".to_string()),
+                config_schema: m.config_schema.map(|c| c.to_string()),
                 source_code: m.source_code,
                 capability_world: m.capability_world,
                 imported_interfaces: m.imported_interfaces,

@@ -234,8 +234,16 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                 Node Parameters
               </label>
               <div className="bg-surface-3/40 border border-white/5 rounded-[2rem] p-6 glass-dark shadow-2xl">
-                {isSmartClassifierModule(node.data.moduleName) ? (
+                {isSmartClassifierModule(
+                  node.data.moduleName,
+                  node.data.configSchema,
+                ) ? (
+                  /* key: the inspector reuses this component instance across
+                     node selections; without it, one node's staged
+                     provisioning form (name/actor) leaks into the next
+                     node's setup and can provision the wrong model. */
                   <SmartClassifierConfig
+                    key={node.id}
                     nodeId={node.id}
                     config={node.data.config || {}}
                     updateNodeData={updateNodeData}

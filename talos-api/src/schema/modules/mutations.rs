@@ -520,6 +520,9 @@ impl ModulesMutations {
                 .config
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "{}".to_string()),
+            // Compile response: the registry module type carries no config
+            // schema; clients needing it re-query wasmModules after compile.
+            config_schema: None,
             capability_world: Some(module.capability_world.to_string()),
             imported_interfaces: Some(module.imported_interfaces),
             source_code: None,

@@ -33,6 +33,7 @@ const _GET_MODULES_LOADER = gql`
       id
       name
       config
+      configSchema
       sourceCode
       capabilityWorld
       importedInterfaces
@@ -145,6 +146,7 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
       {
         name: string;
         config: Record<string, unknown>;
+        configSchema?: Record<string, unknown>;
         capabilityWorld?: string | null;
         sourceCode?: string | null;
         category?: string | null;
@@ -166,9 +168,18 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
         } catch {
           // if (import.meta.env.DEV) console.warn(`Failed to parse config for module ${m.id}`, e);
         }
+        let parsedSchema: Record<string, unknown> | undefined;
+        try {
+          parsedSchema = m.configSchema
+            ? JSON.parse(m.configSchema)
+            : undefined;
+        } catch {
+          parsedSchema = undefined;
+        }
         moduleMap.set(m.id, {
           name: m.name,
           config: parsedConfig,
+          configSchema: parsedSchema,
           sourceCode: m.sourceCode,
           capabilityWorld: m.capabilityWorld,
           importedInterfaces: m.importedInterfaces,
@@ -199,6 +210,7 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
           moduleId: n.type, // Module UUID (for execution)
           moduleName: moduleName, // Human-readable name
           config: config, // Node configuration (workflow override or module default)
+          configSchema: moduleData?.configSchema ?? undefined,
           capabilityWorld: moduleData?.capabilityWorld ?? undefined,
           sourceCode: moduleData?.sourceCode ?? undefined,
           category: moduleData?.category ?? undefined,
