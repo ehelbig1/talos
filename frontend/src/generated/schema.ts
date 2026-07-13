@@ -613,6 +613,21 @@ export type MlModelSummary = {
   taskType: Scalars["String"]["output"];
 };
 
+/** Outcome of provisioning a classifier. */
+export type MlProvisionResult = {
+  __typename?: "MlProvisionResult";
+  /** True when a model of this name already existed and was reused. */
+  alreadyExisted: Scalars["Boolean"]["output"];
+  datasetId: Scalars["UUID"]["output"];
+  /**
+   * Always `llm_only` for a fresh classifier (it serves via the LLM and
+   * distills into a fast model over time).
+   */
+  lifecycleState: Scalars["String"]["output"];
+  modelId: Scalars["UUID"]["output"];
+  modelName: Scalars["String"]["output"];
+};
+
 /** Outcome of resolving one disagreement. */
 export type MlResolveResult = {
   __typename?: "MlResolveResult";
@@ -707,6 +722,14 @@ export type MutationRoot = {
    * sign out everywhere. Clears the current device's cookies as well.
    */
   logoutAllSessions: Scalars["Boolean"]["output"];
+  /**
+   * Provision (or idempotently reuse) a classifier for a workflow node:
+   * creates the dataset + model (born `llm_only`) + a safe default
+   * promotion policy under the actor's tenancy in one owner-scoped tx, and
+   * returns the model name to stamp into the node. Backed by the SAME
+   * `talos_ml::provision_classifier` the MCP tool calls.
+   */
+  provisionMlClassifier: MlProvisionResult;
   publishWorkflowVersion: WorkflowVersion;
   /**
    * Per-org DEK arc: migrate existing `actor_memory` rows to their actor's
@@ -763,6 +786,13 @@ export type MutationRoot = {
   rotateEncryptionKey: Scalars["Int"]["output"];
   rotateMasterKey: MasterKeyRotationResult;
   setConcurrencyLimit: Scalars["Boolean"]["output"];
+  /**
+   * Bind (or unbind, with a null `actorId`) a workflow's default actor —
+   * the tenancy principal its executions run under. Required for a Smart
+   * Classifier node: model serving + distillation resolve the model owner
+   * from this actor. Mirrors the MCP `set_workflow_actor_id` tool.
+   */
+  setWorkflowActorId: Scalars["Boolean"]["output"];
   setupTwoFactor: TwoFactorSetup;
   signup: AuthPayload;
   terminateActor: Scalars["Boolean"]["output"];
@@ -889,6 +919,18 @@ export type MutationRootLoginArgs = {
   input: LoginInput;
 };
 
+export type MutationRootProvisionMlClassifierArgs = {
+  actorId: Scalars["UUID"]["input"];
+  allowExternalLlm?: InputMaybe<Scalars["Boolean"]["input"]>;
+  confidenceThreshold?: InputMaybe<Scalars["Float"]["input"]>;
+  fallbackModel?: InputMaybe<Scalars["String"]["input"]>;
+  fallbackProvider?: InputMaybe<Scalars["String"]["input"]>;
+  k?: InputMaybe<Scalars["Int"]["input"]>;
+  labels: Array<Scalars["String"]["input"]>;
+  maxExamples?: InputMaybe<Scalars["Int"]["input"]>;
+  name: Scalars["String"]["input"];
+};
+
 export type MutationRootPublishWorkflowVersionArgs = {
   description?: InputMaybe<Scalars["String"]["input"]>;
   workflowId: Scalars["UUID"]["input"];
@@ -952,6 +994,11 @@ export type MutationRootRotateMasterKeyArgs = {
 
 export type MutationRootSetConcurrencyLimitArgs = {
   maxConcurrent?: InputMaybe<Scalars["Int"]["input"]>;
+  workflowId: Scalars["UUID"]["input"];
+};
+
+export type MutationRootSetWorkflowActorIdArgs = {
+  actorId?: InputMaybe<Scalars["UUID"]["input"]>;
   workflowId: Scalars["UUID"]["input"];
 };
 

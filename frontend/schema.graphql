@@ -646,6 +646,24 @@ type MlModelSummary {
 }
 
 """
+Outcome of provisioning a classifier.
+"""
+type MlProvisionResult {
+	modelName: String!
+	modelId: UUID!
+	datasetId: UUID!
+	"""
+	Always `llm_only` for a fresh classifier (it serves via the LLM and
+	distills into a fast model over time).
+	"""
+	lifecycleState: String!
+	"""
+	True when a model of this name already existed and was reused.
+	"""
+	alreadyExisted: Boolean!
+}
+
+"""
 Outcome of resolving one disagreement.
 """
 type MlResolveResult {
@@ -742,6 +760,14 @@ type MutationRoot {
 	promotion policy.
 	"""
 	resolveMlDisagreement(disagreementId: UUID!, correctLabel: String): MlResolveResult!
+	"""
+	Provision (or idempotently reuse) a classifier for a workflow node:
+	creates the dataset + model (born `llm_only`) + a safe default
+	promotion policy under the actor's tenancy in one owner-scoped tx, and
+	returns the model name to stamp into the node. Backed by the SAME
+	`talos_ml::provision_classifier` the MCP tool calls.
+	"""
+	provisionMlClassifier(name: String!, labels: [String!]!, actorId: UUID!, fallbackProvider: String, fallbackModel: String, allowExternalLlm: Boolean, k: Int, confidenceThreshold: Float, maxExamples: Int): MlProvisionResult!
 	createModuleFromTemplate(input: CreateModuleInput!): WasmModule!
 	testModule(moduleId: UUID!, input: String, timeoutSecs: Int): TestModuleResult!
 	createOrganization(name: String!, slug: String!): OrganizationObj!
@@ -836,6 +862,13 @@ type MutationRoot {
 	updateSchedule(workflowId: UUID!, cronExpression: String, timezone: String, isEnabled: Boolean): WorkflowScheduleObj!
 	deleteSchedule(workflowId: UUID!): Boolean!
 	testWorkflow(workflowId: UUID!, mockInputs: String): TestWorkflowResult!
+	"""
+	Bind (or unbind, with a null `actorId`) a workflow's default actor —
+	the tenancy principal its executions run under. Required for a Smart
+	Classifier node: model serving + distillation resolve the model owner
+	from this actor. Mirrors the MCP `set_workflow_actor_id` tool.
+	"""
+	setWorkflowActorId(workflowId: UUID!, actorId: UUID): Boolean!
 }
 
 type NodeTemplate {

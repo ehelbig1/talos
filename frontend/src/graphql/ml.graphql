@@ -44,3 +44,39 @@ mutation ResolveMlDisagreement($disagreementId: UUID!, $correctLabel: String) {
     correctionAppended
   }
 }
+
+# Smart Classifier — one-call provisioning of the model/dataset/policy behind
+# a classifier node, and binding the workflow to the owning actor.
+mutation ProvisionMlClassifier(
+  $name: String!
+  $labels: [String!]!
+  $actorId: UUID!
+  $fallbackProvider: String
+  $fallbackModel: String
+  $allowExternalLlm: Boolean
+  $k: Int
+  $confidenceThreshold: Float
+  $maxExamples: Int
+) {
+  provisionMlClassifier(
+    name: $name
+    labels: $labels
+    actorId: $actorId
+    fallbackProvider: $fallbackProvider
+    fallbackModel: $fallbackModel
+    allowExternalLlm: $allowExternalLlm
+    k: $k
+    confidenceThreshold: $confidenceThreshold
+    maxExamples: $maxExamples
+  ) {
+    modelName
+    modelId
+    datasetId
+    lifecycleState
+    alreadyExisted
+  }
+}
+
+mutation SetWorkflowActorId($workflowId: UUID!, $actorId: UUID) {
+  setWorkflowActorId(workflowId: $workflowId, actorId: $actorId)
+}
