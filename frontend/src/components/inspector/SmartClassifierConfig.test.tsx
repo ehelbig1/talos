@@ -67,6 +67,11 @@ function actorsResponse() {
 }
 
 describe("isSmartClassifierModule", () => {
+  const contractSchema = {
+    required: ["MODEL_NAME", "SYSTEM_PROMPT", "LABELS"],
+    properties: {},
+  };
+
   it("matches the catalog display name a loaded node actually carries", () => {
     // workflowLoader sets moduleName = module display name; catalog modules
     // surface "Smart Classifier", NOT the slug — this is the real load path.
@@ -82,6 +87,26 @@ describe("isSmartClassifierModule", () => {
     expect(isSmartClassifierModule("LLM Inference")).toBe(false);
     expect(isSmartClassifierModule(undefined)).toBe(false);
     expect(isSmartClassifierModule("")).toBe(false);
+  });
+  it("identifies by config contract when a schema is present (rename-stable)", () => {
+    // A renamed catalog module keeps its schema → keeps its panel.
+    expect(isSmartClassifierModule("My Email Sorter", contractSchema)).toBe(
+      true,
+    );
+  });
+  it("refuses a name-alike module whose schema is NOT the contract", () => {
+    // A user sandbox module named "smart_classifier" with different config
+    // must get the raw JSON editor, not this panel (whose provisioning
+    // side effects would be wrong for it).
+    expect(
+      isSmartClassifierModule("smart_classifier", {
+        required: ["THRESHOLD", "WEBHOOK_URL"],
+      }),
+    ).toBe(false);
+  });
+  it("falls back to name matching only when no schema is declared", () => {
+    expect(isSmartClassifierModule("Smart Classifier", undefined)).toBe(true);
+    expect(isSmartClassifierModule("Smart Classifier", {})).toBe(true);
   });
 });
 
@@ -106,6 +131,7 @@ describe("SmartClassifierConfig", () => {
               datasetId: "ds-1",
               lifecycleState: "llm_only",
               alreadyExisted: false,
+              localityWarning: null,
             },
           },
         };
@@ -236,5 +262,96 @@ describe("SmartClassifierConfig", () => {
     // Review link points at the ModelReview page.
     const link = await screen.findByRole("link", { name: /3 to review/i });
     expect(link).toHaveAttribute("href", "/models");
+  });
+});
+
+describe("SmartClassifierConfig affordances", () => {
+  beforeEach(() => {
+    useWorkflowStore.setState({ workflowId: "wf-1" });
+  });
+
+  it("offers re-configure once provisioned, clearing MODEL_NAME", async () => {
+    mockGraphql({
+      ListActorSummaries: () => actorsResponse(),
+      MlModels: () => ({ data: { mlModels: [] } }),
+    });
+    const updateNodeData = vi.fn();
+    render(
+      <SmartClassifierConfig
+        nodeId="node-1"
+        config={{ MODEL_NAME: "clf", LABELS: ["a", "b"], MAX_TOKENS: 64 }}
+        updateNodeData={updateNodeData}
+      />,
+    );
+    const btn = await screen.findByRole("button", {
+      name: /re-configure classifier/i,
+    });
+    fireEvent.click(btn);
+    // MODEL_NAME removed; every OTHER key survives (the escape hatch must
+    // not wipe the node's config).
+    expect(updateNodeData).toHaveBeenCalledWith("node-1", {
+      config: { LABELS: ["a", "b"], MAX_TOKENS: 64 },
+    });
+  });
+
+  it("requires the explicit egress acknowledgment for an external provider", async () => {
+    mockGraphql({ ListActorSummaries: () => actorsResponse() });
+    render(
+      <SmartClassifierConfig
+        nodeId="node-1"
+        config={{ LABELS: ["a", "b"], PROVIDER: "anthropic" }}
+        updateNodeData={vi.fn()}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByPlaceholderText("support-email-urgency"),
+      { target: { value: "clf" } },
+    );
+    // Wait for the async actors fetch before selecting — a change event on a
+    // native select whose option hasn't rendered yet silently stays "".
+    await screen.findByRole("option", { name: "personal-assistant" });
+    fireEvent.change(screen.getAllByRole("combobox")[0], {
+      target: { value: "actor-1" },
+    });
+    // Open the advanced section to reach the acknowledgment.
+    fireEvent.click(screen.getByRole("button", { name: /llm fallback/i }));
+    const setup = screen.getByRole("button", { name: /set up classifier/i });
+    expect(setup).toBeDisabled();
+    expect(
+      screen.getByText(/confirm the external-provider data notice/i),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /acknowledge external provider data egress/i,
+      }),
+    );
+    await waitFor(() => expect(setup).not.toBeDisabled());
+  });
+
+  it("exposes MAX_TOKENS in the advanced section", async () => {
+    mockGraphql({
+      ListActorSummaries: () => actorsResponse(),
+      MlModels: () => ({ data: { mlModels: [] } }),
+    });
+    const updateNodeData = vi.fn();
+    render(
+      <SmartClassifierConfig
+        nodeId="node-1"
+        config={{ MODEL_NAME: "clf", LABELS: ["a", "b"] }}
+        updateNodeData={updateNodeData}
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: /llm fallback/i }),
+    );
+    const field = screen.getByRole("spinbutton");
+    expect(field).toHaveValue(256);
+    fireEvent.change(field, { target: { value: "64" } });
+    expect(updateNodeData).toHaveBeenCalledWith(
+      "node-1",
+      expect.objectContaining({
+        config: expect.objectContaining({ MAX_TOKENS: 64 }),
+      }),
+    );
   });
 });

@@ -130,6 +130,10 @@ pub struct ModuleDetailsRow {
     pub content_hash: String,
     pub compiled_at: chrono::DateTime<chrono::Utc>,
     pub config: Option<serde_json::Value>,
+    /// The module's declared config contract (talos.json `config_schema`).
+    /// Exposed so the editor can identify a module by its CONTRACT (stable
+    /// under rename) instead of its mutable display name.
+    pub config_schema: Option<serde_json::Value>,
     pub source_code: Option<String>,
     pub capability_world: Option<String>,
     pub imported_interfaces: Option<Vec<String>>,
@@ -776,7 +780,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE id = ANY($1)
                AND (user_id = $2 OR org_id = ANY($3))",
@@ -802,7 +806,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE id = ANY($1)",
         )
@@ -828,7 +832,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE (user_id = $1 OR org_id = ANY($4))
              ORDER BY COALESCE(compiled_at, created_at) DESC, id DESC

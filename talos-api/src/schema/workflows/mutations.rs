@@ -1618,6 +1618,28 @@ impl WorkflowsMutations {
                 async_graphql::Error::new("Workflow not found or not owned by you").extend_safe(),
             );
         }
+
+        // MCP-396 parity: the binding decides which actor's tier ceiling,
+        // budget, and approval policies govern every subsequent run — a flip
+        // to a permissive actor (or to unbound/shared mode) must leave a
+        // persistent trace on THIS surface too, exactly as the MCP handler
+        // records it. Same event shape so forensics join on one event_type.
+        talos_actor_repository::spawn_log_admin_event(
+            db_pool.clone(),
+            user_id,
+            "workflow_actor_binding_changed",
+            "workflow",
+            Some(workflow_id),
+            match actor_id {
+                Some(aid) => format!("Workflow {workflow_id} bound to actor {aid}"),
+                None => format!("Workflow {workflow_id} actor binding cleared (shared mode)"),
+            },
+            Some(serde_json::json!({
+                "new_actor_id": actor_id.map(|a| a.to_string()),
+                "shared_mode": actor_id.is_none(),
+                "surface": "graphql",
+            })),
+        );
         Ok(true)
     }
 

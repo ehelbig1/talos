@@ -71,6 +71,14 @@ pub struct ProvisionOutcome {
     /// True when a model of this name already existed and was reused
     /// (idempotent re-add), rather than freshly created.
     pub already_existed: bool,
+    /// Set when the classifier's local-only intent (`allow_external_llm:
+    /// false`) is not backed by the runtime gate that actually enforces
+    /// egress: the bound actor's `max_llm_tier`. The model-config flag gates
+    /// WRITES (this call); at serving time the node's PROVIDER + the actor
+    /// tier decide egress, so a tier-2 actor leaves the contract advisory.
+    /// Surfaced verbatim by both protocol surfaces so the caller can act
+    /// (set the actor's tier ceiling to tier1).
+    pub locality_warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -146,12 +154,15 @@ pub async fn provision_classifier(
         .clamp(0.0, 1.0);
 
     // Model config: serving knobs + the (owner-validated) digest actor.
+    // `labels` is recorded so idempotent re-adds can detect an incompatible
+    // label set instead of silently reusing a model trained on other classes.
     let config = json!({
         "k": k,
         "confidence_threshold": threshold,
         "fallback": { "provider": provider, "model": model },
         "allow_external_llm": input.allow_external_llm,
         "digest": { "actor_id": input.actor_id.to_string() },
+        "labels": labels,
     });
     // Data-egress gate: a non-local fallback requires explicit opt-in.
     validate_llm_locality(&config).map_err(ProvisionError::InvalidInput)?;
@@ -175,18 +186,46 @@ pub async fn provision_classifier(
 
     // Tenancy: the actor MUST belong to the caller — it is the digest target
     // and the distill/serve principal. Fail closed at WRITE time (don't rely
-    // only on the delivery-time skip).
-    let actor_owner: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM actors WHERE id = $1")
-        .bind(input.actor_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| ProvisionError::Internal(e.into()))?;
-    if actor_owner != Some(user_id) {
-        return Err(ProvisionError::InvalidActor);
+    // only on the delivery-time skip). Ownership failures and not-found are
+    // deliberately indistinguishable (InvalidActor — no enumeration); the
+    // STATUS refusal is separate and specific, because the caller provably
+    // owns the actor. Mirrors the setWorkflowActorId mutations, which refuse
+    // archived/terminated actors ("reactivate it first").
+    let actor_row: Option<(Uuid, String, String)> =
+        sqlx::query_as("SELECT user_id, status, max_llm_tier FROM actors WHERE id = $1")
+            .bind(input.actor_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ProvisionError::Internal(e.into()))?;
+    let (actor_status, actor_tier) = match actor_row {
+        Some((owner, status, tier)) if owner == user_id => (status, tier),
+        _ => return Err(ProvisionError::InvalidActor),
+    };
+    if actor_status == "archived" || actor_status == "terminated" {
+        return Err(ProvisionError::InvalidInput(format!(
+            "actor is {actor_status} — reactivate it (or pick an active actor) before binding \
+             it as the classifier's digest target"
+        )));
     }
+    // The local-only contract is enforced at runtime by the ACTOR tier, not
+    // by this config flag (the flag gates writes). Tell the caller when the
+    // two disagree instead of letting the contract be silently advisory.
+    let locality_warning = (!input.allow_external_llm && actor_tier != "tier1").then(|| {
+        format!(
+            "allow_external_llm is false but actor {} has max_llm_tier '{}' — the local-only \
+             intent is only enforced at runtime by a tier1 ceiling \
+             (set_actor_llm_tier_ceiling); with a {} actor, a workflow edit that switches the \
+             node's PROVIDER to an external one WILL egress data",
+            input.actor_id, actor_tier, actor_tier
+        )
+    });
 
     // Idempotent re-add: a model of this name already exists → reuse it
-    // verbatim (never clobber a model a human may have tuned or advanced).
+    // verbatim (never clobber a model a human may have tuned or advanced) —
+    // but only when the request is COMPATIBLE with what exists. Silently
+    // returning a model with a different label set or digest actor poisons
+    // the dataset (new-label rows distilled into the old class space) and
+    // routes digests to an actor the caller didn't name.
     if let Some(existing) = ModelRegistry::resolve_by_name(&mut tx, &name, user_id)
         .await
         .map_err(ProvisionError::Internal)?
@@ -196,19 +235,68 @@ pub async fn provision_classifier(
                 "a model of this name exists but has no dataset — pick a different name".into(),
             ));
         };
+        if let Some(existing_actor) = existing.config_json["digest"]["actor_id"].as_str() {
+            if existing_actor != input.actor_id.to_string() {
+                return Err(ProvisionError::InvalidInput(format!(
+                    "model '{name}' already exists bound to a different actor — re-use it with \
+                     that actor, or pick a different name"
+                )));
+            }
+        }
+        // Pre-remediation models don't record labels in config; skip the
+        // check for those rather than refusing every legacy reuse.
+        if let Some(existing_labels) = existing.config_json["labels"].as_array() {
+            let existing_set: std::collections::HashSet<&str> =
+                existing_labels.iter().filter_map(|v| v.as_str()).collect();
+            let requested_set: std::collections::HashSet<&str> =
+                labels.iter().map(String::as_str).collect();
+            if existing_set != requested_set {
+                return Err(ProvisionError::InvalidInput(format!(
+                    "model '{name}' already exists with a different label set — matching \
+                     labels are required to re-use it, or pick a different name"
+                )));
+            }
+        }
         return Ok(ProvisionOutcome {
             model_name: existing.name,
             model_id: existing.model_id,
             dataset_id,
             lifecycle_state: existing.lifecycle_state,
             already_existed: true,
+            locality_warning,
         });
     }
 
+    // A same-name DATASET without a model (created earlier via
+    // ml_create_dataset) would fail create_dataset's unique index with an
+    // opaque Internal error on every retry — catch it here with an
+    // actionable message instead.
+    let dataset_collision: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM ml_datasets WHERE user_id = $1 AND name = $2 AND org_id IS NULL",
+    )
+    .bind(user_id)
+    .bind(&name)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| ProvisionError::Internal(e.into()))?;
+    if dataset_collision.is_some() {
+        return Err(ProvisionError::InvalidInput(format!(
+            "a dataset named '{name}' already exists (without a model) — pick a different \
+             name, or attach a model to it with ml_create_model"
+        )));
+    }
+
     // Create dataset → model (born llm_only) → policy, all in this tx.
+    // A non-positive growth cap is a caller error, not a request for
+    // "no cap" — reject it like every other invalid input.
+    if input.max_examples.is_some_and(|cap| cap <= 0) {
+        return Err(ProvisionError::InvalidInput(
+            "max_examples must be positive (omit it for the default growth behavior)".into(),
+        ));
+    }
     let schema_json = match input.max_examples {
-        Some(cap) if cap > 0 => json!({ "max_examples": cap }),
-        _ => json!({}),
+        Some(cap) => json!({ "max_examples": cap }),
+        None => json!({}),
     };
     let dataset_id = dataset
         .create_dataset(
@@ -256,6 +344,7 @@ pub async fn provision_classifier(
         dataset_id,
         lifecycle_state: "llm_only".to_string(),
         already_existed: false,
+        locality_warning,
     })
 }
 

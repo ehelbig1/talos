@@ -251,6 +251,12 @@ pub fn run(input: String) -> Result<String, String> {
     let predictions: Vec<Option<talos::core::model::Prediction>> =
         match talos::core::model::predict_batch(&model_name, &features) {
             Ok(reply) => reply.predictions,
+            // Cancellation is a directive, not a serving failure — the WIT
+            // contract says "do NOT retry; unwind". Falling through would
+            // burn a full LLM batch for an execution the operator killed.
+            Err(talos::core::model::Error::Cancelled) => {
+                return Err("Execution cancelled — not retrying".to_string())
+            }
             Err(_) => messages.iter().map(|_| None).collect(),
         };
 

@@ -661,6 +661,13 @@ type MlProvisionResult {
 	True when a model of this name already existed and was reused.
 	"""
 	alreadyExisted: Boolean!
+	"""
+	Set when `allowExternalLlm: false` is not backed by the runtime gate
+	that actually enforces egress — the bound actor's `max_llm_tier`.
+	Show it to the user: the local-only intent is advisory until the
+	actor's tier ceiling is tier1.
+	"""
+	localityWarning: String
 }
 
 """
@@ -1417,6 +1424,12 @@ type WasmModule {
 	contentHash: String!
 	compiledAt: String!
 	config: String!
+	"""
+	JSON string of the module's declared config schema (talos.json
+	`config_schema`), when the module declares one. The editor uses the
+	schema's REQUIRED KEYS as a rename-stable module identity.
+	"""
+	configSchema: String
 	capabilityWorld: String
 	importedInterfaces: [String!]
 	sourceCode: String

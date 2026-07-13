@@ -624,6 +624,13 @@ export type MlProvisionResult = {
    * distills into a fast model over time).
    */
   lifecycleState: Scalars["String"]["output"];
+  /**
+   * Set when `allowExternalLlm: false` is not backed by the runtime gate
+   * that actually enforces egress — the bound actor's `max_llm_tier`.
+   * Show it to the user: the local-only intent is advisory until the
+   * actor's tier ceiling is tier1.
+   */
+  localityWarning?: Maybe<Scalars["String"]["output"]>;
   modelId: Scalars["UUID"]["output"];
   modelName: Scalars["String"]["output"];
 };
@@ -1740,6 +1747,12 @@ export type WasmModule = {
   capabilityWorld?: Maybe<Scalars["String"]["output"]>;
   compiledAt: Scalars["String"]["output"];
   config: Scalars["String"]["output"];
+  /**
+   * JSON string of the module's declared config schema (talos.json
+   * `config_schema`), when the module declares one. The editor uses the
+   * schema's REQUIRED KEYS as a rename-stable module identity.
+   */
+  configSchema?: Maybe<Scalars["String"]["output"]>;
   contentHash: Scalars["String"]["output"];
   id: Scalars["UUID"]["output"];
   importedInterfaces?: Maybe<Array<Scalars["String"]["output"]>>;

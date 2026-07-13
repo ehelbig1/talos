@@ -27,6 +27,11 @@ pub struct MlProvisionResult {
     pub lifecycle_state: String,
     /// True when a model of this name already existed and was reused.
     pub already_existed: bool,
+    /// Set when `allowExternalLlm: false` is not backed by the runtime gate
+    /// that actually enforces egress — the bound actor's `max_llm_tier`.
+    /// Show it to the user: the local-only intent is advisory until the
+    /// actor's tier ceiling is tier1.
+    pub locality_warning: Option<String>,
 }
 
 #[derive(Default)]
@@ -134,6 +139,7 @@ impl MlMutations {
                 dataset_id: o.dataset_id,
                 lifecycle_state: o.lifecycle_state,
                 already_existed: o.already_existed,
+                locality_warning: o.locality_warning,
             }),
             // The validation message is caller-authored (no schema/internal
             // detail) — safe to surface so the editor can show it inline.

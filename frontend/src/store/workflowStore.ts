@@ -22,6 +22,9 @@ export interface WorkflowNodeData {
   moduleId: string;
   moduleName: string;
   config?: Record<string, unknown>;
+  // The module's declared config contract (talos.json config_schema),
+  // hydrated at load time. Used as a rename-stable module identity.
+  configSchema?: Record<string, unknown>;
   category?: string;
   executionStatus?: string;
   capabilityWorld?: string;

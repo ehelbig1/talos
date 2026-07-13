@@ -182,12 +182,28 @@ fn normalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
         {
             continue;
         }
-        // Oversized dedup key → drop the key, keep the teacher signal.
+        // Oversized dedup key → replace with the content hash below (a
+        // dropped key would bypass dedupe entirely, see next comment).
         if i.example_key
             .as_ref()
             .is_some_and(|k| k.len() > MAX_EXAMPLE_KEY_BYTES)
         {
             i.example_key = None;
+        }
+        // Content-hash fallback key. The ml_examples dedupe index is partial
+        // (`WHERE example_key IS NOT NULL`), so a keyless row is NEVER
+        // deduped — retries, replays, and poll loops re-seeing the same item
+        // would append duplicate rows forever, inflating min_examples and
+        // class balance toward the promotion gate with repeated data. Keying
+        // by the hash of the features text makes re-teaching identical
+        // content an UPDATE (newest teacher label wins; corrections stay
+        // protected by the upsert's source guard) instead of a new row.
+        // Done here, not per-emitter, so every __ml_distill__ producer
+        // inherits it.
+        if i.example_key.is_none() {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(i.features_text.as_bytes());
+            i.example_key = Some(format!("ch:{digest:x}"));
         }
         cleaned.push(i);
     }
@@ -572,9 +588,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_drops_oversized_example_key_keeps_item() {
+    fn normalize_replaces_oversized_example_key_keeps_item() {
         // Oversized key would blow the (dataset_id, example_key) btree row
-        // limit and error the whole append — drop the KEY, keep the item.
+        // limit and error the whole append — replace it with the content
+        // hash (a bare drop would bypass dedupe entirely), keep the item.
         let big_key = "k".repeat(MAX_EXAMPLE_KEY_BYTES + 1);
         let env: DistillEnvelope = serde_json::from_value(serde_json::json!({
             "model": "m",
@@ -586,11 +603,39 @@ mod tests {
         .unwrap();
         let (_, items) = normalize(env).unwrap();
         assert_eq!(items.len(), 2, "both items retained");
-        assert!(items[0].example_key.is_none(), "oversized key dropped");
+        let replaced = items[0].example_key.as_deref().expect("hash key");
+        assert!(replaced.starts_with("ch:"), "oversized key → content hash");
+        assert!(replaced.len() <= MAX_EXAMPLE_KEY_BYTES);
         assert_eq!(
             items[1].example_key.as_deref(),
             Some("ok"),
-            "normal key kept"
+            "caller-supplied key kept verbatim"
         );
+    }
+
+    #[test]
+    fn normalize_derives_content_hash_key_when_absent() {
+        // The ml_examples dedupe index is partial (WHERE example_key IS NOT
+        // NULL): a keyless row is NEVER deduped, so retries/replays of the
+        // same content would append duplicate rows forever and inflate the
+        // promotion gate. Absent keys therefore get a deterministic
+        // content-hash key — identical text twice yields the SAME key
+        // (upsert → one row), different text yields different keys.
+        let env = |text: &str| -> DistillEnvelope {
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "items": [{"features_text": text, "label": "archive"}]
+            }))
+            .unwrap()
+        };
+        let (_, a1) = normalize(env("Subject: same email")).unwrap();
+        let (_, a2) = normalize(env("Subject: same email")).unwrap();
+        let (_, b) = normalize(env("Subject: different email")).unwrap();
+        let k1 = a1[0].example_key.as_deref().expect("derived key");
+        let k2 = a2[0].example_key.as_deref().expect("derived key");
+        let kb = b[0].example_key.as_deref().expect("derived key");
+        assert!(k1.starts_with("ch:"));
+        assert_eq!(k1, k2, "identical content → identical key (dedupes)");
+        assert_ne!(k1, kb, "different content → different key");
     }
 }

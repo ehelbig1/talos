@@ -1152,6 +1152,7 @@ async fn handle_provision_classifier(
                 "dataset_id": o.dataset_id.to_string(),
                 "lifecycle_state": o.lifecycle_state,
                 "already_existed": o.already_existed,
+                "locality_warning": o.locality_warning,
                 "next_step": "wire model_name into a classifier node on an actor-bound workflow; it serves via the LLM until it distills enough data and you promote it in the Models page",
             })
             .to_string(),

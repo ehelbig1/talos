@@ -295,8 +295,17 @@ pub fn evaluate_policy(policy: &PolicyJson, inputs: &PolicyInputs<'_>) -> Policy
 /// DECRYPTED dataset content to a provider, and those legs run with no
 /// owning actor (so `max_llm_tier` never applies). The provider must be
 /// LOCAL unless `allow_external_llm: true` is explicit on the config.
-/// Called by the config write paths AND re-checked by consumers before
-/// any dataset-derived LLM invocation (defense in depth).
+///
+/// SCOPE (honest, verified 2026-07-13): this gates config WRITES only —
+/// no serving-time consumer re-checks it today. talos-ml itself makes no
+/// LLM calls (no dataset-derived LLM invocation exists server-side), and
+/// the NODE's fallback leg resolves its provider from the node config's
+/// PROVIDER key, gated at runtime by the ACTOR's `max_llm_tier`, not by
+/// this flag. `provision_classifier` therefore returns a
+/// `locality_warning` when `allow_external_llm: false` is paired with a
+/// non-tier1 actor — the flag is advisory until the actor tier backs it.
+/// If a server-side dataset-derived LLM leg is ever added, it MUST call
+/// this before the invocation, restoring the defense-in-depth intent.
 pub fn validate_llm_locality(config_json: &serde_json::Value) -> Result<(), String> {
     let allow_external = config_json
         .get("allow_external_llm")

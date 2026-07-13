@@ -17,7 +17,7 @@ import {
   useMlModelDisagreementsQuery,
   useResolveMlDisagreementMutation,
 } from "@/generated/graphql";
-import { LIFECYCLE_STYLE } from "@/lib/mlLifecycle";
+import { LIFECYCLE_STYLE, lifecycleLabel } from "@/lib/mlLifecycle";
 
 function pct(v: number | null | undefined): string {
   return v == null ? "—" : `${(v * 100).toFixed(1)}%`;
@@ -156,7 +156,7 @@ export default function ModelReview() {
                           LIFECYCLE_STYLE.llm_only,
                       )}
                     >
-                      {m.lifecycleState.replace("_", " ")}
+                      {lifecycleLabel(m.lifecycleState)}
                     </span>
                     <span className="text-[9px] text-muted-foreground/40 font-bold uppercase tracking-widest">
                       acc {pct(m.promotedAccuracy)}
@@ -176,7 +176,7 @@ export default function ModelReview() {
               <div className="flex flex-wrap items-center gap-x-8 gap-y-3 mb-8 px-6 py-5 bg-white/[0.02] border border-white/5 rounded-[2rem]">
                 <Stat
                   label="Lifecycle"
-                  value={feed.lifecycleState.replace("_", " ")}
+                  value={lifecycleLabel(feed.lifecycleState)}
                 />
                 <Stat
                   label="Shadow agreement"

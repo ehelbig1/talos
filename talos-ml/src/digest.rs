@@ -175,15 +175,33 @@ async fn deliver_one(
     // is not a routine operation and the window is one read tx, so the
     // exposure is negligible — same caller-verifies contract as
     // talos_memory::clone_memories.)
-    let actor_owner: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM actors WHERE id = $1")
-        .bind(digest_actor)
-        .fetch_optional(pool)
-        .await
-        .context("resolve digest actor owner")?;
-    if actor_owner != Some(user_id) {
+    let actor_row: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT user_id, status FROM actors WHERE id = $1")
+            .bind(digest_actor)
+            .fetch_optional(pool)
+            .await
+            .context("resolve digest actor owner")?;
+    let actor_status = match actor_row {
+        Some((owner, status)) if owner == user_id => status,
+        _ => {
+            tracing::warn!(
+                %model_id,
+                "digest actor is not owned by the model's user; skipping delivery"
+            );
+            return Ok(false);
+        }
+    };
+    // A retired actor must stop RECEIVING data, not just stop acting —
+    // archiving/terminating is often containment, and digests carry
+    // decrypted email-derived previews. talos-memory checks org + tier on
+    // persist but never status, so without this skip the tick keeps
+    // accumulating sensitive content in a store the user believes is dead.
+    if actor_status == "archived" || actor_status == "terminated" {
         tracing::warn!(
             %model_id,
-            "digest actor is not owned by the model's user; skipping delivery"
+            actor_status,
+            "digest actor is retired; skipping delivery (point the model config's \
+             digest.actor_id at an active actor to resume digests)"
         );
         return Ok(false);
     }
