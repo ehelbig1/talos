@@ -30,6 +30,24 @@ const DEFAULT_MODEL = "qwen3.6:latest";
 // Mirrors talos-ml provision.rs: name is [A-Za-z0-9._-], 1–128 chars.
 const NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
 
+/**
+ * Whether a node's `moduleName` identifies the smart-classifier module.
+ *
+ * The node only carries the module's display `name` (`workflowLoader.ts` sets
+ * `moduleName = moduleData.name`) plus a per-install UUID — and catalog modules
+ * surface their DISPLAY name, so a loaded node reads "Smart Classifier", not the
+ * "smart-classifier" slug. Normalize (lowercase, spaces/underscores → hyphens)
+ * so we match the display name AND the slug across every code path.
+ */
+export function isSmartClassifierModule(name: string | undefined): boolean {
+  return (
+    (name ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_]+/g, "-") === "smart-classifier"
+  );
+}
+
 interface SmartClassifierConfigProps {
   nodeId: string;
   config: Record<string, unknown>;

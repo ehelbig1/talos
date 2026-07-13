@@ -45,7 +45,10 @@ import { getFixSuggestion } from "@/lib/fixSuggestions";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { ExecutionHistory } from "../ExecutionHistory";
 import { NodeConfigForm } from "../NodeConfigForm";
-import { SmartClassifierConfig } from "./SmartClassifierConfig";
+import {
+  SmartClassifierConfig,
+  isSmartClassifierModule,
+} from "./SmartClassifierConfig";
 
 const STATUS_DOT: Record<NodeStatusType, string> = {
   idle: "bg-muted-foreground/20",
@@ -231,7 +234,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                 Node Parameters
               </label>
               <div className="bg-surface-3/40 border border-white/5 rounded-[2rem] p-6 glass-dark shadow-2xl">
-                {node.data.moduleName === "smart-classifier" ? (
+                {isSmartClassifierModule(node.data.moduleName) ? (
                   <SmartClassifierConfig
                     nodeId={node.id}
                     config={node.data.config || {}}
