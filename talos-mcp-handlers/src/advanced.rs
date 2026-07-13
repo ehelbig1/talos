@@ -3877,6 +3877,24 @@ async fn handle_agent_session_start(
         "static_tool_count": crate::static_tool_count(),
     });
 
+    // DX #17: image staleness. BUILD_TIME is stamped at compile time; a dev
+    // stack whose controller predates recent merges is a recurring trap —
+    // "the fix is on main but the running image doesn't have it" cost two
+    // rebuild cycles on 2026-07-13 alone. Surface the age always, and an
+    // actionable tip once it exceeds a day.
+    if let Ok(built) = chrono::DateTime::parse_from_rfc3339(env!("BUILD_TIME")) {
+        let age_hours =
+            (chrono::Utc::now() - built.with_timezone(&chrono::Utc)).num_minutes() as f64 / 60.0;
+        report["build_age_hours"] = serde_json::json!((age_hours * 10.0).round() / 10.0);
+        if age_hours > 24.0 {
+            report["build_staleness_tip"] = serde_json::json!(format!(
+                "controller image was built {age_hours:.0}h ago — if code merged since, this \
+                 process doesn't have it; rebuild + recreate before live-testing \
+                 (make rebuild SERVICE=controller)"
+            ));
+        }
+    }
+
     if auto_archive_days.is_some() {
         report["auto_archived_stale_drafts"] = serde_json::json!(auto_archived_count);
     }
