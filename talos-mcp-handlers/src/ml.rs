@@ -162,6 +162,14 @@ pub fn tool_schemas() -> Vec<Value> {
                 "policy": { "type": "object", "description": "Advanced: full policy override; omit for the safe default" }
             }, "required": ["name", "labels", "actor_id"] }
         }),
+        serde_json::json!({
+            "name": "ml_delete_model",
+            "description": "Delete a registered model (versions/shadow-stats/disagreements cascade) and optionally its dataset (+examples). Refuses when any of YOUR workflows reference the model by name (remove/repoint those nodes first) or, with delete_dataset, when other models still train on the dataset. The cleanup path for test/demo classifiers.",
+            "inputSchema": { "type": "object", "properties": {
+                "model_name": { "type": "string", "description": "The model to delete (must be yours)" },
+                "delete_dataset": { "type": "boolean", "description": "Also delete the model's dataset and all its examples; default false" }
+            }, "required": ["model_name"] }
+        }),
     ]
 }
 
@@ -202,6 +210,7 @@ pub async fn dispatch(
         "ml_provision_classifier" => {
             Some(handle_provision_classifier(req_id, args, state, user_id).await)
         }
+        "ml_delete_model" => Some(handle_delete_model(req_id, args, state, user_id).await),
         _ => None,
     }
 }
@@ -1162,5 +1171,55 @@ async fn handle_provision_classifier(
             mcp_error(req_id, -32000, "actor not found or not owned by you")
         }
         Err(talos_ml::ProvisionError::Internal(e)) => internal(req_id, "provision_classifier", &e),
+    }
+}
+
+async fn handle_delete_model(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let Some(model_name) = args.get("model_name").and_then(|v| v.as_str()) else {
+        return mcp_error(req_id, -32602, "Missing required parameter: model_name");
+    };
+    let delete_dataset = args
+        .get("delete_dataset")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    match talos_ml::delete_model(&state.db_pool, model_name, delete_dataset, user_id).await {
+        Ok(o) => mcp_text(
+            req_id,
+            &serde_json::json!({
+                "model_name": model_name,
+                "model_id": o.model_id.to_string(),
+                "model_deleted": o.model_deleted,
+                "dataset_id": o.dataset_id.map(|d| d.to_string()),
+                "dataset_deleted": o.dataset_deleted,
+            })
+            .to_string(),
+        ),
+        Err(talos_ml::DeleteError::NotFound) => {
+            mcp_error(req_id, -32000, "model not found or not owned by you")
+        }
+        Err(talos_ml::DeleteError::ReferencedByWorkflows(n)) => mcp_error(
+            req_id,
+            -32602,
+            &format!(
+                "{n} of your workflow(s) reference this model by name — remove or repoint \
+                 those nodes (search_workflows for the model name), then retry"
+            ),
+        ),
+        Err(talos_ml::DeleteError::DatasetShared(siblings)) => mcp_error(
+            req_id,
+            -32602,
+            &format!(
+                "dataset is still used by other model(s): {} — delete those first or omit \
+                 delete_dataset",
+                siblings.join(", ")
+            ),
+        ),
+        Err(talos_ml::DeleteError::Internal(e)) => internal(req_id, "delete_model", &e),
     }
 }
