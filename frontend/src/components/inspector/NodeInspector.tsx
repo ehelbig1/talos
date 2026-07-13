@@ -45,6 +45,7 @@ import { getFixSuggestion } from "@/lib/fixSuggestions";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { ExecutionHistory } from "../ExecutionHistory";
 import { NodeConfigForm } from "../NodeConfigForm";
+import { SmartClassifierConfig } from "./SmartClassifierConfig";
 
 const STATUS_DOT: Record<NodeStatusType, string> = {
   idle: "bg-muted-foreground/20",
@@ -230,13 +231,21 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                 Node Parameters
               </label>
               <div className="bg-surface-3/40 border border-white/5 rounded-[2rem] p-6 glass-dark shadow-2xl">
-                <NodeConfigForm
-                  type={node.data.systemNodeKind || node.data.moduleId}
-                  config={node.data.config || {}}
-                  onChange={(newConfig) =>
-                    updateNodeData(node.id, { config: newConfig })
-                  }
-                />
+                {node.data.moduleName === "smart-classifier" ? (
+                  <SmartClassifierConfig
+                    nodeId={node.id}
+                    config={node.data.config || {}}
+                    updateNodeData={updateNodeData}
+                  />
+                ) : (
+                  <NodeConfigForm
+                    type={node.data.systemNodeKind || node.data.moduleId}
+                    config={node.data.config || {}}
+                    onChange={(newConfig) =>
+                      updateNodeData(node.id, { config: newConfig })
+                    }
+                  />
+                )}
               </div>
             </div>
 

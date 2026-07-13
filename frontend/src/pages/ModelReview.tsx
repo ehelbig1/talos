@@ -17,15 +17,7 @@ import {
   useMlModelDisagreementsQuery,
   useResolveMlDisagreementMutation,
 } from "@/generated/graphql";
-
-// Lifecycle state → badge palette. shadow = learning (amber), hybrid =
-// partly serving (primary), fast_primary = model-led (success).
-const LIFECYCLE_STYLE: Record<string, string> = {
-  llm_only: "text-muted-foreground/60 bg-white/5 border-white/10",
-  shadow: "text-warning bg-warning/5 border-warning/20",
-  hybrid: "text-primary bg-primary/5 border-primary/20",
-  fast_primary: "text-success bg-success/5 border-success/20",
-};
+import { LIFECYCLE_STYLE } from "@/lib/mlLifecycle";
 
 function pct(v: number | null | undefined): string {
   return v == null ? "—" : `${(v * 100).toFixed(1)}%`;
