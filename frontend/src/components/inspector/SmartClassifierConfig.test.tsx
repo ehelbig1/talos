@@ -2,7 +2,10 @@ import { render, screen, fireEvent, waitFor } from "@/test-utils";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { server } from "@/../vitest.setup";
 import { http, HttpResponse } from "msw";
-import { SmartClassifierConfig } from "./SmartClassifierConfig";
+import {
+  SmartClassifierConfig,
+  isSmartClassifierModule,
+} from "./SmartClassifierConfig";
 import { useWorkflowStore } from "@/store/workflowStore";
 
 interface GqlBody {
@@ -62,6 +65,25 @@ function actorsResponse() {
     },
   };
 }
+
+describe("isSmartClassifierModule", () => {
+  it("matches the catalog display name a loaded node actually carries", () => {
+    // workflowLoader sets moduleName = module display name; catalog modules
+    // surface "Smart Classifier", NOT the slug — this is the real load path.
+    expect(isSmartClassifierModule("Smart Classifier")).toBe(true);
+  });
+  it("matches the slug and underscore/case variants", () => {
+    expect(isSmartClassifierModule("smart-classifier")).toBe(true);
+    expect(isSmartClassifierModule("smart_classifier")).toBe(true);
+    expect(isSmartClassifierModule("SMART CLASSIFIER")).toBe(true);
+  });
+  it("does not match other modules or empty", () => {
+    expect(isSmartClassifierModule("hybrid-classify-inbox")).toBe(false);
+    expect(isSmartClassifierModule("LLM Inference")).toBe(false);
+    expect(isSmartClassifierModule(undefined)).toBe(false);
+    expect(isSmartClassifierModule("")).toBe(false);
+  });
+});
 
 describe("SmartClassifierConfig", () => {
   beforeEach(() => {
