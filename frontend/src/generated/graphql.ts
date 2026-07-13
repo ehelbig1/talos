@@ -1365,6 +1365,7 @@ export type GetModulesLoaderQuery = {
     name: string;
     config: string;
     configSchema: string | null;
+    catalogSlug: string | null;
     sourceCode: string | null;
     capabilityWorld: string | null;
     importedInterfaces: Array<string> | null;
@@ -5039,6 +5040,7 @@ export const GetModulesLoaderDocument = new TypedDocumentString(`
     name
     config
     configSchema
+    catalogSlug
     sourceCode
     capabilityWorld
     importedInterfaces

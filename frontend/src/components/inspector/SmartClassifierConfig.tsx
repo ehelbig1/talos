@@ -51,7 +51,13 @@ const CONTRACT_KEYS = ["MODEL_NAME", "SYSTEM_PROMPT", "LABELS"] as const;
 export function isSmartClassifierModule(
   name: string | undefined,
   configSchema?: Record<string, unknown>,
+  catalogSlug?: string,
 ): boolean {
+  // Strongest identity first: the persisted catalog slug (DX #14) — exact,
+  // rename-proof, and never present on user sandbox modules.
+  if (catalogSlug) {
+    return catalogSlug === "smart-classifier";
+  }
   const required = configSchema?.required;
   if (Array.isArray(required)) {
     return CONTRACT_KEYS.every((k) => required.includes(k));

@@ -134,6 +134,9 @@ pub struct ModuleDetailsRow {
     /// Exposed so the editor can identify a module by its CONTRACT (stable
     /// under rename) instead of its mutable display name.
     pub config_schema: Option<serde_json::Value>,
+    /// Origin template slug for catalog modules (stable under display-name
+    /// renames); NULL for sandbox/extracted modules.
+    pub catalog_slug: Option<String>,
     pub source_code: Option<String>,
     pub capability_world: Option<String>,
     pub imported_interfaces: Option<Vec<String>>,
@@ -780,7 +783,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, config_schema, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, catalog_slug, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE id = ANY($1)
                AND (user_id = $2 OR org_id = ANY($3))",
@@ -806,7 +809,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, config_schema, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, catalog_slug, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE id = ANY($1)",
         )
@@ -832,7 +835,7 @@ impl ModuleRepository {
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
-                    config, config_schema, source_code, capability_world, imported_interfaces, language
+                    config, config_schema, catalog_slug, source_code, capability_world, imported_interfaces, language
              FROM modules
              WHERE (user_id = $1 OR org_id = ANY($4))
              ORDER BY COALESCE(compiled_at, created_at) DESC, id DESC
@@ -2507,6 +2510,7 @@ impl ModuleRepository {
         allowed_secrets: &[String],
         requires_approval_for: &[String],
         config_schema: &serde_json::Value,
+        catalog_slug: Option<&str>,
     ) -> Result<CatalogInstallResult> {
         let cw_long = if capability_world_short == "trusted" {
             "automation-node".to_string()
@@ -2538,15 +2542,16 @@ impl ModuleRepository {
                         user_id, name, kind, capability_world, config_schema, \
                         allowed_hosts, allowed_methods, allowed_secrets, requires_approval_for, \
                         source_code, wasm_bytes, content_hash, size_bytes, max_fuel, \
-                        language, created_at, compiled_at, updated_at \
+                        catalog_slug, language, created_at, compiled_at, updated_at \
                      ) VALUES ( \
                         $1, $2, 'catalog', $3, $4, \
                         $5, $6, $7, $8, \
                         $9, $10, $11, $12, $13, \
-                        'rust', NOW(), NOW(), NOW() \
+                        $14, 'rust', NOW(), NOW(), NOW() \
                      ) \
                      ON CONFLICT (user_id, name) WHERE user_id IS NOT NULL DO UPDATE SET \
                         capability_world = EXCLUDED.capability_world, \
+                        catalog_slug = COALESCE(EXCLUDED.catalog_slug, modules.catalog_slug), \
                         config_schema = EXCLUDED.config_schema, \
                         allowed_hosts = EXCLUDED.allowed_hosts, \
                         allowed_methods = EXCLUDED.allowed_methods, \
@@ -2582,6 +2587,7 @@ impl ModuleRepository {
             .bind(content_hash)
             .bind(wasm_bytes.len() as i32)
             .bind(max_fuel)
+            .bind(catalog_slug)
             .fetch_one(&self.db_pool)
             .await?;
         Ok(CatalogInstallResult {

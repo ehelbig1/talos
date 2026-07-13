@@ -60,6 +60,9 @@ pub struct WasmModule {
     /// `config_schema`), when the module declares one. The editor uses the
     /// schema's REQUIRED KEYS as a rename-stable module identity.
     pub config_schema: Option<String>,
+    /// Origin catalog template slug (e.g. "smart-classifier"); stable under
+    /// display-name renames. None for sandbox/extracted modules.
+    pub catalog_slug: Option<String>,
     pub capability_world: Option<String>,
     pub imported_interfaces: Option<Vec<String>>,
     pub source_code: Option<String>,
@@ -504,6 +507,7 @@ impl async_graphql::dataloader::Loader<Uuid> for ModuleLoader {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "{}".to_string()),
                 config_schema: m.config_schema.map(|c| c.to_string()),
+                catalog_slug: m.catalog_slug,
                 source_code: m.source_code,
                 capability_world: m.capability_world,
                 imported_interfaces: m.imported_interfaces,

@@ -34,6 +34,7 @@ const _GET_MODULES_LOADER = gql`
       name
       config
       configSchema
+      catalogSlug
       sourceCode
       capabilityWorld
       importedInterfaces
@@ -147,6 +148,7 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
         name: string;
         config: Record<string, unknown>;
         configSchema?: Record<string, unknown>;
+        catalogSlug?: string | null;
         capabilityWorld?: string | null;
         sourceCode?: string | null;
         category?: string | null;
@@ -180,6 +182,7 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
           name: m.name,
           config: parsedConfig,
           configSchema: parsedSchema,
+          catalogSlug: m.catalogSlug,
           sourceCode: m.sourceCode,
           capabilityWorld: m.capabilityWorld,
           importedInterfaces: m.importedInterfaces,
@@ -211,6 +214,7 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
           moduleName: moduleName, // Human-readable name
           config: config, // Node configuration (workflow override or module default)
           configSchema: moduleData?.configSchema ?? undefined,
+          catalogSlug: moduleData?.catalogSlug ?? undefined,
           capabilityWorld: moduleData?.capabilityWorld ?? undefined,
           sourceCode: moduleData?.sourceCode ?? undefined,
           category: moduleData?.category ?? undefined,

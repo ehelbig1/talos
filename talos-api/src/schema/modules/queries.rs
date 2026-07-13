@@ -218,6 +218,7 @@ impl ModulesQueries {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "{}".to_string()),
                 config_schema: m.config_schema.map(|c| c.to_string()),
+                catalog_slug: m.catalog_slug,
                 capability_world: m.capability_world,
                 imported_interfaces: m.imported_interfaces,
                 source_code: m.source_code,
@@ -280,6 +281,7 @@ impl ModulesQueries {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "{}".to_string()),
                 config_schema: m.config_schema.map(|c| c.to_string()),
+                catalog_slug: m.catalog_slug,
                 capability_world: m.capability_world,
                 imported_interfaces: m.imported_interfaces,
                 source_code: m.source_code,

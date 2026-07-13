@@ -3172,6 +3172,9 @@ async fn handle_install_module_from_catalog(
                     &allowed_secrets,
                     &requires_approval_for,
                     &config_schema,
+                    // The resolved template DIR is the canonical catalog slug —
+                    // stable under display-name renames (DX #14).
+                    module_dir.file_name().and_then(|f| f.to_str()),
                 )
                 .await
             {

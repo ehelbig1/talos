@@ -8194,14 +8194,15 @@ async fn seed_templates(
             "INSERT INTO modules ( \
                  user_id, name, kind, category, description, config_schema, \
                  source_code, allowed_hosts, allowed_secrets, requires_approval_for, \
-                 capability_world, language, created_at, updated_at \
+                 capability_world, catalog_slug, language, created_at, updated_at \
              ) VALUES ( \
                  NULL, $1, 'catalog', $2, $3, $4, \
                  $5, $6, $7, $8, \
-                 $9, 'rust', NOW(), NOW() \
+                 $9, $10, 'rust', NOW(), NOW() \
              ) \
              ON CONFLICT (name) WHERE user_id IS NULL DO UPDATE SET \
                  category              = EXCLUDED.category, \
+                 catalog_slug          = EXCLUDED.catalog_slug, \
                  description           = EXCLUDED.description, \
                  config_schema         = EXCLUDED.config_schema, \
                  source_code           = EXCLUDED.source_code, \
@@ -8221,6 +8222,7 @@ async fn seed_templates(
         .bind(&allowed_secrets)
         .bind(&requires_approval_for)
         .bind(&cw_long)
+        .bind(path.file_name().and_then(|f| f.to_str()))
         .fetch_one(&registry.db_pool)
         .await;
 
