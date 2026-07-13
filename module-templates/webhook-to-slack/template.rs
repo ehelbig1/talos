@@ -174,7 +174,7 @@ fn run(input: String) -> Result<String, String> {
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": format!("Sent via {} | {}", username, talos::core::datetime::now_utc()),
+                    "text": format!("Sent via {} | {}", username, talos::core::datetime::now_iso()),
                 }
             ]
         }));
