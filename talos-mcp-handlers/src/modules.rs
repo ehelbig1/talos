@@ -33,7 +33,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "description": "List all compiled modules (from compile_template or compile_custom_sandbox). Returns module IDs needed for create_workflow.",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "search": { "type": "string", "description": "Case-insensitive substring filter on module name" }
+                },
             }
         }),
         serde_json::json!({
@@ -65,9 +67,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "module_id": { "type": "string", "description": "UUID of the module to inspect" }
+                    "module_id": { "type": "string", "description": "UUID of the module to inspect" },
+                    "module_name": { "type": "string", "description": "Alternative to module_id: case-insensitive exact module name (your modules + catalog)" }
                 },
-                "required": ["module_id"]
+                "required": []
             }
         }),
         serde_json::json!({
@@ -243,6 +246,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "category": { "type": "string", "description": "Filter to a single category (e.g. 'Network', 'AI', 'Integration'). Case-insensitive substring match." },
                     "capability_world": { "type": "string", "description": "Filter by WIT capability world (e.g. 'http-node', 'agent-node')." },
                     "query": { "type": "string", "description": "Substring match against name / display_name / description. Case-insensitive." },
+                    "search": { "type": "string", "description": "Alias for 'query' (accepted so the sibling tools' param name also works)." },
                     "installed_only": { "type": "boolean", "description": "If true, return only modules already installed by the current user. Default: false." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max modules to return (default: 50, max: 200). matching_count = post-filter pre-pagination count; catalog_total_count = catalog-wide pre-filter; returned_count = items in this page. total_available + total are kept as deprecated aliases of matching_count + catalog_total_count." },
                     "offset": { "type": "integer", "minimum": 0, "description": "Skip the first N modules (default: 0). Combine with limit for pagination." }
@@ -481,11 +485,19 @@ async fn handle_list_templates(
 
 async fn handle_list_modules(
     req_id: Option<serde_json::Value>,
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
     let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    // Optional substring filter — escaped (backslash first) so `%`/`_` in
+    // caller input match literally, then wrapped for ILIKE.
+    let name_like = args
+        .get("search")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", talos_search_service::escape_like(s)));
 
     // Query the user_modules view — a single source of truth that unions
     // wasm_modules (custom sandboxes) and user-owned node_templates (catalog
@@ -493,7 +505,7 @@ async fn handle_list_modules(
     // and get_system_status.modules all agree on what a "module" is.
     let rows = state
         .module_repo
-        .list_user_modules_view(user_id, 100)
+        .list_user_modules_view_filtered(user_id, name_like.as_deref(), 100)
         .await
         .unwrap_or_default();
 
@@ -783,9 +795,46 @@ async fn handle_get_module_info(
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
     let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
-    let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
-        Ok(id) => id,
-        Err(resp) => return resp,
+    // module_id (UUID) or module_name (case-insensitive exact) — previously
+    // id-only, which forced a full list_modules pull to look up one module.
+    let module_id = if args.get("module_id").is_some() {
+        match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        }
+    } else if let Some(name) = args
+        .get("module_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match state
+            .module_repo
+            .find_template_id_by_name_ci(name, user_id)
+            .await
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!(
+                        "No module named '{name}' (yours or catalog) — try list_modules \
+                         with search, or list_module_catalog with query"
+                    ),
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "get_module_info name lookup failed");
+                return mcp_error(req_id, -32000, "module lookup failed (see server logs)");
+            }
+        }
+    } else {
+        return mcp_error(
+            req_id,
+            -32602,
+            "Provide module_id (UUID) or module_name (string)",
+        );
     };
 
     // Try wasm_modules first — accepts EITHER wasm_modules.id OR template_id.
@@ -2453,8 +2502,12 @@ async fn handle_list_module_catalog(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // `search` is accepted as an alias for `query` — every sibling listing
+    // tool calls it search, and the mismatch was a live papercut (callers
+    // passed `search`, got the unknown-arg warning, and full output).
     let query_filter = args
         .get("query")
+        .or_else(|| args.get("search"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())

@@ -875,13 +875,28 @@ impl ModuleRepository {
         user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<UserModuleViewRow>> {
+        self.list_user_modules_view_filtered(user_id, None, limit)
+            .await
+    }
+
+    /// `list_user_modules_view` with an optional case-insensitive name
+    /// substring filter. `name_like` must be a pre-escaped LIKE pattern
+    /// (caller escapes `\`/`%`/`_` — backslash first — and wraps in `%`).
+    pub async fn list_user_modules_view_filtered(
+        &self,
+        user_id: Uuid,
+        name_like: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<UserModuleViewRow>> {
         let rows = sqlx::query(
             "SELECT id, name, capability_world, source, template_id \
              FROM user_modules WHERE user_id = $1 \
+               AND ($3::text IS NULL OR name ILIKE $3 ESCAPE '\\') \
              ORDER BY compiled_at DESC LIMIT $2",
         )
         .bind(user_id)
         .bind(limit)
+        .bind(name_like)
         .fetch_all(&self.db_pool)
         .await?;
         rows.iter()
