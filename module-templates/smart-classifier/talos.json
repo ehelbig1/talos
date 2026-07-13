@@ -1,0 +1,51 @@
+{
+  "name": "smart-classifier",
+  "version": "v1.0.0",
+  "display_name": "Smart Classifier",
+  "description": "RFC 0011 self-improving classifier: labels one input into one of the configured LABELS by consulting a distilled model first (talos:core/model predict-batch, lifecycle-gated server-side) and falling back to the LLM only when the model abstains. Emits {label, confidence, _source} — a drop-in classify node — plus an __ml_distill__ envelope for LLM-labeled inputs so the model learns from production. While the model is llm_only/shadow the gate abstains, so behavior is identical to a plain LLM classify node; the LLM-cost reduction turns on automatically once the model earns hybrid/fast_primary. Provision the model/dataset/policy with ml_provision_classifier and reference it here by MODEL_NAME. Requires an actor-bound workflow (the actor resolves tenancy for serving + distillation).",
+  "category": "AI",
+  "capability_world": "agent-node",
+  "allowed_hosts": [],
+  "allowed_secrets": [],
+  "recommended_fuel": {
+    "expected_items": 1,
+    "bytes_per_item": 4000,
+    "llm_output_bytes": 200,
+    "safety_multiplier": 2.5
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["MODEL_NAME", "SYSTEM_PROMPT", "LABELS"],
+    "properties": {
+      "MODEL_NAME": {
+        "type": "string",
+        "description": "The registered ml_models name to consult (from ml_provision_classifier). Resolved under the execution actor's tenancy; served only once the model reaches hybrid/fast_primary."
+      },
+      "SYSTEM_PROMPT": {
+        "type": "string",
+        "description": "Classification instructions for the LLM fallback leg. The allowed labels and the JSON response format are appended automatically; you supply the task description (e.g. 'Classify this support email by urgency.')."
+      },
+      "LABELS": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "The label set (2+). Both the model's and the LLM's answers are validated against it before leaving the node."
+      },
+      "MODEL": {
+        "type": "string",
+        "default": "qwen3.6:latest",
+        "description": "LLM model identifier for the fallback leg."
+      },
+      "PROVIDER": {
+        "type": "string",
+        "enum": ["ollama", "anthropic", "openai", "gemini"],
+        "default": "ollama",
+        "description": "LLM provider for the fallback leg. 'ollama' (default, Tier-1, local) keeps input on-host."
+      },
+      "MAX_TOKENS": {
+        "type": "number",
+        "default": 256,
+        "description": "Max tokens for the LLM classification response (one label is small)."
+      }
+    }
+  }
+}

@@ -16,6 +16,19 @@ pub struct MlResolveResult {
     pub correction_appended: bool,
 }
 
+/// Outcome of provisioning a classifier.
+#[derive(SimpleObject, Clone)]
+pub struct MlProvisionResult {
+    pub model_name: String,
+    pub model_id: Uuid,
+    pub dataset_id: Uuid,
+    /// Always `llm_only` for a fresh classifier (it serves via the LLM and
+    /// distills into a fast model over time).
+    pub lifecycle_state: String,
+    /// True when a model of this name already existed and was reused.
+    pub already_existed: bool,
+}
+
 #[derive(Default)]
 pub struct MlMutations;
 
@@ -69,6 +82,70 @@ impl MlMutations {
             Err(talos_ml::ResolveError::Internal(e)) => {
                 tracing::error!(target: "talos_ml", error = %e, "resolve_ml_disagreement failed");
                 Err(async_graphql::Error::new("Could not resolve disagreement").extend_safe())
+            }
+        }
+    }
+
+    /// Provision (or idempotently reuse) a classifier for a workflow node:
+    /// creates the dataset + model (born `llm_only`) + a safe default
+    /// promotion policy under the actor's tenancy in one owner-scoped tx, and
+    /// returns the model name to stamp into the node. Backed by the SAME
+    /// `talos_ml::provision_classifier` the MCP tool calls.
+    #[allow(clippy::too_many_arguments)]
+    async fn provision_ml_classifier(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        labels: Vec<String>,
+        actor_id: Uuid,
+        fallback_provider: Option<String>,
+        fallback_model: Option<String>,
+        allow_external_llm: Option<bool>,
+        k: Option<i32>,
+        confidence_threshold: Option<f64>,
+        max_examples: Option<i32>,
+    ) -> Result<MlProvisionResult> {
+        require_2fa(ctx)?;
+        require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsWrite)?;
+        let user_id = super::queries::session_user(ctx)?;
+        let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
+        let secrets = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
+        let dataset = talos_ml::DatasetService::new(secrets.clone());
+
+        let input = talos_ml::ProvisionInput {
+            name,
+            labels,
+            actor_id,
+            fallback_provider,
+            fallback_model,
+            allow_external_llm: allow_external_llm.unwrap_or(false),
+            k: k.map(i64::from),
+            confidence_threshold,
+            max_examples: max_examples.map(i64::from),
+            // The GraphQL surface uses the safe default policy; the MCP tool
+            // carries the advanced override for expert flows.
+            policy_override: None,
+        };
+
+        match talos_ml::provision_classifier(db_pool, &dataset, input, user_id).await {
+            Ok(o) => Ok(MlProvisionResult {
+                model_name: o.model_name,
+                model_id: o.model_id,
+                dataset_id: o.dataset_id,
+                lifecycle_state: o.lifecycle_state,
+                already_existed: o.already_existed,
+            }),
+            // The validation message is caller-authored (no schema/internal
+            // detail) — safe to surface so the editor can show it inline.
+            Err(talos_ml::ProvisionError::InvalidInput(m)) => {
+                Err(async_graphql::Error::new(m).extend_safe())
+            }
+            Err(talos_ml::ProvisionError::InvalidActor) => {
+                Err(async_graphql::Error::new("Actor not found or not owned by you").extend_safe())
+            }
+            Err(talos_ml::ProvisionError::Internal(e)) => {
+                tracing::error!(target: "talos_ml", error = %e, "provision_ml_classifier failed");
+                Err(async_graphql::Error::new("Could not provision classifier").extend_safe())
             }
         }
     }
