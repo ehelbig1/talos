@@ -1559,6 +1559,68 @@ impl WorkflowsMutations {
         })
     }
 
+    /// Bind (or unbind, with a null `actorId`) a workflow's default actor —
+    /// the tenancy principal its executions run under. Required for a Smart
+    /// Classifier node: model serving + distillation resolve the model owner
+    /// from this actor. Mirrors the MCP `set_workflow_actor_id` tool.
+    async fn set_workflow_actor_id(
+        &self,
+        ctx: &Context<'_>,
+        workflow_id: Uuid,
+        actor_id: Option<Uuid>,
+    ) -> Result<bool> {
+        require_2fa(ctx)?;
+        require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsWrite)?;
+        let user_id = ctx
+            .data_opt::<Uuid>()
+            .copied()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
+
+        // Validate the actor belongs to the caller + is active before binding
+        // (the repo UPDATE only gates workflow ownership). Mirrors the MCP
+        // handler's service-layer check.
+        if let Some(aid) = actor_id {
+            let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+            match actor_repo.get_actor_basic_info(aid, user_id).await {
+                Ok(Some(info)) if info.status != "archived" && info.status != "terminated" => {}
+                Ok(Some(_)) => {
+                    return Err(async_graphql::Error::new(
+                        "That actor is archived or terminated — reactivate it first",
+                    )
+                    .extend_safe());
+                }
+                Ok(None) => {
+                    return Err(
+                        async_graphql::Error::new("Actor not found or not owned by you")
+                            .extend_safe(),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(target: "talos_api", error = %e, "set_workflow_actor_id actor lookup");
+                    return Err(
+                        async_graphql::Error::new("Could not verify the actor").extend_safe()
+                    );
+                }
+            }
+        }
+
+        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+        let updated = workflow_repo
+            .set_workflow_actor_id(workflow_id, user_id, actor_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(target: "talos_api", error = %e, "set_workflow_actor_id failed");
+                async_graphql::Error::new("Could not bind the actor").extend_safe()
+            })?;
+        if !updated {
+            return Err(
+                async_graphql::Error::new("Workflow not found or not owned by you").extend_safe(),
+            );
+        }
+        Ok(true)
+    }
+
     // ── Organization mutations ─────────────────────────────────────────
 }
 

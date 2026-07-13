@@ -932,6 +932,35 @@ export type ResolveMlDisagreementMutation = {
   };
 };
 
+export type ProvisionMlClassifierMutationVariables = Exact<{
+  name: string;
+  labels: Array<string> | string;
+  actorId: string;
+  fallbackProvider?: string | null | undefined;
+  fallbackModel?: string | null | undefined;
+  allowExternalLlm?: boolean | null | undefined;
+  k?: number | null | undefined;
+  confidenceThreshold?: number | null | undefined;
+  maxExamples?: number | null | undefined;
+}>;
+
+export type ProvisionMlClassifierMutation = {
+  provisionMlClassifier: {
+    modelName: string;
+    modelId: string;
+    datasetId: string;
+    lifecycleState: string;
+    alreadyExisted: boolean;
+  };
+};
+
+export type SetWorkflowActorIdMutationVariables = Exact<{
+  workflowId: string;
+  actorId?: string | null | undefined;
+}>;
+
+export type SetWorkflowActorIdMutation = { setWorkflowActorId: boolean };
+
 export type MyModulesQueryVariables = Exact<{
   limit?: number | null | undefined;
   offset?: number | null | undefined;
@@ -3857,6 +3886,88 @@ export const useResolveMlDisagreementMutation = <
         ResolveMlDisagreementMutation,
         ResolveMlDisagreementMutationVariables
       >(ResolveMlDisagreementDocument, variables)(),
+    ...options,
+  });
+};
+
+export const ProvisionMlClassifierDocument = new TypedDocumentString(`
+    mutation ProvisionMlClassifier($name: String!, $labels: [String!]!, $actorId: UUID!, $fallbackProvider: String, $fallbackModel: String, $allowExternalLlm: Boolean, $k: Int, $confidenceThreshold: Float, $maxExamples: Int) {
+  provisionMlClassifier(
+    name: $name
+    labels: $labels
+    actorId: $actorId
+    fallbackProvider: $fallbackProvider
+    fallbackModel: $fallbackModel
+    allowExternalLlm: $allowExternalLlm
+    k: $k
+    confidenceThreshold: $confidenceThreshold
+    maxExamples: $maxExamples
+  ) {
+    modelName
+    modelId
+    datasetId
+    lifecycleState
+    alreadyExisted
+  }
+}
+    `);
+
+export const useProvisionMlClassifierMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    ProvisionMlClassifierMutation,
+    TError,
+    ProvisionMlClassifierMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    ProvisionMlClassifierMutation,
+    TError,
+    ProvisionMlClassifierMutationVariables,
+    TContext
+  >({
+    mutationKey: ["ProvisionMlClassifier"],
+    mutationFn: (variables?: ProvisionMlClassifierMutationVariables) =>
+      graphqlFetcher<
+        ProvisionMlClassifierMutation,
+        ProvisionMlClassifierMutationVariables
+      >(ProvisionMlClassifierDocument, variables)(),
+    ...options,
+  });
+};
+
+export const SetWorkflowActorIdDocument = new TypedDocumentString(`
+    mutation SetWorkflowActorId($workflowId: UUID!, $actorId: UUID) {
+  setWorkflowActorId(workflowId: $workflowId, actorId: $actorId)
+}
+    `);
+
+export const useSetWorkflowActorIdMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    SetWorkflowActorIdMutation,
+    TError,
+    SetWorkflowActorIdMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    SetWorkflowActorIdMutation,
+    TError,
+    SetWorkflowActorIdMutationVariables,
+    TContext
+  >({
+    mutationKey: ["SetWorkflowActorId"],
+    mutationFn: (variables?: SetWorkflowActorIdMutationVariables) =>
+      graphqlFetcher<
+        SetWorkflowActorIdMutation,
+        SetWorkflowActorIdMutationVariables
+      >(SetWorkflowActorIdDocument, variables)(),
     ...options,
   });
 };
