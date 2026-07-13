@@ -16,6 +16,27 @@ use uuid::Uuid;
 /// catalog walk must run on the blocking pool — MCP-H8).
 static CATALOG_CACHE: OnceCell<Vec<serde_json::Value>> = OnceCell::const_new();
 
+/// Platform-category allowlist for `list_templates`' default view.
+/// Compared CASE-INSENSITIVELY: disk-seeded rows carry talos.json casing
+/// ("AI", "Data"), and the original case-sensitive compare filtered every
+/// seeded template out — list_templates returned 0 against a fully seeded
+/// catalog (the 2026-07-13 catalog-opacity papercut, DX #12).
+const PLATFORM_CATEGORIES: &[&str] = &[
+    "platform",
+    "core",
+    "io",
+    "ai",
+    "data",
+    "monitoring",
+    "communication",
+    "integration",
+];
+
+fn is_platform_category(cat: &str) -> bool {
+    let lowered = cat.to_lowercase();
+    PLATFORM_CATEGORIES.contains(&lowered.as_str())
+}
+
 pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
@@ -254,6 +275,11 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "get_catalog_status",
+            "description": "Catalog diagnostic: which templates are on disk vs seeded into the DB catalog, which are hidden from list_templates by the category allowlist, what each surface reads (list_templates → DB; list_module_catalog + install → disk; dynamic template tools → DB), and how seeding works. Use when templates seem missing or surfaces disagree.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
             "name": "install_module_from_catalog",
             "description": "Compile and install a built-in module template from the catalog. Returns a module_id ready for use in add_node_to_workflow. Much faster than writing custom code for common patterns. Response always includes module_id, name, wasm_sha256 (hex SHA-256 of the compiled bytes), compiled_at (RFC3339 UTC of when the WASM was written), and bytes_changed (true on first install OR when the source produced different bytes than the prior install — false signals an idempotent no-op). Use bytes_changed/wasm_sha256 to verify a reinstall actually picked up new source after a platform deploy. Check for optional warning fields: grant_empty_warning (module has deny-all secret access — every vault:// config value will fail at runtime, reinstall with allowed_secrets) and wildcard_grant_warning (module has wildcard [\"*\"] secret access — consider scoping to explicit paths to limit blast radius).",
             "inputSchema": {
@@ -338,6 +364,7 @@ pub async fn dispatch(
         "get_module_unification_status" => {
             Some(handle_get_module_unification_status(req_id, state).await)
         }
+        "get_catalog_status" => Some(handle_get_catalog_status(req_id, state, agent).await),
         "list_module_usage" => Some(handle_list_module_usage(req_id, args, state, agent).await),
         "find_unreferenced_modules" => {
             Some(handle_find_unreferenced_modules(req_id, args, state, agent).await)
@@ -411,18 +438,7 @@ async fn handle_list_templates(
     //     platform-first) and drop subsequent duplicates by name. The
     //     `duplicate_count` field tells operators how many entries were
     //     collapsed so they can detect drift in the underlying registry.
-    const PLATFORM_CATEGORIES: &[&str] = &[
-        "platform",
-        "core",
-        "io",
-        "ai",
-        "data",
-        "monitoring",
-        "communication",
-        "integration",
-    ];
-
-    let is_platform = |cat: &str| -> bool { PLATFORM_CATEGORIES.contains(&cat) };
+    let is_platform = is_platform_category;
 
     let pre_filter: Vec<&talos_registry::NodeTemplate> = templates
         .iter()
@@ -3782,4 +3798,191 @@ mod host_managed_access_tests {
         let b = host_managed_access_for_world(Some("llm-node"));
         assert_eq!(a.get("external_hosts"), b.get("external_hosts"));
     }
+}
+
+// ── get_catalog_status (DX #12: catalog-opacity diagnostic) ──────────────────
+
+/// One answer to "why isn't my template showing up?": diffs the three
+/// catalog sources of truth (baked disk dir, DB catalog rows, and the
+/// list_templates category-filtered view) and names what each MCP surface
+/// reads. Deliberately UNCACHED disk read — a diagnostic must report disk
+/// truth now, not the boot-time CATALOG_CACHE snapshot.
+async fn handle_get_catalog_status(
+    req_id: Option<serde_json::Value>,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+
+    // Mode: OCI sync owns the DB catalog when TALOS_REGISTRY_URL is set
+    // (empty string treated as unset — the MCP-598 footgun).
+    let registry_url = std::env::var("TALOS_REGISTRY_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mode = if registry_url.is_some() {
+        "oci"
+    } else {
+        "disk"
+    };
+
+    // Disk truth: slug (dir name) + display_name + category per template.
+    let catalog_dir = std::path::PathBuf::from("/app/module-templates");
+    let dir_exists = catalog_dir.is_dir();
+    let disk: Vec<(String, String, String)> = if dir_exists {
+        let dir = catalog_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() || !path.join("template.rs").exists() {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(path.join("talos.json")) else {
+                        continue;
+                    };
+                    let meta: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+                    let slug = path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let display = meta
+                        .get("display_name")
+                        .or_else(|| meta.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&slug)
+                        .to_string();
+                    let category = meta
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("General")
+                        .to_string();
+                    out.push((slug, display, category));
+                }
+            }
+            out.sort();
+            out
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // DB catalog rows (name = display_name at seed time, catalog_slug when
+    // stamped) + the caller's installed catalog modules.
+    let db_rows = state
+        .module_repo
+        .list_catalog_rows()
+        .await
+        .unwrap_or_default();
+    let installed = state
+        .module_repo
+        .list_user_template_names(user_id)
+        .await
+        .unwrap_or_default();
+
+    // Diff disk ↔ DB. A DB row matches a disk template when its stamped
+    // slug equals the dir slug, or (pre-backfill rows) its name equals the
+    // template's display_name or slug.
+    let db_matches = |slug: &str, display: &str| -> bool {
+        db_rows.iter().any(|(name, db_slug, _)| {
+            db_slug.as_deref() == Some(slug) || name == display || name == slug
+        })
+    };
+    let on_disk_not_in_db: Vec<&str> = disk
+        .iter()
+        .filter(|(slug, display, _)| !db_matches(slug, display))
+        .map(|(slug, _, _)| slug.as_str())
+        .collect();
+    let disk_matches = |name: &str, db_slug: Option<&str>| -> bool {
+        disk.iter().any(|(slug, display, _)| {
+            db_slug == Some(slug.as_str()) || name == display || name == slug
+        })
+    };
+    let in_db_not_on_disk: Vec<&str> = db_rows
+        .iter()
+        .filter(|(name, db_slug, _)| !disk_matches(name, db_slug.as_deref()))
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+
+    // list_templates visibility: its default view drops categories outside
+    // the platform allowlist (now case-insensitive).
+    let hidden_by_category: Vec<serde_json::Value> = db_rows
+        .iter()
+        .filter(|(_, _, cat)| cat != "workflow_template" && !is_platform_category(cat))
+        .map(|(name, _, cat)| serde_json::json!({ "name": name, "category": cat }))
+        .collect();
+    let visible = db_rows
+        .iter()
+        .filter(|(_, _, cat)| cat != "workflow_template" && is_platform_category(cat))
+        .count();
+
+    let mut tips: Vec<String> = Vec::new();
+    if !dir_exists {
+        tips.push(
+            "module-templates/ is absent from this image — disk seeding and \
+             list_module_catalog/install_module_from_catalog have nothing to read"
+                .to_string(),
+        );
+    }
+    if mode == "disk" && !on_disk_not_in_db.is_empty() {
+        tips.push(format!(
+            "{} disk template(s) are not in the DB catalog — seeding runs at \
+             every controller boot (idempotent upsert); restart the controller \
+             (or rebuild the image if the templates are newer than it) to seed: {}",
+            on_disk_not_in_db.len(),
+            on_disk_not_in_db.join(", ")
+        ));
+    }
+    if mode == "oci" {
+        tips.push(
+            "OCI mode: the DB catalog is owned by the registry sync loop; \
+             list_module_catalog and install still read the BAKED DISK templates, \
+             so their listing can diverge from the DB"
+                .to_string(),
+        );
+    }
+    if !hidden_by_category.is_empty() {
+        tips.push(format!(
+            "{} seeded template(s) are hidden from list_templates' default view \
+             by the platform-category allowlist — pass include_sandboxes: true \
+             to see them",
+            hidden_by_category.len()
+        ));
+    }
+
+    let report = serde_json::json!({
+        "mode": mode,
+        "registry_url_set": registry_url.is_some(),
+        "disk": {
+            "dir_exists": dir_exists,
+            "template_count": disk.len(),
+            "slugs": disk.iter().map(|(s, _, _)| s.as_str()).collect::<Vec<_>>(),
+        },
+        "db_catalog": {
+            "row_count": db_rows.len(),
+            "list_templates_visible": visible,
+            "hidden_by_category": hidden_by_category,
+        },
+        "diff": {
+            "on_disk_not_in_db": on_disk_not_in_db,
+            "in_db_not_on_disk": in_db_not_on_disk,
+        },
+        "installed_by_you": installed.len(),
+        "surfaces": {
+            "list_templates": "DB modules table (kind='catalog'); default view filters to platform categories",
+            "list_module_catalog": "baked disk dir /app/module-templates (cached per process)",
+            "install_module_from_catalog": "baked disk dir (compiles template.rs on install)",
+            "dynamic template tools (Name-v1)": "DB modules table — absent when seeding hasn't run",
+        },
+        "seeding": "Disk seeding runs at EVERY controller boot as an idempotent upsert into the modules table; it is skipped only when TALOS_REGISTRY_URL is set (OCI owns the catalog) or module-templates/ is missing.",
+        "tips": tips,
+    });
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&report).unwrap_or_default(),
+    )
 }

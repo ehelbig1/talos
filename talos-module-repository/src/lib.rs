@@ -2599,6 +2599,28 @@ impl ModuleRepository {
         })
     }
 
+    /// Platform catalog rows (user_id IS NULL, kind='catalog') for the
+    /// get_catalog_status diagnostic — name, origin slug, category. Catalog
+    /// rows are deployment-shared metadata (no tenant content), safe for any
+    /// authenticated caller to enumerate.
+    pub async fn list_catalog_rows(&self) -> Result<Vec<(String, Option<String>, String)>> {
+        let rows = sqlx::query(
+            "SELECT name, catalog_slug, COALESCE(category, 'General') AS category \
+             FROM modules WHERE user_id IS NULL AND kind = 'catalog' ORDER BY name",
+        )
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.iter()
+            .map(|r| -> Result<(String, Option<String>, String)> {
+                Ok((
+                    r.try_get("name")?,
+                    r.try_get::<Option<String>, _>("catalog_slug")?,
+                    r.try_get("category")?,
+                ))
+            })
+            .collect()
+    }
+
     /// Phase 5: reconciliation sweep is now a no-op. The legacy tables it
     /// used to read from (`wasm_modules`, `node_templates`) are being
     /// dropped in the Phase 5 migration — there are no un-mirrored rows
