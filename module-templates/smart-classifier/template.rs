@@ -44,18 +44,35 @@ fn config_labels(data: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The text to classify: `input.text`, a bare-string input, root `text`, or
-/// the whole input serialized as a last resort.
-fn input_text(data: &serde_json::Value) -> String {
-    if let Some(s) = data["input"]["text"].as_str() {
-        s.to_string()
-    } else if let Some(s) = data["input"].as_str() {
-        s.to_string()
-    } else if let Some(s) = data["text"].as_str() {
-        s.to_string()
-    } else {
-        serde_json::to_string(&data["input"]).unwrap_or_default()
+/// Cap on the classified text. Mirrors the distill validator's
+/// MAX_FEATURE_BYTES: anything longer would be skipped by the dataset
+/// anyway, and an uncapped string flows verbatim into the LLM prompt
+/// (unbounded tokens/latency for zero classification benefit).
+const MAX_INPUT_BYTES: usize = 16 * 1024;
+
+/// The text to classify: `input.text`, a bare-string input, or root `text`.
+/// A shape mismatch is `None` so `run()` fails loud — the old serialize-the-
+/// whole-input fallback silently classified JSON blobs (a missing input
+/// became the literal string "null") and distilled that garbage into the
+/// training dataset instead of surfacing the wiring bug.
+fn input_text(data: &serde_json::Value) -> Option<String> {
+    data["input"]["text"]
+        .as_str()
+        .or_else(|| data["input"].as_str())
+        .or_else(|| data["text"].as_str())
+        .map(str::to_string)
+}
+
+/// Truncate at a char boundary at or below `max` bytes.
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// First balanced top-level JSON object in `s`, string/escape-aware.
@@ -101,7 +118,14 @@ fn parse_llm_label(s: &str) -> Option<String> {
     while from < s.len() {
         let rel = s[from..].find('{')?;
         let start = from + rel;
-        let obj = balanced_object(&s[start..])?;
+        // No balanced object STARTS at this '{' (e.g. an unclosed prose
+        // brace before the real JSON) — a later '{' may still open a valid
+        // one, so keep scanning instead of aborting the whole parse (the
+        // old `?` here rejected replies like `answer { ... {"label":"x"}`).
+        let Some(obj) = balanced_object(&s[start..]) else {
+            from = start + 1;
+            continue;
+        };
         if let Ok(parsed) = serde_json::from_str::<LlmLabel>(obj) {
             return Some(parsed.label.trim().to_string());
         }
@@ -177,10 +201,17 @@ pub fn run(input: String) -> Result<String, String> {
         .or_else(|| data["MAX_TOKENS"].as_u64())
         .unwrap_or(256) as u32;
 
-    let text = input_text(&data);
+    let Some(text) = input_text(&data) else {
+        return Err(
+            "no input text to classify — pass a string, {\"text\": ...}, or wire an \
+             upstream node that emits one of those shapes"
+                .to_string(),
+        );
+    };
     if text.trim().is_empty() {
         return Err("no input text to classify".to_string());
     }
+    let text = truncate_bytes(&text, MAX_INPUT_BYTES).to_string();
     // Optional dedup key from the upstream item's id (keeps repeated inputs
     // from bloating the dataset); omitted when absent.
     let example_key = data["input"]["id"].as_str().map(|s| s.to_string());
@@ -189,6 +220,13 @@ pub fn run(input: String) -> Result<String, String> {
     // LLM handles it (soft degradation).
     let model_pred = match talos::core::model::predict_batch(&model_name, &[text.clone()]) {
         Ok(reply) => reply.predictions.into_iter().next().flatten(),
+        // Cancellation is a directive, not a serving failure — the WIT
+        // contract says "do NOT retry; unwind". Falling through to the LLM
+        // would burn a completion (possibly external) and append a distill
+        // row for an execution the operator killed.
+        Err(talos::core::model::Error::Cancelled) => {
+            return Err("Execution cancelled — not retrying".to_string())
+        }
         Err(_) => None,
     };
     let model_label = model_pred
