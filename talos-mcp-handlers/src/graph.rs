@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{compute_mcp_graph_diff, mcp_error, mcp_text};
+use super::utils::{compute_mcp_graph_diff, mcp_error, mcp_text, mcp_text_with_json};
 use super::{auth, McpState};
 use serde_json::json;
 use std::sync::Arc;
@@ -42,6 +42,75 @@ fn validate_rhai_expression(field_name: &str, source: &str) -> Result<(), String
         )
     })?;
     Ok(())
+}
+
+/// Apply an RFC 7386 JSON Merge Patch to `target` in place.
+///
+/// Backs the `merge_config` action on `update_node_config` (DX pain
+/// point 21, found live 2026-07-14): `update_config` REPLACES a node's
+/// whole config object, so an operator setting `{"DRY_RUN": false}`
+/// via `update_config` silently wiped every sibling key (`TO`,
+/// `AUTH_HEADER`, ...) — a patch-sounding name with replace semantics
+/// and zero warning. `merge_config` gives callers real patch semantics.
+///
+/// Semantics (RFC 7386 §2, transcribed from the spec's pseudocode):
+/// - If `patch` is not a JSON object, `target` is replaced wholesale
+///   by `patch` (covers scalar/array/null patches).
+/// - Otherwise, for each key in `patch`: a `null` value DELETES that
+///   key from `target`; an object value recurses (resetting the
+///   target's existing value to `{}` first if it isn't already an
+///   object — RFC 7386 discards non-object targets rather than
+///   merging onto them); any other value REPLACES the key verbatim.
+pub(crate) fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let Some(patch_obj) = patch.as_object() else {
+        // Patch is a scalar / array / null: wholesale replace.
+        *target = patch.clone();
+        return;
+    };
+
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    // Safe: just ensured `target` is an object above.
+    let target_obj = target.as_object_mut().expect("target is an object");
+
+    for (key, patch_value) in patch_obj {
+        if patch_value.is_null() {
+            target_obj.remove(key);
+        } else if patch_value.is_object() {
+            let entry = target_obj
+                .entry(key.clone())
+                .or_insert_with(|| serde_json::json!({}));
+            if !entry.is_object() {
+                *entry = serde_json::json!({});
+            }
+            json_merge_patch(entry, patch_value);
+        } else {
+            target_obj.insert(key.clone(), patch_value.clone());
+        }
+    }
+}
+
+/// Top-level keys present in `old` but absent from `new`.
+///
+/// Used by `update_config` (the replace-semantics action) to surface
+/// which config keys a wholesale replace silently dropped — so the
+/// caller learns about the wipe from the SUCCESS response, not from
+/// the next scheduled run failing with "Missing X config". Returns an
+/// empty `Vec` when `old` isn't an object (nothing meaningful was
+/// "present" to drop).
+fn dropped_top_level_keys(old: &serde_json::Value, new: &serde_json::Value) -> Vec<String> {
+    let Some(old_obj) = old.as_object() else {
+        return Vec::new();
+    };
+    let new_obj = new.as_object();
+    let mut dropped: Vec<String> = old_obj
+        .keys()
+        .filter(|k| !new_obj.is_some_and(|n| n.contains_key(*k)))
+        .cloned()
+        .collect();
+    dropped.sort();
+    dropped
 }
 
 /// Insert a system node into the graph's `nodes` array, replacing an
@@ -370,8 +439,19 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "description": "Update a node's configuration, retry settings, or position; or remove a node or edge. \
                 Prefer the dedicated remove_edge tool for edge removal and the standalone node delete via \
                 workflow graph tools for node removal — they have clearer required-field contracts. \
+                \
+                IMPORTANT — update_config vs merge_config: 'update_config' REPLACES the node's entire \
+                config object with the given 'config' value — any existing key not present in the new \
+                value is DROPPED (its success response reports what was dropped as 'dropped_keys', but \
+                the drop already happened). 'merge_config' applies 'config' as an RFC 7386 JSON Merge \
+                Patch ONTO the existing config: objects merge key-by-key, scalars/arrays replace just \
+                that key, and an explicit `null` deletes just that key — every other existing key is left \
+                untouched. Use merge_config when you only want to change one or two keys (e.g. toggling \
+                DRY_RUN) without restating the whole config; use update_config when you intend a full \
+                replace and have the complete config in hand. \
                 Required fields per action: \
-                update_config — workflow_id, node_id, config; \
+                update_config — workflow_id, node_id, config (replaces the whole config); \
+                merge_config — workflow_id, node_id, config (RFC 7386 merge patch onto the existing config; null deletes a key); \
                 update_retry — workflow_id, node_id, plus any retry_* fields; \
                 update_position — workflow_id, node_id, x, y; \
                 remove_node — workflow_id, node_id; \
@@ -383,12 +463,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "node_id": { "type": "string", "description": "Node to update or remove (required for all actions except remove_edge)" },
                     "action": {
                         "type": "string",
-                        "enum": ["update_config", "update_retry", "update_position", "remove_node", "remove_edge"],
-                        "description": "Action to perform. Each action has different required fields — see tool description."
+                        "enum": ["update_config", "merge_config", "update_retry", "update_position", "remove_node", "remove_edge"],
+                        "description": "Action to perform. Each action has different required fields — see tool description. 'update_config' replaces the whole config (dropping unlisted keys); 'merge_config' patches just the given keys (RFC 7386 JSON Merge Patch; null deletes a key)."
                     },
                     "x": { "type": "number", "description": "X position (for update_position action)" },
                     "y": { "type": "number", "description": "Y position (for update_position action)" },
-                    "config": { "type": "object", "description": "New config (for update_config action)" },
+                    "config": { "type": "object", "description": "For update_config: the full replacement config (existing keys not listed here are dropped). For merge_config: an RFC 7386 JSON Merge Patch applied onto the existing config — only the listed keys change; set a key to null to delete it." },
                     "retry_count": { "type": "number", "description": "Max retries on failure (for update_retry action)" },
                     "retry_backoff_ms": { "type": "number", "description": "Base backoff in ms (for update_retry action)" },
                     "retry_condition": { "type": "string", "description": "Rhai expression: if false, skip retry and fail immediately (for update_retry action)" },
@@ -1237,6 +1317,9 @@ async fn handle_update_node_config(
         serde_json::from_str(&graph_json_str).unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
 
     let mut template_warnings: Vec<String> = Vec::new();
+    // Populated only by the `update_config` (replace-semantics) arm —
+    // see the "dropped_keys" response addition below.
+    let mut dropped_keys: Option<Vec<String>> = None;
 
     match action {
         "update_config" => {
@@ -1314,7 +1397,89 @@ async fn handle_update_node_config(
             if let Some(nodes) = graph.get_mut("nodes").and_then(|n| n.as_array_mut()) {
                 for node in nodes.iter_mut() {
                     if node.get("id").and_then(|v| v.as_str()) == Some(node_id) {
+                        // DX pain point 21 (2026-07-14): capture the config
+                        // BEFORE the replace so the response can report which
+                        // keys the wholesale overwrite dropped.
+                        let old_config = node.get("data").cloned().unwrap_or(serde_json::json!({}));
                         if let Some(obj) = node.as_object_mut() { obj.insert("data".to_string(), new_config.clone()); } else { return mcp_error(req_id, -32602, "Invalid node structure: expected object"); }
+                        dropped_keys = Some(dropped_top_level_keys(&old_config, &new_config));
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if !found {
+                return mcp_error(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
+            }
+        }
+        "merge_config" => {
+            // MCP-DX21 (2026-07-14): RFC 7386 JSON Merge Patch onto the
+            // node's EXISTING config, instead of `update_config`'s
+            // wholesale replace. See `json_merge_patch` doc comment for
+            // the full rationale/semantics.
+            let raw_node_id = match args.get("node_id").and_then(|v| v.as_str()) {
+                Some(id) if !id.trim().is_empty() => id.trim(),
+                _ => return mcp_error(req_id, -32602, "node_id required for merge_config"),
+            };
+            let node_id = raw_node_id;
+            let raw_patch = args.get("config").cloned().unwrap_or(serde_json::json!({}));
+
+            // Same 1 MB wire-level cap as update_config.
+            if let Err(resp) =
+                crate::utils::enforce_payload_size_limit(&raw_patch, req_id.clone())
+            {
+                return resp;
+            }
+
+            // SECURITY: same "__"-prefixed engine-internal-key guard as
+            // update_config — strip them out of the patch (both value
+            // sets AND explicit-null deletes) so a merge patch can't
+            // touch runtime control fields reserved for the engine and
+            // their dedicated MCP actions.
+            let patch = if let Some(obj) = raw_patch.as_object() {
+                let filtered: serde_json::Map<String, serde_json::Value> = obj
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("__"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                // Validate skip_condition if caller is trying to set it here.
+                // Unlike update_config, an explicit `null` here is a valid
+                // RFC 7386 "delete this key" instruction, not a type error.
+                if let Some(sc) = filtered.get("skip_condition") {
+                    if let Some(expr) = sc.as_str() {
+                        if expr.len() > 2000 {
+                            return mcp_error(req_id, -32602, "skip_condition must be ≤ 2000 characters; use add_skip_condition for validated updates");
+                        }
+                    } else if !sc.is_null() {
+                        return mcp_error(req_id, -32602, "skip_condition must be a string (or null to delete it); use add_skip_condition for validated updates");
+                    }
+                }
+                serde_json::Value::Object(filtered)
+            } else {
+                raw_patch
+            };
+
+            template_warnings.extend(
+                talos_workflow_creation_helpers::detect_template_interpolation_warnings(&patch),
+            );
+
+            let mut found = false;
+            if let Some(nodes) = graph.get_mut("nodes").and_then(|n| n.as_array_mut()) {
+                for node in nodes.iter_mut() {
+                    if node.get("id").and_then(|v| v.as_str()) == Some(node_id) {
+                        let mut merged = node.get("data").cloned().unwrap_or(serde_json::json!({}));
+                        json_merge_patch(&mut merged, &patch);
+
+                        if serde_json::to_string(&merged).map(|s| s.len()).unwrap_or(0) > 100_000 {
+                            return mcp_error(req_id, -32602, "config must be ≤ 100 KB when serialized after merge");
+                        }
+
+                        if let Some(obj) = node.as_object_mut() {
+                            obj.insert("data".to_string(), merged);
+                        } else {
+                            return mcp_error(req_id, -32602, "Invalid node structure: expected object");
+                        }
                         found = true;
                         break;
                     }
@@ -1655,7 +1820,7 @@ async fn handle_update_node_config(
                 edge_target,
             );
         }
-        _ => return mcp_error(req_id, -32602, &format!("Unknown action '{}'. Use 'update_config', 'update_retry', 'remove_node', or 'remove_edge'.", action)),
+        _ => return mcp_error(req_id, -32602, &format!("Unknown action '{}'. Use 'update_config', 'merge_config', 'update_retry', 'update_position', 'remove_node', or 'remove_edge'.", action)),
     }
 
     let updated_json = graph.to_string();
@@ -1666,6 +1831,32 @@ async fn handle_update_node_config(
     let mut msg = format!("Workflow {} updated (action: {}).", wf_id, action);
     for w in &template_warnings {
         msg.push_str(&format!("\n\nWarning: {}", w));
+    }
+
+    // DX pain point 21 (2026-07-14): `update_config` replaces the whole
+    // config object, so surface which existing keys the replace dropped
+    // — in the message AND as a machine-parsable "dropped_keys" field
+    // (additive: existing consumers reading content[0] text see the
+    // same shape as before, just with this warning appended when it
+    // fires). Always present (possibly empty) for update_config; a
+    // "hint" pointing at merge_config is added only when non-empty.
+    let mut machine_block: Option<serde_json::Value> = None;
+    if action == "update_config" {
+        let dk = dropped_keys.unwrap_or_default();
+        if dk.is_empty() {
+            machine_block = Some(serde_json::json!({ "dropped_keys": dk }));
+        } else {
+            let hint = "update_config replaces the whole config object, so keys not present in \
+                the new value are dropped. Use merge_config (RFC 7386 JSON Merge Patch) to change \
+                specific keys without touching the rest.";
+            msg.push_str(&format!(
+                "\n\nWarning: dropped {} existing config key(s) not present in the new config: [{}]. {}",
+                dk.len(),
+                dk.join(", "),
+                hint
+            ));
+            machine_block = Some(serde_json::json!({ "dropped_keys": dk, "hint": hint }));
+        }
     }
 
     // Auto-publish if this workflow has an active published version.
@@ -1703,7 +1894,10 @@ async fn handle_update_node_config(
         }
     }
 
-    mcp_text(req_id, &msg)
+    match machine_block {
+        Some(mb) => mcp_text_with_json(req_id, &msg, mb),
+        None => mcp_text(req_id, &msg),
+    }
 }
 
 // ── update_node_positions ───────────────────────────────────────────────────
@@ -5020,5 +5214,200 @@ mod canonicalise_rhai_tests {
         let raw = "not json";
         let canonical = canonicalise_rhai_in_graph_json(raw);
         assert_eq!(canonical.as_ref(), raw);
+    }
+}
+
+/// RFC 7386 Appendix A test vectors, transcribed verbatim, plus a
+/// nested-object case that goes one level deeper than any Appendix A
+/// example. See https://www.rfc-editor.org/rfc/rfc7386 §Appendix A.
+#[cfg(test)]
+mod json_merge_patch_tests {
+    use super::json_merge_patch;
+    use serde_json::json;
+
+    fn merged(target: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+        let mut target = target;
+        json_merge_patch(&mut target, &patch);
+        target
+    }
+
+    #[test]
+    fn rfc7386_vector_01_replace_scalar() {
+        assert_eq!(merged(json!({"a":"b"}), json!({"a":"c"})), json!({"a":"c"}));
+    }
+
+    #[test]
+    fn rfc7386_vector_02_add_key() {
+        assert_eq!(
+            merged(json!({"a":"b"}), json!({"b":"c"})),
+            json!({"a":"b","b":"c"})
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_03_delete_only_key() {
+        assert_eq!(merged(json!({"a":"b"}), json!({"a": null})), json!({}));
+    }
+
+    #[test]
+    fn rfc7386_vector_04_delete_one_of_two_keys() {
+        assert_eq!(
+            merged(json!({"a":"b","b":"c"}), json!({"a": null})),
+            json!({"b":"c"})
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_05_array_replaced_by_scalar() {
+        assert_eq!(
+            merged(json!({"a":["b"]}), json!({"a":"c"})),
+            json!({"a":"c"})
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_06_scalar_replaced_by_array() {
+        assert_eq!(
+            merged(json!({"a":"c"}), json!({"a":["b"]})),
+            json!({"a":["b"]})
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_07_nested_object_merge_with_delete() {
+        assert_eq!(
+            merged(json!({"a": {"b":"c"}}), json!({"a": {"b":"d", "c": null}})),
+            json!({"a": {"b":"d"}})
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_08_array_of_objects_replaced_wholesale() {
+        assert_eq!(
+            merged(json!({"a": [{"b":"c"}]}), json!({"a": [1]})),
+            json!({"a": [1]})
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_09_top_level_array_replaced() {
+        assert_eq!(
+            merged(json!(["a", "b"]), json!(["c", "d"])),
+            json!(["c", "d"])
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_10_object_replaced_by_array_patch() {
+        assert_eq!(merged(json!({"a":"b"}), json!(["c"])), json!(["c"]));
+    }
+
+    #[test]
+    fn rfc7386_vector_11_object_replaced_by_null_patch() {
+        assert_eq!(merged(json!({"a":"foo"}), json!(null)), json!(null));
+    }
+
+    #[test]
+    fn rfc7386_vector_12_object_replaced_by_string_patch() {
+        assert_eq!(merged(json!({"a":"foo"}), json!("bar")), json!("bar"));
+    }
+
+    #[test]
+    fn rfc7386_vector_13_null_value_preserved_when_not_targeted() {
+        assert_eq!(
+            merged(json!({"e": null}), json!({"a": 1})),
+            json!({"e": null, "a": 1})
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_14_non_object_target_with_delete_of_absent_key() {
+        assert_eq!(
+            merged(json!([1, 2]), json!({"a":"b", "c": null})),
+            json!({"a":"b"})
+        );
+    }
+
+    #[test]
+    fn rfc7386_vector_15_deeply_nested_delete_leaves_empty_object() {
+        assert_eq!(
+            merged(json!({}), json!({"a": {"bb": {"ccc": null}}})),
+            json!({"a": {"bb": {}}})
+        );
+    }
+
+    #[test]
+    fn nested_merge_three_levels_preserves_untouched_siblings() {
+        // Beyond the RFC vectors: three levels deep, with sibling keys at
+        // every level that must survive the patch untouched — this is the
+        // shape the update_node_config footgun fix actually needs (patch
+        // one nested key, keep everything else).
+        let target = json!({
+            "AUTH": { "TO": "ops@example.com", "AUTH_HEADER": "Bearer xyz" },
+            "DRY_RUN": true,
+            "nested": { "keep": "me", "inner": { "a": 1, "b": 2 } }
+        });
+        let patch = json!({
+            "DRY_RUN": false,
+            "nested": { "inner": { "a": 99 } }
+        });
+        assert_eq!(
+            merged(target, patch),
+            json!({
+                "AUTH": { "TO": "ops@example.com", "AUTH_HEADER": "Bearer xyz" },
+                "DRY_RUN": false,
+                "nested": { "keep": "me", "inner": { "a": 99, "b": 2 } }
+            })
+        );
+    }
+
+    #[test]
+    fn null_deletes_nested_key_without_touching_siblings() {
+        let target = json!({ "a": { "b": "c", "d": "e" } });
+        let patch = json!({ "a": { "b": null } });
+        assert_eq!(merged(target, patch), json!({ "a": { "d": "e" } }));
+    }
+
+    #[test]
+    fn empty_patch_is_a_no_op() {
+        let target = json!({"a": "b", "c": {"d": 1}});
+        assert_eq!(merged(target.clone(), json!({})), target);
+    }
+}
+
+#[cfg(test)]
+mod dropped_top_level_keys_tests {
+    use super::dropped_top_level_keys;
+    use serde_json::json;
+
+    #[test]
+    fn reports_keys_missing_from_new_config() {
+        let old = json!({"TO": "a@example.com", "AUTH_HEADER": "Bearer xyz", "DRY_RUN": true});
+        let new = json!({"DRY_RUN": false});
+        let mut dropped = dropped_top_level_keys(&old, &new);
+        dropped.sort();
+        assert_eq!(dropped, vec!["AUTH_HEADER".to_string(), "TO".to_string()]);
+    }
+
+    #[test]
+    fn empty_when_nothing_dropped() {
+        let old = json!({"DRY_RUN": true});
+        let new = json!({"DRY_RUN": false, "TO": "a@example.com"});
+        assert!(dropped_top_level_keys(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn empty_when_old_config_absent_or_not_object() {
+        assert!(dropped_top_level_keys(&json!(null), &json!({})).is_empty());
+        assert!(dropped_top_level_keys(&json!({}), &json!({})).is_empty());
+    }
+
+    #[test]
+    fn all_dropped_when_new_config_is_empty() {
+        let old = json!({"A": 1, "B": 2});
+        let new = json!({});
+        let mut dropped = dropped_top_level_keys(&old, &new);
+        dropped.sort();
+        assert_eq!(dropped, vec!["A".to_string(), "B".to_string()]);
     }
 }
