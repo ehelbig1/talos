@@ -40,11 +40,15 @@ export default function ModelReview() {
     models[0]?.name ??
     null;
 
-  const { data: feedData, isLoading: feedLoading } =
-    useMlModelDisagreementsQuery(
-      { modelName: activeName ?? "", limit: 50 },
-      { enabled: !!activeName, refetchOnWindowFocus: true },
-    );
+  const {
+    data: feedData,
+    isLoading: feedLoading,
+    isError: feedError,
+    refetch: refetchFeed,
+  } = useMlModelDisagreementsQuery(
+    { modelName: activeName ?? "", limit: 50 },
+    { enabled: !!activeName, refetchOnWindowFocus: true },
+  );
   const feed = feedData?.mlModelDisagreements;
   const pending = feed?.pending ?? [];
 
@@ -199,6 +203,26 @@ export default function ModelReview() {
                     className="h-40 bg-white/[0.02] border border-white/5 rounded-[2rem] animate-pulse"
                   />
                 ))}
+              </div>
+            ) : feedError ? (
+              // A failed queue load must NEVER masquerade as "all caught
+              // up" — with pending items still counted in the model list,
+              // that silently hides work (found live 2026-07-14: a
+              // schema/query version skew errored the feed while the
+              // badge showed 10 pending).
+              <div className="text-center py-24 bg-white/[0.01] border border-dashed border-destructive/20 rounded-[2.5rem]">
+                <p className="text-sm text-destructive/80 font-black uppercase tracking-[0.2em]">
+                  Could not load the review queue
+                </p>
+                <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-widest mt-2">
+                  The pending count in the model list is still accurate.
+                </p>
+                <button
+                  onClick={() => refetchFeed()}
+                  className="mt-6 px-5 py-2 text-[10px] font-black uppercase tracking-[0.2em] text-foreground/80 bg-white/[0.04] border border-white/10 rounded-full hover:bg-white/[0.08] transition-premium"
+                >
+                  Retry
+                </button>
               </div>
             ) : pending.length === 0 ? (
               <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-[2.5rem] group">
