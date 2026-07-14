@@ -46,10 +46,16 @@ pub struct MlDisagreement {
 pub struct MlDisagreementFeed {
     pub model_id: Uuid,
     pub lifecycle_state: String,
-    /// Rolling shadow agreement (fast-vs-LLM, all bands), 0–1. `None`
-    /// when the model has no shadow observations yet.
+    /// Rolling shadow agreement (fast-vs-LLM, all bands), 0–1, scoped to
+    /// the CURRENT shadow era — the window rotates on every lifecycle
+    /// transition, version promotion, or manual reset, so this reads only
+    /// evidence about the current model/teacher combination. `None` when
+    /// the era has no observations yet.
     pub shadow_agreement: Option<f64>,
     pub shadow_observations: i32,
+    /// Current shadow era number (increments on each window rotation) —
+    /// display context for the agreement figure.
+    pub shadow_epoch: i32,
     pub pending: Vec<MlDisagreement>,
 }
 
@@ -133,6 +139,13 @@ impl MlQueries {
                 async_graphql::Error::new("Could not load model status").extend_safe()
             })?;
 
+        let shadow_epoch = talos_ml::shadow_epoch(&mut tx, model.model_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(target: "talos_ml", error = %e, "shadow_epoch");
+                async_graphql::Error::new("Could not load model status").extend_safe()
+            })?;
+
         Ok(MlDisagreementFeed {
             model_id: model.model_id,
             lifecycle_state: model.lifecycle_state,
@@ -140,6 +153,7 @@ impl MlQueries {
             shadow_observations: shadow
                 .map(|(_, n)| n.min(i64::from(i32::MAX)) as i32)
                 .unwrap_or(0),
+            shadow_epoch,
             pending: pending
                 .into_iter()
                 .map(|d| MlDisagreement {

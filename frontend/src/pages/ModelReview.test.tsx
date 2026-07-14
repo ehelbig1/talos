@@ -29,6 +29,7 @@ function feed() {
     lifecycleState: "shadow",
     shadowAgreement: 0.942,
     shadowObservations: 121,
+    shadowEpoch: 2,
     pending: [
       {
         id: "d-1",

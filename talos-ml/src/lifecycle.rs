@@ -349,6 +349,53 @@ pub fn confidence_band(confidence: Option<f32>) -> i16 {
     }
 }
 
+/// How many PAST shadow eras to retain alongside the current one.
+/// Each era is at most 11 counter rows (bands 0..=10), so retention is
+/// a display/debug affordance, not a storage concern — the bump prunes
+/// anything older so the table stays bounded per model regardless of
+/// transition count.
+const RETAINED_SHADOW_EPOCHS: i32 = 4;
+
+/// Rotate the model's shadow-agreement window: bump `shadow_epoch` and
+/// prune eras past the retention depth. Free function (not a
+/// `LifecycleService` method) because BOTH era-change paths call it —
+/// `LifecycleService::transition` and `ModelRegistry::promote_version`
+/// — plus the operator's manual window reset. Returns the new epoch.
+///
+/// Callers run this inside the same transaction as the era change so a
+/// rollback can't leave the window rotated without the transition (or
+/// vice versa). Double-bumps within one tx (auto-advance promotes AND
+/// transitions) are harmless: each bump is a distinct empty era and the
+/// prune keeps the retention invariant.
+pub async fn bump_shadow_epoch(conn: &mut PgConnection, model_id: Uuid) -> Result<i32> {
+    let new_epoch: i32 = sqlx::query_scalar(
+        "UPDATE ml_models SET shadow_epoch = shadow_epoch + 1, updated_at = NOW() \
+         WHERE id = $1 RETURNING shadow_epoch",
+    )
+    .bind(model_id)
+    .fetch_one(&mut *conn)
+    .await
+    .context("bump shadow epoch")?;
+    sqlx::query("DELETE FROM ml_shadow_stats WHERE model_id = $1 AND epoch < $2")
+        .bind(model_id)
+        .bind(new_epoch - RETAINED_SHADOW_EPOCHS)
+        .execute(&mut *conn)
+        .await
+        .context("prune retired shadow epochs")?;
+    Ok(new_epoch)
+}
+
+/// The model's current shadow era — display context for the agreement
+/// number ("era 3, 41 observations" reads very differently from a
+/// lifetime aggregate).
+pub async fn shadow_epoch(conn: &mut PgConnection, model_id: Uuid) -> Result<i32> {
+    sqlx::query_scalar("SELECT shadow_epoch FROM ml_models WHERE id = $1")
+        .bind(model_id)
+        .fetch_one(&mut *conn)
+        .await
+        .context("read shadow epoch")
+}
+
 pub struct LifecycleService {
     secrets: std::sync::Arc<talos_secrets_manager::SecretsManager>,
 }
@@ -401,7 +448,16 @@ impl LifecycleService {
         .execute(&mut *conn)
         .await
         .context("lifecycle CAS transition")?;
-        Ok(res.rows_affected() == 1)
+        if res.rows_affected() != 1 {
+            return Ok(false);
+        }
+        // Every era change rotates the shadow-agreement window: the
+        // drift guard must judge the NEW state on fresh observations,
+        // not on history accumulated under a different state/teacher
+        // (the advance→demote ping-pong this prevents is documented on
+        // migration 20260714170000).
+        bump_shadow_epoch(&mut *conn, model_id).await?;
+        Ok(true)
     }
 
     /// Record one shadow observation: the fast path predicted (or
@@ -416,11 +472,16 @@ impl LifecycleService {
         confidence: Option<f32>,
         agreed: bool,
     ) -> Result<()> {
+        // INSERT..SELECT stamps the model's CURRENT shadow_epoch in the
+        // same statement — one round trip, and an outcome can never land
+        // in a stale era even if a transition commits between a read and
+        // a write. A concurrently-deleted model inserts zero rows.
         sqlx::query(
             "INSERT INTO ml_shadow_stats \
-                 (model_id, user_id, org_id, band, agree_count, total_count, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, 1, NOW()) \
-             ON CONFLICT (model_id, band) DO UPDATE SET \
+                 (model_id, user_id, org_id, band, epoch, agree_count, total_count, updated_at) \
+             SELECT $1, $2, $3, $4, m.shadow_epoch, $5, 1, NOW() \
+             FROM ml_models m WHERE m.id = $1 \
+             ON CONFLICT (model_id, epoch, band) DO UPDATE SET \
                  agree_count = ml_shadow_stats.agree_count + EXCLUDED.agree_count, \
                  total_count = ml_shadow_stats.total_count + 1, \
                  updated_at = NOW()",
@@ -439,7 +500,42 @@ impl LifecycleService {
     /// Rolling agreement across bands AT OR ABOVE `min_band`, plus the
     /// total observation count — the drift-guard input. Returns None
     /// when no observations exist (fail-safe: no data, no judgment).
+    ///
+    /// Scoped to the model's CURRENT shadow epoch: observations from
+    /// before the last transition / promotion / window reset don't
+    /// count. This is what makes the drift guard's demote decision read
+    /// only evidence about the current model-state-teacher combination
+    /// (see migration 20260714170000 for the ping-pong this prevents).
+    /// Use [`Self::shadow_agreement_lifetime`] for the all-history view.
     pub async fn shadow_agreement(
+        &self,
+        conn: &mut PgConnection,
+        model_id: Uuid,
+        min_band: i16,
+    ) -> Result<Option<(f64, i64)>> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT COALESCE(SUM(s.agree_count), 0)::bigint, \
+                    COALESCE(SUM(s.total_count), 0)::bigint \
+             FROM ml_shadow_stats s \
+             JOIN ml_models m ON m.id = s.model_id AND s.epoch = m.shadow_epoch \
+             WHERE s.model_id = $1 AND s.band >= $2",
+        )
+        .bind(model_id)
+        .bind(min_band)
+        .fetch_optional(&mut *conn)
+        .await
+        .context("read shadow agreement")?;
+        Ok(
+            row.and_then(|(agree, total)| {
+                (total > 0).then(|| (agree as f64 / total as f64, total))
+            }),
+        )
+    }
+
+    /// All-history sibling of [`Self::shadow_agreement`] — sums every
+    /// retained epoch. Display/context only; never feed this to the
+    /// drift guard (stale eras would re-poison the demote decision).
+    pub async fn shadow_agreement_lifetime(
         &self,
         conn: &mut PgConnection,
         model_id: Uuid,
@@ -453,7 +549,7 @@ impl LifecycleService {
         .bind(min_band)
         .fetch_optional(&mut *conn)
         .await
-        .context("read shadow agreement")?;
+        .context("read lifetime shadow agreement")?;
         Ok(
             row.and_then(|(agree, total)| {
                 (total > 0).then(|| (agree as f64 / total as f64, total))

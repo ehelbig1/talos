@@ -21,6 +21,7 @@ query MlModelDisagreements($modelName: String!, $limit: Int) {
     lifecycleState
     shadowAgreement
     shadowObservations
+    shadowEpoch
     pending {
       id
       exampleKey

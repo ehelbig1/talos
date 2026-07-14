@@ -42,6 +42,10 @@ pub struct ResolvedModel {
     pub model_id: Uuid,
     pub dataset_id: Option<Uuid>,
     pub config_json: serde_json::Value,
+    /// The lifecycle transition policy (ml_set_policy), when set —
+    /// surfaced on the model card so "which gates apply" doesn't need a
+    /// separate DB query.
+    pub policy_json: Option<serde_json::Value>,
     pub promoted_version: Option<ModelVersionRow>,
 }
 
@@ -188,6 +192,10 @@ impl ModelRegistry {
         .bind(version_id)
         .execute(&mut *conn)
         .await?;
+        // New serving version = new shadow era: agreement accumulated by
+        // the retired version must not feed the drift guard's judgment
+        // of this one (migration 20260714170000).
+        crate::lifecycle::bump_shadow_epoch(&mut *conn, model_id).await?;
         Ok(())
     }
 
@@ -333,7 +341,8 @@ impl ModelRegistry {
         user_id: Uuid,
     ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
-            "SELECT id, name, lifecycle_state, dataset_id, config_json, production_version_id \
+            "SELECT id, name, lifecycle_state, dataset_id, config_json, policy_json, \
+                    production_version_id \
              FROM ml_models WHERE id = $1 AND user_id = $2",
         )
         .bind(model_id)
@@ -360,7 +369,8 @@ impl ModelRegistry {
         user_id: Uuid,
     ) -> Result<Option<ResolvedModel>> {
         let model = sqlx::query(
-            "SELECT id, name, lifecycle_state, dataset_id, config_json, production_version_id \
+            "SELECT id, name, lifecycle_state, dataset_id, config_json, policy_json, \
+                    production_version_id \
              FROM ml_models WHERE name = $1 AND user_id = $2 \
              ORDER BY (org_id IS NULL) DESC, org_id, id LIMIT 1",
         )
@@ -383,6 +393,7 @@ impl ModelRegistry {
         let lifecycle_state: String = m.try_get("lifecycle_state")?;
         let dataset_id: Option<Uuid> = m.try_get("dataset_id")?;
         let config: serde_json::Value = m.try_get("config_json")?;
+        let policy: Option<serde_json::Value> = m.try_get("policy_json")?;
         let prod_id: Option<Uuid> = m.try_get("production_version_id")?;
         let version = match prod_id {
             Some(vid) => {
@@ -413,6 +424,7 @@ impl ModelRegistry {
             lifecycle_state,
             dataset_id,
             config_json: config,
+            policy_json: policy,
             promoted_version: version,
         }))
     }

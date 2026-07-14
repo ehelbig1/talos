@@ -43,8 +43,9 @@ pub use eval::{
 };
 pub use knn::{knn_vote, knn_vote_balanced, KnnPrediction, Neighbor};
 pub use lifecycle::{
-    can_transition, confidence_band, evaluate_policy, validate_llm_locality, LifecycleService,
-    LifecycleState, PolicyDecision, PolicyInputs, PolicyJson,
+    bump_shadow_epoch, can_transition, confidence_band, evaluate_policy, shadow_epoch,
+    validate_llm_locality, LifecycleService, LifecycleState, PolicyDecision, PolicyInputs,
+    PolicyJson,
 };
 pub use lifecycle_job::{run_policy_tick, spawn_policy_evaluator};
 pub use linear::{FitOpts, LinearModel, LinearPrediction};

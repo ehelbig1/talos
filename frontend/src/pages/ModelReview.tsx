@@ -181,7 +181,7 @@ export default function ModelReview() {
                 <Stat
                   label="Shadow agreement"
                   value={pct(feed.shadowAgreement)}
-                  hint={`${feed.shadowObservations} obs`}
+                  hint={`${feed.shadowObservations} obs · era ${feed.shadowEpoch}`}
                 />
                 <Stat label="Pending review" value={String(pending.length)} />
                 <div className="ml-auto flex items-center gap-2 text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.25em]">

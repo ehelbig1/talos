@@ -906,6 +906,7 @@ export type MlModelDisagreementsQuery = {
     lifecycleState: string;
     shadowAgreement: number | null;
     shadowObservations: number;
+    shadowEpoch: number;
     pending: Array<{
       id: string;
       exampleKey: string | null;
@@ -3813,6 +3814,7 @@ export const MlModelDisagreementsDocument = new TypedDocumentString(`
     lifecycleState
     shadowAgreement
     shadowObservations
+    shadowEpoch
     pending {
       id
       exampleKey
