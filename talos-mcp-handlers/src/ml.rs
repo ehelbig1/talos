@@ -163,6 +163,13 @@ pub fn tool_schemas() -> Vec<Value> {
             }, "required": ["name", "labels", "actor_id"] }
         }),
         serde_json::json!({
+            "name": "ml_reset_shadow_window",
+            "description": "Rotate a model's shadow-agreement window (new epoch): the drift guard and the card's `shadow` block start counting fresh observations, and history moves to the lifetime aggregate. Use after changing the TEACHER without promoting a version (new fallback model/prompt, correction-loop improvements) — transitions and promotions rotate the window automatically. Audit-logged.",
+            "inputSchema": { "type": "object", "properties": {
+                "model_name": { "type": "string", "description": "The model whose window to rotate (must be yours)" }
+            }, "required": ["model_name"] }
+        }),
+        serde_json::json!({
             "name": "ml_delete_model",
             "description": "Delete a registered model (versions/shadow-stats/disagreements cascade) and optionally its dataset (+examples). Refuses when any of YOUR workflows reference the model by name (remove/repoint those nodes first) or, with delete_dataset, when other models still train on the dataset. The cleanup path for test/demo classifiers.",
             "inputSchema": { "type": "object", "properties": {
@@ -209,6 +216,9 @@ pub async fn dispatch(
         }
         "ml_provision_classifier" => {
             Some(handle_provision_classifier(req_id, args, state, user_id).await)
+        }
+        "ml_reset_shadow_window" => {
+            Some(handle_reset_shadow_window(req_id, args, state, user_id).await)
         }
         "ml_delete_model" => Some(handle_delete_model(req_id, args, state, user_id).await),
         _ => None,
@@ -731,12 +741,23 @@ async fn handle_get_model_card(
         },
         None => None,
     };
-    // P2d lifecycle visibility: state + shadow agreement (overall) +
-    // pending-review count ride on the card so "why did the model say
-    // X" and "is it safe to advance" read from one place.
+    // P2d lifecycle visibility: state + shadow agreement + pending-review
+    // count ride on the card so "why did the model say X" and "is it safe
+    // to advance" read from one place. Agreement is CURRENT-ERA (what the
+    // drift guard judges); the lifetime aggregate rides alongside for
+    // context, clearly labeled so nobody feeds it back into a decision.
     let lsvc = lifecycle_service(state);
+    let epoch = talos_ml::shadow_epoch(&mut tx, model.model_id).await.ok();
     let shadow = lsvc
         .shadow_agreement(&mut tx, model.model_id, 0)
+        .await
+        .ok()
+        .flatten()
+        .map(|(agreement, total)| {
+            serde_json::json!({"agreement": agreement, "observations": total, "epoch": epoch})
+        });
+    let shadow_lifetime = lsvc
+        .shadow_agreement_lifetime(&mut tx, model.model_id, 0)
         .await
         .ok()
         .flatten()
@@ -753,9 +774,11 @@ async fn handle_get_model_card(
         "name": name,
         "lifecycle_state": model.lifecycle_state,
         "shadow": shadow,
+        "shadow_lifetime": shadow_lifetime,
         "has_pending_disagreements": pending_disagreements,
         "dataset_id": model.dataset_id.map(|d| d.to_string()),
         "config_json": model.config_json,
+        "policy_json": model.policy_json,
         "promoted_version": model.promoted_version,
         "versions": versions,
         "dataset_stats": dataset_stats,
@@ -1010,6 +1033,63 @@ async fn handle_set_lifecycle(
             "State changed concurrently — re-read the model card and retry",
         ),
         Err(e) => internal(req_id, "set_lifecycle", &e),
+    }
+}
+
+/// Manual shadow-window rotation — for teacher-only changes (new
+/// fallback model/prompt, correction-loop improvements) that don't run
+/// through the automatic rotation on transition/promotion. Owner-only,
+/// audit-logged. The bump itself discards nothing: history moves to the
+/// lifetime aggregate and prunes past the retention depth.
+async fn handle_reset_shadow_window(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let Some(name) = args.get("model_name").and_then(|v| v.as_str()) else {
+        return mcp_error(req_id, -32602, "Missing required parameter: model_name");
+    };
+    let mut tx = match user_tx(state, user_id).await {
+        Ok(tx) => tx,
+        Err(e) => return internal(req_id, "reset_shadow_window", &e),
+    };
+    // resolve_by_name is user-scoped — the tenancy gate; a foreign model
+    // is indistinguishable from an absent one.
+    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
+        return mcp_error(req_id, -32000, "Model not found");
+    };
+    let new_epoch = match talos_ml::bump_shadow_epoch(&mut tx, model.model_id).await {
+        Ok(e) => e,
+        Err(e) => return internal(req_id, "reset_shadow_window", &e),
+    };
+    match tx.commit().await {
+        Ok(()) => {
+            let _ = state
+                .actor_repo
+                .insert_admin_event_log(
+                    user_id,
+                    "ml_shadow_window_reset",
+                    "ml_model",
+                    Some(model.model_id),
+                    &format!(
+                        "Model '{}' shadow-agreement window manually rotated to epoch {new_epoch}",
+                        model.name
+                    ),
+                    None,
+                )
+                .await;
+            mcp_text(
+                req_id,
+                &serde_json::json!({
+                    "model_id": model.model_id.to_string(),
+                    "shadow_epoch": new_epoch,
+                    "note": "drift guard and card `shadow` now count fresh observations; history is in `shadow_lifetime`",
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => internal(req_id, "reset_shadow_window commit", &e.into()),
     }
 }
 

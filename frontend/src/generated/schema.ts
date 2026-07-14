@@ -588,10 +588,18 @@ export type MlDisagreementFeed = {
   modelId: Scalars["UUID"]["output"];
   pending: Array<MlDisagreement>;
   /**
-   * Rolling shadow agreement (fast-vs-LLM, all bands), 0–1. `None`
-   * when the model has no shadow observations yet.
+   * Rolling shadow agreement (fast-vs-LLM, all bands), 0–1, scoped to
+   * the CURRENT shadow era — the window rotates on every lifecycle
+   * transition, version promotion, or manual reset, so this reads only
+   * evidence about the current model/teacher combination. `None` when
+   * the era has no observations yet.
    */
   shadowAgreement?: Maybe<Scalars["Float"]["output"]>;
+  /**
+   * Current shadow era number (increments on each window rotation) —
+   * display context for the agreement figure.
+   */
+  shadowEpoch: Scalars["Int"]["output"];
   shadowObservations: Scalars["Int"]["output"];
 };
 

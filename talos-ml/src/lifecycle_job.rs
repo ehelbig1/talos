@@ -209,6 +209,13 @@ async fn evaluate_one_model(
     stamp_last_eval_pool(pool, model_id).await;
 
     // ── Drift guard (fail-safe demote) ──────────────────────────────
+    // `shadow_agreement` is scoped to the model's CURRENT shadow epoch
+    // (rotated on every transition/promotion), so this judgment reads
+    // only evidence about the serving version in its current state —
+    // it must re-accumulate min_shadow_total FRESH observations after
+    // every era change before it may demote. Pre-epoch, the cumulative
+    // aggregate made advance→demote ping-pong reachable (migration
+    // 20260714170000).
     if matches!(state, LifecycleState::Hybrid | LifecycleState::FastPrimary) {
         if let Some(floor) = policy.demote_below_agreement {
             let min_total = policy.min_shadow_total.unwrap_or(DEFAULT_MIN_SHADOW_TOTAL);

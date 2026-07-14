@@ -317,3 +317,164 @@ async fn disagreements_roundtrip_encrypted_and_owner_scoped() {
         .await
         .unwrap());
 }
+
+// ── Epoch-windowed shadow agreement (migration 20260714170000) ──────
+
+/// The wrongful-demote regression pin: agreement accumulated in a prior
+/// era (old teacher / old version / old state) must NOT feed the current
+/// window. Pre-epoch, a model with bad early history was demoted the
+/// moment it advanced — the guard read the stale aggregate, already past
+/// min_shadow_total, before any fresh observation existed.
+#[tokio::test]
+async fn transition_rotates_shadow_window_and_stale_history_stays_out() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = Uuid::new_v4();
+    seed_user(&pool, user).await;
+    let ds = seed_dataset(&pool, user, serde_json::json!({})).await;
+    let model = seed_model(&pool, user, ds).await;
+    let svc = lifecycle_service(&pool);
+    let mut conn = pool.acquire().await.unwrap();
+
+    // Era 0: a bad run — five straight disagreements.
+    for _ in 0..5 {
+        svc.record_shadow_outcome(&mut conn, model, user, None, Some(0.9), false)
+            .await
+            .unwrap();
+    }
+    let (agreement, total) = svc
+        .shadow_agreement(&mut conn, model, 0)
+        .await
+        .unwrap()
+        .expect("era 0 has observations");
+    assert_eq!((agreement, total), (0.0, 5));
+
+    // Transition rotates the window (llm_only -> shadow).
+    assert!(svc
+        .transition(
+            &mut conn,
+            model,
+            user,
+            LifecycleState::LlmOnly,
+            LifecycleState::Shadow
+        )
+        .await
+        .unwrap());
+    assert_eq!(talos_ml::shadow_epoch(&mut conn, model).await.unwrap(), 1);
+
+    // Fresh era: NO observations — the drift guard has no data and
+    // therefore no judgment (fail-safe), instead of inheriting 0%.
+    assert!(svc
+        .shadow_agreement(&mut conn, model, 0)
+        .await
+        .unwrap()
+        .is_none());
+    // History remains visible in the lifetime aggregate.
+    let (lifetime_agreement, lifetime_total) = svc
+        .shadow_agreement_lifetime(&mut conn, model, 0)
+        .await
+        .unwrap()
+        .expect("lifetime keeps history");
+    assert_eq!((lifetime_agreement, lifetime_total), (0.0, 5));
+
+    // Fresh observations count from zero in the new era.
+    for _ in 0..3 {
+        svc.record_shadow_outcome(&mut conn, model, user, None, Some(0.9), true)
+            .await
+            .unwrap();
+    }
+    let (agreement, total) = svc
+        .shadow_agreement(&mut conn, model, 0)
+        .await
+        .unwrap()
+        .expect("era 1 has observations");
+    assert_eq!((agreement, total), (1.0, 3));
+    let (lifetime_agreement, lifetime_total) = svc
+        .shadow_agreement_lifetime(&mut conn, model, 0)
+        .await
+        .unwrap()
+        .expect("lifetime sums both eras");
+    assert_eq!(lifetime_total, 8);
+    assert!((lifetime_agreement - 3.0 / 8.0).abs() < 1e-9);
+}
+
+/// Promoting a new version is an era change too: the retired version's
+/// agreement must not vouch for (or condemn) its successor.
+#[tokio::test]
+async fn promote_version_rotates_shadow_window() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = Uuid::new_v4();
+    seed_user(&pool, user).await;
+    let ds = seed_dataset(&pool, user, serde_json::json!({})).await;
+    let model = seed_model(&pool, user, ds).await;
+    let svc = lifecycle_service(&pool);
+    let mut conn = pool.acquire().await.unwrap();
+
+    svc.record_shadow_outcome(&mut conn, model, user, None, Some(0.8), true)
+        .await
+        .unwrap();
+
+    let version = talos_ml::ModelRegistry::create_version(
+        &mut conn,
+        model,
+        user,
+        None,
+        "knn-pgvector",
+        None,
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    talos_ml::ModelRegistry::promote_version(&mut conn, model, version.id)
+        .await
+        .unwrap();
+
+    assert_eq!(talos_ml::shadow_epoch(&mut conn, model).await.unwrap(), 1);
+    assert!(
+        svc.shadow_agreement(&mut conn, model, 0)
+            .await
+            .unwrap()
+            .is_none(),
+        "the new version starts with an empty window"
+    );
+}
+
+/// Old eras prune past the retention depth, so per-model counter rows
+/// stay bounded no matter how many transitions a model goes through.
+#[tokio::test]
+async fn shadow_epoch_retention_prunes_old_eras() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = Uuid::new_v4();
+    seed_user(&pool, user).await;
+    let ds = seed_dataset(&pool, user, serde_json::json!({})).await;
+    let model = seed_model(&pool, user, ds).await;
+    let svc = lifecycle_service(&pool);
+    let mut conn = pool.acquire().await.unwrap();
+
+    // One observation per era across 7 eras (0..=6).
+    for _ in 0..7 {
+        svc.record_shadow_outcome(&mut conn, model, user, None, Some(0.7), true)
+            .await
+            .unwrap();
+        talos_ml::bump_shadow_epoch(&mut conn, model).await.unwrap();
+    }
+    assert_eq!(talos_ml::shadow_epoch(&mut conn, model).await.unwrap(), 7);
+
+    // Retention keeps the current era plus the last RETAINED (4): eras
+    // below 7-4=3 are gone.
+    let (min_epoch, eras): (i32, i64) = sqlx::query_as(
+        "SELECT MIN(epoch), COUNT(DISTINCT epoch) FROM ml_shadow_stats WHERE model_id = $1",
+    )
+    .bind(model)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(min_epoch, 3, "eras below current-4 pruned");
+    assert_eq!(eras, 4, "eras 3..=6 hold data (7 is empty so far)");
+    // Lifetime now reflects retained eras only — 4 observations.
+    let (_, lifetime_total) = svc
+        .shadow_agreement_lifetime(&mut conn, model, 0)
+        .await
+        .unwrap()
+        .expect("retained history");
+    assert_eq!(lifetime_total, 4);
+}

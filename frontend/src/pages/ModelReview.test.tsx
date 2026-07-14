@@ -29,6 +29,7 @@ function feed() {
     lifecycleState: "shadow",
     shadowAgreement: 0.942,
     shadowObservations: 121,
+    shadowEpoch: 2,
     pending: [
       {
         id: "d-1",
@@ -117,5 +118,24 @@ describe("ModelReview", () => {
       disagreementId: "d-1",
       correctLabel: "archive",
     });
+  });
+
+  it("shows an error state (never 'all caught up') when the queue query fails", async () => {
+    mockGraphql({
+      // Feed query errors — e.g. schema/query version skew or a decrypt
+      // failure. Pre-fix this rendered the same empty state as a
+      // genuinely clear queue, hiding pending work behind "All caught
+      // up" while the model list still showed a pending badge.
+      mlModelDisagreements: () => new HttpResponse(null, { status: 500 }),
+      mlModels: () => ({ data: { mlModels: models() } }),
+    });
+
+    render(<ModelReview />);
+
+    expect(
+      await screen.findByText(/could not load the review queue/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/all caught up/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
   });
 });
