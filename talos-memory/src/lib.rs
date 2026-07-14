@@ -32,6 +32,9 @@ pub mod memory_rpc;
 pub mod ml_rpc;
 pub mod rpc_auth;
 pub mod state_rpc;
+pub mod write_error;
+
+pub use write_error::MemoryWriteError;
 
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 /// MCP-656: cap caller-controlled `metadata` JSONB at 16 KiB. Pre-fix
@@ -593,6 +596,13 @@ where
     }
 }
 
+/// Anyhow-returning entry point kept for the ~10 existing callers (MCP
+/// handlers, GraphQL mutations, the RPC subscriber, actor scaffolding,
+/// `talos-ml` digest, examples/tests) that don't need to distinguish
+/// failure classes. Delegates to [`persist_memory_with_metadata_typed`],
+/// which owns the real logic — see that function's docs. `MemoryWriteError`
+/// converts into `anyhow::Error` via `?`, so this is a pure signature
+/// adapter with no behavior change.
 pub async fn persist_memory_with_metadata(
     pool: &Pool<Postgres>,
     actor_id: Uuid,
@@ -602,6 +612,35 @@ pub async fn persist_memory_with_metadata(
     memory_type: &str,
     ttl_hours: Option<f64>,
 ) -> Result<PersistOutcome> {
+    persist_memory_with_metadata_typed(pool, actor_id, key, value, metadata, memory_type, ttl_hours)
+        .await
+        .map_err(Into::into)
+}
+
+/// Typed-error sibling of [`persist_memory_with_metadata`]. Same logic,
+/// same SQL, same validation — the only difference is that failures are
+/// classified into a [`MemoryWriteError`] variant AT THE SOURCE (where
+/// the concrete failing operation — validation, crypto, or DB — is still
+/// known), instead of relying on a caller substring-matching the
+/// stringified error afterward.
+///
+/// Added for `talos-engine::node_hook`'s `__memory_write__` failure
+/// metric, which pre-fix classified via `err.to_string().contains(...)`
+/// — fragile because any `anyhow::Context::context(...)` call anywhere
+/// upstream of the caller could silently change the string and demote a
+/// crypto/db failure into the catch-all bucket (finding N-5, crate
+/// review 2026-05-05). Callers that don't need classification should use
+/// [`persist_memory_with_metadata`] instead — this typed variant is not
+/// meant to replace the anyhow API workspace-wide.
+pub async fn persist_memory_with_metadata_typed(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    key: &str,
+    value: &serde_json::Value,
+    metadata: Option<&serde_json::Value>,
+    memory_type: &str,
+    ttl_hours: Option<f64>,
+) -> std::result::Result<PersistOutcome, MemoryWriteError> {
     // MCP-1224 (2026-05-18): route through the canonical
     // `validate_memory_key` helper at the persistence boundary so
     // every writer — MCP handlers, GraphQL mutations, engine
@@ -615,23 +654,26 @@ pub async fn persist_memory_with_metadata(
     // persisted a row that readers (all trim post-MCP-834) couldn't
     // recover. Same canonical-layer-defense shape as MCP-1218/1219
     // promoting graph_json caps into the engine's canonical validator.
-    let key = validate_memory_key(key).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let key = validate_memory_key(key)
+        .map_err(|e| MemoryWriteError::Validation(anyhow::anyhow!("{}", e)))?;
     // Single JSON serialization, reused for size check + embedding text +
     // encryption. Prior code serialized the same value three times per
     // write (once for the size cap, once for embedding text input, once
     // inside the encryption hook).
-    let serialized = serde_json::to_string(value).context("memory value JSON serialization")?;
+    let serialized = serde_json::to_string(value)
+        .context("memory value JSON serialization")
+        .map_err(MemoryWriteError::Validation)?;
     // Enforce the canonical per-value size ceiling here so every writer —
     // MCP, GraphQL, engine __memory_write__, and the worker RPC — observes
     // the same limit. Prior inconsistency (worker accepted 1 MiB, MCP
     // rejected at 64 KiB) allowed sandboxes to write rows that later
     // failed re-read through MCP.
     if serialized.len() > MAX_VALUE_BYTES {
-        anyhow::bail!(
+        return Err(MemoryWriteError::Validation(anyhow::anyhow!(
             "value too large ({} bytes). Maximum allowed is {} bytes (64 KiB).",
             serialized.len(),
             MAX_VALUE_BYTES
-        );
+        )));
     }
     // MCP-656: cap metadata at 16 KiB. Same rationale as MAX_METADATA_BYTES
     // doc — the JSONB column previously had no upper bound, allowing a
@@ -640,17 +682,18 @@ pub async fn persist_memory_with_metadata(
     // (non-tx + tx) observe the same limit.
     if let Some(m) = metadata {
         let m_bytes = serde_json::to_string(m)
-            .context("metadata JSON serialization")?
+            .context("metadata JSON serialization")
+            .map_err(MemoryWriteError::Validation)?
             .len();
         if m_bytes > MAX_METADATA_BYTES {
-            anyhow::bail!(
+            return Err(MemoryWriteError::Validation(anyhow::anyhow!(
                 "metadata too large ({} bytes). Maximum allowed is {} bytes (16 KiB).",
                 m_bytes,
                 MAX_METADATA_BYTES
-            );
+            )));
         }
     }
-    let canonical_type = validate_memory_type(memory_type)?;
+    let canonical_type = validate_memory_type(memory_type).map_err(MemoryWriteError::Validation)?;
     let expires_at = default_expires_at(canonical_type, ttl_hours);
 
     let embedding: Option<pgvector::Vector> = if canonical_type != "scratchpad" {
@@ -676,16 +719,19 @@ pub async fn persist_memory_with_metadata(
     // (actor_id, key) row will fail AES-GCM tag verification on read.
     // Per-org DEK arc: encrypt under the actor's org root DEK (v4), and stamp
     // that org on the row so its org_id matches its DEK scope.
-    let org_id = resolve_actor_org_id(pool, actor_id).await?;
+    let org_id = resolve_actor_org_id(pool, actor_id)
+        .await
+        .map_err(MemoryWriteError::Db)?;
     let aad = build_memory_aad(actor_id, key);
     let (key_id, ciphertext, value_format) =
         maybe_encrypt_value_serialized(serialized, org_id, aad)
-            .await?
+            .await
+            .map_err(MemoryWriteError::Crypto)?
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                MemoryWriteError::Crypto(anyhow::anyhow!(
                     "actor_memory write attempted without crypto hook registered — \
              ensure register_memory_crypto_hook() runs at startup before any write"
-                )
+                ))
             })?;
 
     sqlx::query(
@@ -715,7 +761,8 @@ pub async fn persist_memory_with_metadata(
     .bind(org_id)
     .execute(pool)
     .await
-    .context("Failed to persist actor memory")?;
+    .context("Failed to persist actor memory")
+    .map_err(MemoryWriteError::Db)?;
 
     let graph_extraction_attempted = canonical_type != "scratchpad" && GRAPH_HOOK.get().is_some();
     if graph_extraction_attempted {

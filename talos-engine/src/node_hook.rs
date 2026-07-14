@@ -11,7 +11,12 @@
 //!    on_pipeline_step_completed). When the execution is owned by an
 //!    actor and the node output contains a `__memory_write__` JSON
 //!    object, the payload is persisted to `actor_memory` via
-//!    [`talos_actor_memory_service::persist_memory_with_metadata`].
+//!    [`talos_actor_memory_service::persist_memory_with_metadata_typed`]
+//!    (the typed-error sibling of `persist_memory_with_metadata` — see
+//!    `talos_memory::MemoryWriteError`; this hook is the one caller that
+//!    needs to classify failures for the `memory_write_failures_total`
+//!    metric, so it uses the variant directly instead of matching on
+//!    `err.to_string()`).
 //!    This is a controller-internal protocol that lets any node return
 //!    `{ "__memory_write__": { "key": ..., "value": ..., metadata: {...}, ... } }`
 //!    to trigger an actor-memory write without a dedicated host function.
@@ -32,44 +37,6 @@ use serde_json::Value as JsonValue;
 use sqlx::{Pool, Postgres};
 use talos_workflow_engine_core::{NodeCompletionContext, NodeLifecycleHook};
 use uuid::Uuid;
-
-/// Substrings used to classify `__memory_write__` failures into one
-/// of three metric label buckets: `crypto`, `db`, or `other`.
-///
-/// **The wording match is fragile.** The underlying error returns
-/// `anyhow::Error` from `talos_actor_memory_service` which wraps
-/// errors from `talos_secrets_manager` (encrypt/decrypt), `sqlx`
-/// (database I/O), and assorted ad-hoc strings. Until those grow a
-/// typed-error API, classification depends on a substring of the
-/// stringified error matching one of the markers below.
-///
-/// Markers are split into named constants here so the contract is
-/// visible to a future reader who refactors the upstream errors —
-/// a search for `MEMORY_WRITE_*_MARKERS` will surface every
-/// downstream classifier that depends on the wording.
-const MEMORY_WRITE_CRYPTO_MARKERS: &[&str] = &["decrypt_dek", "encrypt_value", "aead::Error"];
-const MEMORY_WRITE_DB_MARKERS: &[&str] = &["database", "pool", "sqlx"];
-
-/// Classify a stringified `__memory_write__` failure for metric
-/// labelling. Pure function — exposed via `pub(crate)` purely so
-/// `node_hook_tests::classify_*` can pin the substring contract.
-///
-/// Resolution order: crypto markers win over DB markers (a crypto
-/// error happening in a DB-bound code path should still page the
-/// crypto on-call, not the DB on-call). Anything that matches
-/// neither bucket is `"other"`.
-pub(crate) fn classify_memory_write_failure(err_str: &str) -> &'static str {
-    if MEMORY_WRITE_CRYPTO_MARKERS
-        .iter()
-        .any(|m| err_str.contains(m))
-    {
-        "crypto"
-    } else if MEMORY_WRITE_DB_MARKERS.iter().any(|m| err_str.contains(m)) {
-        "db"
-    } else {
-        "other"
-    }
-}
 
 /// Default Talos impl of [`NodeLifecycleHook`]. Owns a `PgPool` so it
 /// can persist fuel rollups and actor-memory writes synchronously
@@ -223,7 +190,7 @@ impl ControllerNodeHook {
 
         let pool = self.pool.clone();
         tokio::spawn(async move {
-            if let Err(e) = talos_actor_memory_service::persist_memory_with_metadata(
+            if let Err(e) = talos_actor_memory_service::persist_memory_with_metadata_typed(
                 &pool,
                 actor_id,
                 &key,
@@ -234,11 +201,14 @@ impl ControllerNodeHook {
             )
             .await
             {
-                // Classify for metric label. Crypto / DB errors are the
-                // high-blast-radius failures the alerts page on. Marker
-                // set lives in MEMORY_WRITE_*_MARKERS at the top of this
-                // file so the substring contract is visible + testable.
-                let reason = classify_memory_write_failure(&e.to_string());
+                // Classify for metric label directly from the typed
+                // `MemoryWriteError` variant — set AT THE SOURCE inside
+                // `persist_memory_with_metadata_typed`, where the
+                // concrete failing operation (validation / crypto / db)
+                // is still known. This is immune to `anyhow::Context`
+                // wrapping anywhere upstream, unlike the pre-fix
+                // substring classifier that matched on `e.to_string()`.
+                let reason = e.metric_label();
                 if let Some(m) = talos_metrics::global() {
                     m.memory_write_failures_total
                         .with_label_values(&[reason])
@@ -401,73 +371,5 @@ impl NodeLifecycleHook for ControllerNodeHook {
                 );
             }
         });
-    }
-}
-
-#[cfg(test)]
-mod classify_tests {
-    use super::*;
-
-    /// Pin the substring contract for memory-write failure
-    /// classification. Marker drift is an alerts-go-quiet bug class:
-    /// if the upstream error wording changes and these tests still
-    /// pass, classification still works. If they fail, the
-    /// classifier needs to be updated alongside the upstream change.
-    #[test]
-    fn classify_crypto_errors() {
-        assert_eq!(
-            classify_memory_write_failure("decrypt_dek failed: invalid wrap"),
-            "crypto"
-        );
-        assert_eq!(
-            classify_memory_write_failure("encrypt_value: aead::Error: tag mismatch"),
-            "crypto"
-        );
-        assert_eq!(
-            classify_memory_write_failure("aead::Error - generic GCM failure"),
-            "crypto"
-        );
-    }
-
-    #[test]
-    fn classify_db_errors() {
-        assert_eq!(
-            classify_memory_write_failure("database connection lost"),
-            "db"
-        );
-        assert_eq!(
-            classify_memory_write_failure("pool exhausted: timeout 5s"),
-            "db"
-        );
-        assert_eq!(
-            classify_memory_write_failure("sqlx::Error::Io: broken pipe"),
-            "db"
-        );
-    }
-
-    #[test]
-    fn classify_unknown_errors() {
-        assert_eq!(
-            classify_memory_write_failure("memory_type 'epsiodic' is not a known kind"),
-            "other"
-        );
-        assert_eq!(classify_memory_write_failure(""), "other");
-        assert_eq!(
-            classify_memory_write_failure("graph extraction failed"),
-            "other"
-        );
-    }
-
-    #[test]
-    fn crypto_takes_precedence_over_db() {
-        // A crypto error inside a DB-touching operation gets classified
-        // as crypto so the crypto on-call sees the page, not DB.
-        // (Realistic case: AES decrypt failing while reading a row.)
-        assert_eq!(
-            classify_memory_write_failure(
-                "sqlx query succeeded but aead::Error during decrypt_dek"
-            ),
-            "crypto"
-        );
     }
 }
