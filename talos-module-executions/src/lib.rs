@@ -22,6 +22,27 @@ pub enum ExecutionStatus {
     Failed,
     #[sqlx(rename = "timeout")]
     Timeout,
+    /// Set by the sibling-cancellation path (migration 20260327000003 added
+    /// it to the DB CHECK in March 2026; this variant lagged 3.5 months —
+    /// every history read over a module with a cancelled execution failed
+    /// with a decode error until 2026-07-14).
+    #[sqlx(rename = "cancelled")]
+    Cancelled,
+}
+
+impl ExecutionStatus {
+    /// The canonical status set — MUST match the module_executions status
+    /// CHECK constraint (migrations/20260327000003). The drift test below
+    /// fails if a DB-legal value can't decode through this enum; when the
+    /// CHECK gains a value, add it here AND to this list in the same PR.
+    pub const ALL: &'static [(&'static str, ExecutionStatus)] = &[
+        ("pending", ExecutionStatus::Pending),
+        ("running", ExecutionStatus::Running),
+        ("completed", ExecutionStatus::Completed),
+        ("failed", ExecutionStatus::Failed),
+        ("timeout", ExecutionStatus::Timeout),
+        ("cancelled", ExecutionStatus::Cancelled),
+    ];
 }
 
 impl std::fmt::Display for ExecutionStatus {
@@ -32,6 +53,7 @@ impl std::fmt::Display for ExecutionStatus {
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Timeout => write!(f, "timeout"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
