@@ -597,6 +597,23 @@ pub enum MemoryOpResult {
     /// JSON-encoded value as stored in actor_memory.value.
     GetValue {
         value: String,
+        /// Row creation time, Unix epoch SECONDS (UTC). Populated for
+        /// `get-entry`; `None` on replies from pre-`get-entry` controllers
+        /// (DX-19, 2026-07-14). `#[serde(default)]` + `skip_serializing_if`
+        /// keep the wire format compatible across mixed controller/worker
+        /// versions: an old controller omits the field (worker fills
+        /// `None`); an old worker ignores the extra field. The bare `get`
+        /// host fn reads only `value`, so its behavior is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at_unix: Option<u64>,
+        /// Expiry time, Unix epoch SECONDS (UTC); `None` when the entry has
+        /// no TTL. See `created_at_unix` for the compatibility rationale.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_unix: Option<u64>,
+        /// Canonical `memory_type` the value was stored under. See
+        /// `created_at_unix` for the compatibility rationale.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_type: Option<String>,
     },
     Ok,
     Keys {
@@ -633,4 +650,80 @@ pub enum MemoryRpcError {
     StorageFull,
     Internal(String),
     Timeout,
+}
+
+#[cfg(test)]
+mod get_entry_wire_compat_tests {
+    //! DX-19 (2026-07-14): the `get-entry` addition grew `MemoryOpResult::
+    //! GetValue` three optional fields. Prove the wire format stays
+    //! compatible in BOTH directions across a mixed controller/worker fleet.
+    use super::*;
+
+    /// A reply produced by a PRE-`get-entry` controller (no new fields)
+    /// must still deserialize on a new worker — the fields default to None.
+    #[test]
+    fn old_get_value_reply_json_deserializes_with_none_fields() {
+        // Byte-for-byte what an old controller emits: only `kind` + `value`.
+        let old = r#"{"result":{"Ok":{"kind":"get_value","value":"\"hello\""}}}"#;
+        let reply: MemoryRpcReply = serde_json::from_str(old).expect("old reply must decode");
+        match reply.result {
+            Ok(MemoryOpResult::GetValue {
+                value,
+                created_at_unix,
+                expires_at_unix,
+                memory_type,
+            }) => {
+                assert_eq!(value, "\"hello\"");
+                assert_eq!(created_at_unix, None);
+                assert_eq!(expires_at_unix, None);
+                assert_eq!(memory_type, None);
+            }
+            other => panic!("expected GetValue, got {other:?}"),
+        }
+    }
+
+    /// A new controller with the fields set MUST serialize them, and the
+    /// None case MUST omit them (skip_serializing_if) so the bytes match
+    /// the legacy shape exactly — the `get` behavior is byte-identical.
+    #[test]
+    fn new_get_value_none_serializes_to_legacy_bytes() {
+        let none_reply = MemoryRpcReply {
+            result: Ok(MemoryOpResult::GetValue {
+                value: "\"hello\"".into(),
+                created_at_unix: None,
+                expires_at_unix: None,
+                memory_type: None,
+            }),
+        };
+        let bytes = serde_json::to_string(&none_reply).unwrap();
+        assert_eq!(
+            bytes,
+            r#"{"result":{"Ok":{"kind":"get_value","value":"\"hello\""}}}"#
+        );
+
+        let some_reply = MemoryRpcReply {
+            result: Ok(MemoryOpResult::GetValue {
+                value: "\"hello\"".into(),
+                created_at_unix: Some(1_752_500_000),
+                expires_at_unix: Some(1_752_600_000),
+                memory_type: Some("episodic".into()),
+            }),
+        };
+        // Round-trips cleanly when the fields are present.
+        let s = serde_json::to_string(&some_reply).unwrap();
+        let back: MemoryRpcReply = serde_json::from_str(&s).unwrap();
+        match back.result {
+            Ok(MemoryOpResult::GetValue {
+                created_at_unix,
+                expires_at_unix,
+                memory_type,
+                ..
+            }) => {
+                assert_eq!(created_at_unix, Some(1_752_500_000));
+                assert_eq!(expires_at_unix, Some(1_752_600_000));
+                assert_eq!(memory_type.as_deref(), Some("episodic"));
+            }
+            other => panic!("expected GetValue, got {other:?}"),
+        }
+    }
 }

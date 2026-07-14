@@ -1436,9 +1436,26 @@ async fn execute_memory_op(
             // applied to the worker entry point).
             let key = talos_memory::validate_memory_key(&key)
                 .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
-            match talos_memory::recall_exact(pool, actor_id, key).await {
+            // DX-19 (2026-07-14): serve BOTH `get` and `get-entry` from this
+            // one arm via `recall_entry`, which returns the same value (same
+            // decrypt path as `recall_exact`) PLUS durability metadata. The
+            // `get` host fn reads only `value`; `get-entry` reads the
+            // timestamps too. The SIGNED request bytes are unchanged — the
+            // reply just carries three extra (skip-if-None) fields.
+            //
+            // Absent key stays `Err(KeyNotFound)` here (byte-identical to the
+            // legacy `get` reply); the worker's `get-entry` host fn maps that
+            // to `Ok(none)`.
+            match talos_memory::recall_entry(pool, actor_id, key).await {
                 Ok(Some(row)) => Ok(MemoryOpResult::GetValue {
                     value: serde_json::to_string(&row.value).unwrap_or_else(|_| "null".into()),
+                    // Unix epoch seconds; `try_from` fails closed to None for
+                    // the impossible pre-1970 timestamp rather than wrapping.
+                    created_at_unix: u64::try_from(row.created_at.timestamp()).ok(),
+                    expires_at_unix: row
+                        .expires_at
+                        .and_then(|e| u64::try_from(e.timestamp()).ok()),
+                    memory_type: Some(row.memory_type),
                 }),
                 Ok(None) => Err(MemoryRpcError::KeyNotFound),
                 Err(e) => Err(MemoryRpcError::Internal(e.to_string())),

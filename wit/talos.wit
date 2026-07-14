@@ -1130,7 +1130,46 @@ interface agent-memory {
 
     /// Retrieve a value by key. Reads back a value written by `set` or
     /// `store-with-embedding` regardless of its memory type.
+    ///
+    /// NOTE: a missing key and an infrastructure failure are BOTH surfaced
+    /// as `error` here (there is no typed "absent" outcome). Consumer /
+    /// delivery nodes that must distinguish "no data yet" from "memory
+    /// service down", or that need to check staleness, should call
+    /// `get-entry` instead.
     get: func(key: string) -> result<string, error>;
+
+    /// A key's stored value plus its durability metadata. Returned by
+    /// `get-entry`. `created-at-unix` / `expires-at-unix` are Unix epoch
+    /// SECONDS (UTC); `expires-at-unix` is `none` for entries with no TTL
+    /// (e.g. `semantic` memories). `memory-type` is the canonical type the
+    /// value was stored under (`episodic`, `semantic`, `working`, ...).
+    record memory-entry-detail {
+        /// The stored value, JSON-decoded to its literal string form the
+        /// same way `get` returns it (a JSON string literal is unwrapped to
+        /// its inner text; objects/arrays come back as serialized JSON).
+        value: string,
+        /// Row creation time, Unix epoch seconds (UTC).
+        created-at-unix: u64,
+        /// Expiry time, Unix epoch seconds (UTC); `none` when the entry has
+        /// no TTL.
+        expires-at-unix: option<u64>,
+        /// Canonical memory type the value was persisted under.
+        memory-type: string,
+    }
+
+    /// Retrieve a value by key together with its durability metadata,
+    /// distinguishing "no such key" from an infrastructure/authorization
+    /// failure: an absent key is `ok(none)` and is NEVER an `error`.
+    /// `error` is reserved for the memory service being unreachable, the
+    /// module lacking the capability, or a malformed request.
+    ///
+    /// Prefer this over `get` in delivery / consumer nodes that need to
+    /// (a) tell "no brief today" apart from "memory service down" before
+    /// acting on the absence, or (b) check freshness — e.g. reject a
+    /// `daily_brief/latest` whose `created-at-unix` is yesterday's, or
+    /// treat an entry near its `expires-at-unix` as stale. `get` remains
+    /// the right call when only the value matters.
+    get-entry: func(key: string) -> result<option<memory-entry-detail>, error>;
 
     /// Delete a key from memory.
     delete: func(key: string) -> result<_, error>;

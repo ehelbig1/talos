@@ -469,6 +469,21 @@ pub struct MemoryRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A recalled memory row plus the durability metadata a freshness-aware
+/// consumer needs — the value AND its `created_at` / `expires_at` /
+/// `memory_type`. Backs the `agent-memory::get-entry` WIT function
+/// (DX-19). Distinct from [`MemoryRow`] only in that it also carries
+/// `created_at`; the decrypt path is shared (`decrypt_row_value`).
+#[derive(Clone, Debug, Serialize)]
+pub struct MemoryEntry {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub memory_type: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MemoryMeta {
     pub key: String,
@@ -967,6 +982,53 @@ pub async fn recall_exact(
         key: row_key,
         value,
         memory_type: r.try_get("memory_type")?,
+        expires_at: r.try_get("expires_at")?,
+        updated_at: r.try_get("updated_at")?,
+    }))
+}
+
+/// Sibling of [`recall_exact`] that also returns durability metadata
+/// (`created_at`, `expires_at`, `memory_type`) so a caller can reason
+/// about freshness / TTL — backs the `agent-memory::get-entry` WIT fn
+/// (DX-19). Returns `Ok(None)` for an absent (or expired) key; that is
+/// NOT an error, matching `recall_exact`.
+///
+/// The decrypt path is REUSED verbatim from [`decrypt_row_value`] (the
+/// same canonical `resolve_stored_value` + per-row `value_format`
+/// AAD-dispatch as `recall_exact`) — no crypto logic is duplicated here.
+/// The SELECT projects `actor_id` + `value_format` for that dispatch and
+/// adds only `created_at` over `recall_exact`'s projection.
+pub async fn recall_entry(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    key: &str,
+) -> Result<Option<MemoryEntry>> {
+    // MCP-S2: project actor_id + value_format so `decrypt_row_value`
+    // dispatches v0/v1/v3/v4 correctly. Fail-loud `try_get(...)?` on every
+    // read (lint checks 52/55) — a dropped/renamed column errors, never a
+    // silent default.
+    let row = sqlx::query(
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, \
+                created_at, expires_at, updated_at \
+         FROM actor_memory \
+         WHERE actor_id = $1 AND key = $2 \
+           AND (expires_at IS NULL OR expires_at > now())",
+    )
+    .bind(actor_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .context("recall_entry")?;
+
+    let Some(r) = row else { return Ok(None) };
+    // Shared canonical decrypt path (fails loud on missing actor_id/key/
+    // value_format projection).
+    let value = decrypt_row_value(&r).await?;
+    Ok(Some(MemoryEntry {
+        key: r.try_get("key")?,
+        value,
+        memory_type: r.try_get("memory_type")?,
+        created_at: r.try_get("created_at")?,
         expires_at: r.try_get("expires_at")?,
         updated_at: r.try_get("updated_at")?,
     }))
