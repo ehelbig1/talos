@@ -201,8 +201,22 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
         ? n.type.slice("system:".length).replace(/^\w/, (c) => c.toUpperCase())
         : moduleData?.name || n.type;
 
-      // Workflow config takes precedence over module default config
-      const config = n.data || moduleData?.config || {};
+      // Workflow config takes precedence over module default config.
+      // Stored `data` IS the flat config (the engine/MCP contract). HEAL the
+      // legacy editor-saved shape, where the whole WorkflowNodeData was
+      // persisted with the real config nested under data.config (those
+      // nodes were never runnable — see serializeNode in useWorkflowSave):
+      // detect it by the UI-metadata markers the old serializer leaked, use
+      // the nested object, and the next save writes the correct flat shape.
+      const raw = (n.data ?? {}) as Record<string, unknown>;
+      const legacyNested =
+        !isSystemNode &&
+        typeof raw.config === "object" &&
+        raw.config !== null &&
+        ("moduleName" in raw || "moduleId" in raw);
+      const config = legacyNested
+        ? (raw.config as Record<string, unknown>)
+        : n.data || moduleData?.config || {};
 
       return {
         id: n.id, // Use backend ID for consistency
