@@ -247,3 +247,21 @@ fn test_validate_jsonb_huge_array_rejected() {
     // 200K items should exceed 1MB
     assert!(result.is_err());
 }
+
+// ==================== Status canonical-set pin ====================
+
+#[test]
+fn execution_status_all_round_trips_display() {
+    // ALL mirrors the module_executions status CHECK constraint
+    // (migrations/20260327000003). If a variant's rename and Display ever
+    // disagree, or a CHECK value goes missing here, this fails. The
+    // integration twin (controller/tests/module_execution_status_tests.rs)
+    // proves the DECODE side against a real database — the direction that
+    // silently drifted for 3.5 months when 'cancelled' was added to the
+    // CHECK but not the enum.
+    use super::ExecutionStatus;
+    assert_eq!(ExecutionStatus::ALL.len(), 6);
+    for (text, status) in ExecutionStatus::ALL {
+        assert_eq!(&status.to_string(), text, "Display/rename drift for {text}");
+    }
+}
