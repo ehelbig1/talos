@@ -155,6 +155,25 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         extra_where: "AND is_active = true",
         disconnect_is_soft_delete: true,
     },
+    IntegrationProviderConfig {
+        id: "gcp",
+        display_name: "Google Cloud",
+        description: "List projects and receive Cloud Monitoring alerts",
+        icon: "Cloud",
+        color: "#4285F4",
+        graphql_enum: "GOOGLE_CLOUD",
+        oauth_hosts: &["accounts.google.com"],
+        env_vars: &["GOOGLE_CLOUD_CLIENT_ID", "GOOGLE_CLOUD_CLIENT_SECRET"],
+        redirect_path: "/api/gcp/callback",
+        db_table: "google_cloud_integrations",
+        // store.rs aliases the table `t` when there is no join, so the
+        // identifier + extra_where fragments reference `t.*` (NOT `g.*`,
+        // which is the alias only used for join-carrying providers like gcal).
+        account_identifier_column: "COALESCE(t.account_email, 'Google Cloud')",
+        account_identifier_join: None,
+        extra_where: "AND t.is_active = true",
+        disconnect_is_soft_delete: true,
+    },
 ];
 
 #[cfg(test)]

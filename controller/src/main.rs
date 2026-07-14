@@ -67,6 +67,7 @@ mod execution_repository;
 mod feature_flags;
 mod gmail;
 mod google_calendar;
+mod google_cloud;
 mod graph_rag;
 mod idempotency;
 mod integrations;
@@ -209,6 +210,7 @@ struct PlatformServices {
     slack_api_client: std::sync::Arc<slack::SlackApiClient>,
     slack_integration_service: std::sync::Arc<slack::SlackIntegrationService>,
     gmail_integration_service: std::sync::Arc<gmail::GmailIntegrationService>,
+    google_cloud_integration_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     github_connect_service: std::sync::Arc<talos_github_connect::GithubConnectService>,
     gmail_watch_service: Option<std::sync::Arc<gmail::watch::GmailWatchService>>,
     gmail_pubsub_verifier: Option<std::sync::Arc<gmail::pubsub_jwt::PubsubJwtVerifier>>,
@@ -1161,6 +1163,22 @@ async fn build_platform_services(
     );
     tracing::info!("Gmail integration service initialized (token encryption + dual-write enabled)");
 
+    // ---------- Initialize Google Cloud integration service ----------
+    let google_cloud_integration_service = std::sync::Arc::new(
+        google_cloud::GoogleCloudIntegrationService::new(db_pool.clone())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to initialize Google Cloud integration service: {}",
+                    e
+                )
+            })?
+            .with_secrets_manager(secrets_manager.clone())
+            .with_credentials_service(oauth_credential_service.clone()),
+    );
+    tracing::info!(
+        "Google Cloud integration service initialized (token encryption + dual-write enabled)"
+    );
+
     // ---------- GitHub App connect service (RFC 0008 Phase B) ----------
     // Optional: enabled only when GITHUB_APP_ID (+ companions) are set. A
     // half-configured App (id set but a required field missing/blank, or an
@@ -1659,6 +1677,7 @@ async fn build_platform_services(
         slack_api_client,
         slack_integration_service,
         gmail_integration_service,
+        google_cloud_integration_service,
         github_connect_service,
         gmail_watch_service,
         gmail_pubsub_verifier,
@@ -4702,6 +4721,7 @@ fn build_router(
     let slack_api_client = services.slack_api_client.clone();
     let slack_integration_service = services.slack_integration_service.clone();
     let gmail_integration_service = services.gmail_integration_service.clone();
+    let google_cloud_integration_service = services.google_cloud_integration_service.clone();
     let github_connect_service = services.github_connect_service.clone();
     let gmail_watch_service = services.gmail_watch_service.clone();
     let gmail_pubsub_verifier = services.gmail_pubsub_verifier.clone();
@@ -4960,6 +4980,43 @@ fn build_router(
     let gmail_callback_route = Router::new()
         .route("/api/gmail/callback", get(gmail::gmail_callback_handler))
         .with_state(gmail_integration_service.clone())
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // Create Google Cloud integration management routes (authenticated).
+    // NOTE: Layers execute in REVERSE order (bottom-up).
+    let gcp_integration_routes = Router::new()
+        .route(
+            "/api/gcp/integrations",
+            get(google_cloud::list_integrations_handler),
+        )
+        .route(
+            "/api/gcp/integrations/{id}",
+            get(google_cloud::get_integration_handler),
+        )
+        .route(
+            "/api/gcp/integrations/{id}",
+            axum::routing::delete(google_cloud::disconnect_integration_handler),
+        )
+        .route("/api/gcp/connect", get(google_cloud::connect_gcp_handler))
+        .route(
+            "/api/gcp/projects",
+            get(google_cloud::list_projects_handler),
+        )
+        .with_state(google_cloud_integration_service.clone())
+        .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
+        .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
+        .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
+        .layer(Extension(api_limiter.clone())) // Runs 2nd
+        .layer(Extension(whitelist.clone())); // Runs 1st (first)
+
+    // Google Cloud OAuth callback — NO auth middleware.
+    // Cross-site redirects from accounts.google.com don't carry session cookies
+    // (SameSite policy). The user is identified via the state token instead.
+    let gcp_callback_route = Router::new()
+        .route("/api/gcp/callback", get(google_cloud::gcp_callback_handler))
+        .with_state(google_cloud_integration_service.clone())
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));
@@ -5574,6 +5631,8 @@ fn build_router(
         .merge(gmail_api_routes)
         .merge(gmail_integration_routes)
         .merge(gmail_callback_route)
+        .merge(gcp_integration_routes)
+        .merge(gcp_callback_route)
         .merge(github_connect_route)
         .merge(github_setup_callback_route);
     // Optional gmail push routes — `None` when GMAIL_PUBSUB_TOPIC

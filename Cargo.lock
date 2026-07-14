@@ -1729,6 +1729,7 @@ dependencies = [
  "talos-github-repository",
  "talos-gmail",
  "talos-google-calendar",
+ "talos-google-cloud",
  "talos-graph-rag",
  "talos-hot-update-service",
  "talos-http-utils",
@@ -7915,6 +7916,49 @@ dependencies = [
  "urlencoding",
  "uuid",
  "worker",
+]
+
+[[package]]
+name = "talos-google-cloud"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-nats",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "dashmap 6.2.1",
+ "jsonwebtoken",
+ "rand 0.8.6",
+ "redis",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "talos-actor-repository",
+ "talos-config",
+ "talos-dlp-provider",
+ "talos-http-body",
+ "talos-http-utils",
+ "talos-integration-helpers",
+ "talos-integration-state",
+ "talos-memory",
+ "talos-module-executions",
+ "talos-oauth",
+ "talos-registry",
+ "talos-secrets-manager",
+ "talos-text-util",
+ "talos-trace-nats",
+ "talos-workflow-engine-core",
+ "talos-workflow-job-protocol",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]

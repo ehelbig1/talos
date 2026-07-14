@@ -374,6 +374,7 @@ impl PlatformMutations {
             IntegrationService::Gmail => "GMAIL",
             IntegrationService::Slack => "SLACK",
             IntegrationService::Jira => "JIRA",
+            IntegrationService::GoogleCloud => "GOOGLE_CLOUD",
         };
 
         let provider = talos_integrations::provider_config::PROVIDERS

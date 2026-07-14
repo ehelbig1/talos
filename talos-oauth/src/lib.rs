@@ -136,7 +136,7 @@ pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bo
         // Revoking a refresh_token also revokes every access_token issued
         // under that grant. 200 OK = revoked. 400 = token already invalid
         // (treat as success — the user-facing intent is "make it dead").
-        "gmail" | "google_calendar" => {
+        "gmail" | "google_calendar" | "google_cloud" => {
             let resp = client
                 .post("https://oauth2.googleapis.com/revoke")
                 .form(&[("token", token)])
