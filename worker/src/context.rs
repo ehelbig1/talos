@@ -261,6 +261,13 @@ pub struct TalosContext {
     /// Number of log messages emitted in this execution.
     pub(crate) log_message_count: AtomicU64,
 
+    /// Host-diagnostic entries published into the per-execution log
+    /// stream this execution (see [`Self::emit_host_diagnostic`]).
+    /// Separate counter from `log_message_count` so guest log spam
+    /// can't starve host diagnostics out of the quota, and a burst of
+    /// host denials can't consume the guest's log budget.
+    pub(crate) host_diag_count: AtomicU64,
+
     /// Per-execution event emission counter for the events interface.
     pub(crate) event_emit_count: AtomicU64,
 
@@ -1024,6 +1031,7 @@ impl TalosContext {
             secret_access_count: AtomicU64::new(0),
             fs_bytes_written: AtomicU64::new(0),
             log_message_count: AtomicU64::new(0),
+            host_diag_count: AtomicU64::new(0),
             event_emit_count: AtomicU64::new(0),
             streams: StreamRegistry::new(),
             sse_connects_per_host: dashmap::DashMap::new(),
@@ -1289,6 +1297,72 @@ impl TalosContext {
     /// Records a capability denial to the cryptographic audit ledger and
     /// publishes it to the WORM stream (`talos.audit.ledger`).
     ///
+    /// Cap on host-diagnostic entries per execution. Diagnostics are
+    /// host-triggered but guest-influenced (each denied call can emit
+    /// one), so the cap bounds log-store growth for a module hammering
+    /// a denied host in a loop. 100 is far above any legitimate run's
+    /// denial count while keeping worst-case volume trivial.
+    pub(crate) const HOST_DIAG_CAP: u64 = 100;
+
+    /// Publish a sanitized host-side diagnostic into the per-execution
+    /// log stream — the same `wasm.log.{execution_id}` channel guest
+    /// `logging::log` uses, marked `source: "host"` — so it lands in
+    /// `workflow_execution_logs` and is visible via `get_execution_logs`
+    /// / `tail_worker_logs` / the editor trace.
+    ///
+    /// WHY (DX pain point 22, 3rd occurrence 2026-07-14): the WIT error
+    /// enums carry no message (and changing them breaks every compiled
+    /// module), so a denied or failed host call surfaced to the module
+    /// author as a bare `networkerror` — indistinguishable across DNS
+    /// outage, host-allowlist deny, method deny, tier-1 egress deny, and
+    /// connection failure. The true reason logged only to worker stderr,
+    /// which the debugging surfaces can't see. Every deny/failure path
+    /// now pairs its opaque enum return with one of these entries.
+    ///
+    /// SANITIZATION CONTRACT: `reason` is a fixed kebab-case token from
+    /// the emitting site; `message` must be built from values the module
+    /// author already controls (their host, method, key path) plus fixed
+    /// policy names — NEVER raw resolver/reqwest error strings (which can
+    /// embed proxy or internal-infra detail) and NEVER secret-derived
+    /// values (same rule as `record_capability_denied`'s `target`).
+    ///
+    /// Best-effort and fire-and-forget: no NATS / no execution_id → no-op;
+    /// a publish failure never changes the call's outcome.
+    // `&mut self` (not `&self`): TalosContext is Send but not Sync (the
+    // WASI stdio streams), so async methods must hold an exclusive ref
+    // to keep their futures Send — same reason record_capability_denied
+    // and every other async host method take `&mut self`.
+    pub async fn emit_host_diagnostic(&mut self, reason: &str, message: &str) {
+        let count = self
+            .host_diag_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= Self::HOST_DIAG_CAP {
+            if count == Self::HOST_DIAG_CAP {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    "host-diagnostic quota exceeded, dropping further entries"
+                );
+            }
+            return;
+        }
+        let Some(nats) = &self.nats_client else {
+            return;
+        };
+        let Some(execution_id) = self.execution_id.as_deref().filter(|e| !e.is_empty()) else {
+            return;
+        };
+        let log_entry = build_host_diagnostic_entry(
+            execution_id,
+            self.request_id.as_deref().unwrap_or_default(),
+            reason,
+            message,
+        );
+        if let Ok(payload) = serde_json::to_vec(&log_entry) {
+            let topic = format!("wasm.log.{execution_id}");
+            let _ = nats.publish(topic, payload.into()).await;
+        }
+    }
+
     /// Every policy-driven refusal in the worker — HTTP host allowlist,
     /// HTTP method allowlist, Tier-1 LLM egress, secret allowlist,
     /// private-IP SSRF guard — calls this BEFORE returning the deny error
@@ -1323,6 +1397,16 @@ impl TalosContext {
     /// `dyn RngCore + Send` which is not `Sync`. Matches the existing
     /// inline-audit pattern at `host_impl.rs::secrets::get_secret`.
     pub async fn record_capability_denied(&mut self, capability: &str, policy: &str, target: &str) {
+        // Guest-visible diagnostic FIRST (and unconditionally — the audit
+        // ledger below is optional wiring, the module author's debugging
+        // signal is not). `capability`/`policy` are fixed tokens and
+        // `target` already obeys this fn's no-secrets contract, so the
+        // pair is safe to surface in the execution log.
+        self.emit_host_diagnostic(
+            policy,
+            &format!("{capability} denied by policy '{policy}' (target: {target})"),
+        )
+        .await;
         let Some(ledger_mutex) = &self.audit_ledger else {
             return;
         };
@@ -1819,5 +1903,79 @@ mod per_host_rate_limit_tests {
             assert!(!per_host_check_and_bump(&counts, "a:80", 2));
         }
         assert_eq!(*counts.get("a:80").unwrap(), 2);
+    }
+}
+
+/// Pure builder for the host-diagnostic log entry — the wire contract
+/// with the controller's `wasm.log.*` subscriber (which persists to
+/// `workflow_execution_logs` keyed on `execution_id`/`level`/`message`).
+/// Kept as a free function so the shape is unit-testable without
+/// constructing a `TalosContext` (no test constructor exists — the
+/// context owns WASI streams). `source: "host"` distinguishes these
+/// entries from guest `logging::log` output (`source: "wasm"`).
+pub(crate) fn build_host_diagnostic_entry(
+    execution_id: &str,
+    request_id: &str,
+    reason: &str,
+    message: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "execution_id": execution_id,
+        "request_id": request_id,
+        "level": "WARN",
+        "message": format!("[host:{reason}] {message}"),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "source": "host",
+        "trace_id": null,
+        "span_id": null,
+    })
+}
+
+#[cfg(test)]
+mod host_diagnostic_tests {
+    use super::build_host_diagnostic_entry;
+
+    /// The controller's log subscriber persists entries by this shape —
+    /// pin every field the consumer reads so a rename here can't
+    /// silently stop diagnostics from being stored (the exact
+    /// alerts-go-quiet class this feature exists to fix).
+    #[test]
+    fn entry_matches_the_log_subscriber_contract() {
+        let e = build_host_diagnostic_entry(
+            "exec-1",
+            "req-1",
+            "dns-resolution-failed",
+            "hostname resolution failed for 'api.example.com'",
+        );
+        assert_eq!(e["execution_id"], "exec-1");
+        assert_eq!(e["request_id"], "req-1");
+        assert_eq!(e["level"], "WARN");
+        assert_eq!(e["source"], "host");
+        assert_eq!(
+            e["message"],
+            "[host:dns-resolution-failed] hostname resolution failed for 'api.example.com'"
+        );
+        assert!(e["timestamp"].is_string());
+        // Present-but-null keeps the entry shape identical to guest
+        // entries for consumers that read these keys unconditionally.
+        assert!(e.get("trace_id").is_some());
+        assert!(e.get("span_id").is_some());
+    }
+
+    /// The `[host:reason]` prefix is what operators grep for — pin that
+    /// reasons flow through verbatim (kebab-case tokens, no spaces).
+    #[test]
+    fn reason_token_prefixes_the_message() {
+        for reason in [
+            "dns-resolution-failed",
+            "circuit-breaker-open",
+            "request-timeout",
+            "connection-failed",
+            "method-allowlist",
+        ] {
+            let e = build_host_diagnostic_entry("x", "", reason, "m");
+            let msg = e["message"].as_str().unwrap();
+            assert!(msg.starts_with(&format!("[host:{reason}] ")), "{msg}");
+        }
     }
 }
