@@ -2003,18 +2003,17 @@ async fn handle_add_node_to_workflow(
             },
         };
 
-        // `dependencies` arg validation is the caller's responsibility
-        // (returns -32602 directly). The service forwards the value as
-        // a borrowed JSON ref; structural validation here keeps the
-        // service focused on compile + persist.
+        // N-6 (crate review 2026-05-06, re-verified 2026-07-14):
+        // `dependencies` validation now happens inside
+        // `InlineCompileService::compile_and_persist` itself (mapped to
+        // `InlineCompileError::DependencyValidation`, same -32602 code
+        // and identical "Dependency validation failed: …" message this
+        // handler used to produce) — the service boundary is guarded
+        // regardless of caller, so a redundant pre-check here would be
+        // pure duplication immediately before the service call (nothing
+        // expensive happens in between). No pre-validation left here;
+        // the raw value is forwarded as-is.
         let dependencies = args.get("dependencies");
-        if let Err(dep_error) = crate::utils::validate_dependencies(dependencies) {
-            return mcp_error(
-                req_id,
-                -32602,
-                &format!("Dependency validation failed: {}", dep_error),
-            );
-        }
 
         // Capture explicit perm lists so the service's drift guard can
         // distinguish "caller did not pass the key" from "caller passed
