@@ -3284,7 +3284,9 @@ fn wire_rpc_subscribers(
                 db_pool: db_pool.clone(),
                 dataset_service: talos_ml::DatasetService::new(secrets_manager),
             });
-            spawn_ml_rpc_subscriber(nats, rpc_shutdown_rx.clone());
+            spawn_ml_rpc_subscriber(nats.clone(), rpc_shutdown_rx.clone());
+            // Few-shot corrections op shares the predict context.
+            rpc_subscribers::spawn_ml_fewshot_subscriber(nats, rpc_shutdown_rx.clone());
         }
     }
     // Background sweep for expired integration_state rows. Runs

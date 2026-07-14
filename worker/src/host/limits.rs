@@ -27,6 +27,10 @@ pub(crate) const MAX_DB_QUERIES_PER_EXECUTION: u64 = 500;
 /// traffic. 2000 ≈ 60+ full batches — far above any legitimate
 /// classify node (inbox batches run ~25) while bounding the abuse case.
 pub(crate) const MAX_MODEL_PREDICT_INPUTS_PER_EXECUTION: u64 = 2000;
+/// Per-execution cap on `model::few-shot` CALLS. One fetch per LLM
+/// fallback leg is the intended shape; the cap stops a guest loop from
+/// turning the server-side decrypt path into a scan.
+pub(crate) const MAX_MODEL_FEWSHOT_CALLS_PER_EXECUTION: u64 = 8;
 /// Maximum NATS publish calls per execution.
 pub(crate) const MAX_MESSAGING_PUBLISHES_PER_EXECUTION: u64 = 1000;
 /// MCP-524: subject prefixes reserved for the platform that WASM modules

@@ -234,6 +234,39 @@ pub struct ServeReply {
     pub backend: String,
 }
 
+/// Human-correction few-shot anchors for a model's LLM TEACHER leg (the
+/// `talos.ml.fewshot` op). Same resolve + dataset-ownership belt as
+/// serving, with one deliberate difference: NO promoted-version
+/// requirement — the teacher loop matters MOST while the model is still
+/// `llm_only`/`shadow`, before anything is promoted (corrections must fix
+/// the teacher's labels before the model distills them). An empty result
+/// is success (fresh model, no corrections yet).
+pub async fn few_shot_for_model(
+    service: &DatasetService,
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    model_name: &str,
+    k: u32,
+) -> Result<Vec<(String, String)>, ServeError> {
+    let resolved = ModelRegistry::resolve_by_name(&mut *conn, model_name, user_id)
+        .await
+        .map_err(ServeError::Internal)?
+        .ok_or(ServeError::NotFound)?;
+    let dataset_id = resolved.dataset_id.ok_or(ServeError::NotAvailable)?;
+    // Dataset-ownership belt (same rationale as serving: an owned model
+    // must not read a dataset the signed user doesn't own). Coarse
+    // NotAvailable — no foreign-dataset enumeration.
+    match service.dataset_tenancy(&mut *conn, dataset_id).await {
+        Ok(t) if t.user_id == user_id => {}
+        Ok(_) => return Err(ServeError::NotAvailable),
+        Err(_) => return Err(ServeError::NotAvailable),
+    }
+    service
+        .few_shot_corrections(&mut *conn, dataset_id, k)
+        .await
+        .map_err(ServeError::Internal)
+}
+
 /// Batch predict for one signed principal. The connection MUST be a
 /// tenant-scoped transaction for `user_id` (RLS backstop) — the RPC
 /// subscriber opens it from the SIGNED request's user_id, never from

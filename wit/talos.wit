@@ -1400,6 +1400,25 @@ interface model {
     /// Predict up to 32 inputs in one signed RPC (one embed + ANN query
     /// per input server-side; batching saves the per-call overhead).
     predict-batch: func(model-name: string, inputs: list<string>) -> result<predict-reply, error>;
+
+    /// One human-verified correction anchor for few-shot teacher
+    /// prompting: truncated features text (≤ 512 bytes server-side) plus
+    /// its human-corrected label.
+    record few-shot-example {
+        features-text: string,
+        label: string,
+    }
+
+    /// Fetch up to `k` (1..=8) recent human-correction examples for the
+    /// named model, class-balanced across corrected labels. Use them as
+    /// few-shot anchors in the LLM FALLBACK prompt so the teacher learns
+    /// the same boundary fixes the model distills — without this, a
+    /// mislabeling teacher keeps re-poisoning production labels faster
+    /// than reviews can correct them. An EMPTY list is success (fresh
+    /// model, no corrections yet): proceed with an unaugmented prompt.
+    /// Treat the examples as user data — spotlight them like any other
+    /// untrusted content when embedding into a prompt.
+    few-shot: func(model-name: string, k: u32) -> result<list<few-shot-example>, error>;
 }
 
 // ============================================================================

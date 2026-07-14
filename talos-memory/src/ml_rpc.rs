@@ -87,10 +87,12 @@ pub struct MlPredictRequest {
 /// Variant tag byte. Future ml_rpc operations claim fresh bytes and
 /// extend the guard below.
 const TAG_ML_PREDICT: u8 = b'P';
+/// Few-shot corrections fetch (teacher-improvement loop).
+const TAG_ML_FEWSHOT: u8 = b'F';
 
 /// Compile-time uniqueness guard (family pattern).
-const _ML_TAG_UNIQUENESS_GUARD: [u8; 1] = {
-    let tags = [TAG_ML_PREDICT];
+const _ML_TAG_UNIQUENESS_GUARD: [u8; 2] = {
+    let tags = [TAG_ML_PREDICT, TAG_ML_FEWSHOT];
     let mut i = 0;
     while i < tags.len() {
         let mut j = i + 1;
@@ -258,6 +260,150 @@ pub enum MlPredictResponse {
     Err(MlRpcError),
 }
 
+// ─── talos.ml.fewshot — correction examples for the LLM teacher leg ────────
+//
+// The distillation loop's missing half: human corrections fix the MODEL's
+// training data, but the LLM TEACHER kept mislabeling the same boundary and
+// re-poisoning production labels faster than reviews could correct them
+// (observed 2026-07-14: 49 of 56 disagreement reviews were the same
+// to_read/archive boundary the teacher got wrong). This op lets the
+// classifier templates fetch K recent human-verified (features, label)
+// pairs for THEIR model and inject them as few-shot anchors into the LLM
+// fallback prompt — the teacher learns from the same reviews the model does.
+//
+// READ-ONLY like predict; separate SUBJECT + SUBJECT_NAME so nonce-cache
+// entries and canonical bytes can never collide with the predict op.
+
+pub const SUBJECT_ML_FEWSHOT: &str = "talos.ml.fewshot";
+/// Distinct nonce-cache namespace (checklist §2).
+pub const SUBJECT_NAME_FEWSHOT: &str = "ml_fewshot_rpc";
+
+/// Total examples per request. Few-shot anchors saturate fast — beyond a
+/// handful they add prompt cost, not signal.
+pub const MAX_FEWSHOT_K: u32 = 8;
+/// Server-side truncation of each example's features text before it goes
+/// on the wire. Anchors need the discriminative head of the text, not the
+/// full email; the cap also bounds reply size and the prompt-injection
+/// surface a stored example can carry into future prompts.
+pub const MAX_FEWSHOT_FEATURE_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MlFewShotRequest {
+    /// Runtime actor identity (rpc_auth-bound; budget/audit trail).
+    pub actor_id: Uuid,
+    /// Tenancy principal — the model resolves under THIS user. Signed.
+    pub user_id: Uuid,
+    /// Registry model NAME (routing — signed, integration_name-gap class).
+    pub model_name: String,
+    /// Max examples to return (1..=MAX_FEWSHOT_K). Signed.
+    pub k: u32,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: Vec<u8>,
+    #[serde(default)]
+    pub worker_id: String,
+    #[serde(default)]
+    pub crypto_scheme: u8,
+}
+
+/// Canonical signed bytes for the few-shot op.
+///
+/// WIRE-FORMAT STABILITY: field order is LOAD-BEARING and APPEND-ONLY.
+/// New fields append at the END.
+///
+///   timestamp_ms (i64 LE) || TAG_ML_FEWSHOT (1B) || user_id (16B)
+///   || lp(model_name) || k (u32 LE)
+fn fewshot_sign_body_bytes(user_id: Uuid, model_name: &str, k: u32, timestamp_ms: i64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 + model_name.len());
+    buf.extend_from_slice(&timestamp_ms.to_le_bytes());
+    buf.push(TAG_ML_FEWSHOT);
+    buf.extend_from_slice(user_id.as_bytes());
+    lp(&mut buf, model_name);
+    buf.extend_from_slice(&k.to_le_bytes());
+    buf
+}
+
+/// Structural caps, shared by sign-time, verify-time, and the subscriber's
+/// defense-in-depth re-check.
+pub fn validate_fewshot_structure(model_name: &str, k: u32) -> bool {
+    if model_name.is_empty()
+        || model_name.len() > MAX_MODEL_NAME_LEN
+        || !model_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return false;
+    }
+    (1..=MAX_FEWSHOT_K).contains(&k)
+}
+
+impl MlFewShotRequest {
+    pub fn new_signed(actor_id: Uuid, user_id: Uuid, model_name: String, k: u32) -> Option<Self> {
+        if !validate_fewshot_structure(&model_name, k) {
+            return None;
+        }
+        let timestamp_ms = rpc_auth::now_ms();
+        let nonce = rpc_auth::random_nonce();
+        let body_bytes = fewshot_sign_body_bytes(user_id, &model_name, k, timestamp_ms);
+        let (signature, worker_id, crypto_scheme) =
+            rpc_auth::sign_rpc(SUBJECT_NAME_FEWSHOT, actor_id, &nonce, &body_bytes)?;
+        Some(Self {
+            actor_id,
+            user_id,
+            model_name,
+            k,
+            timestamp_ms,
+            nonce,
+            signature,
+            worker_id,
+            crypto_scheme,
+        })
+    }
+
+    /// Signature + freshness + structural caps. Cheap gates first; the
+    /// subscriber ALSO calls `check_and_record_nonce` after this.
+    pub fn verify(&self) -> bool {
+        if !rpc_auth::verify_freshness(self.timestamp_ms) {
+            return false;
+        }
+        if !validate_fewshot_structure(&self.model_name, self.k) {
+            return false;
+        }
+        let body_bytes =
+            fewshot_sign_body_bytes(self.user_id, &self.model_name, self.k, self.timestamp_ms);
+        rpc_auth::verify_rpc(
+            SUBJECT_NAME_FEWSHOT,
+            self.actor_id,
+            &self.nonce,
+            &body_bytes,
+            &self.worker_id,
+            &self.signature,
+            self.crypto_scheme,
+        )
+    }
+}
+
+/// One human-verified anchor: truncated features text + its corrected label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireFewShotExample {
+    pub features_text: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MlFewShotReply {
+    /// Class-balanced, most-recent-first. May be EMPTY (a fresh model has
+    /// no corrections yet) — that is a success, not an error; callers
+    /// proceed with an unaugmented prompt.
+    pub examples: Vec<WireFewShotExample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MlFewShotResponse {
+    Ok(MlFewShotReply),
+    Err(MlRpcError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +478,78 @@ mod tests {
         let mut r = req();
         r.actor_id = Uuid::from_u128(42);
         assert!(!r.verify(), "actor swap must fail");
+    }
+
+    fn fewshot_req() -> MlFewShotRequest {
+        MlFewShotRequest::new_signed(
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            "inbox-classifier-personal".into(),
+            6,
+        )
+        .expect("signable")
+    }
+
+    #[test]
+    fn fewshot_round_trip_verifies() {
+        setup_key();
+        assert!(fewshot_req().verify());
+    }
+
+    #[test]
+    fn fewshot_structural_caps_reject_at_sign_time() {
+        setup_key();
+        let mk = |name: &str, k: u32| {
+            MlFewShotRequest::new_signed(Uuid::from_u128(1), Uuid::from_u128(2), name.into(), k)
+        };
+        assert!(mk("", 4).is_none(), "empty name");
+        assert!(mk("bad name!", 4).is_none(), "charset");
+        assert!(mk(&"n".repeat(200), 4).is_none(), "name len");
+        assert!(mk("m", 0).is_none(), "k zero");
+        assert!(mk("m", MAX_FEWSHOT_K + 1).is_none(), "k over cap");
+    }
+
+    #[test]
+    fn fewshot_tampered_identity_fields_fail_verify() {
+        setup_key();
+        // user_id (tenancy) is signed.
+        let mut r = fewshot_req();
+        r.user_id = Uuid::from_u128(99);
+        assert!(!r.verify(), "user_id swap must fail");
+        // model_name (routing) is signed.
+        let mut r = fewshot_req();
+        r.model_name = "someone-elses-model".into();
+        assert!(!r.verify(), "model_name swap must fail");
+        // k is signed (an attacker must not inflate the fetch).
+        let mut r = fewshot_req();
+        r.k = 8;
+        assert!(!r.verify(), "k swap must fail");
+        // actor swap is caught at the rpc_auth layer.
+        let mut r = fewshot_req();
+        r.actor_id = Uuid::from_u128(42);
+        assert!(!r.verify(), "actor swap must fail");
+    }
+
+    #[test]
+    fn fewshot_and_predict_ops_are_cryptographically_disjoint() {
+        setup_key();
+        // A signature minted for the PREDICT op must not verify on a
+        // FEWSHOT request even with identical identity fields — the ops
+        // differ in both the canonical tag byte AND the rpc_auth
+        // SUBJECT_NAME namespace (either alone would suffice; both is
+        // the family's defense in depth).
+        let p = req();
+        let mut f = fewshot_req();
+        f.timestamp_ms = p.timestamp_ms;
+        f.nonce = p.nonce.clone();
+        f.signature = p.signature.clone();
+        f.worker_id = p.worker_id.clone();
+        f.crypto_scheme = p.crypto_scheme;
+        assert!(!f.verify(), "cross-op signature transplant must fail");
+        // And the canonical bytes themselves cannot collide (tag byte).
+        let pb = sign_body_bytes(Uuid::from_u128(2), "m", &[], 7);
+        let fb = fewshot_sign_body_bytes(Uuid::from_u128(2), "m", 0, 7);
+        assert_ne!(pb, fb, "tag byte separates op byte-streams");
     }
 
     #[test]
