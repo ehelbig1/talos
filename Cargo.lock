@@ -8251,6 +8251,7 @@ dependencies = [
  "talos-http-body",
  "talos-text-util",
  "talos-workflow-job-protocol",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
