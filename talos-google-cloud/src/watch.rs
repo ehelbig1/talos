@@ -73,7 +73,7 @@ const PUSH_RECEIVED_THROTTLE_MS: i64 = 60_000;
 /// Row stored in `integration_state.value`. Separate from any API-
 /// facing struct so controller-private fields (the raw `push_token`)
 /// never leak through a summary projection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct GcpWatchRow {
     pub id: Uuid,
     pub integration_id: Uuid,
@@ -92,6 +92,26 @@ pub(crate) struct GcpWatchRow {
     pub last_push_received_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+// Hand-written (not derived): `push_token` is the sole authenticator for
+// the push endpoint, and lint 37's secret-field regex now includes
+// `push_token` so a re-derive fails the structural lint. A future
+// `tracing!(?row)` must never dump it.
+impl std::fmt::Debug for GcpWatchRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcpWatchRow")
+            .field("id", &self.id)
+            .field("integration_id", &self.integration_id)
+            .field("display_name", &self.display_name)
+            .field("expected_sa_email", &self.expected_sa_email)
+            .field("push_token", &"[REDACTED]")
+            .field("module_id", &self.module_id)
+            .field("last_push_received_ms", &self.last_push_received_ms)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .finish()
+    }
 }
 
 fn decode_row(entry: &StoredEntry) -> Result<GcpWatchRow> {
