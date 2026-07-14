@@ -232,13 +232,16 @@ impl ParallelWorkflowEngine {
                 job_id: None,
                 user_id: Some(uid),
                 actor_id: self.actor_id,
-                // Match pre-extraction behavior: the redis fallback key
-                // is `redis:wasm:{module_id}` keyed on `step_module_id`
-                // to match the worker's redis-key convention.
+                // User-scoped redis URI (L-27): keyed on `uid` + `step_module_id`
+                // to match `wasm:{user_id}:{module_id}`, the key the registry
+                // pre-warmed under this same `uid` in the fetch above. The
+                // worker strips `redis:` and GETs it verbatim.
                 module_uri: artifact
                     .as_ref()
                     .and_then(|a| a.oci_url.clone())
-                    .unwrap_or_else(|| format!("redis:wasm:{step_module_id}")),
+                    .unwrap_or_else(|| {
+                        talos_workflow_engine_core::scoped_wasm_redis_uri(uid, step_module_id)
+                    }),
                 // Embed bytes when the fetcher already resolved them,
                 // matching `engine_dispatch_single.rs` and the loop
                 // dispatcher in `scheduler_handlers.rs`. Skips the

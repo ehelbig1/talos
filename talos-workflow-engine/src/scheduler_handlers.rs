@@ -1705,6 +1705,26 @@ impl ParallelWorkflowEngine {
                 }
             };
 
+            // The successful `cached_wasm_module` above was fetched via
+            // fetch_module(body_uuid) -> get_module_for_execution(.., user_id),
+            // which requires (and pre-warmed the redis cache under) this
+            // user_id. So it's Some here, and it's the exact id the
+            // `redis:wasm:` URI below must be scoped to (L-27). Fail-closed
+            // on the unreachable None rather than emitting an unscoped key.
+            let loop_user_id = match self.user_id() {
+                Some(uid) => uid,
+                None => {
+                    let msg = "user_id required for loop-body dispatch".to_string();
+                    last_output = serde_json::json!({
+                        "__error": true,
+                        "error_message": msg.clone(),
+                    });
+                    termination_reason = "module_fetch_error";
+                    terminating_error = Some(msg);
+                    break;
+                }
+            };
+
             // Flat-merge input + config (same pattern as regular node dispatch).
             let mut merged_input = serde_json::Map::new();
             if let Some(obj) = current_input.as_object() {
@@ -1755,10 +1775,12 @@ impl ParallelWorkflowEngine {
                 job_id: None,
                 user_id: self.user_id(),
                 actor_id: self.actor_id(),
-                module_uri: wasm_module
-                    .oci_url
-                    .clone()
-                    .unwrap_or_else(|| format!("redis:wasm:{body_module_id}")),
+                // User-scoped redis URI (L-27): `wasm:{user_id}:{module_id}`,
+                // the key the registry pre-warmed under this same `loop_user_id`
+                // in the fetch above. The worker strips `redis:` and GETs it.
+                module_uri: wasm_module.oci_url.clone().unwrap_or_else(|| {
+                    talos_workflow_engine_core::scoped_wasm_redis_uri(loop_user_id, body_module_id)
+                }),
                 // Embed bytes directly so the worker doesn't depend on
                 // a Redis pre-warm under a key the engine doesn't
                 // control — bypasses the `wasm:{uid}:{id}` vs
