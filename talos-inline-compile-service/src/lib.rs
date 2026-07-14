@@ -76,6 +76,23 @@ pub enum InlineCompileError {
     #[error("{0}")]
     CapabilityCeilingViolation(String),
 
+    /// Caller-supplied `dependencies` map failed the canonical crate
+    /// allowlist (`talos_compilation::dependency_allowlist::validate_dependencies`
+    /// — unallowlisted crate name, or a version requirement that isn't
+    /// pinned, e.g. a bare `"*"`). Maps to `-32602`.
+    ///
+    /// N-6 (crate review 2026-05-06, re-verified 2026-07-14): this
+    /// service validated `capability_world` in-service but forwarded
+    /// `dependencies` straight into `lint_code` / `compile_to_wasm_with_config`
+    /// unchecked — a doc comment claimed the caller was responsible.
+    /// Today's sole caller (`talos-mcp-handlers/src/workflows.rs`)
+    /// happened to validate first, but the service boundary itself was
+    /// unguarded: a future GraphQL/other caller could forward an
+    /// unvalidated deps map straight into lint+compile. Validating here
+    /// closes that gap regardless of caller.
+    #[error("Dependency validation failed: {0}")]
+    DependencyValidation(String),
+
     /// Lint pre-flight surfaced syntax / type errors. Maps to `-32000`.
     /// Message format: `"Lint check failed — fix these errors before
     /// compiling (saved ~30-60s):\n<line:col: msg>\n…"`.
@@ -119,7 +136,7 @@ impl InlineCompileError {
     /// Stable JSON-RPC error code for protocol wrappers.
     pub fn jsonrpc_code(&self) -> i32 {
         match self {
-            Self::InvalidArg(_) => -32602,
+            Self::InvalidArg(_) | Self::DependencyValidation(_) => -32602,
             Self::CapabilityCeilingViolation(_) => -32603,
             Self::LintFailed(_)
             | Self::CompilationFailed(_)
@@ -141,6 +158,12 @@ impl InlineCompileError {
             | Self::CompilationFailed(msg)
             | Self::SharedModuleOverwrite(msg)
             | Self::PermissionDrift(msg) => msg.clone(),
+            // Display format adds the "Dependency validation failed: "
+            // prefix around the raw allowlist-validator message, so the
+            // user-facing text is `self.to_string()`, not the bare field
+            // — matches how `NoWasmEmitted` (a fixed-text Display) is
+            // surfaced below.
+            Self::DependencyValidation(_) => self.to_string(),
             Self::NoWasmEmitted => self.to_string(),
             Self::Internal(_) => "Internal error".to_string(),
         }
@@ -188,9 +211,12 @@ pub struct InlineCompileInput<'a> {
     /// Same `Option` semantics. Strings are uppercased by convention.
     pub explicit_allowed_methods: Option<Vec<String>>,
     /// Optional `dependencies` map (mirrors `compile_custom_sandbox`'s
-    /// allowlisted-crate set). Forwarded to lint + compile. Pre-
-    /// validated by the caller via
-    /// `talos_workflow_creation_helpers::validate_dependencies`.
+    /// allowlisted-crate set). Forwarded to lint + compile. Validated
+    /// in-service (early in `compile_and_persist`, via
+    /// `talos_compilation::dependency_allowlist::validate_dependencies`)
+    /// — callers MAY pre-validate for an earlier error, but the service
+    /// boundary itself is guarded regardless (N-6, crate review
+    /// 2026-05-06).
     pub dependencies: Option<&'a serde_json::Value>,
     /// Optional integration namespace. Pre-parsed by the caller from
     /// the raw args via `parse_integration_name_arg`.
@@ -292,6 +318,17 @@ impl InlineCompileService {
                 talos_capability_world::compilable_worlds_csv()
             )));
         }
+
+        // 1c. N-6 (crate review 2026-05-06, re-verified 2026-07-14):
+        //     validate caller-supplied `dependencies` against the
+        //     canonical crate allowlist BEFORE it's forwarded into
+        //     `lint_code` (step 4) and `compile_to_wasm_with_config`
+        //     (step 5) below. Defense in depth — today's sole caller
+        //     (`talos-mcp-handlers/src/workflows.rs`) already validates
+        //     before invoking this service, but the service boundary
+        //     itself must not trust an unvalidated deps map from a
+        //     future caller (GraphQL, etc.).
+        validate_service_dependencies(input.dependencies)?;
 
         // 2. Pre-compile actor capability ceiling check. The handler
         //    runs a post-compile check too; this short-circuits the
@@ -595,6 +632,18 @@ impl InlineCompileService {
 // Pure helpers
 // -----------------------------------------------------------------------------
 
+/// Validates `dependencies` against the canonical crate allowlist
+/// (`talos_compilation::dependency_allowlist::validate_dependencies`)
+/// and maps a failure into the service's typed error. Pulled out as a
+/// pure, DB-free helper (mirrors `normalise_world_to_node` /
+/// `world_short_for_persistence` below) so it's unit-testable without
+/// standing up `InlineCompileService`'s repositories/compiler.
+fn validate_service_dependencies(
+    deps: Option<&serde_json::Value>,
+) -> Result<(), InlineCompileError> {
+    talos_compilation::validate_dependencies(deps).map_err(InlineCompileError::DependencyValidation)
+}
+
 /// `"http"` → `"http-node"`; `"http-node"` → `"http-node"`. Used for
 /// world-rank comparison against the actor's `max_capability_world`.
 fn normalise_world_to_node(world: &str) -> String {
@@ -739,5 +788,51 @@ mod tests {
     fn world_short_passthrough_when_unsuffixed() {
         // Caller may already pass the short form — leave it.
         assert_eq!(world_short_for_persistence("http"), "http");
+    }
+
+    // -------------------------------------------------------------------
+    // N-6: service-side dependency validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn dependency_validation_rejects_disallowed_crate() {
+        let deps = serde_json::json!({ "some-unallowlisted-crate": "1.0" });
+        let err = validate_service_dependencies(Some(&deps)).unwrap_err();
+        assert!(matches!(err, InlineCompileError::DependencyValidation(_)));
+        assert_eq!(err.jsonrpc_code(), -32602);
+        let msg = err.user_facing_message();
+        assert!(
+            msg.starts_with("Dependency validation failed: "),
+            "unexpected message: {msg}"
+        );
+        assert!(msg.contains("Disallowed crate dependencies"));
+        assert!(msg.contains("some-unallowlisted-crate"));
+    }
+
+    #[test]
+    fn dependency_validation_rejects_wildcard_version() {
+        let deps = serde_json::json!({ "serde": "*" });
+        let err = validate_service_dependencies(Some(&deps)).unwrap_err();
+        assert_eq!(err.jsonrpc_code(), -32602);
+        let msg = err.user_facing_message();
+        assert!(
+            msg.starts_with("Dependency validation failed: "),
+            "unexpected message: {msg}"
+        );
+        assert!(msg.contains("Invalid version specifiers"));
+        assert!(msg.contains("serde = \"*\""));
+    }
+
+    #[test]
+    fn dependency_validation_accepts_absent_null_and_empty() {
+        assert!(validate_service_dependencies(None).is_ok());
+        assert!(validate_service_dependencies(Some(&serde_json::Value::Null)).is_ok());
+        assert!(validate_service_dependencies(Some(&serde_json::json!({}))).is_ok());
+    }
+
+    #[test]
+    fn dependency_validation_accepts_allowlisted_crate_with_pinned_version() {
+        let deps = serde_json::json!({ "serde": "1.0", "chrono": "0.4" });
+        assert!(validate_service_dependencies(Some(&deps)).is_ok());
     }
 }
