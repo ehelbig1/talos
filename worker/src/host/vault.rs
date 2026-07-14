@@ -360,6 +360,14 @@ impl TalosContext {
                     error = %e,
                     "Failed to resolve hostname for SSRF validation"
                 );
+                self.emit_host_diagnostic(
+                    "dns-resolution-failed",
+                    &format!(
+                        "hostname resolution failed for '{host}' during {capability_label} — \
+                         DNS unavailable or name does not exist; the request was not sent"
+                    ),
+                )
+                .await;
                 Err("dns-resolution-failed")
             }
         }

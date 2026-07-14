@@ -358,6 +358,17 @@ impl wit_http::Host for TalosContext {
                         error = %e,
                         "Failed to resolve hostname for SSRF validation"
                     );
+                    // Fixed-text reason (no resolver error string — it can
+                    // embed infra detail); distinguishes the DNS-outage
+                    // class from every policy deny that shares this enum.
+                    self.emit_host_diagnostic(
+                        "dns-resolution-failed",
+                        &format!(
+                            "hostname resolution failed for '{host}' — DNS unavailable \
+                             or name does not exist; the request was not sent"
+                        ),
+                    )
+                    .await;
                     return Err(wit_http::Error::Networkerror);
                 }
             }
@@ -401,6 +412,14 @@ impl wit_http::Host for TalosContext {
         let host_str = host.to_string();
         if !get_global_circuit_breaker().allow_request(&host_str) {
             tracing::warn!(host = %host, "Circuit breaker open - rejecting HTTP request");
+            self.emit_host_diagnostic(
+                "circuit-breaker-open",
+                &format!(
+                    "circuit breaker open for '{host}' after recent failures — \
+                     request rejected without being sent; it closes automatically"
+                ),
+            )
+            .await;
             return Err(wit_http::Error::Networkerror);
         }
 
@@ -489,8 +508,26 @@ impl wit_http::Host for TalosContext {
             Err(e) => {
                 get_global_circuit_breaker().record_failure(&host_str);
                 return Err(if e.is_timeout() {
+                    self.emit_host_diagnostic(
+                        "request-timeout",
+                        &format!("request to '{host_str}' timed out"),
+                    )
+                    .await;
                     wit_http::Error::Timeout
                 } else {
+                    // Class only — reqwest's Display can embed proxy /
+                    // internal-infra detail, and the connect-vs-reset
+                    // distinction is all the module author needs.
+                    let class = if e.is_connect() {
+                        "connection failed (refused/unreachable)"
+                    } else {
+                        "request failed after connecting (reset/protocol)"
+                    };
+                    self.emit_host_diagnostic(
+                        "connection-failed",
+                        &format!("request to '{host_str}': {class}"),
+                    )
+                    .await;
                     wit_http::Error::Networkerror
                 });
             }
@@ -1011,14 +1048,38 @@ impl wit_http::Host for TalosContext {
 
         let self_http_client = self.http_client.clone();
         let dry_run = self.dry_run;
-        let stream = futures_util::stream::iter(validated.into_iter().map(move |v| {
-            let max_r = max_resp;
-            let self_http_client = self_http_client.clone();
-            async move {
-                let (url_str, method, headers, body, timeout_ms) = match v {
-                    Err(e) => return Err(e),
-                    Ok(params) => params,
-                };
+        // Host per input slot, captured BEFORE the entries move into the
+        // stream — used after the join to emit per-failure diagnostics.
+        // None = the entry already failed validation (its deny was
+        // diagnosed at validation time via record_capability_denied).
+        let request_hosts: Vec<Option<String>> = validated
+            .iter()
+            .map(|v| {
+                v.as_ref().ok().and_then(|(u, _, _, _, _)| {
+                    url::Url::parse(u)
+                        .ok()
+                        .and_then(|p| p.host_str().map(str::to_string))
+                })
+            })
+            .collect();
+        let stream =
+            futures_util::stream::iter(validated.into_iter().enumerate().map(move |(idx, v)| {
+                let max_r = max_resp;
+                let self_http_client = self_http_client.clone();
+                async move {
+                    // Tag every future with its INPUT index: buffer_unordered
+                    // yields in COMPLETION order, and the WIT contract
+                    // promises `responses[i]` corresponds to `requests[i]`.
+                    // Pre-fix, any batch whose requests finished out of
+                    // order returned misattributed responses (silent
+                    // cross-request data mix-up under the default
+                    // concurrency of 10). The post-join sort restores the
+                    // documented order.
+                    let result = async move {
+                        let (url_str, method, headers, body, timeout_ms) = match v {
+                            Err(e) => return Err(e),
+                            Ok(params) => params,
+                        };
 
                 // Dry-run mode: mock non-GET HTTP requests
                 if dry_run && method != reqwest::Method::GET {
@@ -1114,15 +1175,41 @@ impl wit_http::Host for TalosContext {
                     resp_body_bytes.extend_from_slice(&chunk);
                 }
 
-                Ok(wit_http::Response {
-                    status,
-                    headers: resp_headers,
-                    body: resp_body_bytes,
-                })
-            }
-        }));
+                        Ok(wit_http::Response {
+                            status,
+                            headers: resp_headers,
+                            body: resp_body_bytes,
+                        })
+                    }
+                    .await;
+                    (idx, result)
+                }
+            }));
 
-        stream.buffer_unordered(concurrency_limit).collect().await
+        let mut indexed: Vec<(usize, Result<wit_http::Response, wit_http::Error>)> =
+            stream.buffer_unordered(concurrency_limit).collect().await;
+        // Restore the documented input order (see the tagging comment
+        // above) — completion order is an implementation detail.
+        indexed.sort_unstable_by_key(|&(i, _)| i);
+        // Per-failure diagnostics for DISPATCH failures. Validation
+        // failures (request_hosts[i] == None) were already diagnosed at
+        // validation time; capped globally by HOST_DIAG_CAP.
+        for (idx, r) in &indexed {
+            if let Err(e) = r {
+                if let Some(Some(host)) = request_hosts.get(*idx) {
+                    let class = match e {
+                        wit_http::Error::Timeout => "timed out",
+                        _ => "failed (connection/reset or response over limits)",
+                    };
+                    self.emit_host_diagnostic(
+                        "batch-request-failed",
+                        &format!("fetch_all[{idx}] to '{host}' {class}"),
+                    )
+                    .await;
+                }
+            }
+        }
+        indexed.into_iter().map(|(_, r)| r).collect()
     }
 
     /// Tier 1 — Fetch with secret injected as `Authorization: Bearer {value}`.
