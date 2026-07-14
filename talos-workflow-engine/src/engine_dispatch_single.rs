@@ -110,12 +110,19 @@ impl ParallelWorkflowEngine {
             }
         }
 
-        if self.user_id.is_none() {
-            return (
-                node_idx,
-                Err("Module execution requires user context (user_id not set)".to_string()),
-            );
-        }
+        // Bind the concrete executing user_id up front. It's the same id the
+        // module fetcher used to pre-warm the redis cache (fetch_module ->
+        // get_module_for_execution(module_id, user_id)), so the `redis:wasm:`
+        // URI emitted below resolves the exact key the registry wrote.
+        let user_id = match self.user_id {
+            Some(uid) => uid,
+            None => {
+                return (
+                    node_idx,
+                    Err("Module execution requires user context (user_id not set)".to_string()),
+                );
+            }
+        };
 
         // Module-level config from the artifact, merged with any
         // graph-JSON-level node config (graph JSON wins; reserved
@@ -315,10 +322,13 @@ impl ParallelWorkflowEngine {
             job_id: Some(job_id),
             user_id: self.user_id,
             actor_id: self.actor_id,
-            module_uri: wasm_module
-                .oci_url
-                .clone()
-                .unwrap_or_else(|| format!("redis:wasm:{module_id_resolved}")),
+            // User-scoped redis URI (L-27): the worker strips `redis:` and
+            // GETs `wasm:{user_id}:{module_id}` — the exact key the registry
+            // pre-warmed under this same user during fetch_module above. No
+            // more non-scoped `wasm:{module_id}` shadow key.
+            module_uri: wasm_module.oci_url.clone().unwrap_or_else(|| {
+                talos_workflow_engine_core::scoped_wasm_redis_uri(user_id, module_id_resolved)
+            }),
             // Embed bytes directly (no Redis pre-warm dependency) when they
             // fit under the NATS-payload-aware cap; oversized components
             // (interpreter toolchains: componentize-py/jco, 12-18MB) route

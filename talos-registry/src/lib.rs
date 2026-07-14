@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{Pool, Postgres};
 use talos_capability_world::CapabilityWorld;
+// L-27: canonical user-scoped WASM cache-key + dispatch-URI format, shared
+// with `talos-workflow-engine` (the engine emits the URI; the registry writes
+// the key) so the two can never drift. Both crates depend on this one.
+use talos_workflow_engine_core::{scoped_wasm_cache_key, scoped_wasm_redis_uri};
 use uuid::Uuid;
 
 const MAX_ALLOWED_HOSTS: usize = 50;
@@ -57,8 +61,9 @@ fn clamp_execution_fuel(db_max_fuel: i64) -> i64 {
 }
 
 /// Inline-dispatch byte ceiling — modules larger than this are dispatched
-/// by `redis:wasm:{id}` URI rather than embedded in the `DispatchJob`, so
-/// their bytes MUST be resident in Redis before the worker fetches them.
+/// by `redis:wasm:{user_id}:{id}` URI rather than embedded in the
+/// `DispatchJob`, so their bytes MUST be resident in Redis before the
+/// worker fetches them.
 ///
 /// Kept in lockstep with the engine's authoritative copy
 /// (`talos_workflow_engine::dispatch_bytes::inline_wasm_cap_bytes`) via the
@@ -615,42 +620,16 @@ impl ModuleRegistry {
         .await
         .context("Failed to insert module")?;
 
-        // Cache in Redis for fast access
-        if true {
-            if let Some(ref client) = self.redis_client {
-                let key = format!("wasm:{}", id);
-                match client.get_multiplexed_async_connection().await {
-                    Ok(mut conn) => {
-                        // MCP-745 (2026-05-13): log SETEX failures. Pre-fix
-                        // `let _ = ...await` silently dropped Redis OOM /
-                        // eviction / permission errors after a successful
-                        // DB insert, leaving the cache out-of-sync with
-                        // the database. Reads via `get_module_bytes` then
-                        // miss and fall back to the DB on every call —
-                        // operator sees latency creep with NO log signal
-                        // tying it to Redis health. Mirrors the shape
-                        // already used in `cache_wasm_bytes_under` below.
-                        if let Err(e) = redis::cmd("SETEX")
-                            .arg(&key)
-                            .arg(86400)
-                            .arg(&module.wasm_bytes)
-                            .query_async::<()>(&mut conn)
-                            .await
-                        {
-                            tracing::warn!(
-                                target: "talos_rpc",
-                                module_id = %id,
-                                error = %e,
-                                "Redis SETEX failed in store_module — cache and DB are now out of sync",
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Redis connection error during SET in store_module: {}", e)
-                    }
-                }
-            }
-        }
+        // L-27: no store-time Redis seed. The old seed wrote a non-scoped
+        // `wasm:{id}` key, which is exactly the cross-tenant-readable shadow
+        // key this fix removes. Scoping it under the module owner would be
+        // dead weight: the read path is user-scoped and the dispatch-prep
+        // pre-warm (`get_module` -> `cache_wasm_bytes_under` /
+        // `ensure_wasm_bytes_cached`, both keyed on the EXECUTING user) fires
+        // before every dispatch and provably covers the redis-routed path.
+        // For catalog modules (`user_id IS NULL`) there is no single owner to
+        // scope to anyway. So the seed is dropped entirely; the first
+        // execution's pre-warm populates the correct user-scoped key.
 
         Ok(id)
     }
@@ -723,35 +702,10 @@ impl ModuleRegistry {
         .await
         .context("Failed to insert fresh module")?;
 
-        // Cache in Redis for fast access (same as store_module)
-        if let Some(ref client) = self.redis_client {
-            let key = format!("wasm:{}", id);
-            match client.get_multiplexed_async_connection().await {
-                Ok(mut conn) => {
-                    // MCP-745 (2026-05-13): see store_module for rationale.
-                    if let Err(e) = redis::cmd("SETEX")
-                        .arg(&key)
-                        .arg(86400)
-                        .arg(&module.wasm_bytes)
-                        .query_async::<()>(&mut conn)
-                        .await
-                    {
-                        tracing::warn!(
-                            target: "talos_rpc",
-                            module_id = %id,
-                            error = %e,
-                            "Redis SETEX failed in store_module_fresh — cache and DB are now out of sync",
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Redis connection error during SET in store_module_fresh: {}",
-                        e
-                    )
-                }
-            }
-        }
+        // L-27: no store-time Redis seed (same rationale as store_module) —
+        // the old seed wrote the cross-tenant-readable non-scoped `wasm:{id}`
+        // shadow key. The dispatch-prep pre-warm populates the correct
+        // user-scoped key before the first execution.
 
         Ok(id)
     }
@@ -850,10 +804,13 @@ impl ModuleRegistry {
             // fetch returns — the worker fetches by `redis:wasm:` URI and
             // would race a fire-and-forget fill. Small (inlined) modules
             // keep the async fill. See `ensure_wasm_bytes_cached`.
+            // L-27: pre-warm under the CALLER's `user_id` — the exact id the
+            // engine will emit in the dispatch URI for this fetch.
             if wasm_bytes.len() > inline_wasm_cap_bytes() {
-                self.ensure_wasm_bytes_cached(module_id, &wasm_bytes).await;
+                self.ensure_wasm_bytes_cached(user_id, module_id, &wasm_bytes)
+                    .await;
             } else {
-                self.cache_wasm_bytes_under(module_id, &wasm_bytes);
+                self.cache_wasm_bytes_under(user_id, module_id, &wasm_bytes);
             }
         }
 
@@ -1052,12 +1009,14 @@ impl ModuleRegistry {
                     integration_name: row.try_get::<Option<String>, _>("integration_name")?,
                 };
                 // Oversized (redis-routed) modules must be resident before
-                // returning — see the twin call in `get_module`.
+                // returning — see the twin call in `get_module`. L-27: cache
+                // under the requested `module_id` (the id the engine emits)
+                // and the caller's `user_id`, NOT the successor `new_id`.
                 if m.wasm_bytes.len() > inline_wasm_cap_bytes() {
-                    self.ensure_wasm_bytes_cached(module_id, &m.wasm_bytes)
+                    self.ensure_wasm_bytes_cached(user_id, module_id, &m.wasm_bytes)
                         .await;
                 } else {
-                    self.cache_wasm_bytes_under(module_id, &m.wasm_bytes);
+                    self.cache_wasm_bytes_under(user_id, module_id, &m.wasm_bytes);
                 }
                 return Ok(m);
             }
@@ -1070,23 +1029,29 @@ impl ModuleRegistry {
         )
     }
 
-    /// Best-effort Redis cache fill for `wasm:<module_id>` so the worker
-    /// bytecode-load path can find the resolved module by its original id
-    /// after a fallback resolution. Silently ignored when no Redis is
-    /// configured or the connection is unavailable — the worker will fall
-    /// through to its own module-load path on miss.
+    /// Best-effort Redis cache fill for `wasm:{user_id}:{module_id}` so the
+    /// worker bytecode-load path can find the resolved module after a
+    /// fallback resolution. Silently ignored when no Redis is configured or
+    /// the connection is unavailable — the worker falls through to its own
+    /// module-load path on miss.
+    ///
+    /// L-27: the key is USER-SCOPED. `user_id` MUST be the executing user —
+    /// the same id the engine then emits in the `redis:wasm:{user_id}:{id}`
+    /// dispatch URI (see `get_module` / `get_module_for_execution`, both of
+    /// which thread the caller's `user_id` through). A non-scoped
+    /// `wasm:{module_id}` key was cross-tenant readable.
     ///
     /// **Fire-and-forget**: returns immediately and does the SET on a
     /// background tokio task. `get_module()` is on the dispatch hot path —
-    /// every workflow node-execution pays this — and the previous blocking
-    /// implementation added one Redis round-trip per fetch. The fire-and-
+    /// every workflow node-execution pays this — and a blocking
+    /// implementation would add a Redis round-trip per fetch. The fire-and-
     /// forget pattern keeps cache-warming asynchronous while preserving
     /// the cache's purpose (subsequent dispatches resolve from Redis).
     ///
     /// SETEX with a 24h TTL bounds stale-after-rotation exposure for
     /// callers that don't explicitly DEL the key (matches the TTL on
     /// `get_module_bytes::SETEX`).
-    fn cache_wasm_bytes_under(&self, module_id: Uuid, wasm_bytes: &[u8]) {
+    fn cache_wasm_bytes_under(&self, user_id: Uuid, module_id: Uuid, wasm_bytes: &[u8]) {
         let Some(ref redis_client) = self.redis_client else {
             return;
         };
@@ -1101,39 +1066,41 @@ impl ModuleRegistry {
         let client = redis_client.clone();
         let bytes = wasm_bytes.to_vec();
         tokio::spawn(async move {
-            Self::set_wasm_key(&client, module_id, &bytes).await;
+            Self::set_wasm_key(&client, user_id, module_id, &bytes).await;
         });
     }
 
-    /// **Synchronous** Redis pre-warm for `wasm:<module_id>` — awaits the
-    /// SETEX before returning so the key is guaranteed resident.
+    /// **Synchronous** Redis pre-warm for `wasm:{user_id}:{module_id}` —
+    /// awaits the SETEX before returning so the key is guaranteed resident.
     ///
     /// Required for OVERSIZED components (interpreter toolchains:
     /// componentize-py ~18 MB, jco ~13 MB). Those exceed the inline cap,
-    /// so the engine dispatches them by `redis:wasm:{id}` URI instead of
-    /// embedding the bytes (`dispatch_bytes::embeds_inline`). If the
-    /// pre-warm were fire-and-forget (as for small modules), the worker
-    /// could issue its `GET wasm:{id}` before the background SETEX landed
-    /// and fail the job with "wasm module not found" — a non-deterministic
-    /// race that gets WORSE with size (a 13 MB SETEX easily loses to a
-    /// fast local dispatch → NATS → worker GET). Awaiting closes it: the
-    /// key exists before `fetch` returns to the engine, so it exists
-    /// before the JobRequest is even built.
-    async fn ensure_wasm_bytes_cached(&self, module_id: Uuid, wasm_bytes: &[u8]) {
+    /// so the engine dispatches them by `redis:wasm:{user_id}:{id}` URI
+    /// instead of embedding the bytes (`dispatch_bytes::embeds_inline`). If
+    /// the pre-warm were fire-and-forget (as for small modules), the worker
+    /// could issue its `GET wasm:{user_id}:{id}` before the background SETEX
+    /// landed and fail the job with "wasm module not found" — a
+    /// non-deterministic race that gets WORSE with size (a 13 MB SETEX
+    /// easily loses to a fast local dispatch → NATS → worker GET). Awaiting
+    /// closes it: the key exists before `fetch` returns to the engine, so
+    /// it exists before the JobRequest is even built.
+    async fn ensure_wasm_bytes_cached(&self, user_id: Uuid, module_id: Uuid, wasm_bytes: &[u8]) {
         let Some(ref client) = self.redis_client else {
             return;
         };
-        Self::set_wasm_key(client, module_id, wasm_bytes).await;
+        Self::set_wasm_key(client, user_id, module_id, wasm_bytes).await;
     }
 
     /// Shared SETEX body for both the fire-and-forget (`cache_wasm_bytes_under`)
-    /// and awaited (`ensure_wasm_bytes_cached`) pre-warm paths.
-    async fn set_wasm_key(client: &redis::Client, module_id: Uuid, bytes: &[u8]) {
+    /// and awaited (`ensure_wasm_bytes_cached`) pre-warm paths. Writes the
+    /// canonical user-scoped key so it can never drift from the URI the
+    /// engine emits — both derive from `talos_workflow_engine_core`.
+    async fn set_wasm_key(client: &redis::Client, user_id: Uuid, module_id: Uuid, bytes: &[u8]) {
         let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
-            tracing::debug!(module_id = %module_id, "Redis connect failed during cache fill — read path will fall back");
+            tracing::debug!(user_id = %user_id, module_id = %module_id, "Redis connect failed during cache fill — read path will fall back");
             return;
         };
-        let key = format!("wasm:{}", module_id);
+        let key = scoped_wasm_cache_key(user_id, module_id);
         // SETEX (vs SET): bound stale exposure if a downstream rotation
         // path forgets to DEL. 24h matches `get_module_bytes`.
         if let Err(e) = redis::cmd("SETEX")
@@ -1143,13 +1110,13 @@ impl ModuleRegistry {
             .query_async::<()>(&mut conn)
             .await
         {
-            tracing::debug!(module_id = %module_id, error = %e, "Redis SET failed during cache fill");
+            tracing::debug!(user_id = %user_id, module_id = %module_id, error = %e, "Redis SET failed during cache fill");
         }
     }
 
     pub async fn get_module_bytes(&self, module_id: Uuid, user_id: Uuid) -> Result<Vec<u8>> {
         // SECURITY: Use user-scoped cache key to prevent cross-tenant cache leakage
-        let cache_key = format!("wasm:{}:{}", user_id, module_id);
+        let cache_key = scoped_wasm_cache_key(user_id, module_id);
 
         // 1. Try to fetch from Redis cache
         if let Some(ref client) = self.redis_client {
@@ -1244,16 +1211,10 @@ impl ModuleRegistry {
             }
             // CRITICAL: match the user-scoped cache key written by
             // `ensure_module_in_cache` / `get_module_bytes`, which SET at
-            // `wasm:{user_id}:{module_id}` for cross-tenant isolation.
-            // Previously this returned `redis:wasm:{module_id}` which the
-            // worker would look up as a missing key, failing every loop
-            // re-dispatch and every sub-workflow invocation with "failed
-            // to fetch wasm module from redis (not found or redis unavailable)".
-            // First-iteration dispatches happened to work because the
-            // controller seeds the unscoped key via `cache_wasm_bytes_under`
-            // in get_module()'s fallback paths, but that path didn't fire
-            // for the second loop iteration.
-            format!("redis:wasm:{}:{}", user_id, module_id)
+            // `wasm:{user_id}:{module_id}` for cross-tenant isolation. The
+            // engine's dispatch sites emit the identical URI (L-27), both
+            // via `talos_workflow_engine_core::scoped_wasm_redis_uri`.
+            scoped_wasm_redis_uri(user_id, module_id)
         };
 
         Ok(ModuleExecutionInfo {
@@ -1277,49 +1238,35 @@ impl ModuleRegistry {
     /// SECURITY: Uses user-scoped cache key to prevent cross-tenant access.
     pub async fn ensure_module_in_cache(&self, module_id: Uuid, user_id: Uuid) -> Result<()> {
         if let Some(ref client) = self.redis_client {
-            // SECURITY: User-scoped cache key prevents cross-tenant leakage
-            let user_key = format!("wasm:{}:{}", user_id, module_id);
-            // Shadow key — the engine's loop-body / pipeline-step dispatchers
-            // in `talos-workflow-engine` emit `redis:wasm:{module_id}` URIs
-            // with `wasm_bytes: None`, so the worker must be able to resolve
-            // this non-scoped key. See `fetch_and_cache_both_keys` below.
-            let shadow_key = format!("wasm:{}", module_id);
+            // SECURITY (L-27): user-scoped cache key prevents cross-tenant
+            // leakage. This is the only key shape the worker resolves now —
+            // the engine emits `redis:wasm:{user_id}:{module_id}` for every
+            // dispatch shape (single / pipeline-step / loop-body).
+            let user_key = scoped_wasm_cache_key(user_id, module_id);
             if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
                 let user_exists: bool = redis::cmd("EXISTS")
                     .arg(&user_key)
                     .query_async(&mut conn)
                     .await
                     .unwrap_or(false);
-                let shadow_exists: bool = redis::cmd("EXISTS")
-                    .arg(&shadow_key)
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or(false);
-                if user_exists && shadow_exists {
+                if user_exists {
                     return Ok(());
                 }
             }
         }
 
-        // Fetch from Postgres (auth-enforced) and populate BOTH keys so every
-        // downstream dispatch path (get_execution_info's user-scoped URI OR
-        // the engine's non-scoped URI) resolves on the worker.
-        self.fetch_and_cache_both_keys(module_id, user_id).await?;
+        // Fetch from Postgres (auth-enforced) and populate the user-scoped
+        // key so the engine's `redis:wasm:{user_id}:{module_id}` URI resolves
+        // on the worker.
+        self.fetch_and_cache_scoped(module_id, user_id).await?;
         Ok(())
     }
 
-    /// Fetch module bytes from Postgres and write them to BOTH Redis keys:
-    /// `wasm:{user_id}:{module_id}` (user-scoped — read by controller helpers)
-    /// and `wasm:{module_id}` (non-scoped — read by the engine's loop-body
-    /// and pipeline-step dispatchers, which currently emit
-    /// `redis:wasm:{module_id}` URIs with `wasm_bytes: None`).
-    ///
-    /// The double-write is a safety belt while the engine is updated to
-    /// embed bytes inline in DispatchJob; see `docs/mcp-test-fixes-handoff.md`
-    /// for the engine-side fix. The bytes are identical and the controller
-    /// already authorized the fetch, so mirroring to the non-scoped key
-    /// introduces no new cross-tenant exposure.
-    async fn fetch_and_cache_both_keys(&self, module_id: Uuid, user_id: Uuid) -> Result<Vec<u8>> {
+    /// Fetch module bytes from Postgres and write them to the user-scoped
+    /// Redis key `wasm:{user_id}:{module_id}` — the one key shape the worker
+    /// resolves (L-27). The engine emits the matching
+    /// `redis:wasm:{user_id}:{module_id}` URI for every dispatch shape.
+    async fn fetch_and_cache_scoped(&self, module_id: Uuid, user_id: Uuid) -> Result<Vec<u8>> {
         // Phase 5.1: reads from `modules` by canonical id. See
         // `get_module_bytes` for the ownership-scope rationale.
         let bytes = sqlx::query_scalar::<_, Vec<u8>>(
@@ -1337,14 +1284,12 @@ impl ModuleRegistry {
 
         if let Some(ref client) = self.redis_client {
             if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let user_key = format!("wasm:{}:{}", user_id, module_id);
-                let shadow_key = format!("wasm:{}", module_id);
-                // 24h TTL on both — matches existing get_module_bytes behaviour.
-                // MCP-745 (2026-05-13): log SETEX failures on both keys.
-                // ensure_module_in_cache is the prefetch path called
-                // before dispatch — silent failure here means the
-                // subsequent execution incurs the DB-read fallback even
-                // though the operator believed the cache was warm.
+                let user_key = scoped_wasm_cache_key(user_id, module_id);
+                // 24h TTL — matches existing get_module_bytes behaviour.
+                // MCP-745 (2026-05-13): log SETEX failures. ensure_module_in_cache
+                // is the prefetch path called before dispatch — silent failure
+                // here means the subsequent execution incurs the DB-read
+                // fallback even though the operator believed the cache was warm.
                 if let Err(e) = redis::cmd("SETEX")
                     .arg(&user_key)
                     .arg(86400)
@@ -1356,23 +1301,6 @@ impl ModuleRegistry {
                         target: "talos_rpc",
                         module_id = %module_id,
                         user_id = %user_id,
-                        key = "user",
-                        error = %e,
-                        "Redis SETEX failed in ensure_module_in_cache — prefetch incomplete",
-                    );
-                }
-                if let Err(e) = redis::cmd("SETEX")
-                    .arg(&shadow_key)
-                    .arg(86400)
-                    .arg(&bytes)
-                    .query_async::<()>(&mut conn)
-                    .await
-                {
-                    tracing::warn!(
-                        target: "talos_rpc",
-                        module_id = %module_id,
-                        user_id = %user_id,
-                        key = "shadow",
                         error = %e,
                         "Redis SETEX failed in ensure_module_in_cache — prefetch incomplete",
                     );
@@ -1721,6 +1649,29 @@ impl ModuleRegistry {
         .await
         .context("Failed to store precompiled AOT blob on unified modules table")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wasm_cache_key_tests {
+    use super::*;
+
+    // L-27: the key the registry writes (`set_wasm_key` / `get_module_bytes`
+    // / `ensure_module_in_cache`, all via `scoped_wasm_cache_key`) MUST equal
+    // the key the worker derives by stripping `redis:` from the URI the engine
+    // emits (`scoped_wasm_redis_uri`). Both come from the shared
+    // `talos_workflow_engine_core` helper, so this pins the contract on the
+    // registry side — if someone reverts the registry to a bespoke literal,
+    // this test catches the drift.
+    #[test]
+    fn registry_key_matches_engine_uri_after_redis_strip() {
+        let user = Uuid::new_v4();
+        let module = Uuid::new_v4();
+        let key = scoped_wasm_cache_key(user, module);
+        let uri = scoped_wasm_redis_uri(user, module);
+        assert_eq!(uri.strip_prefix("redis:"), Some(key.as_str()));
+        // And the concrete shape the worker's `get_execution_info` test pins.
+        assert_eq!(key, format!("wasm:{}:{}", user, module));
     }
 }
 
