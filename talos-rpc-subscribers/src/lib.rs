@@ -996,6 +996,253 @@ pub fn spawn_ml_rpc_subscriber(
     });
 }
 
+/// `talos.ml.fewshot` subscriber — human-correction anchors for the LLM
+/// teacher leg (structural mirror of the predict subscriber; every guard
+/// per docs/platform-primitive-checklist.md). Reuses ML_PREDICT_CONTEXT:
+/// same pool + DatasetService, installed once at boot.
+pub fn spawn_ml_fewshot_subscriber(
+    nats: std::sync::Arc<async_nats::Client>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use talos_memory::ml_rpc::{
+        MlFewShotReply, MlFewShotRequest, MlFewShotResponse, MlRpcError, WireFewShotExample,
+        MAX_IN_FLIGHT, SUBJECT_ML_FEWSHOT, SUBSCRIBER_OP_TIMEOUT_MS,
+    };
+
+    async fn publish_reply(
+        nats: &async_nats::Client,
+        reply_to: async_nats::Subject,
+        resp: &talos_memory::ml_rpc::MlFewShotResponse,
+    ) {
+        let _ = nats
+            .publish(
+                reply_to,
+                serde_json::to_vec(resp).unwrap_or_default().into(),
+            )
+            .await;
+    }
+
+    let spec = kernel::RpcSubscriberSpec {
+        subject: SUBJECT_ML_FEWSHOT,
+        max_in_flight: MAX_IN_FLIGHT,
+        active_msg: "ML-fewshot RPC subscriber active",
+        subscribe_failed_msg: "ML-fewshot RPC subscribe failed; retrying after backoff (worker model::few-shot calls time out in the meantime)",
+        rebind_event_kind: "ml_fewshot_subscriber_rebinding",
+        rebind_msg: "ML-fewshot RPC subscriber stream ended; supervisor re-binding",
+    };
+    let handler_nats = nats.clone();
+    kernel::spawn_rpc_subscriber(nats, shutdown, spec, move |msg, sem| {
+        let nats_client = handler_nats.clone();
+        async move {
+            let start = std::time::Instant::now();
+            let reply_to = match msg.reply.clone() {
+                Some(r) => r,
+                None => return,
+            };
+
+            let req: MlFewShotRequest = match serde_json::from_slice(&msg.payload) {
+                Ok(r) => r,
+                Err(_) => {
+                    publish_reply(
+                        &nats_client,
+                        reply_to,
+                        &MlFewShotResponse::Err(MlRpcError::Invalid),
+                    )
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_ML_FEWSHOT,
+                        uuid::Uuid::nil(),
+                        "invalid",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+            };
+
+            // verify() covers HMAC + freshness + structural caps.
+            if !req.verify()
+                || !crossreplica_replay_ok(SUBJECT_ML_FEWSHOT, req.actor_id, &req.nonce).await
+            {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "ml-fewshot RPC: HMAC or freshness verification failed"
+                );
+                publish_reply(
+                    &nats_client,
+                    reply_to,
+                    &MlFewShotResponse::Err(MlRpcError::Unauthorized),
+                )
+                .await;
+                record_rpc_metric(
+                    SUBJECT_ML_FEWSHOT,
+                    req.actor_id,
+                    "unauthorized",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            if !talos_memory::rpc_auth::check_and_record_nonce(
+                talos_memory::ml_rpc::SUBJECT_NAME_FEWSHOT,
+                req.actor_id,
+                &req.nonce,
+            ) {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    "ml-fewshot RPC: nonce replay rejected"
+                );
+                publish_reply(
+                    &nats_client,
+                    reply_to,
+                    &MlFewShotResponse::Err(MlRpcError::Unauthorized),
+                )
+                .await;
+                record_rpc_metric(
+                    SUBJECT_ML_FEWSHOT,
+                    req.actor_id,
+                    "replay",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            let Some(ctx) = ML_PREDICT_CONTEXT.get() else {
+                publish_reply(
+                    &nats_client,
+                    reply_to,
+                    &MlFewShotResponse::Err(MlRpcError::NotAvailable),
+                )
+                .await;
+                record_rpc_metric(
+                    SUBJECT_ML_FEWSHOT,
+                    req.actor_id,
+                    "not_available",
+                    start.elapsed().as_millis() as u64,
+                    0,
+                );
+                return;
+            };
+
+            let _permit = sem.acquire_owned().await;
+            let permit_at = std::time::Instant::now();
+
+            // Dead-reply guard (same rationale as predict).
+            if start.elapsed()
+                >= std::time::Duration::from_millis(talos_memory::ml_rpc::REQUEST_TIMEOUT_MS)
+            {
+                tracing::warn!(
+                    actor_id = %req.actor_id,
+                    queued_ms = start.elapsed().as_millis() as u64,
+                    "ml-fewshot RPC: caller deadline already passed after permit wait — skipping"
+                );
+                publish_reply(
+                    &nats_client,
+                    reply_to,
+                    &MlFewShotResponse::Err(MlRpcError::Timeout),
+                )
+                .await;
+                record_rpc_metric(
+                    SUBJECT_ML_FEWSHOT,
+                    req.actor_id,
+                    "stale_deadline",
+                    permit_at.saturating_duration_since(start).as_millis() as u64,
+                    0,
+                );
+                return;
+            }
+
+            // Zombie-permit guard (checklist §3): covers tx open, model
+            // resolution, and the decrypt loop.
+            let served = kernel::guard_op_with(
+                std::time::Duration::from_millis(SUBSCRIBER_OP_TIMEOUT_MS),
+                async {
+                    // Tenancy from the SIGNED user_id only.
+                    let mut tx = talos_db::begin_tenant_read_scoped(
+                        &ctx.db_pool,
+                        &talos_tenancy::TenantReadScope::new(req.user_id, Vec::new()),
+                    )
+                    .await
+                    .map_err(talos_ml::ServeError::Internal)?;
+                    let examples = talos_ml::few_shot_for_model(
+                        &ctx.dataset_service,
+                        &mut tx,
+                        req.user_id,
+                        &req.model_name,
+                        req.k,
+                    )
+                    .await?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| talos_ml::ServeError::Internal(anyhow::anyhow!(e)))?;
+                    Ok::<_, talos_ml::ServeError>(examples)
+                },
+            )
+            .await;
+
+            let resp = match served {
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        timeout_ms = SUBSCRIBER_OP_TIMEOUT_MS,
+                        "ml-fewshot RPC: op exceeded permit-guard timeout — permit released"
+                    );
+                    MlFewShotResponse::Err(MlRpcError::Timeout)
+                }
+                Ok(Ok(examples)) => MlFewShotResponse::Ok(MlFewShotReply {
+                    examples: examples
+                        .into_iter()
+                        .map(|(features_text, label)| WireFewShotExample {
+                            features_text,
+                            label,
+                        })
+                        .collect(),
+                }),
+                Ok(Err(talos_ml::ServeError::NotFound)) => {
+                    MlFewShotResponse::Err(MlRpcError::NotFound)
+                }
+                // Few-shot has no promoted-version requirement, but the
+                // serve error type is shared — map exhaustively.
+                Ok(Err(talos_ml::ServeError::NotPromoted)) => {
+                    MlFewShotResponse::Err(MlRpcError::NotPromoted)
+                }
+                Ok(Err(talos_ml::ServeError::NotAvailable)) => {
+                    MlFewShotResponse::Err(MlRpcError::NotAvailable)
+                }
+                Ok(Err(talos_ml::ServeError::Internal(e))) => {
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        error = %e,
+                        "ml-fewshot RPC: serve error"
+                    );
+                    MlFewShotResponse::Err(MlRpcError::Internal)
+                }
+            };
+
+            let outcome = match &resp {
+                MlFewShotResponse::Ok(_) => "ok",
+                MlFewShotResponse::Err(MlRpcError::Unauthorized) => "unauthorized",
+                MlFewShotResponse::Err(MlRpcError::NotFound) => "not_found",
+                MlFewShotResponse::Err(MlRpcError::NotPromoted) => "not_promoted",
+                MlFewShotResponse::Err(MlRpcError::NotAvailable) => "not_available",
+                MlFewShotResponse::Err(MlRpcError::Invalid) => "invalid",
+                MlFewShotResponse::Err(MlRpcError::Timeout) => "timeout",
+                MlFewShotResponse::Err(MlRpcError::Internal) => "internal",
+            };
+            publish_reply(&nats_client, reply_to, &resp).await;
+            record_rpc_metric(
+                SUBJECT_ML_FEWSHOT,
+                req.actor_id,
+                outcome,
+                permit_at.saturating_duration_since(start).as_millis() as u64,
+                permit_at.elapsed().as_millis() as u64,
+            );
+        }
+    });
+}
+
 pub fn spawn_memory_rpc_subscriber(
     nats: std::sync::Arc<async_nats::Client>,
     pool: sqlx::PgPool,

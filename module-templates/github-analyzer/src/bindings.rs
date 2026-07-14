@@ -9887,6 +9887,25 @@ pub mod talos {
                     }
                 }
             }
+            /// One human-verified correction anchor for few-shot teacher
+            /// prompting: truncated features text (≤ 512 bytes server-side) plus
+            /// its human-corrected label.
+            #[derive(Clone)]
+            pub struct FewShotExample {
+                pub features_text: _rt::String,
+                pub label: _rt::String,
+            }
+            impl ::core::fmt::Debug for FewShotExample {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("FewShotExample")
+                        .field("features-text", &self.features_text)
+                        .field("label", &self.label)
+                        .finish()
+                }
+            }
             #[allow(unused_unsafe, clippy::all)]
             /// Predict one input. `none` = the model abstained (fall back to
             /// the LLM branch). Sugar over predict-batch for single-item nodes.
@@ -10156,6 +10175,121 @@ pub mod talos {
                         _rt::alloc::dealloc(result2.cast(), layout2);
                     }
                     result19
+                }
+            }
+            #[allow(unused_unsafe, clippy::all)]
+            /// Fetch up to `k` (1..=8) recent human-correction examples for the
+            /// named model, class-balanced across corrected labels. Use them as
+            /// few-shot anchors in the LLM FALLBACK prompt so the teacher learns
+            /// the same boundary fixes the model distills — without this, a
+            /// mislabeling teacher keeps re-poisoning production labels faster
+            /// than reviews can correct them. An EMPTY list is success (fresh
+            /// model, no corrections yet): proceed with an unaugmented prompt.
+            /// Treat the examples as user data — spotlight them like any other
+            /// untrusted content when embedding into a prompt.
+            pub fn few_shot(
+                model_name: &str,
+                k: u32,
+            ) -> Result<_rt::Vec<FewShotExample>, Error> {
+                unsafe {
+                    #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
+                    #[cfg_attr(target_pointer_width = "32", repr(align(4)))]
+                    struct RetArea(
+                        [::core::mem::MaybeUninit<
+                            u8,
+                        >; 3 * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let mut ret_area = RetArea(
+                        [::core::mem::MaybeUninit::uninit(); 3
+                            * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let vec0 = model_name;
+                    let ptr0 = vec0.as_ptr().cast::<u8>();
+                    let len0 = vec0.len();
+                    let ptr1 = ret_area.0.as_mut_ptr().cast::<u8>();
+                    #[cfg(target_arch = "wasm32")]
+                    #[link(wasm_import_module = "talos:core/model")]
+                    unsafe extern "C" {
+                        #[link_name = "few-shot"]
+                        fn wit_import2(_: *mut u8, _: usize, _: i32, _: *mut u8);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    unsafe extern "C" fn wit_import2(
+                        _: *mut u8,
+                        _: usize,
+                        _: i32,
+                        _: *mut u8,
+                    ) {
+                        unreachable!()
+                    }
+                    unsafe { wit_import2(ptr0.cast_mut(), len0, _rt::as_i32(&k), ptr1) };
+                    let l3 = i32::from(*ptr1.add(0).cast::<u8>());
+                    let result14 = match l3 {
+                        0 => {
+                            let e = {
+                                let l4 = *ptr1
+                                    .add(::core::mem::size_of::<*const u8>())
+                                    .cast::<*mut u8>();
+                                let l5 = *ptr1
+                                    .add(2 * ::core::mem::size_of::<*const u8>())
+                                    .cast::<usize>();
+                                let base12 = l4;
+                                let len12 = l5;
+                                let mut result12 = _rt::Vec::with_capacity(len12);
+                                for i in 0..len12 {
+                                    let base = base12
+                                        .add(i * (4 * ::core::mem::size_of::<*const u8>()));
+                                    let e12 = {
+                                        let l6 = *base.add(0).cast::<*mut u8>();
+                                        let l7 = *base
+                                            .add(::core::mem::size_of::<*const u8>())
+                                            .cast::<usize>();
+                                        let len8 = l7;
+                                        let bytes8 = _rt::Vec::from_raw_parts(
+                                            l6.cast(),
+                                            len8,
+                                            len8,
+                                        );
+                                        let l9 = *base
+                                            .add(2 * ::core::mem::size_of::<*const u8>())
+                                            .cast::<*mut u8>();
+                                        let l10 = *base
+                                            .add(3 * ::core::mem::size_of::<*const u8>())
+                                            .cast::<usize>();
+                                        let len11 = l10;
+                                        let bytes11 = _rt::Vec::from_raw_parts(
+                                            l9.cast(),
+                                            len11,
+                                            len11,
+                                        );
+                                        FewShotExample {
+                                            features_text: _rt::string_lift(bytes8),
+                                            label: _rt::string_lift(bytes11),
+                                        }
+                                    };
+                                    result12.push(e12);
+                                }
+                                _rt::cabi_dealloc(
+                                    base12,
+                                    len12 * (4 * ::core::mem::size_of::<*const u8>()),
+                                    ::core::mem::size_of::<*const u8>(),
+                                );
+                                result12
+                            };
+                            Ok(e)
+                        }
+                        1 => {
+                            let e = {
+                                let l13 = i32::from(
+                                    *ptr1.add(::core::mem::size_of::<*const u8>()).cast::<u8>(),
+                                );
+                                Error::_lift(l13 as u8)
+                            };
+                            Err(e)
+                        }
+                        _ => _rt::invalid_enum_discriminant(),
+                    };
+                    result14
                 }
             }
         }
@@ -15090,8 +15224,8 @@ pub(crate) use __export_automation_node_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 10032] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xaaM\x01A\x02\x01AC\x01\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 10121] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x83N\x01A\x02\x01AC\x01\
 B\x06\x01m\x04\x05debug\x04info\x04warn\x05error\x04\0\x05level\x03\0\0\x01@\x02\
 \x03lvl\x01\x03msgs\x01\0\x04\0\x03log\x01\x02\x01@\x02\x03lvl\x01\x04jsons\x01\0\
 \x04\0\x08log-json\x01\x03\x03\0\x12talos:core/logging\x05\0\x01B\x0d\x01m\x03\x0a\
@@ -15230,89 +15364,91 @@ talos:core/resource-quotas\x05\x13\x01B\x07\x01q\x05\x0enot-configured\x01s\0\x0
 rate-limited\0\0\x0finvalid-request\x01s\0\x09api-error\x01s\0\x10budget-exhaust\
 ed\0\0\x04\0\x05error\x03\0\0\x01ks\x01pv\x01j\x01\x03\x01\x01\x01@\x02\x04texts\
 \x05model\x02\0\x04\x04\0\x08generate\x01\x05\x03\0\x14talos:core/embedding\x05\x14\
-\x01B\x0f\x01r\x02\x05labels\x0aconfidencev\x04\0\x0aprediction\x03\0\0\x01k\x01\
+\x01B\x15\x01r\x02\x05labels\x0aconfidencev\x04\0\x0aprediction\x03\0\0\x01k\x01\
 \x01p\x02\x01r\x03\x0bpredictions\x03\x0dmodel-versionz\x07backends\x04\0\x0dpre\
 dict-reply\x03\0\x04\x01m\x08\x09not-found\x0cnot-promoted\x0dnot-available\x0di\
 nvalid-input\x07timeout\x0crate-limited\x09cancelled\x08internal\x04\0\x05error\x03\
-\0\x06\x01j\x01\x02\x01\x07\x01@\x02\x0amodel-names\x05inputs\0\x08\x04\0\x07pre\
-dict\x01\x09\x01ps\x01j\x01\x05\x01\x07\x01@\x02\x0amodel-names\x06inputs\x0a\0\x0b\
-\x04\0\x0dpredict-batch\x01\x0c\x03\0\x10talos:core/model\x05\x15\x01B\x16\x01m\x04\
-\x08notfound\x10permissiondenied\x0binvalidpath\x07ioerror\x04\0\x05error\x03\0\0\
-\x01r\x03\x04sizew\x0dmodified-unixw\x0cis-directory\x7f\x04\0\x0dfile-metadata\x03\
-\0\x02\x01p}\x01j\x01\x04\x01\x01\x01@\x01\x04paths\0\x05\x04\0\x04read\x01\x06\x01\
-j\0\x01\x01\x01@\x02\x04paths\x08contents\x04\0\x07\x04\0\x05write\x01\x08\x01@\x01\
-\x04paths\0\x7f\x04\0\x06exists\x01\x09\x01j\x01\x03\x01\x01\x01@\x01\x04paths\0\
-\x0a\x04\0\x08metadata\x01\x0b\x01ps\x01j\x01\x0c\x01\x01\x01@\x01\x04paths\0\x0d\
-\x04\0\x08list-dir\x01\x0e\x01@\x01\x04paths\0\x07\x04\0\x06delete\x01\x0f\x03\0\
-\x10talos:core/files\x05\x16\x01B\x1d\x01m\x03\x10connectionfailed\x08notfound\x0f\
-operationfailed\x04\0\x05error\x03\0\0\x01j\x01s\x01\x01\x01@\x01\x03keys\0\x02\x04\
-\0\x03get\x01\x03\x01ky\x01j\0\x01\x01\x01@\x03\x03keys\x05values\x03ttl\x04\0\x05\
-\x04\0\x03set\x01\x06\x01@\x01\x03keys\0\x05\x04\0\x06delete\x01\x07\x01@\x01\x03\
-keys\0\x7f\x04\0\x06exists\x01\x08\x01j\x01x\x01\x01\x01@\x02\x03keys\x06amountx\
-\0\x09\x04\0\x09increment\x01\x0a\x04\0\x09decrement\x01\x0a\x01ps\x01ks\x01p\x0c\
-\x01j\x01\x0d\x01\x01\x01@\x01\x04keys\x0b\0\x0e\x04\0\x04mget\x01\x0f\x01o\x02s\
-s\x01p\x10\x01@\x01\x05pairs\x11\0\x05\x04\0\x04mset\x01\x12\x01@\x02\x03keys\x03\
-ttly\0\x05\x04\0\x06expire\x01\x13\x03\0\x10talos:core/cache\x05\x17\x01B\x10\x01\
-m\x04\x10connectionfailed\x0dpublishfailed\x0fsubscribefailed\x0cinvalidtopic\x04\
-\0\x05error\x03\0\0\x01p}\x01o\x02ss\x01p\x03\x01k\x04\x01r\x03\x05topics\x07pay\
-load\x02\x07headers\x05\x04\0\x07message\x03\0\x06\x01j\0\x01\x01\x01@\x02\x05to\
-pics\x07payload\x02\0\x08\x04\0\x07publish\x01\x09\x01@\x01\x03msg\x07\0\x08\x04\
-\0\x14publish-with-headers\x01\x0a\x01j\x01\x02\x01\x01\x01@\x03\x05topics\x07pa\
-yload\x02\x0atimeout-msy\0\x0b\x04\0\x07request\x01\x0c\x03\0\x14talos:core/mess\
-aging\x05\x18\x01B\x0a\x01m\x04\x10connectionfailed\x0aqueryerror\x0cunauthorize\
-d\x0cinvalidquery\x04\0\x05error\x03\0\0\x01r\x02\x04rowss\x0drows-affectedw\x04\
-\0\x0cquery-result\x03\0\x02\x01ps\x01j\x01\x03\x01\x01\x01@\x02\x03sqls\x06para\
-ms\x04\0\x05\x04\0\x0dexecute-query\x01\x06\x01@\0\0s\x04\0\x0eget-last-error\x01\
-\x07\x03\0\x13talos:core/database\x05\x19\x01B\x02\x01@\x01\x06reasons\0\x7f\x04\
-\0\x10request-approval\x01\0\x03\0\x15talos:core/governance\x05\x1a\x01B\x1d\x01\
-ks\x01r\x03\x03keys\x05values\x08metadata\0\x04\0\x0cmemory-entry\x03\0\x01\x01r\
-\x04\x03keys\x05values\x05scorev\x08metadata\0\x04\0\x0dsearch-result\x03\0\x03\x01\
-m\x04\x0dnot-available\x0dkey-not-found\x0cstorage-full\x0dinvalid-input\x04\0\x05\
-error\x03\0\x05\x01ps\x01r\x02\x05limity\x0dexclude-kinds\x07\x04\0\x0esearch-op\
-tions\x03\0\x08\x01j\0\x01\x06\x01@\x02\x03keys\x05values\0\x0a\x04\0\x03set\x01\
-\x0b\x01j\x01s\x01\x06\x01@\x01\x03keys\0\x0c\x04\0\x03get\x01\x0d\x01@\x01\x03k\
-eys\0\x0a\x04\0\x06delete\x01\x0e\x01j\x01\x07\x01\x06\x01@\x01\x06prefix\0\0\x0f\
-\x04\0\x09list-keys\x01\x10\x01@\x01\x05entry\x02\0\x0a\x04\0\x14store-with-embe\
-dding\x01\x11\x01p\x04\x01j\x01\x12\x01\x06\x01@\x02\x05querys\x05limity\0\x13\x04\
-\0\x06search\x01\x14\x01@\x02\x05querys\x04opts\x09\0\x13\x04\0\x0fsearch-filter\
-ed\x01\x15\x03\0\x17talos:core/agent-memory\x05\x1b\x01B\x0a\x01r\x04\x0bentity-\
-types\x05labels\x08distancey\x0apropertiess\x04\0\x09graph-hit\x03\0\0\x01p\x01\x01\
-r\x03\x0centity-county\x08entities\x02\x0drelationshipss\x04\0\x0dgraph-context\x03\
-\0\x03\x01m\x04\x0dnot-available\x0dinvalid-input\x07timeout\x08internal\x04\0\x05\
-error\x03\0\x05\x01j\x01\x04\x01\x06\x01@\x03\x05querys\x09max-depthy\x05limity\0\
-\x07\x04\0\x0cgraph-search\x01\x08\x03\0\x17talos:core/graph-memory\x05\x1c\x01B\
-\x15\x01kw\x01ks\x01kx\x01r\x07\x03keys\x05values\x0bttl-seconds\0\x0bidx-str-on\
-e\x01\x0bidx-str-two\x01\x0didx-ts-one-ms\x02\x0bidx-int-one\x02\x04\0\x0cstored\
--entry\x03\0\x03\x01r\x07\x0akey-prefix\x01\x0eidx-str-one-eq\x01\x0eidx-str-two\
--eq\x01\x11idx-ts-one-gte-ms\x02\x10idx-ts-one-lt-ms\x02\x0eidx-int-one-eq\x02\x05\
-limity\x04\0\x0blist-filter\x03\0\x05\x01m\x06\x0dnot-available\x09not-found\x0d\
-invalid-input\x0cunauthorized\x0cstorage-full\x07timeout\x04\0\x05error\x03\0\x07\
-\x01j\0\x01\x08\x01@\x01\x05entry\x04\0\x09\x04\0\x03set\x01\x0a\x01j\x01\x04\x01\
-\x08\x01@\x01\x03keys\0\x0b\x04\0\x03get\x01\x0c\x01@\x01\x03keys\0\x09\x04\0\x06\
-delete\x01\x0d\x01p\x04\x01j\x01\x0e\x01\x08\x01@\x01\x06filter\x06\0\x0f\x04\0\x0c\
-list-entries\x01\x10\x03\0\x1ctalos:core/integration-state\x05\x1d\x01B\x16\x01k\
-s\x01r\x03\x06targets\x07payloads\x0ecorrelation-id\0\x04\0\x0dagent-message\x03\
-\0\x01\x01r\x04\x06sources\x07payloads\x07success\x7f\x0ecorrelation-id\0\x04\0\x0e\
-agent-response\x03\0\x03\x01m\x04\x0fagent-not-found\x07timeout\x11permission-de\
-nied\x11invocation-failed\x04\0\x05error\x03\0\x05\x01j\x01\x04\x01\x06\x01@\x02\
-\x03msg\x02\x0atimeout-msy\0\x07\x04\0\x06invoke\x01\x08\x01j\0\x01\x06\x01@\x01\
-\x03msg\x02\0\x09\x04\0\x04send\x01\x0a\x01ps\x01j\x01\x0b\x01\x06\x01@\0\0\x0c\x04\
-\0\x0blist-agents\x01\x0d\x01j\x01s\x01\x06\x01@\x02\x09module-ids\x06configs\0\x0e\
-\x04\0\x13inject-runtime-node\x01\x0f\x01@\x01\x07node-ids\0\x09\x04\0\x0frerout\
-e-to-node\x01\x10\x03\0\x1etalos:core/agent-orchestration\x05\x1e\x01B\x17\x01p}\
-\x01ks\x01r\x04\x06buckets\x03keys\x04body\0\x0ccontent-type\x01\x04\0\x0bput-re\
-quest\x03\0\x02\x01r\x03\x04body\0\x0ccontent-type\x01\x04sizew\x04\0\x0cget-res\
-ponse\x03\0\x04\x01r\x03\x03keys\x04sizew\x0dlast-modified\x01\x04\0\x0alist-ent\
-ry\x03\0\x06\x01m\x05\x0enot-configured\x09not-found\x0daccess-denied\x10bucket-\
-not-found\x10operation-failed\x04\0\x05error\x03\0\x08\x01j\0\x01\x09\x01@\x01\x03\
-req\x03\0\x0a\x04\0\x03put\x01\x0b\x01j\x01\x05\x01\x09\x01@\x02\x06buckets\x03k\
-eys\0\x0c\x04\0\x03get\x01\x0d\x01@\x02\x06buckets\x03keys\0\x0a\x04\0\x06delete\
-\x01\x0e\x01ky\x01p\x07\x01j\x01\x10\x01\x09\x01@\x03\x06buckets\x06prefix\x01\x08\
-max-keys\x0f\0\x11\x04\0\x0clist-objects\x01\x12\x03\0\x19talos:core/object-stor\
-age\x05\x1f\x01j\x01s\x01s\x01@\x01\x05inputs\0\x20\x04\0\x03run\x01!\x04\0\x1at\
-alos:core/automation-node\x04\0\x0b\x15\x01\0\x0fautomation-node\x03\0\0\0G\x09p\
-roducers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\
-\x060.41.0";
+\0\x06\x01r\x02\x0dfeatures-texts\x05labels\x04\0\x10few-shot-example\x03\0\x08\x01\
+j\x01\x02\x01\x07\x01@\x02\x0amodel-names\x05inputs\0\x0a\x04\0\x07predict\x01\x0b\
+\x01ps\x01j\x01\x05\x01\x07\x01@\x02\x0amodel-names\x06inputs\x0c\0\x0d\x04\0\x0d\
+predict-batch\x01\x0e\x01p\x09\x01j\x01\x0f\x01\x07\x01@\x02\x0amodel-names\x01k\
+y\0\x10\x04\0\x08few-shot\x01\x11\x03\0\x10talos:core/model\x05\x15\x01B\x16\x01\
+m\x04\x08notfound\x10permissiondenied\x0binvalidpath\x07ioerror\x04\0\x05error\x03\
+\0\0\x01r\x03\x04sizew\x0dmodified-unixw\x0cis-directory\x7f\x04\0\x0dfile-metad\
+ata\x03\0\x02\x01p}\x01j\x01\x04\x01\x01\x01@\x01\x04paths\0\x05\x04\0\x04read\x01\
+\x06\x01j\0\x01\x01\x01@\x02\x04paths\x08contents\x04\0\x07\x04\0\x05write\x01\x08\
+\x01@\x01\x04paths\0\x7f\x04\0\x06exists\x01\x09\x01j\x01\x03\x01\x01\x01@\x01\x04\
+paths\0\x0a\x04\0\x08metadata\x01\x0b\x01ps\x01j\x01\x0c\x01\x01\x01@\x01\x04pat\
+hs\0\x0d\x04\0\x08list-dir\x01\x0e\x01@\x01\x04paths\0\x07\x04\0\x06delete\x01\x0f\
+\x03\0\x10talos:core/files\x05\x16\x01B\x1d\x01m\x03\x10connectionfailed\x08notf\
+ound\x0foperationfailed\x04\0\x05error\x03\0\0\x01j\x01s\x01\x01\x01@\x01\x03key\
+s\0\x02\x04\0\x03get\x01\x03\x01ky\x01j\0\x01\x01\x01@\x03\x03keys\x05values\x03\
+ttl\x04\0\x05\x04\0\x03set\x01\x06\x01@\x01\x03keys\0\x05\x04\0\x06delete\x01\x07\
+\x01@\x01\x03keys\0\x7f\x04\0\x06exists\x01\x08\x01j\x01x\x01\x01\x01@\x02\x03ke\
+ys\x06amountx\0\x09\x04\0\x09increment\x01\x0a\x04\0\x09decrement\x01\x0a\x01ps\x01\
+ks\x01p\x0c\x01j\x01\x0d\x01\x01\x01@\x01\x04keys\x0b\0\x0e\x04\0\x04mget\x01\x0f\
+\x01o\x02ss\x01p\x10\x01@\x01\x05pairs\x11\0\x05\x04\0\x04mset\x01\x12\x01@\x02\x03\
+keys\x03ttly\0\x05\x04\0\x06expire\x01\x13\x03\0\x10talos:core/cache\x05\x17\x01\
+B\x10\x01m\x04\x10connectionfailed\x0dpublishfailed\x0fsubscribefailed\x0cinvali\
+dtopic\x04\0\x05error\x03\0\0\x01p}\x01o\x02ss\x01p\x03\x01k\x04\x01r\x03\x05top\
+ics\x07payload\x02\x07headers\x05\x04\0\x07message\x03\0\x06\x01j\0\x01\x01\x01@\
+\x02\x05topics\x07payload\x02\0\x08\x04\0\x07publish\x01\x09\x01@\x01\x03msg\x07\
+\0\x08\x04\0\x14publish-with-headers\x01\x0a\x01j\x01\x02\x01\x01\x01@\x03\x05to\
+pics\x07payload\x02\x0atimeout-msy\0\x0b\x04\0\x07request\x01\x0c\x03\0\x14talos\
+:core/messaging\x05\x18\x01B\x0a\x01m\x04\x10connectionfailed\x0aqueryerror\x0cu\
+nauthorized\x0cinvalidquery\x04\0\x05error\x03\0\0\x01r\x02\x04rowss\x0drows-aff\
+ectedw\x04\0\x0cquery-result\x03\0\x02\x01ps\x01j\x01\x03\x01\x01\x01@\x02\x03sq\
+ls\x06params\x04\0\x05\x04\0\x0dexecute-query\x01\x06\x01@\0\0s\x04\0\x0eget-las\
+t-error\x01\x07\x03\0\x13talos:core/database\x05\x19\x01B\x02\x01@\x01\x06reason\
+s\0\x7f\x04\0\x10request-approval\x01\0\x03\0\x15talos:core/governance\x05\x1a\x01\
+B\x1d\x01ks\x01r\x03\x03keys\x05values\x08metadata\0\x04\0\x0cmemory-entry\x03\0\
+\x01\x01r\x04\x03keys\x05values\x05scorev\x08metadata\0\x04\0\x0dsearch-result\x03\
+\0\x03\x01m\x04\x0dnot-available\x0dkey-not-found\x0cstorage-full\x0dinvalid-inp\
+ut\x04\0\x05error\x03\0\x05\x01ps\x01r\x02\x05limity\x0dexclude-kinds\x07\x04\0\x0e\
+search-options\x03\0\x08\x01j\0\x01\x06\x01@\x02\x03keys\x05values\0\x0a\x04\0\x03\
+set\x01\x0b\x01j\x01s\x01\x06\x01@\x01\x03keys\0\x0c\x04\0\x03get\x01\x0d\x01@\x01\
+\x03keys\0\x0a\x04\0\x06delete\x01\x0e\x01j\x01\x07\x01\x06\x01@\x01\x06prefix\0\
+\0\x0f\x04\0\x09list-keys\x01\x10\x01@\x01\x05entry\x02\0\x0a\x04\0\x14store-wit\
+h-embedding\x01\x11\x01p\x04\x01j\x01\x12\x01\x06\x01@\x02\x05querys\x05limity\0\
+\x13\x04\0\x06search\x01\x14\x01@\x02\x05querys\x04opts\x09\0\x13\x04\0\x0fsearc\
+h-filtered\x01\x15\x03\0\x17talos:core/agent-memory\x05\x1b\x01B\x0a\x01r\x04\x0b\
+entity-types\x05labels\x08distancey\x0apropertiess\x04\0\x09graph-hit\x03\0\0\x01\
+p\x01\x01r\x03\x0centity-county\x08entities\x02\x0drelationshipss\x04\0\x0dgraph\
+-context\x03\0\x03\x01m\x04\x0dnot-available\x0dinvalid-input\x07timeout\x08inte\
+rnal\x04\0\x05error\x03\0\x05\x01j\x01\x04\x01\x06\x01@\x03\x05querys\x09max-dep\
+thy\x05limity\0\x07\x04\0\x0cgraph-search\x01\x08\x03\0\x17talos:core/graph-memo\
+ry\x05\x1c\x01B\x15\x01kw\x01ks\x01kx\x01r\x07\x03keys\x05values\x0bttl-seconds\0\
+\x0bidx-str-one\x01\x0bidx-str-two\x01\x0didx-ts-one-ms\x02\x0bidx-int-one\x02\x04\
+\0\x0cstored-entry\x03\0\x03\x01r\x07\x0akey-prefix\x01\x0eidx-str-one-eq\x01\x0e\
+idx-str-two-eq\x01\x11idx-ts-one-gte-ms\x02\x10idx-ts-one-lt-ms\x02\x0eidx-int-o\
+ne-eq\x02\x05limity\x04\0\x0blist-filter\x03\0\x05\x01m\x06\x0dnot-available\x09\
+not-found\x0dinvalid-input\x0cunauthorized\x0cstorage-full\x07timeout\x04\0\x05e\
+rror\x03\0\x07\x01j\0\x01\x08\x01@\x01\x05entry\x04\0\x09\x04\0\x03set\x01\x0a\x01\
+j\x01\x04\x01\x08\x01@\x01\x03keys\0\x0b\x04\0\x03get\x01\x0c\x01@\x01\x03keys\0\
+\x09\x04\0\x06delete\x01\x0d\x01p\x04\x01j\x01\x0e\x01\x08\x01@\x01\x06filter\x06\
+\0\x0f\x04\0\x0clist-entries\x01\x10\x03\0\x1ctalos:core/integration-state\x05\x1d\
+\x01B\x16\x01ks\x01r\x03\x06targets\x07payloads\x0ecorrelation-id\0\x04\0\x0dage\
+nt-message\x03\0\x01\x01r\x04\x06sources\x07payloads\x07success\x7f\x0ecorrelati\
+on-id\0\x04\0\x0eagent-response\x03\0\x03\x01m\x04\x0fagent-not-found\x07timeout\
+\x11permission-denied\x11invocation-failed\x04\0\x05error\x03\0\x05\x01j\x01\x04\
+\x01\x06\x01@\x02\x03msg\x02\x0atimeout-msy\0\x07\x04\0\x06invoke\x01\x08\x01j\0\
+\x01\x06\x01@\x01\x03msg\x02\0\x09\x04\0\x04send\x01\x0a\x01ps\x01j\x01\x0b\x01\x06\
+\x01@\0\0\x0c\x04\0\x0blist-agents\x01\x0d\x01j\x01s\x01\x06\x01@\x02\x09module-\
+ids\x06configs\0\x0e\x04\0\x13inject-runtime-node\x01\x0f\x01@\x01\x07node-ids\0\
+\x09\x04\0\x0freroute-to-node\x01\x10\x03\0\x1etalos:core/agent-orchestration\x05\
+\x1e\x01B\x17\x01p}\x01ks\x01r\x04\x06buckets\x03keys\x04body\0\x0ccontent-type\x01\
+\x04\0\x0bput-request\x03\0\x02\x01r\x03\x04body\0\x0ccontent-type\x01\x04sizew\x04\
+\0\x0cget-response\x03\0\x04\x01r\x03\x03keys\x04sizew\x0dlast-modified\x01\x04\0\
+\x0alist-entry\x03\0\x06\x01m\x05\x0enot-configured\x09not-found\x0daccess-denie\
+d\x10bucket-not-found\x10operation-failed\x04\0\x05error\x03\0\x08\x01j\0\x01\x09\
+\x01@\x01\x03req\x03\0\x0a\x04\0\x03put\x01\x0b\x01j\x01\x05\x01\x09\x01@\x02\x06\
+buckets\x03keys\0\x0c\x04\0\x03get\x01\x0d\x01@\x02\x06buckets\x03keys\0\x0a\x04\
+\0\x06delete\x01\x0e\x01ky\x01p\x07\x01j\x01\x10\x01\x09\x01@\x03\x06buckets\x06\
+prefix\x01\x08max-keys\x0f\0\x11\x04\0\x0clist-objects\x01\x12\x03\0\x19talos:co\
+re/object-storage\x05\x1f\x01j\x01s\x01s\x01@\x01\x05inputs\0\x20\x04\0\x03run\x01\
+!\x04\0\x1atalos:core/automation-node\x04\0\x0b\x15\x01\0\x0fautomation-node\x03\
+\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-\
+bindgen-rust\x060.41.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {

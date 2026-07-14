@@ -537,6 +537,80 @@ impl DatasetService {
         Ok(out)
     }
 
+    /// Class-balanced, most-recent-first human CORRECTIONS for few-shot
+    /// teacher anchoring (the `talos.ml.fewshot` op). Recency ordering is
+    /// deliberate — corrections encode the CURRENT boundary truth, and the
+    /// newest reviews are the ones fixing what the teacher gets wrong
+    /// today. Features are truncated to the wire cap at a char boundary:
+    /// anchors need the discriminative head of the text, and the cap
+    /// bounds both reply size and the prompt-injection surface a stored
+    /// example can carry into future prompts.
+    ///
+    /// Returns up to `k_total` (features_text, label) pairs, interleaved
+    /// round-robin across labels so a lopsided correction history (e.g.
+    /// 49 to_read vs 16 archive) still anchors every corrected class.
+    pub async fn few_shot_corrections(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+        k_total: u32,
+    ) -> Result<Vec<(String, String)>> {
+        let k_total = k_total.clamp(1, talos_memory::ml_rpc::MAX_FEWSHOT_K) as usize;
+        // Up to k_total per label (the interleave below trims to k_total
+        // overall); ranked window first, ciphertext joined only for the
+        // winners — same shape as `sample_examples`.
+        let rows: Vec<EncRow> = sqlx::query_as(&format!(
+            "SELECT {ENC_ROW_COLS} FROM ml_examples \
+             WHERE id IN ( \
+                 SELECT id FROM (SELECT id, ROW_NUMBER() OVER \
+                     (PARTITION BY label_json->>'label' ORDER BY created_at DESC) AS rn \
+                   FROM ml_examples \
+                   WHERE dataset_id = $1 AND source = 'correction' \
+                     AND label_json ? 'label') t \
+                 WHERE rn <= $2) \
+             ORDER BY created_at DESC",
+        ))
+        .bind(dataset_id)
+        .bind(k_total as i64)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        // Decrypt + truncate, grouped per label preserving recency order.
+        let mut per_label: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (_id, label, _source, text) = self.decrypt_row(dataset_id, row).await?;
+            let truncated = talos_text_util::truncate_at_char_boundary(
+                &text,
+                talos_memory::ml_rpc::MAX_FEWSHOT_FEATURE_BYTES,
+            )
+            .to_string();
+            per_label.entry(label).or_default().push(truncated);
+        }
+
+        // Round-robin across labels: one from each class per pass, so no
+        // class dominates the anchor budget.
+        let mut queues: Vec<(String, std::collections::VecDeque<String>)> =
+            per_label.into_iter().map(|(l, v)| (l, v.into())).collect();
+        let mut out = Vec::with_capacity(k_total);
+        while out.len() < k_total {
+            let mut yielded = false;
+            for (label, q) in queues.iter_mut() {
+                if out.len() >= k_total {
+                    break;
+                }
+                if let Some(text) = q.pop_front() {
+                    out.push((text, label.clone()));
+                    yielded = true;
+                }
+            }
+            if !yielded {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// (id, label) pairs for split assignment — classification rows only,
     /// no decryption needed.
     pub async fn load_labels(

@@ -51,6 +51,6 @@ pub use linear::{FitOpts, LinearModel, LinearPrediction};
 pub use provision::{provision_classifier, ProvisionError, ProvisionInput, ProvisionOutcome};
 pub use registry::{ModelRegistry, ModelReviewSummary, ModelVersionRow, ResolvedModel};
 pub use serve::{
-    invalidate_serving_cache, serve_predict_batch, ServeError, ServeReply, ServedPrediction,
-    ServingMode,
+    few_shot_for_model, invalidate_serving_cache, serve_predict_batch, ServeError, ServeReply,
+    ServedPrediction, ServingMode,
 };

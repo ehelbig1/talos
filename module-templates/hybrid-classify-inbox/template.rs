@@ -223,7 +223,33 @@ pub fn run(input: String) -> Result<String, String> {
     } else {
         Vec::new()
     };
-    let few_shot = upstream["few_shot"].clone();
+    // Few-shot anchors, two sources merged: (1) the model's own human
+    // CORRECTIONS via the host (talos.ml.fewshot) — the teacher-improvement
+    // loop, so the LLM learns the same boundary fixes the model distills —
+    // then (2) whatever the upstream feedback node supplied (legacy
+    // channel). Host fetch is BEST-EFFORT: any error other than
+    // cancellation degrades to the upstream-only behavior. Cancellation
+    // unwinds per the WIT contract.
+    let mut few_shot_items: Vec<serde_json::Value> = Vec::new();
+    match talos::core::model::few_shot(&model_name, 6) {
+        Ok(examples) => {
+            for ex in examples {
+                few_shot_items.push(serde_json::json!({
+                    "text": ex.features_text,
+                    "label": ex.label,
+                    "source": "human_correction",
+                }));
+            }
+        }
+        Err(talos::core::model::Error::Cancelled) => {
+            return Err("Execution cancelled — not retrying".to_string())
+        }
+        Err(_) => {}
+    }
+    if let Some(upstream_fs) = upstream["few_shot"].as_array() {
+        few_shot_items.extend(upstream_fs.iter().cloned());
+    }
+    let few_shot = serde_json::Value::Array(few_shot_items);
     if messages.is_empty() {
         return Ok(serde_json::json!({
             "classifications": [],
