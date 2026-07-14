@@ -85,7 +85,7 @@ impl wit_agent_memory::Host for TalosContext {
         )
         .await
         {
-            Ok(talos_memory::memory_rpc::MemoryOpResult::GetValue { value }) => {
+            Ok(talos_memory::memory_rpc::MemoryOpResult::GetValue { value, .. }) => {
                 // Round-trip fidelity: `set("k", "x")` must yield `get("k") == "x"`.
                 // The RPC ships back a JSON-encoded value because the storage
                 // layer preserves JSON structure server-side. Unwrap a JSON
@@ -102,6 +102,80 @@ impl wit_agent_memory::Host for TalosContext {
         };
         if let Some(ref m) = __metrics {
             m.record_host_function_call("agent_memory::get", __start.elapsed().as_millis() as f64);
+        }
+        result
+    }
+
+    /// DX-19 (2026-07-14): value + durability metadata, with an absent key
+    /// surfaced as `Ok(None)` rather than an error. Carries the EXACT same
+    /// gate set as `get` (capability-world gate + audit-ledger row on deny,
+    /// canonical key validation, per-call metrics, signed-RPC prereqs) —
+    /// the batch-method sibling-defense lesson: every new method gets the
+    /// full gates, copied not approximated. Reuses the same
+    /// `MemoryOp::Get` request (signed bytes unchanged); the reply now
+    /// carries the timestamps.
+    async fn get_entry(
+        &mut self,
+        key: String,
+    ) -> Result<Option<wit_agent_memory::MemoryEntryDetail>, wit_agent_memory::Error> {
+        if require_agent_memory_capability(&self.capability_world).is_err() {
+            self.record_capability_denied("agent-memory-get-entry", "capability-world", &key)
+                .await;
+            return Err(wit_agent_memory::Error::NotAvailable);
+        }
+        // Fail-fast key validation (parity with get/set/delete + the
+        // controller's memory_rpc verify()).
+        if talos_memory::validate_memory_key(&key).is_err() {
+            return Err(wit_agent_memory::Error::InvalidInput);
+        }
+        let __start = std::time::Instant::now();
+        let __metrics = self.metrics.clone();
+        let (actor_id, nats) = match mem_rpc_prereqs_owned(self) {
+            Some(p) => p,
+            None => return Err(wit_agent_memory::Error::NotAvailable),
+        };
+        let result = match call_memory_op(
+            actor_id,
+            nats,
+            talos_memory::memory_rpc::MemoryOp::Get { key },
+        )
+        .await
+        {
+            Ok(talos_memory::memory_rpc::MemoryOpResult::GetValue {
+                value,
+                created_at_unix,
+                expires_at_unix,
+                memory_type,
+            }) => {
+                // Same value round-trip as `get`: unwrap a JSON string
+                // literal back to its inner bytes; objects/arrays stay
+                // serialized JSON.
+                let unwrapped = match serde_json::from_str::<serde_json::Value>(&value) {
+                    Ok(serde_json::Value::String(s)) => s,
+                    _ => value,
+                };
+                Ok(Some(wit_agent_memory::MemoryEntryDetail {
+                    value: unwrapped,
+                    // A real row always carries created_at; the `unwrap_or(0)`
+                    // only guards a reply from a pre-DX-19 controller that
+                    // omits the field (worker/controller version skew).
+                    created_at_unix: created_at_unix.unwrap_or(0),
+                    expires_at_unix,
+                    memory_type: memory_type.unwrap_or_default(),
+                }))
+            }
+            // Absent key is NOT an error for get-entry — the whole point of
+            // the addition. The controller replies KeyNotFound (byte-identical
+            // to the legacy `get` miss); we translate it to Ok(None) here.
+            Err(talos_memory::memory_rpc::MemoryRpcError::KeyNotFound) => Ok(None),
+            Ok(_) => Err(wit_agent_memory::Error::NotAvailable),
+            Err(e) => Err(map_mem_err(e)),
+        };
+        if let Some(ref m) = __metrics {
+            m.record_host_function_call(
+                "agent_memory::get_entry",
+                __start.elapsed().as_millis() as f64,
+            );
         }
         result
     }
