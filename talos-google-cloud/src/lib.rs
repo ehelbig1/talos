@@ -9,8 +9,12 @@
 //! provider_key derivation mirrors `talos-google-calendar` (stable UUID
 //! from `Sha256(google_account_id)[..16]`).
 
+pub mod admin;
 pub mod api;
+pub mod dispatch;
 pub mod integration;
+pub mod watch;
+pub mod watch_channel_service;
 #[allow(unused_imports)]
 pub use integration::{
     GoogleCloudIntegration, GoogleCloudIntegrationInfo, GoogleCloudIntegrationService,
