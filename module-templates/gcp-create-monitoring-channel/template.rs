@@ -14,12 +14,17 @@ use talos_sdk_macros::talos_module;
 const MAX_ERROR_EXCERPT_CHARS: usize = 500;
 const MAX_DISPLAY_NAME_CHARS: usize = 100;
 const LIST_PAGE_SIZE: usize = 200;
+/// Hard cap on pre-check pagination (bounded per the unbounded-pagination
+/// rule): 5 × 200 = 1000 channels examined before failing loudly.
+const MAX_LIST_PAGES: usize = 5;
 
 // Typed decoders (NOT top-level serde_json::Value — 3-10x cheaper in WASM fuel).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListChannelsResp {
     notification_channels: Option<Vec<Channel>>,
+    #[serde(default)]
+    next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -147,52 +152,80 @@ pub fn run(input: String) -> Result<String, String> {
 
     // ── Pre-check: does a pubsub channel for this topic already exist? ──────
     // POST is NOT idempotent, so this lookup is what makes re-runs safe.
-    let list_url = format!(
-        "{}?filter={}&pageSize={}",
-        base_url,
-        pct("type=\"pubsub\""),
-        LIST_PAGE_SIZE
-    );
-    let list_req = talos::core::http::Request {
-        method: talos::core::http::Method::Get,
-        url: list_url,
-        headers: auth_headers.clone(),
-        body: vec![],
-        timeout_ms: Some(15000),
-    };
-    let list_resp =
-        talos::core::http::fetch(&list_req).map_err(|e| format!("channel list fetch: {:?}", e))?;
-    if list_resp.status == 401 {
-        return Err(
-            "GCP 401: write-tier access_token invalid or expired. Re-consent via /api/gcp/connect-write or call refresh_oauth_token on the oauth/google_cloud_write vault path."
-                .to_string(),
+    // Paginated with a hard page cap (bounded per the unbounded-pagination
+    // rule): up to MAX_LIST_PAGES × LIST_PAGE_SIZE channels are examined
+    // before we give up LOUDLY rather than risk minting a duplicate.
+    let mut page_token: Option<String> = None;
+    for _page in 0..MAX_LIST_PAGES {
+        let mut list_url = format!(
+            "{}?filter={}&pageSize={}",
+            base_url,
+            pct("type=\"pubsub\""),
+            LIST_PAGE_SIZE
         );
+        if let Some(ref tok) = page_token {
+            list_url.push_str("&pageToken=");
+            list_url.push_str(&pct(tok));
+        }
+        let list_req = talos::core::http::Request {
+            method: talos::core::http::Method::Get,
+            url: list_url,
+            headers: auth_headers.clone(),
+            body: vec![],
+            timeout_ms: Some(15000),
+        };
+        let list_resp = talos::core::http::fetch(&list_req)
+            .map_err(|e| format!("channel list fetch: {:?}", e))?;
+        if list_resp.status == 401 {
+            return Err(
+                "GCP 401: write-tier access_token invalid or expired. Re-consent via /api/gcp/connect-write or call refresh_oauth_token on the oauth/google_cloud_write vault path."
+                    .to_string(),
+            );
+        }
+        if !(200..300).contains(&list_resp.status) {
+            let body = String::from_utf8_lossy(&list_resp.body).into_owned();
+            return Err(format!(
+                "GCP Monitoring HTTP {} (channel pre-check): {}",
+                list_resp.status,
+                excerpt(&body)
+            ));
+        }
+        let list_body = String::from_utf8(list_resp.body)
+            .map_err(|_| "channel list: invalid utf8 response")?;
+        let listed: ListChannelsResp =
+            serde_json::from_str(&list_body).map_err(|e| format!("channel list parse: {}", e))?;
+        if let Some(existing) = listed
+            .notification_channels
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.labels.topic == full_topic)
+        {
+            let result = serde_json::json!({
+                "created": false,
+                "already_existed": true,
+                "channel_name": existing.name,
+                "topic": full_topic,
+            });
+            return serde_json::to_string(&result).map_err(|e| e.to_string());
+        }
+        match listed.next_page_token.filter(|t| !t.is_empty()) {
+            Some(tok) => page_token = Some(tok),
+            None => {
+                page_token = None;
+                break;
+            }
+        }
     }
-    if !(200..300).contains(&list_resp.status) {
-        let body = String::from_utf8_lossy(&list_resp.body).into_owned();
+    if page_token.is_some() {
+        // Cap exhausted with pages remaining: refuse to create — a duplicate
+        // channel is worse than asking the operator to prune/verify manually.
         return Err(format!(
-            "GCP Monitoring HTTP {} (channel pre-check): {}",
-            list_resp.status,
-            excerpt(&body)
+            "channel pre-check exhausted {} pages ({} channels) without finishing; \
+             refusing to create a possibly-duplicate channel. Prune unused \
+             notification channels or create this one manually.",
+            MAX_LIST_PAGES,
+            MAX_LIST_PAGES * LIST_PAGE_SIZE
         ));
-    }
-    let list_body =
-        String::from_utf8(list_resp.body).map_err(|_| "channel list: invalid utf8 response")?;
-    let listed: ListChannelsResp =
-        serde_json::from_str(&list_body).map_err(|e| format!("channel list parse: {}", e))?;
-    if let Some(existing) = listed
-        .notification_channels
-        .unwrap_or_default()
-        .into_iter()
-        .find(|c| c.labels.topic == full_topic)
-    {
-        let result = serde_json::json!({
-            "created": false,
-            "already_existed": true,
-            "channel_name": existing.name,
-            "topic": full_topic,
-        });
-        return serde_json::to_string(&result).map_err(|e| e.to_string());
     }
 
     // ── Create the channel ───────────────────────────────────────────────────

@@ -129,6 +129,17 @@ fn oauth_http_client() -> reqwest::Client {
 /// for Google; via bearer auth for Slack's `auth.revoke`. We deliberately
 /// avoid SDK abstractions here — every revoke endpoint has its own quirks
 /// and we want the wire shape to be reviewable.
+/// Every Google-family provider whose tokens revoke at
+/// `https://oauth2.googleapis.com/revoke`. A provider missing here while
+/// present in the refresh match (credentials.rs) fails SILENTLY on
+/// disconnect — the fall-through arm reads as "no revoke endpoint".
+pub(crate) const GOOGLE_REVOKE_PROVIDERS: &[&str] = &[
+    "gmail",
+    "google_calendar",
+    "google_cloud",
+    "google_cloud_write",
+];
+
 pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bool> {
     let client = oauth_http_client();
 
@@ -137,7 +148,14 @@ pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bo
         // Revoking a refresh_token also revokes every access_token issued
         // under that grant. 200 OK = revoked. 400 = token already invalid
         // (treat as success — the user-facing intent is "make it dead").
-        "gmail" | "google_calendar" | "google_cloud" => {
+        // `google_cloud_write` (Phase C provisioning tier) MUST be here:
+        // it's the highest-privilege Google grant and a disconnect that
+        // silently skips provider-side revocation would leave a live write
+        // token at Google until natural expiry. (Drift class: a provider
+        // added to the refresh match but not here fails SILENTLY — the
+        // fall-through arm treats it as "no revoke endpoint". Pinned by
+        // `google_revoke_arm_covers_every_google_provider`.)
+        p if GOOGLE_REVOKE_PROVIDERS.contains(&p) => {
             let resp = client
                 .post("https://oauth2.googleapis.com/revoke")
                 .form(&[("token", token)])
@@ -1622,6 +1640,32 @@ impl OAuthService {
         .ok(); // Don't fail if logging fails
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod revoke_provider_coverage_tests {
+    use super::GOOGLE_REVOKE_PROVIDERS;
+
+    /// Drift guard (GCP Phase C review finding #1): `google_cloud_write` was
+    /// added to the refresh match but initially NOT the revoke arm, so an
+    /// explicit user disconnect of the highest-privilege Google grant left
+    /// the refresh token live at Google. Every Google-family provider that
+    /// refreshes at oauth2.googleapis.com must also revoke there.
+    #[test]
+    fn google_revoke_arm_covers_every_google_provider() {
+        for p in [
+            "gmail",
+            "google_calendar",
+            "google_cloud",
+            "google_cloud_write",
+        ] {
+            assert!(
+                GOOGLE_REVOKE_PROVIDERS.contains(&p),
+                "provider {p} refreshes via Google but is missing from GOOGLE_REVOKE_PROVIDERS — \
+                 its disconnect would silently skip provider-side revocation"
+            );
+        }
     }
 }
 
