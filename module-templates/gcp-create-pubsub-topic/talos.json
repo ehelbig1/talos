@@ -1,0 +1,52 @@
+{
+  "name": "gcp-create-pubsub-topic",
+  "version": "v1.0.0",
+  "display_name": "GCP: Create Pub/Sub Topic",
+  "description": "Create a Google Cloud Pub/Sub topic via 'PUT https://pubsub.googleapis.com/v1/projects/{PROJECT_ID}/topics/{TOPIC_NAME}'. Idempotent: if the topic already exists (HTTP 409) the module returns SUCCESS with already_existed=true, so re-running a provisioning workflow is safe. First of the three Phase C provisioning modules — the self-serve automation of docs/gcp-push-setup.md (topic → push subscription → monitoring channel).\n\nThis is a WRITE-capable module: it requires the write-tier Google Cloud OAuth consent granted via '/api/gcp/connect-write' (a SEPARATE consent from the read-only '/api/gcp/connect' flow). Set AUTH_HEADER to a vault:// reference under 'oauth/google_cloud_write/...' — the controller resolves + refreshes the token at dispatch time.",
+  "category": "Cloud",
+  "capability_world": "http-node",
+  "allowed_hosts": ["pubsub.googleapis.com"],
+  "allowed_methods": ["PUT"],
+  "requires_secrets": ["oauth/google_cloud_write/*"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER", "PROJECT_ID", "TOPIC_NAME"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the WRITE-tier OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/google_cloud_write/{user_id}/{provider_key}/access_token'). The controller resolves the vault reference and refreshes the token if expired. Note the '_write' namespace — the read-tier 'oauth/google_cloud/*' token cannot create topics."
+      },
+      "PROJECT_ID": {
+        "type": "string",
+        "description": "GCP project id the topic is created in. Must match ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ (validated before the request is built)."
+      },
+      "TOPIC_NAME": {
+        "type": "string",
+        "description": "Short topic name (NOT the full 'projects/...' path). Must match ^[A-Za-z][A-Za-z0-9._~+%-]{2,254}$ and must not start with 'goog' (validated before the request is built)."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable the Pub/Sub API",
+      "detail": "In https://console.cloud.google.com, enable the Cloud Pub/Sub API for the target project."
+    },
+    {
+      "step": 2,
+      "title": "Grant write-tier consent",
+      "detail": "Complete the WRITE-tier OAuth flow via '/api/gcp/connect-write'. This is a separate consent from the read-only GCP integration and stores tokens under 'oauth/google_cloud_write/{user_id}/{provider_key}/...'."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/google_cloud_write/{your_user_id}/{your_provider_key}/access_token'. The controller resolves the vault path + refreshes the token before dispatching. On 401s, re-consent via /api/gcp/connect-write or call refresh_oauth_token(vault_path)."
+    },
+    {
+      "step": 4,
+      "title": "Chain the Phase C provisioning",
+      "detail": "Follow with 'GCP: Create Push Subscription' and 'GCP: Create Monitoring Channel' to complete the docs/gcp-push-setup.md provisioning end-to-end. Re-runs are safe — an existing topic returns already_existed=true instead of failing."
+    }
+  ]
+}

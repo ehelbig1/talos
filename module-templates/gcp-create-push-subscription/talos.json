@@ -1,0 +1,81 @@
+{
+  "name": "gcp-create-push-subscription",
+  "version": "v1.0.0",
+  "display_name": "GCP: Create Push Subscription",
+  "description": "Create a Google Cloud Pub/Sub PUSH subscription with OIDC-authenticated delivery via 'PUT https://pubsub.googleapis.com/v1/projects/{PROJECT_ID}/subscriptions/{SUBSCRIPTION_NAME}'. Binds the subscription to a topic and points push delivery at a Talos watch-channel endpoint, with an OIDC token minted by the given service account against the given audience (ackDeadlineSeconds=60). Idempotent: if the subscription already exists (HTTP 409) the module returns SUCCESS with already_existed=true, so re-running a provisioning workflow is safe. Second of the three Phase C provisioning modules — the self-serve automation of docs/gcp-push-setup.md (topic → push subscription → monitoring channel).\n\nThis is a WRITE-capable module: it requires the write-tier Google Cloud OAuth consent granted via '/api/gcp/connect-write' (a SEPARATE consent from the read-only '/api/gcp/connect' flow). Set AUTH_HEADER to a vault:// reference under 'oauth/google_cloud_write/...' — the controller resolves + refreshes the token at dispatch time.",
+  "category": "Cloud",
+  "capability_world": "http-node",
+  "allowed_hosts": ["pubsub.googleapis.com"],
+  "allowed_methods": ["PUT"],
+  "requires_secrets": ["oauth/google_cloud_write/*"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": [
+      "AUTH_HEADER",
+      "PROJECT_ID",
+      "TOPIC_NAME",
+      "SUBSCRIPTION_NAME",
+      "PUSH_ENDPOINT",
+      "SERVICE_ACCOUNT_EMAIL",
+      "AUDIENCE"
+    ],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the WRITE-tier OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/google_cloud_write/{user_id}/{provider_key}/access_token'). The controller resolves the vault reference and refreshes the token if expired. Note the '_write' namespace — the read-tier 'oauth/google_cloud/*' token cannot create subscriptions."
+      },
+      "PROJECT_ID": {
+        "type": "string",
+        "description": "GCP project id that owns the topic and the new subscription. Must match ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ (validated before the request is built)."
+      },
+      "TOPIC_NAME": {
+        "type": "string",
+        "description": "Short name of the EXISTING topic to subscribe to (create it first with 'GCP: Create Pub/Sub Topic'). Must match ^[A-Za-z][A-Za-z0-9._~+%-]{2,254}$ and must not start with 'goog'."
+      },
+      "SUBSCRIPTION_NAME": {
+        "type": "string",
+        "description": "Short subscription name (NOT the full 'projects/...' path). Must match ^[A-Za-z][A-Za-z0-9._~+%-]{2,254}$ and must not start with 'goog' (validated before the request is built)."
+      },
+      "PUSH_ENDPOINT": {
+        "type": "string",
+        "description": "The Talos push URL for this watch channel — copy it from the watch-channel row (Settings → Google Cloud Watch Channels). Must start with https:// (Pub/Sub push requires HTTPS)."
+      },
+      "SERVICE_ACCOUNT_EMAIL": {
+        "type": "string",
+        "description": "Service account that mints the push OIDC token. MUST equal the watch's expected service account (see docs/gcp-push-setup.md) — Talos rejects pushes signed by any other SA. Shape: <name>@<project>.iam.gserviceaccount.com."
+      },
+      "AUDIENCE": {
+        "type": "string",
+        "description": "OIDC token audience. MUST equal the Talos controller's GCP_PUBSUB_AUDIENCE env value — an audience mismatch makes Talos reject every push with 401. Non-empty, no whitespace."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create the topic first",
+      "detail": "Run 'GCP: Create Pub/Sub Topic' (or create the topic manually). The subscription PUT fails with 404 if the topic does not exist."
+    },
+    {
+      "step": 2,
+      "title": "Grant write-tier consent",
+      "detail": "Complete the WRITE-tier OAuth flow via '/api/gcp/connect-write' and set AUTH_HEADER to 'Bearer vault://oauth/google_cloud_write/{your_user_id}/{your_provider_key}/access_token'."
+    },
+    {
+      "step": 3,
+      "title": "Copy the push endpoint from Talos",
+      "detail": "The PUSH_ENDPOINT comes from the Talos watch-channel row (Settings → Google Cloud Watch Channels) — it embeds the per-watch URL token that authenticates the channel."
+    },
+    {
+      "step": 4,
+      "title": "Match audience and service account to the controller",
+      "detail": "AUDIENCE must equal the controller's GCP_PUBSUB_AUDIENCE, and SERVICE_ACCOUNT_EMAIL must equal the watch's expected service account (see docs/gcp-push-setup.md). Mismatches surface as 401-rejected pushes, not as errors from this module."
+    },
+    {
+      "step": 5,
+      "title": "Finish with the monitoring channel",
+      "detail": "Run 'GCP: Create Monitoring Channel' to point Cloud Monitoring incident notifications at the topic. Re-runs of this module are safe — an existing subscription returns already_existed=true instead of failing."
+    }
+  ]
+}

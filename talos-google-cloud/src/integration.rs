@@ -843,9 +843,8 @@ mod tests {
         let scopes = GcpTier::Read.scopes();
         assert!(scopes.contains(&"https://www.googleapis.com/auth/cloud-platform.read-only"));
         assert!(
-            !scopes
-                .iter()
-                .any(|s| s.contains("/auth/pubsub") || *s == "https://www.googleapis.com/auth/monitoring"),
+            !scopes.iter().any(|s| s.contains("/auth/pubsub")
+                || *s == "https://www.googleapis.com/auth/monitoring"),
             "read tier must not carry write scopes"
         );
     }
